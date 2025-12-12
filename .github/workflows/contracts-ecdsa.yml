@@ -1,10 +1,7 @@
 name: Solidity ECDSA
 
 on:
-  pull_request:
-    branches:
-      - main
-  # We intend to use `workflow dispatch` in two different situations/paths
+  # We intend to use `workflow dispatch` in two different situations/paths:
   # 1. If a workflow will be manually dispatched from branch named
   #    `dapp-development`, workflow will deploy the contracts on the selected
   #    testnet and publish them to NPM registry with `dapp-dev-<environment>`
@@ -109,7 +106,7 @@ jobs:
       # As a workaround for a slither issue https://github.com/crytic/slither/issues/1140
       # we disable compilation of dependencies when running slither.
       - name: Run Slither
-        run: SKIP_DEPENDENCY_COMPILER=true slither . --compile-force-framework hardhat
+        run: SKIP_DEPENDENCY_COMPILER=true slither .
 
   contracts-build-and-test:
     needs: contracts-detect-changes
