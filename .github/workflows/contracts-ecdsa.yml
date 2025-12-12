@@ -1,6 +1,7 @@
 name: Solidity ECDSA
 
 on:
+  pull_request:
   # We intend to use `workflow dispatch` in two different situations/paths:
   # 1. If a workflow will be manually dispatched from branch named
   #    `dapp-development`, workflow will deploy the contracts on the selected
