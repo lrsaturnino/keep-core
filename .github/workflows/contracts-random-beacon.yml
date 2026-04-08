@@ -56,8 +56,6 @@ jobs:
           # artifacts generation during `hardhat compile` - see
           # https://github.com/NomicFoundation/hardhat/issues/3877
           node-version: "18.15.0"
-          cache: "yarn"
-          cache-dependency-path: solidity/random-beacon/yarn.lock
 
       - name: Install dependencies
         run: |
@@ -87,8 +85,6 @@ jobs:
           # artifacts generation during `hardhat compile` - see
           # https://github.com/NomicFoundation/hardhat/issues/3877
           node-version: "18.15.0"
-          cache: "yarn"
-          cache-dependency-path: solidity/random-beacon/yarn.lock
 
       - uses: actions/setup-python@v4
         with:
@@ -132,8 +128,6 @@ jobs:
           # artifacts generation during `hardhat compile` - see
           # https://github.com/NomicFoundation/hardhat/issues/3877
           node-version: "18.15.0"
-          cache: "yarn"
-          cache-dependency-path: solidity/random-beacon/yarn.lock
 
       - name: Install dependencies
         run: |
@@ -164,8 +158,6 @@ jobs:
           # artifacts generation during `hardhat compile` - see
           # https://github.com/NomicFoundation/hardhat/issues/3877
           node-version: "18.15.0"
-          cache: "yarn"
-          cache-dependency-path: solidity/random-beacon/yarn.lock
 
       - name: Install dependencies
         run: |
@@ -202,8 +194,6 @@ jobs:
           # artifacts generation during `hardhat compile` - see
           # https://github.com/NomicFoundation/hardhat/issues/3877
           node-version: "18.15.0"
-          cache: "yarn"
-          cache-dependency-path: solidity/random-beacon/yarn.lock
           registry-url: "https://registry.npmjs.org"
 
       - name: Install dependencies
@@ -305,8 +295,6 @@ jobs:
           # artifacts generation during `hardhat compile` - see
           # https://github.com/NomicFoundation/hardhat/issues/3877
           node-version: "18.15.0"
-          cache: "yarn"
-          cache-dependency-path: solidity/random-beacon/yarn.lock
           registry-url: "https://registry.npmjs.org"
 
       - name: Install dependencies
