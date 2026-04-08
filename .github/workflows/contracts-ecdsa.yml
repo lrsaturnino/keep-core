@@ -60,7 +60,7 @@ jobs:
           cache-dependency-path: solidity/ecdsa/yarn.lock
 
       - name: Install dependencies
-        run: yarn install
+        run: corepack enable && yarn install
 
       - name: Build
         run: yarn build
