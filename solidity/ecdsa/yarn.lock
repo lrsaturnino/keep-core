@@ -6904,7 +6904,7 @@ __metadata:
   version: 1.4.2
   resolution: "eth-sig-util@npm:1.4.2"
   dependencies:
-    ethereumjs-abi: "npm:0.6.8"
+    ethereumjs-abi: "git+https://github.com/ethereumjs/ethereumjs-abi.git"
     ethereumjs-util: "npm:^5.1.1"
   checksum: 10c0/63f88b8dda12eedfa83d47c43f52025dba724ca602385386f408fd41f40c077b06ada2d58c13d9844dae7340b7fee6a0281517b4e20e41d05bf68de2340fc314
   languageName: node
