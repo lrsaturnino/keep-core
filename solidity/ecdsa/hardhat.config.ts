@@ -1,4 +1,4 @@
-import "@nomicfoundation/hardhat-verify"
+// import "@nomicfoundation/hardhat-verify" // Optional; comment out if not installed
 import "@keep-network/hardhat-helpers"
 import "@keep-network/hardhat-local-networks-config"
 import "@nomiclabs/hardhat-waffle"
@@ -15,8 +15,6 @@ import "solidity-docgen"
 import "./tasks"
 import { task } from "hardhat/config"
 import { TASK_TEST } from "hardhat/builtin-tasks/task-names"
-
-import type { HardhatUserConfig } from "hardhat/config"
 
 const TASK_CHECK_ACCOUNTS_COUNT = "check-accounts-count"
 
@@ -45,7 +43,7 @@ export const testConfig = {
   operatorsCount: 100,
 }
 
-const config: HardhatUserConfig = {
+const config = {
   solidity: {
     compilers: [
       {
@@ -137,28 +135,27 @@ const config: HardhatUserConfig = {
     username: "thesis",
     project: "",
   },
-  etherscan: {
-    apiKey: process.env.ETHERSCAN_API_KEY,
-  },
+  // etherscan: { apiKey: process.env.ETHERSCAN_API_KEY }, // Requires @nomicfoundation/hardhat-verify
   namedAccounts: {
     deployer: {
       default: 1, // take the second account
-      sepolia: "0x68ad60CC5e8f3B7cC53beaB321cf0e6036962dBc",
+      // Use first account from ACCOUNTS_PRIVATE_KEYS (required for custom testnet deployers)
+      sepolia: 0,
       mainnet: "0x716089154304f22a2F9c8d2f8C45815183BF3532",
     },
     governance: {
       default: 2,
-      sepolia: "0x68ad60CC5e8f3B7cC53beaB321cf0e6036962dBc",
+      sepolia: 0,
       mainnet: "0x9f6e831c8f8939dc0c830c6e492e7cef4f9c2f5f", // Threshold Council
     },
     chaosnetOwner: {
       default: 3,
-      sepolia: "0x68ad60CC5e8f3B7cC53beaB321cf0e6036962dBc",
+      sepolia: 0,
       mainnet: "0x9f6e831c8f8939dc0c830c6e492e7cef4f9c2f5f", // Threshold Council
     },
     esdm: {
       default: 4,
-      sepolia: "0x68ad60CC5e8f3B7cC53beaB321cf0e6036962dBc",
+      sepolia: 0,
       mainnet: "0x9f6e831c8f8939dc0c830c6e492e7cef4f9c2f5f", // Threshold Council
     },
   },
@@ -189,11 +186,9 @@ const config: HardhatUserConfig = {
         "node_modules/@threshold-network/solidity-contracts/deployments/development",
         "node_modules/@keep-network/random-beacon/deployments/development",
       ],
-      sepolia: [
-        "./external/sepolia",
-        "node_modules/@threshold-network/solidity-contracts/artifacts",
-        "node_modules/@keep-network/random-beacon/artifacts",
-      ],
+      // Use local deployments/sepolia only - npm artifacts have transactionHash
+      // that causes "cannot get the transaction" errors with some RPC nodes.
+      sepolia: [],
       mainnet: ["./external/mainnet"],
     },
   },

@@ -108,6 +108,10 @@ const config: HardhatUserConfig = {
         ? process.env.ACCOUNTS_PRIVATE_KEYS.split(",")
         : undefined,
       tags: ["etherscan", "tenderly"],
+      // Override gas to avoid REPLACEMENT_UNDERPRICED when retrying after a failed deploy
+      ...(process.env.GAS_PRICE_GWEI && {
+        gasPrice: parseInt(process.env.GAS_PRICE_GWEI, 10) * 1e9,
+      }),
     },
     mainnet: {
       url: process.env.CHAIN_API_URL || "",
@@ -165,7 +169,9 @@ const config: HardhatUserConfig = {
       development: [
         "node_modules/@threshold-network/solidity-contracts/deployments/development",
       ],
-      sepolia: ["node_modules/@threshold-network/solidity-contracts/artifacts"],
+      // Use local deployments/sepolia only - npm artifacts have transactionHash
+      // that causes "cannot get the transaction" errors with some RPC nodes.
+      sepolia: [],
       mainnet: ["./external/mainnet"],
     },
   },

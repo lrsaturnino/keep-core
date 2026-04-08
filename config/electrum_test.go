@@ -30,6 +30,13 @@ func TestResolveElectrum(t *testing.T) {
 				},
 			},
 		},
+		bitcoin.Testnet4: {
+			expectedConfig: []electrum.Config{
+				{
+					URL: "ssl://134.199.227.217:50002",
+				},
+			},
+		},
 		bitcoin.Regtest: {
 			expectedConfig: []electrum.Config{
 				{
