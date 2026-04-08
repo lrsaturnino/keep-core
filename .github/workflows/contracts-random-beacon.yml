@@ -60,7 +60,11 @@ jobs:
           cache-dependency-path: solidity/random-beacon/yarn.lock
 
       - name: Install dependencies
-        run: yarn install --network-concurrency 1
+        run: |
+          corepack enable
+          corepack prepare yarn@4.8.1 --activate
+          yarn --version
+          yarn install --immutable
 
       - name: Build
         run: yarn build
@@ -104,7 +108,11 @@ jobs:
         run: pip3 install slither-analyzer==$SLITHER_VERSION
 
       - name: Install dependencies
-        run: yarn install --network-concurrency 1
+        run: |
+          corepack enable
+          corepack prepare yarn@4.8.1 --activate
+          yarn --version
+          yarn install --immutable
 
       - name: Run Slither
         run: slither .
@@ -128,7 +136,11 @@ jobs:
           cache-dependency-path: solidity/random-beacon/yarn.lock
 
       - name: Install dependencies
-        run: yarn install --network-concurrency 1
+        run: |
+          corepack enable
+          corepack prepare yarn@4.8.1 --activate
+          yarn --version
+          yarn install --immutable
 
       - name: Build solidity contracts
         run: yarn build
@@ -156,7 +168,11 @@ jobs:
           cache-dependency-path: solidity/random-beacon/yarn.lock
 
       - name: Install dependencies
-        run: yarn install --network-concurrency 1 --frozen-lockfile
+        run: |
+          corepack enable
+          corepack prepare yarn@4.8.1 --activate
+          yarn --version
+          yarn install --immutable
 
       - name: Deploy contracts
         run: yarn deploy:test
@@ -191,7 +207,11 @@ jobs:
           registry-url: "https://registry.npmjs.org"
 
       - name: Install dependencies
-        run: yarn install --network-concurrency 1 --frozen-lockfile
+        run: |
+          corepack enable
+          corepack prepare yarn@4.8.1 --activate
+          yarn --version
+          yarn install --immutable
 
       - name: Get upstream packages versions
         uses: keep-network/ci/actions/upstream-builds-query@v2
@@ -290,7 +310,11 @@ jobs:
           registry-url: "https://registry.npmjs.org"
 
       - name: Install dependencies
-        run: yarn install --network-concurrency 1 --frozen-lockfile
+        run: |
+          corepack enable
+          corepack prepare yarn@4.8.1 --activate
+          yarn --version
+          yarn install --immutable
 
       - name: Get upstream packages versions
         uses: keep-network/ci/actions/upstream-builds-query@v2

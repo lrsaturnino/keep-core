@@ -34,7 +34,11 @@ jobs:
           cache-dependency-path: solidity/ecdsa/yarn.lock
 
       - name: Install dependencies
-        run: yarn install --frozen-lockfile
+        run: |
+          corepack enable
+          corepack prepare yarn@4.8.1 --activate
+          yarn --version
+          yarn install --immutable
 
       # Deploy contracts to a local network to generate deployment artifacts that
       # are required by dashboard and client compilation.
