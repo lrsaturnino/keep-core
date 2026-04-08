@@ -57,8 +57,13 @@ jobs:
           # https://github.com/NomicFoundation/hardhat/issues/3877
           node-version: "18.15.0"
 
+      - uses: ./.github/actions/setup-git-for-yarn
+
       - name: Install dependencies
         run: |
+          export GIT_CONFIG_GLOBAL="${RUNNER_TEMP:-/tmp}/yarn-gitconfig"
+          export GIT_CONFIG_NOSYSTEM=1
+          git config --file "$GIT_CONFIG_GLOBAL" core.autocrlf false
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
@@ -103,8 +108,13 @@ jobs:
           SLITHER_VERSION: 0.8.3
         run: pip3 install slither-analyzer==$SLITHER_VERSION
 
+      - uses: ./.github/actions/setup-git-for-yarn
+
       - name: Install dependencies
         run: |
+          export GIT_CONFIG_GLOBAL="${RUNNER_TEMP:-/tmp}/yarn-gitconfig"
+          export GIT_CONFIG_NOSYSTEM=1
+          git config --file "$GIT_CONFIG_GLOBAL" core.autocrlf false
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
@@ -129,8 +139,13 @@ jobs:
           # https://github.com/NomicFoundation/hardhat/issues/3877
           node-version: "18.15.0"
 
+      - uses: ./.github/actions/setup-git-for-yarn
+
       - name: Install dependencies
         run: |
+          export GIT_CONFIG_GLOBAL="${RUNNER_TEMP:-/tmp}/yarn-gitconfig"
+          export GIT_CONFIG_NOSYSTEM=1
+          git config --file "$GIT_CONFIG_GLOBAL" core.autocrlf false
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
@@ -159,8 +174,13 @@ jobs:
           # https://github.com/NomicFoundation/hardhat/issues/3877
           node-version: "18.15.0"
 
+      - uses: ./.github/actions/setup-git-for-yarn
+
       - name: Install dependencies
         run: |
+          export GIT_CONFIG_GLOBAL="${RUNNER_TEMP:-/tmp}/yarn-gitconfig"
+          export GIT_CONFIG_NOSYSTEM=1
+          git config --file "$GIT_CONFIG_GLOBAL" core.autocrlf false
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
@@ -196,8 +216,13 @@ jobs:
           node-version: "18.15.0"
           registry-url: "https://registry.npmjs.org"
 
+      - uses: ./.github/actions/setup-git-for-yarn
+
       - name: Install dependencies
         run: |
+          export GIT_CONFIG_GLOBAL="${RUNNER_TEMP:-/tmp}/yarn-gitconfig"
+          export GIT_CONFIG_NOSYSTEM=1
+          git config --file "$GIT_CONFIG_GLOBAL" core.autocrlf false
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
@@ -297,8 +322,13 @@ jobs:
           node-version: "18.15.0"
           registry-url: "https://registry.npmjs.org"
 
+      - uses: ./.github/actions/setup-git-for-yarn
+
       - name: Install dependencies
         run: |
+          export GIT_CONFIG_GLOBAL="${RUNNER_TEMP:-/tmp}/yarn-gitconfig"
+          export GIT_CONFIG_NOSYSTEM=1
+          git config --file "$GIT_CONFIG_GLOBAL" core.autocrlf false
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version

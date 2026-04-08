@@ -31,8 +31,13 @@ jobs:
           node-version: "18.15.0"
           registry-url: "https://registry.npmjs.org"
 
+      - uses: ./.github/actions/setup-git-for-yarn
+
       - name: Enable Yarn 4 (packageManager)
         run: |
+          export GIT_CONFIG_GLOBAL="${RUNNER_TEMP:-/tmp}/yarn-gitconfig"
+          export GIT_CONFIG_NOSYSTEM=1
+          git config --file "$GIT_CONFIG_GLOBAL" core.autocrlf false
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
