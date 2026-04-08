@@ -1,0 +1,16 @@
+name: Setup Git for Yarn (git dependencies)
+description: >
+  Point GIT_CONFIG_GLOBAL at a minimal writable config so Yarn can clone git
+  dependencies on GitHub-hosted runners (avoids "invalid key core.autocrlf" /
+  "unable to write parameters to config file" during git clone).
+runs:
+  using: composite
+  steps:
+    - name: Configure Git for Yarn clones
+      shell: bash
+      run: |
+        set -euo pipefail
+        CFG="${RUNNER_TEMP}/yarn-gitconfig"
+        git config --file "$CFG" core.autocrlf false
+        git config --file "$CFG" --add safe.directory '*'
+        echo "GIT_CONFIG_GLOBAL=${CFG}" >> "$GITHUB_ENV"
