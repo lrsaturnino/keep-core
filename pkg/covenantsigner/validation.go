@@ -631,24 +631,29 @@ func normalizeScopedApprovalTrustRoot(
 		nil
 }
 
-func normalizeDepositorTrustRoots(
-	trustRoots []DepositorTrustRoot,
-) ([]DepositorTrustRoot, error) {
+// normalizeScopedTrustRoots validates and normalizes a slice of trust roots
+// of any scoped-approval type. getFields extracts (Route, Reserve, Network,
+// PublicKey) from each element; build constructs a normalized element from
+// the validated fields. Duplicates within the same route/reserve/network
+// scope are rejected.
+func normalizeScopedTrustRoots[T any](
+	typeName string,
+	trustRoots []T,
+	getFields func(T) (TemplateID, string, string, string),
+	build func(route TemplateID, reserve, network, publicKey string) T,
+) ([]T, error) {
 	if len(trustRoots) == 0 {
 		return nil, nil
 	}
 
-	normalized := make([]DepositorTrustRoot, len(trustRoots))
+	normalized := make([]T, len(trustRoots))
 	seen := make(map[string]int, len(trustRoots))
 
 	for i, trustRoot := range trustRoots {
-		name := fmt.Sprintf("depositorTrustRoots[%d]", i)
+		name := fmt.Sprintf("%s[%d]", typeName, i)
+		r, res, net, pk := getFields(trustRoot)
 		route, reserve, network, publicKey, err := normalizeScopedApprovalTrustRoot(
-			name,
-			trustRoot.Route,
-			trustRoot.Reserve,
-			trustRoot.Network,
-			trustRoot.PublicKey,
+			name, r, res, net, pk,
 		)
 		if err != nil {
 			return nil, err
@@ -658,8 +663,9 @@ func normalizeDepositorTrustRoots(
 		if previousIndex, ok := seen[scopeKey]; ok {
 			return nil, &inputError{
 				fmt.Sprintf(
-					"%s duplicates depositorTrustRoots[%d] for route %s reserve %s network %s",
+					"%s duplicates %s[%d] for route %s reserve %s network %s",
 					name,
+					typeName,
 					previousIndex,
 					route,
 					reserve,
@@ -668,65 +674,46 @@ func normalizeDepositorTrustRoots(
 			}
 		}
 		seen[scopeKey] = i
-
-		normalized[i] = DepositorTrustRoot{
-			Route:     route,
-			Reserve:   reserve,
-			Network:   network,
-			PublicKey: publicKey,
-		}
+		normalized[i] = build(route, reserve, network, publicKey)
 	}
 
 	return normalized, nil
 }
 
+func normalizeDepositorTrustRoots(
+	trustRoots []DepositorTrustRoot,
+) ([]DepositorTrustRoot, error) {
+	return normalizeScopedTrustRoots(
+		"depositorTrustRoots",
+		trustRoots,
+		func(t DepositorTrustRoot) (TemplateID, string, string, string) {
+			return t.Route, t.Reserve, t.Network, t.PublicKey
+		},
+		func(route TemplateID, reserve, network, publicKey string) DepositorTrustRoot {
+			return DepositorTrustRoot{
+				Route: route, Reserve: reserve,
+				Network: network, PublicKey: publicKey,
+			}
+		},
+	)
+}
+
 func normalizeCustodianTrustRoots(
 	trustRoots []CustodianTrustRoot,
 ) ([]CustodianTrustRoot, error) {
-	if len(trustRoots) == 0 {
-		return nil, nil
-	}
-
-	normalized := make([]CustodianTrustRoot, len(trustRoots))
-	seen := make(map[string]int, len(trustRoots))
-
-	for i, trustRoot := range trustRoots {
-		name := fmt.Sprintf("custodianTrustRoots[%d]", i)
-		route, reserve, network, publicKey, err := normalizeScopedApprovalTrustRoot(
-			name,
-			trustRoot.Route,
-			trustRoot.Reserve,
-			trustRoot.Network,
-			trustRoot.PublicKey,
-		)
-		if err != nil {
-			return nil, err
-		}
-
-		scopeKey := string(route) + "|" + reserve + "|" + network
-		if previousIndex, ok := seen[scopeKey]; ok {
-			return nil, &inputError{
-				fmt.Sprintf(
-					"%s duplicates custodianTrustRoots[%d] for route %s reserve %s network %s",
-					name,
-					previousIndex,
-					route,
-					reserve,
-					network,
-				),
+	return normalizeScopedTrustRoots(
+		"custodianTrustRoots",
+		trustRoots,
+		func(t CustodianTrustRoot) (TemplateID, string, string, string) {
+			return t.Route, t.Reserve, t.Network, t.PublicKey
+		},
+		func(route TemplateID, reserve, network, publicKey string) CustodianTrustRoot {
+			return CustodianTrustRoot{
+				Route: route, Reserve: reserve,
+				Network: network, PublicKey: publicKey,
 			}
-		}
-		seen[scopeKey] = i
-
-		normalized[i] = CustodianTrustRoot{
-			Route:     route,
-			Reserve:   reserve,
-			Network:   network,
-			PublicKey: publicKey,
-		}
-	}
-
-	return normalized, nil
+		},
+	)
 }
 
 func trustRootLookupScope(request RouteSubmitRequest) (TemplateID, string, string) {
