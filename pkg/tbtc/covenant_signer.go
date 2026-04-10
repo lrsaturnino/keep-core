@@ -33,6 +33,11 @@ const defaultMinActiveOutpointConfirmations uint = 6
 
 const qcV1SignerHandoffKind = "qc_v1_signer_handoff_v1"
 
+// qcV1SignerHandoff is the downstream handoff artifact produced for qc_v1
+// signing jobs. Its field names and the qcV1SignerHandoffKind constant form
+// part of the external handoff API contract consumed by the handoff
+// processor. Do not rename fields or change the Kind value without a
+// corresponding schema version bump.
 type qcV1SignerHandoff struct {
 	Kind                      string
 	SignerRequestID           string
