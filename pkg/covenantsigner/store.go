@@ -351,6 +351,7 @@ func (s *Store) Put(job *Job) error {
 
 	s.byRequestID[job.RequestID] = cloned
 	s.byRouteKey[key] = job.RequestID
+	delete(s.poisonedRoutes, key)
 
 	if hasExisting && existingRequestID != job.RequestID {
 		if err := s.handle.Delete(jobsDirectory, existingRequestID+".json"); err != nil {
