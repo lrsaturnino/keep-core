@@ -71,7 +71,13 @@ func NewInputError(message string) error {
 func strictUnmarshal(data []byte, target any) error {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
-	return decoder.Decode(target)
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if decoder.More() {
+		return fmt.Errorf("unexpected trailing content after JSON object")
+	}
+	return nil
 }
 
 type validationOptions struct {
