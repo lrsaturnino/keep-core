@@ -140,16 +140,16 @@ func Initialize(
 		return nil, false, fmt.Errorf("failed to bind covenant signer port [%d]: %w", config.Port, err)
 	}
 
-	go func() { // #nosec G118 -- parent ctx is already cancelled; shutdown needs a fresh deadline
+	// #nosec G118 -- this goroutine intentionally uses context.Background for
+	// the shutdown drain. ctx is already cancelled when <-ctx.Done() unblocks;
+	// using it for the Shutdown timeout would cause immediate cancellation.
+	go func() {
 		<-ctx.Done()
 
 		// Cancel the service context so in-flight threshold signing
 		// operations observe shutdown and terminate promptly.
 		cancelService()
 
-		// #nosec G118 -- context.Background is required here because ctx is
-		// already cancelled at this point; using it would make Shutdown return
-		// immediately with context.Canceled before the drain completes.
 		shutdownCtx, cancelShutdown := context.WithTimeout(
 			context.Background(),
 			5*time.Second,
