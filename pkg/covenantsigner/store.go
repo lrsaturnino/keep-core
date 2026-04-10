@@ -359,9 +359,8 @@ func (s *Store) Put(job *Job) error {
 				existingRequestID+".json",
 				err,
 			)
-		} else {
-			delete(s.byRequestID, existingRequestID)
 		}
+		delete(s.byRequestID, existingRequestID)
 	}
 
 	return nil

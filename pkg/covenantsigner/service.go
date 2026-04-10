@@ -214,6 +214,15 @@ func (s *Service) loadPollJob(route TemplateID, input SignerPollInput) (*Job, er
 		return nil, &inputError{"routeRequestId does not match stored job"}
 	}
 
+	// Verify this job is still the current holder of its route key. A Put()
+	// for a newer job may have evicted the in-memory entry while the file
+	// delete failed, leaving a stale byRequestID entry. If the route key
+	// now points to a different request, treat this job as not found.
+	holder, holderOk, holderErr := s.store.GetByRouteRequest(route, job.RouteRequestID)
+	if holderErr != nil || !holderOk || holder.RequestID != job.RequestID {
+		return nil, errJobNotFound
+	}
+
 	digest, err := requestDigest(
 		input.Request,
 		validationOptions{
