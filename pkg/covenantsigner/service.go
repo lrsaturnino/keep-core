@@ -79,7 +79,7 @@ func NewService(
 	handle persistence.BasicHandle,
 	engine Engine,
 	options ...ServiceOption,
-) (*Service, error) {
+) (_ *Service, retErr error) {
 	if engine == nil {
 		engine = NewPassiveEngine()
 	}
@@ -100,6 +100,12 @@ func NewService(
 		return nil, err
 	}
 	service.store = store
+	// Release the file lock if any subsequent initialization step fails.
+	defer func() {
+		if retErr != nil {
+			service.store.Close()
+		}
+	}()
 
 	normalizedDepositorTrustRoots, err := normalizeDepositorTrustRoots(
 		service.depositorTrustRoots,
