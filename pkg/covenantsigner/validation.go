@@ -1563,7 +1563,7 @@ func normalizeMigrationDestination(
 	}
 
 	return &MigrationDestinationReservation{
-		ReservationID:             destination.ReservationID,
+		ReservationID:             strings.TrimSpace(destination.ReservationID),
 		Reserve:                   normalizeLowerHex(destination.Reserve),
 		Epoch:                     destination.Epoch,
 		Route:                     destination.Route,
