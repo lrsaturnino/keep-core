@@ -103,7 +103,9 @@ func NewService(
 	// Release the file lock if any subsequent initialization step fails.
 	defer func() {
 		if retErr != nil {
-			service.store.Close()
+			if closeErr := service.store.Close(); closeErr != nil {
+				logger.Warnf("failed to close store after init failure: [%v]", closeErr)
+			}
 		}
 	}()
 

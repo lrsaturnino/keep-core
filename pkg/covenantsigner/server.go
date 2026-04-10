@@ -147,6 +147,9 @@ func Initialize(
 		// operations observe shutdown and terminate promptly.
 		cancelService()
 
+		// #nosec G118 -- context.Background is required here because ctx is
+		// already cancelled at this point; using it would make Shutdown return
+		// immediately with context.Canceled before the drain completes.
 		shutdownCtx, cancelShutdown := context.WithTimeout(
 			context.Background(),
 			5*time.Second,
