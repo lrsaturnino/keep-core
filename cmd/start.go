@@ -3,7 +3,9 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	commonEthereum "github.com/keep-network/keep-common/pkg/chain/ethereum"
@@ -143,7 +145,8 @@ func start(cmd *cobra.Command) error {
 }
 
 func startWithDeps(cmd *cobra.Command, deps startDeps) error {
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	beaconChain, tbtcChain, blockCounter, signing, operatorPrivateKey, err :=
 		deps.connectEthereum(ctx, clientConfig.Ethereum)
