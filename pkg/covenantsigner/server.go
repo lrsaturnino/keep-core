@@ -68,10 +68,22 @@ func Initialize(
 		return nil, false, err
 	}
 	if service.signerApprovalVerifier == nil {
+		hasTrustRoots := len(service.depositorTrustRoots) > 0 ||
+			len(service.custodianTrustRoots) > 0 ||
+			len(service.migrationPlanQuoteTrustRoots) > 0
+		if hasTrustRoots {
+			return nil, false, fmt.Errorf(
+				"trust roots are configured but the engine does not implement " +
+					"SignerApprovalVerifier; signer approval certificates cannot " +
+					"be verified -- remove trust root configuration or use an " +
+					"engine that supports approval verification",
+			)
+		}
 		logger.Warn(
 			"covenant signer started without a signer approval verifier; " +
 				"structured signerApproval certificates will not be verified and " +
-				"requests without signerApproval will be accepted",
+				"requests without signerApproval will be accepted; " +
+				"set covenantSigner.requireApprovalTrustRoots=true to enforce approval verification",
 		)
 	}
 	if config.EnableSelfV1 &&
