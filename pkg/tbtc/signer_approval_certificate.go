@@ -272,6 +272,11 @@ func verifySignerApprovalCertificate(
 		return fmt.Errorf("cannot parse threshold signature: %w", err)
 	}
 
+	halfOrder := new(big.Int).Rsh(btcec.S256().N, 1)
+	if parsedSignature.S.Cmp(halfOrder) > 0 {
+		return fmt.Errorf("threshold signature S value is not low-S normalized")
+	}
+
 	if !ecdsa.Verify(walletPublicKey, approvalDigest, parsedSignature.R, parsedSignature.S) {
 		return fmt.Errorf("threshold signature does not verify against wallet public key")
 	}
