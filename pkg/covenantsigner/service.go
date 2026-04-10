@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 
@@ -115,6 +116,14 @@ func NewService(
 		return nil, err
 	}
 	service.custodianTrustRoots = normalizedCustodianTrustRoots
+
+	for i := range service.migrationPlanQuoteTrustRoots {
+		trimmed := strings.TrimSpace(service.migrationPlanQuoteTrustRoots[i].KeyID)
+		if trimmed == "" {
+			return nil, fmt.Errorf("migration plan quote trust root KeyID at index %d is empty after trimming", i)
+		}
+		service.migrationPlanQuoteTrustRoots[i].KeyID = trimmed
+	}
 
 	return service, nil
 }
