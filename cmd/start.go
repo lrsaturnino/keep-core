@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"time"
 
 	commonEthereum "github.com/keep-network/keep-common/pkg/chain/ethereum"
@@ -255,9 +256,16 @@ func startWithDeps(cmd *cobra.Command, deps startDeps) error {
 			return fmt.Errorf("error initializing TBTC: [%v]", err)
 		}
 
+		signerConfig := clientConfig.CovenantSigner
+		if signerConfig.DataDir == "" && signerConfig.Port != 0 {
+			signerConfig.DataDir = filepath.Join(
+				filepath.Clean(clientConfig.Storage.Dir), "work", "tbtc",
+			)
+		}
+
 		_, _, err = deps.initializeSigner(
 			ctx,
-			clientConfig.CovenantSigner,
+			signerConfig,
 			tbtcDataPersistence,
 			covenantSignerEngine,
 		)
