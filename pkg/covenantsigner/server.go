@@ -16,6 +16,7 @@ import (
 
 	"github.com/ipfs/go-log/v2"
 	"github.com/keep-network/keep-common/pkg/persistence"
+	"golang.org/x/time/rate"
 )
 
 var logger = log.Logger("keep-covenant-signer")
@@ -247,17 +248,24 @@ func newHandler(service *Service, serviceCtx context.Context, authToken string, 
 	mux := http.NewServeMux()
 	protectedHandler := withBearerAuth(mux, authToken)
 
+	// Single rate limiter shared across all submit routes. The server uses one
+	// static auth token, so this is equivalent to per-token limiting.
+	submitLimiter := rate.NewLimiter(
+		rate.Every(time.Minute/submitRateLimitPerMinute),
+		submitRateLimitPerMinute,
+	)
+
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
 
-	mux.HandleFunc("POST /v1/qc_v1/signer/requests", submitHandler(service, serviceCtx, TemplateQcV1))
+	mux.HandleFunc("POST /v1/qc_v1/signer/requests", submitHandler(service, serviceCtx, TemplateQcV1, submitLimiter))
 	mux.HandleFunc("POST /v1/qc_v1/signer/requests:poll", pollBodyHandler(service, TemplateQcV1))
 	mux.HandleFunc("/v1/qc_v1/signer/requests/", pollPathHandler(service, TemplateQcV1))
 	if enableSelfV1 {
-		mux.HandleFunc("POST /v1/self_v1/signer/requests", submitHandler(service, serviceCtx, TemplateSelfV1))
+		mux.HandleFunc("POST /v1/self_v1/signer/requests", submitHandler(service, serviceCtx, TemplateSelfV1, submitLimiter))
 		mux.HandleFunc("POST /v1/self_v1/signer/requests:poll", pollBodyHandler(service, TemplateSelfV1))
 		mux.HandleFunc("/v1/self_v1/signer/requests/", pollPathHandler(service, TemplateSelfV1))
 	}
@@ -354,8 +362,19 @@ func handleError(w http.ResponseWriter, err error) {
 
 const submitTimeout = 5 * time.Minute
 
-func submitHandler(service *Service, serviceCtx context.Context, route TemplateID) http.HandlerFunc {
+// submitRateLimitPerMinute is the maximum number of new submit requests
+// accepted per minute. Each submit may initiate a 5-minute threshold signing
+// operation, so even a small burst can saturate the engine. Idempotent polls
+// and dedup hits are not affected by this limit.
+const submitRateLimitPerMinute = 5
+
+func submitHandler(service *Service, serviceCtx context.Context, route TemplateID, limiter *rate.Limiter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !limiter.Allow() {
+			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
+
 		input := SignerSubmitInput{}
 		if !decodeJSON(w, r, &input) {
 			return
