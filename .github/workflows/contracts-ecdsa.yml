@@ -61,11 +61,20 @@ jobs:
 
       - name: Install dependencies
         run: |
-          unset GIT_CONFIG_PARAMETERS
-          while IFS= read -r key; do unset "$key"; done < <(env | sed -n "s/^\(GIT_CONFIG_\(KEY\|VALUE\)_[0-9]\+\)=.*$/\1/p")
-          export GIT_CONFIG_COUNT=0
+          while IFS='=' read -r key _; do
+            case "$key" in
+              GIT_CONFIG_*) unset "$key" ;;
+            esac
+          done < <(env)
+          export HOME="${RUNNER_TEMP:-/tmp}/git-home"
+          mkdir -p "$HOME"
+          export GIT_CONFIG_GLOBAL="${RUNNER_TEMP:-/tmp}/yarn-gitconfig"
+          printf "[core]
+  autocrlf = false
+" >"$GIT_CONFIG_GLOBAL"
           export GIT_CONFIG_NOSYSTEM=1
           export GIT_CONFIG_SYSTEM=/dev/null
+          export GIT_CONFIG_COUNT=0
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
@@ -114,11 +123,20 @@ jobs:
 
       - name: Install dependencies
         run: |
-          unset GIT_CONFIG_PARAMETERS
-          while IFS= read -r key; do unset "$key"; done < <(env | sed -n "s/^\(GIT_CONFIG_\(KEY\|VALUE\)_[0-9]\+\)=.*$/\1/p")
-          export GIT_CONFIG_COUNT=0
+          while IFS='=' read -r key _; do
+            case "$key" in
+              GIT_CONFIG_*) unset "$key" ;;
+            esac
+          done < <(env)
+          export HOME="${RUNNER_TEMP:-/tmp}/git-home"
+          mkdir -p "$HOME"
+          export GIT_CONFIG_GLOBAL="${RUNNER_TEMP:-/tmp}/yarn-gitconfig"
+          printf "[core]
+  autocrlf = false
+" >"$GIT_CONFIG_GLOBAL"
           export GIT_CONFIG_NOSYSTEM=1
           export GIT_CONFIG_SYSTEM=/dev/null
+          export GIT_CONFIG_COUNT=0
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
@@ -149,11 +167,20 @@ jobs:
 
       - name: Install dependencies
         run: |
-          unset GIT_CONFIG_PARAMETERS
-          while IFS= read -r key; do unset "$key"; done < <(env | sed -n "s/^\(GIT_CONFIG_\(KEY\|VALUE\)_[0-9]\+\)=.*$/\1/p")
-          export GIT_CONFIG_COUNT=0
+          while IFS='=' read -r key _; do
+            case "$key" in
+              GIT_CONFIG_*) unset "$key" ;;
+            esac
+          done < <(env)
+          export HOME="${RUNNER_TEMP:-/tmp}/git-home"
+          mkdir -p "$HOME"
+          export GIT_CONFIG_GLOBAL="${RUNNER_TEMP:-/tmp}/yarn-gitconfig"
+          printf "[core]
+  autocrlf = false
+" >"$GIT_CONFIG_GLOBAL"
           export GIT_CONFIG_NOSYSTEM=1
           export GIT_CONFIG_SYSTEM=/dev/null
+          export GIT_CONFIG_COUNT=0
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
@@ -186,11 +213,20 @@ jobs:
 
       - name: Install dependencies
         run: |
-          unset GIT_CONFIG_PARAMETERS
-          while IFS= read -r key; do unset "$key"; done < <(env | sed -n "s/^\(GIT_CONFIG_\(KEY\|VALUE\)_[0-9]\+\)=.*$/\1/p")
-          export GIT_CONFIG_COUNT=0
+          while IFS='=' read -r key _; do
+            case "$key" in
+              GIT_CONFIG_*) unset "$key" ;;
+            esac
+          done < <(env)
+          export HOME="${RUNNER_TEMP:-/tmp}/git-home"
+          mkdir -p "$HOME"
+          export GIT_CONFIG_GLOBAL="${RUNNER_TEMP:-/tmp}/yarn-gitconfig"
+          printf "[core]
+  autocrlf = false
+" >"$GIT_CONFIG_GLOBAL"
           export GIT_CONFIG_NOSYSTEM=1
           export GIT_CONFIG_SYSTEM=/dev/null
+          export GIT_CONFIG_COUNT=0
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
@@ -230,11 +266,20 @@ jobs:
 
       - name: Install dependencies
         run: |
-          unset GIT_CONFIG_PARAMETERS
-          while IFS= read -r key; do unset "$key"; done < <(env | sed -n "s/^\(GIT_CONFIG_\(KEY\|VALUE\)_[0-9]\+\)=.*$/\1/p")
-          export GIT_CONFIG_COUNT=0
+          while IFS='=' read -r key _; do
+            case "$key" in
+              GIT_CONFIG_*) unset "$key" ;;
+            esac
+          done < <(env)
+          export HOME="${RUNNER_TEMP:-/tmp}/git-home"
+          mkdir -p "$HOME"
+          export GIT_CONFIG_GLOBAL="${RUNNER_TEMP:-/tmp}/yarn-gitconfig"
+          printf "[core]
+  autocrlf = false
+" >"$GIT_CONFIG_GLOBAL"
           export GIT_CONFIG_NOSYSTEM=1
           export GIT_CONFIG_SYSTEM=/dev/null
+          export GIT_CONFIG_COUNT=0
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
@@ -340,11 +385,20 @@ jobs:
 
       - name: Install dependencies
         run: |
-          unset GIT_CONFIG_PARAMETERS
-          while IFS= read -r key; do unset "$key"; done < <(env | sed -n "s/^\(GIT_CONFIG_\(KEY\|VALUE\)_[0-9]\+\)=.*$/\1/p")
-          export GIT_CONFIG_COUNT=0
+          while IFS='=' read -r key _; do
+            case "$key" in
+              GIT_CONFIG_*) unset "$key" ;;
+            esac
+          done < <(env)
+          export HOME="${RUNNER_TEMP:-/tmp}/git-home"
+          mkdir -p "$HOME"
+          export GIT_CONFIG_GLOBAL="${RUNNER_TEMP:-/tmp}/yarn-gitconfig"
+          printf "[core]
+  autocrlf = false
+" >"$GIT_CONFIG_GLOBAL"
           export GIT_CONFIG_NOSYSTEM=1
           export GIT_CONFIG_SYSTEM=/dev/null
+          export GIT_CONFIG_COUNT=0
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
