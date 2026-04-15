@@ -2,6 +2,7 @@
 import fs from "fs"
 import path from "path"
 
+import "@nomicfoundation/hardhat-chai-matchers"
 import "@keep-network/hardhat-helpers"
 import "@keep-network/hardhat-local-networks-config"
 import "@nomiclabs/hardhat-waffle"
@@ -25,6 +26,13 @@ function resolveRandomBeaconExport(subdir: "deploy" | "artifacts"): string {
   const local = path.join(__dirname, "../random-beacon/export", subdir)
   if (fs.existsSync(local)) {
     return local
+  }
+  // For deploy scripts, also allow direct source path from sibling package.
+  if (subdir === "deploy") {
+    const sourceDeploy = path.join(__dirname, "../random-beacon/deploy")
+    if (fs.existsSync(sourceDeploy)) {
+      return sourceDeploy
+    }
   }
   return path.join(
     __dirname,
