@@ -38,6 +38,5 @@ runs:
           echo "GIT_CONFIG_NOSYSTEM=1"
           echo "GIT_CONFIG_SYSTEM=/dev/null"
           echo "GIT_CONFIG_COUNT=0"
-          echo "GIT_CONFIG_PARAMETERS="
         } >> "$GITHUB_ENV"
         echo "${WRAPPER_DIR}" >> "$GITHUB_PATH"
