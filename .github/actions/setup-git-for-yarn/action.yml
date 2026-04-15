@@ -10,12 +10,33 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        CFG="${RUNNER_TEMP:-/tmp}/yarn-gitconfig"
-        printf "[core]\n  autocrlf = false\n" >"$CFG"
+        SAFE_HOME="${RUNNER_TEMP:-/tmp}/git-home"
+        WRAPPER_DIR="${RUNNER_TEMP:-/tmp}/git-clean-bin"
+        REAL_GIT="$(command -v git)"
+
+        mkdir -p "$SAFE_HOME" "$WRAPPER_DIR"
+        printf '%s\n' \
+          '#!/usr/bin/env bash' \
+          'set -euo pipefail' \
+          "while IFS='=' read -r key _; do" \
+          '  case "$key" in' \
+          '    GIT_CONFIG_*) unset "$key" ;;' \
+          '  esac' \
+          'done < <(env)' \
+          "export HOME=\"${SAFE_HOME}\"" \
+          'export GIT_CONFIG_NOSYSTEM=1' \
+          'export GIT_CONFIG_SYSTEM=/dev/null' \
+          'export GIT_CONFIG_GLOBAL=/dev/null' \
+          'export GIT_CONFIG_COUNT=0' \
+          "exec \"${REAL_GIT}\" \"\$@\"" \
+          >"${WRAPPER_DIR}/git"
+        chmod +x "${WRAPPER_DIR}/git"
         {
-          echo "GIT_CONFIG_GLOBAL=${CFG}"
+          echo "HOME=${SAFE_HOME}"
           echo "GIT_CONFIG_NOSYSTEM=1"
           echo "GIT_CONFIG_SYSTEM=/dev/null"
-          echo "GIT_CONFIG_PARAMETERS="
+          echo "GIT_CONFIG_GLOBAL=/dev/null"
           echo "GIT_CONFIG_COUNT=0"
+          echo "GIT_CONFIG_PARAMETERS="
         } >> "$GITHUB_ENV"
+        echo "${WRAPPER_DIR}" >> "$GITHUB_PATH"
