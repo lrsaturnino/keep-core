@@ -27,13 +27,6 @@ function resolveRandomBeaconExport(subdir: "deploy" | "artifacts"): string {
   if (fs.existsSync(local)) {
     return local
   }
-  // For deploy scripts, also allow direct source path from sibling package.
-  if (subdir === "deploy") {
-    const sourceDeploy = path.join(__dirname, "../random-beacon/deploy")
-    if (fs.existsSync(sourceDeploy)) {
-      return sourceDeploy
-    }
-  }
   return path.join(
     __dirname,
     "node_modules/@keep-network/random-beacon/export",
