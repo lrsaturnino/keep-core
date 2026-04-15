@@ -32,6 +32,8 @@ runs:
           >"${WRAPPER_DIR}/git"
         chmod +x "${WRAPPER_DIR}/git"
         {
+          echo "GIT=${WRAPPER_DIR}/git"
+          echo "npm_config_git=${WRAPPER_DIR}/git"
           echo "GIT_CONFIG_GLOBAL=/dev/null"
           echo "GIT_CONFIG_NOSYSTEM=1"
           echo "GIT_CONFIG_SYSTEM=/dev/null"
