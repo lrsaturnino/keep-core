@@ -16,5 +16,6 @@ runs:
           echo "GIT_CONFIG_GLOBAL=${CFG}"
           echo "GIT_CONFIG_NOSYSTEM=1"
           echo "GIT_CONFIG_SYSTEM=/dev/null"
+          echo "GIT_CONFIG_PARAMETERS="
           echo "GIT_CONFIG_COUNT=0"
         } >> "$GITHUB_ENV"
