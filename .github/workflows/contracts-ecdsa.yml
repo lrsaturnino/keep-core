@@ -66,6 +66,7 @@ jobs:
           export GIT_CONFIG_NOSYSTEM=1
           export GIT_CONFIG_SYSTEM=/dev/null
           export GIT_CONFIG_COUNT=0
+          export YARN_ENABLE_HARDENED_MODE=0
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
@@ -129,6 +130,7 @@ jobs:
           export GIT_CONFIG_NOSYSTEM=1
           export GIT_CONFIG_SYSTEM=/dev/null
           export GIT_CONFIG_COUNT=0
+          export YARN_ENABLE_HARDENED_MODE=0
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
@@ -174,6 +176,7 @@ jobs:
           export GIT_CONFIG_NOSYSTEM=1
           export GIT_CONFIG_SYSTEM=/dev/null
           export GIT_CONFIG_COUNT=0
+          export YARN_ENABLE_HARDENED_MODE=0
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
@@ -221,6 +224,7 @@ jobs:
           export GIT_CONFIG_NOSYSTEM=1
           export GIT_CONFIG_SYSTEM=/dev/null
           export GIT_CONFIG_COUNT=0
+          export YARN_ENABLE_HARDENED_MODE=0
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
@@ -275,6 +279,7 @@ jobs:
           export GIT_CONFIG_NOSYSTEM=1
           export GIT_CONFIG_SYSTEM=/dev/null
           export GIT_CONFIG_COUNT=0
+          export YARN_ENABLE_HARDENED_MODE=0
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
@@ -395,6 +400,7 @@ jobs:
           export GIT_CONFIG_NOSYSTEM=1
           export GIT_CONFIG_SYSTEM=/dev/null
           export GIT_CONFIG_COUNT=0
+          export YARN_ENABLE_HARDENED_MODE=0
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
