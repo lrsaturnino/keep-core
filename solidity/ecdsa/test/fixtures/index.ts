@@ -96,13 +96,15 @@ export const params = {
  * expects a function receiving HardhatRuntimeEnvironment, which doesn't support custom parameters.
  *
  * @param options - Configuration options for the fixture
- * @param options.useAllowlist - If true, configures Allowlist mode; if false/undefined, uses TokenStaking mode (default: false)
+ * @param options.useAllowlist - If true (default), Allowlist mode; if false, legacy TokenStaking stake path
  * @returns A fixture function that can be called to deploy and configure the test environment
  *
  * @internal
  */
-const createWalletRegistryFixture = (options?: { useAllowlist?: boolean }) =>
-  deployments.createFixture(
+const createWalletRegistryFixture = (options?: { useAllowlist?: boolean }) => {
+  const useAllowlist = options?.useAllowlist ?? true
+
+  return deployments.createFixture(
     async (): Promise<{
       tToken: T
       walletRegistry: WalletRegistryStub & WalletRegistry
@@ -158,7 +160,7 @@ const createWalletRegistryFixture = (options?: { useAllowlist?: boolean }) =>
       // In Allowlist mode, the WalletRegistry uses the Allowlist contract for authorization
       // routing instead of TokenStaking. This supports TIP-092 compliant testing.
       let allowlist: Allowlist | undefined
-      if (options?.useAllowlist) {
+      if (useAllowlist) {
         allowlist = await setupAllowlist(walletRegistry, deployer)
       }
 
@@ -175,7 +177,7 @@ const createWalletRegistryFixture = (options?: { useAllowlist?: boolean }) =>
       // Notification rewards are only needed when using TokenStaking for authorization.
       // In Allowlist mode, authorization routing goes through the Allowlist contract,
       // so TokenStaking notification rewards are not required.
-      if (!options?.useAllowlist) {
+      if (!useAllowlist) {
         await updateTokenStakingParams(tToken, staking, deployer)
       }
 
@@ -205,28 +207,27 @@ const createWalletRegistryFixture = (options?: { useAllowlist?: boolean }) =>
       }
     }
   )
+}
 
 /**
  * Creates and loads a WalletRegistry test fixture with dual-mode authorization support.
  *
  * This is the main entry point for test files to load the WalletRegistry fixture.
- * It supports both TokenStaking (default) and Allowlist authorization modes for
+ * It supports TokenStaking (default) and Allowlist authorization modes for
  * comprehensive testing of the dual-mode authorization routing implementation.
  *
  * @param options - Configuration options for the fixture
- * @param options.useAllowlist - If true, configures Allowlist mode; if false/undefined, uses TokenStaking mode (default: false)
+ * @param options.useAllowlist - If true (default), Allowlist mode; if false, legacy stake path
  * @returns Promise resolving to fixture with all deployed contracts, signers, and test operators
  *
  * @example
- * // TokenStaking mode (default - legacy authorization path)
- * const { walletRegistry, operators, staking } = await walletRegistryFixture()
+ * const { walletRegistry, operators, allowlist } = await walletRegistryFixture()
  *
  * @example
- * // Allowlist mode (TIP-092 compliant authorization path)
- * const { walletRegistry, operators, allowlist } = await walletRegistryFixture({ useAllowlist: true })
+ * const { walletRegistry, operators, staking } = await walletRegistryFixture({ useAllowlist: false })
  *
  * @remarks
- * - Default mode uses TokenStaking for authorization (backward compatible with existing tests)
+ * - Default uses TokenStaking; use `{ useAllowlist: true }` for dual-mode / Allowlist-only tests
  * - Allowlist mode calls walletRegistry.initializeV2() to enable dual-mode routing
  * - In Allowlist mode, TokenStaking notification rewards are NOT configured (not needed)
  * - Fixture uses hardhat-deploy's snapshot/restore for efficient test isolation
@@ -392,7 +393,7 @@ async function fundReimbursementPool(
  *
  * @internal
  */
-async function setupAllowlist(
+export async function setupAllowlist(
   walletRegistry: WalletRegistry,
   deployer: SignerWithAddress
 ): Promise<Allowlist> {

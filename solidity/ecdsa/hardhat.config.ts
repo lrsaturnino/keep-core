@@ -23,11 +23,6 @@ const TASK_CHECK_ACCOUNTS_COUNT = "check-accounts-count"
 
 /** Prefer sibling ../random-beacon/export when present (monorepo) so deploy scripts match source, not stale npm. */
 function resolveRandomBeaconExport(subdir: "deploy" | "artifacts"): string {
-  if (subdir === "deploy") {
-    // Force local override deploy scripts in this package to avoid stale npm
-    // deploy behavior on test networks.
-    return path.join(__dirname, "external/random-beacon/export/deploy")
-  }
   const local = path.join(__dirname, "../random-beacon/export", subdir)
   if (fs.existsSync(local)) {
     return local

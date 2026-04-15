@@ -2151,7 +2151,7 @@ __metadata:
   peerDependencies:
     eslint: ">=6.8.0"
     eslint-plugin-import: ^2.18.2
-  checksum: 10c0/e6b3b51b0895e57a69254be3c38d339c9fcee9a2f7eba525049d948b00fcb31fc7cd6734dcf465bd617d342f70efdac910c88e45d87aa9eae2d2e723b5899158
+  checksum: 10c0/3313cf7d0ad067b376bdb09d7243f1d7392e2b61e088318e68ee57beff5a0089da5512c995744f2183d67bd844bbe68ee2f14d989bdd47f660a351f4a3dcf429
   languageName: node
   linkType: hard
 
@@ -14281,7 +14281,7 @@ __metadata:
   resolution: "solhint-config-keep@https://codeload.github.com/keep-network/solhint-config-keep/tar.gz/5e1751e58c0f1c507305ffc8c7f6c58047657ada"
   peerDependencies:
     solhint: ">=3.3.4"
-  checksum: 10c0/a2d14a23080948b4dae5733deb818a23898f1a04dd18f3c15b32657bdbd87fb3ee7c5f493f68aa362a24d967fc44c4211a4dd5195ee3f344411309e667bbd194
+  checksum: 10c0/c4deed3efa00a6939042c8e94fdc7bb8abd18ddb3a3908688b3cd5bdf0d786594411809ad8527ee34a4b0c56413b161eeef9f3201942a3265537d9f37fa0919d
   languageName: node
   linkType: hard
 

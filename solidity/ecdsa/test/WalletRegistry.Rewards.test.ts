@@ -18,11 +18,30 @@ import type {
   IWalletOwner,
   T,
   IRandomBeacon,
+  Allowlist,
 } from "../typechain"
 
 const { to1e18 } = helpers.number
 
 const { createSnapshot, restoreSnapshot } = helpers.snapshot
+
+async function rewardsBeneficiaryAddress(
+  walletRegistry: WalletRegistry,
+  staking: TokenStaking,
+  stakingProvider: string
+): Promise<string> {
+  const allowlistAddr = await walletRegistry.allowlist()
+  if (allowlistAddr !== ethers.constants.AddressZero) {
+    const al = (await ethers.getContractAt(
+      "Allowlist",
+      allowlistAddr
+    )) as Allowlist
+    const r = await al.rolesOf(stakingProvider)
+    return r.beneficiary
+  }
+  const r = await staking.rolesOf(stakingProvider)
+  return r.beneficiary
+}
 
 describe("WalletRegistry - Rewards", () => {
   let tToken: T
@@ -90,8 +109,11 @@ describe("WalletRegistry - Rewards", () => {
         stakingProvider = await walletRegistry.operatorToStakingProvider(
           operator
         )
-        // eslint-disable-next-line @typescript-eslint/no-extra-semi
-        ;({ beneficiary } = await staking.rolesOf(stakingProvider))
+        beneficiary = await rewardsBeneficiaryAddress(
+          walletRegistry,
+          staking,
+          stakingProvider
+        )
 
         // Allocate sortition pool rewards
         await tToken.connect(deployer).mint(deployer.address, rewardAmount)
@@ -144,8 +166,11 @@ describe("WalletRegistry - Rewards", () => {
         stakingProvider = await walletRegistry.operatorToStakingProvider(
           operator
         )
-        // eslint-disable-next-line @typescript-eslint/no-extra-semi
-        ;({ beneficiary } = await staking.rolesOf(stakingProvider))
+        beneficiary = await rewardsBeneficiaryAddress(
+          walletRegistry,
+          staking,
+          stakingProvider
+        )
 
         // Allocate sortition pool rewards
         await tToken.connect(deployer).mint(deployer.address, rewardAmount)
