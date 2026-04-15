@@ -71,7 +71,18 @@ jobs:
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
-          yarn install --immutable
+          unset_args=()
+          while IFS='=' read -r key _; do
+            case "$key" in
+              GIT_CONFIG_*) unset_args+=("-u" "$key") ;;
+            esac
+          done < <(env)
+          env "${unset_args[@]}" \
+            GIT_CONFIG_NOSYSTEM=1 \
+            GIT_CONFIG_SYSTEM=/dev/null \
+            GIT_CONFIG_GLOBAL="$GIT_CONFIG_GLOBAL" \
+            GIT_CONFIG_COUNT=0 \
+            yarn install --immutable
 
       - name: Build
         run: yarn build
@@ -126,7 +137,18 @@ jobs:
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
-          yarn install --immutable
+          unset_args=()
+          while IFS='=' read -r key _; do
+            case "$key" in
+              GIT_CONFIG_*) unset_args+=("-u" "$key") ;;
+            esac
+          done < <(env)
+          env "${unset_args[@]}" \
+            GIT_CONFIG_NOSYSTEM=1 \
+            GIT_CONFIG_SYSTEM=/dev/null \
+            GIT_CONFIG_GLOBAL="$GIT_CONFIG_GLOBAL" \
+            GIT_CONFIG_COUNT=0 \
+            yarn install --immutable
 
       - name: Run Slither
         run: slither .
@@ -161,7 +183,18 @@ jobs:
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
-          yarn install --immutable
+          unset_args=()
+          while IFS='=' read -r key _; do
+            case "$key" in
+              GIT_CONFIG_*) unset_args+=("-u" "$key") ;;
+            esac
+          done < <(env)
+          env "${unset_args[@]}" \
+            GIT_CONFIG_NOSYSTEM=1 \
+            GIT_CONFIG_SYSTEM=/dev/null \
+            GIT_CONFIG_GLOBAL="$GIT_CONFIG_GLOBAL" \
+            GIT_CONFIG_COUNT=0 \
+            yarn install --immutable
 
       - name: Build solidity contracts
         run: yarn build
@@ -200,7 +233,18 @@ jobs:
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
-          yarn install --immutable
+          unset_args=()
+          while IFS='=' read -r key _; do
+            case "$key" in
+              GIT_CONFIG_*) unset_args+=("-u" "$key") ;;
+            esac
+          done < <(env)
+          env "${unset_args[@]}" \
+            GIT_CONFIG_NOSYSTEM=1 \
+            GIT_CONFIG_SYSTEM=/dev/null \
+            GIT_CONFIG_GLOBAL="$GIT_CONFIG_GLOBAL" \
+            GIT_CONFIG_COUNT=0 \
+            yarn install --immutable
 
       - name: Deploy contracts
         run: yarn deploy:test
@@ -246,7 +290,18 @@ jobs:
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
-          yarn install --immutable
+          unset_args=()
+          while IFS='=' read -r key _; do
+            case "$key" in
+              GIT_CONFIG_*) unset_args+=("-u" "$key") ;;
+            esac
+          done < <(env)
+          env "${unset_args[@]}" \
+            GIT_CONFIG_NOSYSTEM=1 \
+            GIT_CONFIG_SYSTEM=/dev/null \
+            GIT_CONFIG_GLOBAL="$GIT_CONFIG_GLOBAL" \
+            GIT_CONFIG_COUNT=0 \
+            yarn install --immutable
 
       - name: Get upstream packages versions
         uses: keep-network/ci/actions/upstream-builds-query@v2
@@ -356,7 +411,18 @@ jobs:
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
-          yarn install --immutable
+          unset_args=()
+          while IFS='=' read -r key _; do
+            case "$key" in
+              GIT_CONFIG_*) unset_args+=("-u" "$key") ;;
+            esac
+          done < <(env)
+          env "${unset_args[@]}" \
+            GIT_CONFIG_NOSYSTEM=1 \
+            GIT_CONFIG_SYSTEM=/dev/null \
+            GIT_CONFIG_GLOBAL="$GIT_CONFIG_GLOBAL" \
+            GIT_CONFIG_COUNT=0 \
+            yarn install --immutable
 
       - name: Get upstream packages versions
         uses: keep-network/ci/actions/upstream-builds-query@v2
