@@ -1,0 +1,499 @@
+{
+  "address": "0x0d0aBd39dE4513A1064319F4e48Fdf97717C76B9",
+  "abi": [
+    {
+      "inputs": [],
+      "stateMutability": "nonpayable",
+      "type": "constructor"
+    },
+    {
+      "inputs": [],
+      "name": "NoDecreasePending",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "NotWalletRegistry",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "RequestedWeightNotBelowCurrentWeight",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "StakingProviderAlreadyAdded",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "StakingProviderUnknown",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "ZeroAddress",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "ZeroWeight",
+      "type": "error"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": false,
+          "internalType": "uint8",
+          "name": "version",
+          "type": "uint8"
+        }
+      ],
+      "name": "Initialized",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": false,
+          "internalType": "address",
+          "name": "notifier",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "address[]",
+          "name": "stakingProviders",
+          "type": "address[]"
+        }
+      ],
+      "name": "MaliciousBehaviorIdentified",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "previousOwner",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "newOwner",
+          "type": "address"
+        }
+      ],
+      "name": "OwnershipTransferStarted",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "previousOwner",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "newOwner",
+          "type": "address"
+        }
+      ],
+      "name": "OwnershipTransferred",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "stakingProvider",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint96",
+          "name": "weight",
+          "type": "uint96"
+        }
+      ],
+      "name": "StakingProviderAdded",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "stakingProvider",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint96",
+          "name": "oldWeight",
+          "type": "uint96"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint96",
+          "name": "newWeight",
+          "type": "uint96"
+        }
+      ],
+      "name": "WeightDecreaseFinalized",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "stakingProvider",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint96",
+          "name": "oldWeight",
+          "type": "uint96"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint96",
+          "name": "newWeight",
+          "type": "uint96"
+        }
+      ],
+      "name": "WeightDecreaseRequested",
+      "type": "event"
+    },
+    {
+      "inputs": [],
+      "name": "acceptOwnership",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "stakingProvider",
+          "type": "address"
+        },
+        {
+          "internalType": "uint96",
+          "name": "weight",
+          "type": "uint96"
+        }
+      ],
+      "name": "addStakingProvider",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "stakingProvider",
+          "type": "address"
+        }
+      ],
+      "name": "approveAuthorizationDecrease",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "stakingProvider",
+          "type": "address"
+        },
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "name": "authorizedStake",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "_walletRegistry",
+          "type": "address"
+        }
+      ],
+      "name": "initialize",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "owner",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "pendingOwner",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "renounceOwnership",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "stakingProvider",
+          "type": "address"
+        },
+        {
+          "internalType": "uint96",
+          "name": "newWeight",
+          "type": "uint96"
+        }
+      ],
+      "name": "requestWeightDecrease",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "stakingProvider",
+          "type": "address"
+        }
+      ],
+      "name": "rolesOf",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "stakeOwner",
+          "type": "address"
+        },
+        {
+          "internalType": "address payable",
+          "name": "beneficiary",
+          "type": "address"
+        },
+        {
+          "internalType": "address",
+          "name": "authorizer",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        },
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        },
+        {
+          "internalType": "address",
+          "name": "notifier",
+          "type": "address"
+        },
+        {
+          "internalType": "address[]",
+          "name": "_stakingProviders",
+          "type": "address[]"
+        }
+      ],
+      "name": "seize",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "name": "stakingProviders",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "weight",
+          "type": "uint96"
+        },
+        {
+          "internalType": "uint96",
+          "name": "pendingNewWeight",
+          "type": "uint96"
+        },
+        {
+          "internalType": "bool",
+          "name": "decreasePending",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "newOwner",
+          "type": "address"
+        }
+      ],
+      "name": "transferOwnership",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "walletRegistry",
+      "outputs": [
+        {
+          "internalType": "contract WalletRegistry",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    }
+  ],
+  "transactionHash": "0x732f606d68e6bc3fa1c0928b8a46a462e084518cb71d8e62961bc7402f182c30",
+  "receipt": {
+    "to": null,
+    "from": "0xf6287aa4823976fA3366e33a3F005a074062E41c",
+    "contractAddress": "0x0d0aBd39dE4513A1064319F4e48Fdf97717C76B9",
+    "transactionIndex": 78,
+    "gasUsed": "683960",
+    "logsBloom": "0x00000000040000080000000000000000400000000000000000800000000000000000000000000008000000000000000000000000000000000000000000000000002020000000000000000000000002080001000000000000000000000000000000000000020000000000020000000800000000800000000000000000000000400000000000000000000000000000000000000000000080000000000000800000000000000000000000000000000400000000000000080000000000000040000000000020000000000000000000040000000000000400000000000000000020000000000000000000000000000000000000000000000000000000000000000000",
+    "blockHash": "0x334e14facde53e8a87801cdbf223e046b63df6478a5a41d46d09b018615300d3",
+    "transactionHash": "0x732f606d68e6bc3fa1c0928b8a46a462e084518cb71d8e62961bc7402f182c30",
+    "logs": [
+      {
+        "transactionIndex": 78,
+        "blockNumber": 10581105,
+        "transactionHash": "0x732f606d68e6bc3fa1c0928b8a46a462e084518cb71d8e62961bc7402f182c30",
+        "address": "0x0d0aBd39dE4513A1064319F4e48Fdf97717C76B9",
+        "topics": [
+          "0xbc7cd75a20ee27fd9adebab32041f755214dbc6bffa90cc0225b39da2e5c2d3b",
+          "0x000000000000000000000000d52f4c377ad6f425803b550567be434a3aa3a04d"
+        ],
+        "data": "0x",
+        "logIndex": 223,
+        "blockHash": "0x334e14facde53e8a87801cdbf223e046b63df6478a5a41d46d09b018615300d3"
+      },
+      {
+        "transactionIndex": 78,
+        "blockNumber": 10581105,
+        "transactionHash": "0x732f606d68e6bc3fa1c0928b8a46a462e084518cb71d8e62961bc7402f182c30",
+        "address": "0x0d0aBd39dE4513A1064319F4e48Fdf97717C76B9",
+        "topics": [
+          "0x8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e0",
+          "0x0000000000000000000000000000000000000000000000000000000000000000",
+          "0x000000000000000000000000f6287aa4823976fa3366e33a3f005a074062e41c"
+        ],
+        "data": "0x",
+        "logIndex": 224,
+        "blockHash": "0x334e14facde53e8a87801cdbf223e046b63df6478a5a41d46d09b018615300d3"
+      },
+      {
+        "transactionIndex": 78,
+        "blockNumber": 10581105,
+        "transactionHash": "0x732f606d68e6bc3fa1c0928b8a46a462e084518cb71d8e62961bc7402f182c30",
+        "address": "0x0d0aBd39dE4513A1064319F4e48Fdf97717C76B9",
+        "topics": [
+          "0x7f26b83ff96e1f2b6a682f133852f6798a09c465da95921460cefb3847402498"
+        ],
+        "data": "0x0000000000000000000000000000000000000000000000000000000000000001",
+        "logIndex": 225,
+        "blockHash": "0x334e14facde53e8a87801cdbf223e046b63df6478a5a41d46d09b018615300d3"
+      },
+      {
+        "transactionIndex": 78,
+        "blockNumber": 10581105,
+        "transactionHash": "0x732f606d68e6bc3fa1c0928b8a46a462e084518cb71d8e62961bc7402f182c30",
+        "address": "0x0d0aBd39dE4513A1064319F4e48Fdf97717C76B9",
+        "topics": [
+          "0x7e644d79422f17c01e4894b5f4f588d331ebfa28653d42ae832dc59e38c9798f"
+        ],
+        "data": "0x0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000f4dd058fb10aa6c85ef8862ef3ad7b7c6a786b24",
+        "logIndex": 226,
+        "blockHash": "0x334e14facde53e8a87801cdbf223e046b63df6478a5a41d46d09b018615300d3"
+      }
+    ],
+    "blockNumber": 10581105,
+    "cumulativeGasUsed": "8048355",
+    "status": 1,
+    "byzantium": true
+  },
+  "numDeployments": 1,
+  "implementation": "0xD52F4c377ad6f425803B550567BE434A3Aa3a04d",
+  "devdoc": "Contract deployed as upgradable proxy"
+}
