@@ -21,11 +21,24 @@ import { TASK_TEST } from "hardhat/builtin-tasks/task-names"
 
 const TASK_CHECK_ACCOUNTS_COUNT = "check-accounts-count"
 
-/** Prefer sibling ../random-beacon/export when present (monorepo) so deploy scripts match source, not stale npm. */
+/**
+ * Random-beacon `export/` is gitignored in the random-beacon package, so CI never
+ * has ../random-beacon/export. Prefer committed `external/random-beacon-export/deploy`
+ * (mirrors npm export scripts with a fixed 05_approve_*) before falling back to node_modules.
+ */
 function resolveRandomBeaconExport(subdir: "deploy" | "artifacts"): string {
   const local = path.join(__dirname, "../random-beacon/export", subdir)
   if (fs.existsSync(local)) {
     return local
+  }
+  if (subdir === "deploy") {
+    const bundledDeploy = path.join(
+      __dirname,
+      "external/random-beacon-export/deploy"
+    )
+    if (fs.existsSync(bundledDeploy)) {
+      return bundledDeploy
+    }
   }
   return path.join(
     __dirname,
