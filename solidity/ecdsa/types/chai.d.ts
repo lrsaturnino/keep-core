@@ -4,9 +4,6 @@
  */
 declare namespace Chai {
   interface Assertion {
-    revertedWithCustomError(
-      contract: unknown,
-      errorName: string
-    ): Promise<void>
+    revertedWithCustomError(contract: unknown, errorName: string): Promise<void>
   }
 }

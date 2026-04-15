@@ -2,7 +2,6 @@
 import fs from "fs"
 import path from "path"
 
-import "@nomicfoundation/hardhat-chai-matchers"
 import "@keep-network/hardhat-helpers"
 import "@keep-network/hardhat-local-networks-config"
 import "@nomiclabs/hardhat-waffle"
@@ -27,7 +26,11 @@ function resolveRandomBeaconExport(subdir: "deploy" | "artifacts"): string {
   if (fs.existsSync(local)) {
     return local
   }
-  return path.join(__dirname, "node_modules/@keep-network/random-beacon/export", subdir)
+  return path.join(
+    __dirname,
+    "node_modules/@keep-network/random-beacon/export",
+    subdir
+  )
 }
 
 const thresholdSolidityCompilerConfig = {

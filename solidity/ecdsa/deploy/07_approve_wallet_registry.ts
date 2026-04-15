@@ -36,10 +36,7 @@ const func: DeployFunction = async (hre: HardhatRuntimeEnvironment) => {
     )
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e)
-    if (
-      msg.includes("No method named") &&
-      msg.includes("approveApplication")
-    ) {
+    if (msg.includes("No method named") && msg.includes("approveApplication")) {
       hre.deployments.log(
         "TokenStaking has no approveApplication callable on this network; skipping WalletRegistry approval"
       )
