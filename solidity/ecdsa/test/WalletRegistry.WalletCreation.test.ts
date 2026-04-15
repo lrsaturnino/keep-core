@@ -16,7 +16,9 @@ import { selectGroup, hashUint32Array } from "./utils/groups"
 import { createNewWallet } from "./utils/wallets"
 import { submitRelayEntry } from "./utils/randomBeacon"
 import { assertGasUsed } from "./helpers/gas"
+import { legacyTokenStakingAt } from "./utils/operators"
 
+import type { type Operator } from "./utils/operators"
 import type { BigNumber, ContractTransaction, Signer } from "ethers"
 import type { IWalletOwner } from "../typechain/IWalletOwner"
 import type { SignerWithAddress } from "@nomiclabs/hardhat-ethers/signers"
@@ -29,7 +31,6 @@ import type {
   DkgChallenger,
 } from "../typechain"
 import type { DkgResult, DkgResultSubmittedEventArgs } from "./utils/dkg"
-import { legacyTokenStakingAt, type Operator } from "./utils/operators"
 import type { FakeContract } from "@defi-wonderland/smock"
 
 const { to1e18 } = helpers.number
@@ -2402,65 +2403,67 @@ describe("WalletRegistry - Wallet Creation", async () => {
                 context.skip(
                   "called by a third party (skipped: no processSlashing on dev TokenStaking)",
                   async () => {
-                  let challengeTx: ContractTransaction
-                  let slashingTx: ContractTransaction
+                    let challengeTx: ContractTransaction
+                    let slashingTx: ContractTransaction
 
-                  before(async () => {
-                    await createSnapshot()
+                    before(async () => {
+                      await createSnapshot()
 
-                    challengeTx = await walletRegistry
-                      .connect(thirdParty)
-                      .challengeDkgResult(dkgResult)
+                      challengeTx = await walletRegistry
+                        .connect(thirdParty)
+                        .challengeDkgResult(dkgResult)
 
-                    slashingTx = await legacyTokenStakingAt(staking, thirdParty).processSlashing(
-                      1
-                    )
-                  })
+                      slashingTx = await legacyTokenStakingAt(
+                        staking,
+                        thirdParty
+                      ).processSlashing(1)
+                    })
 
-                  after(async () => {
-                    await restoreSnapshot()
-                  })
+                    after(async () => {
+                      await restoreSnapshot()
+                    })
 
-                  it("should emit DkgResultChallenged event", async () => {
-                    await expect(challengeTx)
-                      .to.emit(walletRegistry, "DkgResultChallenged")
-                      .withArgs(
-                        dkgResultHash,
-                        await thirdParty.getAddress(),
-                        "Invalid group members"
-                      )
-                  })
+                    it("should emit DkgResultChallenged event", async () => {
+                      await expect(challengeTx)
+                        .to.emit(walletRegistry, "DkgResultChallenged")
+                        .withArgs(
+                          dkgResultHash,
+                          await thirdParty.getAddress(),
+                          "Invalid group members"
+                        )
+                    })
 
-                  it("should not unlock the sortition pool", async () => {
-                    await expect(await sortitionPool.isLocked()).to.be.true
-                  })
+                    it("should not unlock the sortition pool", async () => {
+                      await expect(await sortitionPool.isLocked()).to.be.true
+                    })
 
-                  it("should emit DkgMaliciousResultSlashed event", async () => {
-                    await expect(challengeTx)
-                      .to.emit(walletRegistry, "DkgMaliciousResultSlashed")
-                      .withArgs(dkgResultHash, to1e18(400), submitter.address)
-                  })
+                    it("should emit DkgMaliciousResultSlashed event", async () => {
+                      await expect(challengeTx)
+                        .to.emit(walletRegistry, "DkgMaliciousResultSlashed")
+                        .withArgs(dkgResultHash, to1e18(400), submitter.address)
+                    })
 
-                  it("should reward the notifier", async () => {
-                    await expect(challengeTx)
-                      .to.emit(staking, "NotifierRewarded")
-                      .withArgs(thirdParty.address, 0)
-                  })
+                    it("should reward the notifier", async () => {
+                      await expect(challengeTx)
+                        .to.emit(staking, "NotifierRewarded")
+                        .withArgs(thirdParty.address, 0)
+                    })
 
-                  it("should slash malicious result submitter", async () => {
-                    const stakingProvider =
-                      await walletRegistry.operatorToStakingProvider(
-                        submitter.address
-                      )
-                    await expect(slashingTx)
-                      .to.emit(staking, "TokensSeized")
-                      .withArgs(stakingProvider, to1e18(400), false)
-                  })
+                    it("should slash malicious result submitter", async () => {
+                      const stakingProvider =
+                        await walletRegistry.operatorToStakingProvider(
+                          submitter.address
+                        )
+                      await expect(slashingTx)
+                        .to.emit(staking, "TokensSeized")
+                        .withArgs(stakingProvider, to1e18(400), false)
+                    })
 
-                  it("should use close to 1 720 000 gas", async () => {
-                    await assertGasUsed(challengeTx, 1_720_000, 80_000)
-                  })
-                })
+                    it("should use close to 1 720 000 gas", async () => {
+                      await assertGasUsed(challengeTx, 1_720_000, 80_000)
+                    })
+                  }
+                )
               })
 
               context("at the end of challenge period", async () => {
@@ -2481,61 +2484,63 @@ describe("WalletRegistry - Wallet Creation", async () => {
                 context.skip(
                   "called by a third party (skipped: no processSlashing on dev TokenStaking)",
                   async () => {
-                  let challengeTx: ContractTransaction
-                  let slashingTx: ContractTransaction
+                    let challengeTx: ContractTransaction
+                    let slashingTx: ContractTransaction
 
-                  before(async () => {
-                    await createSnapshot()
+                    before(async () => {
+                      await createSnapshot()
 
-                    challengeTx = await walletRegistry
-                      .connect(thirdParty)
-                      .challengeDkgResult(dkgResult)
+                      challengeTx = await walletRegistry
+                        .connect(thirdParty)
+                        .challengeDkgResult(dkgResult)
 
-                    slashingTx = await legacyTokenStakingAt(staking, thirdParty).processSlashing(
-                      1
-                    )
-                  })
+                      slashingTx = await legacyTokenStakingAt(
+                        staking,
+                        thirdParty
+                      ).processSlashing(1)
+                    })
 
-                  after(async () => {
-                    await restoreSnapshot()
-                  })
+                    after(async () => {
+                      await restoreSnapshot()
+                    })
 
-                  it("should emit DkgResultChallenged event", async () => {
-                    await expect(challengeTx)
-                      .to.emit(walletRegistry, "DkgResultChallenged")
-                      .withArgs(
-                        dkgResultHash,
-                        await thirdParty.getAddress(),
-                        "Invalid group members"
-                      )
-                  })
+                    it("should emit DkgResultChallenged event", async () => {
+                      await expect(challengeTx)
+                        .to.emit(walletRegistry, "DkgResultChallenged")
+                        .withArgs(
+                          dkgResultHash,
+                          await thirdParty.getAddress(),
+                          "Invalid group members"
+                        )
+                    })
 
-                  it("should not unlock the sortition pool", async () => {
-                    await expect(await sortitionPool.isLocked()).to.be.true
-                  })
+                    it("should not unlock the sortition pool", async () => {
+                      await expect(await sortitionPool.isLocked()).to.be.true
+                    })
 
-                  it("should emit DkgMaliciousResultSlashed event", async () => {
-                    await expect(challengeTx)
-                      .to.emit(walletRegistry, "DkgMaliciousResultSlashed")
-                      .withArgs(dkgResultHash, to1e18(400), submitter.address)
-                  })
+                    it("should emit DkgMaliciousResultSlashed event", async () => {
+                      await expect(challengeTx)
+                        .to.emit(walletRegistry, "DkgMaliciousResultSlashed")
+                        .withArgs(dkgResultHash, to1e18(400), submitter.address)
+                    })
 
-                  it("should reward the notifier", async () => {
-                    await expect(challengeTx)
-                      .to.emit(staking, "NotifierRewarded")
-                      .withArgs(thirdParty.address, 0)
-                  })
+                    it("should reward the notifier", async () => {
+                      await expect(challengeTx)
+                        .to.emit(staking, "NotifierRewarded")
+                        .withArgs(thirdParty.address, 0)
+                    })
 
-                  it("should slash malicious result submitter", async () => {
-                    const stakingProvider =
-                      await walletRegistry.operatorToStakingProvider(
-                        submitter.address
-                      )
-                    await expect(slashingTx)
-                      .to.emit(staking, "TokensSeized")
-                      .withArgs(stakingProvider, to1e18(400), false)
-                  })
-                })
+                    it("should slash malicious result submitter", async () => {
+                      const stakingProvider =
+                        await walletRegistry.operatorToStakingProvider(
+                          submitter.address
+                        )
+                      await expect(slashingTx)
+                        .to.emit(staking, "TokensSeized")
+                        .withArgs(stakingProvider, to1e18(400), false)
+                    })
+                  }
+                )
               })
 
               context("with challenge period passed", async () => {
@@ -2604,9 +2609,10 @@ describe("WalletRegistry - Wallet Creation", async () => {
                     .connect(thirdParty)
                     .challengeDkgResult(dkgResult)
 
-                  slashingTx = await legacyTokenStakingAt(staking, thirdParty).processSlashing(
-                      1
-                    )
+                  slashingTx = await legacyTokenStakingAt(
+                    staking,
+                    thirdParty
+                  ).processSlashing(1)
                 })
 
                 after(async () => {
@@ -2940,55 +2946,57 @@ describe("WalletRegistry - Wallet Creation", async () => {
             context.skip(
               "called by a third party (skipped: no processSlashing on dev TokenStaking)",
               async () => {
-              let challengeTx: ContractTransaction
-              let slashingTx: ContractTransaction
+                let challengeTx: ContractTransaction
+                let slashingTx: ContractTransaction
 
-              before(async () => {
-                await createSnapshot()
+                before(async () => {
+                  await createSnapshot()
 
-                challengeTx = await walletRegistry
-                  .connect(thirdParty)
-                  .challengeDkgResult(dkgResult)
+                  challengeTx = await walletRegistry
+                    .connect(thirdParty)
+                    .challengeDkgResult(dkgResult)
 
-                slashingTx = await legacyTokenStakingAt(staking, thirdParty).processSlashing(
-                      1
+                  slashingTx = await legacyTokenStakingAt(
+                    staking,
+                    thirdParty
+                  ).processSlashing(1)
+                })
+
+                after(async () => {
+                  await restoreSnapshot()
+                })
+
+                it("should emit DkgResultChallenged event", async () => {
+                  await expect(challengeTx)
+                    .to.emit(walletRegistry, "DkgResultChallenged")
+                    .withArgs(
+                      dkgResultHash,
+                      await thirdParty.getAddress(),
+                      "Invalid group members"
                     )
-              })
+                })
 
-              after(async () => {
-                await restoreSnapshot()
-              })
+                it("should not unlock the sortition pool", async () => {
+                  await expect(await sortitionPool.isLocked()).to.be.true
+                })
 
-              it("should emit DkgResultChallenged event", async () => {
-                await expect(challengeTx)
-                  .to.emit(walletRegistry, "DkgResultChallenged")
-                  .withArgs(
-                    dkgResultHash,
-                    await thirdParty.getAddress(),
-                    "Invalid group members"
-                  )
-              })
+                it("should emit DkgMaliciousResultSlashed event", async () => {
+                  await expect(challengeTx)
+                    .to.emit(walletRegistry, "DkgMaliciousResultSlashed")
+                    .withArgs(dkgResultHash, to1e18(400), submitter.address)
+                })
 
-              it("should not unlock the sortition pool", async () => {
-                await expect(await sortitionPool.isLocked()).to.be.true
-              })
-
-              it("should emit DkgMaliciousResultSlashed event", async () => {
-                await expect(challengeTx)
-                  .to.emit(walletRegistry, "DkgMaliciousResultSlashed")
-                  .withArgs(dkgResultHash, to1e18(400), submitter.address)
-              })
-
-              it("should slash malicious result submitter", async () => {
-                const stakingProvider =
-                  await walletRegistry.operatorToStakingProvider(
-                    submitter.address
-                  )
-                await expect(slashingTx)
-                  .to.emit(staking, "TokensSeized")
-                  .withArgs(stakingProvider, to1e18(400), false)
-              })
-            })
+                it("should slash malicious result submitter", async () => {
+                  const stakingProvider =
+                    await walletRegistry.operatorToStakingProvider(
+                      submitter.address
+                    )
+                  await expect(slashingTx)
+                    .to.emit(staking, "TokensSeized")
+                    .withArgs(stakingProvider, to1e18(400), false)
+                })
+              }
+            )
 
             context("with insufficient gas provided", async () => {
               it("should revert when gas check fails", async () => {
@@ -3020,55 +3028,57 @@ describe("WalletRegistry - Wallet Creation", async () => {
             context.skip(
               "called by a third party (skipped: no processSlashing on dev TokenStaking)",
               async () => {
-              let challengeTx: ContractTransaction
-              let slashingTx: ContractTransaction
+                let challengeTx: ContractTransaction
+                let slashingTx: ContractTransaction
 
-              before(async () => {
-                await createSnapshot()
+                before(async () => {
+                  await createSnapshot()
 
-                challengeTx = await walletRegistry
-                  .connect(thirdParty)
-                  .challengeDkgResult(dkgResult)
+                  challengeTx = await walletRegistry
+                    .connect(thirdParty)
+                    .challengeDkgResult(dkgResult)
 
-                slashingTx = await legacyTokenStakingAt(staking, thirdParty).processSlashing(
-                      1
+                  slashingTx = await legacyTokenStakingAt(
+                    staking,
+                    thirdParty
+                  ).processSlashing(1)
+                })
+
+                after(async () => {
+                  await restoreSnapshot()
+                })
+
+                it("should emit DkgResultChallenged event", async () => {
+                  await expect(challengeTx)
+                    .to.emit(walletRegistry, "DkgResultChallenged")
+                    .withArgs(
+                      dkgResultHash,
+                      await thirdParty.getAddress(),
+                      "Invalid group members"
                     )
-              })
+                })
 
-              after(async () => {
-                await restoreSnapshot()
-              })
+                it("should not unlock the sortition pool", async () => {
+                  await expect(await sortitionPool.isLocked()).to.be.true
+                })
 
-              it("should emit DkgResultChallenged event", async () => {
-                await expect(challengeTx)
-                  .to.emit(walletRegistry, "DkgResultChallenged")
-                  .withArgs(
-                    dkgResultHash,
-                    await thirdParty.getAddress(),
-                    "Invalid group members"
-                  )
-              })
+                it("should emit DkgMaliciousResultSlashed event", async () => {
+                  await expect(challengeTx)
+                    .to.emit(walletRegistry, "DkgMaliciousResultSlashed")
+                    .withArgs(dkgResultHash, to1e18(400), submitter.address)
+                })
 
-              it("should not unlock the sortition pool", async () => {
-                await expect(await sortitionPool.isLocked()).to.be.true
-              })
-
-              it("should emit DkgMaliciousResultSlashed event", async () => {
-                await expect(challengeTx)
-                  .to.emit(walletRegistry, "DkgMaliciousResultSlashed")
-                  .withArgs(dkgResultHash, to1e18(400), submitter.address)
-              })
-
-              it("should slash malicious result submitter", async () => {
-                const stakingProvider =
-                  await walletRegistry.operatorToStakingProvider(
-                    submitter.address
-                  )
-                await expect(slashingTx)
-                  .to.emit(staking, "TokensSeized")
-                  .withArgs(stakingProvider, to1e18(400), false)
-              })
-            })
+                it("should slash malicious result submitter", async () => {
+                  const stakingProvider =
+                    await walletRegistry.operatorToStakingProvider(
+                      submitter.address
+                    )
+                  await expect(slashingTx)
+                    .to.emit(staking, "TokensSeized")
+                    .withArgs(stakingProvider, to1e18(400), false)
+                })
+              }
+            )
           })
 
           context("with challenge period passed", async () => {
@@ -3134,9 +3144,10 @@ describe("WalletRegistry - Wallet Creation", async () => {
                 .connect(thirdParty)
                 .challengeDkgResult(dkgResult)
 
-              slashingTx = await legacyTokenStakingAt(staking, thirdParty).processSlashing(
-                      1
-                    )
+              slashingTx = await legacyTokenStakingAt(
+                staking,
+                thirdParty
+              ).processSlashing(1)
             })
 
             after(async () => {
