@@ -15,7 +15,8 @@ const { createSnapshot, restoreSnapshot } = helpers.snapshot
 const { to1e18 } = helpers.number
 
 const fixture = deployments.createFixture(async () => {
-  await deployments.fixture(["WalletRegistry"])
+  // Full fixture: tagged-only runs skip external @threshold-network deploys (e.g. T).
+  await deployments.fixture()
 
   const walletRegistry: WalletRegistryStub & WalletRegistry =
     await helpers.contracts.getContract("WalletRegistry")
