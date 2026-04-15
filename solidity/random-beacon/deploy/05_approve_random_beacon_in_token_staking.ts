@@ -1,8 +1,18 @@
 import type { HardhatRuntimeEnvironment } from "hardhat/types"
 import type { DeployFunction } from "hardhat-deploy/types"
+import type { utils } from "ethers"
 
 // ApplicationStatus enum: NOT_APPROVED=0, APPROVED=1, PAUSED=2, DISABLED=3
 const APPLICATION_STATUS_APPROVED = 1
+
+function ifaceHasFunction(iface: utils.Interface, name: string): boolean {
+  try {
+    iface.getFunction(name)
+    return true
+  } catch {
+    return false
+  }
+}
 
 const func: DeployFunction = async (hre: HardhatRuntimeEnvironment) => {
   const { getNamedAccounts, deployments, ethers } = hre
@@ -12,12 +22,8 @@ const func: DeployFunction = async (hre: HardhatRuntimeEnvironment) => {
   const RandomBeacon = await deployments.get("RandomBeacon")
   const TokenStaking = await get("TokenStaking")
 
-  const hasApproveApplication = TokenStaking.abi.some(
-    (item) =>
-      item.type === "function" && item.name === "approveApplication"
-  )
-
-  if (!hasApproveApplication) {
+  const iface = new ethers.utils.Interface(TokenStaking.abi)
+  if (!ifaceHasFunction(iface, "approveApplication")) {
     hre.deployments.log(
       "TokenStaking does not have approveApplication (Threshold TokenStaking); skipping"
     )
@@ -25,26 +31,48 @@ const func: DeployFunction = async (hre: HardhatRuntimeEnvironment) => {
   }
 
   // Skip if RandomBeacon is already approved (idempotent for re-runs)
-  const tokenStakingContract = await ethers.getContractAt(
-    "TokenStaking",
-    TokenStaking.address
-  )
-  const appInfo = await tokenStakingContract.applicationInfo(
-    RandomBeacon.address
-  )
-  if (appInfo.status === APPLICATION_STATUS_APPROVED) {
-    hre.deployments.log(
-      "RandomBeacon already approved in TokenStaking; skipping"
+  try {
+    const tokenStakingContract = await ethers.getContractAt(
+      TokenStaking.abi,
+      TokenStaking.address
     )
-    return
+    if (ifaceHasFunction(iface, "applicationInfo")) {
+      const appInfo = await tokenStakingContract.applicationInfo(
+        RandomBeacon.address
+      )
+      if (appInfo.status === APPLICATION_STATUS_APPROVED) {
+        hre.deployments.log(
+          "RandomBeacon already approved in TokenStaking; skipping"
+        )
+        return
+      }
+    }
+  } catch (e) {
+    hre.deployments.log(
+      `Could not read TokenStaking application status (continuing): ${e}`
+    )
   }
 
-  await execute(
-    "TokenStaking",
-    { from: deployer, log: true, waitConfirmations: 1 },
-    "approveApplication",
-    RandomBeacon.address
-  )
+  try {
+    await execute(
+      "TokenStaking",
+      { from: deployer, log: true, waitConfirmations: 1 },
+      "approveApplication",
+      RandomBeacon.address
+    )
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e)
+    if (
+      msg.includes("No method named") &&
+      msg.includes("approveApplication")
+    ) {
+      hre.deployments.log(
+        "TokenStaking has no approveApplication callable on this network; skipping"
+      )
+      return
+    }
+    throw e
+  }
 }
 
 export default func

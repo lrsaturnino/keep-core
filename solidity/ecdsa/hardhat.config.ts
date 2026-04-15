@@ -1,4 +1,8 @@
 // import "@nomicfoundation/hardhat-verify" // Optional; comment out if not installed
+import fs from "fs"
+import path from "path"
+
+import "@nomicfoundation/hardhat-chai-matchers"
 import "@keep-network/hardhat-helpers"
 import "@keep-network/hardhat-local-networks-config"
 import "@nomiclabs/hardhat-waffle"
@@ -16,6 +20,15 @@ import { task } from "hardhat/config"
 import { TASK_TEST } from "hardhat/builtin-tasks/task-names"
 
 const TASK_CHECK_ACCOUNTS_COUNT = "check-accounts-count"
+
+/** Prefer sibling ../random-beacon/export when present (monorepo) so deploy scripts match source, not stale npm. */
+function resolveRandomBeaconExport(subdir: "deploy" | "artifacts"): string {
+  const local = path.join(__dirname, "../random-beacon/export", subdir)
+  if (fs.existsSync(local)) {
+    return local
+  }
+  return path.join(__dirname, "node_modules/@keep-network/random-beacon/export", subdir)
+}
 
 const thresholdSolidityCompilerConfig = {
   version: "0.8.9",
@@ -169,9 +182,8 @@ const config = {
                 "node_modules/@threshold-network/solidity-contracts/export/deploy",
             },
             {
-              artifacts:
-                "node_modules/@keep-network/random-beacon/export/artifacts",
-              deploy: "node_modules/@keep-network/random-beacon/export/deploy",
+              artifacts: resolveRandomBeaconExport("artifacts"),
+              deploy: resolveRandomBeaconExport("deploy"),
             },
           ]
         : undefined,
@@ -183,7 +195,11 @@ const config = {
       // with `yarn link` command.
       development: [
         "node_modules/@threshold-network/solidity-contracts/deployments/development",
-        "node_modules/@keep-network/random-beacon/deployments/development",
+        fs.existsSync(
+          path.join(__dirname, "../random-beacon/deployments/development")
+        )
+          ? path.join(__dirname, "../random-beacon/deployments/development")
+          : "node_modules/@keep-network/random-beacon/deployments/development",
       ],
       // Use local deployments/sepolia only - npm artifacts have transactionHash
       // that causes "cannot get the transaction" errors with some RPC nodes.

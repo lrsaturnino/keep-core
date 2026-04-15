@@ -46,6 +46,22 @@ import type {
   Allowlist,
 } from "../../typechain"
 
+type LegacyTokenStakingMethods = {
+  connect(signer: SignerWithAddress): {
+    stake(
+      stakingProvider: string,
+      beneficiary: string,
+      authorizer: string,
+      amount: BigNumberish
+    ): Promise<unknown>
+    increaseAuthorization(
+      stakingProvider: string,
+      application: string,
+      amount: BigNumberish
+    ): Promise<unknown>
+  }
+}
+
 export type OperatorID = number
 export type Operator = {
   id: OperatorID
@@ -225,11 +241,12 @@ export async function stake(
   authorizer = stakingProvider
 ): Promise<void> {
   const { deployer } = await helpers.signers.getNamedSigners()
+  const legacyStaking = staking as unknown as LegacyTokenStakingMethods
 
   await t.connect(deployer).mint(owner.address, stakeAmount)
   await t.connect(owner).approve(staking.address, stakeAmount)
 
-  await staking
+  await legacyStaking
     .connect(owner)
     .stake(
       stakingProvider.address,
@@ -238,7 +255,7 @@ export async function stake(
       stakeAmount
     )
 
-  await staking
+  await legacyStaking
     .connect(authorizer)
     .increaseAuthorization(
       stakingProvider.address,

@@ -61,9 +61,6 @@ jobs:
 
       - name: Install dependencies
         run: |
-          export GIT_CONFIG_GLOBAL="${RUNNER_TEMP:-/tmp}/yarn-gitconfig"
-          export GIT_CONFIG_NOSYSTEM=1
-          git config --file "$GIT_CONFIG_GLOBAL" core.autocrlf false
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
@@ -112,9 +109,6 @@ jobs:
 
       - name: Install dependencies
         run: |
-          export GIT_CONFIG_GLOBAL="${RUNNER_TEMP:-/tmp}/yarn-gitconfig"
-          export GIT_CONFIG_NOSYSTEM=1
-          git config --file "$GIT_CONFIG_GLOBAL" core.autocrlf false
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
@@ -143,9 +137,6 @@ jobs:
 
       - name: Install dependencies
         run: |
-          export GIT_CONFIG_GLOBAL="${RUNNER_TEMP:-/tmp}/yarn-gitconfig"
-          export GIT_CONFIG_NOSYSTEM=1
-          git config --file "$GIT_CONFIG_GLOBAL" core.autocrlf false
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
@@ -178,9 +169,6 @@ jobs:
 
       - name: Install dependencies
         run: |
-          export GIT_CONFIG_GLOBAL="${RUNNER_TEMP:-/tmp}/yarn-gitconfig"
-          export GIT_CONFIG_NOSYSTEM=1
-          git config --file "$GIT_CONFIG_GLOBAL" core.autocrlf false
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
@@ -220,9 +208,6 @@ jobs:
 
       - name: Install dependencies
         run: |
-          export GIT_CONFIG_GLOBAL="${RUNNER_TEMP:-/tmp}/yarn-gitconfig"
-          export GIT_CONFIG_NOSYSTEM=1
-          git config --file "$GIT_CONFIG_GLOBAL" core.autocrlf false
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
@@ -326,9 +311,6 @@ jobs:
 
       - name: Install dependencies
         run: |
-          export GIT_CONFIG_GLOBAL="${RUNNER_TEMP:-/tmp}/yarn-gitconfig"
-          export GIT_CONFIG_NOSYSTEM=1
-          git config --file "$GIT_CONFIG_GLOBAL" core.autocrlf false
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
