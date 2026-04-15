@@ -10,12 +10,11 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        SAFE_HOME="${RUNNER_TEMP:-/tmp}/git-home"
         SAFE_TMP="${RUNNER_TEMP:-/tmp}"
         WRAPPER_DIR="${RUNNER_TEMP:-/tmp}/git-clean-bin"
         REAL_GIT="$(command -v git)"
 
-        mkdir -p "$SAFE_HOME" "$WRAPPER_DIR"
+        mkdir -p "$WRAPPER_DIR"
         printf '%s\n' \
           '#!/usr/bin/env bash' \
           'set -euo pipefail' \
@@ -24,7 +23,7 @@ runs:
           '    GIT_CONFIG_*) unset "$key" ;;' \
           '  esac' \
           'done < <(env)' \
-          "export HOME=\"${SAFE_HOME}\"" \
+          'export GIT_CONFIG_GLOBAL=/dev/null' \
           'export GIT_CONFIG_NOSYSTEM=1' \
           'export GIT_CONFIG_SYSTEM=/dev/null' \
           'export GIT_CONFIG_COUNT=0' \
@@ -33,7 +32,7 @@ runs:
           >"${WRAPPER_DIR}/git"
         chmod +x "${WRAPPER_DIR}/git"
         {
-          echo "HOME=${SAFE_HOME}"
+          echo "GIT_CONFIG_GLOBAL=/dev/null"
           echo "GIT_CONFIG_NOSYSTEM=1"
           echo "GIT_CONFIG_SYSTEM=/dev/null"
           echo "GIT_CONFIG_COUNT=0"
