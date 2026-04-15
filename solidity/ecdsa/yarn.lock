@@ -2134,7 +2134,7 @@ __metadata:
 
 "@thesis-co/eslint-config@github:thesis/eslint-config":
   version: 0.1.0
-  resolution: "@thesis-co/eslint-config@https://github.com/thesis/eslint-config.git#commit=778365bbebb6b056bf973d25c57b8b466d21cbcf"
+  resolution: "@thesis-co/eslint-config@https://codeload.github.com/thesis/eslint-config/tar.gz/778365bbebb6b056bf973d25c57b8b466d21cbcf"
   dependencies:
     "@thesis-co/prettier-config": "github:thesis/prettier-config"
     "@typescript-eslint/eslint-plugin": "npm:^4.32.0"
@@ -14278,7 +14278,7 @@ __metadata:
 
 "solhint-config-keep@github:keep-network/solhint-config-keep":
   version: 0.1.0
-  resolution: "solhint-config-keep@https://github.com/keep-network/solhint-config-keep.git#commit=5e1751e58c0f1c507305ffc8c7f6c58047657ada"
+  resolution: "solhint-config-keep@https://codeload.github.com/keep-network/solhint-config-keep/tar.gz/5e1751e58c0f1c507305ffc8c7f6c58047657ada"
   peerDependencies:
     solhint: ">=3.3.4"
   checksum: 10c0/a2d14a23080948b4dae5733deb818a23898f1a04dd18f3c15b32657bdbd87fb3ee7c5f493f68aa362a24d967fc44c4211a4dd5195ee3f344411309e667bbd194
