@@ -10,10 +10,11 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        CFG="${RUNNER_TEMP}/yarn-gitconfig"
-        : >"$CFG"
-        git config --file "$CFG" core.autocrlf false
+        CFG="${RUNNER_TEMP:-/tmp}/yarn-gitconfig"
+        printf "[core]\n  autocrlf = false\n" >"$CFG"
         {
           echo "GIT_CONFIG_GLOBAL=${CFG}"
           echo "GIT_CONFIG_NOSYSTEM=1"
+          echo "GIT_CONFIG_SYSTEM=/dev/null"
+          echo "GIT_CONFIG_COUNT=0"
         } >> "$GITHUB_ENV"
