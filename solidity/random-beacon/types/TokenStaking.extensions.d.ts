@@ -2,7 +2,7 @@
  * Augments generated TokenStaking types with methods present on deployed
  * TokenStaking variants used by random-beacon tests.
  */
-import type { BigNumberish, ContractTransaction } from "ethers"
+import type { BigNumber, BigNumberish, ContractTransaction } from "ethers"
 import type { CallOverrides } from "@ethersproject/contracts"
 
 declare module "../typechain/TokenStaking" {
@@ -37,6 +37,15 @@ declare module "../typechain/TokenStaking" {
       count: BigNumberish,
       overrides?: CallOverrides
     ): Promise<ContractTransaction>
+
+    getSlashingQueueLength(overrides?: CallOverrides): Promise<BigNumber>
+
+    slashingQueue(
+      index: BigNumberish,
+      overrides?: CallOverrides
+    ): Promise<
+      [string, BigNumber] & { stakingProvider: string; amount: BigNumber }
+    >
 
     "requestAuthorizationDecrease(address,address,uint96)"(
       stakingProvider: string,
