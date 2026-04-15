@@ -65,9 +65,7 @@ jobs:
           unset GIT_CONFIG_PARAMETERS
           export GIT_CONFIG_NOSYSTEM=1
           export GIT_CONFIG_SYSTEM=/dev/null
-          export GIT_CONFIG_GLOBAL="${RUNNER_TEMP:-/tmp}/git-global-config"
           export GIT_CONFIG_COUNT=0
-          printf "[core]\n  autocrlf = false\n" >"$GIT_CONFIG_GLOBAL"
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
@@ -80,7 +78,6 @@ jobs:
           env "${unset_args[@]}" \
             GIT_CONFIG_NOSYSTEM=1 \
             GIT_CONFIG_SYSTEM=/dev/null \
-            GIT_CONFIG_GLOBAL="$GIT_CONFIG_GLOBAL" \
             GIT_CONFIG_COUNT=0 \
             yarn install --immutable
 
@@ -131,9 +128,7 @@ jobs:
           unset GIT_CONFIG_PARAMETERS
           export GIT_CONFIG_NOSYSTEM=1
           export GIT_CONFIG_SYSTEM=/dev/null
-          export GIT_CONFIG_GLOBAL="${RUNNER_TEMP:-/tmp}/git-global-config"
           export GIT_CONFIG_COUNT=0
-          printf "[core]\n  autocrlf = false\n" >"$GIT_CONFIG_GLOBAL"
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
@@ -146,7 +141,6 @@ jobs:
           env "${unset_args[@]}" \
             GIT_CONFIG_NOSYSTEM=1 \
             GIT_CONFIG_SYSTEM=/dev/null \
-            GIT_CONFIG_GLOBAL="$GIT_CONFIG_GLOBAL" \
             GIT_CONFIG_COUNT=0 \
             yarn install --immutable
 
@@ -177,9 +171,7 @@ jobs:
           unset GIT_CONFIG_PARAMETERS
           export GIT_CONFIG_NOSYSTEM=1
           export GIT_CONFIG_SYSTEM=/dev/null
-          export GIT_CONFIG_GLOBAL="${RUNNER_TEMP:-/tmp}/git-global-config"
           export GIT_CONFIG_COUNT=0
-          printf "[core]\n  autocrlf = false\n" >"$GIT_CONFIG_GLOBAL"
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
@@ -192,7 +184,6 @@ jobs:
           env "${unset_args[@]}" \
             GIT_CONFIG_NOSYSTEM=1 \
             GIT_CONFIG_SYSTEM=/dev/null \
-            GIT_CONFIG_GLOBAL="$GIT_CONFIG_GLOBAL" \
             GIT_CONFIG_COUNT=0 \
             yarn install --immutable
 
@@ -227,9 +218,7 @@ jobs:
           unset GIT_CONFIG_PARAMETERS
           export GIT_CONFIG_NOSYSTEM=1
           export GIT_CONFIG_SYSTEM=/dev/null
-          export GIT_CONFIG_GLOBAL="${RUNNER_TEMP:-/tmp}/git-global-config"
           export GIT_CONFIG_COUNT=0
-          printf "[core]\n  autocrlf = false\n" >"$GIT_CONFIG_GLOBAL"
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
@@ -242,7 +231,6 @@ jobs:
           env "${unset_args[@]}" \
             GIT_CONFIG_NOSYSTEM=1 \
             GIT_CONFIG_SYSTEM=/dev/null \
-            GIT_CONFIG_GLOBAL="$GIT_CONFIG_GLOBAL" \
             GIT_CONFIG_COUNT=0 \
             yarn install --immutable
 
@@ -284,9 +272,7 @@ jobs:
           unset GIT_CONFIG_PARAMETERS
           export GIT_CONFIG_NOSYSTEM=1
           export GIT_CONFIG_SYSTEM=/dev/null
-          export GIT_CONFIG_GLOBAL="${RUNNER_TEMP:-/tmp}/git-global-config"
           export GIT_CONFIG_COUNT=0
-          printf "[core]\n  autocrlf = false\n" >"$GIT_CONFIG_GLOBAL"
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
@@ -299,7 +285,6 @@ jobs:
           env "${unset_args[@]}" \
             GIT_CONFIG_NOSYSTEM=1 \
             GIT_CONFIG_SYSTEM=/dev/null \
-            GIT_CONFIG_GLOBAL="$GIT_CONFIG_GLOBAL" \
             GIT_CONFIG_COUNT=0 \
             yarn install --immutable
 
@@ -405,9 +390,7 @@ jobs:
           unset GIT_CONFIG_PARAMETERS
           export GIT_CONFIG_NOSYSTEM=1
           export GIT_CONFIG_SYSTEM=/dev/null
-          export GIT_CONFIG_GLOBAL="${RUNNER_TEMP:-/tmp}/git-global-config"
           export GIT_CONFIG_COUNT=0
-          printf "[core]\n  autocrlf = false\n" >"$GIT_CONFIG_GLOBAL"
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
@@ -420,7 +403,6 @@ jobs:
           env "${unset_args[@]}" \
             GIT_CONFIG_NOSYSTEM=1 \
             GIT_CONFIG_SYSTEM=/dev/null \
-            GIT_CONFIG_GLOBAL="$GIT_CONFIG_GLOBAL" \
             GIT_CONFIG_COUNT=0 \
             yarn install --immutable
 
