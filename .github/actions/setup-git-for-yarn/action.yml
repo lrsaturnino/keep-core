@@ -11,10 +11,13 @@ runs:
       run: |
         set -euo pipefail
         SAFE_HOME="${RUNNER_TEMP:-/tmp}/git-home"
+        SAFE_TMP="${RUNNER_TEMP:-/tmp}"
+        SAFE_GLOBAL_CFG="${RUNNER_TEMP:-/tmp}/git-global-config"
         WRAPPER_DIR="${RUNNER_TEMP:-/tmp}/git-clean-bin"
         REAL_GIT="$(command -v git)"
 
         mkdir -p "$SAFE_HOME" "$WRAPPER_DIR"
+        printf "[core]\n  autocrlf = false\n" >"$SAFE_GLOBAL_CFG"
         printf '%s\n' \
           '#!/usr/bin/env bash' \
           'set -euo pipefail' \
@@ -26,8 +29,9 @@ runs:
           "export HOME=\"${SAFE_HOME}\"" \
           'export GIT_CONFIG_NOSYSTEM=1' \
           'export GIT_CONFIG_SYSTEM=/dev/null' \
-          'export GIT_CONFIG_GLOBAL=/dev/null' \
+          "export GIT_CONFIG_GLOBAL=\"${SAFE_GLOBAL_CFG}\"" \
           'export GIT_CONFIG_COUNT=0' \
+          "if ! pwd >/dev/null 2>&1; then cd \"${SAFE_TMP}\"; fi" \
           "exec \"${REAL_GIT}\" \"\$@\"" \
           >"${WRAPPER_DIR}/git"
         chmod +x "${WRAPPER_DIR}/git"
@@ -35,7 +39,7 @@ runs:
           echo "HOME=${SAFE_HOME}"
           echo "GIT_CONFIG_NOSYSTEM=1"
           echo "GIT_CONFIG_SYSTEM=/dev/null"
-          echo "GIT_CONFIG_GLOBAL=/dev/null"
+          echo "GIT_CONFIG_GLOBAL=${SAFE_GLOBAL_CFG}"
           echo "GIT_CONFIG_COUNT=0"
           echo "GIT_CONFIG_PARAMETERS="
         } >> "$GITHUB_ENV"
