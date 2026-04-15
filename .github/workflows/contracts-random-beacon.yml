@@ -61,6 +61,11 @@ jobs:
 
       - name: Install dependencies
         run: |
+          unset GIT_CONFIG_PARAMETERS
+          while IFS= read -r key; do unset "$key"; done < <(env | sed -n "s/^\(GIT_CONFIG_\(KEY\|VALUE\)_[0-9]\+\)=.*$/\1/p")
+          export GIT_CONFIG_COUNT=0
+          export GIT_CONFIG_NOSYSTEM=1
+          export GIT_CONFIG_SYSTEM=/dev/null
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
@@ -109,6 +114,11 @@ jobs:
 
       - name: Install dependencies
         run: |
+          unset GIT_CONFIG_PARAMETERS
+          while IFS= read -r key; do unset "$key"; done < <(env | sed -n "s/^\(GIT_CONFIG_\(KEY\|VALUE\)_[0-9]\+\)=.*$/\1/p")
+          export GIT_CONFIG_COUNT=0
+          export GIT_CONFIG_NOSYSTEM=1
+          export GIT_CONFIG_SYSTEM=/dev/null
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
@@ -137,6 +147,11 @@ jobs:
 
       - name: Install dependencies
         run: |
+          unset GIT_CONFIG_PARAMETERS
+          while IFS= read -r key; do unset "$key"; done < <(env | sed -n "s/^\(GIT_CONFIG_\(KEY\|VALUE\)_[0-9]\+\)=.*$/\1/p")
+          export GIT_CONFIG_COUNT=0
+          export GIT_CONFIG_NOSYSTEM=1
+          export GIT_CONFIG_SYSTEM=/dev/null
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
@@ -169,6 +184,11 @@ jobs:
 
       - name: Install dependencies
         run: |
+          unset GIT_CONFIG_PARAMETERS
+          while IFS= read -r key; do unset "$key"; done < <(env | sed -n "s/^\(GIT_CONFIG_\(KEY\|VALUE\)_[0-9]\+\)=.*$/\1/p")
+          export GIT_CONFIG_COUNT=0
+          export GIT_CONFIG_NOSYSTEM=1
+          export GIT_CONFIG_SYSTEM=/dev/null
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
@@ -208,6 +228,11 @@ jobs:
 
       - name: Install dependencies
         run: |
+          unset GIT_CONFIG_PARAMETERS
+          while IFS= read -r key; do unset "$key"; done < <(env | sed -n "s/^\(GIT_CONFIG_\(KEY\|VALUE\)_[0-9]\+\)=.*$/\1/p")
+          export GIT_CONFIG_COUNT=0
+          export GIT_CONFIG_NOSYSTEM=1
+          export GIT_CONFIG_SYSTEM=/dev/null
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
@@ -311,6 +336,11 @@ jobs:
 
       - name: Install dependencies
         run: |
+          unset GIT_CONFIG_PARAMETERS
+          while IFS= read -r key; do unset "$key"; done < <(env | sed -n "s/^\(GIT_CONFIG_\(KEY\|VALUE\)_[0-9]\+\)=.*$/\1/p")
+          export GIT_CONFIG_COUNT=0
+          export GIT_CONFIG_NOSYSTEM=1
+          export GIT_CONFIG_SYSTEM=/dev/null
           corepack enable
           corepack prepare yarn@4.8.1 --activate
           yarn --version
