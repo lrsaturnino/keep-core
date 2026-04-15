@@ -1217,7 +1217,7 @@ __metadata:
     "@openzeppelin/contracts": "npm:4.7.3"
     "@openzeppelin/hardhat-upgrades": "npm:^1.20.0"
     "@tenderly/hardhat-tenderly": "npm:1.0.12"
-    "@thesis-co/eslint-config": "github:thesis/eslint-config#v0.2.0"
+    "@thesis-co/eslint-config": "https://codeload.github.com/thesis/eslint-config/tar.gz/e63608fab2a1ad5c8fe89873bf0d4d4f9ef4a081"
     "@thesis/solidity-contracts": "github:thesis/solidity-contracts#4985bcf"
     "@threshold-network/solidity-contracts": "npm:development"
     "@typechain/ethers-v5": "npm:^9.0.0"
@@ -1238,7 +1238,7 @@ __metadata:
     prettier: "npm:^2.4.1"
     prettier-plugin-solidity: "npm:^1.0.0-beta.18"
     solhint: "npm:^3.3.6"
-    solhint-config-keep: "github:keep-network/solhint-config-keep"
+    solhint-config-keep: "https://codeload.github.com/keep-network/solhint-config-keep/tar.gz/5e1751e58c0f1c507305ffc8c7f6c58047657ada"
     solidity-docgen: "npm:^0.6.0-beta.35"
     ts-node: "npm:^10.2.1"
     typechain: "npm:^7.0.0"
@@ -1694,7 +1694,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@thesis-co/eslint-config@github:thesis/eslint-config#v0.2.0":
+"@thesis-co/eslint-config@https://codeload.github.com/thesis/eslint-config/tar.gz/e63608fab2a1ad5c8fe89873bf0d4d4f9ef4a081":
   version: 0.2.0
   resolution: "@thesis-co/eslint-config@https://codeload.github.com/thesis/eslint-config/tar.gz/e63608fab2a1ad5c8fe89873bf0d4d4f9ef4a081"
   dependencies:
@@ -12568,7 +12568,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"solhint-config-keep@github:keep-network/solhint-config-keep":
+"solhint-config-keep@https://codeload.github.com/keep-network/solhint-config-keep/tar.gz/5e1751e58c0f1c507305ffc8c7f6c58047657ada":
   version: 0.1.0
   resolution: "solhint-config-keep@https://codeload.github.com/keep-network/solhint-config-keep/tar.gz/5e1751e58c0f1c507305ffc8c7f6c58047657ada"
   peerDependencies:
