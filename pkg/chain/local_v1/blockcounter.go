@@ -69,20 +69,6 @@ func (lbc *localBlockCounter) WatchBlocks(ctx context.Context) <-chan uint64 {
 	lbc.watchers = append(lbc.watchers, watcher)
 	lbc.structMutex.Unlock()
 
-	go func() {
-		<-ctx.Done()
-
-		lbc.structMutex.Lock()
-		for i, w := range lbc.watchers {
-			if w == watcher {
-				lbc.watchers[i] = lbc.watchers[len(lbc.watchers)-1]
-				lbc.watchers = lbc.watchers[:len(lbc.watchers)-1]
-				break
-			}
-		}
-		lbc.structMutex.Unlock()
-	}()
-
 	return watcher.channel
 }
 
@@ -114,13 +100,22 @@ func (lbc *localBlockCounter) count(blockTime ...time.Duration) {
 		}
 
 		lbc.structMutex.Lock()
-		watchers := make([]*watcher, len(lbc.watchers))
-		copy(watchers, lbc.watchers)
+		activeWatchers := make([]*watcher, 0, len(lbc.watchers))
+		for _, watcher := range lbc.watchers {
+			if watcher.ctx.Err() != nil {
+				close(watcher.channel)
+				continue
+			}
+
+			activeWatchers = append(activeWatchers, watcher)
+		}
+		lbc.watchers = activeWatchers
+		watchers := make([]*watcher, len(activeWatchers))
+		copy(watchers, activeWatchers)
 		lbc.structMutex.Unlock()
 
 		for _, watcher := range watchers {
 			if watcher.ctx.Err() != nil {
-				close(watcher.channel)
 				continue
 			}
 
