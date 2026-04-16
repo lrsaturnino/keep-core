@@ -62,7 +62,9 @@ func (lbc *localBlockCounter) CurrentBlock() (uint64, error) {
 func (lbc *localBlockCounter) WatchBlocks(ctx context.Context) <-chan uint64 {
 	watcher := &watcher{
 		ctx:     ctx,
-		channel: make(chan uint64, 1),
+		// A slightly larger buffer reduces timing-sensitive block drops in tests
+		// and local coordination flows while preserving non-blocking semantics.
+		channel: make(chan uint64, 16),
 	}
 
 	lbc.structMutex.Lock()
