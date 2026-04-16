@@ -12,17 +12,22 @@ runs:
         set -euo pipefail
         SAFE_TMP="${RUNNER_TEMP:-/tmp}"
         WRAPPER_DIR="${RUNNER_TEMP:-/tmp}/git-clean-bin"
+        SAFE_HOME="${SAFE_TMP}/git-clean-home"
+        SAFE_XDG_CONFIG_HOME="${SAFE_TMP}/git-clean-xdg-config"
         REAL_GIT="$(command -v git)"
 
-        mkdir -p "$WRAPPER_DIR"
+        mkdir -p "$WRAPPER_DIR" "$SAFE_HOME" "$SAFE_XDG_CONFIG_HOME"
         printf '%s\n' \
           '#!/usr/bin/env bash' \
           'set -euo pipefail' \
+          'unset GIT_CONFIG_PARAMETERS' \
           "while IFS='=' read -r key _; do" \
           '  case "$key" in' \
           '    GIT_CONFIG_*) unset "$key" ;;' \
           '  esac' \
           'done < <(env)' \
+          "export HOME=\"${SAFE_HOME}\"" \
+          "export XDG_CONFIG_HOME=\"${SAFE_XDG_CONFIG_HOME}\"" \
           'export GIT_CONFIG_GLOBAL=/dev/null' \
           'export GIT_CONFIG_NOSYSTEM=1' \
           'export GIT_CONFIG_SYSTEM=/dev/null' \
@@ -34,6 +39,8 @@ runs:
         {
           echo "GIT=${WRAPPER_DIR}/git"
           echo "npm_config_git=${WRAPPER_DIR}/git"
+          echo "HOME=${SAFE_HOME}"
+          echo "XDG_CONFIG_HOME=${SAFE_XDG_CONFIG_HOME}"
           echo "GIT_CONFIG_GLOBAL=/dev/null"
           echo "GIT_CONFIG_NOSYSTEM=1"
           echo "GIT_CONFIG_SYSTEM=/dev/null"
