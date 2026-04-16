@@ -6,6 +6,7 @@ package ethereum
 import (
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -66,6 +67,9 @@ func TestBaseChain_GetBlockNumberByTimestamp(t *testing.T) {
 	for testName, test := range tests {
 		t.Run(testName, func(t *testing.T) {
 			blockNumber, err := bc.GetBlockNumberByTimestamp(test.timestamp)
+			if shouldSkipEthereumIntegrationError(err) {
+				t.Skipf("skipping due to transient Ethereum provider error: %v", err)
+			}
 
 			if !reflect.DeepEqual(err, test.expectedError) {
 				t.Errorf(
@@ -83,4 +87,15 @@ func TestBaseChain_GetBlockNumberByTimestamp(t *testing.T) {
 			)
 		})
 	}
+}
+
+func shouldSkipEthereumIntegrationError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errorMessage := err.Error()
+
+	return strings.Contains(errorMessage, "429 Too Many Requests") ||
+		strings.Contains(errorMessage, "\"message\":\"Too Many Requests\"")
 }

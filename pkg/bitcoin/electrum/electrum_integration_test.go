@@ -175,6 +175,9 @@ func TestGetTransaction_Negative_Integration(t *testing.T) {
 		defer cancelCtx()
 
 		_, err := electrum.GetTransaction(invalidTxID)
+		if shouldSkipElectrumIntegrationError(err) {
+			t.Skipf("skipping due to transient electrum error: %v", err)
+		}
 
 		expectedErr := fmt.Errorf(
 			"failed to get raw transaction with ID [%s]: [not found]",
@@ -225,6 +228,9 @@ func TestGetTransactionConfirmations_Negative_Integration(t *testing.T) {
 		defer cancelCtx()
 
 		_, err := electrum.GetTransactionConfirmations(invalidTxID)
+		if shouldSkipElectrumIntegrationError(err) {
+			t.Skipf("skipping due to transient electrum error: %v", err)
+		}
 
 		expectedErr := fmt.Errorf(
 			"failed to get raw transaction with ID [%s]: [not found]",
@@ -702,4 +708,15 @@ func toJson(val interface{}) string {
 	}
 
 	return string(b)
+}
+
+func shouldSkipElectrumIntegrationError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errorMessage := err.Error()
+
+	return strings.Contains(errorMessage, "request timeout") ||
+		strings.Contains(errorMessage, "retry timeout")
 }
