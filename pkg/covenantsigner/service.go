@@ -19,7 +19,7 @@ type Service struct {
 	engine                       Engine
 	signerApprovalVerifier       SignerApprovalVerifier
 	now                          func() time.Time
-	currentBlockProvider         func() uint64
+	currentBlockProvider         func() (uint64, error)
 	maxInFlight                  int
 	inFlightSlots                chan struct{}
 	mutex                        sync.Mutex
@@ -62,14 +62,10 @@ func WithCustodianTrustRoots(
 }
 
 func WithCurrentBlockProvider(engine Engine) ServiceOption {
-	var provider func() uint64
+	var provider func() (uint64, error)
 	if cbp, ok := engine.(CurrentBlockHeightProvider); ok {
-		provider = func() uint64 {
-			blockHeight, err := cbp.CurrentBlockHeight(context.Background())
-			if err != nil {
-				return 0
-			}
-			return blockHeight
+		provider = func() (uint64, error) {
+			return cbp.CurrentBlockHeight(context.Background())
 		}
 	}
 
@@ -273,9 +269,17 @@ func (s *Service) loadPollJob(route TemplateID, input SignerPollInput) (*Job, er
 	// Check if the signer approval certificate has expired since submit.
 	// If expired, reject the poll to avoid producing a signature with an
 	// authorization that is no longer valid.
+	//
+	// NOTE: The >= comparison is intentional. A certificate with
+	// EndBlock=100 is considered expired when the current block is
+	// 100 or greater. This is because EndBlock is a closed interval:
+	// the signature is valid only up to and including EndBlock.
 	if s.currentBlockProvider != nil && job.Request.SignerApproval != nil {
 		if job.Request.SignerApproval.EndBlock != nil {
-			currentBlock := s.currentBlockProvider()
+			currentBlock, err := s.currentBlockProvider()
+			if err != nil {
+				return nil, fmt.Errorf("failed to get current block height: %w", err)
+			}
 			if currentBlock >= *job.Request.SignerApproval.EndBlock {
 				return nil, &inputError{
 					"signer approval certificate has expired",
@@ -451,7 +455,11 @@ func (s *Service) Submit(ctx context.Context, route TemplateID, input SignerSubm
 func (s *Service) Poll(ctx context.Context, route TemplateID, input SignerPollInput) (StepResult, error) {
 	var currentBlock uint64
 	if s.currentBlockProvider != nil {
-		currentBlock = s.currentBlockProvider()
+		blockHeight, err := s.currentBlockProvider()
+		if err != nil {
+			return StepResult{}, fmt.Errorf("failed to get current block height: %w", err)
+		}
+		currentBlock = blockHeight
 	}
 	if err := validatePollInput(
 		route,

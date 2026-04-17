@@ -452,6 +452,11 @@ func validateCommonRequest(
 			// EndBlock is set and the current block height has reached or
 			// passed it, the certificate is expired and must be re-verified
 			// to ensure the signer's authorization is still valid.
+			//
+			// NOTE: The >= comparison is intentional. A certificate with
+			// EndBlock=N is considered expired when the current block is
+			// N or greater, because EndBlock uses a closed interval: the
+			// signature is valid only up to and including EndBlock.
 			if request.SignerApproval.EndBlock != nil &&
 				options.currentBlock != nil &&
 				*options.currentBlock >= *request.SignerApproval.EndBlock {
