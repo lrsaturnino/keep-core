@@ -61,6 +61,7 @@ func Initialize(
 		WithMigrationPlanQuoteTrustRoots(config.MigrationPlanQuoteTrustRoots),
 		WithDepositorTrustRoots(config.DepositorTrustRoots),
 		WithCustodianTrustRoots(config.CustodianTrustRoots),
+		WithCurrentBlockProvider(engine),
 	)
 	if err != nil {
 		return nil, false, err
@@ -258,6 +259,15 @@ func newHandler(service *Service, serviceCtx context.Context, authToken string, 
 		submitRateLimitPerMinute,
 	)
 
+	// Poll operations are rate-limited to prevent a single client from
+	// monopolising CPU time on signing operations. Each poll may trigger
+	// an expensive threshold signing call, so even a modest burst can
+	// degrade responsiveness for other clients.
+	pollLimiter := rate.NewLimiter(
+		rate.Every(time.Minute/pollRateLimitPerMinute),
+		pollRateLimitPerMinute,
+	)
+
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -265,12 +275,12 @@ func newHandler(service *Service, serviceCtx context.Context, authToken string, 
 	})
 
 	mux.HandleFunc("POST /v1/qc_v1/signer/requests", submitHandler(service, serviceCtx, TemplateQcV1, submitLimiter))
-	mux.HandleFunc("POST /v1/qc_v1/signer/requests:poll", pollBodyHandler(service, TemplateQcV1))
-	mux.HandleFunc("/v1/qc_v1/signer/requests/", pollPathHandler(service, TemplateQcV1))
+	mux.HandleFunc("POST /v1/qc_v1/signer/requests:poll", pollBodyHandler(service, TemplateQcV1, pollLimiter))
+	mux.HandleFunc("/v1/qc_v1/signer/requests/", pollPathHandler(service, TemplateQcV1, pollLimiter))
 	if enableSelfV1 {
 		mux.HandleFunc("POST /v1/self_v1/signer/requests", submitHandler(service, serviceCtx, TemplateSelfV1, submitLimiter))
-		mux.HandleFunc("POST /v1/self_v1/signer/requests:poll", pollBodyHandler(service, TemplateSelfV1))
-		mux.HandleFunc("/v1/self_v1/signer/requests/", pollPathHandler(service, TemplateSelfV1))
+		mux.HandleFunc("POST /v1/self_v1/signer/requests:poll", pollBodyHandler(service, TemplateSelfV1, pollLimiter))
+		mux.HandleFunc("/v1/self_v1/signer/requests/", pollPathHandler(service, TemplateSelfV1, pollLimiter))
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -363,6 +373,12 @@ func handleError(w http.ResponseWriter, err error) {
 	http.Error(w, "internal server error", http.StatusInternalServerError)
 }
 
+// Poll operations are rate-limited to prevent a single client from
+// monopolising CPU time on signing operations. Each poll may trigger
+// an expensive threshold signing call, so even a modest burst can
+// degrade responsiveness for other clients.
+const pollRateLimitPerMinute = 60
+
 const submitTimeout = 5 * time.Minute
 
 // submitRateLimitPerMinute is the maximum number of new submit requests
@@ -400,8 +416,13 @@ func submitHandler(service *Service, serviceCtx context.Context, route TemplateI
 	}
 }
 
-func pollBodyHandler(service *Service, route TemplateID) http.HandlerFunc {
+func pollBodyHandler(service *Service, route TemplateID, limiter *rate.Limiter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !limiter.Allow() {
+			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
+
 		input := SignerPollInput{}
 		if !decodeJSON(w, r, &input) {
 			return
@@ -417,11 +438,16 @@ func pollBodyHandler(service *Service, route TemplateID) http.HandlerFunc {
 	}
 }
 
-func pollPathHandler(service *Service, route TemplateID) http.HandlerFunc {
+func pollPathHandler(service *Service, route TemplateID, limiter *rate.Limiter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		if !limiter.Allow() {
+			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 			return
 		}
 

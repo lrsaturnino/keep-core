@@ -153,8 +153,9 @@ func (cfh *contentFaultingHandle) ReadAll() (<-chan persistence.DataDescriptor, 
 }
 
 type scriptedEngine struct {
-	submit func(*Job) (*Transition, error)
-	poll   func(*Job) (*Transition, error)
+	submit             func(*Job) (*Transition, error)
+	poll               func(*Job) (*Transition, error)
+	currentBlockHeight uint64
 }
 
 func (se *scriptedEngine) OnSubmit(_ context.Context, job *Job) (*Transition, error) {
@@ -169,6 +170,10 @@ func (se *scriptedEngine) OnPoll(_ context.Context, job *Job) (*Transition, erro
 		return nil, nil
 	}
 	return se.poll(job)
+}
+
+func (se *scriptedEngine) CurrentBlockHeight(context.Context) (uint64, error) {
+	return se.currentBlockHeight, nil
 }
 
 func mustJSON(t *testing.T, value any) []byte {

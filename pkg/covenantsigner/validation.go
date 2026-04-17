@@ -79,6 +79,7 @@ type validationOptions struct {
 	migrationPlanQuoteVerificationNow time.Time
 	signerApprovalVerifier            SignerApprovalVerifier
 	policyIndependentDigest           bool
+	currentBlock                      *uint64
 }
 
 // requestDigest accepts raw requests because Poll validates equivalence against
@@ -447,7 +448,18 @@ func validateCommonRequest(
 
 	if request.SignerApproval != nil {
 		if options.policyIndependentDigest {
-			return nil
+			// Check if the signer approval certificate has expired. If
+			// EndBlock is set and the current block height has reached or
+			// passed it, the certificate is expired and must be re-verified
+			// to ensure the signer's authorization is still valid.
+			if request.SignerApproval.EndBlock != nil &&
+				options.currentBlock != nil &&
+				*options.currentBlock >= *request.SignerApproval.EndBlock {
+				// Certificate expired; fall through to re-verification to ensure
+				// the signer's authorization is still valid.
+			} else {
+				return nil
+			}
 		}
 		if options.signerApprovalVerifier == nil {
 			return &inputError{

@@ -32,9 +32,21 @@ type Transition struct {
 // Returning errJobNotFound signals that the engine can no longer locate the
 // underlying signing job. The service treats this as a terminal failure and
 // transitions the job to JobStateFailed.
+//
+// CurrentBlockHeight is optional. When implemented, it is called during Submit
+// and Poll to determine whether a signer approval certificate has expired.
 type Engine interface {
 	OnSubmit(ctx context.Context, job *Job) (*Transition, error)
 	OnPoll(ctx context.Context, job *Job) (*Transition, error)
+}
+
+// CurrentBlockHeightProvider is an optional interface implemented by Engines
+// that can provide the current Bitcoin block height. When implemented, the
+// service uses it to check signer approval certificate expiration during
+// Submit and Poll. Engines that do not implement this interface are assumed
+// to never have signer approvals expire.
+type CurrentBlockHeightProvider interface {
+	CurrentBlockHeight(ctx context.Context) (uint64, error)
 }
 
 type SignerApprovalVerifier interface {
@@ -64,4 +76,8 @@ func (pe *passiveEngine) OnSubmit(context.Context, *Job) (*Transition, error) {
 
 func (pe *passiveEngine) OnPoll(context.Context, *Job) (*Transition, error) {
 	return nil, nil
+}
+
+func (pe *passiveEngine) CurrentBlockHeight(context.Context) (uint64, error) {
+	return 0, errors.New("passiveEngine does not provide current block height")
 }

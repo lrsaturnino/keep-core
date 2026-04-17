@@ -19,6 +19,9 @@ type Service struct {
 	engine                       Engine
 	signerApprovalVerifier       SignerApprovalVerifier
 	now                          func() time.Time
+	currentBlockProvider         func() uint64
+	maxInFlight                  int
+	inFlightSlots                chan struct{}
 	mutex                        sync.Mutex
 	dataDir                      string
 	migrationPlanQuoteTrustRoots []MigrationPlanQuoteTrustRoot
@@ -58,6 +61,29 @@ func WithCustodianTrustRoots(
 	}
 }
 
+func WithCurrentBlockProvider(engine Engine) ServiceOption {
+	var provider func() uint64
+	if cbp, ok := engine.(CurrentBlockHeightProvider); ok {
+		provider = func() uint64 {
+			blockHeight, err := cbp.CurrentBlockHeight(context.Background())
+			if err != nil {
+				return 0
+			}
+			return blockHeight
+		}
+	}
+
+	return func(service *Service) {
+		service.currentBlockProvider = provider
+	}
+}
+
+func WithMaxInFlight(n int) ServiceOption {
+	return func(service *Service) {
+		service.maxInFlight = n
+	}
+}
+
 func WithSignerApprovalVerifier(
 	verifier SignerApprovalVerifier,
 ) ServiceOption {
@@ -93,6 +119,10 @@ func NewService(
 	}
 	for _, option := range options {
 		option(service)
+	}
+
+	if service.maxInFlight > 0 {
+		service.inFlightSlots = make(chan struct{}, service.maxInFlight)
 	}
 
 	store, err := NewStore(handle, service.dataDir)
@@ -240,6 +270,20 @@ func (s *Service) loadPollJob(route TemplateID, input SignerPollInput) (*Job, er
 		return nil, errJobNotFound
 	}
 
+	// Check if the signer approval certificate has expired since submit.
+	// If expired, reject the poll to avoid producing a signature with an
+	// authorization that is no longer valid.
+	if s.currentBlockProvider != nil && job.Request.SignerApproval != nil {
+		if job.Request.SignerApproval.EndBlock != nil {
+			currentBlock := s.currentBlockProvider()
+			if currentBlock >= *job.Request.SignerApproval.EndBlock {
+				return nil, &inputError{
+					"signer approval certificate has expired",
+				}
+			}
+		}
+	}
+
 	digest, err := requestDigest(
 		input.Request,
 		validationOptions{
@@ -357,6 +401,15 @@ func (s *Service) Submit(ctx context.Context, route TemplateID, input SignerSubm
 		return *existingResult, nil
 	}
 
+	if s.inFlightSlots != nil {
+		select {
+		case s.inFlightSlots <- struct{}{}:
+		case <-ctx.Done():
+			return StepResult{}, ctx.Err()
+		}
+		defer func() { <-s.inFlightSlots }()
+	}
+
 	transition, err := s.engine.OnSubmit(ctx, job)
 	if err != nil {
 		return StepResult{}, err
@@ -396,11 +449,16 @@ func (s *Service) Submit(ctx context.Context, route TemplateID, input SignerSubm
 }
 
 func (s *Service) Poll(ctx context.Context, route TemplateID, input SignerPollInput) (StepResult, error) {
+	var currentBlock uint64
+	if s.currentBlockProvider != nil {
+		currentBlock = s.currentBlockProvider()
+	}
 	if err := validatePollInput(
 		route,
 		input,
 		validationOptions{
 			policyIndependentDigest: true,
+			currentBlock:            &currentBlock,
 		},
 	); err != nil {
 		return StepResult{}, err
@@ -418,6 +476,15 @@ func (s *Service) Poll(ctx context.Context, route TemplateID, input SignerPollIn
 		return result, nil
 	}
 	s.mutex.Unlock()
+
+	if s.inFlightSlots != nil {
+		select {
+		case s.inFlightSlots <- struct{}{}:
+		case <-ctx.Done():
+			return StepResult{}, ctx.Err()
+		}
+		defer func() { <-s.inFlightSlots }()
+	}
 
 	transition, pollErr := s.engine.OnPoll(ctx, job)
 	if pollErr != nil {

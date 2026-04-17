@@ -12,8 +12,11 @@ import (
 	"github.com/keep-network/keep-common/pkg/persistence"
 )
 
-const jobsDirectory = "covenant-signer/jobs"
-const lockFileName = ".lock"
+const (
+	jobsDirectory     = "covenant-signer/jobs"
+	poisonedDirectory = "covenant-signer/poisoned"
+	lockFileName      = ".lock"
+)
 
 type Store struct {
 	handle         persistence.BasicHandle
@@ -293,6 +296,30 @@ func (s *Store) load() error {
 		logger.Infof("store load complete: loaded [%d] jobs", loaded)
 	}
 
+	poisonedDataChan, poisonedErrorChan := s.handle.ReadAll()
+	for poisonedDataChan != nil || poisonedErrorChan != nil {
+		select {
+		case descriptor, ok := <-poisonedDataChan:
+			if !ok {
+				poisonedDataChan = nil
+				continue
+			}
+			if descriptor.Directory() != poisonedDirectory {
+				continue
+			}
+			key := descriptor.Name()
+			s.poisonedRoutes[key] = struct{}{}
+		case err, ok := <-poisonedErrorChan:
+			if !ok {
+				poisonedErrorChan = nil
+				continue
+			}
+			if err != nil {
+				return err
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -372,5 +399,21 @@ func (s *Store) Put(job *Job) error {
 		delete(s.byRequestID, existingRequestID)
 	}
 
+	return nil
+}
+
+func (s *Store) MarkPoisoned(key string) error {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	if _, ok := s.poisonedRoutes[key]; ok {
+		return nil
+	}
+
+	if err := s.handle.Save(nil, poisonedDirectory, key); err != nil {
+		return err
+	}
+
+	s.poisonedRoutes[key] = struct{}{}
 	return nil
 }
