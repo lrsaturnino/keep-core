@@ -16,11 +16,12 @@ const jobsDirectory = "covenant-signer/jobs"
 const lockFileName = ".lock"
 
 type Store struct {
-	handle      persistence.BasicHandle
-	mutex       sync.Mutex
-	lockFile    *os.File
-	byRequestID map[string]*Job
-	byRouteKey  map[string]string
+	handle         persistence.BasicHandle
+	mutex          sync.Mutex
+	lockFile       *os.File
+	byRequestID    map[string]*Job
+	byRouteKey     map[string]string
+	poisonedRoutes map[string]struct{}
 }
 
 // NewStore creates a new Store backed by the given persistence handle. When
@@ -30,9 +31,10 @@ type Store struct {
 // error. When dataDir is empty (in-memory handles), file locking is skipped.
 func NewStore(handle persistence.BasicHandle, dataDir string) (*Store, error) {
 	store := &Store{
-		handle:      handle,
-		byRequestID: make(map[string]*Job),
-		byRouteKey:  make(map[string]string),
+		handle:         handle,
+		byRequestID:    make(map[string]*Job),
+		byRouteKey:     make(map[string]string),
+		poisonedRoutes: make(map[string]struct{}),
 	}
 
 	if dataDir != "" {
