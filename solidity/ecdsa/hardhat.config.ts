@@ -1,4 +1,7 @@
-// import "@nomicfoundation/hardhat-verify" // Optional; comment out if not installed
+// TODO: Re-enable after Hardhat 3 upgrade — use `@nomicfoundation/hardhat-verify` ^3.x (Etherscan API v2).
+// `^2.1.3` is the last Hardhat-2–compatible line; without the plugin loaded, `hardhat verify` is unavailable on
+// mainnet and all testnets, not only Sepolia.
+// import "@nomicfoundation/hardhat-verify"
 import fs from "fs"
 import path from "path"
 
@@ -164,7 +167,7 @@ const config = {
     username: "thesis",
     project: "",
   },
-  // etherscan: { apiKey: process.env.ETHERSCAN_API_KEY }, // Requires @nomicfoundation/hardhat-verify
+  // etherscan: { apiKey: process.env.ETHERSCAN_API_KEY }, // See TODO at top re: hardhat-verify / API v2
   namedAccounts: {
     deployer: {
       default: 1, // take the second account
