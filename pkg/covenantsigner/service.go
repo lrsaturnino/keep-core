@@ -74,6 +74,12 @@ func WithCurrentBlockProvider(engine Engine) ServiceOption {
 	}
 }
 
+// WithMaxInFlight sets the maximum number of submissions that may be in
+// flight (waiting for signature) at any time. When n > 0, a semaphore
+// channel of size n is created; submissions acquire a slot before
+// proceeding and release it when the signature response is received.
+// When n <= 0, the limit is disabled: all submissions proceed immediately
+// without waiting. Defaults to 0 (disabled).
 func WithMaxInFlight(n int) ServiceOption {
 	return func(service *Service) {
 		service.maxInFlight = n
@@ -274,16 +280,14 @@ func (s *Service) loadPollJob(route TemplateID, input SignerPollInput) (*Job, er
 	// EndBlock=100 is considered expired when the current block is
 	// 100 or greater. This is because EndBlock is a closed interval:
 	// the signature is valid only up to and including EndBlock.
-	if s.currentBlockProvider != nil && job.Request.SignerApproval != nil {
-		if job.Request.SignerApproval.EndBlock != nil {
-			currentBlock, err := s.currentBlockProvider()
-			if err != nil {
-				return nil, fmt.Errorf("failed to get current block height: %w", err)
-			}
-			if currentBlock >= *job.Request.SignerApproval.EndBlock {
-				return nil, &inputError{
-					"signer approval certificate has expired",
-				}
+	if s.currentBlockProvider != nil && job.Request.SignerApproval != nil && job.Request.SignerApproval.EndBlock != nil {
+		currentBlock, err := s.currentBlockProvider()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get current block height: %w", err)
+		}
+		if currentBlock >= *job.Request.SignerApproval.EndBlock {
+			return nil, &inputError{
+				"signer approval certificate has expired",
 			}
 		}
 	}
