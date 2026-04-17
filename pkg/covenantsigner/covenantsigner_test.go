@@ -3003,6 +3003,13 @@ func TestServicePollAcceptsEquivalentArtifactApprovalRequestVariants(t *testing.
 		submit: func(*Job) (*Transition, error) {
 			return &Transition{State: JobStatePending, Detail: "queued"}, nil
 		},
+		poll: func(*Job) (*Transition, error) {
+			return &Transition{State: JobStatePending, Detail: "polling"}, nil
+		},
+		currentBlockHeight: 100,
+		signerApprovalVerifier: SignerApprovalVerifierFunc(func(request RouteSubmitRequest) error {
+			return nil
+		}),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -3423,7 +3430,7 @@ func TestMigrationTransactionPlanCommitmentHashMatchesCanonicalVectors(t *testin
 func TestServicePollPropagatesCurrentBlockProviderError(t *testing.T) {
 	handle := newMemoryHandle()
 	wantErr := errors.New("blockchain is unavailable")
-	service, err := NewService(handle, &scriptedEngine{
+	engine := &scriptedEngine{
 		submit: func(*Job) (*Transition, error) {
 			return &Transition{State: JobStatePending, Detail: "queued"}, nil
 		},
@@ -3435,7 +3442,8 @@ func TestServicePollPropagatesCurrentBlockProviderError(t *testing.T) {
 		signerApprovalVerifier: SignerApprovalVerifierFunc(func(request RouteSubmitRequest) error {
 			return nil
 		}),
-	})
+	}
+	service, err := NewService(handle, engine, WithCurrentBlockProvider(engine))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3472,7 +3480,7 @@ func TestServicePollPropagatesCurrentBlockProviderError(t *testing.T) {
 func TestServiceLoadPollJobPropagatesCurrentBlockProviderError(t *testing.T) {
 	handle := newMemoryHandle()
 	wantErr := errors.New("blockchain is unavailable")
-	service, err := NewService(handle, &scriptedEngine{
+	engine := &scriptedEngine{
 		submit: func(*Job) (*Transition, error) {
 			return &Transition{State: JobStatePending, Detail: "queued"}, nil
 		},
@@ -3484,7 +3492,8 @@ func TestServiceLoadPollJobPropagatesCurrentBlockProviderError(t *testing.T) {
 		signerApprovalVerifier: SignerApprovalVerifierFunc(func(request RouteSubmitRequest) error {
 			return nil
 		}),
-	})
+	}
+	service, err := NewService(handle, engine, WithCurrentBlockProvider(engine))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3519,18 +3528,20 @@ func TestServiceLoadPollJobPropagatesCurrentBlockProviderError(t *testing.T) {
 // returns an error.
 func TestServicePollRejectsExpiredCertificate(t *testing.T) {
 	handle := newMemoryHandle()
-	service, err := NewService(handle, &scriptedEngine{
+	engine := &scriptedEngine{
 		submit: func(*Job) (*Transition, error) {
 			return &Transition{State: JobStatePending, Detail: "queued"}, nil
 		},
 		poll: func(*Job) (*Transition, error) {
 			return &Transition{State: JobStatePending, Detail: "polling"}, nil
 		},
-		currentBlockHeight: 200, // EndBlock is 123456, so currentBlock >= EndBlock
+		currentBlockHeight: 200, // EndBlock is 123456; set >= EndBlock to trigger expiration
 		signerApprovalVerifier: SignerApprovalVerifierFunc(func(request RouteSubmitRequest) error {
 			return nil
 		}),
-	})
+	}
+	engine.currentBlockHeight = 123456 // satisfy expiration: currentBlock >= EndBlock
+	service, err := NewService(handle, engine, WithCurrentBlockProvider(engine))
 	if err != nil {
 		t.Fatal(err)
 	}
