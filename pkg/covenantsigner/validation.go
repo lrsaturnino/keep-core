@@ -460,8 +460,15 @@ func validateCommonRequest(
 			if request.SignerApproval.EndBlock != nil &&
 				options.currentBlock != nil &&
 				*options.currentBlock >= *request.SignerApproval.EndBlock {
-				// Certificate expired; fall through to re-verification to ensure
-				// the signer's authorization is still valid.
+				// Certificate expired. When no verifier is present (Poll flow),
+				// return the expiration error directly. When a verifier is
+				// present (Submit flow), fall through to re-verify in case the
+				// signer's authorization was renewed.
+				if options.signerApprovalVerifier == nil {
+					return &inputError{
+						"signer approval certificate has expired",
+					}
+				}
 			} else {
 				return nil
 			}
