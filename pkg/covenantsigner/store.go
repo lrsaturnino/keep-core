@@ -19,12 +19,11 @@ const (
 )
 
 type Store struct {
-	handle         persistence.BasicHandle
-	mutex          sync.Mutex
-	lockFile       *os.File
-	byRequestID    map[string]*Job
-	byRouteKey     map[string]string
-	poisonedRoutes map[string]struct{}
+	handle      persistence.BasicHandle
+	mutex       sync.Mutex
+	lockFile    *os.File
+	byRequestID map[string]*Job
+	byRouteKey  map[string]string
 }
 
 // NewStore creates a new Store backed by the given persistence handle. When
@@ -34,10 +33,9 @@ type Store struct {
 // error. When dataDir is empty (in-memory handles), file locking is skipped.
 func NewStore(handle persistence.BasicHandle, dataDir string) (*Store, error) {
 	store := &Store{
-		handle:         handle,
-		byRequestID:    make(map[string]*Job),
-		byRouteKey:     make(map[string]string),
-		poisonedRoutes: make(map[string]struct{}),
+		handle:      handle,
+		byRequestID: make(map[string]*Job),
+		byRouteKey:  make(map[string]string),
 	}
 
 	if dataDir != "" {
@@ -307,8 +305,6 @@ func (s *Store) load() error {
 			if descriptor.Directory() != poisonedDirectory {
 				continue
 			}
-			key := descriptor.Name()
-			s.poisonedRoutes[key] = struct{}{}
 		case err, ok := <-poisonedErrorChan:
 			if !ok {
 				poisonedErrorChan = nil
@@ -386,7 +382,6 @@ func (s *Store) Put(job *Job) error {
 
 	s.byRequestID[job.RequestID] = cloned
 	s.byRouteKey[key] = job.RequestID
-	delete(s.poisonedRoutes, key)
 
 	if hasExisting && existingRequestID != job.RequestID {
 		if err := s.handle.Delete(jobsDirectory, existingRequestID+".json"); err != nil {
@@ -399,21 +394,5 @@ func (s *Store) Put(job *Job) error {
 		delete(s.byRequestID, existingRequestID)
 	}
 
-	return nil
-}
-
-func (s *Store) MarkPoisoned(key string) error {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
-	if _, ok := s.poisonedRoutes[key]; ok {
-		return nil
-	}
-
-	if err := s.handle.Save(nil, poisonedDirectory, key); err != nil {
-		return err
-	}
-
-	s.poisonedRoutes[key] = struct{}{}
 	return nil
 }
