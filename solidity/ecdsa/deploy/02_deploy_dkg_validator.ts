@@ -13,15 +13,18 @@ const func: DeployFunction = async (hre: HardhatRuntimeEnvironment) => {
 
   const EcdsaSortitionPool = await deployments.get("EcdsaSortitionPool")
 
-  // skipIfAlreadyDeployed: false — so hardhat-deploy compares on-chain bytecode to the
-  // current artifact. With true, an existing deployments/*.json skips deploy entirely
-  // even when Solidity was patched (e.g. groupSize 100 → 3), leaving stale contracts.
+  // Non-mainnet: skipIfAlreadyDeployed false so hardhat-deploy can redeploy when bytecode
+  // changes (e.g. groupSize 100 → 3). Mainnet: true so bytecode/artifact drift cannot
+  // silently overwrite deployments/mainnet/EcdsaDkgValidator.json while WalletRegistry
+  // still points at the old on-chain validator (THRESHOLD_FORCE_DKG_COMPILE only forces compile).
+  const skipIfAlreadyDeployed = hre.network.name === "mainnet"
+
   const EcdsaDkgValidator = await deployments.deploy("EcdsaDkgValidator", {
     from: deployer,
     args: [EcdsaSortitionPool.address],
     log: true,
     waitConfirmations: 1,
-    skipIfAlreadyDeployed: false,
+    skipIfAlreadyDeployed,
   })
 
   if (hre.network.tags.etherscan) {
