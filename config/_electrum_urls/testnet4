@@ -1,1 +1,6 @@
+# Default Electrum URLs for Bitcoin testnet4 (one is chosen at random at startup).
+# Override with --bitcoin.electrum.url or bitcoin.electrum.url in the config file.
+# Hostnames are from Electrum's chains/testnet4/servers.json plus the previous IP fallback.
+ssl://mempool.space:40002
+ssl://testnet4-electrumx.wakiyamap.dev:51002
 ssl://134.199.227.217:50002
