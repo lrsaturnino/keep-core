@@ -643,11 +643,14 @@ type expectedErrorMessages struct {
 var expectedServerErrorMessages = expectedErrorMessages{
 	missingBlockHeader: []string{
 		"errNo: 0, errMsg: missing header",
+		// JSON-RPC internal-error code returned by some Electrum forks (e.g. mempool.space).
+		"errNo: -32603, errMsg: missing header",
 		"errNo: 1, errMsg: height 4,294,967,295 out of range",
 		"errNo: 1, errMsg: Invalid height",
 	},
 	missingTransactionInBlock: []string{
 		"errNo: 0, errMsg: tx not found or is unconfirmed",
+		"errNo: -32603, errMsg: tx not found or is unconfirmed",
 		"errNo: 1, errMsg: tx 9489457dc2c5a461a0b86394741ef57731605f2c628102de9f4d90afee9ac794 not in block at height 123,456",
 		"errNo: 1, errMsg: No transaction matching the requested hash found at height 123456"},
 }
