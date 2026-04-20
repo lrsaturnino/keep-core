@@ -154,11 +154,10 @@ func (cfh *contentFaultingHandle) ReadAll() (<-chan persistence.DataDescriptor, 
 }
 
 type scriptedEngine struct {
-	submit                 func(*Job) (*Transition, error)
-	poll                   func(*Job) (*Transition, error)
-	currentBlockHeight     uint64
-	currentBlockErr        error
-	signerApprovalVerifier SignerApprovalVerifier
+	submit             func(*Job) (*Transition, error)
+	poll               func(*Job) (*Transition, error)
+	currentBlockHeight uint64
+	currentBlockErr    error
 }
 
 func (se *scriptedEngine) OnSubmit(_ context.Context, job *Job) (*Transition, error) {
@@ -177,13 +176,6 @@ func (se *scriptedEngine) OnPoll(_ context.Context, job *Job) (*Transition, erro
 
 func (se *scriptedEngine) CurrentBlockHeight(context.Context) (uint64, error) {
 	return se.currentBlockHeight, se.currentBlockErr
-}
-
-func (se *scriptedEngine) VerifySignerApproval(request RouteSubmitRequest) error {
-	if se.signerApprovalVerifier == nil {
-		return nil
-	}
-	return se.signerApprovalVerifier.VerifySignerApproval(request)
 }
 
 func mustJSON(t *testing.T, value any) []byte {
@@ -935,10 +927,9 @@ func TestServiceSubmitDeduplicatesByRouteRequestID(t *testing.T) {
 		submit: func(*Job) (*Transition, error) {
 			return &Transition{State: JobStatePending, Detail: "queued"}, nil
 		},
-		signerApprovalVerifier: SignerApprovalVerifierFunc(
-			func(RouteSubmitRequest) error { return nil },
-		),
-	})
+	}, WithSignerApprovalVerifier(SignerApprovalVerifierFunc(
+		func(RouteSubmitRequest) error { return nil },
+	)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -973,10 +964,9 @@ func TestServiceSubmitRejectsRouteRequestIDDigestMismatch(t *testing.T) {
 		submit: func(*Job) (*Transition, error) {
 			return &Transition{State: JobStatePending, Detail: "queued"}, nil
 		},
-		signerApprovalVerifier: SignerApprovalVerifierFunc(
-			func(RouteSubmitRequest) error { return nil },
-		),
-	})
+	}, WithSignerApprovalVerifier(SignerApprovalVerifierFunc(
+		func(RouteSubmitRequest) error { return nil },
+	)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1016,10 +1006,9 @@ func TestServiceSubmitReturnsExistingJobWhileInitialEngineCallIsInFlight(t *test
 			<-releaseEngine
 			return &Transition{State: JobStatePending, Detail: "queued"}, nil
 		},
-		signerApprovalVerifier: SignerApprovalVerifierFunc(
-			func(RouteSubmitRequest) error { return nil },
-		),
-	})
+	}, WithSignerApprovalVerifier(SignerApprovalVerifierFunc(
+		func(RouteSubmitRequest) error { return nil },
+	)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3007,9 +2996,6 @@ func TestServicePollAcceptsEquivalentArtifactApprovalRequestVariants(t *testing.
 			return &Transition{State: JobStatePending, Detail: "polling"}, nil
 		},
 		currentBlockHeight: 100,
-		signerApprovalVerifier: SignerApprovalVerifierFunc(func(request RouteSubmitRequest) error {
-			return nil
-		}),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -3439,11 +3425,10 @@ func TestServicePollPropagatesCurrentBlockProviderError(t *testing.T) {
 		},
 		currentBlockHeight: 100,
 		currentBlockErr:    wantErr,
-		signerApprovalVerifier: SignerApprovalVerifierFunc(func(request RouteSubmitRequest) error {
-			return nil
-		}),
 	}
-	service, err := NewService(handle, engine, WithCurrentBlockProvider(engine))
+	service, err := NewService(handle, engine, WithCurrentBlockProvider(engine), WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(request RouteSubmitRequest) error {
+		return nil
+	})))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3489,11 +3474,10 @@ func TestServiceLoadPollJobPropagatesCurrentBlockProviderError(t *testing.T) {
 		},
 		currentBlockHeight: 100,
 		currentBlockErr:    wantErr,
-		signerApprovalVerifier: SignerApprovalVerifierFunc(func(request RouteSubmitRequest) error {
-			return nil
-		}),
 	}
-	service, err := NewService(handle, engine, WithCurrentBlockProvider(engine))
+	service, err := NewService(handle, engine, WithCurrentBlockProvider(engine), WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(request RouteSubmitRequest) error {
+		return nil
+	})))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3536,12 +3520,11 @@ func TestServicePollRejectsExpiredCertificate(t *testing.T) {
 			return &Transition{State: JobStatePending, Detail: "polling"}, nil
 		},
 		currentBlockHeight: 200, // EndBlock is 123456; set >= EndBlock to trigger expiration
-		signerApprovalVerifier: SignerApprovalVerifierFunc(func(request RouteSubmitRequest) error {
-			return nil
-		}),
 	}
 	engine.currentBlockHeight = 123456 // satisfy expiration: currentBlock >= EndBlock
-	service, err := NewService(handle, engine, WithCurrentBlockProvider(engine))
+	service, err := NewService(handle, engine, WithCurrentBlockProvider(engine), WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(request RouteSubmitRequest) error {
+		return nil
+	})))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3582,10 +3565,9 @@ func TestServicePollAcceptsValidCertificate(t *testing.T) {
 			return &Transition{State: JobStatePending, Detail: "polling"}, nil
 		},
 		currentBlockHeight: 100, // EndBlock is 123456, so currentBlock < EndBlock
-		signerApprovalVerifier: SignerApprovalVerifierFunc(func(request RouteSubmitRequest) error {
-			return nil
-		}),
-	})
+	}, WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(request RouteSubmitRequest) error {
+		return nil
+	})))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3625,7 +3607,9 @@ func TestServicePollSkipsBlockProviderWhenNoExpiration(t *testing.T) {
 			return &Transition{State: JobStatePending, Detail: "polling"}, nil
 		},
 		currentBlockHeight: 100,
-	})
+	}, WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(RouteSubmitRequest) error {
+		return nil
+	})))
 	if err != nil {
 		t.Fatal(err)
 	}
