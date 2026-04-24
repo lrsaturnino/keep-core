@@ -1,5 +1,5 @@
 {
-  "address": "0x3245B1a2dc82D02F7e159CA5ef14B6e35585779a",
+  "address": "0x8bd3837D477844955Add5b590EF6019E44A2Cb63",
   "abi": [
     {
       "type": "constructor",
@@ -462,6 +462,19 @@
     },
     {
       "type": "function",
+      "name": "addToSkipList",
+      "constant": false,
+      "payable": false,
+      "inputs": [
+        {
+          "type": "address",
+          "name": "application"
+        }
+      ],
+      "outputs": []
+    },
+    {
+      "type": "function",
       "name": "applicationInfo",
       "constant": true,
       "stateMutability": "view",
@@ -893,6 +906,27 @@
     },
     {
       "type": "function",
+      "name": "legacyApproveAuthorizationDecrease",
+      "constant": false,
+      "payable": false,
+      "inputs": [
+        {
+          "type": "address",
+          "name": "stakingProvider"
+        },
+        {
+          "type": "address",
+          "name": "application"
+        }
+      ],
+      "outputs": [
+        {
+          "type": "uint96"
+        }
+      ]
+    },
+    {
+      "type": "function",
       "name": "legacyRequestAuthorizationDecrease",
       "constant": false,
       "payable": false,
@@ -924,6 +958,28 @@
         }
       ],
       "outputs": []
+    },
+    {
+      "type": "function",
+      "name": "migrateAndRelease",
+      "constant": false,
+      "payable": false,
+      "inputs": [
+        {
+          "type": "address",
+          "name": "stakingProvider"
+        },
+        {
+          "type": "uint96",
+          "name": "amount"
+        }
+      ],
+      "outputs": [
+        {
+          "type": "bool",
+          "name": "stakeless"
+        }
+      ]
     },
     {
       "type": "function",
@@ -1148,6 +1204,23 @@
         }
       ],
       "outputs": []
+    },
+    {
+      "type": "function",
+      "name": "skipList",
+      "constant": true,
+      "stateMutability": "view",
+      "payable": false,
+      "inputs": [
+        {
+          "type": "address"
+        }
+      ],
+      "outputs": [
+        {
+          "type": "bool"
+        }
+      ]
     },
     {
       "type": "function",
