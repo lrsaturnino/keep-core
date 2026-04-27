@@ -1,7 +1,5 @@
-// TODO: Re-enable after Hardhat 3 upgrade — use `@nomicfoundation/hardhat-verify` ^3.x (Etherscan API v2).
-// `^2.1.3` is the last Hardhat-2–compatible line; without the plugin loaded, `hardhat verify` is unavailable on
-// mainnet and all testnets, not only Sepolia.
-// import "@nomicfoundation/hardhat-verify"
+// `@nomicfoundation/hardhat-verify` ^2.1.x is the Hardhat 2–compatible line; Hardhat 3 uses ^3.x (API v2).
+// Set DISABLE_HARDHAT_VERIFY=true to omit the plugin and skip Etherscan steps in deploy scripts; default is on.
 import fs from "fs"
 import path from "path"
 
@@ -23,6 +21,12 @@ import { task } from "hardhat/config"
 import { TASK_TEST } from "hardhat/builtin-tasks/task-names"
 
 const TASK_CHECK_ACCOUNTS_COUNT = "check-accounts-count"
+
+const hardhatVerifyEnabled = process.env.DISABLE_HARDHAT_VERIFY !== "true"
+if (hardhatVerifyEnabled) {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports,@typescript-eslint/no-var-requires,global-require
+  require("@nomicfoundation/hardhat-verify")
+}
 
 /**
  * Random-beacon `export/` is gitignored in the random-beacon package, so CI never
@@ -167,7 +171,13 @@ const config = {
     username: "thesis",
     project: "",
   },
-  // etherscan: { apiKey: process.env.ETHERSCAN_API_KEY }, // See TODO at top re: hardhat-verify / API v2
+  ...(hardhatVerifyEnabled
+    ? {
+        etherscan: {
+          apiKey: process.env.ETHERSCAN_API_KEY,
+        },
+      }
+    : {}),
   namedAccounts: {
     deployer: {
       default: 1, // take the second account

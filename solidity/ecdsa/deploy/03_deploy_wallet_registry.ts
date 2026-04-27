@@ -1,3 +1,5 @@
+import verifyOnEtherscanOrContinue from "./etherscanVerification"
+
 import type { HardhatRuntimeEnvironment } from "hardhat/types"
 import type { DeployFunction } from "hardhat-deploy/types"
 
@@ -58,8 +60,11 @@ const func: DeployFunction = async (hre: HardhatRuntimeEnvironment) => {
     deployer
   )
 
-  if (hre.network.tags.etherscan) {
-    try {
+  if (
+    hre.network.tags.etherscan &&
+    process.env.DISABLE_HARDHAT_VERIFY !== "true"
+  ) {
+    await verifyOnEtherscanOrContinue(hre, async () => {
       await helpers.etherscan.verify(EcdsaInactivity)
 
       // We use `verify` instead of `verify:verify` as the `verify` task is defined
@@ -69,11 +74,7 @@ const func: DeployFunction = async (hre: HardhatRuntimeEnvironment) => {
         address: proxyDeployment.address,
         constructorArgsParams: proxyDeployment.args,
       })
-    } catch (err) {
-      hre.deployments.log(
-        `Etherscan verification skipped (e.g. API v1 deprecated): ${err}`
-      )
-    }
+    })
   }
 
   if (hre.network.tags.tenderly) {
