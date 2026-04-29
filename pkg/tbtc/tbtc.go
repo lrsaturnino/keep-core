@@ -10,6 +10,7 @@ import (
 
 	"github.com/ipfs/go-log"
 
+	"github.com/keep-network/keep-common/pkg/chain/ethereum"
 	"github.com/keep-network/keep-common/pkg/persistence"
 	"github.com/keep-network/keep-core/pkg/clientinfo"
 	"github.com/keep-network/keep-core/pkg/generator"
@@ -42,6 +43,31 @@ type GroupParameters struct {
 // misconduct to the protocol, including inactivity.
 func (gp *GroupParameters) DishonestThreshold() int {
 	return gp.GroupSize - gp.HonestThreshold
+}
+
+// defaultGroupParameters returns mainnet-style parameters unless the client
+// runs on a small-operator testnet (Sepolia) or local developer network, where
+// the deployed EcdsaDkgValidator uses group size 3. Must stay aligned with
+// on-chain EcdsaDkgValidator / EcdsaDkg group size for that deployment.
+func defaultGroupParameters(n ethereum.Network) *GroupParameters {
+	switch n {
+	case ethereum.Sepolia, ethereum.Developer:
+		logger.Infof(
+			"TBTC group parameters: testnet/small group (size=3, quorum=3, honest=2) for %s",
+			n,
+		)
+		return &GroupParameters{
+			GroupSize:       3,
+			GroupQuorum:     3,
+			HonestThreshold: 2,
+		}
+	default:
+		return &GroupParameters{
+			GroupSize:       100,
+			GroupQuorum:     90,
+			HonestThreshold: 51,
+		}
+	}
 }
 
 const (
@@ -82,12 +108,9 @@ func Initialize(
 	config Config,
 	clientInfo *clientinfo.Registry,
 	perfMetrics *clientinfo.PerformanceMetrics,
+	ethereumNetwork ethereum.Network,
 ) error {
-	groupParameters := &GroupParameters{
-		GroupSize:       100,
-		GroupQuorum:     90,
-		HonestThreshold: 51,
-	}
+	groupParameters := defaultGroupParameters(ethereumNetwork)
 
 	node, err := newNode(
 		groupParameters,
