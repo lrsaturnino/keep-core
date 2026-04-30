@@ -1,10 +1,13 @@
 package ethereum
 
 import (
+	"context"
 	"fmt"
 	"math/big"
 
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 
 	"github.com/keep-network/keep-common/pkg/chain/ethereum"
 	"github.com/keep-network/keep-common/pkg/chain/ethereum/ethutil"
@@ -124,6 +127,32 @@ func NewBitcoinDifficultyChain(
 	}, nil
 }
 
+// waitDeployBackendTransactionMined blocks until tx is mined. Generated contract
+// bindings submit via asynchronous mining waiter; without this wait, callers can
+// read stale LightRelay.currentEpoch via eth_call and fail the next
+// RetargetGasEstimate with "Invalid target in pre-retarget headers".
+func (bdc *BitcoinDifficultyChain) waitDeployBackendTransactionMined(
+	tx *types.Transaction,
+	method string,
+) error {
+	if tx == nil {
+		return fmt.Errorf("nil transaction waiting for [%s]", method)
+	}
+	receipt, err := bind.WaitMined(context.Background(), bdc.client, tx)
+	if err != nil {
+		return fmt.Errorf("waiting for transaction [%s] [%s]: [%w]", method, tx.Hash().Hex(), err)
+	}
+	if receipt.Status != types.ReceiptStatusSuccessful {
+		return fmt.Errorf(
+			"transaction [%s] [%s] failed with status [%d]",
+			method,
+			tx.Hash().Hex(),
+			receipt.Status,
+		)
+	}
+	return nil
+}
+
 // Ready checks whether the relay is active (i.e. genesis has been performed).
 // Note that if the relay is used by querying the current and previous epoch
 // difficulty, at least one retarget needs to be provided after genesis;
@@ -174,8 +203,11 @@ func (bdc *BitcoinDifficultyChain) Retarget(headers []*bitcoin.BlockHeader) erro
 	}
 
 	// Update Bitcoin difficulty directly via LightRelay.
-	_, err := bdc.lightRelay.Retarget(serializedHeaders)
-	return err
+	tx, err := bdc.lightRelay.Retarget(serializedHeaders)
+	if err != nil {
+		return err
+	}
+	return bdc.waitDeployBackendTransactionMined(tx, "LightRelay.Retarget")
 }
 
 // RetargetWithRefund adds a new epoch to the relay by providing a proof of the
@@ -203,13 +235,19 @@ func (bdc *BitcoinDifficultyChain) RetargetWithRefund(headers []*bitcoin.BlockHe
 	gasEstimateWithMargin := float64(gasEstimate) * float64(1.2)
 
 	// Update Bitcoin difficulty via LightRelayMaintainerProxy.
-	_, err = bdc.lightRelayMaintainerProxy.Retarget(
+	tx, err := bdc.lightRelayMaintainerProxy.Retarget(
 		serializedHeaders,
 		ethutil.TransactionOptions{
 			GasLimit: uint64(gasEstimateWithMargin),
 		},
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	return bdc.waitDeployBackendTransactionMined(
+		tx,
+		"LightRelayMaintainerProxy.Retarget",
+	)
 }
 
 // CurrentEpoch returns the number of the latest difficulty epoch which is
