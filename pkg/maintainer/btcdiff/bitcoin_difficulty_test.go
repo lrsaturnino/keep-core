@@ -2,6 +2,7 @@ package btcdiff
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -115,6 +116,14 @@ func TestProveNextEpoch(t *testing.T) {
 
 	createBlockHeaders := func() map[uint]*bitcoin.BlockHeader {
 		return map[uint]*bitcoin.BlockHeader{
+			602784: { // First block of epoch 299 (anchor for uniform nBits)
+				Version:                 0,
+				PreviousBlockHeaderHash: bitcoin.Hash{},
+				MerkleRootHash:          bitcoin.Hash{},
+				Time:                    999000,
+				Bits:                    1111111,
+				Nonce:                   1,
+			},
 			604797: {
 				Version:                 0,
 				PreviousBlockHeaderHash: bitcoin.Hash{},
@@ -500,6 +509,14 @@ func TestProveEpochs_Successful(t *testing.T) {
 	// Set one block header on each side of the retarget. The old epoch number
 	// is 299, the new epoch number is 300.
 	blockHeaders := map[uint]*bitcoin.BlockHeader{
+		602784: { // First block of epoch 299
+			Version:                 0,
+			PreviousBlockHeaderHash: bitcoin.Hash{},
+			MerkleRootHash:          bitcoin.Hash{},
+			Time:                    999000,
+			Bits:                    1111111,
+			Nonce:                   1,
+		},
 		604799: { // Last block of the old epoch (epoch 299)
 			Version:                 0,
 			PreviousBlockHeaderHash: bitcoin.Hash{},
@@ -632,6 +649,14 @@ func TestBitcoinDifficultyMaintainer_Integration(t *testing.T) {
 			//************ Prove two epochs ************
 			// Set block headers for epochs 300 and 301 in the Bitcoin chain.
 			blockHeaders := map[uint]*bitcoin.BlockHeader{
+				602784: { // First block of epoch 299
+					Version:                 0,
+					PreviousBlockHeaderHash: bitcoin.Hash{},
+					MerkleRootHash:          bitcoin.Hash{},
+					Time:                    999000,
+					Bits:                    1111111,
+					Nonce:                   1,
+				},
 				604799: { // Last block of the epoch 299
 					Version:                 0,
 					PreviousBlockHeaderHash: bitcoin.Hash{},
@@ -769,5 +794,118 @@ func TestBitcoinDifficultyMaintainer_Integration(t *testing.T) {
 				)
 			}
 		})
+	}
+}
+
+func TestProveNextEpoch_RejectsNonUniformPreRetargetDifficulty(t *testing.T) {
+	ctx := context.Background()
+
+	btcChain := connectLocalBitcoinChain()
+	btcChain.SetBlockHeaders(map[uint]*bitcoin.BlockHeader{
+		602784: {
+			Version:                 0,
+			PreviousBlockHeaderHash: bitcoin.Hash{},
+			MerkleRootHash:          bitcoin.Hash{},
+			Time:                    1,
+			Bits:                    1111111,
+			Nonce:                   1,
+		},
+		604799: {
+			Version:                 0,
+			PreviousBlockHeaderHash: bitcoin.Hash{},
+			MerkleRootHash:          bitcoin.Hash{},
+			Time:                    2,
+			Bits:                    9999999,
+			Nonce:                   2,
+		},
+		604800: {
+			Version:                 0,
+			PreviousBlockHeaderHash: bitcoin.Hash{},
+			MerkleRootHash:          bitcoin.Hash{},
+			Time:                    3,
+			Bits:                    2222222,
+			Nonce:                   3,
+		},
+	})
+
+	difficultyChain := connectLocalBitcoinDifficultyChain()
+	difficultyChain.SetReady(true)
+	difficultyChain.SetAuthorizedOperator(difficultyChain.Signing().Address(), true)
+	difficultyChain.SetProofLength(1)
+	difficultyChain.SetCurrentEpoch(299)
+
+	bdm := &bitcoinDifficultyMaintainer{
+		btcChain: btcChain,
+		chain:    difficultyChain,
+		config: Config{
+			DisableProxy:       true,
+			IdleBackOffTime:    bitcoinDifficultyDefaultIdleBackOffTime,
+			RestartBackOffTime: bitcoinDifficultyDefaultRestartBackoffTime,
+		},
+	}
+
+	_, err := bdm.proveNextEpoch(ctx)
+	if err == nil {
+		t.Fatal("expected non-uniform pre-retarget difficulty to be rejected")
+	}
+	if !errors.Is(err, ErrUniformPreRetargetDifficulty) {
+		t.Fatalf("expected wrapped ErrUniformPreRetargetDifficulty; got [%v]", err)
+	}
+}
+
+func TestProveNextEpoch_IdlesWhenIdleOnPreflightFailure(t *testing.T) {
+	ctx := context.Background()
+
+	btcChain := connectLocalBitcoinChain()
+	btcChain.SetBlockHeaders(map[uint]*bitcoin.BlockHeader{
+		602784: {
+			Version:                 0,
+			PreviousBlockHeaderHash: bitcoin.Hash{},
+			MerkleRootHash:          bitcoin.Hash{},
+			Time:                    1,
+			Bits:                    1111111,
+			Nonce:                   1,
+		},
+		604799: {
+			Version:                 0,
+			PreviousBlockHeaderHash: bitcoin.Hash{},
+			MerkleRootHash:          bitcoin.Hash{},
+			Time:                    2,
+			Bits:                    9999999,
+			Nonce:                   2,
+		},
+		604800: {
+			Version:                 0,
+			PreviousBlockHeaderHash: bitcoin.Hash{},
+			MerkleRootHash:          bitcoin.Hash{},
+			Time:                    3,
+			Bits:                    2222222,
+			Nonce:                   3,
+		},
+	})
+
+	difficultyChain := connectLocalBitcoinDifficultyChain()
+	difficultyChain.SetReady(true)
+	difficultyChain.SetAuthorizedOperator(difficultyChain.Signing().Address(), true)
+	difficultyChain.SetProofLength(1)
+	difficultyChain.SetCurrentEpoch(299)
+
+	bdm := &bitcoinDifficultyMaintainer{
+		btcChain: btcChain,
+		chain:    difficultyChain,
+		config: Config{
+			DisableProxy:           true,
+			IdleOnPreflightFailure: true,
+			IdleBackOffTime:        bitcoinDifficultyDefaultIdleBackOffTime,
+			RestartBackOffTime:     bitcoinDifficultyDefaultRestartBackoffTime,
+		},
+	}
+
+	proven, err := bdm.proveNextEpoch(ctx)
+	if err != nil {
+		t.Fatalf("expected idle skip without error; got [%v]", err)
+	}
+	if proven {
+		t.Fatal("expected epoch not proven when preflight mismatch is skipped")
 	}
 }

@@ -150,6 +150,20 @@ func (bdc *BitcoinDifficultyChain) waitDeployBackendTransactionMined(
 			receipt.Status,
 		)
 	}
+	// Some RPC load balancers can lag reads after receipt; wait a few L1
+	// confirmations before the next RetargetGasEstimate/eth_call.
+	if receipt.BlockNumber != nil && bdc.blockCounter != nil {
+		includedAt := receipt.BlockNumber.Uint64()
+		const confirmDepth = uint64(3)
+		if err := bdc.blockCounter.WaitForBlockHeight(includedAt + confirmDepth); err != nil {
+			return fmt.Errorf(
+				"waiting confirmation depth after [%s] [%s]: [%w]",
+				method,
+				tx.Hash().Hex(),
+				err,
+			)
+		}
+	}
 	return nil
 }
 

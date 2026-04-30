@@ -2,6 +2,7 @@ package btcdiff
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -242,6 +243,25 @@ func (bdm *bitcoinDifficultyMaintainer) proveNextEpoch(ctx context.Context) (
 	// blockchain only if the blockchain height is equal to or greater than
 	// the end of the range.
 	if currentBlockHeight >= lastBlockHeaderHeight {
+		lastPreRetargetHeight := newEpochHeight - 1
+		if err := bdm.verifyUniformPreRetargetDifficulty(
+			currentEpoch,
+			firstBlockHeaderHeight,
+			lastPreRetargetHeight,
+		); err != nil {
+			if bdm.config.IdleOnPreflightFailure &&
+				errors.Is(err, ErrUniformPreRetargetDifficulty) {
+				logger.Warnf(
+					"idling bitcoin difficulty maintainer (%v); "+
+						"set bitcoinDifficulty.idleOnPreflightFailure=false to "+
+						"fail fast instead",
+					err,
+				)
+				return false, nil
+			}
+			return false, err
+		}
+
 		headers, err := bdm.getBlockHeaders(
 			firstBlockHeaderHeight,
 			lastBlockHeaderHeight,
@@ -309,6 +329,59 @@ func (bdm *bitcoinDifficultyMaintainer) proveNextEpoch(ctx context.Context) (
 	}
 
 	return false, nil
+}
+
+// verifyUniformPreRetargetDifficulty checks that each Bitcoin header on the
+// pre-retarget side of the relay proof encodes the same compact difficulty
+// (nBits) as the first block of currentEpoch on Bitcoin. LightRelay rejects
+// proofs otherwise ("Invalid target in pre-retarget headers"). Mainnet avoids
+// mixed nBits inside a difficulty window; Bitcoin testnets (e.g. testnet4)
+// may insert minimum-difficulty blocks, which makes honest proofs impossible for
+// the unmodified relay.
+func (bdm *bitcoinDifficultyMaintainer) verifyUniformPreRetargetDifficulty(
+	currentEpoch uint64,
+	firstPreRetargetHeight uint,
+	lastPreRetargetHeight uint,
+) error {
+	anchorHeight := uint(currentEpoch) * bitcoinDifficultyEpochLength
+	anchor, err := bdm.btcChain.GetBlockHeader(anchorHeight)
+	if err != nil {
+		return fmt.Errorf(
+			"cannot load anchor header at epoch start height %d for "+
+				"pre-retarget difficulty check: %w",
+			anchorHeight,
+			err,
+		)
+	}
+
+	for h := firstPreRetargetHeight; h <= lastPreRetargetHeight; h++ {
+		hdr, err := bdm.btcChain.GetBlockHeader(h)
+		if err != nil {
+			return fmt.Errorf(
+				"cannot load header %d for pre-retarget difficulty check: %w",
+				h,
+				err,
+			)
+		}
+
+		if hdr.Bits != anchor.Bits {
+			return fmt.Errorf(
+				"%w: bitcoin header at height %d has nBits %#x but epoch %d "+
+					"anchor (height %d) has nBits %#x; light relay requires "+
+					"uniform difficulty across the proof's pre-retarget headers "+
+					"(testnet minimum-difficulty blocks often break this); retarget "+
+					"cannot succeed without relay or chain changes",
+				ErrUniformPreRetargetDifficulty,
+				h,
+				hdr.Bits,
+				currentEpoch,
+				anchorHeight,
+				anchor.Bits,
+			)
+		}
+	}
+
+	return nil
 }
 
 // getBlockHeaders returns block headers from the given range.
