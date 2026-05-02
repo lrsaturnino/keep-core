@@ -960,38 +960,90 @@ func (c *Connection) getScriptUtxos(
 	return filteredItems, nil
 }
 
+// feeEstimateWithFallbackTargets returns confirmation targets to try, in order.
+// Callers default to 1 block (see bitcoin.TransactionFeeEstimator); on public
+// testnets blockchain.estimatefee(1) often fails while looser targets work.
+// See electrum_integration_test.go (TestEstimateSatPerVByteFee_Integration).
+func feeEstimateWithFallbackTargets(primary uint32) []uint32 {
+	seen := make(map[uint32]struct{})
+	var out []uint32
+	add := func(u uint32) {
+		if _, ok := seen[u]; ok {
+			return
+		}
+		seen[u] = struct{}{}
+		out = append(out, u)
+	}
+	add(primary)
+	for _, fb := range []uint32{25, 100} {
+		add(fb)
+	}
+	return out
+}
+
+// getFeeBtcPerKbOnce issues a single blockchain.estimatefee call (no multi-minute
+// retry loop). Persistent RPC errors for one confirmation target should not
+// exhaust RequestRetryTimeout; EstimateSatPerVByteFee tries looser targets next.
+func (c *Connection) getFeeBtcPerKbOnce(blocks uint32) (float32, error) {
+	if err := c.reconnectIfShutdown(); err != nil {
+		return 0, err
+	}
+	requestCtx, requestCancel := context.WithTimeout(
+		c.parentCtx,
+		c.config.RequestTimeout,
+	)
+	defer requestCancel()
+	c.clientMutex.Lock()
+	fee, err := c.client.GetFee(requestCtx, blocks)
+	c.clientMutex.Unlock()
+	if err != nil {
+		return 0, fmt.Errorf("request failed: [%w]", err)
+	}
+	return fee, nil
+}
+
 // EstimateSatPerVByteFee returns the estimated sat/vbyte fee for a
 // transaction to be confirmed within the given number of blocks.
 func (c *Connection) EstimateSatPerVByteFee(blocks uint32) (int64, error) {
-	// According to Electrum protocol docs, the returned fee is BTC/KB.
-	btcPerKbFee, err := requestWithRetry(
-		c,
-		func(
-			ctx context.Context,
-			client *electrum.Client,
-		) (float32, error) {
-			// TODO: client.GetFee calls Electrum's blockchain.estimatefee underneath.
-			//       According to https://electrumx.readthedocs.io/en/latest/protocol-methods.html#blockchain-estimatefee,
-			//       the blockchain.estimatefee function will be deprecated
-			//       since version 1.4.2 of the protocol. We need to replace it
-			//       somehow once it disappears from Electrum implementations.
-			return client.GetFee(ctx, blocks)
-		},
-		"GetFee",
+	targets := feeEstimateWithFallbackTargets(blocks)
+	var lastErr error
+
+	for _, b := range targets {
+		btcPerKbFee, err := c.getFeeBtcPerKbOnce(b)
+		if err != nil {
+			lastErr = err
+			logger.Debugf("GetFee for [%d] confirmation blocks failed: [%v]", b, err)
+			continue
+		}
+		// According to Electrum protocol docs, if the daemon does not have
+		// enough information to make an estimate, the integer -1 is returned.
+		if btcPerKbFee < 0 {
+			lastErr = fmt.Errorf(
+				"daemon does not have enough information to make an estimate",
+			)
+			logger.Debugf("GetFee for [%d] blocks returned no estimate (fee < 0)", b)
+			continue
+		}
+
+		if b != blocks {
+			logger.Infof(
+				"using Electrum fee estimate for [%d] confirmation blocks "+
+					"(requested [%d] was unavailable)",
+				b,
+				blocks,
+			)
+		}
+
+		return convertBtcKbToSatVByte(btcPerKbFee), nil
+	}
+
+	if lastErr != nil {
+		return 0, fmt.Errorf("failed to get fee: [%v]", lastErr)
+	}
+	return 0, fmt.Errorf(
+		"failed to get fee from Electrum after trying confirmation targets %v",
+		targets,
 	)
-	if err != nil {
-		return 0, fmt.Errorf("failed to get fee: [%v]", err)
-	}
-
-	// According to Electrum protocol docs, if the daemon does not have
-	// enough information to make an estimate, the integer -1 is returned.
-	if btcPerKbFee < 0 {
-		return 0, fmt.Errorf(
-			"daemon does not have enough information to make an estimate",
-		)
-	}
-
-	return convertBtcKbToSatVByte(btcPerKbFee), nil
 }
 
 func convertBtcKbToSatVByte(btcPerKbFee float32) int64 {

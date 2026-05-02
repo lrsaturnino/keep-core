@@ -1,10 +1,40 @@
 package electrum
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/keep-network/keep-core/internal/testutils"
 )
+
+func TestFeeEstimateWithFallbackTargets(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		primary uint32
+		want   []uint32
+	}{
+		{
+			name:   "default one block adds 25 and 100",
+			primary: 1,
+			want:   []uint32{1, 25, 100},
+		},
+		{
+			name:   "dedup when primary is 25",
+			primary: 25,
+			want:   []uint32{25, 100},
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := feeEstimateWithFallbackTargets(tc.primary)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("expected %v, got %v", tc.want, got)
+			}
+		})
+	}
+}
 
 func TestConvertBtcKbToSatVByte(t *testing.T) {
 	var tests = map[string]struct {
