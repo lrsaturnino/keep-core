@@ -962,7 +962,8 @@ func (c *Connection) getScriptUtxos(
 
 // feeEstimateWithFallbackTargets returns confirmation targets to try, in order.
 // Callers default to 1 block (see bitcoin.TransactionFeeEstimator); on public
-// testnets blockchain.estimatefee(1) often fails while looser targets work.
+// testnets many targets can fail (empty mempool). We try a wide set, then
+// optional static fallback in EstimateSatPerVByteFee.
 // See electrum_integration_test.go (TestEstimateSatPerVByteFee_Integration).
 func feeEstimateWithFallbackTargets(primary uint32) []uint32 {
 	seen := make(map[uint32]struct{})
@@ -975,10 +976,28 @@ func feeEstimateWithFallbackTargets(primary uint32) []uint32 {
 		out = append(out, u)
 	}
 	add(primary)
-	for _, fb := range []uint32{25, 100} {
+	for _, fb := range []uint32{6, 25, 50, 100, 144, 500, 1008} {
 		add(fb)
 	}
 	return out
+}
+
+// defaultFallbackSatPerVByteWhenEstimateFails is used when Electrum cannot
+// return a fee for any confirmation target (typical on testnet4 / quiet
+// mempools: -32603 for all N). Relay policy still accepts low feerates;
+// deposit sweep max-fee checks on the Bridge bound the total fee.
+const defaultFallbackSatPerVByteWhenEstimateFails int64 = 2
+
+// isElectrumFeeOracleFailure reports whether the error is the usual
+// "no fee data" / JSON-RPC -32603 from estimatefee, as opposed to transport
+// or auth failures where we should not invent a feerate.
+func isElectrumFeeOracleFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "cannot estimate fee") ||
+		strings.Contains(s, "-32603")
 }
 
 // getFeeBtcPerKbOnce issues a single blockchain.estimatefee call (no multi-minute
@@ -1007,11 +1026,15 @@ func (c *Connection) getFeeBtcPerKbOnce(blocks uint32) (float32, error) {
 func (c *Connection) EstimateSatPerVByteFee(blocks uint32) (int64, error) {
 	targets := feeEstimateWithFallbackTargets(blocks)
 	var lastErr error
+	sawFeeOracleFailure := false
 
 	for _, b := range targets {
 		btcPerKbFee, err := c.getFeeBtcPerKbOnce(b)
 		if err != nil {
 			lastErr = err
+			if isElectrumFeeOracleFailure(err) {
+				sawFeeOracleFailure = true
+			}
 			logger.Debugf("GetFee for [%d] confirmation blocks failed: [%v]", b, err)
 			continue
 		}
@@ -1021,6 +1044,7 @@ func (c *Connection) EstimateSatPerVByteFee(blocks uint32) (int64, error) {
 			lastErr = fmt.Errorf(
 				"daemon does not have enough information to make an estimate",
 			)
+			sawFeeOracleFailure = true
 			logger.Debugf("GetFee for [%d] blocks returned no estimate (fee < 0)", b)
 			continue
 		}
@@ -1035,6 +1059,17 @@ func (c *Connection) EstimateSatPerVByteFee(blocks uint32) (int64, error) {
 		}
 
 		return convertBtcKbToSatVByte(btcPerKbFee), nil
+	}
+
+	if sawFeeOracleFailure {
+		logger.Warnf(
+			"Electrum returned no fee estimate for any target %v; using "+
+				"fallback [%d] sat/vbyte (last error: [%v])",
+			targets,
+			defaultFallbackSatPerVByteWhenEstimateFails,
+			lastErr,
+		)
+		return defaultFallbackSatPerVByteWhenEstimateFails, nil
 	}
 
 	if lastErr != nil {

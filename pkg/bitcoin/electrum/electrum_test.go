@@ -15,14 +15,18 @@ func TestFeeEstimateWithFallbackTargets(t *testing.T) {
 		want   []uint32
 	}{
 		{
-			name:   "default one block adds 25 and 100",
+			name:    "primary 1 tries common confirmation horizons",
 			primary: 1,
-			want:   []uint32{1, 25, 100},
+			want: []uint32{
+				1, 6, 25, 50, 100, 144, 500, 1008,
+			},
 		},
 		{
-			name:   "dedup when primary is 25",
+			name:    "dedup when primary is 25",
 			primary: 25,
-			want:   []uint32{25, 100},
+			want: []uint32{
+				25, 6, 50, 100, 144, 500, 1008,
+			},
 		},
 	} {
 		tc := tc

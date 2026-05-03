@@ -16,7 +16,7 @@ type Config struct {
 	DisableProxy bool
 
 	// IdleOnPreflightFailure, when true, treats a relay preflight failure due to
-	// mismatched pre-retarget nBits (ErrUniformPreRetargetDifficulty) as a
+	// pre-retarget headers not matching LightRelay rules (ErrUniformPreRetargetDifficulty) as a
 	// non-fatal condition: skip submitting and idle until the next tick instead
 	// of surfacing an error that restarts the maintainer loop. Use on Bitcoin
 	// testnets where minimum-difficulty blocks make LightRelay proofs impossible.
