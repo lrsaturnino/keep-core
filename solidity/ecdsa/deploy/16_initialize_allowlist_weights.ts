@@ -341,6 +341,9 @@ const func: DeployFunction = async (hre: HardhatRuntimeEnvironment) => {
       console.warn(
         "WARNING: Ownership transfer failed. Manual intervention required."
       )
+      throw new Error(
+        `Ownership transfer failed; manual intervention required: ${error.message}`
+      )
     }
   } else {
     console.log()

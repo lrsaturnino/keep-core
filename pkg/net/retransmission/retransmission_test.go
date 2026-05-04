@@ -78,6 +78,28 @@ func TestHandlerReceiveRetransmissions(t *testing.T) {
 	}
 }
 
+func TestHandlerEvictsOldRetransmissions(t *testing.T) {
+	var received []net.Message
+
+	handler := withRetransmissionSupport(func(message net.Message) {
+		received = append(received, message)
+	}, 2)
+
+	firstMessage := &mockNetworkMessage{senderID: "a", seqno: 1}
+
+	handler(firstMessage)
+	handler(&mockNetworkMessage{senderID: "a", seqno: 2})
+	handler(&mockNetworkMessage{senderID: "a", seqno: 3})
+	handler(firstMessage)
+
+	if len(received) != 4 {
+		t.Fatalf(
+			"unexpected number of accepted messages\nactual:   [%v]\nexpected: [4]",
+			len(received),
+		)
+	}
+}
+
 type mockNetworkMessage struct {
 	senderID string
 	seqno    uint64

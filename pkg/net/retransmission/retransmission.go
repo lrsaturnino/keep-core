@@ -14,6 +14,8 @@ import (
 	"github.com/keep-network/keep-core/pkg/net"
 )
 
+const maxCachedMessageIDs = 10000
+
 // RetransmitFn represents a retransmission routine.
 type RetransmitFn func() error
 
@@ -52,8 +54,20 @@ func ScheduleRetransmissions(
 // considered the same. Handler can not be reused between channels if sequence
 // number of message is local for channel.
 func WithRetransmissionSupport(delegate func(m net.Message)) func(m net.Message) {
+	return withRetransmissionSupport(delegate, maxCachedMessageIDs)
+}
+
+func withRetransmissionSupport(
+	delegate func(m net.Message),
+	maxCacheSize int,
+) func(m net.Message) {
+	if maxCacheSize <= 0 {
+		maxCacheSize = 1
+	}
+
 	mutex := &sync.Mutex{}
-	cache := make(map[string]bool)
+	cache := make(map[string]struct{})
+	messageIDs := make([]string, 0, maxCacheSize)
 
 	return func(message net.Message) {
 		messageID := fmt.Sprintf(
@@ -65,7 +79,14 @@ func WithRetransmissionSupport(delegate func(m net.Message)) func(m net.Message)
 		mutex.Lock()
 		_, seen := cache[messageID]
 		if !seen {
-			cache[messageID] = true
+			if len(cache) >= maxCacheSize {
+				delete(cache, messageIDs[0])
+				messageIDs[0] = ""
+				messageIDs = messageIDs[1:]
+			}
+
+			cache[messageID] = struct{}{}
+			messageIDs = append(messageIDs, messageID)
 		}
 		mutex.Unlock()
 

@@ -148,7 +148,7 @@ func TestValidate_PeerNotRecognized_FirstApplicationReturnedError(t *testing.T) 
 	testutils.AssertAnyErrorInChainMatchesTarget(t, applicationError, err)
 }
 
-func TestValidate_PeerRecognized_Cached(t *testing.T) {
+func TestValidate_PeerRecognized_Rechecked(t *testing.T) {
 	_, peerOperatorPublicKey, err := operator.GenerateKeyPair(
 		local_v1.DefaultCurve,
 	)
@@ -175,16 +175,15 @@ func TestValidate_PeerRecognized_Cached(t *testing.T) {
 	}
 
 	// Ensure the application does not recognize the operator anymore.
-	// Validation should still succeed, since the cached result should be used.
+	// Validation should fail because positive results are rechecked to avoid
+	// accepting peers whose application recognition was revoked.
 	application.setIsRecognized(peerOperatorPublicKey, result{
 		isRecognized: false,
 		err:          nil,
 	})
 
 	err = policy.Validate(peerOperatorPublicKey)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutils.AssertErrorsSame(t, errNotRecognized, err)
 }
 
 func TestValidate_PeerNotRecognized_CacheEmptied(t *testing.T) {

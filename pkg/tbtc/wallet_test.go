@@ -8,16 +8,17 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
-	"github.com/keep-network/keep-core/pkg/chain"
-	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"math/big"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/keep-network/keep-core/internal/testutils"
 	"github.com/keep-network/keep-core/pkg/bitcoin"
+	"github.com/keep-network/keep-core/pkg/chain"
+	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/tecdsa"
 )
 
@@ -167,6 +168,42 @@ func TestWalletDispatcher_Dispatch(t *testing.T) {
 	err = walletDispatcher.dispatch(wallet2Action2)
 	if err != nil {
 		t.Errorf("unexpected error: [%v]", err)
+	}
+}
+
+func TestEnsureWalletSyncedBetweenChains_TransactionWithoutInputs(t *testing.T) {
+	walletPublicKeyHash := [20]byte{}
+	outputScript, err := bitcoin.PayToWitnessPublicKeyHash(walletPublicKeyHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	malformedTransaction := &bitcoin.Transaction{
+		Version: 1,
+		Outputs: []*bitcoin.TransactionOutput{
+			{
+				Value:           1000,
+				PublicKeyScript: outputScript,
+			},
+		},
+	}
+
+	btcChain := newLocalBitcoinChain()
+	if err := btcChain.BroadcastTransaction(malformedTransaction); err != nil {
+		t.Fatal(err)
+	}
+
+	err = EnsureWalletSyncedBetweenChains(
+		walletPublicKeyHash,
+		nil,
+		Connect(),
+		btcChain,
+	)
+	if err == nil {
+		t.Fatal("expected transaction-without-inputs error")
+	}
+	if !strings.Contains(err.Error(), "has no inputs") {
+		t.Fatalf("unexpected error: [%v]", err)
 	}
 }
 
