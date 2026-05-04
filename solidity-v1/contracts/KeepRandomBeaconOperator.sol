@@ -412,16 +412,18 @@ contract KeepRandomBeaconOperator is ReentrancyGuard, GasPriceOracleConsumer {
 
         // Spend no more than groupSelectionGasEstimate + 40000 gas max
         // This will prevent relayEntry failure in case the service contract is compromised
-        currentRequestServiceContract.call.gas(
-            groupSelectionGasEstimate.add(40000)
-        )(
-            abi.encodeWithSignature(
-                "entryCreated(uint256,bytes,address)",
-                currentRequestId,
-                _groupSignature,
-                msg.sender
-            )
-        );
+        (bool entryCreatedSuccess, ) =
+            currentRequestServiceContract.call.gas(
+                groupSelectionGasEstimate.add(40000)
+            )(
+                abi.encodeWithSignature(
+                    "entryCreated(uint256,bytes,address)",
+                    currentRequestId,
+                    _groupSignature,
+                    msg.sender
+                )
+            );
+        require(entryCreatedSuccess, "Relay entry notification failed");
 
         if (currentRequestCallbackFee > 0) {
             executeCallback(uint256(keccak256(_groupSignature)));

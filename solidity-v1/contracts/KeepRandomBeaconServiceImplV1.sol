@@ -125,6 +125,18 @@ contract KeepRandomBeaconServiceImplV1 is ReentrancyGuard, IRandomBeacon {
         _;
     }
 
+    modifier onlyAuthorizedOperatorContract() {
+        require(
+            _operatorContracts.contains(msg.sender),
+            "Only authorized operator contract can call."
+        );
+        require(
+            KeepRegistry(_registry).isApprovedOperatorContract(msg.sender),
+            "Operator contract is not approved"
+        );
+        _;
+    }
+
     constructor() public {
         _initialized["KeepRandomBeaconServiceImplV1"] = true;
     }
@@ -345,12 +357,7 @@ contract KeepRandomBeaconServiceImplV1 is ReentrancyGuard, IRandomBeacon {
         uint256 requestId,
         bytes memory entry,
         address payable submitter
-    ) public {
-        require(
-            _operatorContracts.contains(msg.sender),
-            "Only authorized operator contract can call relay entry."
-        );
-
+    ) public onlyAuthorizedOperatorContract {
         _previousEntry = entry;
         uint256 entryAsNumber = uint256(keccak256(entry));
         emit RelayEntryGenerated(requestId, entryAsNumber);
@@ -361,12 +368,10 @@ contract KeepRandomBeaconServiceImplV1 is ReentrancyGuard, IRandomBeacon {
     /// @notice Executes customer specified callback for the relay entry request.
     /// @param requestId Request id tracked internally by this contract.
     /// @param entry The generated random number.
-    function executeCallback(uint256 requestId, uint256 entry) public {
-        require(
-            _operatorContracts.contains(msg.sender),
-            "Only authorized operator contract can call execute callback."
-        );
-
+    function executeCallback(uint256 requestId, uint256 entry)
+        public
+        onlyAuthorizedOperatorContract
+    {
         require(
             _callbacks[requestId].callbackContract != address(0),
             "Callback contract not found"

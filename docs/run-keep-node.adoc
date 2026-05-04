@@ -187,7 +187,7 @@ IMPORTANT: Please update your firewall rules if necessary.
 |clientInfo.port
 |Egress
 |TCP
-|9601
+|0
 
 |===
 
@@ -309,8 +309,9 @@ startup log.  When sharing remember to substitute the `/ipv4/` address with the 
 [#clientInfo]
 == Client Info
 
-The client exposes metrics and diagnostics on a configurable port (default: `9601`)
-under `/metrics` and `/diagnostics` resources.
+The client exposes metrics and diagnostics on a configurable port when
+explicitly enabled with `clientInfo.port` under `/metrics` and `/diagnostics`
+resources. Expose this endpoint only on a trusted network.
 
 The data can be consumed by Prometheus to monitor the state of a node.
 
@@ -323,15 +324,15 @@ The client exposes the following metrics:
 - connected bootstraps count,
 - Ethereum client connectivity status (if a simple read-only CALL can be executed).
 
-Metrics are enabled once the client starts. It is possible to customize the port 
-at which metrics endpoint is exposed as well as the frequency with which 
-the metrics are collected.
+Metrics are enabled once the client info endpoint is configured. It is possible
+to customize the port at which metrics endpoint is exposed as well as the
+frequency with which the metrics are collected.
 
 Exposed metrics contain the value and timestamp at which they were collected.
 
 Example metrics endpoint call result:
 ```
-$ curl localhost:9601/metrics
+$ curl localhost:<client-info-port>/metrics
 # TYPE connected_peers_count gauge
 connected_peers_count 108 1623235129569
 
@@ -350,12 +351,12 @@ The client exposes the following diagnostics:
 - list of connected peers along with their network id and Ethereum operator address,
 - information about the client's network id and Ethereum operator address.
 
-Diagnostics are enabled once the client starts. It is possible to customize
-the port at which diagnostics endpoint is exposed.
+Diagnostics are enabled once the client info endpoint is configured. It is
+possible to customize the port at which diagnostics endpoint is exposed.
 
 Example diagnostics endpoint call result:
 ```
-$ curl localhost:9601/diagnostics
+$ curl localhost:<client-info-port>/diagnostics
 {
   "client_info" { 
    "ethereum_address":"0xDcd4199e22d09248cA2583cBDD2759b2acD22381",

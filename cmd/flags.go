@@ -256,8 +256,8 @@ func initClientInfoFlags(cmd *cobra.Command, cfg *config.Config) {
 	cmd.Flags().IntVar(
 		&cfg.ClientInfo.Port,
 		"clientInfo.port",
-		9601,
-		"Client Info HTTP server listening port.",
+		0,
+		"Client Info HTTP server listening port. Disabled by default.",
 	)
 
 	cmd.Flags().DurationVar(

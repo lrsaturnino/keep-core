@@ -174,7 +174,7 @@ var cmdFlagsTests = map[string]struct {
 		flagName:              "--clientInfo.port",
 		flagValue:             "9870",
 		expectedValueFromFlag: 9870,
-		defaultValue:          9601,
+		defaultValue:          0,
 	},
 	"clientInfo.networkMetricsTick": {
 		readValueFunc:         func(c *config.Config) interface{} { return c.ClientInfo.NetworkMetricsTick },

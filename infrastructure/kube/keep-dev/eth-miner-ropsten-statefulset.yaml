@@ -36,7 +36,6 @@ spec:
         volumeMounts:
           - name: ropsten-miner
             mountPath: /root/.ethereum
-        args: ["--testnet", "--networkid=3", "--datadir=/root/.ethereum", "--syncmode=fast", "--rpc", "--rpcapi=eth,web3,personal,admin,net,miner", "--rpcport=8545", "--rpcaddr=0.0.0.0", "--rpccorsdomain=\"\"", "--rpcvhosts=*", "--ws", "--wsport=8546", "--wsaddr=0.0.0.0", "--wsorigins=*", --mine, --minerthreads=2, --miner.etherbase=0xF7886F29Ffc82D349E3a9131a463Ba0eD35b7C58]
+        args: ["--testnet", "--networkid=3", "--datadir=/root/.ethereum", "--syncmode=fast", "--rpc", "--rpcapi=eth,web3,net", "--rpcport=8545", "--rpcaddr=0.0.0.0", "--rpccorsdomain=\"\"", "--rpcvhosts=*", "--ws", "--wsapi=eth,web3,net", "--wsport=8546", "--wsaddr=0.0.0.0", "--wsorigins=*", --mine, --minerthreads=2, --miner.etherbase=0xF7886F29Ffc82D349E3a9131a463Ba0eD35b7C58]
       nodeSelector:
         pool-type: eth-ropsten
-

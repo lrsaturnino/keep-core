@@ -7,11 +7,12 @@ through the `/metrics` endpoint when the client info endpoint is configured.
 == Metrics Endpoint
 
 Metrics are exposed via HTTP at the `/metrics` endpoint on the port configured
-in the `ClientInfo` section of the configuration file (default: `9601`).
+in the `ClientInfo` section of the configuration file. The endpoint is disabled
+by default and should only be exposed on a trusted network.
 
 Example:
 ----
-curl http://localhost:9601/metrics
+curl http://localhost:<client-info-port>/metrics
 ----
 
 == Metric Types
