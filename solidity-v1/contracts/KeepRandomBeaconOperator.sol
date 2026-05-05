@@ -410,8 +410,8 @@ contract KeepRandomBeaconOperator is ReentrancyGuard, GasPriceOracleConsumer {
 
         emit RelayEntrySubmitted();
 
-        // Spend no more than groupSelectionGasEstimate + 40000 gas max
-        // This will prevent relayEntry failure in case the service contract is compromised
+        // Spend no more than groupSelectionGasEstimate + 40000 gas max to cap
+        // gas forwarded to the service contract.
         (bool entryCreatedSuccess, ) =
             currentRequestServiceContract.call.gas(
                 groupSelectionGasEstimate.add(40000)

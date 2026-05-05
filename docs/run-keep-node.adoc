@@ -313,6 +313,11 @@ The client exposes metrics and diagnostics on a configurable port when
 explicitly enabled with `clientInfo.port` under `/metrics` and `/diagnostics`
 resources. Expose this endpoint only on a trusted network.
 
+IMPORTANT: The metrics server is *disabled by default* (port `0`). If you
+previously relied on the default port `9601`, you must now set
+`clientInfo.port = 9601` (or another port) in your configuration file
+to retain metrics collection.
+
 The data can be consumed by Prometheus to monitor the state of a node.
 
 [#metrics]
