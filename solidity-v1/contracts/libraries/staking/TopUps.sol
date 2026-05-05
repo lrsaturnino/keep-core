@@ -46,6 +46,10 @@ library TopUps {
         // Stake is not yet initialized so we don't need to check if the
         // operator is not undelegating - initializing and undelegating at the
         // same time is not possible.
+        require(
+            operatorParams.getAmount() > 0,
+            "Operator stake already cancelled"
+        );
         require(value > 0, "Top-up value must be greater than zero");
 
         uint256 newAmount = operatorParams.getAmount().add(value);
@@ -76,6 +80,10 @@ library TopUps {
     ) public {
         // Stake is initialized, the operator is still active so we need
         // to check if it's not undelegating.
+        require(
+            operatorParams.getAmount() > 0,
+            "Operator stake already cancelled"
+        );
         require(!isUndelegating(operatorParams), "Stake undelegated");
         require(value > 0, "Top-up value must be greater than zero");
 

@@ -43,7 +43,7 @@ library GrantStaking {
     /// captures the grant ID for that delegation.
     /// Grant ID can be later retrieved based on the operator address and used
     /// to authenticate grantee or to fetch the information about grant
-    /// unlocking schedule for escrow.
+    /// unlocking schedule.
     /// @param tokenGrant KEEP token grant contract reference.
     /// @param operator The operator tokens are delegated to.
     function tryCapturingGrantId(

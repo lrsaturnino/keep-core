@@ -1,0 +1,5 @@
+# UBS scan exclusions
+# Test files use deep Chai assertion chains (.to.eq.BN etc.) intentionally;
+# null-guard warnings are false positives in that context.
+**/test/**
+**/tests/**
