@@ -14,6 +14,9 @@ import (
 	"github.com/keep-network/keep-core/pkg/net"
 )
 
+// maxCachedMessageIDs bounds the retransmission deduplication window. It is
+// sized to accommodate the expected number of concurrent protocol participants
+// multiplied by the retransmission count per phase, with headroom for bursts.
 const maxCachedMessageIDs = 10000
 
 // RetransmitFn represents a retransmission routine.
@@ -46,7 +49,9 @@ func ScheduleRetransmissions(
 // enhances it with functionality allowing to handle retransmissions.
 // The returned handler filters out retransmissions and calls the delegate
 // handler only if the received message is not a retransmission or if it is
-// a retransmission but it has not been seen by the original handler yet.
+// a retransmission but it has not been seen within the last
+// maxCachedMessageIDs unique message IDs. Messages older than that window may
+// be re-processed if their IDs have been evicted from the cache.
 // The returned handler is thread-safe.
 //
 // Retransmissions are identified by sender transport ID and message sequence
@@ -76,19 +81,25 @@ func withRetransmissionSupport(
 			message.Seqno(),
 		)
 
-		mutex.Lock()
-		_, seen := cache[messageID]
-		if !seen {
-			if len(cache) >= maxCacheSize {
-				delete(cache, messageIDs[0])
-				messageIDs[0] = ""
-				messageIDs = messageIDs[1:]
-			}
+		// The lock is acquired and released inside the closure so that it is
+		// not held during the delegate call, which may be slow or re-entrant.
+		seen := func() bool {
+			mutex.Lock()
+			defer mutex.Unlock()
 
-			cache[messageID] = struct{}{}
-			messageIDs = append(messageIDs, messageID)
-		}
-		mutex.Unlock()
+			_, seen := cache[messageID]
+			if !seen {
+				if len(cache) >= maxCacheSize {
+					delete(cache, messageIDs[0])
+					messageIDs[0] = ""
+					messageIDs = messageIDs[1:]
+				}
+
+				cache[messageID] = struct{}{}
+				messageIDs = append(messageIDs, messageID)
+			}
+			return seen
+		}()
 
 		if !seen {
 			delegate(message)

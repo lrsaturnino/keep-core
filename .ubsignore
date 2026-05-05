@@ -1,0 +1,4 @@
+# Deploy scripts use console.log intentionally for progress output and
+# readFileSync/writeFileSync appropriately for synchronous deploy workflows.
+# These are not production application code; UBS warnings are false positives.
+solidity/ecdsa/deploy/16_initialize_allowlist_weights.ts

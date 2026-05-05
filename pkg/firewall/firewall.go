@@ -84,7 +84,9 @@ type anyApplicationPolicy struct {
 // or it is a non-allowlisted node but it is recognized as eligible by any of
 // the applications. Nil is returned on a successful validation, error otherwise.
 // Due to performance reasons, negative validation results for non-allowlisted
-// nodes are stored in a cache for a certain amount of time.
+// nodes are stored in a cache for a certain amount of time. Positive results
+// are intentionally not cached so that operator revocations take effect on the
+// next Validate call rather than after a cache TTL.
 func (aap *anyApplicationPolicy) Validate(
 	remotePeerPublicKey *operator.PublicKey,
 ) error {
