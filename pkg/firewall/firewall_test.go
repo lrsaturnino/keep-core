@@ -17,7 +17,6 @@ func TestValidate_PeerNotRecognized_NoApplications(t *testing.T) {
 	policy := &anyApplicationPolicy{
 		applications:        []Application{},
 		allowList:           EmptyAllowList,
-		positiveResultCache: cache.NewTimeCache(cachingPeriod),
 		negativeResultCache: cache.NewTimeCache(cachingPeriod),
 	}
 
@@ -45,7 +44,6 @@ func TestValidate_PeerNotRecognized_MultipleApplications(t *testing.T) {
 			newMockApplication(),
 			newMockApplication()},
 		allowList:           EmptyAllowList,
-		positiveResultCache: cache.NewTimeCache(cachingPeriod),
 		negativeResultCache: cache.NewTimeCache(cachingPeriod),
 	}
 
@@ -72,7 +70,6 @@ func TestValidate_PeerRecognized_FirstApplicationRecognizes(t *testing.T) {
 			application,
 			newMockApplication()},
 		allowList:           EmptyAllowList,
-		positiveResultCache: cache.NewTimeCache(cachingPeriod),
 		negativeResultCache: cache.NewTimeCache(cachingPeriod),
 	}
 
@@ -101,7 +98,6 @@ func TestValidate_PeerRecognized_SecondApplicationRecognizes(t *testing.T) {
 			newMockApplication(),
 			application},
 		allowList:           EmptyAllowList,
-		positiveResultCache: cache.NewTimeCache(cachingPeriod),
 		negativeResultCache: cache.NewTimeCache(cachingPeriod),
 	}
 
@@ -140,7 +136,6 @@ func TestValidate_PeerNotRecognized_FirstApplicationReturnedError(t *testing.T) 
 			application1,
 			application2},
 		allowList:           EmptyAllowList,
-		positiveResultCache: cache.NewTimeCache(cachingPeriod),
 		negativeResultCache: cache.NewTimeCache(cachingPeriod),
 	}
 
@@ -165,7 +160,6 @@ func TestValidate_PeerRecognized_Rechecked(t *testing.T) {
 	policy := &anyApplicationPolicy{
 		applications:        []Application{application},
 		allowList:           EmptyAllowList,
-		positiveResultCache: cache.NewTimeCache(cachingPeriod),
 		negativeResultCache: cache.NewTimeCache(cachingPeriod),
 	}
 
@@ -203,7 +197,6 @@ func TestValidate_PeerNotRecognized_CacheEmptied(t *testing.T) {
 	policy := &anyApplicationPolicy{
 		applications:        []Application{application},
 		allowList:           EmptyAllowList,
-		positiveResultCache: cache.NewTimeCache(cachingPeriod),
 		negativeResultCache: cache.NewTimeCache(cachingPeriod),
 	}
 
@@ -238,7 +231,6 @@ func TestValidate_PeerNotRecognized_Cached(t *testing.T) {
 	policy := &anyApplicationPolicy{
 		applications:        []Application{application},
 		allowList:           EmptyAllowList,
-		positiveResultCache: cache.NewTimeCache(cachingPeriod),
 		negativeResultCache: cache.NewTimeCache(cachingPeriod),
 	}
 
@@ -273,7 +265,6 @@ func TestValidate_PeerRecognized_CacheEmptied(t *testing.T) {
 	policy := &anyApplicationPolicy{
 		applications:        []Application{application},
 		allowList:           EmptyAllowList,
-		positiveResultCache: cache.NewTimeCache(cachingPeriod),
 		negativeResultCache: cache.NewTimeCache(cachingPeriod),
 	}
 
@@ -311,7 +302,6 @@ func TestValidate_PeerIsAllowlistedNode(t *testing.T) {
 	policy := &anyApplicationPolicy{
 		applications:        []Application{newMockApplication()},
 		allowList:           allowList,
-		positiveResultCache: cache.NewTimeCache(cachingPeriod),
 		negativeResultCache: cache.NewTimeCache(cachingPeriod),
 	}
 

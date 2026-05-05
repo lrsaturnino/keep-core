@@ -52,10 +52,6 @@ func (al *AllowList) Contains(operatorPublicKey *operator.PublicKey) bool {
 var EmptyAllowList = NewAllowList([]*operator.PublicKey{})
 
 const (
-	// PositiveIsRecognizedCachePeriod is retained for backward compatibility.
-	// Positive recognition results are rechecked on each validation.
-	PositiveIsRecognizedCachePeriod = 12 * time.Hour
-
 	// NegativeIsRecognizedCachePeriod is the time period the cache maintains
 	// the negative result of the last `IsRecognized` checks.
 	// We use the cache to minimize calls to the on-chain client.
@@ -73,7 +69,6 @@ func AnyApplicationPolicy(
 	return &anyApplicationPolicy{
 		applications:        applications,
 		allowList:           allowList,
-		positiveResultCache: cache.NewTimeCache(PositiveIsRecognizedCachePeriod),
 		negativeResultCache: cache.NewTimeCache(NegativeIsRecognizedCachePeriod),
 	}
 }
@@ -81,7 +76,6 @@ func AnyApplicationPolicy(
 type anyApplicationPolicy struct {
 	applications        []Application
 	allowList           *AllowList
-	positiveResultCache *cache.TimeCache
 	negativeResultCache *cache.TimeCache
 }
 
