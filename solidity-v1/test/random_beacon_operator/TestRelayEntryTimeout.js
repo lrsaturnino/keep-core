@@ -8,6 +8,7 @@ const { contract, accounts, web3 } = require("@openzeppelin/test-environment")
 const blsData = require("../helpers/data.js")
 const stakeDelegate = require("../helpers/stakeDelegate")
 const { initContracts } = require("../helpers/initContracts")
+const RelayEntryServiceStub = contract.fromArtifact("RelayEntryServiceStub")
 
 const BN = web3.utils.BN
 const chai = require("chai")
@@ -163,6 +164,36 @@ describe("KeepRandomBeaconOperator/RelayEntryTimeout", function () {
       expect(await operatorContract.isEntryInProgress()).to.be.true
       await expectEvent(receipt, "RelayEntryRequested")
       await expectRevert(requestRelayEntry(), "Beacon is busy")
+    })
+
+    it("should revert when the service entry notification fails after retry", async () => {
+      const failingServiceContract = await RelayEntryServiceStub.new({
+        from: deployer,
+      })
+      await operatorContract.addServiceContract(
+        failingServiceContract.address,
+        {
+          from: serviceContractUpgrader,
+        }
+      )
+
+      const timeout = await operatorContract.relayEntryTimeout()
+      await failingServiceContract.sign(
+        operatorContract.address,
+        0,
+        blsData.previousEntry,
+        {
+          value: entryFee,
+          from: serviceContract,
+        }
+      )
+      await time.advanceBlockTo((await time.latestBlock()).add(timeout))
+      await operatorContract.reportRelayEntryTimeout({ from: thirdParty })
+
+      await expectRevert(
+        operatorContract.relayEntry(blsData.groupSignature),
+        "Relay entry notification failed"
+      )
     })
 
     it("should not be retried when there are no more active groups", async () => {

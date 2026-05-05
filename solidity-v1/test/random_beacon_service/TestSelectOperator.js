@@ -5,6 +5,7 @@ const assert = require("chai").assert
 const { contract, accounts } = require("@openzeppelin/test-environment")
 const OperatorContract = contract.fromArtifact("KeepRandomBeaconOperatorStub")
 const GasPriceOracle = contract.fromArtifact("GasPriceOracle")
+const RelayEntryServiceStub = contract.fromArtifact("RelayEntryServiceStub")
 
 describe("TestKeepRandomBeaconService/SelectOperator", function () {
   let registry
@@ -152,6 +153,41 @@ describe("TestKeepRandomBeaconService/SelectOperator", function () {
     await expectRevert(
       serviceContract.selectOperatorContract(0, { from: accounts[0] }),
       "Total number of groups must be greater than zero."
+    )
+  })
+
+  it("should reject relay entry and callback calls from disabled operator contracts.", async function () {
+    const operatorCaller = await RelayEntryServiceStub.new({
+      from: accounts[0],
+    })
+
+    await registry.approveOperatorContract(operatorCaller.address, {
+      from: accounts[0],
+    })
+    await serviceContract.addOperatorContract(operatorCaller.address, {
+      from: accounts[0],
+    })
+    await registry.disableOperatorContract(operatorCaller.address, {
+      from: accounts[0],
+    })
+
+    await expectRevert(
+      operatorCaller.callServiceEntryCreated(
+        serviceContract.address,
+        1,
+        "0x1234",
+        accounts[1]
+      ),
+      "Operator contract is not approved"
+    )
+
+    await expectRevert(
+      operatorCaller.callServiceExecuteCallback(
+        serviceContract.address,
+        1,
+        123
+      ),
+      "Operator contract is not approved"
     )
   })
 })
