@@ -28,6 +28,21 @@
 #   Category 16 (PANIC/RECOVER & TIME PATTERNS): err-shadow and
 #     context-without-cancel false positives from existing test code patterns.
 #
-# Full workaround for Go test file commits:
+# When staging signing_done.go (or any Go file with time.NewTicker), an
+# additional false positive fires in category 1 (CONCURRENCY & GOROUTINE
+# SAFETY): the go.resource.ticker-no-stop ast-grep rule uses
+# `inside: has: pattern: $TICKER.Stop()` but ast-grep's `inside: has:`
+# cannot see sibling statements, so the rule fires unconditionally even
+# when `defer ticker.Stop()` is immediately present. Category 1 must be
+# added to the skip list:
+#
+#   Category 1 (CONCURRENCY): go.resource.ticker-no-stop fires for every
+#     time.NewTicker() call regardless of whether Stop() is deferred.
+#
+# Full workaround for Go test file commits that include signing_done.go:
+#
+#   UBS_SKIP_CATEGORIES=1,3,9,12,16 git commit ...
+#
+# Full workaround for Go test file commits (no signing_done.go):
 #
 #   UBS_SKIP_CATEGORIES=3,9,12,16 git commit ...
