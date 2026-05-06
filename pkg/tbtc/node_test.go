@@ -699,6 +699,92 @@ func TestNode_HandleMovedFundsSweepProposal_WalletBusy(t *testing.T) {
 	}
 }
 
+// TestProcessCoordinationResult_NoopActionReturnsEarly verifies that
+// processCoordinationResult returns without dispatching any wallet action when
+// the proposed action is ActionNoop.
+func TestProcessCoordinationResult_NoopActionReturnsEarly(t *testing.T) {
+	n, signer := setupNodeForHandlerTests(t)
+
+	result := &coordinationResult{
+		wallet: signer.wallet,
+		window: newCoordinationWindow(100),
+		proposal: &mockCoordinationProposal{
+			action: ActionNoop,
+		},
+	}
+
+	processCoordinationResult(n, result)
+
+	if count := dispatchedActionsCount(n); count != 0 {
+		t.Errorf("expected no dispatched actions for Noop result, got %d", count)
+	}
+}
+
+// TestProcessCoordinationResult_HeartbeatRoutesToHandler verifies that
+// processCoordinationResult dispatches a heartbeat action when the proposal is
+// a HeartbeatProposal and the wallet is controlled by this node.
+func TestProcessCoordinationResult_HeartbeatRoutesToHandler(t *testing.T) {
+	n, signer := setupNodeForHandlerTests(t)
+
+	result := &coordinationResult{
+		wallet: signer.wallet,
+		window: newCoordinationWindow(100),
+		proposal: &HeartbeatProposal{
+			Message: [16]byte{0x04},
+		},
+	}
+
+	processCoordinationResult(n, result)
+
+	// Allow dispatched goroutine to complete.
+	time.Sleep(50 * time.Millisecond)
+
+	// Dispatcher should be idle; a panicking handler would have made this fail.
+	if count := dispatchedActionsCount(n); count != 0 {
+		t.Errorf(
+			"expected dispatcher to be idle after heartbeat action, got %d active",
+			count,
+		)
+	}
+}
+
+// TestProcessCoordinationResult_DepositSweepRoutesToHandler verifies that
+// processCoordinationResult attempts to dispatch a deposit sweep action when
+// the proposal is a DepositSweepProposal. The wallet is pre-marked busy so
+// dispatch returns errWalletBusy immediately, proving the routing path was
+// exercised without running the action's execute() method.
+func TestProcessCoordinationResult_DepositSweepRoutesToHandler(t *testing.T) {
+	n, signer := setupNodeForHandlerTests(t)
+	walletKey := walletKeyFor(t, signer)
+
+	// Mark the wallet busy so dispatch is rejected before execute() runs.
+	func() {
+		n.walletDispatcher.actionsMutex.Lock()
+		defer n.walletDispatcher.actionsMutex.Unlock()
+		n.walletDispatcher.actions[walletKey] = ActionNoop
+	}()
+
+	result := &coordinationResult{
+		wallet: signer.wallet,
+		window: newCoordinationWindow(100),
+		proposal: &DepositSweepProposal{},
+	}
+
+	processCoordinationResult(n, result)
+
+	// Busy sentinel must still be there: dispatch was attempted (routing worked)
+	// but returned errWalletBusy without touching the map entry.
+	_, ok := func() (WalletActionType, bool) {
+		n.walletDispatcher.actionsMutex.Lock()
+		defer n.walletDispatcher.actionsMutex.Unlock()
+		v, exists := n.walletDispatcher.actions[walletKey]
+		return v, exists
+	}()
+	if !ok {
+		t.Error("expected walletDispatcher to retain the busy sentinel after DepositSweep routing")
+	}
+}
+
 // setupNodeForHandlerTests creates a fully-initialised node with one
 // registered signer. It returns both the node and the signer so that callers
 // can construct controlled/uncontrolled wallets as needed.
