@@ -267,7 +267,7 @@ func setupSigningExecutor(t *testing.T) *signingExecutor {
 		localProvider,
 		keyStorePersistence,
 		&mockPersistenceHandle{},
-		generator.StartScheduler(),
+		newTestScheduler(t),
 		&mockCoordinationProposalGenerator{},
 		Config{PreParamsPoolSize: 1, PreParamsGenerationTimeout: time.Hour},
 	)

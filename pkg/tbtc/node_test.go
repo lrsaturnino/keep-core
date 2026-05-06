@@ -58,7 +58,7 @@ func TestNode_GetSigningExecutor(t *testing.T) {
 		localProvider,
 		keyStorePersistence,
 		&mockPersistenceHandle{},
-		generator.StartScheduler(),
+		newTestScheduler(t),
 		&mockCoordinationProposalGenerator{},
 		Config{PreParamsPoolSize: 1, PreParamsGenerationTimeout: time.Hour},
 	)
@@ -190,7 +190,7 @@ func TestNode_GetCoordinationExecutor(t *testing.T) {
 		localProvider,
 		keyStorePersistence,
 		&mockPersistenceHandle{},
-		generator.StartScheduler(),
+		newTestScheduler(t),
 		&mockCoordinationProposalGenerator{},
 		Config{PreParamsPoolSize: 1, PreParamsGenerationTimeout: time.Hour},
 	)
@@ -327,7 +327,7 @@ func TestNode_RunCoordinationLayer(t *testing.T) {
 		localProvider,
 		keyStorePersistence,
 		&mockPersistenceHandle{},
-		generator.StartScheduler(),
+		newTestScheduler(t),
 		&mockCoordinationProposalGenerator{},
 		Config{PreParamsPoolSize: 1, PreParamsGenerationTimeout: time.Hour},
 	)
@@ -521,7 +521,7 @@ func TestNode_HandleHeartbeatProposal_DispatchesAction(t *testing.T) {
 	n.handleHeartbeatProposal(signer.wallet, &HeartbeatProposal{Message: [16]byte{0x03}}, 10, 100)
 
 	// Allow the dispatched goroutine to run and clean up.
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
 	if count := dispatchedActionsCount(n); count != 0 {
 		t.Errorf(
@@ -588,7 +588,7 @@ func TestNode_HandleDepositSweepProposal_DispatchesAction(t *testing.T) {
 	)
 
 	// Allow the dispatched goroutine to run and clean up.
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
 	if count := dispatchedActionsCount(n); count != 0 {
 		t.Errorf(
@@ -655,7 +655,7 @@ func TestNode_HandleRedemptionProposal_DispatchesAction(t *testing.T) {
 	)
 
 	// Allow the dispatched goroutine to run and clean up.
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
 	if count := dispatchedActionsCount(n); count != 0 {
 		t.Errorf(
@@ -717,7 +717,7 @@ func TestNode_HandleMovingFundsProposal_DispatchesAction(t *testing.T) {
 	n.handleMovingFundsProposal(signer.wallet, &MovingFundsProposal{}, 10, 100)
 
 	// Allow the dispatched goroutine to run and clean up.
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
 	if count := dispatchedActionsCount(n); count != 0 {
 		t.Errorf(
@@ -784,7 +784,7 @@ func TestNode_HandleMovedFundsSweepProposal_DispatchesAction(t *testing.T) {
 	)
 
 	// Allow the dispatched goroutine to run and clean up.
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
 	if count := dispatchedActionsCount(n); count != 0 {
 		t.Errorf(
@@ -1016,7 +1016,7 @@ func setupNodeForClosureTests(t *testing.T) (*node, *signer, *localChain) {
 		localProvider,
 		createMockKeyStorePersistence(t, signer),
 		&mockPersistenceHandle{},
-		generator.StartScheduler(),
+		newTestScheduler(t),
 		&mockCoordinationProposalGenerator{},
 		Config{PreParamsPoolSize: 1, PreParamsGenerationTimeout: time.Hour},
 	)
@@ -1195,7 +1195,7 @@ func setupNodeWithChain(t *testing.T) (*node, *signer, *localChain) {
 		localProvider,
 		createMockKeyStorePersistence(t, signer),
 		&mockPersistenceHandle{},
-		generator.StartScheduler(),
+		newTestScheduler(t),
 		&mockCoordinationProposalGenerator{},
 		Config{PreParamsPoolSize: 1, PreParamsGenerationTimeout: time.Hour},
 	)
@@ -1314,4 +1314,17 @@ func createMockKeyStorePersistence(
 	return &mockPersistenceHandle{
 		saved: descriptors,
 	}
+}
+
+// newTestScheduler creates a scheduler with a permanently-locked latch so that
+// checkProtocols stops all background workers within one tick (~1s). This
+// prevents CPU-intensive pre-params generation from running during tests that
+// do not exercise DKG.
+func newTestScheduler(t *testing.T) *generator.Scheduler {
+	t.Helper()
+	sched := generator.StartScheduler()
+	noGenLatch := generator.NewProtocolLatch()
+	noGenLatch.Lock()
+	sched.RegisterProtocol(noGenLatch)
+	return sched
 }

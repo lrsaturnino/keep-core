@@ -691,7 +691,7 @@ func TestDkgExecutor_ExecuteDkgIfEligible_PreParamExhaustion(t *testing.T) {
 	// returns 0 immediately -- satisfying membersCount(1) > preParamsCount(0).
 	tecdsaExec := dkg.NewExecutor(
 		&testutils.MockLogger{},
-		generator.StartScheduler(),
+		newTestScheduler(t),
 		&mockPersistenceHandle{},
 		1,         // preParamsPoolSize: 1 slot (not unbuffered)
 		time.Hour, // preParamsGenerationTimeout: avoids 0-deadline tight loop
