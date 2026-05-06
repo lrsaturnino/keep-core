@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/keep-network/keep-core/pkg/clientinfo"
 	"github.com/keep-network/keep-core/pkg/net"
 	"github.com/keep-network/keep-core/pkg/net/gen/pb"
 	"github.com/keep-network/keep-core/pkg/operator"
@@ -504,6 +505,80 @@ func TestChannel_IncomingMessageWorker_ContextCancel(t *testing.T) {
 	}
 }
 
+// TestChannel_SubscriptionWorker_ContextCancel verifies that subscriptionWorker
+// exits cleanly when the context is cancelled.
+func TestChannel_SubscriptionWorker_ContextCancel(t *testing.T) {
+	sub := &mockSubscription{}
+	ch := &channel{
+		subscription:         sub,
+		incomingMessageQueue: make(chan *pubsub.Message, incomingMessageThrottle),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		ch.subscriptionWorker(ctx)
+		close(done)
+	}()
+
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("subscriptionWorker did not exit after context cancel")
+	}
+}
+
+// TestChannel_MonitorQueueSizes_OverThreshold verifies that snapshotQueueSizes
+// records the current incoming queue and handler queue sizes as gauges.
+func TestChannel_MonitorQueueSizes_OverThreshold(t *testing.T) {
+	const incomingFill = 7
+	const handlerFill = 3
+
+	incomingQueue := make(chan *pubsub.Message, incomingMessageThrottle)
+	for i := 0; i < incomingFill; i++ {
+		incomingQueue <- &pubsub.Message{Message: &pubsubpb.Message{}}
+	}
+
+	handlerCh := make(chan net.Message, messageHandlerThrottle)
+	for i := 0; i < handlerFill; i++ {
+		handlerCh <- &mockNetMessage{}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ch := &channel{
+		incomingMessageQueue: incomingQueue,
+		messageHandlers:      []*messageHandler{{ctx: ctx, channel: handlerCh}},
+	}
+
+	recorder := &mockMetricsRecorder{}
+	ch.snapshotQueueSizes(recorder)
+
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+
+	if got := recorder.gauges[clientinfo.MetricIncomingMessageQueueSize]; got != incomingFill {
+		t.Errorf(
+			"expected incoming queue gauge %v, got %v",
+			incomingFill,
+			got,
+		)
+	}
+
+	handlerKey := fmt.Sprintf("%s_0", clientinfo.MetricMessageHandlerQueueSize)
+	if got := recorder.gauges[handlerKey]; got != handlerFill {
+		t.Errorf(
+			"expected handler queue gauge %v, got %v",
+			handlerFill,
+			got,
+		)
+	}
+}
+
 type mockTopicValidator struct {
 	registered   pubsub.Validator
 	registerErr  error
@@ -526,3 +601,12 @@ func (mv *mockTopicValidator) RegisterTopicValidator(
 func (mv *mockTopicValidator) UnregisterTopicValidator(_ string) error {
 	return mv.unregisterErr
 }
+
+type mockSubscription struct{}
+
+func (ms *mockSubscription) Next(ctx context.Context) (*pubsub.Message, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (ms *mockSubscription) Cancel() {}
