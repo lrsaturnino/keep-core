@@ -29,7 +29,7 @@ To quickly setup and start a client use the following scripts from the project r
 
 * `./scripts/install.sh`
 * `./scripts/initialize.sh`
-* `./scrtips/start.sh`
+* `./scripts/start.sh`
 
 == Installation scripts explained
 
