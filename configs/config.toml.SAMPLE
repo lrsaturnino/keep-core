@@ -104,8 +104,11 @@ Dir = "/my/secure/location"
 # Diagnostics module exposes the following information:
 # - list of connected peers along with their network id and ethereum operator address
 # - information about the client's network id and ethereum operator address
-[clientInfo]
-Port = 9601
+#
+# The metrics/diagnostics HTTP server is disabled by default. To enable it,
+# uncomment the section below and set Port to the listening port.
+# [clientInfo]
+# Port = 9601
 # NetworkMetricsTick = 60
 # EthereumMetricsTick = 600
 

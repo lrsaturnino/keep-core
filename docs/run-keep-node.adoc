@@ -165,7 +165,9 @@ monitoring.
 
 A *Network* Port has to be exposed publicly, so the peers can connect to your node.
 // TODO: Add link to the Rewards Allocation documentation.
-A *Diagnostics* Port has to be exposed publicly, for the Rewards Allocation. 
+A *Diagnostics* Port must be reachable from the Rewards Allocation prober via a
+trusted network path; do not expose it publicly. See <<clientInfo>> for the
+trusted-network requirement and the new opt-in default.
 
 IMPORTANT: Please update your firewall rules if necessary.
 

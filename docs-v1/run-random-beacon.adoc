@@ -482,9 +482,9 @@ metrics endpoint is exposed as well as the frequency with which the metrics are 
 
 Exposed metrics contain the value and timestamp at which they were collected.
 
-Example metrics endpoint call result:
+Example metrics endpoint call result (substitute `<port>` with the value of `clientInfo.port` you configured):
 ```
-$ curl localhost:9601/metrics
+$ curl localhost:<port>/metrics
 # TYPE connected_peers_count gauge
 connected_peers_count 108 1623235129569
 

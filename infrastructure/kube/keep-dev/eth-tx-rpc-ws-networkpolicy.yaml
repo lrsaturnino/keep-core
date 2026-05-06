@@ -1,0 +1,23 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: eth-tx-rpc-ws-ingress
+  namespace: ropsten
+  labels:
+    app: geth
+    type: tx
+spec:
+  podSelector:
+    matchLabels:
+      app: geth
+      type: tx
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8545
+        - protocol: TCP
+          port: 8546

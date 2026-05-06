@@ -14,7 +14,6 @@ docker run --detach \
     --log-opt max-size=100m \
     --log-opt max-file=3 \
     -p 3919:3919 \
-    -p 9601:9601 \
     thresholdnetwork/keep-client:latest \
     start \
     --ethereum.url $ETHEREUM_WS_URL \
