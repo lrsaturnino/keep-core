@@ -6,3 +6,10 @@
 #
 **/*.test.ts
 **/*.spec.ts
+#
+# Go-only commits: the UBS shadow workspace includes only staged files, so go.mod
+# is absent when only *.go files are staged. This triggers a false positive in
+# category 12 (MODULE & BUILD HYGIENE). Use the workaround below until UBS
+# supports automatic go.mod inclusion in staged-file mode:
+#
+#   UBS_SKIP_CATEGORIES=12 git commit ...
