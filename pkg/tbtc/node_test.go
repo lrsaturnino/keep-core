@@ -785,10 +785,10 @@ func TestProcessCoordinationResult_DepositSweepRoutesToHandler(t *testing.T) {
 	}
 }
 
-// setupNodeForHandlerTests creates a fully-initialised node with one
-// registered signer. It returns both the node and the signer so that callers
-// can construct controlled/uncontrolled wallets as needed.
-func setupNodeForHandlerTests(t *testing.T) (*node, *signer) {
+// setupNodeForClosureTests creates a node backed by a fast-block localChain
+// (1 ms per block) so that WaitForBlockConfirmations (32 blocks) completes in
+// ~32 ms instead of seconds.
+func setupNodeForClosureTests(t *testing.T) (*node, *signer, *localChain) {
 	t.Helper()
 
 	groupParameters := &GroupParameters{
@@ -797,24 +797,24 @@ func setupNodeForHandlerTests(t *testing.T) (*node, *signer) {
 		HonestThreshold: 3,
 	}
 
-	localChain := Connect()
+	lc := Connect(1 * time.Millisecond)
 	localProvider := local.Connect()
 
 	signer := createMockSigner(t)
 
 	walletPublicKeyHash := bitcoin.PublicKeyHash(signer.wallet.publicKey)
-	walletID, err := localChain.CalculateWalletID(signer.wallet.publicKey)
+	walletID, err := lc.CalculateWalletID(signer.wallet.publicKey)
 	if err != nil {
 		t.Fatal(err)
 	}
-	localChain.setWallet(walletPublicKeyHash, &WalletChainData{
+	lc.setWallet(walletPublicKeyHash, &WalletChainData{
 		EcdsaWalletID: walletID,
 		State:         StateLive,
 	})
 
 	n, err := newNode(
 		groupParameters,
-		localChain,
+		lc,
 		newLocalBitcoinChain(),
 		localProvider,
 		createMockKeyStorePersistence(t, signer),
@@ -827,6 +827,192 @@ func setupNodeForHandlerTests(t *testing.T) (*node, *signer) {
 		t.Fatal(err)
 	}
 
+	return n, signer, lc
+}
+
+// TestArchiveClosedWallets_ArchivesClosedWallet verifies that a wallet whose
+// on-chain state is StateClosed is removed from the node's registry.
+func TestArchiveClosedWallets_ArchivesClosedWallet(t *testing.T) {
+	n, signer, lc := setupNodeWithChain(t)
+
+	walletPublicKeyHash := bitcoin.PublicKeyHash(signer.wallet.publicKey)
+	walletID, err := lc.CalculateWalletID(signer.wallet.publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lc.setWallet(walletPublicKeyHash, &WalletChainData{
+		EcdsaWalletID: walletID,
+		State:         StateClosed,
+	})
+
+	if err := n.archiveClosedWallets(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if keys := n.walletRegistry.getWalletsPublicKeys(); len(keys) != 0 {
+		t.Errorf("expected empty registry after archiving, got %d wallets", len(keys))
+	}
+}
+
+// TestArchiveClosedWallets_ArchivesTerminatedWallet verifies that a wallet in
+// StateTerminated is also removed from the registry.
+func TestArchiveClosedWallets_ArchivesTerminatedWallet(t *testing.T) {
+	n, signer, lc := setupNodeWithChain(t)
+
+	walletPublicKeyHash := bitcoin.PublicKeyHash(signer.wallet.publicKey)
+	walletID, err := lc.CalculateWalletID(signer.wallet.publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lc.setWallet(walletPublicKeyHash, &WalletChainData{
+		EcdsaWalletID: walletID,
+		State:         StateTerminated,
+	})
+
+	if err := n.archiveClosedWallets(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if keys := n.walletRegistry.getWalletsPublicKeys(); len(keys) != 0 {
+		t.Errorf("expected empty registry after archiving terminated wallet, got %d wallets", len(keys))
+	}
+}
+
+// TestArchiveClosedWallets_KeepsLiveWallet verifies that a live wallet is not
+// removed from the registry.
+func TestArchiveClosedWallets_KeepsLiveWallet(t *testing.T) {
+	n, _, _ := setupNodeWithChain(t)
+
+	if err := n.archiveClosedWallets(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if keys := n.walletRegistry.getWalletsPublicKeys(); len(keys) != 1 {
+		t.Errorf("expected 1 wallet in registry, got %d", len(keys))
+	}
+}
+
+// TestHandleWalletClosure_ArchivesWallet verifies the happy path: after
+// WaitForBlockConfirmations, a closed wallet is removed from the registry.
+func TestHandleWalletClosure_ArchivesWallet(t *testing.T) {
+	n, signer, lc := setupNodeForClosureTests(t)
+
+	walletPublicKeyHash := bitcoin.PublicKeyHash(signer.wallet.publicKey)
+	walletID, err := lc.CalculateWalletID(signer.wallet.publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Close the wallet before calling handleWalletClosure so that stateCheck
+	// confirms closure immediately after the 32-block wait.
+	lc.setWallet(walletPublicKeyHash, &WalletChainData{
+		EcdsaWalletID: walletID,
+		State:         StateClosed,
+	})
+
+	if err := n.handleWalletClosure(walletID); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if keys := n.walletRegistry.getWalletsPublicKeys(); len(keys) != 0 {
+		t.Errorf("expected empty registry after closure handling, got %d wallets", len(keys))
+	}
+}
+
+// TestHandleWalletClosure_SkipsUncontrolledWallet verifies that when the
+// closed wallet is not in the node's registry the function returns nil without
+// touching any other wallet.
+func TestHandleWalletClosure_SkipsUncontrolledWallet(t *testing.T) {
+	n, signer, lc := setupNodeForClosureTests(t)
+
+	// Build a wallet that is NOT in the node's registry but IS on the chain.
+	uncontrolled := uncontrolledWalletFor(signer)
+	uncontrolledPKH := bitcoin.PublicKeyHash(uncontrolled.publicKey)
+	uncontrolledID, err := lc.CalculateWalletID(uncontrolled.publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lc.setWallet(uncontrolledPKH, &WalletChainData{
+		EcdsaWalletID: uncontrolledID,
+		State:         StateClosed,
+	})
+
+	if err := n.handleWalletClosure(uncontrolledID); err != nil {
+		t.Fatalf("unexpected error for uncontrolled wallet: %v", err)
+	}
+
+	// Signer's own wallet must be untouched.
+	if keys := n.walletRegistry.getWalletsPublicKeys(); len(keys) != 1 {
+		t.Errorf("expected signer wallet to remain in registry, got %d wallets", len(keys))
+	}
+}
+
+// TestHandleWalletClosure_ReturnsErrorWhenNotConfirmed verifies that when the
+// stateCheck finds the wallet still live (no reorg confirmed), an error is
+// returned.
+func TestHandleWalletClosure_ReturnsErrorWhenNotConfirmed(t *testing.T) {
+	n, signer, lc := setupNodeForClosureTests(t)
+
+	walletID, err := lc.CalculateWalletID(signer.wallet.publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// wallet is StateLive → IsWalletRegistered returns true → stateCheck = false
+	if err := n.handleWalletClosure(walletID); err == nil {
+		t.Fatal("expected error for unconfirmed closure, got nil")
+	}
+}
+
+// setupNodeWithChain creates a fully-initialised node and returns the node,
+// the signer, and the underlying *localChain so callers can manipulate chain
+// state (e.g. close/terminate a wallet) after creation.
+func setupNodeWithChain(t *testing.T) (*node, *signer, *localChain) {
+	t.Helper()
+
+	groupParameters := &GroupParameters{
+		GroupSize:       5,
+		GroupQuorum:     4,
+		HonestThreshold: 3,
+	}
+
+	lc := Connect()
+	localProvider := local.Connect()
+
+	signer := createMockSigner(t)
+
+	walletPublicKeyHash := bitcoin.PublicKeyHash(signer.wallet.publicKey)
+	walletID, err := lc.CalculateWalletID(signer.wallet.publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lc.setWallet(walletPublicKeyHash, &WalletChainData{
+		EcdsaWalletID: walletID,
+		State:         StateLive,
+	})
+
+	n, err := newNode(
+		groupParameters,
+		lc,
+		newLocalBitcoinChain(),
+		localProvider,
+		createMockKeyStorePersistence(t, signer),
+		&mockPersistenceHandle{},
+		generator.StartScheduler(),
+		&mockCoordinationProposalGenerator{},
+		Config{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return n, signer, lc
+}
+
+// setupNodeForHandlerTests is a convenience wrapper that discards the chain.
+func setupNodeForHandlerTests(t *testing.T) (*node, *signer) {
+	t.Helper()
+	n, signer, _ := setupNodeWithChain(t)
 	return n, signer
 }
 
