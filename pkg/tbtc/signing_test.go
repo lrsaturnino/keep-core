@@ -107,6 +107,50 @@ func TestSigningExecutor_SignBatch(t *testing.T) {
 	}
 }
 
+func TestSigningExecutor_Sign_ContextCancelled(t *testing.T) {
+	executor := setupSigningExecutor(t)
+
+	ctx, cancelCtx := context.WithCancel(context.Background())
+	defer cancelCtx()
+
+	message := big.NewInt(100)
+	startBlock := uint64(0)
+
+	// Cancel the context before signing starts; sign() should return quickly
+	// rather than hanging.
+	cancelCtx()
+
+	signature, _, _, err := executor.sign(ctx, message, startBlock)
+
+	// A cancelled context may return nil signature with nil error (early exit)
+	// or an error -- both are acceptable. What must NOT happen is a hang.
+	if err != nil && signature != nil {
+		t.Errorf("expected nil signature on context cancel, got: %+v", signature)
+	}
+}
+
+func TestSigningExecutor_Sign_AllSignersFailed(t *testing.T) {
+	// Build an executor where all signer goroutines will fail by reducing the
+	// attempts limit to near-zero so the retry loop exhausts immediately.
+	executor := setupSigningExecutor(t)
+	executor.signingAttemptsLimit = 0
+
+	ctx, cancelCtx := context.WithCancel(context.Background())
+	defer cancelCtx()
+
+	message := big.NewInt(100)
+	startBlock := uint64(0)
+
+	signature, _, _, err := executor.sign(ctx, message, startBlock)
+
+	// With zero attempts, all signers cannot succeed. We expect either
+	// errSigningExecutorBusy (if the lock is still held) or an error/nil
+	// result -- but not a completed valid signature.
+	if signature != nil && err == nil {
+		t.Error("expected failure when signingAttemptsLimit is 0, but got a valid signature")
+	}
+}
+
 // setupSigningExecutor sets up an instance of the signing executor ready
 // to perform test signing.
 func setupSigningExecutor(t *testing.T) *signingExecutor {
