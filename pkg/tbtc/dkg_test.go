@@ -14,8 +14,11 @@ import (
 
 	"github.com/keep-network/keep-core/internal/testutils"
 	"github.com/keep-network/keep-core/pkg/chain"
+	"github.com/keep-network/keep-core/pkg/chain/local_v1"
 	"github.com/keep-network/keep-core/pkg/generator"
 	"github.com/keep-network/keep-core/pkg/internal/tecdsatest"
+	"github.com/keep-network/keep-core/pkg/net/local"
+	"github.com/keep-network/keep-core/pkg/operator"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/tecdsa"
 	"github.com/keep-network/keep-core/pkg/tecdsa/dkg"
@@ -704,4 +707,99 @@ func TestDkgExecutor_ExecuteDkgIfEligible_PreParamExhaustion(t *testing.T) {
 	}
 
 	de.executeDkgIfEligible(big.NewInt(1), 0, 0)
+}
+
+// TestDkgExecutor_ExecuteDkgValidation_ValidationCheckError verifies that
+// executeDkgValidation returns gracefully when IsDKGResultValid returns an
+// error (e.g. chain temporarily unavailable).
+func TestDkgExecutor_ExecuteDkgValidation_ValidationCheckError(t *testing.T) {
+	c := &dkgResultValidErrChain{Connect()}
+	de := &dkgExecutor{chain: c}
+
+	de.executeDkgValidation(big.NewInt(1), 0, &DKGChainResult{}, [32]byte{})
+}
+
+// TestDkgExecutor_ExecuteDkgValidation_InvalidResult_ChallengeFails verifies
+// that executeDkgValidation returns after logging an error when the result is
+// invalid but ChallengeDKGResult fails because the chain is not in Challenge
+// state (the default Idle state of localChain).
+func TestDkgExecutor_ExecuteDkgValidation_InvalidResult_ChallengeFails(t *testing.T) {
+	// localChain defaults: dkgResultValid=false, dkgState=Idle.
+	// IsDKGResultValid → (false, nil); ChallengeDKGResult → error.
+	de := &dkgExecutor{chain: Connect()}
+
+	de.executeDkgValidation(big.NewInt(1), 0, &DKGChainResult{}, [32]byte{})
+}
+
+// TestDkgExecutor_ExecuteDkgValidation_ValidResult_NotMember verifies that
+// executeDkgValidation returns early with "not eligible" when the result is
+// valid but the current operator is not among the DKG participants.
+func TestDkgExecutor_ExecuteDkgValidation_ValidResult_NotMember(t *testing.T) {
+	c := Connect()
+	c.setDKGResultValidity(true) // IsDKGResultValid → (true, nil)
+
+	de := &dkgExecutor{
+		chain: c,
+		operatorIDFn: func() (chain.OperatorID, error) {
+			return chain.OperatorID(99), nil // not in result.Members
+		},
+	}
+
+	result := &DKGChainResult{
+		Members: chain.OperatorIDs{1, 2, 3, 4, 5},
+	}
+
+	de.executeDkgValidation(big.NewInt(1), 0, result, [32]byte{})
+}
+
+// TestDkgExecutor_GenerateSigningGroup_DKGParametersError verifies that
+// generateSigningGroup returns gracefully when DKGParameters returns an error.
+// setupBroadcastChannel succeeds; the function exits before spawning goroutines.
+func TestDkgExecutor_GenerateSigningGroup_DKGParametersError(t *testing.T) {
+	_, operatorPublicKey, err := operator.GenerateKeyPair(local_v1.DefaultCurve)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c := &dkgParamsErrChain{Connect()}
+	netProvider := local.ConnectWithKey(operatorPublicKey)
+
+	de := &dkgExecutor{
+		chain:       c,
+		netProvider: netProvider,
+	}
+
+	gsr := &GroupSelectionResult{
+		OperatorsIDs:       chain.OperatorIDs{1, 2, 3, 4, 5},
+		OperatorsAddresses: chain.Addresses{"0xAA", "0xBB", "0xCC", "0xDD", "0xEE"},
+	}
+
+	de.generateSigningGroup(
+		logger.With(),
+		big.NewInt(1),
+		[]uint8{1},
+		gsr,
+		0,
+		0,
+	)
+}
+
+// dkgResultValidErrChain wraps localChain and returns an error from
+// IsDKGResultValid to exercise the early-return error path in executeDkgValidation.
+type dkgResultValidErrChain struct {
+	*localChain
+}
+
+func (c *dkgResultValidErrChain) IsDKGResultValid(*DKGChainResult) (bool, error) {
+	return false, fmt.Errorf("chain unavailable")
+}
+
+// dkgParamsErrChain wraps localChain and returns an error from DKGParameters
+// to exercise the early-return error path in generateSigningGroup.
+type dkgParamsErrChain struct {
+	*localChain
+}
+
+func (c *dkgParamsErrChain) DKGParameters() (*DKGParameters, error) {
+	return nil, fmt.Errorf("params unavailable")
 }
