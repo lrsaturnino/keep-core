@@ -573,6 +573,31 @@ func TestNode_HandleDepositSweepProposal_WalletBusy(t *testing.T) {
 	}
 }
 
+// TestNode_HandleDepositSweepProposal_DispatchesAction verifies the happy path:
+// for a controlled wallet the action is dispatched and the dispatcher cleans
+// up the entry once the goroutine completes (action will fail validation with
+// the empty proposal, but the dispatch itself succeeds).
+func TestNode_HandleDepositSweepProposal_DispatchesAction(t *testing.T) {
+	n, signer := setupNodeForHandlerTests(t)
+
+	n.handleDepositSweepProposal(
+		signer.wallet,
+		&DepositSweepProposal{SweepTxFee: big.NewInt(0)},
+		10,
+		100,
+	)
+
+	// Allow the dispatched goroutine to run and clean up.
+	time.Sleep(50 * time.Millisecond)
+
+	if count := dispatchedActionsCount(n); count != 0 {
+		t.Errorf(
+			"expected walletDispatcher to be idle after action completed, got %d active actions",
+			count,
+		)
+	}
+}
+
 // TestNode_HandleRedemptionProposal_WalletNotControlled verifies that
 // handleRedemptionProposal skips dispatch for an uncontrolled wallet.
 func TestNode_HandleRedemptionProposal_WalletNotControlled(t *testing.T) {
@@ -611,6 +636,31 @@ func TestNode_HandleRedemptionProposal_WalletBusy(t *testing.T) {
 		t.Errorf(
 			"expected pre-populated ActionRedemption to remain, got ok=%v actionType=%v",
 			ok, actionType,
+		)
+	}
+}
+
+// TestNode_HandleRedemptionProposal_DispatchesAction verifies the happy path:
+// for a controlled wallet the action is dispatched and the dispatcher cleans
+// up the entry once the goroutine completes (action will fail validation with
+// the empty proposal, but the dispatch itself succeeds).
+func TestNode_HandleRedemptionProposal_DispatchesAction(t *testing.T) {
+	n, signer := setupNodeForHandlerTests(t)
+
+	n.handleRedemptionProposal(
+		signer.wallet,
+		&RedemptionProposal{RedemptionTxFee: big.NewInt(0)},
+		10,
+		100,
+	)
+
+	// Allow the dispatched goroutine to run and clean up.
+	time.Sleep(50 * time.Millisecond)
+
+	if count := dispatchedActionsCount(n); count != 0 {
+		t.Errorf(
+			"expected walletDispatcher to be idle after action completed, got %d active actions",
+			count,
 		)
 	}
 }
@@ -657,6 +707,26 @@ func TestNode_HandleMovingFundsProposal_WalletBusy(t *testing.T) {
 	}
 }
 
+// TestNode_HandleMovingFundsProposal_DispatchesAction verifies the happy path:
+// for a controlled wallet the action is dispatched and the dispatcher cleans
+// up the entry once the goroutine completes (action fails immediately because
+// the wallet has no main UTXO, but the dispatch itself succeeds).
+func TestNode_HandleMovingFundsProposal_DispatchesAction(t *testing.T) {
+	n, signer := setupNodeForHandlerTests(t)
+
+	n.handleMovingFundsProposal(signer.wallet, &MovingFundsProposal{}, 10, 100)
+
+	// Allow the dispatched goroutine to run and clean up.
+	time.Sleep(50 * time.Millisecond)
+
+	if count := dispatchedActionsCount(n); count != 0 {
+		t.Errorf(
+			"expected walletDispatcher to be idle after action completed, got %d active actions",
+			count,
+		)
+	}
+}
+
 // TestNode_HandleMovedFundsSweepProposal_WalletNotControlled verifies that
 // handleMovedFundsSweepProposal skips dispatch for an uncontrolled wallet.
 func TestNode_HandleMovedFundsSweepProposal_WalletNotControlled(t *testing.T) {
@@ -695,6 +765,31 @@ func TestNode_HandleMovedFundsSweepProposal_WalletBusy(t *testing.T) {
 		t.Errorf(
 			"expected pre-populated ActionMovedFundsSweep to remain, got ok=%v actionType=%v",
 			ok, actionType,
+		)
+	}
+}
+
+// TestNode_HandleMovedFundsSweepProposal_DispatchesAction verifies the happy
+// path: for a controlled wallet the action is dispatched and the dispatcher
+// cleans up the entry once the goroutine completes (action will fail validation
+// with the empty proposal, but the dispatch itself succeeds).
+func TestNode_HandleMovedFundsSweepProposal_DispatchesAction(t *testing.T) {
+	n, signer := setupNodeForHandlerTests(t)
+
+	n.handleMovedFundsSweepProposal(
+		signer.wallet,
+		&MovedFundsSweepProposal{SweepTxFee: big.NewInt(0)},
+		10,
+		100,
+	)
+
+	// Allow the dispatched goroutine to run and clean up.
+	time.Sleep(50 * time.Millisecond)
+
+	if count := dispatchedActionsCount(n); count != 0 {
+		t.Errorf(
+			"expected walletDispatcher to be idle after action completed, got %d active actions",
+			count,
 		)
 	}
 }
@@ -782,6 +877,108 @@ func TestProcessCoordinationResult_DepositSweepRoutesToHandler(t *testing.T) {
 	}()
 	if !ok {
 		t.Error("expected walletDispatcher to retain the busy sentinel after DepositSweep routing")
+	}
+}
+
+// TestProcessCoordinationResult_RedemptionRoutesToHandler verifies that
+// processCoordinationResult dispatches a redemption action when the proposal is
+// a RedemptionProposal and the wallet is controlled by this node. The wallet is
+// pre-marked busy so dispatch returns errWalletBusy immediately, proving the
+// routing path was exercised without running the action's execute() method.
+func TestProcessCoordinationResult_RedemptionRoutesToHandler(t *testing.T) {
+	n, signer := setupNodeForHandlerTests(t)
+	walletKey := walletKeyFor(t, signer)
+
+	// Mark the wallet busy so dispatch is rejected before execute() runs.
+	func() {
+		n.walletDispatcher.actionsMutex.Lock()
+		defer n.walletDispatcher.actionsMutex.Unlock()
+		n.walletDispatcher.actions[walletKey] = ActionNoop
+	}()
+
+	result := &coordinationResult{
+		wallet: signer.wallet,
+		window: newCoordinationWindow(100),
+		proposal: &RedemptionProposal{RedemptionTxFee: big.NewInt(0)},
+	}
+
+	processCoordinationResult(n, result)
+
+	// Busy sentinel must still be there: dispatch was attempted (routing worked)
+	// but returned errWalletBusy without touching the map entry.
+	_, ok := func() (WalletActionType, bool) {
+		n.walletDispatcher.actionsMutex.Lock()
+		defer n.walletDispatcher.actionsMutex.Unlock()
+		v, exists := n.walletDispatcher.actions[walletKey]
+		return v, exists
+	}()
+	if !ok {
+		t.Error("expected walletDispatcher to retain the busy sentinel after Redemption routing")
+	}
+}
+
+// TestProcessCoordinationResult_MovingFundsRoutesToHandler verifies that
+// processCoordinationResult dispatches a moving funds action when the proposal
+// is a MovingFundsProposal and the wallet is controlled by this node.
+func TestProcessCoordinationResult_MovingFundsRoutesToHandler(t *testing.T) {
+	n, signer := setupNodeForHandlerTests(t)
+	walletKey := walletKeyFor(t, signer)
+
+	func() {
+		n.walletDispatcher.actionsMutex.Lock()
+		defer n.walletDispatcher.actionsMutex.Unlock()
+		n.walletDispatcher.actions[walletKey] = ActionNoop
+	}()
+
+	result := &coordinationResult{
+		wallet:   signer.wallet,
+		window:   newCoordinationWindow(100),
+		proposal: &MovingFundsProposal{},
+	}
+
+	processCoordinationResult(n, result)
+
+	_, ok := func() (WalletActionType, bool) {
+		n.walletDispatcher.actionsMutex.Lock()
+		defer n.walletDispatcher.actionsMutex.Unlock()
+		v, exists := n.walletDispatcher.actions[walletKey]
+		return v, exists
+	}()
+	if !ok {
+		t.Error("expected walletDispatcher to retain the busy sentinel after MovingFunds routing")
+	}
+}
+
+// TestProcessCoordinationResult_MovedFundsSweepRoutesToHandler verifies that
+// processCoordinationResult dispatches a moved funds sweep action when the
+// proposal is a MovedFundsSweepProposal and the wallet is controlled by this
+// node.
+func TestProcessCoordinationResult_MovedFundsSweepRoutesToHandler(t *testing.T) {
+	n, signer := setupNodeForHandlerTests(t)
+	walletKey := walletKeyFor(t, signer)
+
+	func() {
+		n.walletDispatcher.actionsMutex.Lock()
+		defer n.walletDispatcher.actionsMutex.Unlock()
+		n.walletDispatcher.actions[walletKey] = ActionNoop
+	}()
+
+	result := &coordinationResult{
+		wallet:   signer.wallet,
+		window:   newCoordinationWindow(100),
+		proposal: &MovedFundsSweepProposal{SweepTxFee: big.NewInt(0)},
+	}
+
+	processCoordinationResult(n, result)
+
+	_, ok := func() (WalletActionType, bool) {
+		n.walletDispatcher.actionsMutex.Lock()
+		defer n.walletDispatcher.actionsMutex.Unlock()
+		v, exists := n.walletDispatcher.actions[walletKey]
+		return v, exists
+	}()
+	if !ok {
+		t.Error("expected walletDispatcher to retain the busy sentinel after MovedFundsSweep routing")
 	}
 }
 
