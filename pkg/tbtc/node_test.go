@@ -465,6 +465,211 @@ func (mcp *mockCoordinationProposal) Unmarshal(bytes []byte) error {
 	panic("unsupported")
 }
 
+// TestNode_HandleHeartbeatProposal_WalletNotControlled verifies that
+// handleHeartbeatProposal returns without dispatching when the node does not
+// control any signers for the given wallet.
+func TestNode_HandleHeartbeatProposal_WalletNotControlled(t *testing.T) {
+	groupParameters := &GroupParameters{
+		GroupSize:       5,
+		GroupQuorum:     4,
+		HonestThreshold: 3,
+	}
+
+	localChain := Connect()
+	localProvider := local.Connect()
+
+	signer := createMockSigner(t)
+
+	walletPublicKeyHash := bitcoin.PublicKeyHash(signer.wallet.publicKey)
+	walletID, err := localChain.CalculateWalletID(signer.wallet.publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localChain.setWallet(walletPublicKeyHash, &WalletChainData{
+		EcdsaWalletID: walletID,
+		State:         StateLive,
+	})
+
+	keyStorePersistence := createMockKeyStorePersistence(t, signer)
+
+	n, err := newNode(
+		groupParameters,
+		localChain,
+		newLocalBitcoinChain(),
+		localProvider,
+		keyStorePersistence,
+		&mockPersistenceHandle{},
+		generator.StartScheduler(),
+		&mockCoordinationProposalGenerator{},
+		Config{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Construct a wallet key not controlled by this node (double the base point).
+	walletPublicKey := signer.wallet.publicKey
+	x, y := walletPublicKey.Curve.Double(walletPublicKey.X, walletPublicKey.Y)
+	uncontrolledWallet := wallet{
+		publicKey: &ecdsa.PublicKey{
+			Curve: walletPublicKey.Curve,
+			X:     x,
+			Y:     y,
+		},
+		signingGroupOperators: signer.wallet.signingGroupOperators,
+	}
+
+	proposal := &HeartbeatProposal{Message: [16]byte{0x01}}
+
+	n.handleHeartbeatProposal(uncontrolledWallet, proposal, 10, 100)
+
+	n.walletDispatcher.actionsMutex.Lock()
+	actionsCount := len(n.walletDispatcher.actions)
+	n.walletDispatcher.actionsMutex.Unlock()
+
+	if actionsCount != 0 {
+		t.Errorf(
+			"expected no dispatched actions for uncontrolled wallet, got %d",
+			actionsCount,
+		)
+	}
+}
+
+// TestNode_HandleHeartbeatProposal_WalletBusy verifies that
+// handleHeartbeatProposal does not crash when the wallet dispatcher returns
+// errWalletBusy (another action is already running on the same wallet).
+func TestNode_HandleHeartbeatProposal_WalletBusy(t *testing.T) {
+	groupParameters := &GroupParameters{
+		GroupSize:       5,
+		GroupQuorum:     4,
+		HonestThreshold: 3,
+	}
+
+	localChain := Connect()
+	localProvider := local.Connect()
+
+	signer := createMockSigner(t)
+
+	walletPublicKeyHash := bitcoin.PublicKeyHash(signer.wallet.publicKey)
+	walletID, err := localChain.CalculateWalletID(signer.wallet.publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localChain.setWallet(walletPublicKeyHash, &WalletChainData{
+		EcdsaWalletID: walletID,
+		State:         StateLive,
+	})
+
+	keyStorePersistence := createMockKeyStorePersistence(t, signer)
+
+	n, err := newNode(
+		groupParameters,
+		localChain,
+		newLocalBitcoinChain(),
+		localProvider,
+		keyStorePersistence,
+		&mockPersistenceHandle{},
+		generator.StartScheduler(),
+		&mockCoordinationProposalGenerator{},
+		Config{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	walletPublicKeyBytes, err := marshalPublicKey(signer.wallet.publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	walletKey := hex.EncodeToString(walletPublicKeyBytes)
+
+	// Simulate a wallet already executing an action.
+	n.walletDispatcher.actionsMutex.Lock()
+	n.walletDispatcher.actions[walletKey] = ActionHeartbeat
+	n.walletDispatcher.actionsMutex.Unlock()
+
+	proposal := &HeartbeatProposal{Message: [16]byte{0x02}}
+
+	// Must not panic even though dispatch will return errWalletBusy.
+	n.handleHeartbeatProposal(signer.wallet, proposal, 10, 100)
+
+	// The pre-populated entry must still be there -- our call did not modify it.
+	n.walletDispatcher.actionsMutex.Lock()
+	actionType, ok := n.walletDispatcher.actions[walletKey]
+	n.walletDispatcher.actionsMutex.Unlock()
+
+	if !ok || actionType != ActionHeartbeat {
+		t.Errorf(
+			"expected actions map to retain pre-populated ActionHeartbeat, "+
+				"got ok=%v actionType=%v",
+			ok, actionType,
+		)
+	}
+}
+
+// TestNode_HandleHeartbeatProposal_DispatchesAction verifies the happy path:
+// for a controlled wallet the action is dispatched and the dispatcher cleans
+// up the entry once the goroutine completes.
+func TestNode_HandleHeartbeatProposal_DispatchesAction(t *testing.T) {
+	groupParameters := &GroupParameters{
+		GroupSize:       5,
+		GroupQuorum:     4,
+		HonestThreshold: 3,
+	}
+
+	localChain := Connect()
+	localProvider := local.Connect()
+
+	signer := createMockSigner(t)
+
+	walletPublicKeyHash := bitcoin.PublicKeyHash(signer.wallet.publicKey)
+	walletID, err := localChain.CalculateWalletID(signer.wallet.publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localChain.setWallet(walletPublicKeyHash, &WalletChainData{
+		EcdsaWalletID: walletID,
+		State:         StateLive,
+	})
+
+	keyStorePersistence := createMockKeyStorePersistence(t, signer)
+
+	n, err := newNode(
+		groupParameters,
+		localChain,
+		newLocalBitcoinChain(),
+		localProvider,
+		keyStorePersistence,
+		&mockPersistenceHandle{},
+		generator.StartScheduler(),
+		&mockCoordinationProposalGenerator{},
+		Config{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	proposal := &HeartbeatProposal{Message: [16]byte{0x03}}
+
+	// Must dispatch without panicking.
+	n.handleHeartbeatProposal(signer.wallet, proposal, 10, 100)
+
+	// Allow the dispatched goroutine to run and clean up.
+	time.Sleep(50 * time.Millisecond)
+
+	n.walletDispatcher.actionsMutex.Lock()
+	actionsCount := len(n.walletDispatcher.actions)
+	n.walletDispatcher.actionsMutex.Unlock()
+
+	if actionsCount != 0 {
+		t.Errorf(
+			"expected walletDispatcher to be idle after action completed, "+
+				"got %d active actions",
+			actionsCount,
+		)
+	}
+}
+
 // createMockSigner creates a mock signer instance that can be used for
 // test cases that needs a placeholder signer. The produced signer cannot
 // be used to test actual signing scenarios.
