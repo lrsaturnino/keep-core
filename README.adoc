@@ -39,7 +39,7 @@ A good place to start is link:docs/[the docs directory].
 === Running a Node
 
 To run your own node in the Keep Network, follow the
-link:https://docs.keep.network/run-keep-node.html[Run Keep Node] doc. Feedback
+link:docs/run-keep-node.adoc[Run Keep Node] doc. Feedback
 on this process and the documentation
 https://github.com/keep-network/keep-core/issues[is appreciated!]
 
