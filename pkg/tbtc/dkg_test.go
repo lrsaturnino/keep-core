@@ -17,6 +17,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/chain/local_v1"
 	"github.com/keep-network/keep-core/pkg/generator"
 	"github.com/keep-network/keep-core/pkg/internal/tecdsatest"
+	"github.com/keep-network/keep-core/pkg/net"
 	"github.com/keep-network/keep-core/pkg/net/local"
 	"github.com/keep-network/keep-core/pkg/operator"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
@@ -842,3 +843,43 @@ type dkgParamsErrChain struct {
 func (c *dkgParamsErrChain) DKGParameters() (*DKGParameters, error) {
 	return nil, fmt.Errorf("params unavailable")
 }
+
+// TestDkgExecutor_GenerateSigningGroup_BroadcastChannelError verifies that
+// generateSigningGroup returns gracefully when the net.Provider fails to
+// create a broadcast channel. The function exits before spawning goroutines.
+func TestDkgExecutor_GenerateSigningGroup_BroadcastChannelError(t *testing.T) {
+	de := &dkgExecutor{
+		chain:       Connect(),
+		netProvider: &errNetProvider{},
+	}
+
+	gsr := &GroupSelectionResult{
+		OperatorsIDs:       chain.OperatorIDs{1, 2, 3, 4, 5},
+		OperatorsAddresses: chain.Addresses{"0xAA", "0xBB", "0xCC", "0xDD", "0xEE"},
+	}
+
+	de.generateSigningGroup(
+		logger.With(),
+		big.NewInt(1),
+		[]uint8{1},
+		gsr,
+		0,
+		0,
+	)
+}
+
+// errNetProvider is a minimal net.Provider stub whose BroadcastChannelFor always
+// returns an error, used to exercise the broadcast-channel setup failure path in
+// generateSigningGroup.
+type errNetProvider struct{}
+
+func (p *errNetProvider) ID() net.TransportIdentifier { return nil }
+func (p *errNetProvider) Type() string                { return "" }
+func (p *errNetProvider) BroadcastChannelFor(_ string) (net.BroadcastChannel, error) {
+	return nil, fmt.Errorf("network unavailable")
+}
+func (p *errNetProvider) ConnectionManager() net.ConnectionManager { return nil }
+func (p *errNetProvider) CreateTransportIdentifier(_ *operator.PublicKey) (net.TransportIdentifier, error) {
+	return nil, nil
+}
+func (p *errNetProvider) BroadcastChannelForwarderFor(_ string) {}
