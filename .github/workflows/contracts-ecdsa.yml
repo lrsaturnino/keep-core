@@ -139,12 +139,9 @@ jobs:
         if: github.ref != 'refs/heads/dapp-development'
         run: yarn test
 
-      # TODO: once a baseline coverage threshold is agreed, set
-      # continue-on-error: false and add a coverage gate step here.
-      - name: Coverage (non-blocking)
+      - name: Coverage
         if: github.ref != 'refs/heads/dapp-development'
         run: yarn hardhat coverage
-        continue-on-error: true
 
   contracts-deployment-dry-run:
     needs: contracts-detect-changes
