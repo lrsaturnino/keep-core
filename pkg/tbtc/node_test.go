@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"encoding/hex"
 	"fmt"
+	"math/big"
 	"reflect"
 	"testing"
 	"time"
@@ -469,69 +470,14 @@ func (mcp *mockCoordinationProposal) Unmarshal(bytes []byte) error {
 // handleHeartbeatProposal returns without dispatching when the node does not
 // control any signers for the given wallet.
 func TestNode_HandleHeartbeatProposal_WalletNotControlled(t *testing.T) {
-	groupParameters := &GroupParameters{
-		GroupSize:       5,
-		GroupQuorum:     4,
-		HonestThreshold: 3,
-	}
-
-	localChain := Connect()
-	localProvider := local.Connect()
-
-	signer := createMockSigner(t)
-
-	walletPublicKeyHash := bitcoin.PublicKeyHash(signer.wallet.publicKey)
-	walletID, err := localChain.CalculateWalletID(signer.wallet.publicKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	localChain.setWallet(walletPublicKeyHash, &WalletChainData{
-		EcdsaWalletID: walletID,
-		State:         StateLive,
-	})
-
-	keyStorePersistence := createMockKeyStorePersistence(t, signer)
-
-	n, err := newNode(
-		groupParameters,
-		localChain,
-		newLocalBitcoinChain(),
-		localProvider,
-		keyStorePersistence,
-		&mockPersistenceHandle{},
-		generator.StartScheduler(),
-		&mockCoordinationProposalGenerator{},
-		Config{},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Construct a wallet key not controlled by this node (double the base point).
-	walletPublicKey := signer.wallet.publicKey
-	x, y := walletPublicKey.Curve.Double(walletPublicKey.X, walletPublicKey.Y)
-	uncontrolledWallet := wallet{
-		publicKey: &ecdsa.PublicKey{
-			Curve: walletPublicKey.Curve,
-			X:     x,
-			Y:     y,
-		},
-		signingGroupOperators: signer.wallet.signingGroupOperators,
-	}
-
+	n, signer := setupNodeForHandlerTests(t)
+	uncontrolledWallet := uncontrolledWalletFor(signer)
 	proposal := &HeartbeatProposal{Message: [16]byte{0x01}}
 
 	n.handleHeartbeatProposal(uncontrolledWallet, proposal, 10, 100)
 
-	n.walletDispatcher.actionsMutex.Lock()
-	actionsCount := len(n.walletDispatcher.actions)
-	n.walletDispatcher.actionsMutex.Unlock()
-
-	if actionsCount != 0 {
-		t.Errorf(
-			"expected no dispatched actions for uncontrolled wallet, got %d",
-			actionsCount,
-		)
+	if count := dispatchedActionsCount(n); count != 0 {
+		t.Errorf("expected no dispatched actions for uncontrolled wallet, got %d", count)
 	}
 }
 
@@ -539,65 +485,24 @@ func TestNode_HandleHeartbeatProposal_WalletNotControlled(t *testing.T) {
 // handleHeartbeatProposal does not crash when the wallet dispatcher returns
 // errWalletBusy (another action is already running on the same wallet).
 func TestNode_HandleHeartbeatProposal_WalletBusy(t *testing.T) {
-	groupParameters := &GroupParameters{
-		GroupSize:       5,
-		GroupQuorum:     4,
-		HonestThreshold: 3,
-	}
+	n, signer := setupNodeForHandlerTests(t)
+	walletKey := walletKeyFor(t, signer)
 
-	localChain := Connect()
-	localProvider := local.Connect()
+	func() {
+		n.walletDispatcher.actionsMutex.Lock()
+		defer n.walletDispatcher.actionsMutex.Unlock()
+		n.walletDispatcher.actions[walletKey] = ActionHeartbeat
+	}()
 
-	signer := createMockSigner(t)
-
-	walletPublicKeyHash := bitcoin.PublicKeyHash(signer.wallet.publicKey)
-	walletID, err := localChain.CalculateWalletID(signer.wallet.publicKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	localChain.setWallet(walletPublicKeyHash, &WalletChainData{
-		EcdsaWalletID: walletID,
-		State:         StateLive,
-	})
-
-	keyStorePersistence := createMockKeyStorePersistence(t, signer)
-
-	n, err := newNode(
-		groupParameters,
-		localChain,
-		newLocalBitcoinChain(),
-		localProvider,
-		keyStorePersistence,
-		&mockPersistenceHandle{},
-		generator.StartScheduler(),
-		&mockCoordinationProposalGenerator{},
-		Config{},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	walletPublicKeyBytes, err := marshalPublicKey(signer.wallet.publicKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	walletKey := hex.EncodeToString(walletPublicKeyBytes)
-
-	// Simulate a wallet already executing an action.
-	n.walletDispatcher.actionsMutex.Lock()
-	n.walletDispatcher.actions[walletKey] = ActionHeartbeat
-	n.walletDispatcher.actionsMutex.Unlock()
-
-	proposal := &HeartbeatProposal{Message: [16]byte{0x02}}
-
-	// Must not panic even though dispatch will return errWalletBusy.
-	n.handleHeartbeatProposal(signer.wallet, proposal, 10, 100)
+	n.handleHeartbeatProposal(signer.wallet, &HeartbeatProposal{Message: [16]byte{0x02}}, 10, 100)
 
 	// The pre-populated entry must still be there -- our call did not modify it.
-	n.walletDispatcher.actionsMutex.Lock()
-	actionType, ok := n.walletDispatcher.actions[walletKey]
-	n.walletDispatcher.actionsMutex.Unlock()
-
+	actionType, ok := func() (WalletActionType, bool) {
+		n.walletDispatcher.actionsMutex.Lock()
+		defer n.walletDispatcher.actionsMutex.Unlock()
+		v, exists := n.walletDispatcher.actions[walletKey]
+		return v, exists
+	}()
 	if !ok || actionType != ActionHeartbeat {
 		t.Errorf(
 			"expected actions map to retain pre-populated ActionHeartbeat, "+
@@ -611,6 +516,195 @@ func TestNode_HandleHeartbeatProposal_WalletBusy(t *testing.T) {
 // for a controlled wallet the action is dispatched and the dispatcher cleans
 // up the entry once the goroutine completes.
 func TestNode_HandleHeartbeatProposal_DispatchesAction(t *testing.T) {
+	n, signer := setupNodeForHandlerTests(t)
+
+	n.handleHeartbeatProposal(signer.wallet, &HeartbeatProposal{Message: [16]byte{0x03}}, 10, 100)
+
+	// Allow the dispatched goroutine to run and clean up.
+	time.Sleep(50 * time.Millisecond)
+
+	if count := dispatchedActionsCount(n); count != 0 {
+		t.Errorf(
+			"expected walletDispatcher to be idle after action completed, got %d active actions",
+			count,
+		)
+	}
+}
+
+// TestNode_HandleDepositSweepProposal_WalletNotControlled verifies that
+// handleDepositSweepProposal skips dispatch for an uncontrolled wallet.
+func TestNode_HandleDepositSweepProposal_WalletNotControlled(t *testing.T) {
+	n, signer := setupNodeForHandlerTests(t)
+	uncontrolledWallet := uncontrolledWalletFor(signer)
+	proposal := &DepositSweepProposal{}
+
+	n.handleDepositSweepProposal(uncontrolledWallet, proposal, 10, 100)
+
+	if count := dispatchedActionsCount(n); count != 0 {
+		t.Errorf("expected no dispatched actions for uncontrolled wallet, got %d", count)
+	}
+}
+
+// TestNode_HandleDepositSweepProposal_WalletBusy verifies that
+// handleDepositSweepProposal handles errWalletBusy without panicking.
+func TestNode_HandleDepositSweepProposal_WalletBusy(t *testing.T) {
+	n, signer := setupNodeForHandlerTests(t)
+	walletKey := walletKeyFor(t, signer)
+
+	func() {
+		n.walletDispatcher.actionsMutex.Lock()
+		defer n.walletDispatcher.actionsMutex.Unlock()
+		n.walletDispatcher.actions[walletKey] = ActionDepositSweep
+	}()
+
+	n.handleDepositSweepProposal(signer.wallet, &DepositSweepProposal{}, 10, 100)
+
+	actionType, ok := func() (WalletActionType, bool) {
+		n.walletDispatcher.actionsMutex.Lock()
+		defer n.walletDispatcher.actionsMutex.Unlock()
+		v, exists := n.walletDispatcher.actions[walletKey]
+		return v, exists
+	}()
+	if !ok || actionType != ActionDepositSweep {
+		t.Errorf(
+			"expected pre-populated ActionDepositSweep to remain, got ok=%v actionType=%v",
+			ok, actionType,
+		)
+	}
+}
+
+// TestNode_HandleRedemptionProposal_WalletNotControlled verifies that
+// handleRedemptionProposal skips dispatch for an uncontrolled wallet.
+func TestNode_HandleRedemptionProposal_WalletNotControlled(t *testing.T) {
+	n, signer := setupNodeForHandlerTests(t)
+	uncontrolledWallet := uncontrolledWalletFor(signer)
+	proposal := &RedemptionProposal{}
+
+	n.handleRedemptionProposal(uncontrolledWallet, proposal, 10, 100)
+
+	if count := dispatchedActionsCount(n); count != 0 {
+		t.Errorf("expected no dispatched actions for uncontrolled wallet, got %d", count)
+	}
+}
+
+// TestNode_HandleRedemptionProposal_WalletBusy verifies that
+// handleRedemptionProposal handles errWalletBusy without panicking.
+func TestNode_HandleRedemptionProposal_WalletBusy(t *testing.T) {
+	n, signer := setupNodeForHandlerTests(t)
+	walletKey := walletKeyFor(t, signer)
+
+	func() {
+		n.walletDispatcher.actionsMutex.Lock()
+		defer n.walletDispatcher.actionsMutex.Unlock()
+		n.walletDispatcher.actions[walletKey] = ActionRedemption
+	}()
+
+	n.handleRedemptionProposal(signer.wallet, &RedemptionProposal{RedemptionTxFee: big.NewInt(0)}, 10, 100)
+
+	actionType, ok := func() (WalletActionType, bool) {
+		n.walletDispatcher.actionsMutex.Lock()
+		defer n.walletDispatcher.actionsMutex.Unlock()
+		v, exists := n.walletDispatcher.actions[walletKey]
+		return v, exists
+	}()
+	if !ok || actionType != ActionRedemption {
+		t.Errorf(
+			"expected pre-populated ActionRedemption to remain, got ok=%v actionType=%v",
+			ok, actionType,
+		)
+	}
+}
+
+// TestNode_HandleMovingFundsProposal_WalletNotControlled verifies that
+// handleMovingFundsProposal skips dispatch for an uncontrolled wallet.
+func TestNode_HandleMovingFundsProposal_WalletNotControlled(t *testing.T) {
+	n, signer := setupNodeForHandlerTests(t)
+	uncontrolledWallet := uncontrolledWalletFor(signer)
+	proposal := &MovingFundsProposal{}
+
+	n.handleMovingFundsProposal(uncontrolledWallet, proposal, 10, 100)
+
+	if count := dispatchedActionsCount(n); count != 0 {
+		t.Errorf("expected no dispatched actions for uncontrolled wallet, got %d", count)
+	}
+}
+
+// TestNode_HandleMovingFundsProposal_WalletBusy verifies that
+// handleMovingFundsProposal handles errWalletBusy without panicking.
+func TestNode_HandleMovingFundsProposal_WalletBusy(t *testing.T) {
+	n, signer := setupNodeForHandlerTests(t)
+	walletKey := walletKeyFor(t, signer)
+
+	func() {
+		n.walletDispatcher.actionsMutex.Lock()
+		defer n.walletDispatcher.actionsMutex.Unlock()
+		n.walletDispatcher.actions[walletKey] = ActionMovingFunds
+	}()
+
+	n.handleMovingFundsProposal(signer.wallet, &MovingFundsProposal{}, 10, 100)
+
+	actionType, ok := func() (WalletActionType, bool) {
+		n.walletDispatcher.actionsMutex.Lock()
+		defer n.walletDispatcher.actionsMutex.Unlock()
+		v, exists := n.walletDispatcher.actions[walletKey]
+		return v, exists
+	}()
+	if !ok || actionType != ActionMovingFunds {
+		t.Errorf(
+			"expected pre-populated ActionMovingFunds to remain, got ok=%v actionType=%v",
+			ok, actionType,
+		)
+	}
+}
+
+// TestNode_HandleMovedFundsSweepProposal_WalletNotControlled verifies that
+// handleMovedFundsSweepProposal skips dispatch for an uncontrolled wallet.
+func TestNode_HandleMovedFundsSweepProposal_WalletNotControlled(t *testing.T) {
+	n, signer := setupNodeForHandlerTests(t)
+	uncontrolledWallet := uncontrolledWalletFor(signer)
+	proposal := &MovedFundsSweepProposal{}
+
+	n.handleMovedFundsSweepProposal(uncontrolledWallet, proposal, 10, 100)
+
+	if count := dispatchedActionsCount(n); count != 0 {
+		t.Errorf("expected no dispatched actions for uncontrolled wallet, got %d", count)
+	}
+}
+
+// TestNode_HandleMovedFundsSweepProposal_WalletBusy verifies that
+// handleMovedFundsSweepProposal handles errWalletBusy without panicking.
+func TestNode_HandleMovedFundsSweepProposal_WalletBusy(t *testing.T) {
+	n, signer := setupNodeForHandlerTests(t)
+	walletKey := walletKeyFor(t, signer)
+
+	func() {
+		n.walletDispatcher.actionsMutex.Lock()
+		defer n.walletDispatcher.actionsMutex.Unlock()
+		n.walletDispatcher.actions[walletKey] = ActionMovedFundsSweep
+	}()
+
+	n.handleMovedFundsSweepProposal(signer.wallet, &MovedFundsSweepProposal{}, 10, 100)
+
+	actionType, ok := func() (WalletActionType, bool) {
+		n.walletDispatcher.actionsMutex.Lock()
+		defer n.walletDispatcher.actionsMutex.Unlock()
+		v, exists := n.walletDispatcher.actions[walletKey]
+		return v, exists
+	}()
+	if !ok || actionType != ActionMovedFundsSweep {
+		t.Errorf(
+			"expected pre-populated ActionMovedFundsSweep to remain, got ok=%v actionType=%v",
+			ok, actionType,
+		)
+	}
+}
+
+// setupNodeForHandlerTests creates a fully-initialised node with one
+// registered signer. It returns both the node and the signer so that callers
+// can construct controlled/uncontrolled wallets as needed.
+func setupNodeForHandlerTests(t *testing.T) (*node, *signer) {
+	t.Helper()
+
 	groupParameters := &GroupParameters{
 		GroupSize:       5,
 		GroupQuorum:     4,
@@ -632,14 +726,12 @@ func TestNode_HandleHeartbeatProposal_DispatchesAction(t *testing.T) {
 		State:         StateLive,
 	})
 
-	keyStorePersistence := createMockKeyStorePersistence(t, signer)
-
 	n, err := newNode(
 		groupParameters,
 		localChain,
 		newLocalBitcoinChain(),
 		localProvider,
-		keyStorePersistence,
+		createMockKeyStorePersistence(t, signer),
 		&mockPersistenceHandle{},
 		generator.StartScheduler(),
 		&mockCoordinationProposalGenerator{},
@@ -649,25 +741,36 @@ func TestNode_HandleHeartbeatProposal_DispatchesAction(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	proposal := &HeartbeatProposal{Message: [16]byte{0x03}}
+	return n, signer
+}
 
-	// Must dispatch without panicking.
-	n.handleHeartbeatProposal(signer.wallet, proposal, 10, 100)
-
-	// Allow the dispatched goroutine to run and clean up.
-	time.Sleep(50 * time.Millisecond)
-
-	n.walletDispatcher.actionsMutex.Lock()
-	actionsCount := len(n.walletDispatcher.actions)
-	n.walletDispatcher.actionsMutex.Unlock()
-
-	if actionsCount != 0 {
-		t.Errorf(
-			"expected walletDispatcher to be idle after action completed, "+
-				"got %d active actions",
-			actionsCount,
-		)
+// uncontrolledWalletFor returns a wallet whose public key is NOT registered in
+// the given signer's keystore -- constructed by doubling the signer's key.
+func uncontrolledWalletFor(s *signer) wallet {
+	pk := s.wallet.publicKey
+	x, y := pk.Curve.Double(pk.X, pk.Y)
+	return wallet{
+		publicKey:             &ecdsa.PublicKey{Curve: pk.Curve, X: x, Y: y},
+		signingGroupOperators: s.wallet.signingGroupOperators,
 	}
+}
+
+// walletKeyFor returns the hex-encoded wallet key as stored in walletDispatcher.
+func walletKeyFor(t *testing.T, s *signer) string {
+	t.Helper()
+	b, err := marshalPublicKey(s.wallet.publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return hex.EncodeToString(b)
+}
+
+// dispatchedActionsCount returns the number of active actions in the
+// walletDispatcher, holding the lock for the read.
+func dispatchedActionsCount(n *node) int {
+	n.walletDispatcher.actionsMutex.Lock()
+	defer n.walletDispatcher.actionsMutex.Unlock()
+	return len(n.walletDispatcher.actions)
 }
 
 // createMockSigner creates a mock signer instance that can be used for
