@@ -269,7 +269,7 @@ func setupSigningExecutor(t *testing.T) *signingExecutor {
 		&mockPersistenceHandle{},
 		generator.StartScheduler(),
 		&mockCoordinationProposalGenerator{},
-		Config{},
+		Config{PreParamsPoolSize: 1, PreParamsGenerationTimeout: time.Hour},
 	)
 	if err != nil {
 		t.Fatal(err)

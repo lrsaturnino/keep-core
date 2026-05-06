@@ -60,7 +60,7 @@ func TestNode_GetSigningExecutor(t *testing.T) {
 		&mockPersistenceHandle{},
 		generator.StartScheduler(),
 		&mockCoordinationProposalGenerator{},
-		Config{},
+		Config{PreParamsPoolSize: 1, PreParamsGenerationTimeout: time.Hour},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -192,7 +192,7 @@ func TestNode_GetCoordinationExecutor(t *testing.T) {
 		&mockPersistenceHandle{},
 		generator.StartScheduler(),
 		&mockCoordinationProposalGenerator{},
-		Config{},
+		Config{PreParamsPoolSize: 1, PreParamsGenerationTimeout: time.Hour},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -329,7 +329,7 @@ func TestNode_RunCoordinationLayer(t *testing.T) {
 		&mockPersistenceHandle{},
 		generator.StartScheduler(),
 		&mockCoordinationProposalGenerator{},
-		Config{},
+		Config{PreParamsPoolSize: 1, PreParamsGenerationTimeout: time.Hour},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1018,7 +1018,7 @@ func setupNodeForClosureTests(t *testing.T) (*node, *signer, *localChain) {
 		&mockPersistenceHandle{},
 		generator.StartScheduler(),
 		&mockCoordinationProposalGenerator{},
-		Config{},
+		Config{PreParamsPoolSize: 1, PreParamsGenerationTimeout: time.Hour},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1197,7 +1197,7 @@ func setupNodeWithChain(t *testing.T) (*node, *signer, *localChain) {
 		&mockPersistenceHandle{},
 		generator.StartScheduler(),
 		&mockCoordinationProposalGenerator{},
-		Config{},
+		Config{PreParamsPoolSize: 1, PreParamsGenerationTimeout: time.Hour},
 	)
 	if err != nil {
 		t.Fatal(err)
