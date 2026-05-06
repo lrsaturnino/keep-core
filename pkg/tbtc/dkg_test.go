@@ -752,6 +752,45 @@ func TestDkgExecutor_ExecuteDkgValidation_ValidResult_NotMember(t *testing.T) {
 	de.executeDkgValidation(big.NewInt(1), 0, result, [32]byte{})
 }
 
+// TestDkgExecutor_ExecuteDkgValidation_ValidResult_OperatorIDError verifies
+// that executeDkgValidation returns gracefully when the result is valid but
+// operatorIDFn returns an error (unable to determine operator identity).
+func TestDkgExecutor_ExecuteDkgValidation_ValidResult_OperatorIDError(t *testing.T) {
+	c := Connect()
+	c.setDKGResultValidity(true)
+
+	de := &dkgExecutor{
+		chain: c,
+		operatorIDFn: func() (chain.OperatorID, error) {
+			return 0, fmt.Errorf("ID lookup failed")
+		},
+	}
+
+	de.executeDkgValidation(big.NewInt(1), 0, &DKGChainResult{}, [32]byte{})
+}
+
+// TestDkgExecutor_ExecuteDkgValidation_ValidResult_MemberDKGParamsError verifies
+// that executeDkgValidation returns gracefully when the result is valid, the
+// operator is a member, but DKGParameters returns an error before approval is
+// scheduled.
+func TestDkgExecutor_ExecuteDkgValidation_ValidResult_MemberDKGParamsError(t *testing.T) {
+	c := &dkgParamsErrChain{Connect()}
+	c.localChain.setDKGResultValidity(true)
+
+	de := &dkgExecutor{
+		chain: c,
+		operatorIDFn: func() (chain.OperatorID, error) {
+			return chain.OperatorID(1), nil // member of result.Members
+		},
+	}
+
+	result := &DKGChainResult{
+		Members: chain.OperatorIDs{1, 2, 3, 4, 5},
+	}
+
+	de.executeDkgValidation(big.NewInt(1), 0, result, [32]byte{})
+}
+
 // TestDkgExecutor_GenerateSigningGroup_DKGParametersError verifies that
 // generateSigningGroup returns gracefully when DKGParameters returns an error.
 // setupBroadcastChannel succeeds; the function exits before spawning goroutines.
