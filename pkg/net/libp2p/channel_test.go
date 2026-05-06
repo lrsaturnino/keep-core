@@ -260,3 +260,136 @@ type mockTransportIdentifier struct {
 func (mti *mockTransportIdentifier) String() string {
 	return mti.transportID
 }
+
+// TestDeliver_DropsMessageWhenHandlerFull verifies that deliver() does not
+// block and silently drops the message when a handler's channel buffer is full.
+func TestDeliver_DropsMessageWhenHandlerFull(t *testing.T) {
+	ch := &channel{}
+
+	// Fill the handler channel to capacity so the next send will be dropped.
+	handlerCh := make(chan net.Message, messageHandlerThrottle)
+	for i := 0; i < messageHandlerThrottle; i++ {
+		handlerCh <- &mockNetMessage{}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ch.messageHandlers = []*messageHandler{
+		{ctx: ctx, channel: handlerCh},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		ch.deliver(&mockNetMessage{})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// deliver returned immediately -- correct
+	case <-time.After(1 * time.Second):
+		t.Fatal("deliver blocked when handler channel was full")
+	}
+
+	if len(handlerCh) != messageHandlerThrottle {
+		t.Errorf(
+			"expected handler channel to remain full (%d), got %d",
+			messageHandlerThrottle,
+			len(handlerCh),
+		)
+	}
+}
+
+// TestIncomingMessageWorker_IncrementsReceivedCounter verifies that
+// incomingMessageWorker increments the message_received_total counter for
+// every message dequeued, even when subsequent processing fails.
+func TestIncomingMessageWorker_IncrementsReceivedCounter(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	recorder := &mockMetricsRecorder{}
+
+	ch := &channel{
+		incomingMessageQueue: make(chan *pubsub.Message, incomingMessageThrottle),
+		metricsRecorder:      recorder,
+	}
+
+	go ch.incomingMessageWorker(ctx)
+
+	// A message with valid framing but no payload will fail type-lookup after
+	// proto-unmarshal succeeds; the counter is incremented before processing
+	// so it must still be observed. We set the inner pb.Message to avoid a
+	// nil-dereference on pubsubMessage.Data.
+	ch.incomingMessageQueue <- &pubsub.Message{Message: &pubsubpb.Message{}}
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		recorder.mu.Lock()
+		count := recorder.counters["message_received_total"]
+		recorder.mu.Unlock()
+		if count >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	recorder.mu.Lock()
+	got := recorder.counters["message_received_total"]
+	recorder.mu.Unlock()
+
+	if got < 1 {
+		t.Errorf("expected message_received_total >= 1, got %v", got)
+	}
+}
+
+// TestSetMetricsRecorder_NilRecorderSkipsMonitor verifies that passing a nil
+// recorder to setMetricsRecorder does not start the monitoring goroutine.
+// A subsequent call with a real recorder must then start it (sync.Once is only
+// consumed when recorder != nil).
+func TestSetMetricsRecorder_NilRecorderSkipsMonitor(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ch := &channel{ctx: ctx}
+
+	// First call with nil -- must not start the monitor goroutine.
+	ch.setMetricsRecorder(nil)
+	if ch.metricsRecorder != nil {
+		t.Error("expected metricsRecorder to be nil after nil set")
+	}
+
+	// sync.Once is NOT consumed by the nil-guarded branch, so a subsequent
+	// call with a real recorder must set the field.
+	recorder := &mockMetricsRecorder{}
+	ch.setMetricsRecorder(recorder)
+	if ch.metricsRecorder == nil {
+		t.Error("expected metricsRecorder to be set after non-nil set")
+	}
+}
+
+type mockMetricsRecorder struct {
+	mu       sync.Mutex
+	counters map[string]float64
+	gauges   map[string]float64
+}
+
+func (m *mockMetricsRecorder) IncrementCounter(name string, value float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.counters == nil {
+		m.counters = make(map[string]float64)
+	}
+	m.counters[name] += value
+}
+
+func (m *mockMetricsRecorder) SetGauge(name string, value float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.gauges == nil {
+		m.gauges = make(map[string]float64)
+	}
+	m.gauges[name] = value
+}
+
+func (m *mockMetricsRecorder) RecordDuration(_ string, _ time.Duration) {}
