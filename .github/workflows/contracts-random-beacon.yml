@@ -137,10 +137,6 @@ jobs:
         if: github.ref != 'refs/heads/dapp-development'
         run: yarn test
 
-      - name: Coverage
-        if: github.ref != 'refs/heads/dapp-development'
-        run: yarn hardhat coverage
-
   contracts-deployment-dry-run:
     needs: contracts-detect-changes
     runs-on: ubuntu-latest

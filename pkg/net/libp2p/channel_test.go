@@ -580,8 +580,8 @@ func TestChannel_MonitorQueueSizes_OverThreshold(t *testing.T) {
 }
 
 type mockTopicValidator struct {
-	registered   pubsub.Validator
-	registerErr  error
+	registered    pubsub.Validator
+	registerErr   error
 	unregisterErr error
 }
 

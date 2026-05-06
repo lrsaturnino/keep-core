@@ -860,8 +860,8 @@ func TestProcessCoordinationResult_DepositSweepRoutesToHandler(t *testing.T) {
 	}()
 
 	result := &coordinationResult{
-		wallet: signer.wallet,
-		window: newCoordinationWindow(100),
+		wallet:   signer.wallet,
+		window:   newCoordinationWindow(100),
 		proposal: &DepositSweepProposal{},
 	}
 
@@ -897,8 +897,8 @@ func TestProcessCoordinationResult_RedemptionRoutesToHandler(t *testing.T) {
 	}()
 
 	result := &coordinationResult{
-		wallet: signer.wallet,
-		window: newCoordinationWindow(100),
+		wallet:   signer.wallet,
+		window:   newCoordinationWindow(100),
 		proposal: &RedemptionProposal{RedemptionTxFee: big.NewInt(0)},
 	}
 

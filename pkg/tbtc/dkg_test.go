@@ -511,10 +511,10 @@ func TestDkgExecutor_CheckEligibility(t *testing.T) {
 	const myAddress chain.Address = "0xMY"
 
 	tests := map[string]struct {
-		selectionResult   *GroupSelectionResult
-		selectionErr      error
-		wantIndexes       []uint8
-		wantErr           bool
+		selectionResult *GroupSelectionResult
+		selectionErr    error
+		wantIndexes     []uint8
+		wantErr         bool
 	}{
 		"operator not selected": {
 			selectionResult: &GroupSelectionResult{
@@ -693,11 +693,11 @@ func TestDkgExecutor_ExecuteDkgIfEligible_PreParamExhaustion(t *testing.T) {
 		&testutils.MockLogger{},
 		generator.StartScheduler(),
 		&mockPersistenceHandle{},
-		1,            // preParamsPoolSize: 1 slot (not unbuffered)
-		time.Hour,    // preParamsGenerationTimeout: avoids 0-deadline tight loop
-		0,            // preParamsGenerationDelay
-		0,            // preParamsGenerationConcurrency
-		0,            // keyGenerationConcurrency
+		1,         // preParamsPoolSize: 1 slot (not unbuffered)
+		time.Hour, // preParamsGenerationTimeout: avoids 0-deadline tight loop
+		0,         // preParamsGenerationDelay
+		0,         // preParamsGenerationConcurrency
+		0,         // keyGenerationConcurrency
 	)
 
 	de := &dkgExecutor{

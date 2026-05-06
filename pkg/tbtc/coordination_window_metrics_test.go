@@ -14,11 +14,11 @@ import (
 // noopMetrics satisfies clientinfo.PerformanceMetricsRecorder with no side effects.
 type noopMetrics struct{}
 
-func (n *noopMetrics) IncrementCounter(name string, value float64)     {}
-func (n *noopMetrics) RecordDuration(name string, d time.Duration)     {}
-func (n *noopMetrics) SetGauge(name string, value float64)             {}
-func (n *noopMetrics) GetCounterValue(name string) float64             { return 0 }
-func (n *noopMetrics) GetGaugeValue(name string) float64               { return 0 }
+func (n *noopMetrics) IncrementCounter(name string, value float64) {}
+func (n *noopMetrics) RecordDuration(name string, d time.Duration) {}
+func (n *noopMetrics) SetGauge(name string, value float64)         {}
+func (n *noopMetrics) GetCounterValue(name string) float64         { return 0 }
+func (n *noopMetrics) GetGaugeValue(name string) float64           { return 0 }
 
 var _ clientinfo.PerformanceMetricsRecorder = (*noopMetrics)(nil)
 
