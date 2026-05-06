@@ -3,6 +3,7 @@ package tbtc
 import (
 	"context"
 	"fmt"
+	"math/big"
 	"reflect"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/keep-network/keep-core/internal/testutils"
 	"github.com/keep-network/keep-core/pkg/chain"
+	"github.com/keep-network/keep-core/pkg/generator"
 	"github.com/keep-network/keep-core/pkg/internal/tecdsatest"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/tecdsa"
@@ -600,4 +602,106 @@ func testWaitForBlockFn(localChain *localChain) waitForBlockFn {
 
 		return nil
 	}
+}
+
+// TestDkgExecutor_ExecuteDkgIfEligible_NotEligible verifies that
+// executeDkgIfEligible returns cleanly when the operator is not included in
+// the selected signing group.
+func TestDkgExecutor_ExecuteDkgIfEligible_NotEligible(t *testing.T) {
+	groupParameters := &GroupParameters{
+		GroupSize:       5,
+		GroupQuorum:     3,
+		HonestThreshold: 2,
+	}
+
+	const myAddress chain.Address = "0xME"
+
+	c := &selectGroupChain{
+		localChain: Connect(),
+		selectGroupResult: &GroupSelectionResult{
+			OperatorsIDs:       chain.OperatorIDs{1, 2, 3, 4, 5},
+			OperatorsAddresses: chain.Addresses{"0xAA", "0xBB", "0xCC", "0xDD", "0xEE"},
+		},
+	}
+
+	de := &dkgExecutor{
+		groupParameters: groupParameters,
+		operatorAddress: myAddress,
+		chain:           c,
+	}
+
+	de.executeDkgIfEligible(big.NewInt(1), 0, 0)
+}
+
+// TestDkgExecutor_ExecuteDkgIfEligible_SelectGroupError verifies that
+// executeDkgIfEligible returns cleanly when SelectGroup returns an error.
+func TestDkgExecutor_ExecuteDkgIfEligible_SelectGroupError(t *testing.T) {
+	groupParameters := &GroupParameters{
+		GroupSize:       5,
+		GroupQuorum:     3,
+		HonestThreshold: 2,
+	}
+
+	const myAddress chain.Address = "0xME"
+
+	c := &selectGroupChain{
+		localChain:     Connect(),
+		selectGroupErr: fmt.Errorf("chain unavailable"),
+	}
+
+	de := &dkgExecutor{
+		groupParameters: groupParameters,
+		operatorAddress: myAddress,
+		chain:           c,
+	}
+
+	de.executeDkgIfEligible(big.NewInt(1), 0, 0)
+}
+
+// TestDkgExecutor_ExecuteDkgIfEligible_PreParamExhaustion verifies that
+// executeDkgIfEligible returns cleanly when the operator is eligible but the
+// pre-parameters pool is empty (insufficient pre-params for the required
+// member count).
+func TestDkgExecutor_ExecuteDkgIfEligible_PreParamExhaustion(t *testing.T) {
+	groupParameters := &GroupParameters{
+		GroupSize:       5,
+		GroupQuorum:     3,
+		HonestThreshold: 2,
+	}
+
+	const myAddress chain.Address = "0xME"
+
+	// Operator holds one seat in the selected group.
+	c := &selectGroupChain{
+		localChain: Connect(),
+		selectGroupResult: &GroupSelectionResult{
+			OperatorsIDs:       chain.OperatorIDs{1, 2, 3, 4, 5},
+			OperatorsAddresses: chain.Addresses{myAddress, "0xBB", "0xCC", "0xDD", "0xEE"},
+		},
+	}
+
+	// poolSize=1 with a long generation timeout avoids a tight goroutine loop:
+	// the worker blocks inside GeneratePreParamsWithContext (not re-entering
+	// it repeatedly), so pre-params generation happens at most once before
+	// blocking on the full pool. The pool starts empty, so PreParamsCount()
+	// returns 0 immediately -- satisfying membersCount(1) > preParamsCount(0).
+	tecdsaExec := dkg.NewExecutor(
+		&testutils.MockLogger{},
+		generator.StartScheduler(),
+		&mockPersistenceHandle{},
+		1,            // preParamsPoolSize: 1 slot (not unbuffered)
+		time.Hour,    // preParamsGenerationTimeout: avoids 0-deadline tight loop
+		0,            // preParamsGenerationDelay
+		0,            // preParamsGenerationConcurrency
+		0,            // keyGenerationConcurrency
+	)
+
+	de := &dkgExecutor{
+		groupParameters: groupParameters,
+		operatorAddress: myAddress,
+		chain:           c,
+		tecdsaExecutor:  tecdsaExec,
+	}
+
+	de.executeDkgIfEligible(big.NewInt(1), 0, 0)
 }
