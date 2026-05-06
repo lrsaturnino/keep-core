@@ -700,6 +700,116 @@ func TestSigningRetryLoop(t *testing.T) {
 	}
 }
 
+func TestSigningRetryLoop_GetCurrentBlockErrorCausesRetry(t *testing.T) {
+	message := big.NewInt(100)
+
+	groupParameters := &GroupParameters{
+		GroupSize:       10,
+		HonestThreshold: 6,
+	}
+
+	signingGroupOperators := chain.Addresses{
+		"address-1", "address-2", "address-8", "address-4",
+		"address-2", "address-6", "address-7", "address-8",
+		"address-9", "address-8",
+	}
+
+	retryLoop := newSigningRetryLoop(
+		&testutils.MockLogger{},
+		message,
+		200,
+		1,
+		signingGroupOperators,
+		groupParameters,
+		&mockSigningAnnouncer{
+			outgoingAnnouncements: make(map[string]group.MemberIndex),
+			incomingAnnouncementsFn: func(string) ([]group.MemberIndex, error) {
+				panic("should not be reached: announcer invoked when getCurrentBlock always errors")
+			},
+		},
+		&mockSigningDoneCheck{
+			waitUntilAllDoneOutcomeFn: func(uint64) (*signing.Result, uint64, error) {
+				panic("should not be reached")
+			},
+		},
+	)
+
+	ctx, cancelCtx := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelCtx()
+
+	_, err := retryLoop.start(
+		ctx,
+		func(context.Context, uint64) error { return nil },
+		func() (uint64, error) { return 0, fmt.Errorf("rpc unavailable") },
+		func(*signingAttemptParams) (*signing.Result, uint64, error) {
+			panic("should not be reached: signing invoked when getCurrentBlock always errors")
+		},
+	)
+
+	if err != context.DeadlineExceeded {
+		t.Errorf(
+			"unexpected error\nexpected: [%v]\nactual:   [%v]",
+			context.DeadlineExceeded,
+			err,
+		)
+	}
+}
+
+func TestSigningRetryLoop_WaitForBlockErrorCausesRetry(t *testing.T) {
+	message := big.NewInt(100)
+
+	groupParameters := &GroupParameters{
+		GroupSize:       10,
+		HonestThreshold: 6,
+	}
+
+	signingGroupOperators := chain.Addresses{
+		"address-1", "address-2", "address-8", "address-4",
+		"address-2", "address-6", "address-7", "address-8",
+		"address-9", "address-8",
+	}
+
+	retryLoop := newSigningRetryLoop(
+		&testutils.MockLogger{},
+		message,
+		200,
+		1,
+		signingGroupOperators,
+		groupParameters,
+		&mockSigningAnnouncer{
+			outgoingAnnouncements: make(map[string]group.MemberIndex),
+			incomingAnnouncementsFn: func(string) ([]group.MemberIndex, error) {
+				panic("should not be reached: announcer invoked when waitForBlock always errors")
+			},
+		},
+		&mockSigningDoneCheck{
+			waitUntilAllDoneOutcomeFn: func(uint64) (*signing.Result, uint64, error) {
+				panic("should not be reached")
+			},
+		},
+	)
+
+	ctx, cancelCtx := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelCtx()
+
+	_, err := retryLoop.start(
+		ctx,
+		func(context.Context, uint64) error { return fmt.Errorf("rpc timeout") },
+		func() (uint64, error) { return 200, nil }, // behind announcementEndBlock so attempt is not skipped
+		func(*signingAttemptParams) (*signing.Result, uint64, error) {
+			panic("should not be reached: signing invoked when waitForBlock always errors")
+		},
+	)
+
+	if err != context.DeadlineExceeded {
+		t.Errorf(
+			"unexpected error\nexpected: [%v]\nactual:   [%v]",
+			context.DeadlineExceeded,
+			err,
+		)
+	}
+}
+
 type mockSigningAnnouncer struct {
 	// outgoingAnnouncements holds all announcements that are sent by the
 	// announcer.

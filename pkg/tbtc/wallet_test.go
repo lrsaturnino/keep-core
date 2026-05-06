@@ -473,3 +473,289 @@ func (mwse *mockWalletSigningExecutor) buildSignaturesKey(
 
 	return sha256.Sum256(buffer.Bytes())
 }
+
+// noConfirmBtcChain wraps localBitcoinChain but always fails GetTransactionConfirmations,
+// simulating a Bitcoin node that never acknowledges the transaction.
+type noConfirmBtcChain struct {
+	*localBitcoinChain
+}
+
+func (c *noConfirmBtcChain) GetTransactionConfirmations(bitcoin.Hash) (uint, error) {
+	return 0, fmt.Errorf("rpc unavailable")
+}
+
+func TestWalletTransactionExecutor_BroadcastTransaction_Success(t *testing.T) {
+	executor := &walletTransactionExecutor{
+		btcChain:        newLocalBitcoinChain(),
+		executingWallet: generateWallet(big.NewInt(1)),
+	}
+
+	tx := &bitcoin.Transaction{
+		Version: 1,
+		Inputs: []*bitcoin.TransactionInput{
+			{
+				Outpoint: &bitcoin.TransactionOutpoint{
+					TransactionHash: bitcoin.Hash{0x01},
+					OutputIndex:     0,
+				},
+				Sequence: 0xffffffff,
+			},
+		},
+		Outputs: []*bitcoin.TransactionOutput{
+			{Value: 1000, PublicKeyScript: []byte{0x51}},
+		},
+	}
+
+	err := executor.broadcastTransaction(
+		&testutils.MockLogger{},
+		tx,
+		5*time.Second,
+		1*time.Millisecond,
+	)
+
+	if err != nil {
+		t.Errorf("expected no error, got: %v", err)
+	}
+}
+
+func TestWalletTransactionExecutor_BroadcastTransaction_Timeout(t *testing.T) {
+	executor := &walletTransactionExecutor{
+		btcChain:        &noConfirmBtcChain{newLocalBitcoinChain()},
+		executingWallet: generateWallet(big.NewInt(1)),
+	}
+
+	tx := &bitcoin.Transaction{
+		Version: 1,
+		Inputs: []*bitcoin.TransactionInput{
+			{
+				Outpoint: &bitcoin.TransactionOutpoint{
+					TransactionHash: bitcoin.Hash{0x02},
+					OutputIndex:     0,
+				},
+				Sequence: 0xffffffff,
+			},
+		},
+		Outputs: []*bitcoin.TransactionOutput{
+			{Value: 2000, PublicKeyScript: []byte{0x51}},
+		},
+	}
+
+	err := executor.broadcastTransaction(
+		&testutils.MockLogger{},
+		tx,
+		50*time.Millisecond,
+		5*time.Millisecond,
+	)
+
+	expectedMsg := "broadcast timeout exceeded"
+	if err == nil || err.Error() != expectedMsg {
+		t.Errorf("expected error %q, got: %v", expectedMsg, err)
+	}
+}
+
+// walletSyncBtcChain is a minimal bitcoin.Chain stub for EnsureWalletSyncedBetweenChains tests.
+// Only GetUtxosForPublicKeyHash, GetMempoolUtxosForPublicKeyHash, and GetTransaction
+// are meaningful; all other methods panic if called.
+type walletSyncBtcChain struct {
+	utxos   []*bitcoin.UnspentTransactionOutput
+	mempool []*bitcoin.UnspentTransactionOutput
+	txs     map[bitcoin.Hash]*bitcoin.Transaction
+}
+
+func (c *walletSyncBtcChain) GetUtxosForPublicKeyHash([20]byte) ([]*bitcoin.UnspentTransactionOutput, error) {
+	return c.utxos, nil
+}
+
+func (c *walletSyncBtcChain) GetMempoolUtxosForPublicKeyHash([20]byte) ([]*bitcoin.UnspentTransactionOutput, error) {
+	return c.mempool, nil
+}
+
+func (c *walletSyncBtcChain) GetTransaction(hash bitcoin.Hash) (*bitcoin.Transaction, error) {
+	if tx, ok := c.txs[hash]; ok {
+		return tx, nil
+	}
+	return nil, fmt.Errorf("tx not found: %s", hash.String())
+}
+
+func (c *walletSyncBtcChain) GetTransactionConfirmations(bitcoin.Hash) (uint, error) {
+	panic("unused in wallet sync tests")
+}
+func (c *walletSyncBtcChain) BroadcastTransaction(*bitcoin.Transaction) error {
+	panic("unused in wallet sync tests")
+}
+func (c *walletSyncBtcChain) GetLatestBlockHeight() (uint, error) {
+	panic("unused in wallet sync tests")
+}
+func (c *walletSyncBtcChain) GetBlockHeader(uint) (*bitcoin.BlockHeader, error) {
+	panic("unused in wallet sync tests")
+}
+func (c *walletSyncBtcChain) GetTransactionMerkleProof(bitcoin.Hash, uint) (*bitcoin.TransactionMerkleProof, error) {
+	panic("unused in wallet sync tests")
+}
+func (c *walletSyncBtcChain) GetTransactionsForPublicKeyHash([20]byte, int) ([]*bitcoin.Transaction, error) {
+	panic("unused in wallet sync tests")
+}
+func (c *walletSyncBtcChain) GetTxHashesForPublicKeyHash([20]byte) ([]bitcoin.Hash, error) {
+	panic("unused in wallet sync tests")
+}
+func (c *walletSyncBtcChain) GetMempoolForPublicKeyHash([20]byte) ([]*bitcoin.Transaction, error) {
+	panic("unused in wallet sync tests")
+}
+func (c *walletSyncBtcChain) EstimateSatPerVByteFee(uint32) (int64, error) {
+	panic("unused in wallet sync tests")
+}
+func (c *walletSyncBtcChain) GetCoinbaseTxHash(uint) (bitcoin.Hash, error) {
+	panic("unused in wallet sync tests")
+}
+
+func TestEnsureWalletSyncedBetweenChains_FreshWalletNoUtxos(t *testing.T) {
+	var walletPKH [20]byte
+	walletPKH[0] = 0xaa
+
+	btcChain := &walletSyncBtcChain{
+		utxos:   []*bitcoin.UnspentTransactionOutput{},
+		mempool: []*bitcoin.UnspentTransactionOutput{},
+	}
+
+	err := EnsureWalletSyncedBetweenChains(walletPKH, nil, Connect(), btcChain)
+
+	if err != nil {
+		t.Errorf("expected no error for fresh wallet with no UTXOs, got: %v", err)
+	}
+}
+
+func TestEnsureWalletSyncedBetweenChains_FreshWalletSpamUtxos(t *testing.T) {
+	var walletPKH [20]byte
+	walletPKH[0] = 0xaa
+
+	// Outputs with OutputIndex != 0 cannot be produced by the wallet as its
+	// first transaction and are classified as spam.
+	spamUtxo := &bitcoin.UnspentTransactionOutput{
+		Outpoint: &bitcoin.TransactionOutpoint{
+			TransactionHash: bitcoin.Hash{0x01},
+			OutputIndex:     1,
+		},
+		Value: 5000,
+	}
+
+	btcChain := &walletSyncBtcChain{
+		utxos:   []*bitcoin.UnspentTransactionOutput{spamUtxo},
+		mempool: []*bitcoin.UnspentTransactionOutput{},
+	}
+
+	err := EnsureWalletSyncedBetweenChains(walletPKH, nil, Connect(), btcChain)
+
+	if err != nil {
+		t.Errorf("expected no error when all UTXOs are spam (OutputIndex != 0), got: %v", err)
+	}
+}
+
+func TestEnsureWalletSyncedBetweenChains_FreshWalletDepositSweepFirstTx(t *testing.T) {
+	var walletPKH [20]byte
+	walletPKH[0] = 0xaa
+
+	// The deposit that the wallet swept.
+	depositFundingTxHash := bitcoin.Hash{0xdd}
+	var depositFundingOutputIndex uint32 = 0
+
+	// The sweep transaction spending the deposit UTXO. Its single output
+	// lands at index 0, which is the tell-tale sign of a wallet-produced tx.
+	sweepTx := &bitcoin.Transaction{
+		Version: 1,
+		Inputs: []*bitcoin.TransactionInput{
+			{
+				Outpoint: &bitcoin.TransactionOutpoint{
+					TransactionHash: depositFundingTxHash,
+					OutputIndex:     depositFundingOutputIndex,
+				},
+				Sequence: 0xffffffff,
+			},
+		},
+		Outputs: []*bitcoin.TransactionOutput{
+			{Value: 9000, PublicKeyScript: []byte{0x51}},
+		},
+	}
+
+	sweepUtxo := &bitcoin.UnspentTransactionOutput{
+		Outpoint: &bitcoin.TransactionOutpoint{
+			TransactionHash: sweepTx.Hash(),
+			OutputIndex:     0,
+		},
+		Value: 9000,
+	}
+
+	localChain := Connect()
+	localChain.setDepositRequest(
+		depositFundingTxHash,
+		depositFundingOutputIndex,
+		&DepositChainRequest{},
+	)
+
+	btcChain := &walletSyncBtcChain{
+		utxos:   []*bitcoin.UnspentTransactionOutput{sweepUtxo},
+		mempool: []*bitcoin.UnspentTransactionOutput{},
+		txs:     map[bitcoin.Hash]*bitcoin.Transaction{sweepTx.Hash(): sweepTx},
+	}
+
+	err := EnsureWalletSyncedBetweenChains(walletPKH, nil, localChain, btcChain)
+
+	if err == nil {
+		t.Error("expected error for fresh wallet that produced a deposit sweep, got nil")
+	}
+}
+
+func TestEnsureWalletSyncedBetweenChains_MainUtxoInSync(t *testing.T) {
+	var walletPKH [20]byte
+	walletPKH[0] = 0xbb
+
+	mainUtxo := &bitcoin.UnspentTransactionOutput{
+		Outpoint: &bitcoin.TransactionOutpoint{
+			TransactionHash: bitcoin.Hash{0x10},
+			OutputIndex:     0,
+		},
+		Value: 100000,
+	}
+
+	// The bitcoin chain still holds the main UTXO — wallet has not spent it.
+	btcChain := &walletSyncBtcChain{
+		utxos: []*bitcoin.UnspentTransactionOutput{mainUtxo},
+	}
+
+	err := EnsureWalletSyncedBetweenChains(walletPKH, mainUtxo, Connect(), btcChain)
+
+	if err != nil {
+		t.Errorf("expected no error when main UTXO is still unspent, got: %v", err)
+	}
+}
+
+func TestEnsureWalletSyncedBetweenChains_MainUtxoSpent(t *testing.T) {
+	var walletPKH [20]byte
+	walletPKH[0] = 0xcc
+
+	mainUtxo := &bitcoin.UnspentTransactionOutput{
+		Outpoint: &bitcoin.TransactionOutpoint{
+			TransactionHash: bitcoin.Hash{0x20},
+			OutputIndex:     0,
+		},
+		Value: 100000,
+	}
+
+	// The main UTXO has been spent; only a new change UTXO remains.
+	changeUtxo := &bitcoin.UnspentTransactionOutput{
+		Outpoint: &bitcoin.TransactionOutpoint{
+			TransactionHash: bitcoin.Hash{0x21},
+			OutputIndex:     0,
+		},
+		Value: 99000,
+	}
+
+	btcChain := &walletSyncBtcChain{
+		utxos: []*bitcoin.UnspentTransactionOutput{changeUtxo},
+	}
+
+	err := EnsureWalletSyncedBetweenChains(walletPKH, mainUtxo, Connect(), btcChain)
+
+	if err == nil {
+		t.Error("expected error when main UTXO has been spent on Bitcoin, got nil")
+	}
+}

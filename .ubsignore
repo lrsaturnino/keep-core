@@ -13,3 +13,21 @@
 # supports automatic go.mod inclusion in staged-file mode:
 #
 #   UBS_SKIP_CATEGORIES=12 git commit ...
+#
+# When staging Go test files, additional pre-existing patterns trigger false
+# positives that require extra categories to be skipped:
+#
+#   Category 3 (CONTEXT PROPAGATION): context.WithTimeout returned from a
+#     closure without a visible defer cancel(); the cancel IS stored at the
+#     call site but UBS can't trace through the indirect call.
+#
+#   Category 9 (CRYPTOGRAPHY & SECURITY): test session IDs like
+#     `sessionID == fmt.Sprintf(...)` are flagged as timing-unsafe comparisons
+#     even though these are plain string identifiers, not secrets or tokens.
+#
+#   Category 16 (PANIC/RECOVER & TIME PATTERNS): err-shadow and
+#     context-without-cancel false positives from existing test code patterns.
+#
+# Full workaround for Go test file commits:
+#
+#   UBS_SKIP_CATEGORIES=3,9,12,16 git commit ...
