@@ -479,6 +479,108 @@ func TestFinalSigningGroup(t *testing.T) {
 	}
 }
 
+// selectGroupChain wraps *localChain and overrides SelectGroup so tests can
+// inject arbitrary group selection results without triggering the panic in
+// the default localChain implementation.
+type selectGroupChain struct {
+	*localChain
+	selectGroupResult *GroupSelectionResult
+	selectGroupErr    error
+}
+
+func (c *selectGroupChain) SelectGroup() (*GroupSelectionResult, error) {
+	return c.selectGroupResult, c.selectGroupErr
+}
+
+// TestDkgExecutor_CheckEligibility covers the eligibility decision path of
+// checkEligibility: operator selected, not selected, multiple seats, group
+// size exceeded, and SelectGroup failure.
+func TestDkgExecutor_CheckEligibility(t *testing.T) {
+	groupParameters := &GroupParameters{
+		GroupSize:       5,
+		GroupQuorum:     3,
+		HonestThreshold: 2,
+	}
+
+	const myAddress chain.Address = "0xMY"
+
+	tests := map[string]struct {
+		selectionResult   *GroupSelectionResult
+		selectionErr      error
+		wantIndexes       []uint8
+		wantErr           bool
+	}{
+		"operator not selected": {
+			selectionResult: &GroupSelectionResult{
+				OperatorsIDs:       chain.OperatorIDs{1, 2, 3, 4, 5},
+				OperatorsAddresses: chain.Addresses{"0xAA", "0xBB", "0xCC", "0xDD", "0xEE"},
+			},
+			wantIndexes: []uint8{},
+		},
+		"operator holds one seat": {
+			selectionResult: &GroupSelectionResult{
+				OperatorsIDs:       chain.OperatorIDs{1, 2, 3, 4, 5},
+				OperatorsAddresses: chain.Addresses{"0xAA", myAddress, "0xCC", "0xDD", "0xEE"},
+			},
+			wantIndexes: []uint8{2},
+		},
+		"operator holds multiple seats": {
+			selectionResult: &GroupSelectionResult{
+				OperatorsIDs:       chain.OperatorIDs{1, 2, 3, 4, 5},
+				OperatorsAddresses: chain.Addresses{myAddress, "0xBB", myAddress, "0xDD", myAddress},
+			},
+			wantIndexes: []uint8{1, 3, 5},
+		},
+		"group size larger than supported": {
+			selectionResult: &GroupSelectionResult{
+				OperatorsIDs:       chain.OperatorIDs{1, 2, 3, 4, 5, 6},
+				OperatorsAddresses: chain.Addresses{"0xAA", "0xBB", "0xCC", "0xDD", "0xEE", "0xFF"},
+			},
+			wantErr: true,
+		},
+		"SelectGroup returns error": {
+			selectionErr: fmt.Errorf("chain unavailable"),
+			wantErr:      true,
+		},
+	}
+
+	for testName, test := range tests {
+		t.Run(testName, func(t *testing.T) {
+			baseChain := Connect()
+			c := &selectGroupChain{
+				localChain:        baseChain,
+				selectGroupResult: test.selectionResult,
+				selectGroupErr:    test.selectionErr,
+			}
+
+			de := &dkgExecutor{
+				groupParameters: groupParameters,
+				operatorAddress: myAddress,
+				chain:           c,
+			}
+
+			logger := &testutils.MockLogger{}
+			indexes, _, err := de.checkEligibility(logger)
+
+			if (err != nil) != test.wantErr {
+				t.Fatalf("checkEligibility error = %v, wantErr %v", err, test.wantErr)
+			}
+
+			if test.wantErr {
+				return
+			}
+
+			if !reflect.DeepEqual(test.wantIndexes, indexes) {
+				t.Errorf(
+					"unexpected indexes\nexpected: %v\nactual:   %v",
+					test.wantIndexes,
+					indexes,
+				)
+			}
+		})
+	}
+}
+
 func testWaitForBlockFn(localChain *localChain) waitForBlockFn {
 	return func(ctx context.Context, block uint64) error {
 		blockCounter, err := localChain.BlockCounter()
