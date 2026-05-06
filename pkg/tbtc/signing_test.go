@@ -3,7 +3,9 @@ package tbtc
 import (
 	"context"
 	"crypto/ecdsa"
+	"crypto/elliptic"
 	"math/big"
+	"strings"
 	"testing"
 	"time"
 
@@ -148,6 +150,44 @@ func TestSigningExecutor_Sign_AllSignersFailed(t *testing.T) {
 	// result -- but not a completed valid signature.
 	if signature != nil && err == nil {
 		t.Error("expected failure when signingAttemptsLimit is 0, but got a valid signature")
+	}
+}
+
+func TestSigningExecutor_Sign_MarshalError(t *testing.T) {
+	executor := setupSigningExecutor(t)
+
+	// Replace the wallet's public key curve with P256 so marshalPublicKey
+	// returns errIncompatiblePublicKey instead of producing key bytes.
+	executor.signers[0].wallet.publicKey.Curve = elliptic.P256()
+
+	ctx, cancelCtx := context.WithCancel(context.Background())
+	defer cancelCtx()
+
+	_, _, _, err := executor.sign(ctx, big.NewInt(100), 0)
+
+	if err == nil {
+		t.Fatal("expected error from sign, got nil")
+	}
+	if !strings.Contains(err.Error(), "cannot marshal wallet public key") {
+		t.Errorf("unexpected error: [%v]", err)
+	}
+}
+
+func TestSigningExecutor_SignBatch_PartialFailure(t *testing.T) {
+	executor := setupSigningExecutor(t)
+	// Zero attempts cause every sign() call to return "all signers failed";
+	// signBatch must surface that error rather than silently return nil sigs.
+	executor.signingAttemptsLimit = 0
+
+	ctx, cancelCtx := context.WithCancel(context.Background())
+	defer cancelCtx()
+
+	messages := []*big.Int{big.NewInt(1), big.NewInt(2), big.NewInt(3)}
+
+	_, err := executor.signBatch(ctx, messages, 0)
+
+	if err == nil {
+		t.Error("expected error from signBatch when all signers fail, got nil")
 	}
 }
 

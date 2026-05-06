@@ -3,15 +3,17 @@ package libp2p
 import (
 	"context"
 	"encoding/hex"
+	"fmt"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/keep-network/keep-core/pkg/operator"
-
 	"github.com/keep-network/keep-core/pkg/net"
+	"github.com/keep-network/keep-core/pkg/net/gen/pb"
+	"github.com/keep-network/keep-core/pkg/operator"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	pubsubpb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -393,3 +395,134 @@ func (m *mockMetricsRecorder) SetGauge(name string, value float64) {
 }
 
 func (m *mockMetricsRecorder) RecordDuration(_ string, _ time.Duration) {}
+
+// TestChannel_ProcessContainerMessage_UnknownType verifies that an incoming
+// message whose type has no registered unmarshaler returns an error instead
+// of panicking.
+func TestChannel_ProcessContainerMessage_UnknownType(t *testing.T) {
+	ch := &channel{
+		unmarshalersByType: make(map[string]func() net.TaggedUnmarshaler),
+	}
+
+	err := ch.processContainerMessage(
+		peer.ID(""),
+		&pb.BroadcastNetworkMessage{Type: []byte("unknown/type")},
+	)
+
+	if err == nil {
+		t.Fatal("expected error for unknown message type, got nil")
+	}
+	if !strings.Contains(err.Error(), "couldn't find unmarshaler") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// TestChannel_SetFilter_ValidatesMessages verifies that SetFilter registers a
+// validator that rejects messages from unauthorized peers.
+func TestChannel_SetFilter_ValidatesMessages(t *testing.T) {
+	_, authorizedKey, _ := operator.GenerateKeyPair(DefaultCurve)
+	_, unauthorizedKey, _ := operator.GenerateKeyPair(DefaultCurve)
+
+	authorizedBytes := hex.EncodeToString(operator.MarshalUncompressed(authorizedKey))
+
+	filter := func(pk *operator.PublicKey) bool {
+		return hex.EncodeToString(operator.MarshalUncompressed(pk)) == authorizedBytes
+	}
+
+	mv := &mockTopicValidator{}
+	ch := &channel{name: "test-channel", validator: mv}
+
+	if err := ch.SetFilter(filter); err != nil {
+		t.Fatalf("SetFilter returned unexpected error: %v", err)
+	}
+	if mv.registered == nil {
+		t.Fatal("expected a validator to be registered")
+	}
+
+	buildMsg := func(key *operator.PublicKey) *pubsub.Message {
+		netKey, err := operatorPublicKeyToNetworkPublicKey(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, _ := peer.IDFromPublicKey(netKey)
+		idBytes, _ := id.Marshal()
+		return &pubsub.Message{Message: &pubsubpb.Message{From: idBytes}}
+	}
+
+	if !mv.registered(nil, peer.ID(""), buildMsg(authorizedKey)) {
+		t.Error("expected authorized peer to pass filter")
+	}
+	if mv.registered(nil, peer.ID(""), buildMsg(unauthorizedKey)) {
+		t.Error("expected unauthorized peer to be rejected by filter")
+	}
+}
+
+// TestChannel_SetFilter_AllowsMessages verifies that a permissive filter
+// allows all peers through.
+func TestChannel_SetFilter_AllowsMessages(t *testing.T) {
+	filter := func(_ *operator.PublicKey) bool { return true }
+
+	mv := &mockTopicValidator{}
+	ch := &channel{name: "test-channel", validator: mv}
+
+	if err := ch.SetFilter(filter); err != nil {
+		t.Fatalf("SetFilter returned unexpected error: %v", err)
+	}
+
+	_, key, _ := operator.GenerateKeyPair(DefaultCurve)
+	netKey, _ := operatorPublicKeyToNetworkPublicKey(key)
+	id, _ := peer.IDFromPublicKey(netKey)
+	idBytes, _ := id.Marshal()
+	msg := &pubsub.Message{Message: &pubsubpb.Message{From: idBytes}}
+
+	if !mv.registered(nil, peer.ID(""), msg) {
+		t.Error("expected permissive filter to allow all messages")
+	}
+}
+
+// TestChannel_IncomingMessageWorker_ContextCancel verifies that
+// incomingMessageWorker exits cleanly when the context is cancelled.
+func TestChannel_IncomingMessageWorker_ContextCancel(t *testing.T) {
+	ch := &channel{
+		incomingMessageQueue: make(chan *pubsub.Message, incomingMessageThrottle),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		ch.incomingMessageWorker(ctx)
+		close(done)
+	}()
+
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("incomingMessageWorker did not exit after context cancel")
+	}
+}
+
+type mockTopicValidator struct {
+	registered   pubsub.Validator
+	registerErr  error
+	unregisterErr error
+}
+
+func (mv *mockTopicValidator) RegisterTopicValidator(
+	_ string,
+	val interface{},
+	_ ...pubsub.ValidatorOpt,
+) error {
+	if v, ok := val.(pubsub.Validator); ok {
+		mv.registered = v
+	} else {
+		return fmt.Errorf("unexpected validator type: %T", val)
+	}
+	return mv.registerErr
+}
+
+func (mv *mockTopicValidator) UnregisterTopicValidator(_ string) error {
+	return mv.unregisterErr
+}

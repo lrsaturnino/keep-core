@@ -4,12 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
-	"github.com/keep-network/keep-core/pkg/chain"
-	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"math/big"
 	"reflect"
 	"sync"
@@ -18,6 +17,8 @@ import (
 
 	"github.com/keep-network/keep-core/internal/testutils"
 	"github.com/keep-network/keep-core/pkg/bitcoin"
+	"github.com/keep-network/keep-core/pkg/chain"
+	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/tecdsa"
 )
 
@@ -383,6 +384,165 @@ func TestWallet_MembersByOperator(t *testing.T) {
 				)
 			}
 		})
+	}
+}
+
+// buildSignTransactionFixture creates a funded localBitcoinChain, a
+// P2WPKH-locked UTXO belonging to walletObj, and a TransactionBuilder
+// with that input added and one OP_TRUE output.
+func buildSignTransactionFixture(
+	t *testing.T,
+	walletObj wallet,
+) (*localBitcoinChain, *bitcoin.TransactionBuilder) {
+	t.Helper()
+
+	btcChain := newLocalBitcoinChain()
+
+	walletPKH := bitcoin.PublicKeyHash(walletObj.publicKey)
+	p2wpkhScript, err := bitcoin.PayToWitnessPublicKeyHash(walletPKH)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fundingTx := &bitcoin.Transaction{
+		Version: 1,
+		Inputs: []*bitcoin.TransactionInput{
+			{
+				Outpoint: &bitcoin.TransactionOutpoint{
+					TransactionHash: bitcoin.Hash{0x01},
+					OutputIndex:     0,
+				},
+				Sequence: 0xffffffff,
+			},
+		},
+		Outputs: []*bitcoin.TransactionOutput{
+			{Value: 100000, PublicKeyScript: p2wpkhScript},
+		},
+	}
+	if err := btcChain.BroadcastTransaction(fundingTx); err != nil {
+		t.Fatal(err)
+	}
+
+	utxo := &bitcoin.UnspentTransactionOutput{
+		Outpoint: &bitcoin.TransactionOutpoint{
+			TransactionHash: fundingTx.Hash(),
+			OutputIndex:     0,
+		},
+		Value: 100000,
+	}
+
+	txBuilder := bitcoin.NewTransactionBuilder(btcChain)
+	if err := txBuilder.AddPublicKeyHashInput(utxo); err != nil {
+		t.Fatal(err)
+	}
+	txBuilder.AddOutput(&bitcoin.TransactionOutput{
+		Value:           90000,
+		PublicKeyScript: []byte{0x51}, // OP_TRUE
+	})
+
+	return btcChain, txBuilder
+}
+
+func TestWalletTransactionExecutor_SignTransaction_Success(t *testing.T) {
+	// Use deterministic private key 100 on secp256k1.
+	privKeyScalar := big.NewInt(100)
+	walletObj := generateWallet(privKeyScalar)
+
+	btcChain, txBuilder := buildSignTransactionFixture(t, walletObj)
+
+	// Pre-compute sig hashes to produce valid ECDSA signatures for the mock.
+	sigHashes, err := txBuilder.ComputeSignatureHashes()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	privKey := &ecdsa.PrivateKey{PublicKey: *walletObj.publicKey, D: privKeyScalar}
+	sigs := make([]*tecdsa.Signature, len(sigHashes))
+	for i, h := range sigHashes {
+		r, s, err := ecdsa.Sign(rand.Reader, privKey, h.Bytes())
+		if err != nil {
+			t.Fatal(err)
+		}
+		sigs[i] = &tecdsa.Signature{R: r, S: s}
+	}
+
+	const startBlock = uint64(0)
+	mockExec := newMockWalletSigningExecutor()
+	mockExec.setSignatures(sigHashes, startBlock, sigs)
+
+	executor := &walletTransactionExecutor{
+		btcChain:        btcChain,
+		executingWallet: walletObj,
+		signingExecutor: mockExec,
+		// Block until context is done so the signing window stays open.
+		waitForBlockFn: func(ctx context.Context, _ uint64) error {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(5 * time.Second):
+				return nil
+			}
+		},
+	}
+
+	tx, err := executor.signTransaction(&testutils.MockLogger{}, txBuilder, startBlock, 1000)
+
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if tx == nil {
+		t.Fatal("expected non-nil signed transaction")
+	}
+}
+
+func TestWalletTransactionExecutor_SignTransaction_Timeout(t *testing.T) {
+	walletObj := generateWallet(big.NewInt(200))
+	_, txBuilder := buildSignTransactionFixture(t, walletObj)
+
+	// Mock executor with no pre-set signatures returns "signing error".
+	mockExec := newMockWalletSigningExecutor()
+
+	executor := &walletTransactionExecutor{
+		btcChain:        newLocalBitcoinChain(),
+		executingWallet: walletObj,
+		signingExecutor: mockExec,
+		// Return immediately -- simulates the timeout block being reached,
+		// which cancels the signing context.
+		waitForBlockFn: func(_ context.Context, _ uint64) error { return nil },
+	}
+
+	_, err := executor.signTransaction(&testutils.MockLogger{}, txBuilder, 0, 1)
+
+	if err == nil {
+		t.Fatal("expected error on signing timeout, got nil")
+	}
+}
+
+func TestWalletTransactionExecutor_SignTransaction_InsufficientSigners(t *testing.T) {
+	walletObj := generateWallet(big.NewInt(300))
+	_, txBuilder := buildSignTransactionFixture(t, walletObj)
+
+	// Mock executor that always returns an "insufficient signers" error.
+	mockExec := newMockWalletSigningExecutor() // no signatures set -> always errors
+
+	executor := &walletTransactionExecutor{
+		btcChain:        newLocalBitcoinChain(),
+		executingWallet: walletObj,
+		signingExecutor: mockExec,
+		waitForBlockFn: func(ctx context.Context, _ uint64) error {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(5 * time.Second):
+				return nil
+			}
+		},
+	}
+
+	_, err := executor.signTransaction(&testutils.MockLogger{}, txBuilder, 0, 1000)
+
+	if err == nil {
+		t.Fatal("expected error for insufficient signers, got nil")
 	}
 }
 
