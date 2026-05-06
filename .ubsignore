@@ -1,0 +1,8 @@
+# UBS ignore patterns for keep-core
+#
+# Hardhat/Chai test files use patterns that UBS flags as false positives:
+# - Chai assertion chains (.to.be.gt, .to.be.lt) flagged as "deep property access"
+# - Array(n) constructor used for test fixtures flagged as "sparse array creation"
+#
+**/*.test.ts
+**/*.spec.ts
