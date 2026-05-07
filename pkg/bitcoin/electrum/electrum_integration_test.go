@@ -551,6 +551,9 @@ func TestEstimateSatPerVByteFee_Integration(t *testing.T) {
 
 		satPerVByteFee, err := electrum.EstimateSatPerVByteFee(targetBlocks)
 		if err != nil {
+			if shouldSkipElectrumIntegrationError(err) {
+				t.Skipf("skipping due to transient electrum error: %v", err)
+			}
 			t.Fatal(err)
 		}
 
@@ -731,4 +734,16 @@ func toJson(val interface{}) string {
 	}
 
 	return string(b)
+}
+
+func shouldSkipElectrumIntegrationError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	msg := err.Error()
+
+	return strings.Contains(msg, "request timeout") ||
+		strings.Contains(msg, "retry timeout") ||
+		strings.Contains(msg, "not enough information")
 }
