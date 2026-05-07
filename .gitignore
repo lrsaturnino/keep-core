@@ -1,6 +1,10 @@
 # MacOS
 *.DS_Store
 
+# Environment files
+.envrc
+.envrc.*
+
 # Executables
 /keep-client
 

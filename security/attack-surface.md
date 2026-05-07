@@ -22,10 +22,6 @@ Frame size capped at 1024 bytes (`authenticated_connection.go:27`).
 
 Firewall check applied after handshake (`authenticated_connection.go:223`): the operator public key recovered from the handshake is validated against the on-chain operator registry. The registry lookup is cached (12 h positive, 1 h negative -- `firewall.go:54`).
 
-**Risk areas:**
-- Malformed protobuf before signature verification (DoS via panic/allocation)
-- Firewall bypass window during negative-cache period (up to 1 h after on-chain deregistration)
-
 ### 1.2 Pubsub Channel Messages (broadcast)
 
 **File:** `pkg/net/libp2p/channel.go:313`
@@ -48,8 +44,6 @@ Deserialization chain:
 4. `senderIdentifier.Unmarshal(message.Sender)` -- sender public key (`channel.go:339`)
 
 Inbound queue depth: 4096 (`channel.go:289`). Messages beyond that are dropped.
-
-**Risk:** Any peer can send messages to any pubsub topic before the type-based routing filters them. Message type strings are looked up in a registry -- an unknown type causes a silent drop, not a crash. However, the outer protobuf is always deserialized before the type check.
 
 ### 1.3 Protocol-Specific Message Types
 
@@ -91,11 +85,6 @@ The client subscribes to Ethereum log events and processes them as triggers. Any
 
 Configured via `--ethereum.url`. Single endpoint; no failover.
 
-**Risk areas:**
-- Compromised or malicious RPC provider can serve false chain state (wrong block numbers, fake events, wrong contract state)
-- Chain ID is validated once on connect (`ethereum.go:221`) but not per-call
-- Rate limited (`--ethereum.requestsPerSecondLimit`, `--ethereum.concurrencyLimit`)
-
 ---
 
 ## 4. Bitcoin Electrum RPC
@@ -109,8 +98,6 @@ Configured via `--bitcoin.electrum.url`. No authentication.
 | `GetTransaction()` (`electrum.go:77`) | Raw Bitcoin transaction bytes from server, parsed and deserialized locally |
 | `GetTransactionConfirmations()` (`electrum.go:129`) | Block height arithmetic based on server-provided data |
 | Block header retrieval (`block.go`) | Block headers used to construct SPV proofs |
-
-A compromised Electrum server can withhold transactions, return false confirmation counts, or serve malformed transaction bytes. SPV proof validation happens on-chain at the Bridge contract, not in the Go client -- so false data may pass the Go layer and fail on-chain, but could also cause incorrect operator behavior (e.g., premature proof submission).
 
 ---
 
@@ -162,8 +149,6 @@ Exposed information:
 - Connected peer addresses and identities
 - Ethereum and Bitcoin RPC health metrics
 - Performance metrics (network layer)
-
-**Risk:** Information disclosure. An attacker on the same network segment can enumerate connected peers, operator identity, and RPC endpoint health without any credentials. This can assist in targeted P2P attacks or identify isolated nodes.
 
 ---
 

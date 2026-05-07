@@ -242,35 +242,3 @@ No use of insecure randomness in cryptographic paths was found.
 | `github.com/keep-network/keep-common` | `v1.7.1-0.20240424...` | `encryption.Box`, persistence, keystore | REVIEW -- internal library, encryption implementation not in this repo |
 | `golang.org/x/crypto` | v0.32.0 | scrypt, sha3, terminal password read | OK |
 
----
-
-## 10. Summary of Flagged Issues
-
-### Critical
-
-| Issue | Location | Description |
-|-------|----------|-------------|
-| tECDSA key shares stored without encryption | `pkg/tecdsa/marshaling.go:24` | Paillier private key and ECDSA share scalar written to disk as plaintext protobuf |
-
-### High
-
-| Issue | Location | Description |
-|-------|----------|-------------|
-| Non-standard hash-to-curve | `pkg/altbn128/altbn128.go:120` | Try-and-increment is timing-sensitive; leaks iteration count; use RFC 9380 |
-| Weak KDF for ECDH | `pkg/crypto/ephemeral/symmetric_key.go:19` | `sha256(shared_secret)` lacks domain separation; use HKDF-SHA256 (RFC 5869) |
-| tss-lib fork unaudited delta | `go.mod` replace directive | GG20 implementation changes between upstream and threshold-network fork unknown |
-
-### Medium
-
-| Issue | Location | Description |
-|-------|----------|-------------|
-| Recovered BLS signature not re-verified | `pkg/beacon/entry/entry.go:215` | `RecoverSignature()` result not checked against group public key before submission |
-| Pedersen generator derivation | `pkg/beacon/gjkr/protocol_parameters.go:23` | Generator H derived via non-constant-time hash-to-curve |
-| `encryption.Box` implementation unknown | `keep-common` dependency | Symmetric encryption scheme not visible in this repo |
-
-### Low
-
-| Issue | Location | Description |
-|-------|----------|-------------|
-| G2 square root exponent not verified | `pkg/altbn128/altbn128.go:272` | Hardcoded exponent for GfP2 sqrt should be cross-checked against BN256 field parameters |
-| BLS aggregation does not enforce distinct signers | `pkg/bls/bls.go:31` | Caller enforces uniqueness; function itself does not |

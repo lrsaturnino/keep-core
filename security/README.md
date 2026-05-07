@@ -21,10 +21,11 @@ Out of scope per the bug bounty program (see `SECURITY.adoc`):
 
 | File | Contents |
 |------|----------|
+| [findings.md](findings.md) | Consolidated findings list (F-01 through F-15) with severity ratings |
 | [architecture.md](architecture.md) | System components, trust boundaries, actor roles, Go-to-chain boundary |
 | [attack-surface.md](attack-surface.md) | All external entry points: P2P, chain events, RPC, config/key ingestion, CLI flags |
 | [critical-paths.md](critical-paths.md) | End-to-end flows where subversion causes fund loss or protocol failure |
-| [crypto-review.md](crypto-review.md) | Cryptographic primitives, custom constructions, flagged issues |
+| [crypto-review.md](crypto-review.md) | Cryptographic primitives and custom constructions |
 | [smart-contracts.md](smart-contracts.md) | Contract inventory, proxy/upgrade patterns, privilege functions, reentrancy surface |
 | [threat-model.md](threat-model.md) | Assets at risk, threat actors, bug-bounty exclusions, STRIDE mapping |
 

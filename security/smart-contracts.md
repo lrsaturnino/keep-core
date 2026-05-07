@@ -52,9 +52,6 @@ Coverage of both `solidity/` (v2, current) and `solidity-v1/` (legacy).
 - `initialize()` (`WalletRegistry.sol:349`): standard initializer; callable only once
 - `initializeV2()` (`WalletRegistry.sol:447`): `reinitializer(2)` for post-TIP-092 allowlist upgrade
 
-**CRITICAL -- Atomic Upgrade Required (`WalletRegistry.sol:435`):**
-> The proxy admin MUST call `upgradeToAndCall` (atomic). Calling `upgradeTo` followed by a separate `initializeV2` creates a front-running window where an attacker can initialize the allowlist with arbitrary parameters.
-
 Storage gaps are included in all libraries (e.g., `EcdsaDkg`, `Wallets`) and abstract contracts to preserve upgrade slots.
 
 ### Allowlist -- Ownable2StepUpgradeable (UPGRADEABLE)
@@ -152,7 +149,7 @@ try staking.slash(amount, providers) {
 ```
 This pattern is safe for reentrancy (exception stops re-entry) but means slashing failures are silent.
 
-### WalletRegistry -- POTENTIAL RISK
+### WalletRegistry
 
 `__ecdsaWalletCreatedCallback()` called on `walletOwner` (`WalletRegistry.sol:895`):
 ```solidity
@@ -160,7 +157,6 @@ walletOwner.__ecdsaWalletCreatedCallback(publicKey, stakingProviders);
 ```
 - `walletOwner` is the Bridge contract (set once by governance)
 - No reentrancy guard on WalletRegistry
-- If the Bridge contract re-enters WalletRegistry during this callback, state may be inconsistent
 
 ---
 
@@ -204,8 +200,6 @@ This prevents cross-chain DKG signature replay (e.g., testnet signatures replaye
    - Members hash check: recalculate and compare
    - Group members check: verify against sortition pool selection with seed
 4. `approveDkgResult()` -- does **not** re-run validation; relies on challenge period being sufficient
-
-**Gap:** If the challenge period passes with no challenge, the result is approved without re-validation. An attacker with sufficient stake who submits a malformed-but-plausible result and dissuades challengers (e.g., by making challenge economically unattractive) could get an invalid result approved.
 
 ### EIP-150 Gas Manipulation Protection
 

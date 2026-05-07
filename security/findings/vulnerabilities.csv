@@ -1,0 +1,5 @@
+id,title,severity,timestamp,file
+vuln-0004,Unauthorized `initializeV2` Call Can Seize `WalletRegistry` Staking Authority During Non-Atomic Upgrade,HIGH,2026-05-07 14:36:26 UTC,vulnerabilities/vuln-0004.md
+vuln-0001,Race Condition in TBTC Event Deduplication Allows Duplicate Protocol Processing,MEDIUM,2026-05-07 10:41:49 UTC,vulnerabilities/vuln-0001.md
+vuln-0002,Unauthenticated ClientInfo Service Exposes Operator and Peer Topology,MEDIUM,2026-05-07 11:10:45 UTC,vulnerabilities/vuln-0002.md
+vuln-0003,Legacy Random Beacon Reward Withdrawal Permanently Burns Claims on Failed Beneficiary Payout,MEDIUM,2026-05-07 11:17:35 UTC,vulnerabilities/vuln-0003.md
