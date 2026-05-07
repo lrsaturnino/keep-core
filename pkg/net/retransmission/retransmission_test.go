@@ -129,15 +129,15 @@ func TestScheduleRetransmissions_WithBackoffStrategy(t *testing.T) {
 		WithBackoffStrategy(),
 	)
 
-	// ScheduleRetransmissions registers its onTick handler in a goroutine;
-	// yield briefly so that goroutine runs before we start sending ticks.
-	time.Sleep(10 * time.Millisecond)
-
 	// BackoffStrategy fires at ticks 1, 3, 6, 11, 20 -- 5 fires in 20 ticks.
 	for i := uint64(1); i <= 20; i++ {
 		ticks <- i
 	}
-	time.Sleep(50 * time.Millisecond)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for atomic.LoadUint64(&retransmissions) < 5 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
 
 	got := atomic.LoadUint64(&retransmissions)
 	if got != 5 {
@@ -167,12 +167,18 @@ func TestScheduleRetransmissions_LogsRetransmitError(t *testing.T) {
 		WithStandardStrategy(),
 	)
 
-	// Allow the registration goroutine inside ScheduleRetransmissions to call
-	// onTick before we send the first tick.
-	time.Sleep(10 * time.Millisecond)
-
 	ticks <- 1
-	time.Sleep(50 * time.Millisecond)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		logger.mu.Lock()
+		n := len(logger.errors)
+		logger.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
 
 	logger.mu.Lock()
 	errs := logger.errors

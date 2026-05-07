@@ -29,15 +29,13 @@ func ScheduleRetransmissions(
 	retransmit RetransmitFn,
 	strategy Strategy,
 ) {
-	go func() {
-		ticker.onTick(ctx, func() {
-			go func() {
-				if err := strategy.Tick(retransmit); err != nil {
-					logger.Errorf("could not retransmit message: [%v]", err)
-				}
-			}()
-		})
-	}()
+	ticker.onTick(ctx, func() {
+		go func() {
+			if err := strategy.Tick(retransmit); err != nil {
+				logger.Errorf("could not retransmit message: [%v]", err)
+			}
+		}()
+	})
 }
 
 // WithRetransmissionSupport takes the standard network message handler and

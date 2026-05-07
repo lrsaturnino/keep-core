@@ -117,11 +117,9 @@ func (sdc *signingDoneCheck) listen(
 					continue
 				}
 
-				func() {
-					sdc.doneSignersMutex.Lock()
-					defer sdc.doneSignersMutex.Unlock()
-					sdc.doneSigners[doneMessage.senderID] = doneMessage
-				}()
+				sdc.doneSignersMutex.Lock()
+				sdc.doneSigners[doneMessage.senderID] = doneMessage
+				sdc.doneSignersMutex.Unlock()
 
 			case <-sdc.receiveCtx.Done():
 				return

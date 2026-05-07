@@ -520,8 +520,7 @@ func TestNode_HandleHeartbeatProposal_DispatchesAction(t *testing.T) {
 
 	n.handleHeartbeatProposal(signer.wallet, &HeartbeatProposal{Message: [16]byte{0x03}}, 10, 100)
 
-	// Allow the dispatched goroutine to run and clean up.
-	time.Sleep(200 * time.Millisecond)
+	waitForDispatcherIdle(t, n)
 
 	if count := dispatchedActionsCount(n); count != 0 {
 		t.Errorf(
@@ -587,8 +586,7 @@ func TestNode_HandleDepositSweepProposal_DispatchesAction(t *testing.T) {
 		100,
 	)
 
-	// Allow the dispatched goroutine to run and clean up.
-	time.Sleep(200 * time.Millisecond)
+	waitForDispatcherIdle(t, n)
 
 	if count := dispatchedActionsCount(n); count != 0 {
 		t.Errorf(
@@ -654,8 +652,7 @@ func TestNode_HandleRedemptionProposal_DispatchesAction(t *testing.T) {
 		100,
 	)
 
-	// Allow the dispatched goroutine to run and clean up.
-	time.Sleep(200 * time.Millisecond)
+	waitForDispatcherIdle(t, n)
 
 	if count := dispatchedActionsCount(n); count != 0 {
 		t.Errorf(
@@ -716,8 +713,7 @@ func TestNode_HandleMovingFundsProposal_DispatchesAction(t *testing.T) {
 
 	n.handleMovingFundsProposal(signer.wallet, &MovingFundsProposal{}, 10, 100)
 
-	// Allow the dispatched goroutine to run and clean up.
-	time.Sleep(200 * time.Millisecond)
+	waitForDispatcherIdle(t, n)
 
 	if count := dispatchedActionsCount(n); count != 0 {
 		t.Errorf(
@@ -783,8 +779,7 @@ func TestNode_HandleMovedFundsSweepProposal_DispatchesAction(t *testing.T) {
 		100,
 	)
 
-	// Allow the dispatched goroutine to run and clean up.
-	time.Sleep(200 * time.Millisecond)
+	waitForDispatcherIdle(t, n)
 
 	if count := dispatchedActionsCount(n); count != 0 {
 		t.Errorf(
@@ -831,8 +826,7 @@ func TestProcessCoordinationResult_HeartbeatRoutesToHandler(t *testing.T) {
 
 	processCoordinationResult(n, result)
 
-	// Allow dispatched goroutine to complete.
-	time.Sleep(50 * time.Millisecond)
+	waitForDispatcherIdle(t, n)
 
 	// Dispatcher should be idle; a panicking handler would have made this fail.
 	if count := dispatchedActionsCount(n); count != 0 {
@@ -1240,6 +1234,19 @@ func dispatchedActionsCount(n *node) int {
 	n.walletDispatcher.actionsMutex.Lock()
 	defer n.walletDispatcher.actionsMutex.Unlock()
 	return len(n.walletDispatcher.actions)
+}
+
+// waitForDispatcherIdle polls until walletDispatcher has no active actions or
+// the 2-second deadline is exceeded.
+func waitForDispatcherIdle(t *testing.T, n *node) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for dispatchedActionsCount(n) > 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for walletDispatcher to become idle")
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 // createMockSigner creates a mock signer instance that can be used for
