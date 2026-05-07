@@ -121,11 +121,12 @@ func TestSigningExecutor_Sign_ContextCancelled(t *testing.T) {
 	// rather than hanging.
 	cancelCtx()
 
-	signature, _, _, err := executor.sign(ctx, message, startBlock)
+	signature, _, _, _ := executor.sign(ctx, message, startBlock)
 
 	// A cancelled context may return nil signature with nil error (early exit)
-	// or an error -- both are acceptable. What must NOT happen is a hang.
-	if err != nil && signature != nil {
+	// or an error -- both are acceptable. What must NOT happen is a hang or
+	// a successful signature returned despite cancellation.
+	if signature != nil {
 		t.Errorf("expected nil signature on context cancel, got: %+v", signature)
 	}
 }
