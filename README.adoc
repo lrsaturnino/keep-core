@@ -82,6 +82,7 @@ keep-core/
   Dockerfile
   main.go, *.go
   docs/
+  security/ <7>
   solidity/ <1>
     ecdsa/
     random-beacon/
@@ -117,3 +118,6 @@ keep-core/
     `gen/`. This subpackage should contain a single file, `gen.go`, with a `//
     go:generate` annotation to trigger appropriate code generation. All code
     generation is done with a single invocation of `go generate` at build time.
+<7> Whitebox security analysis for external pentesters: architecture, attack
+    surface, critical paths, cryptographic review, smart contract security, and
+    threat model. See link:security/[`security/`].
