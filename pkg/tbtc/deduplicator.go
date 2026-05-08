@@ -56,19 +56,10 @@ func (d *deduplicator) notifyDKGStarted(
 	newDKGSeed *big.Int,
 ) bool {
 	d.dkgSeedCache.Sweep()
-
 	// The cache key is the hexadecimal representation of the seed.
 	cacheKey := newDKGSeed.Text(16)
-	// If the key is not in the cache, that means the seed was not handled
-	// yet and the client should proceed with the execution.
-	if !d.dkgSeedCache.Has(cacheKey) {
-		d.dkgSeedCache.Add(cacheKey)
-		return true
-	}
-
-	// Otherwise, the DKG seed is a duplicate and the client should not proceed
-	// with the execution.
-	return false
+	// Add is atomic: returns true only if the key was not already present.
+	return d.dkgSeedCache.Add(cacheKey)
 }
 
 // notifyDKGResultSubmitted notifies the client wants to start some actions
@@ -85,16 +76,7 @@ func (d *deduplicator) notifyDKGResultSubmitted(
 		hex.EncodeToString(newDKGResultHash[:]) +
 		strconv.Itoa(int(newDKGResultBlock))
 
-	// If the key is not in the cache, that means the result was not handled
-	// yet and the client should proceed with the execution.
-	if !d.dkgResultHashCache.Has(cacheKey) {
-		d.dkgResultHashCache.Add(cacheKey)
-		return true
-	}
-
-	// Otherwise, the DKG result is a duplicate and the client should not
-	// proceed with the execution.
-	return false
+	return d.dkgResultHashCache.Add(cacheKey)
 }
 
 func (d *deduplicator) notifyWalletClosed(
@@ -104,15 +86,5 @@ func (d *deduplicator) notifyWalletClosed(
 
 	// Use wallet ID converted to string as the cache key.
 	cacheKey := hex.EncodeToString(WalletID[:])
-
-	// If the key is not in the cache, that means the wallet closure was not
-	// handled yet and the client should proceed with the execution.
-	if !d.walletClosedCache.Has(cacheKey) {
-		d.walletClosedCache.Add(cacheKey)
-		return true
-	}
-
-	// Otherwise, the wallet closure is a duplicate and the client should not
-	// proceed with the execution.
-	return false
+	return d.walletClosedCache.Add(cacheKey)
 }
