@@ -133,7 +133,9 @@ const g1HashToPointMaxAttempts = 64
 // quadratic residue is found) which had variable iteration count proportional
 // to the hash output, creating a timing side channel. The counter-based
 // approach makes each attempt perform identical work (one SHA-256 and one
-// modular square root), bounding and normalising timing across inputs.
+// modular square root), bounding (but not normalising) timing across inputs:
+// the loop exits on the first valid point, so execution time still varies with
+// how many counters are tried.
 //
 // NOTE: this function produces different output than the previous
 // try-and-increment implementation for the same input. Deployment requires a
