@@ -33,8 +33,6 @@ import "@threshold-network/solidity-contracts/contracts/staking/IStaking.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/math/Math.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-
 /// @title Keep Random Beacon
 /// @notice Keep Random Beacon contract. It lets to request a new
 ///         relay entry and validates the new relay entry provided by the
@@ -42,7 +40,7 @@ import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 ///         activities such as group lifecycle or slashing.
 /// @dev Should be owned by the governance contract controlling Random Beacon
 ///      parameters.
-contract RandomBeacon is IRandomBeacon, IApplication, Governable, Reimbursable, ReentrancyGuard {
+contract RandomBeacon is IRandomBeacon, IApplication, Governable, Reimbursable {
     using SafeERC20 for IERC20;
     using Authorization for Authorization.Data;
     using DKG for DKG.Data;
@@ -379,6 +377,7 @@ contract RandomBeacon is IRandomBeacon, IApplication, Governable, Reimbursable, 
         dkg.init(_sortitionPool, _dkgValidator);
         relay.initSeedEntry();
 
+        _reentrancyStatus = 1;
         _transferGovernance(msg.sender);
 
         //
@@ -473,6 +472,17 @@ contract RandomBeacon is IRandomBeacon, IApplication, Governable, Reimbursable, 
         _dkgResultApprovalGasOffset = 41_500;
         _notifyOperatorInactivityGasOffset = 54_500;
         _relayEntrySubmissionGasOffset = 11_250;
+    }
+
+    // Reentrancy guard -- inline to avoid OZ abstract contract bytecode overhead.
+    error ReentrantCall();
+    uint256 private _reentrancyStatus; // 1 = not entered, 2 = entered
+
+    modifier nonReentrant() {
+        if (_reentrancyStatus == 2) revert ReentrantCall();
+        _reentrancyStatus = 2;
+        _;
+        _reentrancyStatus = 1;
     }
 
     modifier onlyStakingContract() {
