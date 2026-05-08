@@ -21,7 +21,7 @@ Out of scope per the bug bounty program (see `SECURITY.adoc`):
 
 | File | Contents |
 |------|----------|
-| [findings.md](findings.md) | Consolidated findings list (F-01 through F-15) with severity ratings |
+| [findings/](findings/) | Individual finding files F-01 through F-17 with severity ratings and verification status |
 | [architecture.md](architecture.md) | System components, trust boundaries, actor roles, Go-to-chain boundary |
 | [attack-surface.md](attack-surface.md) | All external entry points: P2P, chain events, RPC, config/key ingestion, CLI flags |
 | [critical-paths.md](critical-paths.md) | End-to-end flows where subversion causes fund loss or protocol failure |
