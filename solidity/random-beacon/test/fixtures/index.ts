@@ -56,7 +56,7 @@ export const params = {
   dkgResultSubmissionGas: 237_650,
   dkgResultApprovalGasOffset: 41_500,
   notifyOperatorInactivityGasOffset: 54_500,
-  relayEntrySubmissionGasOffset: 11_250,
+  relayEntrySubmissionGasOffset: 13_450,
 }
 
 export interface DeployedContracts {
