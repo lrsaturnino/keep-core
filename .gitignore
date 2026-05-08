@@ -76,3 +76,6 @@ out/
 data/
 logs/
 storage/
+
+# AI model run logs
+strix_runs/
