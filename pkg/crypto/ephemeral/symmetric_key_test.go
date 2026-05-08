@@ -152,5 +152,31 @@ func newEcdhSymmetricKey() (*SymmetricEcdhKey, error) {
 		return nil, err
 	}
 
-	return keyPair1.PrivateKey.Ecdh(keyPair2.PublicKey, nil), nil
+	return keyPair1.PrivateKey.Ecdh(keyPair2.PublicKey, []byte("test")), nil
+}
+
+// TestEcdhNilInfoDiffersFromLabeled documents that passing nil info produces a
+// key that is cryptographically distinct from any labeled derivation. This
+// prevents a regression where nil and a real label converge to the same key.
+func TestEcdhNilInfoDiffersFromLabeled(t *testing.T) {
+	keyPair1, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPair2, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	keyNil := keyPair1.PrivateKey.Ecdh(keyPair2.PublicKey, nil)
+	keyLabeled := keyPair1.PrivateKey.Ecdh(keyPair2.PublicKey, []byte("some-protocol"))
+
+	msg := []byte("probe")
+	encrypted, err := keyNil.Encrypt(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := keyLabeled.Decrypt(encrypted); err == nil {
+		t.Fatal("nil info and labeled info produced the same HKDF key")
+	}
 }
