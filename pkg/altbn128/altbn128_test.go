@@ -2,6 +2,7 @@ package altbn128
 
 import (
 	"crypto/rand"
+	"math/big"
 	"testing"
 
 	bn256 "github.com/ethereum/go-ethereum/crypto/bn256/cloudflare"
@@ -108,6 +109,23 @@ func TestG1HashToPointValidPoint(t *testing.T) {
 		if _, err := recovered.Unmarshal(p.Marshal()); err != nil {
 			t.Errorf("G1HashToPoint produced an invalid G1 point for input %q: %v", msg, err)
 		}
+	}
+}
+
+// TestSqrtGfP2Exponent asserts the hardcoded exponent in sqrtGfP2 equals (p^2+15)/32.
+func TestSqrtGfP2Exponent(t *testing.T) {
+	p2 := new(big.Int).Mul(bn256.P, bn256.P)
+	expected := new(big.Int).Div(new(big.Int).Add(p2, big.NewInt(15)), big.NewInt(32))
+
+	hardcoded, ok := new(big.Int).SetString(
+		"14971724250519463826312126413021210649976634891596900701138993820439690427699319920245032869357433499099632259837909383182382988566862092145199781964622",
+		10,
+	)
+	if !ok {
+		t.Fatal("failed to parse hardcoded exponent")
+	}
+	if expected.Cmp(hardcoded) != 0 {
+		t.Errorf("sqrtGfP2 exponent mismatch:\n  expected (p^2+15)/32 = %v\n  hardcoded            = %v", expected, hardcoded)
 	}
 }
 
