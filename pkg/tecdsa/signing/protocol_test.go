@@ -199,6 +199,7 @@ func TestGenerateSymmetricKeys(t *testing.T) {
 			expectedKey := ephemeral.SymmetricKey(
 				member.ephemeralKeyPairs[otherMemberID].PrivateKey.Ecdh(
 					otherMemberEphemeralPublicKey,
+					signingEcdhInfo(member.id, otherMemberID),
 				),
 			)
 

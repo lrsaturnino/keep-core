@@ -24,10 +24,10 @@ func TestFullEcdh(t *testing.T) {
 	//
 
 	// player 1:
-	symmetricKey1 := keyPair1.PrivateKey.Ecdh(keyPair2.PublicKey)
+	symmetricKey1 := keyPair1.PrivateKey.Ecdh(keyPair2.PublicKey, nil)
 
 	// player 2:
-	symmetricKey2 := keyPair2.PrivateKey.Ecdh(keyPair1.PublicKey)
+	symmetricKey2 := keyPair2.PrivateKey.Ecdh(keyPair1.PublicKey, nil)
 
 	//
 	// players use symmetric key for encryption/decryption

@@ -86,6 +86,7 @@ func (skgm *symmetricKeyGeneratingMember) generateSymmetricKeys(
 		// group member by ECDH'ing the public and private key.
 		symmetricKey := thisMemberEphemeralPrivateKey.Ecdh(
 			otherMemberEphemeralPublicKey,
+			dkgEcdhInfo(skgm.id, otherMember),
 		)
 		skgm.symmetricKeys[otherMember] = symmetricKey
 	}
@@ -464,6 +465,16 @@ func (sm *signingMember) verifyDKGResultSignatures(
 	receivedValidResultSignatures[sm.memberIndex] = sm.selfDKGResultSignature
 
 	return receivedValidResultSignatures
+}
+
+// dkgEcdhInfo returns the HKDF info label for ECDH-derived keys in the tECDSA
+// DKG protocol. The pair is sorted so both peers compute the same info
+// regardless of which side initiates.
+func dkgEcdhInfo(id1, id2 group.MemberIndex) []byte {
+	if id1 > id2 {
+		id1, id2 = id2, id1
+	}
+	return []byte{'t', 'e', 'c', 'd', 's', 'a', '-', 'd', 'k', 'g', byte(id1), byte(id2)}
 }
 
 // submitDKGResult submits the DKG result along with the supporting signatures

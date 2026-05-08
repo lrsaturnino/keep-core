@@ -118,6 +118,7 @@ func (sm *SymmetricKeyGeneratingMember) GenerateSymmetricKeys(
 		// group member by ECDH'ing the public and private key.
 		symmetricKey := thisMemberEphemeralPrivateKey.Ecdh(
 			otherMemberEphemeralPublicKey,
+			gjkrEcdhInfo(sm.ID, otherMember),
 		)
 		sm.symmetricKeys[otherMember] = symmetricKey
 	}
@@ -667,7 +668,7 @@ func (sjm *SharesJustifyingMember) ResolveSecretSharesAccusationsMessages(
 				sjm.discardReceivedShares(accuserID)
 				continue
 			}
-			symmetricKey := revealedAccuserPrivateKey.Ecdh(accusedPublicKey)
+			symmetricKey := revealedAccuserPrivateKey.Ecdh(accusedPublicKey, gjkrEcdhInfo(accuserID, accusedID))
 
 			// Get from evidence log peer shares message sent by the accused
 			// member. If the message is not present, this means the accused
@@ -1108,7 +1109,7 @@ func (pjm *PointsJustifyingMember) ResolvePublicKeySharePointsAccusationsMessage
 				pjm.group.MarkMemberAsDisqualified(accuserID)
 				continue
 			}
-			recoveredSymmetricKey := revealedAccuserPrivateKey.Ecdh(accusedPublicKey)
+			recoveredSymmetricKey := revealedAccuserPrivateKey.Ecdh(accusedPublicKey, gjkrEcdhInfo(accuserID, accusedID))
 
 			// Get from evidence log peer shares message sent by the accused
 			// member. If the message is not present, this means the accused
@@ -1464,7 +1465,7 @@ func (rm *ReconstructingMember) recoverMisbehavedShares(
 				rm.group.MarkMemberAsDisqualified(revealingMemberID)
 				continue
 			}
-			recoveredSymmetricKey := revealedPrivateKey.Ecdh(misbehavedMemberPublicKey)
+			recoveredSymmetricKey := revealedPrivateKey.Ecdh(misbehavedMemberPublicKey, gjkrEcdhInfo(revealingMemberID, misbehavedMemberID))
 
 			// Get from the evidence log peer shares message sent by the member
 			// for which the private key has been revealed.
@@ -1813,6 +1814,16 @@ func (cm *CombiningMember) ComputeGroupPublicKeyShares() {
 
 		cm.groupPublicKeySharesChannel <- groupPublicKeyShares
 	}()
+}
+
+// gjkrEcdhInfo returns the HKDF info label for ECDH-derived keys in the GJKR
+// protocol. The pair is sorted so both peers compute the same info regardless
+// of which side initiates.
+func gjkrEcdhInfo(id1, id2 group.MemberIndex) []byte {
+	if id1 > id2 {
+		id1, id2 = id2, id1
+	}
+	return []byte{'g', 'j', 'k', 'r', byte(id1), byte(id2)}
 }
 
 // deduplicateBySender removes duplicated items for the given sender.

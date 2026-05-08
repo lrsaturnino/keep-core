@@ -105,7 +105,7 @@ func newTestPeerSharesMessage(senderID, receiverID group.MemberIndex, shareS, sh
 		return nil, nil, err
 	}
 
-	key := keyPair1.PrivateKey.Ecdh(keyPair2.PublicKey)
+	key := keyPair1.PrivateKey.Ecdh(keyPair2.PublicKey, gjkrEcdhInfo(senderID, receiverID))
 
 	msg := newPeerSharesMessage(senderID, "session-1")
 	if err := msg.addShares(receiverID, shareS, shareT, key); err != nil {

@@ -1349,8 +1349,14 @@ func (mitm *manInTheMiddle) interceptCommunication(
 	// ephemeral key generated earlier by the man in the middle.
 	if ok && publicKeyMessage.SenderID() != mitm.senderIndex {
 		keyPair := mitm.ephemeralKeyPairs[publicKeyMessage.SenderID()]
+		// Mirror gjkrEcdhInfo: canonical-order pair label for domain separation.
+		id1, id2 := mitm.senderIndex, publicKeyMessage.SenderID()
+		if id1 > id2 {
+			id1, id2 = id2, id1
+		}
 		symmetricKey := keyPair.PrivateKey.Ecdh(
 			publicKeyMessage.GetPublicKey(mitm.senderIndex),
+			[]byte{'g', 'j', 'k', 'r', byte(id1), byte(id2)},
 		)
 
 		mitm.symmetricKeysMutex.Lock()

@@ -223,7 +223,7 @@ func generateGroupWithEphemeralKeys(
 			if member1.ID != member2.ID {
 				privKey := member1.ephemeralKeyPairs[member2.ID].PrivateKey
 				pubKey := member2.ephemeralKeyPairs[member1.ID].PublicKey
-				member1.symmetricKeys[member2.ID] = privKey.Ecdh(pubKey)
+				member1.symmetricKeys[member2.ID] = privKey.Ecdh(pubKey, gjkrEcdhInfo(member1.ID, member2.ID))
 
 				ephemeralKeys[member2.ID] = member1.ephemeralKeyPairs[member2.ID].PublicKey
 			}

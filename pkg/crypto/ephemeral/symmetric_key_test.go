@@ -86,6 +86,61 @@ func TestGracefullyHandleBrokenCipher(t *testing.T) {
 	}
 }
 
+// TestEcdhInfoDomainSeparation verifies that different info values produce
+// different keys even for the same ECDH shared secret.
+func TestEcdhInfoDomainSeparation(t *testing.T) {
+	keyPair1, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPair2, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	keyA := keyPair1.PrivateKey.Ecdh(keyPair2.PublicKey, []byte("protocol-a"))
+	keyB := keyPair1.PrivateKey.Ecdh(keyPair2.PublicKey, []byte("protocol-b"))
+
+	msgA, err := keyA.Encrypt([]byte("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// keyB must not decrypt a message encrypted with keyA.
+	if _, err := keyB.Decrypt(msgA); err == nil {
+		t.Fatal("different info values produced the same key")
+	}
+}
+
+// TestEcdhSymmetry verifies that both sides of ECDH with the same info derive
+// the same key (ECDH is commutative and HKDF is deterministic).
+func TestEcdhSymmetry(t *testing.T) {
+	keyPair1, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPair2, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	info := []byte("symmetry-test")
+	key1 := keyPair1.PrivateKey.Ecdh(keyPair2.PublicKey, info)
+	key2 := keyPair2.PrivateKey.Ecdh(keyPair1.PublicKey, info)
+
+	msg := []byte("message")
+	encrypted, err := key1.Encrypt(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decrypted, err := key2.Decrypt(encrypted)
+	if err != nil {
+		t.Fatalf("symmetric ECDH keys do not match: %v", err)
+	}
+	if string(decrypted) != string(msg) {
+		t.Fatalf("expected %q, got %q", msg, decrypted)
+	}
+}
+
 func newEcdhSymmetricKey() (*SymmetricEcdhKey, error) {
 	keyPair1, err := GenerateKeyPair()
 	if err != nil {
@@ -97,5 +152,5 @@ func newEcdhSymmetricKey() (*SymmetricEcdhKey, error) {
 		return nil, err
 	}
 
-	return keyPair1.PrivateKey.Ecdh(keyPair2.PublicKey), nil
+	return keyPair1.PrivateKey.Ecdh(keyPair2.PublicKey, nil), nil
 }
