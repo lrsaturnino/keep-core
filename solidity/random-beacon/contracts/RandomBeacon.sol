@@ -33,6 +33,7 @@ import "@threshold-network/solidity-contracts/contracts/staking/IStaking.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/math/Math.sol";
+
 /// @title Keep Random Beacon
 /// @notice Keep Random Beacon contract. It lets to request a new
 ///         relay entry and validates the new relay entry provided by the
@@ -471,7 +472,7 @@ contract RandomBeacon is IRandomBeacon, IApplication, Governable, Reimbursable {
         _dkgResultSubmissionGas = 237_650;
         _dkgResultApprovalGasOffset = 41_500;
         _notifyOperatorInactivityGasOffset = 54_500;
-        _relayEntrySubmissionGasOffset = 11_250;
+        _relayEntrySubmissionGasOffset = 13_450;
     }
 
     // Reentrancy guard -- inline to avoid OZ abstract contract bytecode overhead.
