@@ -19,8 +19,9 @@ the hash output, creating a timing side channel.
 
 The function now uses a fixed counter suffix appended to the input before
 hashing: `SHA-256(message || counter)` for counter in `[0, 63]`. Each
-iteration performs identical work, bounding and normalizing timing across
-inputs. The maximum counter value (64) gives a failure probability of
+iteration performs identical work, bounding (but not normalizing) timing across
+inputs: the loop exits on the first valid point, so execution time still varies
+with how many counters are tried. The maximum counter value (64) gives a failure probability of
 `(1/2)^64 ≈ 5e-20`.
 
 **Why it breaks:**
