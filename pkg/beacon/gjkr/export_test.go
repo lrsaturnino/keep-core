@@ -133,6 +133,10 @@ func (mekm *MisbehavedEphemeralKeysMessage) RemovePrivateKey(
 	delete(mekm.privateKeys, memberIndex)
 }
 
+func GjkrEcdhInfo(id1, id2 group.MemberIndex) []byte {
+	return gjkrEcdhInfo(id1, id2)
+}
+
 func GeneratePolynomial(degree int) ([]*big.Int, error) {
 	return generatePolynomial(degree)
 }

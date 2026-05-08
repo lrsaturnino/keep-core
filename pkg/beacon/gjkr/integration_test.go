@@ -1351,7 +1351,7 @@ func (mitm *manInTheMiddle) interceptCommunication(
 		keyPair := mitm.ephemeralKeyPairs[publicKeyMessage.SenderID()]
 		symmetricKey := keyPair.PrivateKey.Ecdh(
 			publicKeyMessage.GetPublicKey(mitm.senderIndex),
-			gjkrEcdhInfo(mitm.senderIndex, publicKeyMessage.SenderID()),
+			gjkr.GjkrEcdhInfo(mitm.senderIndex, publicKeyMessage.SenderID()),
 		)
 
 		mitm.symmetricKeysMutex.Lock()
