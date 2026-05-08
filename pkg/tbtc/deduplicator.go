@@ -58,7 +58,7 @@ func (d *deduplicator) notifyDKGStarted(
 	d.dkgSeedCache.Sweep()
 	// The cache key is the hexadecimal representation of the seed.
 	cacheKey := newDKGSeed.Text(16)
-	// Add is atomic: returns true only if the key was not already present.
+	// Add is mutex-serialized: returns true only if the key was not already present.
 	return d.dkgSeedCache.Add(cacheKey)
 }
 
