@@ -33,6 +33,7 @@ import "@threshold-network/solidity-contracts/contracts/staking/IStaking.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/math/Math.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 
 /// @title Keep Random Beacon
 /// @notice Keep Random Beacon contract. It lets to request a new
@@ -41,7 +42,7 @@ import "@openzeppelin/contracts/utils/math/Math.sol";
 ///         activities such as group lifecycle or slashing.
 /// @dev Should be owned by the governance contract controlling Random Beacon
 ///      parameters.
-contract RandomBeacon is IRandomBeacon, IApplication, Governable, Reimbursable {
+contract RandomBeacon is IRandomBeacon, IApplication, Governable, Reimbursable, ReentrancyGuard {
     using SafeERC20 for IERC20;
     using Authorization for Authorization.Data;
     using DKG for DKG.Data;
@@ -1039,7 +1040,7 @@ contract RandomBeacon is IRandomBeacon, IApplication, Governable, Reimbursable {
     ///         called only before the soft timeout. This should be the majority
     ///         of cases.
     /// @param entry Group BLS signature over the previous entry.
-    function submitRelayEntry(bytes calldata entry) external {
+    function submitRelayEntry(bytes calldata entry) external nonReentrant {
         uint256 gasStart = gasleft();
 
         Groups.Group storage group = groups.getGroup(
@@ -1068,7 +1069,7 @@ contract RandomBeacon is IRandomBeacon, IApplication, Governable, Reimbursable {
     function submitRelayEntry(
         bytes calldata entry,
         uint32[] calldata groupMembers
-    ) external {
+    ) external nonReentrant {
         uint256 gasStart = gasleft();
         uint256 currentRequestId = relay.currentRequestID;
 
