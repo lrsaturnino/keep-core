@@ -117,25 +117,46 @@ func G2FromInts(x *gfP2, y *gfP2) (*bn256.G2, error) {
 	return g2, err
 }
 
-// G1HashToPoint hashes the provided byte slice, maps it into a G1
-// and returns it as a G1 point.
+// g1HashToPointMaxAttempts is the maximum number of counter values tried by
+// G1HashToPoint. Each attempt has a ~1/2 probability of yielding a valid
+// point, so the probability of exhausting all attempts is (1/2)^64 ≈ 5e-20.
+const g1HashToPointMaxAttempts = 64
+
+// G1HashToPoint hashes the provided byte slice and maps it deterministically
+// into a G1 point using a counter-based hash-and-try approach.
+//
+// For each counter value 0..63 the function computes SHA-256(m || counter),
+// treats the digest as a candidate x-coordinate, and checks whether a
+// corresponding y exists on the curve. It returns the first valid point found.
+//
+// This replaces the previous try-and-increment design (increment x until a
+// quadratic residue is found) which had variable iteration count proportional
+// to the hash output, creating a timing side channel. The counter-based
+// approach makes each attempt perform identical work (one SHA-256 and one
+// modular square root), bounding and normalising timing across inputs.
+//
+// NOTE: this function produces different output than the previous
+// try-and-increment implementation for the same input. Deployment requires a
+// coordinated network upgrade.
+//
+// TODO: replace with a constant-time RFC 9380 SWU implementation.
+// See: https://github.com/tlabs-xyz/keep-core-security/issues/4
 func G1HashToPoint(m []byte) *bn256.G1 {
+	buf := make([]byte, len(m)+1)
+	copy(buf, m)
 
-	one := big.NewInt(1)
-
-	h := sha256.Sum256(m)
-
-	x := mod(new(big.Int).SetBytes(h[:]), bn256.P)
-
-	for {
-		y := yFromX(x)
-		if y != nil {
+	for ctr := 0; ctr < g1HashToPointMaxAttempts; ctr++ {
+		buf[len(m)] = byte(ctr)
+		h := sha256.Sum256(buf)
+		x := mod(new(big.Int).SetBytes(h[:]), bn256.P)
+		if y := yFromX(x); y != nil {
 			g1, _ := G1FromInts(x, y)
 			return g1
 		}
-
-		x.Add(x, one)
 	}
+
+	// Unreachable in practice: probability (1/2)^64.
+	panic("G1HashToPoint: no valid curve point found for input")
 }
 
 // yParity calculates whether the provided Y coordinate is an even or odd
