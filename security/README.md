@@ -22,7 +22,7 @@ Out of scope per the bug bounty program (see `SECURITY.adoc`):
 | ID | Title | Severity | Status |
 |----|-------|----------|--------|
 | [F-01](findings/F-01.md) | tECDSA key shares stored without encryption | High | Invalid -- encryption confirmed at rest |
-| [F-02](findings/F-02.md) | Non-standard hash-to-curve (timing side channel) | High | Partially Remediated -- counter-based applied; RFC 9380 SWU pending |
+| [F-02](findings/F-02.md) | Non-standard hash-to-curve (timing side channel) | ~~High~~ Low | Remediated -- counter-based applied; timing channel non-exploitable (public inputs only) |
 | [F-03](findings/F-03.md) | Weak KDF for ECDH-derived session keys | High | Remediated -- HKDF-SHA256 with domain labels |
 | [F-04](findings/F-04.md) | tss-lib fork contains unreviewed custom patches | Medium | Invalid -- known internal fork |
 | [F-05](findings/F-05.md) | Non-atomic WalletRegistry upgrade is front-runnable | Medium | Mitigated by Design -- tracked in GH issue |
@@ -39,8 +39,8 @@ Out of scope per the bug bounty program (see `SECURITY.adoc`):
 | [F-16](findings/F-16.md) | BLS aggregation does not enforce distinct signers | Low | Informational / No Action Required |
 | [F-17](findings/F-17.md) | Single Ethereum RPC endpoint with no failover | Low | Accepted -- architectural constraint |
 
-**Remediations shipped (PR #5):** F-02 (partial), F-03, F-09, F-13, F-15  
-**Open follow-up:** F-02 RFC 9380 SWU ([issue #4](https://github.com/tlabs-xyz/keep-core-security/issues/4)), F-05 upgrade sequencing ([issue #6](https://github.com/tlabs-xyz/keep-core-security/issues/6))
+**Remediations shipped (PR #5):** F-02, F-03, F-09, F-13, F-15  
+**Open follow-up:** F-02 RFC 9380 SWU hygiene ([issue #4](https://github.com/tlabs-xyz/keep-core-security/issues/4), optional -- no security impact), F-05 upgrade sequencing ([issue #6](https://github.com/tlabs-xyz/keep-core-security/issues/6))
 
 ## Files
 
