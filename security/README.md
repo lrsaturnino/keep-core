@@ -17,6 +17,31 @@ Out of scope per the bug bounty program (see `SECURITY.adoc`):
 - Sybil attacks
 - DoS attacks against infrastructure
 
+## Findings Summary
+
+| ID | Title | Severity | Status |
+|----|-------|----------|--------|
+| [F-01](findings/F-01.md) | tECDSA key shares stored without encryption | High | Invalid -- encryption confirmed at rest |
+| [F-02](findings/F-02.md) | Non-standard hash-to-curve (timing side channel) | High | Partially Remediated -- counter-based applied; RFC 9380 SWU pending |
+| [F-03](findings/F-03.md) | Weak KDF for ECDH-derived session keys | High | Remediated -- HKDF-SHA256 with domain labels |
+| [F-04](findings/F-04.md) | tss-lib fork contains unreviewed custom patches | Medium | Invalid -- known internal fork |
+| [F-05](findings/F-05.md) | Non-atomic WalletRegistry upgrade is front-runnable | Medium | Mitigated by Design -- tracked in GH issue |
+| [F-06](findings/F-06.md) | Recovered BLS group signature not re-verified | Medium | Low / Mitigated On-Chain |
+| [F-07](findings/F-07.md) | `approveDkgResult()` does not re-validate the result | Medium | Mitigated by Design -- challenger incentive |
+| [F-08](findings/F-08.md) | Post-TIP-092 slashing is symbolic | Medium | Accepted -- intentional post-TIP-092 design |
+| [F-09](findings/F-09.md) | RandomBeacon callback has no reentrancy guard | Medium | Remediated -- inline nonReentrant guard |
+| [F-10](findings/F-10.md) | `encryption.Box` implementation is opaque | Medium | No Action -- NaCl XSalsa20-Poly1305 confirmed |
+| [F-11](findings/F-11.md) | Firewall positive-cache 12-hour post-deregistration window | Low | No Action Required |
+| [F-12](findings/F-12.md) | Metrics endpoint unauthenticated (topology exposed) | Low | Accepted -- document in operator runbooks |
+| [F-13](findings/F-13.md) | tBTC event deduplication TOCTOU race | Medium | Remediated -- atomic AddIfAbsent |
+| [F-14](findings/F-14.md) | Legacy beacon reward withdrawal burns failed claims | Low | Won't Fix -- v1 contracts are immutable |
+| [F-15](findings/F-15.md) | G2 square root exponent not cross-checked | Low | Remediated -- exponent verified, test added |
+| [F-16](findings/F-16.md) | BLS aggregation does not enforce distinct signers | Low | Informational / No Action Required |
+| [F-17](findings/F-17.md) | Single Ethereum RPC endpoint with no failover | Low | Accepted -- architectural constraint |
+
+**Remediations shipped (PR #5):** F-02 (partial), F-03, F-09, F-13, F-15  
+**Open follow-up:** F-02 RFC 9380 SWU ([issue #4](https://github.com/tlabs-xyz/keep-core-security/issues/4)), F-05 upgrade sequencing ([issue #6](https://github.com/tlabs-xyz/keep-core-security/issues/6))
+
 ## Files
 
 | File | Contents |
