@@ -28,7 +28,7 @@ Firewall check applied after handshake (`authenticated_connection.go:223`): the 
 
 After a connection is established, broadcast messages are received via libp2p gossipsub:
 
-```
+```text
 BroadcastNetworkMessage {
   bytes sender         // secp256k1 public key
   bytes payload        // protocol-specific protobuf
@@ -129,7 +129,7 @@ Config is read via Viper from a YAML/TOML/JSON file (`config.go:238`). No schema
 **Key file loading:** `pkg/chain/ethereum/ethereum.go:525`
 - `ethutil.DecryptKeyFile(config.Account.KeyFile, config.Account.KeyFilePassword)`
 - Path configured via `--ethereum.keyFile`
-- Malformed keystore file can cause DoS; incorrect password silently produces wrong key material
+- Malformed keystore file can cause DoS; an incorrect password fails MAC verification in the V3 keystore decryption path and returns `ErrDecrypt` ("could not decrypt key with given password"), which is propagated to the caller -- it does not silently produce wrong key material
 
 **Password sources** (`config/config.go:166`):
 1. Environment variable `KEEP_ETHEREUM_PASSWORD`

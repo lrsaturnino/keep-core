@@ -16,7 +16,7 @@ The `start` command (`cmd/start.go:65`) sequentially: connects to Ethereum, init
 
 ## Major Packages
 
-```
+```text
 pkg/
   altbn128/      BN256 curve helpers (hash-to-curve, compress/decompress)
   beacon/        Random Beacon protocol (GJKR DKG + BLS entry signing)
@@ -69,6 +69,7 @@ pkg/
 ## Trust Boundaries
 
 ### Trusted
+
 | Source | Trust Basis |
 |--------|-------------|
 | On-chain Ethereum state | Chain finality; used as authoritative source for group membership and DKG results |
@@ -77,6 +78,7 @@ pkg/
 | Configured bootstrap peers | Explicitly listed in config; treated as firewall allowlist exceptions |
 
 ### Untrusted
+
 | Source | Validation Applied |
 |--------|-------------------|
 | P2P peer messages | TLS + 3-act secp256k1 handshake; firewall check against on-chain operator registry; group membership validation on every protocol message |
@@ -85,7 +87,7 @@ pkg/
 | DKG messages from peers | Membership validator (`protocol/group/membership_validator.go:67`); session ID gating; type-checked protobuf deserialization |
 
 ### Key Observation
-The firewall (`pkg/firewall/firewall.go`) caches chain lookups (12 h positive, 1 h negative). A peer that was recently deregistered on-chain can still connect until the negative cache expires.
+The firewall (`pkg/firewall/firewall.go`) caches chain lookups (12 h positive, 1 h negative). A peer that was recently deregistered on-chain can still connect until the positive cache expires.
 
 ## Go-to-Chain Interaction
 
@@ -107,7 +109,7 @@ Contract addresses are resolved from npm package defaults at build time and can 
 
 ## Component Interaction Diagram
 
-```
+```text
              Ethereum chain
                   |
          +--------+--------+
