@@ -313,9 +313,9 @@ func (se *signingExecutor) sign(
 						se.waitForBlockFn,
 					)
 
-					sessionID := fmt.Sprintf(
-						"%v-%v",
-						message.Text(16),
+					sessionID := signingAttemptSessionID(
+						message,
+						attempt.startBlock,
 						attempt.number,
 					)
 

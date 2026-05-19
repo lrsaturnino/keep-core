@@ -137,6 +137,19 @@ type signingAttemptParams struct {
 	excludedMembersIndexes []group.MemberIndex
 }
 
+func signingAttemptSessionID(
+	message *big.Int,
+	attemptStartBlock uint64,
+	attemptNumber uint,
+) string {
+	return fmt.Sprintf(
+		"%v-%v-%v",
+		message.Text(16),
+		attemptStartBlock,
+		attemptNumber,
+	)
+}
+
 // signingAttemptFn represents a function performing a signing attempt.
 type signingAttemptFn func(*signingAttemptParams) (*signing.Result, uint64, error)
 
@@ -260,7 +273,11 @@ func (srl *signingRetryLoop) start(
 		readyMembersIndexes, err := srl.announcer.Announce(
 			announceCtx,
 			srl.signingGroupMemberIndex,
-			fmt.Sprintf("%v-%v", srl.message, srl.attemptCounter),
+			signingAttemptSessionID(
+				srl.message,
+				announcementEndBlock,
+				srl.attemptCounter,
+			),
 		)
 		if err != nil {
 			srl.logger.Warnf(
