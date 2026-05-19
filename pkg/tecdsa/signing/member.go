@@ -140,6 +140,7 @@ func (skgm *symmetricKeyGeneratingMember) initializeTssRoundOne() *tssRoundOneMe
 		len(groupTssPartiesIDs),
 		skgm.group.HonestThreshold()-1,
 	)
+	tssParameters.SetSessionNonceBytes([]byte(skgm.sessionID))
 
 	tssOutgoingMessagesChan := make(chan tss.Message, len(groupTssPartiesIDs))
 	tssResultChan := make(chan tsslibcommon.SignatureData, 1)

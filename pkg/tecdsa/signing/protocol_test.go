@@ -261,6 +261,26 @@ func TestGenerateSymmetricKeys_InvalidEphemeralPublicKeyMessage(t *testing.T) {
 	}
 }
 
+func TestInitializeTssRoundOneSetsSessionNonce(t *testing.T) {
+	members, err := initializeTssRoundOneMembersGroup(
+		dishonestThreshold,
+		groupSize,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expectedNonce := new(big.Int).SetBytes(common.SHA512_256([]byte(sessionID)))
+	for _, member := range members {
+		testutils.AssertBigIntsEqual(
+			t,
+			fmt.Sprintf("session nonce for member [%v]", member.id),
+			expectedNonce,
+			member.tssParameters.SessionNonce(),
+		)
+	}
+}
+
 func TestTssRoundOne(t *testing.T) {
 	members, err := initializeTssRoundOneMembersGroup(
 		dishonestThreshold,
