@@ -271,6 +271,11 @@ func TestInitializeTssRoundOneSetsSessionNonce(t *testing.T) {
 	}
 
 	expectedNonce := new(big.Int).SetBytes(common.SHA512_256([]byte(sessionID)))
+	otherNonce := new(big.Int).SetBytes(common.SHA512_256([]byte("other-session")))
+	if expectedNonce.Cmp(otherNonce) == 0 {
+		t.Fatal("session nonces should differ for different session IDs")
+	}
+
 	for _, member := range members {
 		testutils.AssertBigIntsEqual(
 			t,

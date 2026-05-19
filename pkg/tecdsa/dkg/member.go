@@ -142,6 +142,7 @@ func (skgm *symmetricKeyGeneratingMember) initializeTssRoundOne() (
 		len(groupTssPartiesIDs),
 		skgm.group.HonestThreshold()-1,
 	)
+	// Bind GG20 proof challenges to the existing protocol session.
 	tssParameters.SetSessionNonceBytes([]byte(skgm.sessionID))
 	tssParameters.SetConcurrency(skgm.keyGenerationConcurrency)
 

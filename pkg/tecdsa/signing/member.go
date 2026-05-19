@@ -140,6 +140,7 @@ func (skgm *symmetricKeyGeneratingMember) initializeTssRoundOne() *tssRoundOneMe
 		len(groupTssPartiesIDs),
 		skgm.group.HonestThreshold()-1,
 	)
+	// Bind GG20 proof challenges to the existing protocol session.
 	tssParameters.SetSessionNonceBytes([]byte(skgm.sessionID))
 
 	tssOutgoingMessagesChan := make(chan tss.Message, len(groupTssPartiesIDs))
