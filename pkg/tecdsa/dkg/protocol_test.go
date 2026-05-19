@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	tsslibcommon "github.com/bnb-chain/tss-lib/common"
+	"github.com/bnb-chain/tss-lib/common"
 	"github.com/bnb-chain/tss-lib/crypto/paillier"
 	"github.com/bnb-chain/tss-lib/ecdsa/keygen"
 	"github.com/bnb-chain/tss-lib/tss"
@@ -258,12 +258,7 @@ func TestInitializeTssRoundOneSetsSessionNonce(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	expectedNonce := new(big.Int).SetBytes(tsslibcommon.SHA512_256([]byte(sessionID)))
-	otherNonce := new(big.Int).SetBytes(tsslibcommon.SHA512_256([]byte("other-session")))
-	if expectedNonce.Cmp(otherNonce) == 0 {
-		t.Fatal("session nonces should differ for different session IDs")
-	}
-
+	expectedNonce := new(big.Int).SetBytes(common.SHA512_256([]byte(sessionID)))
 	for _, member := range members {
 		testutils.AssertBigIntsEqual(
 			t,
@@ -271,6 +266,19 @@ func TestInitializeTssRoundOneSetsSessionNonce(t *testing.T) {
 			expectedNonce,
 			member.tssParameters.SessionNonce(),
 		)
+	}
+
+	otherSessionSource := members[0].symmetricKeyGeneratingMember
+	originalSessionID := otherSessionSource.sessionID
+	otherSessionSource.sessionID = "other-session"
+	otherSessionMember, err := otherSessionSource.initializeTssRoundOne()
+	otherSessionSource.sessionID = originalSessionID
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if expectedNonce.Cmp(otherSessionMember.tssParameters.SessionNonce()) == 0 {
+		t.Fatal("initialized TSS members should use different nonces for different session IDs")
 	}
 }
 
