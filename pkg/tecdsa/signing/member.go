@@ -145,6 +145,7 @@ func (skgm *symmetricKeyGeneratingMember) initializeTssRoundOne() *tssRoundOneMe
 
 	tssOutgoingMessagesChan := make(chan tss.Message, len(groupTssPartiesIDs))
 	tssResultChan := make(chan tsslibcommon.SignatureData, 1)
+	fullBytesLen := (tecdsa.Curve.Params().N.BitLen() + 7) / 8
 
 	tssParty := signing.NewLocalParty(
 		skgm.message,
@@ -152,6 +153,7 @@ func (skgm *symmetricKeyGeneratingMember) initializeTssRoundOne() *tssRoundOneMe
 		skgm.privateKeyShare.Data(),
 		tssOutgoingMessagesChan,
 		tssResultChan,
+		fullBytesLen,
 	)
 
 	return &tssRoundOneMember{

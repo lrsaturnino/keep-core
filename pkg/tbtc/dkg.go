@@ -380,11 +380,7 @@ func (de *dkgExecutor) generateSigningGroup(
 					)
 
 					// sessionID must be different for each attempt.
-					sessionID := fmt.Sprintf(
-						"%v-%v",
-						seed.Text(16),
-						attempt.number,
-					)
+					sessionID := dkgAttemptSessionID(seed, attempt.number)
 
 					result, err := de.tecdsaExecutor.Execute(
 						attemptCtx,

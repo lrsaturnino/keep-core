@@ -143,7 +143,7 @@ func signingAttemptSessionID(
 	attemptNumber uint,
 ) string {
 	return fmt.Sprintf(
-		"%v-%v-%v",
+		"signing-%v-%016x-%v",
 		message.Text(16),
 		attemptStartBlock,
 		attemptNumber,

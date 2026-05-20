@@ -28,7 +28,7 @@ import (
 const (
 	groupSize          = 3
 	dishonestThreshold = 0
-	sessionID          = "session-1"
+	sessionID          = "session-1-with-128-bits"
 )
 
 func TestGenerateEphemeralKeyPair(t *testing.T) {
@@ -282,7 +282,7 @@ func TestInitializeTssRoundOneSetsSessionNonce(t *testing.T) {
 
 	otherSessionSource := members[0].symmetricKeyGeneratingMember
 	originalSessionID := otherSessionSource.sessionID
-	otherSessionSource.sessionID = "other-session"
+	otherSessionSource.sessionID = "other-session-with-128-bits"
 	otherSessionMember := otherSessionSource.initializeTssRoundOne()
 	otherSessionSource.sessionID = originalSessionID
 

@@ -31,7 +31,7 @@ import (
 const (
 	groupSize          = 3
 	dishonestThreshold = 0
-	sessionID          = "session-1"
+	sessionID          = "session-1-with-128-bits"
 )
 
 func TestGenerateEphemeralKeyPair(t *testing.T) {
@@ -270,7 +270,7 @@ func TestInitializeTssRoundOneSetsSessionNonce(t *testing.T) {
 
 	otherSessionSource := members[0].symmetricKeyGeneratingMember
 	originalSessionID := otherSessionSource.sessionID
-	otherSessionSource.sessionID = "other-session"
+	otherSessionSource.sessionID = "other-session-with-128-bits"
 	otherSessionMember, err := otherSessionSource.initializeTssRoundOne()
 	otherSessionSource.sessionID = originalSessionID
 	if err != nil {
@@ -1321,7 +1321,7 @@ func TestVerifyDKGResultSignatures(t *testing.T) {
 						resultHash: ResultSignatureHash{11: 11},
 						signature:  []byte("sign 2"),
 						publicKey:  []byte("pubKey 2"),
-						sessionID:  "session-1",
+						sessionID:  sessionID,
 					},
 					&verificationOutcome{
 						isValid: true,
@@ -1334,7 +1334,7 @@ func TestVerifyDKGResultSignatures(t *testing.T) {
 						resultHash: ResultSignatureHash{11: 11},
 						signature:  []byte("sign 3"),
 						publicKey:  []byte("pubKey 3"),
-						sessionID:  "session-1",
+						sessionID:  sessionID,
 					},
 					&verificationOutcome{
 						isValid: true,
@@ -1357,7 +1357,7 @@ func TestVerifyDKGResultSignatures(t *testing.T) {
 						resultHash: ResultSignatureHash{12: 12},
 						signature:  []byte("sign 2"),
 						publicKey:  []byte("pubKey 2"),
-						sessionID:  "session-1",
+						sessionID:  sessionID,
 					},
 					&verificationOutcome{
 						isValid: true,
@@ -1378,7 +1378,7 @@ func TestVerifyDKGResultSignatures(t *testing.T) {
 						resultHash: ResultSignatureHash{11: 11},
 						signature:  []byte("sign 2"),
 						publicKey:  []byte("pubKey 2"),
-						sessionID:  "session-1",
+						sessionID:  sessionID,
 					},
 					&verificationOutcome{
 						isValid: false,
@@ -1398,7 +1398,7 @@ func TestVerifyDKGResultSignatures(t *testing.T) {
 						resultHash: ResultSignatureHash{11: 11},
 						signature:  []byte("bad sign"),
 						publicKey:  []byte("pubKey 2"),
-						sessionID:  "session-1",
+						sessionID:  sessionID,
 					},
 					&verificationOutcome{
 						isValid: false,

@@ -117,7 +117,7 @@ func TestDkgRetryLoop(t *testing.T) {
 				return context.WithTimeout(context.Background(), 10*time.Second)
 			},
 			incomingAnnouncementsFn: func(sessionID string) ([]group.MemberIndex, error) {
-				if sessionID == fmt.Sprintf("%v-%v", seed, 1) {
+				if sessionID == dkgAttemptSessionID(seed, 1) {
 					// Non-quorum of members announced their readiness.
 					return []group.MemberIndex{1, 2, 3, 4, 5, 6, 7}, nil
 				}
@@ -145,7 +145,7 @@ func TestDkgRetryLoop(t *testing.T) {
 				return context.WithTimeout(context.Background(), 10*time.Second)
 			},
 			incomingAnnouncementsFn: func(sessionID string) ([]group.MemberIndex, error) {
-				if sessionID == fmt.Sprintf("%v-%v", seed, 1) {
+				if sessionID == dkgAttemptSessionID(seed, 1) {
 					return nil, fmt.Errorf("unexpected error")
 				}
 
@@ -249,7 +249,7 @@ func TestDkgRetryLoop(t *testing.T) {
 			},
 			incomingAnnouncementsFn: func(sessionID string) ([]group.MemberIndex, error) {
 				// Force the first attempt's announcement failure.
-				if sessionID == fmt.Sprintf("%v-%v", seed, 1) {
+				if sessionID == dkgAttemptSessionID(seed, 1) {
 					return nil, fmt.Errorf("unexpected error")
 				}
 
@@ -351,6 +351,22 @@ func TestDkgRetryLoop(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestDkgAttemptSessionIDHasMinimumEntropyWidth(t *testing.T) {
+	seed := big.NewInt(100)
+
+	sessionID := dkgAttemptSessionID(seed, 1)
+
+	testutils.AssertStringsEqual(
+		t,
+		"session ID format",
+		"dkg-64-0000000000000001",
+		sessionID,
+	)
+	if len(sessionID) < 16 {
+		t.Fatal("DKG session ID must satisfy tss-lib SetSessionNonceBytes minimum length")
 	}
 }
 

@@ -5,11 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
-	"github.com/keep-network/keep-core/pkg/protocol/announcer"
 	"math/big"
 
 	"github.com/ipfs/go-log/v2"
 	"github.com/keep-network/keep-core/pkg/chain"
+	"github.com/keep-network/keep-core/pkg/protocol/announcer"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/tecdsa/dkg"
 	"github.com/keep-network/keep-core/pkg/tecdsa/retry"
@@ -117,6 +117,14 @@ type dkgAttemptParams struct {
 	excludedMembersIndexes []group.MemberIndex
 }
 
+func dkgAttemptSessionID(seed *big.Int, attemptNumber uint) string {
+	return fmt.Sprintf(
+		"dkg-%v-%016x",
+		seed.Text(16),
+		attemptNumber,
+	)
+}
+
 // dkgAttemptFn represents a function performing a DKG attempt.
 type dkgAttemptFn func(*dkgAttemptParams) (*dkg.Result, error)
 
@@ -197,7 +205,7 @@ func (drl *dkgRetryLoop) start(
 		readyMembersIndexes, err := drl.announcer.Announce(
 			announceCtx,
 			drl.memberIndex,
-			fmt.Sprintf("%v-%v", drl.seed, drl.attemptCounter),
+			dkgAttemptSessionID(drl.seed, drl.attemptCounter),
 		)
 		if err != nil {
 			drl.logger.Warnf(
