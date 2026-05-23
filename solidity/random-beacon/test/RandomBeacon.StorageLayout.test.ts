@@ -84,7 +84,7 @@ describe("RandomBeacon - Storage Layout", () => {
       const entry = storage.find((e) => e.label === "_reentrancyStatus")!
       const raw = await ethers.provider.getStorageAt(
         randomBeacon.address,
-        entry.slot
+        ethers.BigNumber.from(entry.slot)
       )
       expect(
         ethers.BigNumber.from(raw).toNumber(),
@@ -113,7 +113,7 @@ describe("RandomBeacon - Storage Layout", () => {
 
       const raw = await ethers.provider.getStorageAt(
         randomBeacon.address,
-        entry.slot
+        ethers.BigNumber.from(entry.slot)
       )
       expect(
         ethers.BigNumber.from(raw).toNumber(),
