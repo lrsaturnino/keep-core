@@ -19,8 +19,6 @@ import (
 	dstore "github.com/ipfs/go-datastore"
 	dssync "github.com/ipfs/go-datastore/sync"
 
-	//lint:ignore SA1019 package deprecated, but we rely on its interface
-	addrutil "github.com/libp2p/go-addr-util"
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	libp2pcrypto "github.com/libp2p/go-libp2p/core/crypto"
@@ -34,6 +32,7 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
 
 	ma "github.com/multiformats/go-multiaddr"
+	manet "github.com/multiformats/go-multiaddr/net"
 )
 
 var logger = log.Logger("keep-libp2p")
@@ -480,12 +479,15 @@ func discoverAndListen(
 }
 
 func getListenAddrs(port int) ([]ma.Multiaddr, error) {
-	ia, err := addrutil.InterfaceAddresses()
+	maddrs, err := manet.InterfaceMultiaddrs()
 	if err != nil {
 		return nil, err
 	}
-	addrs := make([]ma.Multiaddr, 0)
-	for _, addr := range ia {
+	addrs := make([]ma.Multiaddr, 0, len(maddrs))
+	for _, addr := range maddrs {
+		if manet.IsIP6LinkLocal(addr) {
+			continue
+		}
 		portAddr, err := ma.NewMultiaddr(fmt.Sprintf("/tcp/%d", port))
 		if err != nil {
 			return nil, err

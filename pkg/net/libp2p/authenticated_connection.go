@@ -17,10 +17,8 @@ import (
 	"github.com/keep-network/keep-core/pkg/net/gen/pb"
 	"github.com/keep-network/keep-core/pkg/net/security/handshake"
 
+	"google.golang.org/protobuf/encoding/protodelim"
 	"google.golang.org/protobuf/proto"
-	// TODO: Stop using `dev` version of `google.golang.org/protobuf` once v.1.28.2
-	// is published.
-	protodelim "google.golang.org/protobuf/dev/encoding/protodelim"
 )
 
 // Enough space for a proto-encoded envelope with a message, peer.ID, and sig.

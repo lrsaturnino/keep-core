@@ -30,6 +30,10 @@ on:
 
 # Automatic releases are now handled by the dedicated release.yml workflow
 
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
   client-detect-changes:
     runs-on: ubuntu-latest

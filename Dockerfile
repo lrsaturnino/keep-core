@@ -1,4 +1,4 @@
-FROM golang:1.24-alpine3.21 AS build-sources
+FROM golang:1.25.5-alpine3.21 AS build-sources
 
 ENV GOPATH=/go \
 	GOBIN=/go/bin \
@@ -6,7 +6,8 @@ ENV GOPATH=/go \
 	APP_DIR=/go/src/github.com/keep-network/keep-core \
 	TEST_RESULTS_DIR=/mnt/test-results \
 	BIN_PATH=/usr/local/bin \
-	LD_LIBRARY_PATH=/usr/local/lib/
+	LD_LIBRARY_PATH=/usr/local/lib/ \
+	GOTOOLCHAIN=auto
 
 # TODO: Remove perl once go-ethereum is upgraded to 1.11.
 #       See pkg/chain/ethereum/tbtc/gen/Makefile and after_abi_hook for details.
@@ -108,9 +109,10 @@ CMD []
 #
 # Build Binaries
 #
-FROM golang:1.24-bullseye AS build-bins
+FROM golang:1.25.10-bookworm AS build-bins
 
-ENV APP_DIR=/go/src/github.com/keep-network/keep-core
+ENV APP_DIR=/go/src/github.com/keep-network/keep-core \
+	GOTOOLCHAIN=auto
 
 WORKDIR $APP_DIR
 

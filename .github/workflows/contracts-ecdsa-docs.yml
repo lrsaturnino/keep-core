@@ -12,6 +12,10 @@ on:
       - "published"
   workflow_dispatch:
 
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
   docs-detect-changes:
     runs-on: ubuntu-latest

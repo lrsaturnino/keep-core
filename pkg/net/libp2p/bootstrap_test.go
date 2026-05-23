@@ -2,10 +2,11 @@ package libp2p
 
 import (
 	"fmt"
-	"github.com/ipfs/go-ipfs-config"
+	"testing"
+
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/test"
-	"testing"
+	ma "github.com/multiformats/go-multiaddr"
 )
 
 func TestMultipleAddrsPerPeer(t *testing.T) {
@@ -16,24 +17,21 @@ func TestMultipleAddrsPerPeer(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		addr := fmt.Sprintf("/ip4/127.0.0.1/tcp/5001/ipfs/%s", pid.String())
-		bsp1, err := config.ParseBootstrapPeers([]string{addr})
+		addr1, err := ma.NewMultiaddr(fmt.Sprintf("/ip4/127.0.0.1/tcp/5001/p2p/%s", pid.String()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr2, err := ma.NewMultiaddr(fmt.Sprintf("/ip4/127.0.0.1/udp/5002/quic-v1/p2p/%s", pid.String()))
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		addr = fmt.Sprintf("/ip4/127.0.0.1/udp/5002/utp/ipfs/%s", pid.String())
-		bsp2, err := config.ParseBootstrapPeers([]string{addr})
+		bsp1Addr, err := peer.AddrInfoFromP2pAddr(addr1)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		bsp1Addr, err := peer.AddrInfoFromP2pAddr(bsp1[0].Multiaddr())
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		bsp2Addr, err := peer.AddrInfoFromP2pAddr(bsp2[0].Multiaddr())
+		bsp2Addr, err := peer.AddrInfoFromP2pAddr(addr2)
 		if err != nil {
 			t.Fatal(err)
 		}
