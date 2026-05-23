@@ -65,6 +65,25 @@ const config: HardhatUserConfig = {
           optimizer: {
             enabled: true,
           },
+          // storageLayout enables F-09 reentrancy-slot assertion and the
+          // RandomBeacon storage-layout snapshot test. See
+          // test/RandomBeacon.StorageLayout.test.ts. The explicit list mirrors
+          // hardhat's defaults plus storageLayout; specifying only
+          // "storageLayout" here would override the defaults and break
+          // typechain / hardhat-deploy.
+          outputSelection: {
+            "*": {
+              "*": [
+                "abi",
+                "evm.bytecode",
+                "evm.deployedBytecode",
+                "evm.methodIdentifiers",
+                "metadata",
+                "storageLayout",
+              ],
+              "": ["ast"],
+            },
+          },
         },
       },
       {
@@ -72,6 +91,11 @@ const config: HardhatUserConfig = {
         settings: {
           optimizer: {
             enabled: true,
+          },
+          outputSelection: {
+            "*": {
+              "*": ["storageLayout"],
+            },
           },
         },
       },

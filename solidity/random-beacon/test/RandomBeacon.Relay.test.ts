@@ -327,6 +327,24 @@ describe("RandomBeacon - Relay", () => {
                 ethers.utils.parseUnits("2000000", "gwei") // 0,002 ETH
               )
             })
+
+            // F-09 sanity check: submitter must come out at least whole
+            // (refund ≥ gas cost). Tight pinning of the offset itself lives
+            // in test/RandomBeacon.StorageLayout.test.ts where a direct slot
+            // read avoids the gas-accounting noise of a refund comparison.
+            it("reimbursement is sufficient to cover gas cost (submitter made whole)", async () => {
+              const receipt = await tx.wait()
+              const gasCost = receipt.gasUsed.mul(receipt.effectiveGasPrice)
+              const postBalance = await provider.getBalance(submitter.address)
+              const refund = postBalance.sub(initialSubmitterBalance)
+              expect(
+                refund.gte(gasCost),
+                `submitter under-refunded: refund ${refund.toString()} wei < ` +
+                  `gasCost ${gasCost.toString()} wei. If this is the first ` +
+                  `failure after touching _relayEntrySubmissionGasOffset or ` +
+                  `the nonReentrant modifier, re-measure and update both.`
+              ).to.equal(true)
+            })
           })
 
           context("when result is submitted after the soft timeout", () => {
