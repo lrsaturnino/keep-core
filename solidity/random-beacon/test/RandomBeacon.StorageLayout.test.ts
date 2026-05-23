@@ -36,11 +36,9 @@ async function getRandomBeaconStorageLayout(): Promise<StorageEntry[]> {
         "outputSelection (see hardhat.config.ts)"
     )
   }
-  const layout = (
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    buildInfo.output.contracts["contracts/RandomBeacon.sol"]
-      .RandomBeacon as any
-  ).storageLayout
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const contracts = buildInfo.output.contracts as any
+  const layout = contracts["contracts/RandomBeacon.sol"].RandomBeacon.storageLayout
   if (!layout) {
     throw new Error(
       "RandomBeacon storageLayout missing from build-info -- check that the " +
@@ -74,7 +72,9 @@ describe("RandomBeacon - Storage Layout", () => {
         "F-09 regression: _reentrancyStatus storage variable missing from " +
           "RandomBeacon -- the inline reentrancy guard cannot work without it"
       ).to.not.equal(undefined)
-      expect(entry!.contract).to.equal("contracts/RandomBeacon.sol:RandomBeacon")
+      expect(entry!.contract).to.equal(
+        "contracts/RandomBeacon.sol:RandomBeacon"
+      )
       expect(entry!.type).to.match(/^t_uint256$/)
     })
 
