@@ -21,8 +21,8 @@ The function now uses a fixed counter suffix appended to the input before
 hashing: `SHA-256(message || counter)` for counter in `[0, 63]`. Each
 iteration performs identical work, bounding (but not normalizing) timing across
 inputs: the loop exits on the first valid point, so execution time still varies
-with how many counters are tried. The maximum counter value (64) gives a failure probability of
-`(1/2)^64 ≈ 5e-20`.
+with how many counters are tried. Using 64 candidate counters gives a failure
+probability of `(1/2)^64 ≈ 5e-20`.
 
 **Why it breaks:**
 
@@ -70,10 +70,17 @@ The `info` parameter binds the derived key to the specific protocol and
 peer pair. Each callsite passes a label encoding:
 
 - A protocol prefix (`gjkr`, `tecdsa-sign`, `tecdsa-dkg`)
-- The canonical (sorted) pair of member IDs
+- The canonical (sorted) pair of member IDs, each encoded as a single byte
 
 This ensures keys derived for different protocols or peer pairs are
 cryptographically independent, even if the ECDH shared secret is the same.
+
+**Invariant:** Member IDs are encoded as a single byte each. This relies on
+`group.MemberIndex` being a `uint8` (max member index 255). A compile-time
+assertion in `pkg/protocol/group/group.go` enforces this; if the type is ever
+widened, the `*EcdhInfo` helpers must switch to a width-independent encoding
+(e.g. `binary.BigEndian.PutUint16`) in the same coordinated upgrade as F-03,
+otherwise members whose IDs collide modulo 256 will derive identical keys.
 
 **Callsites updated:**
 

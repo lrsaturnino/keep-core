@@ -2,6 +2,8 @@
 // and auxiliary tools that help during group-related operations.
 package group
 
+import "unsafe"
+
 // MemberIndex is an index of a member in a group. The maximum member index
 // value is 255.
 type MemberIndex = uint8
@@ -9,6 +11,15 @@ type MemberIndex = uint8
 // MaxMemberIndex denotes the maximum value of the MemberIndex type. That type
 // is represented as uint8 so the maximum member index is 255.
 const MaxMemberIndex = 255
+
+// Compile-time assertion that MemberIndex fits in a single byte. The HKDF info
+// labels used for ECDH session-key domain separation in gjkr / tecdsa-dkg /
+// tecdsa-signing encode each peer's MemberIndex as one byte (see F-03). If
+// MemberIndex is ever widened, those encoders must switch to a width-
+// independent serialization (e.g. binary.BigEndian.PutUint16) in the same
+// coordinated upgrade, otherwise peers whose IDs collide modulo 256 will
+// silently derive identical session keys.
+var _ [1]struct{} = [unsafe.Sizeof(MemberIndex(0))]struct{}{}
 
 // Group is protocol's members group.
 type Group struct {

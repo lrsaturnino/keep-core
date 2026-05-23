@@ -1818,7 +1818,9 @@ func (cm *CombiningMember) ComputeGroupPublicKeyShares() {
 
 // gjkrEcdhInfo returns the HKDF info label for ECDH-derived keys in the GJKR
 // protocol. The pair is sorted so both peers compute the same info regardless
-// of which side initiates.
+// of which side initiates. Each MemberIndex is encoded as a single byte; the
+// compile-time assertion in pkg/protocol/group/group.go enforces the uint8
+// invariant this relies on.
 func gjkrEcdhInfo(id1, id2 group.MemberIndex) []byte {
 	if id1 > id2 {
 		id1, id2 = id2, id1
