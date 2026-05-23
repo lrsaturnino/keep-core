@@ -3,6 +3,8 @@ package retransmission
 import (
 	"reflect"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -103,6 +105,55 @@ func TestBackoffStrategy_TickSequence(t *testing.T) {
 			"unexpected fire sequence\nexpected: %v\nactual:   %v",
 			expected,
 			fired,
+		)
+	}
+}
+
+// TestBackoffStrategy_ConcurrentTick is a regression test for the data race
+// fixed in this package: ScheduleRetransmissions launches a goroutine per
+// ticker callback, so overlapping ticks can call Tick concurrently when the
+// retransmit function is slow. The mutex serialises counter access; this
+// test would fail under `go test -race` without it. The total number of
+// fires is deterministic regardless of goroutine interleaving because the
+// counter increments and the retransmitTick comparison are atomic together
+// under the mutex.
+func TestBackoffStrategy_ConcurrentTick(t *testing.T) {
+	const (
+		goroutines  = 16
+		ticksPerG   = 50
+		totalTicks  = goroutines * ticksPerG
+		expectedHit = 10
+	)
+
+	strategy := WithBackoffStrategy()
+
+	var fires atomic.Uint64
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	for range [goroutines]struct{}{} {
+		go func() {
+			defer wg.Done()
+			for range [ticksPerG]struct{}{} {
+				_ = strategy.Tick(func() error {
+					fires.Add(1)
+					return nil
+				})
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	// For 800 total ticks the backoff sequence fires at ticks
+	// 1, 3, 6, 11, 20, 37, 70, 135, 264, 521 -- ten fires. The next fire
+	// would land at tick 1034, beyond the total.
+	if got := fires.Load(); got != expectedHit {
+		t.Errorf(
+			"unexpected fire count after %d concurrent ticks\nexpected: %d\nactual:   %d",
+			totalTicks,
+			expectedHit,
+			got,
 		)
 	}
 }
