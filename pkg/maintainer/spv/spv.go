@@ -425,10 +425,12 @@ func getProofInfo(
 	// soft threshold so the operator can notice excessive header RPCs.
 	rpcWarnThreshold := txProofDifficultyFactor.Uint64() * 4
 
-	sumDifficulty := new(big.Int)
-	var requiredBlockCount uint64
-	var reached bool
-	for height := proofStartBlock; height <= uint64(latestBlockHeight); height++ {
+	// Seed the running sum with firstHeader (already fetched above) so the
+	// loop does not refetch the proof-start header on iteration zero.
+	sumDifficulty := new(big.Int).Set(firstHeaderDiff)
+	requiredBlockCount := uint64(1)
+	reached := sumDifficulty.Cmp(totalDifficultyRequired) >= 0
+	for height := proofStartBlock + 1; !reached && height <= uint64(latestBlockHeight); height++ {
 		hdr, err := btcChain.GetBlockHeader(uint(height))
 		if err != nil {
 			return false, 0, 0, fmt.Errorf(
@@ -450,7 +452,6 @@ func getProofInfo(
 		}
 		if sumDifficulty.Cmp(totalDifficultyRequired) >= 0 {
 			reached = true
-			break
 		}
 	}
 
