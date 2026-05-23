@@ -327,7 +327,6 @@ describe("RandomBeacon - Relay", () => {
                 ethers.utils.parseUnits("2000000", "gwei") // 0,002 ETH
               )
             })
-
           })
 
           context("when result is submitted after the soft timeout", () => {
