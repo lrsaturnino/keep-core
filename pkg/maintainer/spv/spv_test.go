@@ -107,6 +107,22 @@ func TestGetProofInfo(t *testing.T) {
 			expectedAccumulatedConfirmations: 0,
 			expectedRequiredConfirmations:    0,
 		},
+		"first header difficulty matches neither epoch": {
+			// Min-difficulty block (e.g. testnet4) where the first header's
+			// difficulty matches neither the current nor the previous epoch
+			// difficulty. Bridge.evaluateProofDifficulty would revert
+			// "Not at current or previous difficulty", so the maintainer must
+			// skip the proof.
+			latestBlockHeight:                790277,
+			transactionConfirmations:         3,
+			currentEpoch:                     392,
+			currentEpochDifficulty:           big.NewInt(50000),
+			previousEpochDifficulty:          big.NewInt(30000),
+			difficultyAtBlock:                func(uint) *big.Int { return big.NewInt(1) },
+			expectedIsProofWithinRelayRange:  false,
+			expectedAccumulatedConfirmations: 0,
+			expectedRequiredConfirmations:    0,
+		},
 	}
 
 	for testName, test := range tests {
