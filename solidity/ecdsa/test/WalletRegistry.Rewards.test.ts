@@ -18,7 +18,6 @@ import type {
   IWalletOwner,
   T,
   IRandomBeacon,
-  Allowlist,
 } from "../typechain"
 
 const { to1e18 } = helpers.number
