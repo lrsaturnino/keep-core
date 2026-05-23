@@ -135,6 +135,58 @@ func TestHandlerEvictsAcrossMultipleCycles(t *testing.T) {
 	}
 }
 
+// TestHandlerRingBufferStableUnderManyCycles regression-tests the bounded
+// cache: feeding many more unique IDs than the cache size must keep FIFO
+// eviction correct cycle after cycle. The slice-shift implementation that
+// preceded the ring buffer was functionally correct here too, but its backing
+// array grew beyond maxCacheSize before Go reallocated; this test pins the
+// observable behavior so a regression in either direction is caught.
+func TestHandlerRingBufferStableUnderManyCycles(t *testing.T) {
+	const cacheSize = 4
+	const totalUnique = 1000
+
+	var received []net.Message
+	handler := withRetransmissionSupport(func(message net.Message) {
+		received = append(received, message)
+	}, cacheSize)
+
+	for i := uint64(1); i <= totalUnique; i++ {
+		handler(&mockNetworkMessage{senderID: "a", seqno: i})
+	}
+
+	if len(received) != totalUnique {
+		t.Fatalf(
+			"expected every unique message to be accepted exactly once\nactual:   [%d]\nexpected: [%d]",
+			len(received),
+			totalUnique,
+		)
+	}
+
+	// The last cacheSize messages must still be deduplicated.
+	for i := uint64(totalUnique - cacheSize + 1); i <= totalUnique; i++ {
+		handler(&mockNetworkMessage{senderID: "a", seqno: i})
+	}
+	if len(received) != totalUnique {
+		t.Fatalf(
+			"recent messages must remain cached after many cycles\nactual:   [%d]\nexpected: [%d]",
+			len(received),
+			totalUnique,
+		)
+	}
+
+	// Messages older than the window must be accepted again.
+	for i := uint64(1); i <= uint64(cacheSize); i++ {
+		handler(&mockNetworkMessage{senderID: "a", seqno: i})
+	}
+	if len(received) != totalUnique+cacheSize {
+		t.Fatalf(
+			"evicted messages must be re-accepted\nactual:   [%d]\nexpected: [%d]",
+			len(received),
+			totalUnique+cacheSize,
+		)
+	}
+}
+
 func TestHandlerConcurrentAccess(t *testing.T) {
 	var mu sync.Mutex
 	var received []net.Message

@@ -72,7 +72,14 @@ func withRetransmissionSupport(
 
 	mutex := &sync.Mutex{}
 	cache := make(map[string]struct{})
-	messageIDs := make([]string, 0, maxCacheSize)
+	// Fixed-size ring buffer recording insertion order so eviction is O(1)
+	// and the backing array never grows beyond maxCacheSize. A slice-shift
+	// approach (cache = cache[1:]) would slide the window through the backing
+	// array and force periodic reallocations, overshooting the configured
+	// bound by roughly 2x in steady state.
+	ring := make([]string, maxCacheSize)
+	head := 0
+	size := 0
 
 	return func(message net.Message) {
 		messageID := fmt.Sprintf(
@@ -81,24 +88,27 @@ func withRetransmissionSupport(
 			message.Seqno(),
 		)
 
-		// The lock is acquired and released inside the closure so that it is
-		// not held during the delegate call, which may be slow or re-entrant.
+		// Hold the mutex only while consulting and updating the bounded
+		// cache. The delegate is invoked outside the critical section so a
+		// slow or re-entrant handler cannot stall other receivers.
 		seen := func() bool {
 			mutex.Lock()
 			defer mutex.Unlock()
 
-			_, seen := cache[messageID]
-			if !seen {
-				if len(cache) >= maxCacheSize {
-					delete(cache, messageIDs[0])
-					messageIDs[0] = ""
-					messageIDs = messageIDs[1:]
-				}
-
-				cache[messageID] = struct{}{}
-				messageIDs = append(messageIDs, messageID)
+			if _, ok := cache[messageID]; ok {
+				return true
 			}
-			return seen
+
+			if size == maxCacheSize {
+				delete(cache, ring[head])
+				ring[head] = messageID
+				head = (head + 1) % maxCacheSize
+			} else {
+				ring[(head+size)%maxCacheSize] = messageID
+				size++
+			}
+			cache[messageID] = struct{}{}
+			return false
 		}()
 
 		if !seen {
