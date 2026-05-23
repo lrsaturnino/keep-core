@@ -313,17 +313,11 @@ func (se *signingExecutor) sign(
 						se.waitForBlockFn,
 					)
 
-					sessionID := signingAttemptSessionID(
-						message,
-						attempt.startBlock,
-						attempt.number,
-					)
-
 					result, err := signing.Execute(
 						attemptCtx,
 						signingAttemptLogger,
 						message,
-						sessionID,
+						attempt.sessionID,
 						signer.signingGroupMemberIndex,
 						signer.privateKeyShare,
 						wallet.groupSize(),

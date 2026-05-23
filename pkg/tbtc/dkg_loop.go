@@ -115,6 +115,10 @@ type dkgAttemptParams struct {
 	startBlock             uint64
 	timeoutBlock           uint64
 	excludedMembersIndexes []group.MemberIndex
+	// sessionID is the GG20 session identifier shared by the announcer and the
+	// DKG protocol for this attempt. Computed once per attempt by the retry
+	// loop so both sides cannot drift.
+	sessionID string
 }
 
 func dkgAttemptSessionID(seed *big.Int, attemptNumber uint) string {
@@ -202,10 +206,14 @@ func (drl *dkgRetryLoop) start(
 			drl.attemptCounter,
 		)
 
+		// Derive the session ID once per attempt so the announcer and the DKG
+		// protocol cannot drift apart.
+		sessionID := dkgAttemptSessionID(drl.seed, drl.attemptCounter)
+
 		readyMembersIndexes, err := drl.announcer.Announce(
 			announceCtx,
 			drl.memberIndex,
-			dkgAttemptSessionID(drl.seed, drl.attemptCounter),
+			sessionID,
 		)
 		if err != nil {
 			drl.logger.Warnf(
@@ -279,6 +287,7 @@ func (drl *dkgRetryLoop) start(
 				startBlock:             announcementEndBlock,
 				timeoutBlock:           timeoutBlock,
 				excludedMembersIndexes: excludedMembersIndexes,
+				sessionID:              sessionID,
 			})
 		} else {
 			drl.logger.Infof(

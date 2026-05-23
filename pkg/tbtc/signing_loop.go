@@ -135,6 +135,10 @@ type signingAttemptParams struct {
 	startBlock             uint64
 	timeoutBlock           uint64
 	excludedMembersIndexes []group.MemberIndex
+	// sessionID is the GG20 session identifier shared by the announcer and the
+	// signing protocol for this attempt. Computed once per attempt by the retry
+	// loop so both sides cannot drift.
+	sessionID string
 }
 
 func signingAttemptSessionID(
@@ -143,7 +147,7 @@ func signingAttemptSessionID(
 	attemptNumber uint,
 ) string {
 	return fmt.Sprintf(
-		"signing-%v-%016x-%v",
+		"signing-%v-%016x-%016x",
 		message.Text(16),
 		attemptStartBlock,
 		attemptNumber,
@@ -270,14 +274,18 @@ func (srl *signingRetryLoop) start(
 			srl.attemptCounter,
 		)
 
+		// Derive the session ID once per attempt so the announcer and the
+		// signing protocol cannot drift apart.
+		sessionID := signingAttemptSessionID(
+			srl.message,
+			announcementEndBlock,
+			srl.attemptCounter,
+		)
+
 		readyMembersIndexes, err := srl.announcer.Announce(
 			announceCtx,
 			srl.signingGroupMemberIndex,
-			signingAttemptSessionID(
-				srl.message,
-				announcementEndBlock,
-				srl.attemptCounter,
-			),
+			sessionID,
 		)
 		if err != nil {
 			srl.logger.Warnf(
@@ -376,6 +384,7 @@ func (srl *signingRetryLoop) start(
 				startBlock:             announcementEndBlock,
 				timeoutBlock:           timeoutBlock,
 				excludedMembersIndexes: excludedMembersIndexes,
+				sessionID:              sessionID,
 			})
 			if err != nil {
 				srl.logger.Warnf(
