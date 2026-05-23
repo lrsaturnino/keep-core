@@ -82,13 +82,18 @@ describe("RandomBeacon - Storage Layout", () => {
     it("is initialised to 1 by the constructor (cold-SSTORE optimisation)", async () => {
       const storage = await getRandomBeaconStorageLayout()
       const entry = storage.find((e) => e.label === "_reentrancyStatus")!
-      const raw = await ethers.provider.getStorageAt(
-        randomBeacon.address,
-        ethers.utils.hexZeroPad(
-          ethers.BigNumber.from(entry.slot).toHexString(),
-          32
-        )
+      // ethers v5 getStorageAt() strips leading zeros from the position arg,
+      // which hardhat's RPC validator then rejects ("must be 32-byte hex"). We
+      // send the RPC directly with a zero-padded slot.
+      const slot = ethers.utils.hexZeroPad(
+        ethers.BigNumber.from(entry.slot).toHexString(),
+        32
       )
+      const raw = await ethers.provider.send("eth_getStorageAt", [
+        randomBeacon.address,
+        slot,
+        "latest",
+      ])
       expect(
         ethers.BigNumber.from(raw).toNumber(),
         "F-09 regression: _reentrancyStatus must be initialised to 1 in the " +
@@ -114,13 +119,18 @@ describe("RandomBeacon - Storage Layout", () => {
         "_relayEntrySubmissionGasOffset missing from storage layout"
       ).to.not.equal(undefined)
 
-      const raw = await ethers.provider.getStorageAt(
-        randomBeacon.address,
-        ethers.utils.hexZeroPad(
-          ethers.BigNumber.from(entry.slot).toHexString(),
-          32
-        )
+      // ethers v5 getStorageAt() strips leading zeros from the position arg,
+      // which hardhat's RPC validator then rejects ("must be 32-byte hex"). We
+      // send the RPC directly with a zero-padded slot.
+      const slot = ethers.utils.hexZeroPad(
+        ethers.BigNumber.from(entry.slot).toHexString(),
+        32
       )
+      const raw = await ethers.provider.send("eth_getStorageAt", [
+        randomBeacon.address,
+        slot,
+        "latest",
+      ])
       expect(
         ethers.BigNumber.from(raw).toNumber(),
         "F-09 regression: _relayEntrySubmissionGasOffset must be 13_450 to " +
