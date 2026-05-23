@@ -1,4 +1,4 @@
-FROM golang:1.25.5-alpine3.21 AS build-sources
+FROM golang:1.25.10-alpine3.23 AS build-sources
 
 ENV GOPATH=/go \
 	GOBIN=/go/bin \
@@ -89,7 +89,7 @@ RUN GOOS=linux make build \
 	version=$VERSION \
 	revision=$REVISION
 
-FROM alpine:3.21 as runtime-docker
+FROM alpine:3.23 as runtime-docker
 
 ENV APP_NAME=keep-client \
 	APP_DIR=/go/src/github.com/keep-network/keep-core \
