@@ -419,6 +419,12 @@ func getProofInfo(
 		txProofDifficultyFactor,
 	)
 
+	// On chains with min-difficulty blocks (e.g. testnet4) the per-header
+	// difficulty walk can need many more blocks than txProofDifficultyFactor
+	// to accumulate enough work. Emit a warning once the walk grows past a
+	// soft threshold so the operator can notice excessive header RPCs.
+	rpcWarnThreshold := txProofDifficultyFactor.Uint64() * 4
+
 	sumDifficulty := new(big.Int)
 	var requiredBlockCount uint64
 	var reached bool
@@ -433,6 +439,15 @@ func getProofInfo(
 		}
 		sumDifficulty.Add(sumDifficulty, hdr.Difficulty())
 		requiredBlockCount++
+		if requiredBlockCount == rpcWarnThreshold+1 {
+			logger.Warnf(
+				"transaction [%s] still has not accumulated enough "+
+					"difficulty after walking [%d] headers; per-block work "+
+					"appears unusually low (e.g. min-difficulty blocks)",
+				transactionHash.Hex(bitcoin.ReversedByteOrder),
+				requiredBlockCount,
+			)
+		}
 		if sumDifficulty.Cmp(totalDifficultyRequired) >= 0 {
 			reached = true
 			break
