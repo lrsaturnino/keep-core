@@ -79,3 +79,6 @@ storage/
 
 # AI model run logs
 strix_runs/
+
+# Claude Code session state
+.claude/
