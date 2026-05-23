@@ -5,9 +5,11 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"crypto/sha256"
+	"encoding/asn1"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"math/big"
 	"strings"
 	"testing"
 
@@ -559,6 +561,74 @@ func TestVerifySignerApprovalCertificateRejectsMalformedDERSignature(t *testing.
 	err = verifySignerApprovalCertificate(&certificate, expectedSignerSetHash)
 	if err == nil || !strings.Contains(err.Error(), "cannot parse threshold signature") {
 		t.Fatalf("expected malformed DER signature error, got %v", err)
+	}
+}
+
+func TestVerifySignerApprovalCertificateRejectsHighSSignature(t *testing.T) {
+	node, _, walletPublicKey := setupCovenantSignerTestNode(t)
+	request := validStructuredSignerApprovalVerificationRequest(
+		t,
+		node,
+		walletPublicKey,
+		covenantsigner.TemplateSelfV1,
+	)
+
+	certificate := *request.SignerApproval
+
+	// Parse the issued DER signature and construct the mathematically
+	// equivalent high-S variant (S' = N - S). ECDSA permits both (R, S) and
+	// (R, N - S) as valid signatures over the same digest; rejecting the
+	// high-S form prevents signature malleability. DER encoding is done via
+	// encoding/asn1 rather than btcec.Signature.Serialize(), which silently
+	// re-normalizes S back to the low range and would defeat this check.
+	signatureBytes, err := hex.DecodeString(strings.TrimPrefix(certificate.Signature, "0x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsedSignature, err := btcec.ParseDERSignature(signatureBytes, btcec.S256())
+	if err != nil {
+		t.Fatal(err)
+	}
+	curveOrder := btcec.S256().N
+	halfOrder := new(big.Int).Rsh(curveOrder, 1)
+	highS := new(big.Int).Set(parsedSignature.S)
+	if highS.Cmp(halfOrder) <= 0 {
+		highS.Sub(curveOrder, highS)
+	}
+	if highS.Cmp(halfOrder) <= 0 {
+		t.Fatalf("could not construct high-S candidate from S=%s", parsedSignature.S.Text(16))
+	}
+	highSignatureDER, err := asn1.Marshal(struct {
+		R, S *big.Int
+	}{R: parsedSignature.R, S: highS})
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate.Signature = "0x" + hex.EncodeToString(highSignatureDER)
+
+	walletExecutor, ok, err := node.getSigningExecutor(walletPublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("node is supposed to control wallet signers")
+	}
+	walletChainData, err := walletExecutor.chain.GetWallet(bitcoin.PublicKeyHash(walletPublicKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedSignerSetHash, err := computeSignerApprovalCertificateSignerSetHash(
+		walletPublicKey,
+		walletChainData,
+		walletExecutor.groupParameters,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = verifySignerApprovalCertificate(&certificate, expectedSignerSetHash)
+	if err == nil || !strings.Contains(err.Error(), "threshold signature S value is not low-S normalized") {
+		t.Fatalf("expected low-S normalization error, got %v", err)
 	}
 }
 

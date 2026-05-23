@@ -138,6 +138,7 @@ func Initialize(
 
 	listener, err := net.Listen("tcp", server.httpServer.Addr)
 	if err != nil {
+		cancelService()
 		return nil, false, fmt.Errorf("failed to bind covenant signer port [%d]: %w", config.Port, err)
 	}
 
