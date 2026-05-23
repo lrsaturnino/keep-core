@@ -16,13 +16,15 @@ import (
 
 	"github.com/ipfs/go-log/v2"
 	"github.com/keep-network/keep-common/pkg/persistence"
+	"golang.org/x/time/rate"
 )
 
 var logger = log.Logger("keep-covenant-signer")
 
 type Server struct {
-	service    *Service
-	httpServer *http.Server
+	service       *Service
+	cancelService context.CancelFunc
+	httpServer    *http.Server
 }
 
 const maxRequestBodyBytes = 2 << 20
@@ -59,6 +61,7 @@ func Initialize(
 		WithMigrationPlanQuoteTrustRoots(config.MigrationPlanQuoteTrustRoots),
 		WithDepositorTrustRoots(config.DepositorTrustRoots),
 		WithCustodianTrustRoots(config.CustodianTrustRoots),
+		WithCurrentBlockProvider(engine),
 	)
 	if err != nil {
 		return nil, false, err
@@ -67,10 +70,22 @@ func Initialize(
 		return nil, false, err
 	}
 	if service.signerApprovalVerifier == nil {
+		hasTrustRoots := len(service.depositorTrustRoots) > 0 ||
+			len(service.custodianTrustRoots) > 0 ||
+			len(service.migrationPlanQuoteTrustRoots) > 0
+		if hasTrustRoots {
+			return nil, false, fmt.Errorf(
+				"trust roots are configured but the engine does not implement " +
+					"SignerApprovalVerifier; signer approval certificates cannot " +
+					"be verified -- remove trust root configuration or use an " +
+					"engine that supports approval verification",
+			)
+		}
 		logger.Warn(
 			"covenant signer started without a signer approval verifier; " +
 				"structured signerApproval certificates will not be verified and " +
-				"requests without signerApproval will be accepted",
+				"requests without signerApproval will be accepted; " +
+				"set covenantSigner.requireApprovalTrustRoots=true to enforce approval verification",
 		)
 	}
 	if config.EnableSelfV1 &&
@@ -102,11 +117,17 @@ func Initialize(
 		)
 	}
 
+	// Create a service-level context that outlives individual HTTP requests
+	// but is cancelled on process shutdown, so in-flight threshold signing
+	// operations are cancelled cleanly rather than killed mid-operation.
+	serviceCtx, cancelService := context.WithCancel(context.WithoutCancel(ctx))
+
 	server := &Server{
-		service: service,
+		service:       service,
+		cancelService: cancelService,
 		httpServer: &http.Server{
 			Addr:              net.JoinHostPort(listenAddress, strconv.Itoa(config.Port)),
-			Handler:           newHandler(service, config.AuthToken, config.EnableSelfV1),
+			Handler:           newHandler(service, serviceCtx, config.AuthToken, config.EnableSelfV1),
 			ReadHeaderTimeout: 5 * time.Second,
 			ReadTimeout:       30 * time.Second,
 			WriteTimeout:      30 * time.Second,
@@ -117,13 +138,22 @@ func Initialize(
 
 	listener, err := net.Listen("tcp", server.httpServer.Addr)
 	if err != nil {
+		cancelService()
 		return nil, false, fmt.Errorf("failed to bind covenant signer port [%d]: %w", config.Port, err)
 	}
 
-	go func() { // #nosec G118 -- parent ctx is already cancelled; shutdown needs a fresh deadline
+	// #nosec G118 -- this goroutine intentionally uses context.Background for
+	// the shutdown drain. ctx is already cancelled when <-ctx.Done() unblocks;
+	// using it for the Shutdown timeout would cause immediate cancellation.
+	go func() {
 		<-ctx.Done()
+
+		// Cancel the service context so in-flight threshold signing
+		// operations observe shutdown and terminate promptly.
+		cancelService()
+
 		shutdownCtx, cancelShutdown := context.WithTimeout(
-			context.WithoutCancel(ctx),
+			context.Background(),
 			5*time.Second,
 		)
 		defer cancelShutdown()
@@ -219,9 +249,25 @@ func hasCustodianTrustRootForRoute(
 	return false
 }
 
-func newHandler(service *Service, authToken string, enableSelfV1 bool) http.Handler {
+func newHandler(service *Service, serviceCtx context.Context, authToken string, enableSelfV1 bool) http.Handler {
 	mux := http.NewServeMux()
 	protectedHandler := withBearerAuth(mux, authToken)
+
+	// Single rate limiter shared across all submit routes. The server uses one
+	// static auth token, so this is equivalent to per-token limiting.
+	submitLimiter := rate.NewLimiter(
+		rate.Every(time.Minute/submitRateLimitPerMinute),
+		submitRateLimitPerMinute,
+	)
+
+	// Poll operations are rate-limited to prevent a single client from
+	// monopolising CPU time on signing operations. Each poll may trigger
+	// an expensive threshold signing call, so even a modest burst can
+	// degrade responsiveness for other clients.
+	pollLimiter := rate.NewLimiter(
+		rate.Every(time.Minute/pollRateLimitPerMinute),
+		pollRateLimitPerMinute,
+	)
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -229,13 +275,13 @@ func newHandler(service *Service, authToken string, enableSelfV1 bool) http.Hand
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
 
-	mux.HandleFunc("POST /v1/qc_v1/signer/requests", submitHandler(service, TemplateQcV1))
-	mux.HandleFunc("POST /v1/qc_v1/signer/requests:poll", pollBodyHandler(service, TemplateQcV1))
-	mux.HandleFunc("/v1/qc_v1/signer/requests/", pollPathHandler(service, TemplateQcV1))
+	mux.HandleFunc("POST /v1/qc_v1/signer/requests", submitHandler(service, serviceCtx, TemplateQcV1, submitLimiter))
+	mux.HandleFunc("POST /v1/qc_v1/signer/requests:poll", pollBodyHandler(service, TemplateQcV1, pollLimiter))
+	mux.HandleFunc("/v1/qc_v1/signer/requests/", pollPathHandler(service, TemplateQcV1, pollLimiter))
 	if enableSelfV1 {
-		mux.HandleFunc("POST /v1/self_v1/signer/requests", submitHandler(service, TemplateSelfV1))
-		mux.HandleFunc("POST /v1/self_v1/signer/requests:poll", pollBodyHandler(service, TemplateSelfV1))
-		mux.HandleFunc("/v1/self_v1/signer/requests/", pollPathHandler(service, TemplateSelfV1))
+		mux.HandleFunc("POST /v1/self_v1/signer/requests", submitHandler(service, serviceCtx, TemplateSelfV1, submitLimiter))
+		mux.HandleFunc("POST /v1/self_v1/signer/requests:poll", pollBodyHandler(service, TemplateSelfV1, pollLimiter))
+		mux.HandleFunc("/v1/self_v1/signer/requests/", pollPathHandler(service, TemplateSelfV1, pollLimiter))
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -328,16 +374,40 @@ func handleError(w http.ResponseWriter, err error) {
 	http.Error(w, "internal server error", http.StatusInternalServerError)
 }
 
-func submitHandler(service *Service, route TemplateID) http.HandlerFunc {
+// Poll operations are rate-limited to prevent a single client from
+// monopolising CPU time on signing operations. Each poll may trigger
+// an expensive threshold signing call, so even a modest burst can
+// degrade responsiveness for other clients.
+const pollRateLimitPerMinute = 60
+
+const submitTimeout = 5 * time.Minute
+
+// submitRateLimitPerMinute is the maximum number of new submit requests
+// accepted per minute. Each submit may initiate a 5-minute threshold signing
+// operation, so even a small burst can saturate the engine. Idempotent polls
+// and dedup hits are not affected by this limit.
+const submitRateLimitPerMinute = 5
+
+func submitHandler(service *Service, serviceCtx context.Context, route TemplateID, limiter *rate.Limiter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !limiter.Allow() {
+			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
+
 		input := SignerSubmitInput{}
 		if !decodeJSON(w, r, &input) {
 			return
 		}
 
-		// Detach from the HTTP request lifetime so that threshold signing
-		// survives write-timeout and client disconnects.
-		result, err := service.Submit(context.WithoutCancel(r.Context()), route, input)
+		// Use the service-level context (cancelled on process shutdown)
+		// with a bounded timeout so threshold signing cannot hang
+		// indefinitely. This detaches from the HTTP request lifetime so
+		// signing survives write-timeout and client disconnects.
+		submitCtx, cancelSubmit := context.WithTimeout(serviceCtx, submitTimeout)
+		defer cancelSubmit()
+
+		result, err := service.Submit(submitCtx, route, input)
 		if err != nil {
 			handleError(w, err)
 			return
@@ -347,8 +417,13 @@ func submitHandler(service *Service, route TemplateID) http.HandlerFunc {
 	}
 }
 
-func pollBodyHandler(service *Service, route TemplateID) http.HandlerFunc {
+func pollBodyHandler(service *Service, route TemplateID, limiter *rate.Limiter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !limiter.Allow() {
+			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
+
 		input := SignerPollInput{}
 		if !decodeJSON(w, r, &input) {
 			return
@@ -364,11 +439,16 @@ func pollBodyHandler(service *Service, route TemplateID) http.HandlerFunc {
 	}
 }
 
-func pollPathHandler(service *Service, route TemplateID) http.HandlerFunc {
+func pollPathHandler(service *Service, route TemplateID, limiter *rate.Limiter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		if !limiter.Allow() {
+			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 			return
 		}
 

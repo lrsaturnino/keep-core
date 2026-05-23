@@ -18,6 +18,18 @@ import (
 	"github.com/keep-network/keep-core/pkg/tecdsa"
 )
 
+var (
+	// ErrMissingWalletID is returned when wallet chain data does not
+	// include a wallet ID, typically because the wallet registry was
+	// unavailable during a fault-isolated GetWallet call.
+	ErrMissingWalletID = fmt.Errorf("wallet chain data must include wallet ID")
+
+	// ErrMissingMembersIDsHash is returned when wallet chain data does
+	// not include a members IDs hash, typically because the wallet
+	// registry was unavailable during a fault-isolated GetWallet call.
+	ErrMissingMembersIDsHash = fmt.Errorf("wallet chain data must include members IDs hash")
+)
+
 const (
 	signerApprovalCertificateVersion            uint32 = 1
 	signerApprovalCertificateSignatureAlgorithm        = "tecdsa-secp256k1"
@@ -178,10 +190,10 @@ func computeSignerApprovalCertificateSignerSetHash(
 		return "", fmt.Errorf("wallet chain data is required")
 	}
 	if walletChainData.EcdsaWalletID == ([32]byte{}) {
-		return "", fmt.Errorf("wallet chain data must include wallet ID")
+		return "", ErrMissingWalletID
 	}
 	if walletChainData.MembersIDsHash == ([32]byte{}) {
-		return "", fmt.Errorf("wallet chain data must include members IDs hash")
+		return "", ErrMissingMembersIDsHash
 	}
 
 	// Keep signer-set payload key encoding aligned with certificate issuance:
@@ -258,6 +270,11 @@ func verifySignerApprovalCertificate(
 	parsedSignature, err := btcec.ParseDERSignature(signatureBytes, btcec.S256())
 	if err != nil {
 		return fmt.Errorf("cannot parse threshold signature: %w", err)
+	}
+
+	halfOrder := new(big.Int).Rsh(btcec.S256().N, 1)
+	if parsedSignature.S.Cmp(halfOrder) > 0 {
+		return fmt.Errorf("threshold signature S value is not low-S normalized")
 	}
 
 	if !ecdsa.Verify(walletPublicKey, approvalDigest, parsedSignature.R, parsedSignature.S) {

@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"math/big"
 	"os"
@@ -153,8 +154,10 @@ func (cfh *contentFaultingHandle) ReadAll() (<-chan persistence.DataDescriptor, 
 }
 
 type scriptedEngine struct {
-	submit func(*Job) (*Transition, error)
-	poll   func(*Job) (*Transition, error)
+	submit             func(*Job) (*Transition, error)
+	poll               func(*Job) (*Transition, error)
+	currentBlockHeight uint64
+	currentBlockErr    error
 }
 
 func (se *scriptedEngine) OnSubmit(_ context.Context, job *Job) (*Transition, error) {
@@ -169,6 +172,10 @@ func (se *scriptedEngine) OnPoll(_ context.Context, job *Job) (*Transition, erro
 		return nil, nil
 	}
 	return se.poll(job)
+}
+
+func (se *scriptedEngine) CurrentBlockHeight(context.Context) (uint64, error) {
+	return se.currentBlockHeight, se.currentBlockErr
 }
 
 func mustJSON(t *testing.T, value any) []byte {
@@ -920,7 +927,9 @@ func TestServiceSubmitDeduplicatesByRouteRequestID(t *testing.T) {
 		submit: func(*Job) (*Transition, error) {
 			return &Transition{State: JobStatePending, Detail: "queued"}, nil
 		},
-	})
+	}, WithSignerApprovalVerifier(SignerApprovalVerifierFunc(
+		func(RouteSubmitRequest) error { return nil },
+	)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -928,7 +937,7 @@ func TestServiceSubmitDeduplicatesByRouteRequestID(t *testing.T) {
 	input := SignerSubmitInput{
 		RouteRequestID: "ors_123",
 		Stage:          StageSignerCoordination,
-		Request:        baseRequest(TemplateSelfV1),
+		Request:        structuredSignerApprovalRequest(TemplateSelfV1),
 	}
 
 	first, err := service.Submit(context.Background(), TemplateSelfV1, input)
@@ -955,7 +964,9 @@ func TestServiceSubmitRejectsRouteRequestIDDigestMismatch(t *testing.T) {
 		submit: func(*Job) (*Transition, error) {
 			return &Transition{State: JobStatePending, Detail: "queued"}, nil
 		},
-	})
+	}, WithSignerApprovalVerifier(SignerApprovalVerifierFunc(
+		func(RouteSubmitRequest) error { return nil },
+	)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -963,7 +974,7 @@ func TestServiceSubmitRejectsRouteRequestIDDigestMismatch(t *testing.T) {
 	input := SignerSubmitInput{
 		RouteRequestID: "ors_duplicate_digest_mismatch",
 		Stage:          StageSignerCoordination,
-		Request:        baseRequest(TemplateSelfV1),
+		Request:        structuredSignerApprovalRequest(TemplateSelfV1),
 	}
 
 	_, err = service.Submit(context.Background(), TemplateSelfV1, input)
@@ -995,7 +1006,9 @@ func TestServiceSubmitReturnsExistingJobWhileInitialEngineCallIsInFlight(t *test
 			<-releaseEngine
 			return &Transition{State: JobStatePending, Detail: "queued"}, nil
 		},
-	})
+	}, WithSignerApprovalVerifier(SignerApprovalVerifierFunc(
+		func(RouteSubmitRequest) error { return nil },
+	)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1003,7 +1016,7 @@ func TestServiceSubmitReturnsExistingJobWhileInitialEngineCallIsInFlight(t *test
 	input := SignerSubmitInput{
 		RouteRequestID: "ors_inflight",
 		Stage:          StageSignerCoordination,
-		Request:        baseRequest(TemplateSelfV1),
+		Request:        structuredSignerApprovalRequest(TemplateSelfV1),
 	}
 
 	firstResultChan := make(chan StepResult, 1)
@@ -2979,6 +2992,10 @@ func TestServicePollAcceptsEquivalentArtifactApprovalRequestVariants(t *testing.
 		submit: func(*Job) (*Transition, error) {
 			return &Transition{State: JobStatePending, Detail: "queued"}, nil
 		},
+		poll: func(*Job) (*Transition, error) {
+			return &Transition{State: JobStatePending, Detail: "polling"}, nil
+		},
+		currentBlockHeight: 100,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -3388,5 +3405,234 @@ func TestMigrationTransactionPlanCommitmentHashMatchesCanonicalVectors(t *testin
 				t.Fatalf("unexpected plan commitment hash: %s", actual)
 			}
 		})
+	}
+}
+
+// Regression tests for deep audit findings.
+
+// TestServicePollPropagatesCurrentBlockProviderError verifies P1-A: when the
+// currentBlockProvider returns an error, Poll returns a wrapped error rather
+// than panicking or silently proceeding.
+func TestServicePollPropagatesCurrentBlockProviderError(t *testing.T) {
+	handle := newMemoryHandle()
+	wantErr := errors.New("blockchain is unavailable")
+	engine := &scriptedEngine{
+		submit: func(*Job) (*Transition, error) {
+			return &Transition{State: JobStatePending, Detail: "queued"}, nil
+		},
+		poll: func(*Job) (*Transition, error) {
+			return &Transition{State: JobStatePending, Detail: "polling"}, nil
+		},
+		currentBlockHeight: 100,
+		currentBlockErr:    wantErr,
+	}
+	service, err := NewService(handle, engine, WithCurrentBlockProvider(engine), WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(request RouteSubmitRequest) error {
+		return nil
+	})))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Submit a job that has a SignerApproval with an EndBlock, so that
+	// currentBlockProvider is called during Poll.
+	request := structuredSignerApprovalRequest(TemplateSelfV1)
+	submitResult, err := service.Submit(context.Background(), TemplateSelfV1, SignerSubmitInput{
+		RouteRequestID: "poll_err",
+		Stage:          StageSignerCoordination,
+		Request:        request,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = service.Poll(context.Background(), TemplateSelfV1, SignerPollInput{
+		RouteRequestID: "poll_err",
+		RequestID:      submitResult.RequestID,
+		Stage:          StageSignerCoordination,
+		Request:        request,
+	})
+	if err == nil {
+		t.Fatal("expected error from currentBlockProvider, got nil")
+	}
+	if !strings.Contains(err.Error(), wantErr.Error()) {
+		t.Fatalf("expected error containing %q, got %v", wantErr.Error(), err)
+	}
+}
+
+// TestServiceLoadPollJobPropagatesCurrentBlockProviderError verifies P1-A: when
+// loadPollJob calls the currentBlockProvider and it returns an error, the job
+// load fails with a wrapped error.
+func TestServiceLoadPollJobPropagatesCurrentBlockProviderError(t *testing.T) {
+	handle := newMemoryHandle()
+	wantErr := errors.New("blockchain is unavailable")
+	engine := &scriptedEngine{
+		submit: func(*Job) (*Transition, error) {
+			return &Transition{State: JobStatePending, Detail: "queued"}, nil
+		},
+		poll: func(*Job) (*Transition, error) {
+			return &Transition{State: JobStatePending, Detail: "polling"}, nil
+		},
+		currentBlockHeight: 100,
+		currentBlockErr:    wantErr,
+	}
+	service, err := NewService(handle, engine, WithCurrentBlockProvider(engine), WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(request RouteSubmitRequest) error {
+		return nil
+	})))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := structuredSignerApprovalRequest(TemplateSelfV1)
+	submitResult, err := service.Submit(context.Background(), TemplateSelfV1, SignerSubmitInput{
+		RouteRequestID: "load_err",
+		Stage:          StageSignerCoordination,
+		Request:        request,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// loadPollJob is called by Poll; the error should propagate through Poll.
+	_, err = service.Poll(context.Background(), TemplateSelfV1, SignerPollInput{
+		RouteRequestID: "load_err",
+		RequestID:      submitResult.RequestID,
+		Stage:          StageSignerCoordination,
+		Request:        request,
+	})
+	if err == nil {
+		t.Fatal("expected error from currentBlockProvider in loadPollJob, got nil")
+	}
+	if !strings.Contains(err.Error(), wantErr.Error()) {
+		t.Fatalf("expected error containing %q, got %v", wantErr.Error(), err)
+	}
+}
+
+// TestServicePollRejectsExpiredCertificate verifies P2-D: when the current block
+// has reached or passed EndBlock, the certificate is considered expired and Poll
+// returns an error.
+func TestServicePollRejectsExpiredCertificate(t *testing.T) {
+	handle := newMemoryHandle()
+	engine := &scriptedEngine{
+		submit: func(*Job) (*Transition, error) {
+			return &Transition{State: JobStatePending, Detail: "queued"}, nil
+		},
+		poll: func(*Job) (*Transition, error) {
+			return &Transition{State: JobStatePending, Detail: "polling"}, nil
+		},
+		currentBlockHeight: 200, // EndBlock is 123456; set >= EndBlock to trigger expiration
+	}
+	engine.currentBlockHeight = 123456 // satisfy expiration: currentBlock >= EndBlock
+	service, err := NewService(handle, engine, WithCurrentBlockProvider(engine), WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(request RouteSubmitRequest) error {
+		return nil
+	})))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := structuredSignerApprovalRequest(TemplateSelfV1)
+	submitResult, err := service.Submit(context.Background(), TemplateSelfV1, SignerSubmitInput{
+		RouteRequestID: "expired",
+		Stage:          StageSignerCoordination,
+		Request:        request,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = service.Poll(context.Background(), TemplateSelfV1, SignerPollInput{
+		RouteRequestID: "expired",
+		RequestID:      submitResult.RequestID,
+		Stage:          StageSignerCoordination,
+		Request:        request,
+	})
+	if err == nil {
+		t.Fatal("expected expiration error, got nil")
+	}
+	if !strings.Contains(err.Error(), "signer approval certificate has expired") {
+		t.Fatalf("expected expiration error, got %v", err)
+	}
+}
+
+// TestServicePollAcceptsValidCertificate verifies P2-D: when the current block
+// is before EndBlock, the certificate is valid and Poll proceeds normally.
+func TestServicePollAcceptsValidCertificate(t *testing.T) {
+	handle := newMemoryHandle()
+	service, err := NewService(handle, &scriptedEngine{
+		submit: func(*Job) (*Transition, error) {
+			return &Transition{State: JobStatePending, Detail: "queued"}, nil
+		},
+		poll: func(*Job) (*Transition, error) {
+			return &Transition{State: JobStatePending, Detail: "polling"}, nil
+		},
+		currentBlockHeight: 100, // EndBlock is 123456, so currentBlock < EndBlock
+	}, WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(request RouteSubmitRequest) error {
+		return nil
+	})))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := structuredSignerApprovalRequest(TemplateSelfV1)
+	submitResult, err := service.Submit(context.Background(), TemplateSelfV1, SignerSubmitInput{
+		RouteRequestID: "valid",
+		Stage:          StageSignerCoordination,
+		Request:        request,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = service.Poll(context.Background(), TemplateSelfV1, SignerPollInput{
+		RouteRequestID: "valid",
+		RequestID:      submitResult.RequestID,
+		Stage:          StageSignerCoordination,
+		Request:        request,
+	})
+	if err != nil {
+		t.Fatalf("expected no error for valid certificate, got %v", err)
+	}
+}
+
+// TestServicePollSkipsBlockProviderWhenNoExpiration verifies P2-D: when the
+// SignerApproval has a nil EndBlock (no expiration), Poll proceeds without
+// error even though currentBlockProvider is called unconditionally at line 461.
+// The actual expiration gate (loadPollJob line 283) correctly skips the check.
+func TestServicePollSkipsBlockProviderWhenNoExpiration(t *testing.T) {
+	handle := newMemoryHandle()
+	service, err := NewService(handle, &scriptedEngine{
+		submit: func(*Job) (*Transition, error) {
+			return &Transition{State: JobStatePending, Detail: "queued"}, nil
+		},
+		poll: func(*Job) (*Transition, error) {
+			return &Transition{State: JobStatePending, Detail: "polling"}, nil
+		},
+		currentBlockHeight: 100,
+	}, WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(RouteSubmitRequest) error {
+		return nil
+	})))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := structuredSignerApprovalRequest(TemplateSelfV1)
+	request.SignerApproval.EndBlock = nil
+
+	submitResult, err := service.Submit(context.Background(), TemplateSelfV1, SignerSubmitInput{
+		RouteRequestID: "no_exp",
+		Stage:          StageSignerCoordination,
+		Request:        request,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = service.Poll(context.Background(), TemplateSelfV1, SignerPollInput{
+		RouteRequestID: "no_exp",
+		RequestID:      submitResult.RequestID,
+		Stage:          StageSignerCoordination,
+		Request:        request,
+	})
+	if err != nil {
+		t.Fatalf("expected no error for nil EndBlock, got %v", err)
 	}
 }

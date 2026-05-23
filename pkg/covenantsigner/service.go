@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,6 +19,9 @@ type Service struct {
 	engine                       Engine
 	signerApprovalVerifier       SignerApprovalVerifier
 	now                          func() time.Time
+	currentBlockProvider         func() (uint64, error)
+	maxInFlight                  int
+	inFlightSlots                chan struct{}
 	mutex                        sync.Mutex
 	dataDir                      string
 	migrationPlanQuoteTrustRoots []MigrationPlanQuoteTrustRoot
@@ -57,6 +61,31 @@ func WithCustodianTrustRoots(
 	}
 }
 
+func WithCurrentBlockProvider(engine Engine) ServiceOption {
+	var provider func() (uint64, error)
+	if cbp, ok := engine.(CurrentBlockHeightProvider); ok {
+		provider = func() (uint64, error) {
+			return cbp.CurrentBlockHeight(context.Background())
+		}
+	}
+
+	return func(service *Service) {
+		service.currentBlockProvider = provider
+	}
+}
+
+// WithMaxInFlight sets the maximum number of submissions that may be in
+// flight (waiting for signature) at any time. When n > 0, a semaphore
+// channel of size n is created; submissions acquire a slot before
+// proceeding and release it when the signature response is received.
+// When n <= 0, the limit is disabled: all submissions proceed immediately
+// without waiting. Defaults to 0 (disabled).
+func WithMaxInFlight(n int) ServiceOption {
+	return func(service *Service) {
+		service.maxInFlight = n
+	}
+}
+
 func WithSignerApprovalVerifier(
 	verifier SignerApprovalVerifier,
 ) ServiceOption {
@@ -78,7 +107,7 @@ func NewService(
 	handle persistence.BasicHandle,
 	engine Engine,
 	options ...ServiceOption,
-) (*Service, error) {
+) (_ *Service, retErr error) {
 	if engine == nil {
 		engine = NewPassiveEngine()
 	}
@@ -94,11 +123,23 @@ func NewService(
 		option(service)
 	}
 
+	if service.maxInFlight > 0 {
+		service.inFlightSlots = make(chan struct{}, service.maxInFlight)
+	}
+
 	store, err := NewStore(handle, service.dataDir)
 	if err != nil {
 		return nil, err
 	}
 	service.store = store
+	// Release the file lock if any subsequent initialization step fails.
+	defer func() {
+		if retErr != nil {
+			if closeErr := service.store.Close(); closeErr != nil {
+				logger.Warnf("failed to close store after init failure: [%v]", closeErr)
+			}
+		}
+	}()
 
 	normalizedDepositorTrustRoots, err := normalizeDepositorTrustRoots(
 		service.depositorTrustRoots,
@@ -115,6 +156,14 @@ func NewService(
 		return nil, err
 	}
 	service.custodianTrustRoots = normalizedCustodianTrustRoots
+
+	for i := range service.migrationPlanQuoteTrustRoots {
+		trimmed := strings.TrimSpace(service.migrationPlanQuoteTrustRoots[i].KeyID)
+		if trimmed == "" {
+			return nil, fmt.Errorf("migration plan quote trust root KeyID at index %d is empty after trimming", i)
+		}
+		service.migrationPlanQuoteTrustRoots[i].KeyID = trimmed
+	}
 
 	return service, nil
 }
@@ -212,6 +261,35 @@ func (s *Service) loadPollJob(route TemplateID, input SignerPollInput) (*Job, er
 	}
 	if job.RouteRequestID != input.RouteRequestID {
 		return nil, &inputError{"routeRequestId does not match stored job"}
+	}
+
+	// Verify this job is still the current holder of its route key. A Put()
+	// for a newer job may have evicted the in-memory entry while the file
+	// delete failed, leaving a stale byRequestID entry. If the route key
+	// now points to a different request, treat this job as not found.
+	holder, holderOk, holderErr := s.store.GetByRouteRequest(route, job.RouteRequestID)
+	if holderErr != nil || !holderOk || holder.RequestID != job.RequestID {
+		return nil, errJobNotFound
+	}
+
+	// Check if the signer approval certificate has expired since submit.
+	// If expired, reject the poll to avoid producing a signature with an
+	// authorization that is no longer valid.
+	//
+	// NOTE: The >= comparison is intentional. A certificate with
+	// EndBlock=100 is considered expired when the current block is
+	// 100 or greater. This is because EndBlock is a closed interval:
+	// the signature is valid only up to and including EndBlock.
+	if s.currentBlockProvider != nil && job.Request.SignerApproval != nil && job.Request.SignerApproval.EndBlock != nil {
+		currentBlock, err := s.currentBlockProvider()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get current block height: %w", err)
+		}
+		if currentBlock >= *job.Request.SignerApproval.EndBlock {
+			return nil, &inputError{
+				"signer approval certificate has expired",
+			}
+		}
 	}
 
 	digest, err := requestDigest(
@@ -331,6 +409,15 @@ func (s *Service) Submit(ctx context.Context, route TemplateID, input SignerSubm
 		return *existingResult, nil
 	}
 
+	if s.inFlightSlots != nil {
+		select {
+		case s.inFlightSlots <- struct{}{}:
+		case <-ctx.Done():
+			return StepResult{}, ctx.Err()
+		}
+		defer func() { <-s.inFlightSlots }()
+	}
+
 	transition, err := s.engine.OnSubmit(ctx, job)
 	if err != nil {
 		return StepResult{}, err
@@ -370,11 +457,20 @@ func (s *Service) Submit(ctx context.Context, route TemplateID, input SignerSubm
 }
 
 func (s *Service) Poll(ctx context.Context, route TemplateID, input SignerPollInput) (StepResult, error) {
+	var currentBlock uint64
+	if s.currentBlockProvider != nil {
+		blockHeight, err := s.currentBlockProvider()
+		if err != nil {
+			return StepResult{}, fmt.Errorf("failed to get current block height: %w", err)
+		}
+		currentBlock = blockHeight
+	}
 	if err := validatePollInput(
 		route,
 		input,
 		validationOptions{
 			policyIndependentDigest: true,
+			currentBlock:            &currentBlock,
 		},
 	); err != nil {
 		return StepResult{}, err
@@ -392,6 +488,15 @@ func (s *Service) Poll(ctx context.Context, route TemplateID, input SignerPollIn
 		return result, nil
 	}
 	s.mutex.Unlock()
+
+	if s.inFlightSlots != nil {
+		select {
+		case s.inFlightSlots <- struct{}{}:
+		case <-ctx.Done():
+			return StepResult{}, ctx.Err()
+		}
+		defer func() { <-s.inFlightSlots }()
+	}
 
 	transition, pollErr := s.engine.OnPoll(ctx, job)
 	if pollErr != nil {

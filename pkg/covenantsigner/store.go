@@ -12,8 +12,11 @@ import (
 	"github.com/keep-network/keep-common/pkg/persistence"
 )
 
-const jobsDirectory = "covenant-signer/jobs"
-const lockFileName = ".lock"
+const (
+	jobsDirectory     = "covenant-signer/jobs"
+	poisonedDirectory = "covenant-signer/poisoned"
+	lockFileName      = ".lock"
+)
 
 type Store struct {
 	handle      persistence.BasicHandle
@@ -45,7 +48,9 @@ func NewStore(handle persistence.BasicHandle, dataDir string) (*Store, error) {
 
 	if err := store.load(); err != nil {
 		// Release the lock if loading fails after successful acquisition.
-		store.Close() // #nosec G104 -- best-effort cleanup; original err is returned
+		if closeErr := store.Close(); closeErr != nil {
+			logger.Warnf("failed to release store lock after load failure: [%v]", closeErr)
+		}
 		return nil, err
 	}
 
@@ -72,7 +77,9 @@ func acquireFileLock(dataDir string) (*os.File, error) {
 		)
 	}
 
-	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600) // #nosec G304 -- lockPath is built from operator config + constants
+	// #nosec G304 -- lockPath is derived from operator-configured dataDir, not
+	// from untrusted user input. The operator controls the data directory.
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"cannot open lock file [%s]: %w",
@@ -85,7 +92,9 @@ func acquireFileLock(dataDir string) (*os.File, error) {
 		int(lockFile.Fd()),
 		syscall.LOCK_EX|syscall.LOCK_NB,
 	); err != nil {
-		lockFile.Close() // #nosec G104 -- best-effort cleanup; lock err is returned
+		if closeErr := lockFile.Close(); closeErr != nil {
+			logger.Warnf("failed to close lock file after failed flock: [%v]", closeErr)
+		}
 		return nil, fmt.Errorf(
 			"cannot acquire exclusive lock on [%s]: "+
 				"another process may already own the store: %w",
@@ -195,6 +204,9 @@ func (s *Store) load() error {
 
 			key := routeKey(job.Route, job.RouteRequestID)
 
+			// Deduplication: when multiple files share the same route key,
+			// keep the job with the newest UpdatedAt timestamp. If timestamps
+			// cannot be compared, prefer whichever has a valid timestamp.
 			if existingID, ok := s.byRouteKey[key]; ok {
 				if existing := s.byRequestID[existingID]; existing != nil {
 					existingIsNewerOrSame, err := isNewerOrSameJobRevision(existing, job)
@@ -282,6 +294,28 @@ func (s *Store) load() error {
 		logger.Infof("store load complete: loaded [%d] jobs", loaded)
 	}
 
+	poisonedDataChan, poisonedErrorChan := s.handle.ReadAll()
+	for poisonedDataChan != nil || poisonedErrorChan != nil {
+		select {
+		case descriptor, ok := <-poisonedDataChan:
+			if !ok {
+				poisonedDataChan = nil
+				continue
+			}
+			if descriptor.Directory() != poisonedDirectory {
+				continue
+			}
+		case err, ok := <-poisonedErrorChan:
+			if !ok {
+				poisonedErrorChan = nil
+				continue
+			}
+			if err != nil {
+				return err
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -356,9 +390,8 @@ func (s *Store) Put(job *Job) error {
 				existingRequestID+".json",
 				err,
 			)
-		} else {
-			delete(s.byRequestID, existingRequestID)
 		}
+		delete(s.byRequestID, existingRequestID)
 	}
 
 	return nil
