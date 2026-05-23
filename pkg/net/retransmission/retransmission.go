@@ -29,6 +29,9 @@ func ScheduleRetransmissions(
 	retransmit RetransmitFn,
 	strategy Strategy,
 ) {
+	// onTick must register the callback synchronously and not block; the
+	// callback offloads work to its own goroutine so the ticker loop is free
+	// to fire subsequent ticks.
 	ticker.onTick(ctx, func() {
 		go func() {
 			if err := strategy.Tick(retransmit); err != nil {
