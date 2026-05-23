@@ -38,7 +38,8 @@ async function getRandomBeaconStorageLayout(): Promise<StorageEntry[]> {
   }
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const contracts = buildInfo.output.contracts as any
-  const layout = contracts["contracts/RandomBeacon.sol"].RandomBeacon.storageLayout
+  const layout =
+    contracts["contracts/RandomBeacon.sol"].RandomBeacon.storageLayout
   if (!layout) {
     throw new Error(
       "RandomBeacon storageLayout missing from build-info -- check that the " +
