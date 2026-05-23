@@ -6,6 +6,13 @@
 #
 **/*.test.ts
 **/*.spec.ts
+**/test/**
+**/tests/**
+#
+# Deploy scripts use console.log intentionally for progress output and
+# readFileSync/writeFileSync appropriately for synchronous deploy workflows.
+# These are not production application code; UBS warnings are false positives.
+solidity/ecdsa/deploy/16_initialize_allowlist_weights.ts
 #
 # Go-only commits: the UBS shadow workspace includes only staged files, so go.mod
 # is absent when only *.go files are staged. This triggers a false positive in
