@@ -121,8 +121,8 @@ func TestG1HashToPointValidPoint(t *testing.T) {
 // do NOT update the expected values without scheduling a network cutover.
 func TestG1HashToPointWireFormat(t *testing.T) {
 	vectors := []struct {
-		input        []byte
-		expectedHex  string
+		input       []byte
+		expectedHex string
 	}{
 		{
 			input:       []byte(""),
