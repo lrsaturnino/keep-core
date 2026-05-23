@@ -156,12 +156,10 @@ Exposed information:
 
 **File:** `pkg/storage/storage.go`
 
-Two storage areas:
-- **Keystore directory** -- encrypted with the Ethereum keystore password
-- **Work directory** -- persistent state for in-progress DKG and signing sessions; not separately encrypted
+Two storage areas, both encrypted at rest with the operator's keystore password:
+- **Keystore directory** -- Ethereum keystore (go-ethereum scrypt/PBKDF2-encrypted)
+- **Work directory** -- persistent state for in-progress DKG and signing sessions; writes go through `persistence.NewEncryptedProtectedPersistence` at `pkg/storage/storage.go:110-113` (NaCl `secretbox` / XSalsa20-Poly1305 with a fresh 24-byte nonce per write, keyed by `sha256.Sum256(password)`)
 
-Work directory content includes tECDSA pre-parameters (Paillier key material) and in-progress DKG shares. If an attacker gains filesystem read access, they can extract:
-- Pre-parameters (reveals Paillier private keys used in tECDSA)
-- In-progress signing data
+Work directory content includes tECDSA pre-parameters (Paillier key material), tECDSA private key shares written via `pkg/tbtc/registry.go:55`, and in-progress DKG/signing artefacts. Filesystem read access alone does NOT expose this material; an attacker also needs the keystore password (or its derivative).
 
-**Note:** tECDSA private key shares are stored as raw protobuf bytes with no additional encryption layer (`pkg/tecdsa/marshaling.go:24`); only the Ethereum keystore receives password-based encryption.
+**Residual concern:** the password-to-key derivation is a bare `sha256.Sum256` (no salt, no iteration count, no memory-hard KDF) in `keep-common`. This applies symmetrically to both storage areas and weakens offline dictionary attacks against stolen disks; see F-01.md §Residual Concern for the cross-repo fix (`keep-common` Argon2id/scrypt migration). Operators with strong random passwords or hardware-backed custody are not materially exposed.

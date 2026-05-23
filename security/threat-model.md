@@ -7,7 +7,7 @@
 | Bitcoin held in tBTC wallets | Highest -- directly redeemable BTC | tECDSA wallet key shares distributed across operators |
 | tBTC token supply integrity | High -- overbacking or underbacking breaks peg | Bridge contract mint/burn accounting |
 | T token stake (v1) | High -- operator collateral | `TokenStaking.sol` (v1) |
-| Operator tECDSA key shares | High -- threshold reconstruction reveals wallet private key | `pkg/tecdsa/` work directory (plaintext protobuf) |
+| Operator tECDSA key shares | High -- threshold reconstruction reveals wallet private key | `pkg/tecdsa/` work directory (encrypted at rest via `persistence.NewEncryptedProtectedPersistence`, XSalsa20-Poly1305 keyed by sha256-of-password); see F-01.md |
 | Operator Ethereum private key | High -- used to authorise all on-chain transactions | Keystore file (password-encrypted) |
 | Random Beacon output | Medium -- controls group selection | `RandomBeacon.sol` relay entry storage |
 | Beacon DKG group key material | Medium -- used to sign relay entries | `pkg/beacon/gjkr/` per-operator shares |

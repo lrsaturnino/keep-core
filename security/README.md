@@ -21,10 +21,10 @@ Out of scope per the bug bounty program (see `SECURITY.adoc`):
 
 | ID | Title | Severity | Status |
 |----|-------|----------|--------|
-| [F-01](findings/F-01.md) | tECDSA key shares stored without encryption | High | Invalid -- encryption confirmed at rest |
+| [F-01](findings/F-01.md) | tECDSA key shares stored without encryption | ~~Critical~~ Informational | Invalid -- encryption confirmed at rest |
 | [F-02](findings/F-02.md) | Non-standard hash-to-curve (timing side channel) | ~~High~~ Low | Remediated -- counter-based applied; timing channel non-exploitable (public inputs only) |
 | [F-03](findings/F-03.md) | Weak KDF for ECDH-derived session keys | High | Remediated -- HKDF-SHA256 with domain labels |
-| [F-04](findings/F-04.md) | tss-lib fork contains unreviewed custom patches | Medium | Invalid -- known internal fork |
+| [F-04](findings/F-04.md) | tss-lib fork contains unreviewed custom patches | ~~High~~ N/A | Invalid -- known internal fork |
 | [F-05](findings/F-05.md) | Non-atomic WalletRegistry upgrade is front-runnable | Medium | Mitigated by Design -- tracked in GH issue |
 | [F-06](findings/F-06.md) | Recovered BLS group signature not re-verified | Medium | Low / Mitigated On-Chain |
 | [F-07](findings/F-07.md) | `approveDkgResult()` does not re-validate the result | Medium | Mitigated by Design -- challenger incentive |
@@ -33,7 +33,7 @@ Out of scope per the bug bounty program (see `SECURITY.adoc`):
 | [F-10](findings/F-10.md) | `encryption.Box` implementation is opaque | Medium | No Action -- NaCl XSalsa20-Poly1305 confirmed |
 | [F-11](findings/F-11.md) | Firewall positive-cache 12-hour post-deregistration window | Low | No Action Required |
 | [F-12](findings/F-12.md) | Metrics endpoint unauthenticated (topology exposed) | Low | Accepted -- document in operator runbooks |
-| [F-13](findings/F-13.md) | tBTC event deduplication TOCTOU race | Medium | Remediated -- atomic AddIfAbsent |
+| [F-13](findings/F-13.md) | tBTC event deduplication TOCTOU race | Medium | Remediated -- atomic `cache.TimeCache.Add` return value |
 | [F-14](findings/F-14.md) | Legacy beacon reward withdrawal burns failed claims | Low | Won't Fix -- v1 contracts are immutable |
 | [F-15](findings/F-15.md) | G2 square root exponent not cross-checked | Low | Remediated -- exponent verified, test added |
 | [F-16](findings/F-16.md) | BLS aggregation does not enforce distinct signers | Low | Informational / No Action Required |

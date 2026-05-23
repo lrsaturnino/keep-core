@@ -129,7 +129,7 @@ Low-level call at `ReimbursementPool.sol:79`:
 ```
 Failure is ignored intentionally (smart-contract receivers may reject ETH). The `nonReentrant` guard prevents reentrant calls regardless.
 
-### RandomBeacon -- PARTIAL PROTECTION
+### RandomBeacon -- PROTECTED (post-F-09)
 
 Relay entry submission (`RandomBeacon.sol:1057`):
 ```solidity
@@ -137,8 +137,7 @@ callback.executeCallback(uint256(keccak256(entry)), _callbackGasLimit);
 ```
 - Callback to arbitrary `IRandomBeaconConsumer` contract
 - Gas-limited by `_callbackGasLimit` (governance-controlled parameter)
-- No reentrancy guard on RandomBeacon itself
-- If the callback calls back into `RandomBeacon`, limited reentrancy is possible within the remaining gas budget
+- Reentrancy is blocked by the inline `nonReentrant` modifier on the two callback-bearing entry points: `submitRelayEntry(bytes)` (`RandomBeacon.sol:1054`) and `submitRelayEntry(bytes, uint32[])` (`RandomBeacon.sol:1083`). OpenZeppelin's `ReentrancyGuard` is not inherited (EIP-170 bytecode budget); the guard is instead a single uint256 storage slot `_reentrancyStatus` initialized to 1 in the constructor and toggled to 2 around any function carrying the modifier. See F-09.md.
 
 Slashing calls are wrapped in try-catch (`RandomBeacon.sol:1099`, `1157`, `1250`):
 ```solidity
@@ -216,11 +215,16 @@ This prevents an attacker from supplying exactly enough gas to pass the try-catc
 Post-TIP-092, `staking.seize()` calls are effectively no-ops in the Allowlist model:
 
 ```solidity
-// Allowlist.sol:200
-function seize(uint256 amount, uint256 rewardMultiplier, address notifier, address[] calldata stakingProviders)
-    external
-{
-    emit TokensSeized(notifier, amount, stakingProviders); // event only, no token transfer
+// solidity/ecdsa/contracts/Allowlist.sol:200-207
+/// @notice No-op stake seize operation. After TIP-092 tokens are not staked
+///         so there is nothing to seize from.
+function seize(
+    uint96,
+    uint256,
+    address notifier,
+    address[] memory _stakingProviders
+) external {
+    emit MaliciousBehaviorIdentified(notifier, _stakingProviders);
 }
 ```
 

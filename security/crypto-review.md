@@ -22,24 +22,26 @@ Operations used:
 - Pairing check: `bn256.PairingCheck()` for BLS verification
 - Custom point compression/decompression (`altbn128.go:150-245`)
 
-### 1.1 Hash-to-Curve (ISSUE)
+### 1.1 Hash-to-Curve (Remediated; see F-02)
 
-**Location:** `pkg/altbn128/altbn128.go:120`
+**Location:** `pkg/altbn128/altbn128.go:120-162`
 
 ```go
 func G1HashToPoint(m []byte) *bn256.G1 {
-    // SHA256 of input, then try-and-increment until valid x
+    // SHA256(m || counter) for counter in 0..63; first valid x wins
 }
 ```
 
-This is a **try-and-increment** hash-to-curve, not the standard Elligator/SWU construction from RFC 9380. Problems:
-- Not constant-time: number of iterations leaks information about the hash output (timing side channel)
-- If used during signing, can leak bits about the signed message or the hash input
-- Non-standard: deviates from IETF BLS draft and RFC 9380
+This is a **counter-based hash-and-try** construction with a bound of 64 attempts. It replaced the original try-and-increment design (increment x until a quadratic residue is found) whose iteration count was geometrically distributed and therefore variable in time.
+
+The counter-based variant still has variable iteration count (the loop exits on the first valid point), but each attempt performs identical work (one SHA-256 + one `big.Int.ModSqrt`) and the iteration count is bounded to at most 64. Per the call-site analysis in `security/findings/F-02.md`, all production callers feed public inputs into this primitive, so the residual timing channel reveals nothing not already public.
 
 Used in:
-- `pkg/bls/bls.go:50` -- BLS `Sign()` (message hashing)
-- `pkg/beacon/gjkr/protocol_parameters.go:24` -- Pedersen generator derivation from beacon seed
+- `pkg/bls/bls.go:51` -- BLS `Sign()` (message hashing; message is the relay entry, public)
+- `pkg/bls/bls.go:63` -- BLS `Verify()` (same public message)
+- `pkg/beacon/gjkr/protocol_parameters.go:24` -- Pedersen generator derivation from the public DKG sortition seed
+
+**Open hygiene item:** A constant-time RFC 9380 SWU implementation is tracked as future work in [issue #4](https://github.com/tlabs-xyz/keep-core-security/issues/4). Not required for security; eliminates the residual panic-on-counter-exhaustion class (probability ~5e-20) noted in F-02.md §Limitations.
 
 ### 1.2 G2 Square Root (REVIEW)
 
@@ -115,39 +117,41 @@ This is the highest-value cryptographic component: compromise yields Bitcoin wal
 
 **The tss-lib fork contains custom patches** (see `go.mod` replace directive). The delta between the upstream bnb-chain fork and the threshold-network fork has not been independently audited here. Any local modification to the GG20 implementation is a high-priority review target.
 
-### 3.2 P2P Share Encryption (OK for mechanism; REVIEW for KDF)
+### 3.2 P2P Share Encryption (Remediated; see F-03)
 
-**Location:** `pkg/crypto/ephemeral/symmetric_key.go:19`
+**Location:** `pkg/crypto/ephemeral/symmetric_key.go:24-40`
 
-Each pair of DKG participants derives a shared symmetric key:
+Each pair of DKG participants derives a shared symmetric key from ECDH on secp256k1 followed by HKDF-SHA256 (RFC 5869):
+
 ```go
-sha256.Sum256(btcec.GenerateSharedSecret(privKey, pubKey))
+shared := btcec.GenerateSharedSecret(privKey, pubKey)
+kdf := hkdf.New(sha256.New, shared, nil /* salt */, info)
+io.ReadFull(kdf, key[:])
 ```
 
-This is ECDH on secp256k1 with SHA256 as a KDF.
+Domain separation is enforced by the `info` parameter, which encodes both the protocol name and the canonical (sorted) peer-pair IDs:
 
-**Issue:** `sha256.Sum256(shared_secret)` is not a proper KDF:
-- No domain separation (same ECDH output → same key across different sessions)
-- No input keying material (IKM) or info field
-- HKDF-SHA256 (RFC 5869) should be used instead
+| Caller | `info` layout | Defined at |
+|--------|---------------|------------|
+| Beacon GJKR | `"gjkr" || min(id_a,id_b) || max(id_a,id_b)` (each ID one byte) | `pkg/beacon/gjkr/protocol.go` (`gjkrEcdhInfo`) |
+| tECDSA DKG | `"tecdsa-dkg" || min || max` | `pkg/tecdsa/dkg/protocol.go` (`dkgEcdhInfo`) |
+| tECDSA signing | `"tecdsa-signing" || sessionID || min || max` | `pkg/tecdsa/signing/protocol.go` (`signingEcdhInfo`) |
 
-### 3.3 Private Key Share Storage (ISSUE)
+`MemberIndex` is a `uint8`, pinned by both a compile-time assertion in `pkg/protocol/group/group.go` and a runtime check in `pkg/protocol/group/member_index_test.go`. The encoders are symmetric in `(id_a, id_b)` (sort before append) and injective across distinct sorted pairs, verified by unit tests at `pkg/{beacon/gjkr,tecdsa/dkg,tecdsa/signing}/protocol_ecdh_info_test.go`. The previous bare `sha256.Sum256(shared_secret)` construction is gone; same ECDH output across different protocols or peer pairs now yields cryptographically independent keys.
 
-**Location:** `pkg/tecdsa/marshaling.go:24`
+### 3.3 Private Key Share Storage (Encrypted at Rest; see F-01)
 
-tECDSA private key shares are serialized to protobuf and stored in the work directory without additional encryption:
+**Location:** `pkg/tecdsa/marshaling.go:24` (serialization), `pkg/storage/storage.go:110-113` (encryption)
 
-```proto
-message PrivateKeyShare {
-  bytes paillier_secret_key_n = 1;     // Paillier N
-  bytes paillier_secret_key_lambda = 2; // λ(N)
-  bytes paillier_secret_key_phi = 3;    // φ(N)
-  bytes xi = 4;                         // ECDSA share scalar
-  // ... Paillier public keys of all parties
-}
-```
+tECDSA private key shares are serialized to protobuf and written through `persistence.NewEncryptedProtectedPersistence`, which wraps each write in NaCl `secretbox` (XSalsa20-Poly1305) keyed by `sha256.Sum256([]byte(password))` with a fresh random 24-byte nonce per write. The same password that unlocks the Ethereum keystore (the operator key file password supplied at startup) is used; both files have a consistent attack surface.
 
-The Ethereum keystore (operator identity key) is password-encrypted, but tECDSA key shares are not. Filesystem read access to the work directory exposes the Paillier private key and the xi share, which together allow an attacker contributing that one share to the threshold computation.
+Full chain:
+1. `cmd/start.go:285-287` -- `storage.Initialize(config, clientConfig.Ethereum.KeyFilePassword)` stores the operator password.
+2. `cmd/start.go:303` -- `storage.InitializeKeyStorePersistence("tbtc")` returns a disk handle.
+3. `pkg/storage/storage.go:110-113` -- The handle is wrapped with `NewEncryptedProtectedPersistence(diskHandle, s.encryptionPassword)`.
+4. `pkg/tbtc/registry.go:55` -- All `saveSigner()` writes go through the encrypted handle.
+
+**Residual concern (tracked separately):** the password-to-key derivation is a bare `sha256.Sum256` -- no salt, no iteration count, no memory-hard KDF. This is in `keep-common`, not `keep-core`, and applies symmetrically to the Ethereum keystore. Operators using strong random passwords or hardware-backed key custody are not materially exposed; for password-based deployments, an Argon2id / scrypt / PBKDF2 upgrade in `keep-common` is the proper fix. See F-01.md §Residual Concern.
 
 ### 3.4 tss-lib Dependency (REVIEW)
 
@@ -172,14 +176,13 @@ The Pedersen commitment generator H is derived as:
 H = G1HashToPoint(previousBeaconEntry.Bytes())
 ```
 
-This uses the try-and-increment hash-to-curve (same issue as §1.1). For Pedersen commitments, H must be a generator of unknown discrete log relative to G. Deriving H from a beacon entry is acceptable IF the DLP is hard -- but the derivation method being non-constant-time is a side-channel concern.
+H must be a generator of unknown discrete log relative to G. Deriving H from a (public) beacon entry is acceptable provided the DLP is hard. The underlying hash-to-curve is now the counter-based variant of §1.1; since the seed is public, the residual timing variation is not exploitable.
 
-### 4.2 Symmetric Encryption (REVIEW)
+### 4.2 Symmetric Encryption (post-F-03)
 
 **Location:** `pkg/beacon/gjkr/member.go` (calls `pkg/crypto/ephemeral/`)
 
-Same ECDH + SHA256 KDF issue as §3.2.  
-The actual encryption uses `encryption.NewBox()` from `github.com/keep-network/keep-common`. This is an external dependency whose implementation was not located in this repository. The encryption scheme (whether AES-GCM, ChaCha20-Poly1305, or other) should be independently confirmed.
+Uses the HKDF-SHA256 derivation from §3.2 with the `"gjkr" || min(id_a,id_b) || max(id_a,id_b)` info label. Underlying authenticated cipher is NaCl `secretbox` (XSalsa20+Poly1305) via `encryption.NewBox()` in `github.com/keep-network/keep-common` -- see F-10.md for the dependency-level confirmation.
 
 ---
 
@@ -190,7 +193,7 @@ The actual encryption uses `encryption.NewBox()` from `github.com/keep-network/k
 
 Key generation: `btcec.NewPrivateKey()` → `crypto/rand.Reader` (correct).
 
-ECDH: `btcec.GenerateSharedSecret(privKey, pubKey)` returns compressed X coordinate of shared point. Then hashed with SHA256 (KDF issue noted in §3.2).
+ECDH: `btcec.GenerateSharedSecret(privKey, pubKey)` returns compressed X coordinate of shared point. The output is fed through HKDF-SHA256 with a domain-separating `info` label (see §3.2).
 
 ---
 
@@ -225,7 +228,7 @@ No use of insecure randomness in cryptographic paths was found.
 
 | Function | Usage | Assessment |
 |----------|-------|-----------|
-| SHA256 | Hash-to-curve, ECDH KDF, commitment derivation | OK (though KDF usage is substandard) |
+| SHA256 | Hash-to-curve, HKDF-SHA256 (ECDH KDF), commitment derivation | OK |
 | Keccak256 | Ethereum message signing, DKG result hash | OK |
 | SHA3-256 | Block simulation, some chain ops | OK |
 | MD5, SHA1 | Not found | -- |
