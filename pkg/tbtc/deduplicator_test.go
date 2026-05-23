@@ -3,6 +3,8 @@ package tbtc
 import (
 	"encoding/hex"
 	"math/big"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -113,6 +115,125 @@ func TestNotifyDKGResultSubmitted(t *testing.T) {
 	canProcess = deduplicator.notifyDKGResultSubmitted(big.NewInt(100), hash1, 500)
 	if !canProcess {
 		t.Fatal("should be allowed to process")
+	}
+}
+
+// TestNotifyDKGStartedConcurrent is the F-13 TOCTOU regression test.
+// Before F-13, notify*() did a Has()+Add() pair and two goroutines racing on
+// the same key could both see Has() return false and both Add() the key,
+// returning true from both calls. The fix relies on cache.TimeCache.Add()
+// being mutex-serialized and returning true only for the first inserter.
+// This test launches many goroutines that all race on the same key behind a
+// barrier and asserts exactly one wins.
+func TestNotifyDKGStartedConcurrent(t *testing.T) {
+	const callers = 100
+
+	dedup := deduplicator{
+		dkgSeedCache: cache.NewTimeCache(testDKGSeedCachePeriod),
+	}
+	seed := big.NewInt(42)
+
+	var wins int32
+	var ready, start sync.WaitGroup
+	ready.Add(callers)
+	start.Add(1)
+
+	results := make(chan bool, callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			ready.Done()
+			start.Wait()
+			results <- dedup.notifyDKGStarted(seed)
+		}()
+	}
+	ready.Wait()
+	start.Done()
+
+	for i := 0; i < callers; i++ {
+		if <-results {
+			atomic.AddInt32(&wins, 1)
+		}
+	}
+	if got := atomic.LoadInt32(&wins); got != 1 {
+		t.Fatalf("F-13 regression: %d/%d concurrent notifyDKGStarted "+
+			"calls returned true; want exactly 1", got, callers)
+	}
+}
+
+func TestNotifyDKGResultSubmittedConcurrent(t *testing.T) {
+	const callers = 100
+
+	dedup := deduplicator{
+		dkgResultHashCache: cache.NewTimeCache(testDKGResultHashCachePeriod),
+	}
+	hashBytes, err := hex.DecodeString(
+		"92327ddff69a2b8c7ae787c5d590a2f14586089e6339e942d56e82aa42052cd9",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hash [32]byte
+	copy(hash[:], hashBytes)
+
+	var wins int32
+	var ready, start sync.WaitGroup
+	ready.Add(callers)
+	start.Add(1)
+
+	results := make(chan bool, callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			ready.Done()
+			start.Wait()
+			results <- dedup.notifyDKGResultSubmitted(big.NewInt(100), hash, 500)
+		}()
+	}
+	ready.Wait()
+	start.Done()
+
+	for i := 0; i < callers; i++ {
+		if <-results {
+			atomic.AddInt32(&wins, 1)
+		}
+	}
+	if got := atomic.LoadInt32(&wins); got != 1 {
+		t.Fatalf("F-13 regression: %d/%d concurrent notifyDKGResultSubmitted "+
+			"calls returned true; want exactly 1", got, callers)
+	}
+}
+
+func TestNotifyWalletClosedConcurrent(t *testing.T) {
+	const callers = 100
+
+	dedup := deduplicator{
+		walletClosedCache: cache.NewTimeCache(testWalletClosedCachePeriod),
+	}
+	wallet := [32]byte{0x77}
+
+	var wins int32
+	var ready, start sync.WaitGroup
+	ready.Add(callers)
+	start.Add(1)
+
+	results := make(chan bool, callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			ready.Done()
+			start.Wait()
+			results <- dedup.notifyWalletClosed(wallet)
+		}()
+	}
+	ready.Wait()
+	start.Done()
+
+	for i := 0; i < callers; i++ {
+		if <-results {
+			atomic.AddInt32(&wins, 1)
+		}
+	}
+	if got := atomic.LoadInt32(&wins); got != 1 {
+		t.Fatalf("F-13 regression: %d/%d concurrent notifyWalletClosed "+
+			"calls returned true; want exactly 1", got, callers)
 	}
 }
 
