@@ -341,8 +341,8 @@ describe("RandomBeacon - Relay", () => {
                 refund.gte(gasCost),
                 `submitter under-refunded: refund ${refund.toString()} wei < ` +
                   `gasCost ${gasCost.toString()} wei. If this is the first ` +
-                  `failure after touching _relayEntrySubmissionGasOffset or ` +
-                  `the nonReentrant modifier, re-measure and update both.`
+                  "failure after touching _relayEntrySubmissionGasOffset or " +
+                  "the nonReentrant modifier, re-measure and update both."
               ).to.equal(true)
             })
           })

@@ -10,7 +10,7 @@
 // `_reentrancyStatus` are load-bearing for F-09's correctness. These tests
 // pin both.
 
-import { artifacts, ethers, waffle, helpers } from "hardhat"
+import { artifacts, ethers, waffle } from "hardhat"
 import { expect } from "chai"
 
 import { randomBeaconDeployment } from "./fixtures"
@@ -33,13 +33,14 @@ async function getRandomBeaconStorageLayout(): Promise<StorageEntry[]> {
   if (!buildInfo) {
     throw new Error(
       `no build-info for ${fullyQualifiedName} -- ensure storageLayout is in ` +
-        `outputSelection (see hardhat.config.ts)`
+        "outputSelection (see hardhat.config.ts)"
     )
   }
-  const layout =
+  const layout = (
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (buildInfo.output.contracts["contracts/RandomBeacon.sol"].RandomBeacon as any)
-      .storageLayout
+    buildInfo.output.contracts["contracts/RandomBeacon.sol"]
+      .RandomBeacon as any
+  ).storageLayout
   if (!layout) {
     throw new Error(
       "RandomBeacon storageLayout missing from build-info -- check that the " +
@@ -104,8 +105,10 @@ describe("RandomBeacon - Storage Layout", () => {
       const entry = storage.find(
         (e) => e.label === "_relayEntrySubmissionGasOffset"
       )!
-      expect(entry, "_relayEntrySubmissionGasOffset missing from storage layout")
-        .to.not.equal(undefined)
+      expect(
+        entry,
+        "_relayEntrySubmissionGasOffset missing from storage layout"
+      ).to.not.equal(undefined)
 
       const raw = await ethers.provider.getStorageAt(
         randomBeacon.address,
@@ -139,15 +142,15 @@ describe("RandomBeacon - Storage Layout", () => {
     it("contains every label in the critical list", async () => {
       const storage = await getRandomBeaconStorageLayout()
       const labels = new Set(storage.map((e) => e.label))
-      for (const label of criticalLabels) {
+      criticalLabels.forEach((label) => {
         expect(
           labels.has(label),
           `storage label '${label}' missing from RandomBeacon layout -- if ` +
-            `this was intentional, update the snapshot in ` +
-            `test/RandomBeacon.StorageLayout.test.ts and confirm no caller ` +
-            `depends on this storage`
+            "this was intentional, update the snapshot in " +
+            "test/RandomBeacon.StorageLayout.test.ts and confirm no caller " +
+            "depends on this storage"
         ).to.equal(true)
-      }
+      })
     })
   })
 })

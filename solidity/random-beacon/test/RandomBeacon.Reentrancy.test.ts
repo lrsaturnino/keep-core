@@ -67,9 +67,11 @@ describe("RandomBeacon - Reentrancy (F-09)", () => {
     randomBeacon = contracts.randomBeacon as RandomBeaconStub
     randomBeaconGovernance =
       contracts.randomBeaconGovernance as RandomBeaconGovernance
-    reentrantConsumer = (contracts as DeployedContracts & {
-      reentrantConsumer: ReentrantBeaconConsumer
-    }).reentrantConsumer
+    reentrantConsumer = (
+      contracts as DeployedContracts & {
+        reentrantConsumer: ReentrantBeaconConsumer
+      }
+    ).reentrantConsumer
 
     await randomBeaconGovernance
       .connect(governance)
@@ -98,6 +100,5 @@ describe("RandomBeacon - Reentrancy (F-09)", () => {
       // this flag to true.
       expect(await reentrantConsumer.reentryRejected()).to.equal(true)
     })
-
   })
 })
