@@ -81,6 +81,20 @@ jobs:
         || needs.client-detect-changes.outputs.path-filter == 'true'
     runs-on: ubuntu-latest
     steps:
+      - name: Free disk space
+        # The multi-arch client binary build exhausts the default ~14GB free
+        # on ubuntu-latest. Reclaim ~30GB by removing preinstalled toolchains
+        # we don't use.
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: false
+
       - uses: actions/checkout@v4
         with:
           # Fetch the whole history for the `git describe` command to work.
