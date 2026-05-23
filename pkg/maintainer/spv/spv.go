@@ -399,6 +399,18 @@ func getProofInfo(
 		requestedDiff = previousEpochDifficulty
 	default:
 		// Bridge would revert "Not at current or previous difficulty".
+		// This typically means the proof's first block was mined at a
+		// min-difficulty (e.g. testnet4); such a transaction is unprovable
+		// against the relay until it is buried under enough work.
+		logger.Warnf(
+			"skipped proving transaction [%s]; first header difficulty "+
+				"[%s] matches neither current epoch [%s] nor previous "+
+				"epoch [%s] difficulty",
+			transactionHash.Hex(bitcoin.ReversedByteOrder),
+			firstHeaderDiff.String(),
+			currentEpochDifficulty.String(),
+			previousEpochDifficulty.String(),
+		)
 		return false, 0, 0, nil
 	}
 
