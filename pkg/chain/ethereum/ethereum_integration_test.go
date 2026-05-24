@@ -5,6 +5,7 @@ package ethereum
 
 import (
 	"fmt"
+	"os"
 	"reflect"
 	"testing"
 	"time"
@@ -17,9 +18,22 @@ import (
 // TODO: Include integration test in the CI.
 // To run the tests execute `go test -v -tags=integration ./...`
 
-const ethereumURL = "https://mainnet.infura.io/v3/f41c6e3d505d44c182a5e5adefdaa43f"
+// ethereumURLEnvVar is the name of the env variable holding the mainnet
+// Ethereum JSON-RPC endpoint used by this integration test. The previous
+// hardcoded Infura URL was checked into the repository and must be treated
+// as compromised; rotate the key on the provider side and inject the new
+// URL via this env variable.
+const ethereumURLEnvVar = "KEEP_TEST_ETHEREUM_URL"
 
 func TestBaseChain_GetBlockNumberByTimestamp(t *testing.T) {
+	ethereumURL := os.Getenv(ethereumURLEnvVar)
+	if ethereumURL == "" {
+		t.Skipf(
+			"skipping: env variable [%s] with Ethereum mainnet JSON-RPC URL is not set",
+			ethereumURLEnvVar,
+		)
+	}
+
 	client, err := ethclient.Dial(ethereumURL)
 	if err != nil {
 		t.Fatal(err)
