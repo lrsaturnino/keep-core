@@ -17,7 +17,6 @@ Dockerfile
 **/node_modules/*
 
 # Solidity stuff.
-solidity-v1/
 solidity/
 
 # Token Stakedrop stuff.
