@@ -30,9 +30,3 @@ repos:
       files: '\.(json|yaml)$'
       language: script
       description: "Checks JSON/YAML code according to the package's linter configuration"
-    - id: lint-faucet-js
-      name: 'lint faucet js'
-      entry: /usr/bin/env bash -c "cd infrastructure/gcp/keep-test/google-functions/keep-faucet && npm run lint:js"
-      files: 'infrastructure\/gcp\/keep-test\/google-functions\/keep-faucet\/.*\.js$'
-      language: script
-      description: "Checks JS code according to the package's linter configuration"
