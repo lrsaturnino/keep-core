@@ -30,8 +30,21 @@ jobs:
           # https://github.com/NomicFoundation/hardhat/issues/3877.
           node-version: "18.15.0"
           registry-url: "https://registry.npmjs.org"
-          cache: "yarn"
-          cache-dependency-path: solidity/random-beacon/yarn.lock
+
+      - uses: ./.github/actions/setup-git-for-yarn
+
+      - name: Enable Yarn 4 (packageManager)
+        run: |
+          export PATH="${RUNNER_TEMP:-/tmp}/git-clean-bin:$PATH"
+          unset GIT_CONFIG_PARAMETERS
+          export GIT_CONFIG_NOSYSTEM=1
+          export GIT_CONFIG_SYSTEM=/dev/null
+          export GIT_CONFIG_COUNT=0
+          export YARN_ENABLE_HARDENED_MODE=0
+          export YARN_CHECKSUM_BEHAVIOR=ignore
+          corepack enable
+          corepack prepare yarn@4.8.1 --activate
+          yarn --version
 
       - name: Resolve latest contracts
         run: |
