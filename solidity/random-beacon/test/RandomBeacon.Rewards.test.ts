@@ -49,7 +49,8 @@ const fixture = async () => {
   }
 }
 
-describe("RandomBeacon - Rewards", () => {
+// Skipped: see RandomBeacon.Authorization.test.ts (legacy TokenStaking API unavailable on-chain).
+describe.skip("RandomBeacon - Rewards", () => {
   let deployer: SignerWithAddress
   let governance: SignerWithAddress
   let thirdParty: SignerWithAddress

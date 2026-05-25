@@ -1,3 +1,5 @@
+import verifyOnEtherscanOrContinue from "./etherscanVerification"
+
 import type { HardhatRuntimeEnvironment } from "hardhat/types"
 import type { DeployFunction } from "hardhat-deploy/types"
 
@@ -5,26 +7,35 @@ const func: DeployFunction = async (hre: HardhatRuntimeEnvironment) => {
   const { getNamedAccounts, deployments, helpers } = hre
   const { deployer } = await getNamedAccounts()
 
-  // Skip if EcdsaDkgValidator already deployed (for existing mainnet/testnet deployments)
-  const existingDkgValidator = await deployments.getOrNull("EcdsaDkgValidator")
-  if (existingDkgValidator) {
-    console.log(
-      `using existing EcdsaDkgValidator at ${existingDkgValidator.address}`
-    )
-    return true
+  // full-redeploy-sepolia-stack.sh sets this when --dkg-group-size 3: incremental compile
+  // can still leave groupSize=100 bytecode in artifacts without a forced compile.
+  if (process.env.THRESHOLD_FORCE_DKG_COMPILE === "1") {
+    await hre.run("compile", { force: true })
   }
 
   const EcdsaSortitionPool = await deployments.get("EcdsaSortitionPool")
+
+  // Non-mainnet: skipIfAlreadyDeployed false so hardhat-deploy can redeploy when bytecode
+  // changes (e.g. groupSize 100 → 3). Mainnet: true so bytecode/artifact drift cannot
+  // silently overwrite deployments/mainnet/EcdsaDkgValidator.json while WalletRegistry
+  // still points at the old on-chain validator (THRESHOLD_FORCE_DKG_COMPILE only forces compile).
+  const skipIfAlreadyDeployed = hre.network.name === "mainnet"
 
   const EcdsaDkgValidator = await deployments.deploy("EcdsaDkgValidator", {
     from: deployer,
     args: [EcdsaSortitionPool.address],
     log: true,
     waitConfirmations: 1,
+    skipIfAlreadyDeployed,
   })
 
-  if (hre.network.tags.etherscan) {
-    await helpers.etherscan.verify(EcdsaDkgValidator)
+  if (
+    hre.network.tags.etherscan &&
+    process.env.DISABLE_HARDHAT_VERIFY !== "true"
+  ) {
+    await verifyOnEtherscanOrContinue(hre, () =>
+      helpers.etherscan.verify(EcdsaDkgValidator)
+    )
   }
 
   if (hre.network.tags.tenderly) {
