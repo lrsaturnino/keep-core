@@ -1,3 +1,5 @@
+import verifyOnEtherscanOrContinue from "./etherscanVerification"
+
 import type { HardhatRuntimeEnvironment } from "hardhat/types"
 import type { DeployFunction } from "hardhat-deploy/types"
 
@@ -37,8 +39,13 @@ const func: DeployFunction = async (hre: HardhatRuntimeEnvironment) => {
     chaosnetOwner
   )
 
-  if (hre.network.tags.etherscan) {
-    await helpers.etherscan.verify(EcdsaSortitionPool)
+  if (
+    hre.network.tags.etherscan &&
+    process.env.DISABLE_HARDHAT_VERIFY !== "true"
+  ) {
+    await verifyOnEtherscanOrContinue(hre, () =>
+      helpers.etherscan.verify(EcdsaSortitionPool)
+    )
   }
 
   if (hre.network.tags.tenderly) {
