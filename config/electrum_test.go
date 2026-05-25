@@ -30,6 +30,13 @@ func TestResolveElectrum(t *testing.T) {
 				},
 			},
 		},
+		bitcoin.Testnet4: {
+			expectedConfig: []electrum.Config{
+				{
+					URL: "ssl://mempool.space:40002",
+				},
+			},
+		},
 		bitcoin.Regtest: {
 			expectedConfig: []electrum.Config{
 				{
