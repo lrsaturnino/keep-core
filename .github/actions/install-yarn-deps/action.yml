@@ -14,6 +14,17 @@ runs:
     - name: Set up Git wrapper for Yarn git dependencies
       uses: ./.github/actions/setup-git-for-yarn
 
+    - name: Cache Yarn artifacts
+      uses: actions/cache@v4
+      with:
+        path: |
+          ${{ inputs.working-directory }}/.yarn/cache
+          ${{ inputs.working-directory }}/.yarn/install-state.gz
+          ${{ inputs.working-directory }}/node_modules
+        key: yarn-${{ runner.os }}-${{ hashFiles(format('{0}/yarn.lock', inputs.working-directory)) }}
+        restore-keys: |
+          yarn-${{ runner.os }}-
+
     - name: Install dependencies
       shell: bash
       working-directory: ${{ inputs.working-directory }}
