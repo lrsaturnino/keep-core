@@ -57,31 +57,9 @@ jobs:
           # https://github.com/NomicFoundation/hardhat/issues/3877
           node-version: "18.15.0"
 
-      - uses: ./.github/actions/setup-git-for-yarn
-
-      - name: Install dependencies
-        run: |
-          export PATH="${RUNNER_TEMP:-/tmp}/git-clean-bin:$PATH"
-          unset GIT_CONFIG_PARAMETERS
-          export GIT_CONFIG_NOSYSTEM=1
-          export GIT_CONFIG_SYSTEM=/dev/null
-          export GIT_CONFIG_COUNT=0
-          export YARN_ENABLE_HARDENED_MODE=0
-          export YARN_CHECKSUM_BEHAVIOR=ignore
-          corepack enable
-          corepack prepare yarn@4.8.1 --activate
-          yarn --version
-          unset_args=()
-          while IFS='=' read -r key _; do
-            case "$key" in
-              GIT_CONFIG_*) unset_args+=("-u" "$key") ;;
-            esac
-          done < <(env)
-          env "${unset_args[@]}" \
-            GIT_CONFIG_NOSYSTEM=1 \
-            GIT_CONFIG_SYSTEM=/dev/null \
-            GIT_CONFIG_COUNT=0 \
-            yarn install --immutable
+      - uses: ./.github/actions/install-yarn-deps
+        with:
+          working-directory: ./solidity/ecdsa
 
       - name: Build
         run: yarn build
@@ -122,31 +100,9 @@ jobs:
           SLITHER_VERSION: 0.8.3
         run: pip3 install slither-analyzer==$SLITHER_VERSION
 
-      - uses: ./.github/actions/setup-git-for-yarn
-
-      - name: Install dependencies
-        run: |
-          export PATH="${RUNNER_TEMP:-/tmp}/git-clean-bin:$PATH"
-          unset GIT_CONFIG_PARAMETERS
-          export GIT_CONFIG_NOSYSTEM=1
-          export GIT_CONFIG_SYSTEM=/dev/null
-          export GIT_CONFIG_COUNT=0
-          export YARN_ENABLE_HARDENED_MODE=0
-          export YARN_CHECKSUM_BEHAVIOR=ignore
-          corepack enable
-          corepack prepare yarn@4.8.1 --activate
-          yarn --version
-          unset_args=()
-          while IFS='=' read -r key _; do
-            case "$key" in
-              GIT_CONFIG_*) unset_args+=("-u" "$key") ;;
-            esac
-          done < <(env)
-          env "${unset_args[@]}" \
-            GIT_CONFIG_NOSYSTEM=1 \
-            GIT_CONFIG_SYSTEM=/dev/null \
-            GIT_CONFIG_COUNT=0 \
-            yarn install --immutable
+      - uses: ./.github/actions/install-yarn-deps
+        with:
+          working-directory: ./solidity/ecdsa
 
       # As a workaround for a slither issue https://github.com/crytic/slither/issues/1140
       # we disable compilation of dependencies when running slither.
@@ -169,31 +125,9 @@ jobs:
           # https://github.com/NomicFoundation/hardhat/issues/3877
           node-version: "18.15.0"
 
-      - uses: ./.github/actions/setup-git-for-yarn
-
-      - name: Install dependencies
-        run: |
-          export PATH="${RUNNER_TEMP:-/tmp}/git-clean-bin:$PATH"
-          unset GIT_CONFIG_PARAMETERS
-          export GIT_CONFIG_NOSYSTEM=1
-          export GIT_CONFIG_SYSTEM=/dev/null
-          export GIT_CONFIG_COUNT=0
-          export YARN_ENABLE_HARDENED_MODE=0
-          export YARN_CHECKSUM_BEHAVIOR=ignore
-          corepack enable
-          corepack prepare yarn@4.8.1 --activate
-          yarn --version
-          unset_args=()
-          while IFS='=' read -r key _; do
-            case "$key" in
-              GIT_CONFIG_*) unset_args+=("-u" "$key") ;;
-            esac
-          done < <(env)
-          env "${unset_args[@]}" \
-            GIT_CONFIG_NOSYSTEM=1 \
-            GIT_CONFIG_SYSTEM=/dev/null \
-            GIT_CONFIG_COUNT=0 \
-            yarn install --immutable
+      - uses: ./.github/actions/install-yarn-deps
+        with:
+          working-directory: ./solidity/ecdsa
 
       - name: Build solidity contracts
         run: yarn build
@@ -218,31 +152,9 @@ jobs:
           # https://github.com/NomicFoundation/hardhat/issues/3877
           node-version: "18.15.0"
 
-      - uses: ./.github/actions/setup-git-for-yarn
-
-      - name: Install dependencies
-        run: |
-          export PATH="${RUNNER_TEMP:-/tmp}/git-clean-bin:$PATH"
-          unset GIT_CONFIG_PARAMETERS
-          export GIT_CONFIG_NOSYSTEM=1
-          export GIT_CONFIG_SYSTEM=/dev/null
-          export GIT_CONFIG_COUNT=0
-          export YARN_ENABLE_HARDENED_MODE=0
-          export YARN_CHECKSUM_BEHAVIOR=ignore
-          corepack enable
-          corepack prepare yarn@4.8.1 --activate
-          yarn --version
-          unset_args=()
-          while IFS='=' read -r key _; do
-            case "$key" in
-              GIT_CONFIG_*) unset_args+=("-u" "$key") ;;
-            esac
-          done < <(env)
-          env "${unset_args[@]}" \
-            GIT_CONFIG_NOSYSTEM=1 \
-            GIT_CONFIG_SYSTEM=/dev/null \
-            GIT_CONFIG_COUNT=0 \
-            yarn install --immutable
+      - uses: ./.github/actions/install-yarn-deps
+        with:
+          working-directory: ./solidity/ecdsa
 
       - name: Deploy contracts
         run: yarn deploy:test
@@ -274,31 +186,9 @@ jobs:
           node-version: "18.15.0"
           registry-url: "https://registry.npmjs.org"
 
-      - uses: ./.github/actions/setup-git-for-yarn
-
-      - name: Install dependencies
-        run: |
-          export PATH="${RUNNER_TEMP:-/tmp}/git-clean-bin:$PATH"
-          unset GIT_CONFIG_PARAMETERS
-          export GIT_CONFIG_NOSYSTEM=1
-          export GIT_CONFIG_SYSTEM=/dev/null
-          export GIT_CONFIG_COUNT=0
-          export YARN_ENABLE_HARDENED_MODE=0
-          export YARN_CHECKSUM_BEHAVIOR=ignore
-          corepack enable
-          corepack prepare yarn@4.8.1 --activate
-          yarn --version
-          unset_args=()
-          while IFS='=' read -r key _; do
-            case "$key" in
-              GIT_CONFIG_*) unset_args+=("-u" "$key") ;;
-            esac
-          done < <(env)
-          env "${unset_args[@]}" \
-            GIT_CONFIG_NOSYSTEM=1 \
-            GIT_CONFIG_SYSTEM=/dev/null \
-            GIT_CONFIG_COUNT=0 \
-            yarn install --immutable
+      - uses: ./.github/actions/install-yarn-deps
+        with:
+          working-directory: ./solidity/ecdsa
 
       - name: Get upstream packages versions
         uses: keep-network/ci/actions/upstream-builds-query@v2
@@ -396,31 +286,9 @@ jobs:
           node-version: "18.15.0"
           registry-url: "https://registry.npmjs.org"
 
-      - uses: ./.github/actions/setup-git-for-yarn
-
-      - name: Install dependencies
-        run: |
-          export PATH="${RUNNER_TEMP:-/tmp}/git-clean-bin:$PATH"
-          unset GIT_CONFIG_PARAMETERS
-          export GIT_CONFIG_NOSYSTEM=1
-          export GIT_CONFIG_SYSTEM=/dev/null
-          export GIT_CONFIG_COUNT=0
-          export YARN_ENABLE_HARDENED_MODE=0
-          export YARN_CHECKSUM_BEHAVIOR=ignore
-          corepack enable
-          corepack prepare yarn@4.8.1 --activate
-          yarn --version
-          unset_args=()
-          while IFS='=' read -r key _; do
-            case "$key" in
-              GIT_CONFIG_*) unset_args+=("-u" "$key") ;;
-            esac
-          done < <(env)
-          env "${unset_args[@]}" \
-            GIT_CONFIG_NOSYSTEM=1 \
-            GIT_CONFIG_SYSTEM=/dev/null \
-            GIT_CONFIG_COUNT=0 \
-            yarn install --immutable
+      - uses: ./.github/actions/install-yarn-deps
+        with:
+          working-directory: ./solidity/ecdsa
 
       - name: Get upstream packages versions
         uses: keep-network/ci/actions/upstream-builds-query@v2
