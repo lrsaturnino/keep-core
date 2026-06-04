@@ -31,8 +31,6 @@ runs:
       run: |
         set -euo pipefail
         export PATH="${RUNNER_TEMP:-/tmp}/git-clean-bin:$PATH"
-        export YARN_ENABLE_HARDENED_MODE=0
-        export YARN_CHECKSUM_BEHAVIOR=ignore
         corepack enable
         yarn --version
         unset_args=()
