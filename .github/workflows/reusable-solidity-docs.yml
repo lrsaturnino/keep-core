@@ -114,7 +114,7 @@ jobs:
 
       - name: Export artifacts
         if: inputs.exportAsGHArtifacts == true
-        uses: actions/upload-artifact@master
+        uses: actions/upload-artifact@v4
         with:
           name: contracts-after-preprocessing
           path: .${{ inputs.projectDir }}/contracts
@@ -149,7 +149,7 @@ jobs:
 
       - name: Export artifacts
         if: inputs.exportAsGHArtifacts == true
-        uses: actions/upload-artifact@master
+        uses: actions/upload-artifact@v4
         with:
           name: contracts-final-output
           path: .${{ inputs.projectDir }}/generated-docs
