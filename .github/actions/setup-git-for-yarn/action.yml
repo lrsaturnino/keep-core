@@ -36,14 +36,13 @@ runs:
           "exec \"${REAL_GIT}\" \"\$@\"" \
           >"${WRAPPER_DIR}/git"
         chmod +x "${WRAPPER_DIR}/git"
+        # Only export the git-binary indirection vars to the job env. The
+        # wrapper itself re-creates a clean GIT_CONFIG_* environment on every
+        # invocation, so downstream steps that legitimately need to write
+        # global git config (e.g. docs publish setting user.email/name) are
+        # not silently redirected to /dev/null.
         {
           echo "GIT=${WRAPPER_DIR}/git"
           echo "npm_config_git=${WRAPPER_DIR}/git"
-          echo "HOME=${SAFE_HOME}"
-          echo "XDG_CONFIG_HOME=${SAFE_XDG_CONFIG_HOME}"
-          echo "GIT_CONFIG_GLOBAL=/dev/null"
-          echo "GIT_CONFIG_NOSYSTEM=1"
-          echo "GIT_CONFIG_SYSTEM=/dev/null"
-          echo "GIT_CONFIG_COUNT=0"
         } >> "$GITHUB_ENV"
         echo "${WRAPPER_DIR}" >> "$GITHUB_PATH"
