@@ -173,15 +173,20 @@ const config: HardhatUserConfig = {
     project: "",
   },
   // Sepolia: all four roles collapse to account index 0 (the single key in
-  // ACCOUNTS_PRIVATE_KEYS). Single-key operation is intentional for our
-  // testnet deploy flow; downstream branches that distinguish deployer vs.
-  // governance vs. esdm (e.g. tasks/initialize-wallet-owner.ts's
-  // owner-vs-governance fork, Ownable.transferOwnership flows) are inactive
-  // on Sepolia by design.
+  // ACCOUNTS_PRIVATE_KEYS) because the testnet stack is operated from one funded
+  // deployer key — there is no separate governance multisig, Threshold Council, or
+  // chaosnet owner on Sepolia. Single-key operation is intentional for our testnet
+  // deploy flow; downstream branches that distinguish deployer vs. governance vs.
+  // esdm (e.g. tasks/initialize-wallet-owner.ts's owner-vs-governance fork,
+  // Ownable.transferOwnership flows) are inactive on Sepolia by design.
+  // This MUST NOT be replicated on mainnet, where the deployer key must be distinct
+  // from governance / chaosnetOwner / esdm (the latter three legitimately share the
+  // Threshold Council address). A deploy-time guard in deploy/00_log_external_deployments.ts
+  // fails the run on mainnet if the deployer collides with any other role.
+  // (etherscan config is assigned post-declaration below to keep HardhatUserConfig inference intact.)
   namedAccounts: {
     deployer: {
       default: 1, // take the second account
-      // Use first account from ACCOUNTS_PRIVATE_KEYS (required for custom testnet deployers)
       sepolia: 0,
       mainnet: "0x716089154304f22a2F9c8d2f8C45815183BF3532",
     },
