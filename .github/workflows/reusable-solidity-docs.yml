@@ -96,7 +96,7 @@ jobs:
       run:
         working-directory: .${{ inputs.projectDir }}
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Prepare contract files for further processing
         if: inputs.trimComments
@@ -123,7 +123,7 @@ jobs:
         shell: bash
         run: git config --global url."https://".insteadOf git://
 
-      - uses: actions/setup-node@v3
+      - uses: actions/setup-node@v4
         with:
           node-version: "18.15.0"
 
