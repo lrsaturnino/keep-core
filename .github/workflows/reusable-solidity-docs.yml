@@ -216,9 +216,12 @@ jobs:
               "https://api.github.com/repos/${{ inputs.destinationRepo }}/pulls?status=open&head=$dest_org:$head_branch")
             if [[ $pr_for_head == $'[\n\n]' ]]; then
               echo "➞ Checked. A PR for the head branch ($head_branch) will be created"
-              hub pull-request --base $base_branch \
-                --message "Update Solidity API docs" \
-                --message "Docs updated by workflow: https://github.com/${{ github.repository}}/actions/runs/${{ github.run_id}}"
+              gh pr create \
+                --repo "${{ inputs.destinationRepo }}" \
+                --base "$base_branch" \
+                --head "$head_branch" \
+                --title "Update Solidity API docs" \
+                --body "Docs updated by workflow: https://github.com/${{ github.repository}}/actions/runs/${{ github.run_id}}"
             else
               echo "➞ Checked. A PR for head branch ($head_branch) already exists and got updated."
             fi
