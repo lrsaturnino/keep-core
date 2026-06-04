@@ -1450,7 +1450,7 @@ __metadata:
     "@openzeppelin/hardhat-upgrades": "npm:^1.20.4"
     "@tenderly/hardhat-tenderly": "npm:>=1.0.13 <1.2.0"
     "@thesis-co/eslint-config": "https://codeload.github.com/thesis/eslint-config/tar.gz/778365bbebb6b056bf973d25c57b8b466d21cbcf"
-    "@threshold-network/solidity-contracts": "npm:development"
+    "@threshold-network/solidity-contracts": "npm:1.3.0-dev.14"
     "@typechain/ethers-v5": "npm:^8.0.5"
     "@typechain/hardhat": "npm:^4.0.0"
     "@types/chai": "npm:^4.3.0"
@@ -2187,14 +2187,14 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@threshold-network/solidity-contracts@npm:development":
-  version: 1.3.0-dev.16
-  resolution: "@threshold-network/solidity-contracts@npm:1.3.0-dev.16"
+"@threshold-network/solidity-contracts@npm:1.3.0-dev.14":
+  version: 1.3.0-dev.14
+  resolution: "@threshold-network/solidity-contracts@npm:1.3.0-dev.14"
   dependencies:
     "@openzeppelin/contracts": "npm:~4.5.0"
     "@openzeppelin/contracts-upgradeable": "npm:~4.5.2"
     "@thesis/solidity-contracts": "github:thesis/solidity-contracts#4985bcf"
-  checksum: 10c0/25d67883e11417fc1e8413ec6d9470b164bc459d262514199f8baa4165f782773793b6a38235026ed31e9c6a3d846efef58b5317ea80f9c59306266879548368
+  checksum: 10c0/8b4f942f92a3ed6e27665bd164e45b96c13d2d6f3422e8733d3b4a382fa02b14dbf79b9843f31289a079d1cbadfd557b4bd1f75e42b95d5861011412123f32d7
   languageName: node
   linkType: hard
 
