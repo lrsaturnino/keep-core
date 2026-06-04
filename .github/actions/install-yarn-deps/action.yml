@@ -31,6 +31,16 @@ runs:
       run: |
         set -euo pipefail
         export PATH="${RUNNER_TEMP:-/tmp}/git-clean-bin:$PATH"
+        # Opt out of Yarn 4 hardened mode. Yarn auto-enables it on public PR
+        # contexts; we cannot use it here because the lockfiles contain
+        # legitimate npm-descriptor -> git-URL remaps (e.g. ethereumjs-abi
+        # @npm:0.6.8 -> github.com/ethereumjs/ethereumjs-abi.git#<commit>,
+        # because npm 0.6.8 was published broken). Hardened mode rejects all
+        # such remaps as potential supply-chain attacks, even when the
+        # remap is internally consistent with the rest of the lockfile.
+        # Note: lockfile checksums remain enforced (YARN_CHECKSUM_BEHAVIOR
+        # is left at its default), so per-package integrity is still checked.
+        export YARN_ENABLE_HARDENED_MODE=0
         corepack enable
         yarn --version
         unset_args=()
