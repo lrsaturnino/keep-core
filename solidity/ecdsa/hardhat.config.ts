@@ -1,9 +1,12 @@
 // `@nomicfoundation/hardhat-verify` ^2.1.x is the Hardhat 2–compatible line; Hardhat 3 uses ^3.x (API v2).
-// Set DISABLE_HARDHAT_VERIFY=true to omit the plugin and skip Etherscan steps in deploy scripts; default is on.
+// Plugin is imported statically so HardhatUserConfig picks up the `etherscan` field type
+// augmentation. Set DISABLE_HARDHAT_VERIFY=true to skip the Etherscan config and any verify
+// calls in deploy scripts; the plugin's task registration is harmless when unused.
 import fs from "fs"
 import path from "path"
 
 import "@nomicfoundation/hardhat-chai-matchers"
+import "@nomicfoundation/hardhat-verify"
 import "@keep-network/hardhat-helpers"
 import "@keep-network/hardhat-local-networks-config"
 import "@nomiclabs/hardhat-waffle"
@@ -25,10 +28,6 @@ import type { HardhatUserConfig } from "hardhat/config"
 const TASK_CHECK_ACCOUNTS_COUNT = "check-accounts-count"
 
 const hardhatVerifyEnabled = process.env.DISABLE_HARDHAT_VERIFY !== "true"
-if (hardhatVerifyEnabled) {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports,@typescript-eslint/no-var-requires,global-require
-  require("@nomicfoundation/hardhat-verify")
-}
 
 /**
  * Random-beacon `export/` is gitignored in the random-beacon package, so CI never
