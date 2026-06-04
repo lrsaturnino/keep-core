@@ -182,13 +182,16 @@ jobs:
         if: inputs.publish == true
         env:
           GITHUB_TOKEN: ${{ secrets.githubToken }}
+          GH_TOKEN: ${{ secrets.githubToken }}
         run: |
           echo "➞ Configure environment variables"
           head_branch=auto-update-solidity-api-docs
           base_branch=${{ inputs.destinationBaseBranch }}
+          echo "➞ Configure gh as git credential helper (keeps token out of URLs and .git/config)"
+          gh auth setup-git --hostname github.com
           echo "➞ Checkout destination repo"
           git clone --branch $base_branch \
-            https://${{ inputs.userName }}:$GITHUB_TOKEN@github.com/${{ inputs.destinationRepo }}.git \
+            https://github.com/${{ inputs.destinationRepo }}.git \
             dest-repo-clone
           echo "➞ Create/checkout head branch"
           cd dest-repo-clone
