@@ -201,7 +201,7 @@ jobs:
 
       - name: Resolve latest contracts
         run: |
-          yarn upgrade \
+          yarn up \
             @threshold-network/solidity-contracts@${{ steps.upstream-builds-query.outputs.threshold-contracts-version }} \
             @keep-network/random-beacon@${{ steps.upstream-builds-query.outputs.random-beacon-version }} \
             @keep-network/sortition-pools
@@ -212,7 +212,7 @@ jobs:
       # test environment it should be used temporarily only.
       - name: Use Sortition Pool forked contracts
         run: |
-          yarn upgrade @keep-network/sortition-pools@github:keep-network/sortition-pools#test-fork
+          yarn up @keep-network/sortition-pools@github:keep-network/sortition-pools#test-fork
 
       - name: Configure tenderly
         env:
@@ -301,7 +301,7 @@ jobs:
 
       - name: Resolve latest contracts
         run: |
-          yarn upgrade \
+          yarn up \
             @threshold-network/solidity-contracts@${{ steps.upstream-builds-query.outputs.threshold-contracts-version }} \
             @keep-network/random-beacon@${{ steps.upstream-builds-query.outputs.random-beacon-version }} \
             @keep-network/sortition-pools
