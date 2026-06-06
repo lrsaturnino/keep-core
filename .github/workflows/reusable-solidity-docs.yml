@@ -169,6 +169,32 @@ jobs:
               body: 'Solidity API documentation preview available in the artifacts of the https://github.com/${{ github.repository}}/actions/runs/${{ github.run_id}} check.'
             })
 
+      - name: Use real git for publishing steps (bypass Yarn git wrapper)
+        if: inputs.publish == true
+        shell: bash
+        run: |
+          # The Yarn git wrapper (.github/actions/setup-git-for-yarn) is placed on
+          # $PATH and exported as $GIT / $npm_config_git for the whole job so
+          # `yarn install` can clone git dependencies. Every git it intercepts is
+          # forced to GIT_CONFIG_GLOBAL=/dev/null with a throwaway $HOME. That
+          # breaks the docs-sync step below: `gh auth setup-git` and the
+          # `git config --global user.email/name` calls cannot write the global
+          # config ("could not lock config file /dev/null"), so the credential
+          # helper is never registered and the authenticated `git push` has no
+          # credentials. Docs publishing does not need the wrapper — `yarn install`
+          # already ran during doc generation — so remove it and point git back at
+          # the real binary for the remaining publishing steps. Scoped to
+          # publish == true, so the preview path and non-docs callers are
+          # unaffected.
+          set -euo pipefail
+          rm -f "${RUNNER_TEMP:-/tmp}/git-clean-bin/git"
+          real_git="$(command -v git)"
+          {
+            echo "GIT=${real_git}"
+            echo "npm_config_git=${real_git}"
+          } >> "$GITHUB_ENV"
+          echo "Bypassed Yarn git wrapper for publishing; git=${real_git}"
+
       - name: Import GPG key
         if: inputs.publish == true && inputs.verifyCommits == true
         uses: crazy-max/ghaction-import-gpg@111c56156bcc6918c056dbef52164cfa583dc549
