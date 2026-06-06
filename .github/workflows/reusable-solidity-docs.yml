@@ -96,7 +96,7 @@ jobs:
       run:
         working-directory: .${{ inputs.projectDir }}
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Prepare contract files for further processing
         if: inputs.trimComments
@@ -114,7 +114,7 @@ jobs:
 
       - name: Export artifacts
         if: inputs.exportAsGHArtifacts == true
-        uses: actions/upload-artifact@master
+        uses: actions/upload-artifact@v4
         with:
           name: contracts-after-preprocessing
           path: .${{ inputs.projectDir }}/contracts
@@ -123,36 +123,13 @@ jobs:
         shell: bash
         run: git config --global url."https://".insteadOf git://
 
-      - uses: actions/setup-node@v3
+      - uses: actions/setup-node@v4
         with:
           node-version: "18.15.0"
 
-      - uses: ./.github/actions/setup-git-for-yarn
-
-      - name: Install dependencies
-        shell: bash
-        run: |
-          export PATH="${RUNNER_TEMP:-/tmp}/git-clean-bin:$PATH"
-          unset GIT_CONFIG_PARAMETERS
-          export GIT_CONFIG_NOSYSTEM=1
-          export GIT_CONFIG_SYSTEM=/dev/null
-          export GIT_CONFIG_COUNT=0
-          export YARN_ENABLE_HARDENED_MODE=0
-          export YARN_CHECKSUM_BEHAVIOR=ignore
-          corepack enable
-          corepack prepare yarn@4.8.1 --activate
-          yarn --version
-          unset_args=()
-          while IFS='=' read -r key _; do
-            case "$key" in
-              GIT_CONFIG_*) unset_args+=("-u" "$key") ;;
-            esac
-          done < <(env)
-          env "${unset_args[@]}" \
-            GIT_CONFIG_NOSYSTEM=1 \
-            GIT_CONFIG_SYSTEM=/dev/null \
-            GIT_CONFIG_COUNT=0 \
-            yarn install --immutable
+      - uses: ./.github/actions/install-yarn-deps
+        with:
+          working-directory: .${{ inputs.projectDir }}
 
       - name: Build Markdown docs
         run: yarn run hardhat docgen
@@ -172,7 +149,7 @@ jobs:
 
       - name: Export artifacts
         if: inputs.exportAsGHArtifacts == true
-        uses: actions/upload-artifact@master
+        uses: actions/upload-artifact@v4
         with:
           name: contracts-final-output
           path: .${{ inputs.projectDir }}/generated-docs
@@ -192,6 +169,32 @@ jobs:
               body: 'Solidity API documentation preview available in the artifacts of the https://github.com/${{ github.repository}}/actions/runs/${{ github.run_id}} check.'
             })
 
+      - name: Use real git for publishing steps (bypass Yarn git wrapper)
+        if: inputs.publish == true
+        shell: bash
+        run: |
+          # The Yarn git wrapper (.github/actions/setup-git-for-yarn) is placed on
+          # $PATH and exported as $GIT / $npm_config_git for the whole job so
+          # `yarn install` can clone git dependencies. Every git it intercepts is
+          # forced to GIT_CONFIG_GLOBAL=/dev/null with a throwaway $HOME. That
+          # breaks the docs-sync step below: `gh auth setup-git` and the
+          # `git config --global user.email/name` calls cannot write the global
+          # config ("could not lock config file /dev/null"), so the credential
+          # helper is never registered and the authenticated `git push` has no
+          # credentials. Docs publishing does not need the wrapper — `yarn install`
+          # already ran during doc generation — so remove it and point git back at
+          # the real binary for the remaining publishing steps. Scoped to
+          # publish == true, so the preview path and non-docs callers are
+          # unaffected.
+          set -euo pipefail
+          rm -f "${RUNNER_TEMP:-/tmp}/git-clean-bin/git"
+          real_git="$(command -v git)"
+          {
+            echo "GIT=${real_git}"
+            echo "npm_config_git=${real_git}"
+          } >> "$GITHUB_ENV"
+          echo "Bypassed Yarn git wrapper for publishing; git=${real_git}"
+
       - name: Import GPG key
         if: inputs.publish == true && inputs.verifyCommits == true
         uses: crazy-max/ghaction-import-gpg@111c56156bcc6918c056dbef52164cfa583dc549
@@ -205,13 +208,16 @@ jobs:
         if: inputs.publish == true
         env:
           GITHUB_TOKEN: ${{ secrets.githubToken }}
+          GH_TOKEN: ${{ secrets.githubToken }}
         run: |
           echo "➞ Configure environment variables"
           head_branch=auto-update-solidity-api-docs
           base_branch=${{ inputs.destinationBaseBranch }}
+          echo "➞ Configure gh as git credential helper (keeps token out of URLs and .git/config)"
+          gh auth setup-git --hostname github.com
           echo "➞ Checkout destination repo"
           git clone --branch $base_branch \
-            https://${{ inputs.userName }}:$GITHUB_TOKEN@github.com/${{ inputs.destinationRepo }}.git \
+            https://github.com/${{ inputs.destinationRepo }}.git \
             dest-repo-clone
           echo "➞ Create/checkout head branch"
           cd dest-repo-clone
@@ -239,9 +245,12 @@ jobs:
               "https://api.github.com/repos/${{ inputs.destinationRepo }}/pulls?status=open&head=$dest_org:$head_branch")
             if [[ $pr_for_head == $'[\n\n]' ]]; then
               echo "➞ Checked. A PR for the head branch ($head_branch) will be created"
-              hub pull-request --base $base_branch \
-                --message "Update Solidity API docs" \
-                --message "Docs updated by workflow: https://github.com/${{ github.repository}}/actions/runs/${{ github.run_id}}"
+              gh pr create \
+                --repo "${{ inputs.destinationRepo }}" \
+                --base "$base_branch" \
+                --head "$head_branch" \
+                --title "Update Solidity API docs" \
+                --body "Docs updated by workflow: https://github.com/${{ github.repository}}/actions/runs/${{ github.run_id}}"
             else
               echo "➞ Checked. A PR for head branch ($head_branch) already exists and got updated."
             fi
