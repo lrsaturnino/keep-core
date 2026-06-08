@@ -41,6 +41,21 @@ export const testConfig = {
   operatorsCount: 64,
 }
 
+// Optional gas price override (in gwei) used to avoid REPLACEMENT_UNDERPRICED
+// when retrying a failed deploy. Validated up-front so a malformed value fails
+// fast instead of silently producing a NaN gasPrice.
+const gasPriceGwei = process.env.GAS_PRICE_GWEI
+  ? Number(process.env.GAS_PRICE_GWEI)
+  : undefined
+if (
+  gasPriceGwei !== undefined &&
+  (!Number.isInteger(gasPriceGwei) || gasPriceGwei <= 0)
+) {
+  throw new Error(
+    `Invalid GAS_PRICE_GWEI "${process.env.GAS_PRICE_GWEI}": expected a positive integer (gwei)`
+  )
+}
+
 const config: HardhatUserConfig = {
   solidity: {
     compilers: [
@@ -109,8 +124,8 @@ const config: HardhatUserConfig = {
         : undefined,
       tags: ["etherscan", "tenderly"],
       // Override gas to avoid REPLACEMENT_UNDERPRICED when retrying after a failed deploy
-      ...(process.env.GAS_PRICE_GWEI && {
-        gasPrice: parseInt(process.env.GAS_PRICE_GWEI, 10) * 1e9,
+      ...(gasPriceGwei !== undefined && {
+        gasPrice: gasPriceGwei * 1e9,
       }),
     },
     mainnet: {

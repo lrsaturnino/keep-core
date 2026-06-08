@@ -213,7 +213,7 @@ const createWalletRegistryFixture = (options?: { useAllowlist?: boolean }) => {
  * Creates and loads a WalletRegistry test fixture with dual-mode authorization support.
  *
  * This is the main entry point for test files to load the WalletRegistry fixture.
- * It supports TokenStaking (default) and Allowlist authorization modes for
+ * It supports Allowlist (default) and TokenStaking authorization modes for
  * comprehensive testing of the dual-mode authorization routing implementation.
  *
  * @param options - Configuration options for the fixture
@@ -221,17 +221,17 @@ const createWalletRegistryFixture = (options?: { useAllowlist?: boolean }) => {
  * @returns Promise resolving to fixture with all deployed contracts, signers, and test operators
  *
  * @example
- * const { walletRegistry, operators, allowlist } = await walletRegistryFixture()
+ * const { walletRegistry, operators, allowlist } = await walletRegistryFixture() // Default: Allowlist mode
  *
  * @example
- * const { walletRegistry, operators, staking } = await walletRegistryFixture({ useAllowlist: false })
+ * const { walletRegistry, operators, staking } = await walletRegistryFixture({ useAllowlist: false }) // Legacy TokenStaking mode
  *
  * @remarks
- * - Default uses TokenStaking; use `{ useAllowlist: true }` for dual-mode / Allowlist-only tests
+ * - Default uses Allowlist; use `{ useAllowlist: false }` for legacy TokenStaking tests
  * - Allowlist mode calls walletRegistry.initializeV2() to enable dual-mode routing
  * - In Allowlist mode, TokenStaking notification rewards are NOT configured (not needed)
  * - Fixture uses hardhat-deploy's snapshot/restore for efficient test isolation
- * - Performance: ~5 seconds (TokenStaking mode), ~7 seconds (Allowlist mode)
+ * - Performance: ~7 seconds (Allowlist mode), ~5 seconds (TokenStaking mode)
  */
 export async function walletRegistryFixture(options?: {
   useAllowlist?: boolean

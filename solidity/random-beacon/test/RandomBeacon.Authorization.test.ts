@@ -1553,7 +1553,7 @@ describe.skip("RandomBeacon - Authorization", () => {
 
           const deauthorizingBy = stakedAmount
 
-          legacyTokenStakingAt(staking, authorizer)[
+          await legacyTokenStakingAt(staking, authorizer)[
             "requestAuthorizationDecrease(address,address,uint96)"
           ](stakingProvider.address, randomBeacon.address, deauthorizingBy)
         })
@@ -1583,7 +1583,7 @@ describe.skip("RandomBeacon - Authorization", () => {
           .registerOperator(operator.address)
 
         const deauthorizingBy = stakedAmount
-        legacyTokenStakingAt(staking, authorizer)[
+        await legacyTokenStakingAt(staking, authorizer)[
           "requestAuthorizationDecrease(address,address,uint96)"
         ](stakingProvider.address, randomBeacon.address, deauthorizingBy)
       })

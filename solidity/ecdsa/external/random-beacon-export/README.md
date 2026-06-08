@@ -25,6 +25,21 @@ These files intentionally mix two formats:
   blind regeneration will reintroduce a hard failure on networks running the
   Threshold staking contract.
 
+## Known limitation: verification is not wrapped
+
+Unlike the hand-maintained ECDSA deploy scripts (which route Etherscan/Tenderly
+verification through `verifyOnEtherscanOrContinue` / `verifyOnTenderlyOrContinue`
+so explorer outages never abort a deploy), the `tsc`-compiled vendored scripts
+call `helpers.etherscan.verify(...)` / `hre.tenderly.verify(...)` directly. A
+verification failure (rate limit, bytecode mismatch, missing key) in one of
+these scripts can therefore halt the deploy.
+
+This is accepted rather than patched: these are build artifacts and must not be
+hand-edited (see Format above). If it becomes a recurring operational problem,
+fix it upstream in `@keep-network/random-beacon`'s `export/deploy` sources and
+re-vendor, or set `DISABLE_HARDHAT_VERIFY` / the network's verify tags off for
+the run.
+
 ## Regeneration policy
 
 When syncing from upstream:
