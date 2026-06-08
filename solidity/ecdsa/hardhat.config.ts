@@ -295,9 +295,10 @@ task(TASK_CHECK_ACCOUNTS_COUNT, "Checks accounts count").setAction(async () => {
 if (hardhatVerifyEnabled) {
   // Assigned post-declaration so the HardhatUserConfig type annotation above
   // remains intact (a conditional spread inside the literal breaks inference).
-  ;(config as HardhatUserConfig & {
+  const configWithEtherscan = config as HardhatUserConfig & {
     etherscan?: { apiKey?: string }
-  }).etherscan = {
+  }
+  configWithEtherscan.etherscan = {
     apiKey: process.env.ETHERSCAN_API_KEY,
   }
 }
