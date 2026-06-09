@@ -1030,6 +1030,7 @@ func (c *Connection) EstimateSatPerVByteFee(blocks uint32) (int64, error) {
 	targets := feeEstimateWithFallbackTargets(blocks)
 	var lastErr error
 	sawFeeOracleFailure := false
+	sawNonOracleFailure := false
 
 	for _, b := range targets {
 		btcPerKbFee, err := c.getFeeBtcPerKbOnce(b)
@@ -1037,6 +1038,8 @@ func (c *Connection) EstimateSatPerVByteFee(blocks uint32) (int64, error) {
 			lastErr = err
 			if isElectrumFeeOracleFailure(err) {
 				sawFeeOracleFailure = true
+			} else {
+				sawNonOracleFailure = true
 			}
 			logger.Debugf("GetFee for [%d] confirmation blocks failed: [%v]", b, err)
 			continue
@@ -1064,8 +1067,15 @@ func (c *Connection) EstimateSatPerVByteFee(blocks uint32) (int64, error) {
 		return convertBtcKbToSatVByte(btcPerKbFee), nil
 	}
 
+	// Only fall back to a fixed low feerate when every failure was a benign
+	// "no estimate" response from the fee oracle. If a transport/auth (or any
+	// other non-oracle) failure was also observed, we cannot assume the oracle
+	// simply lacked data, so we fail safe and surface the error rather than
+	// broadcasting at a guessed feerate.
+	fallbackEligible := sawFeeOracleFailure && !sawNonOracleFailure
+
 	if sawFeeOracleFailure {
-		if lowFeeFallbackAllowed(c.config.Network) {
+		if fallbackEligible && lowFeeFallbackAllowed(c.config.Network) {
 			logger.Warnf(
 				"Electrum returned no fee estimate for any target %v on [%v] "+
 					"network; using fallback [%d] sat/vbyte (last error: [%v])",
@@ -1076,9 +1086,10 @@ func (c *Connection) EstimateSatPerVByteFee(blocks uint32) (int64, error) {
 			)
 		} else {
 			logger.Warnf(
-				"Electrum returned no fee estimate for any target %v on [%v] "+
-					"network; low-fee fallback is not permitted on this network, "+
-					"failing safe (last error: [%v])",
+				"Electrum returned no usable fee estimate for any target %v on "+
+					"[%v] network; low-fee fallback not applicable (mainnet, "+
+					"unknown network, or a non-oracle failure occurred), failing "+
+					"safe (last error: [%v])",
 				targets,
 				c.config.Network,
 				lastErr,
@@ -1086,7 +1097,7 @@ func (c *Connection) EstimateSatPerVByteFee(blocks uint32) (int64, error) {
 		}
 	}
 
-	return feeFallbackResult(c.config.Network, sawFeeOracleFailure, lastErr, targets)
+	return feeFallbackResult(c.config.Network, fallbackEligible, lastErr, targets)
 }
 
 // lowFeeFallbackAllowed reports whether the hardcoded low-fee estimate fallback
