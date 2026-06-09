@@ -26,9 +26,7 @@ const { createSnapshot, restoreSnapshot } = helpers.snapshot
 const ZERO_ADDRESS = ethers.constants.AddressZero
 const MAX_UINT64 = ethers.BigNumber.from("18446744073709551615") // 2^64 - 1
 
-// Skipped: @threshold-network/solidity-contracts TokenStaking no longer exposes legacy
-// stake / increaseAuthorization / approveApplication on-chain (ABI matches). Re-enable with a test mock or pinned staking build.
-describe.skip("RandomBeacon - Authorization", () => {
+describe("RandomBeacon - Authorization", () => {
   let t: T
   let randomBeacon: RandomBeacon
   let randomBeaconGovernance: RandomBeaconGovernance

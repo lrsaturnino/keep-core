@@ -78,8 +78,7 @@ async function fixture() {
   }
 }
 
-// Skipped: see RandomBeacon.Authorization.test.ts (legacy TokenStaking API unavailable on-chain).
-describe.skip("RandomBeacon - Relay", () => {
+describe("RandomBeacon - Relay", () => {
   let governance: SignerWithAddress
   let requester: SignerWithAddress
   let notifier: SignerWithAddress

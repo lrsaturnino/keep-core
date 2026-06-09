@@ -50,8 +50,7 @@ const fixture = async () => {
   return { contracts, signers }
 }
 
-// Skipped: see RandomBeacon.Authorization.test.ts (legacy TokenStaking API unavailable on-chain).
-describe.skip("RandomBeacon - Callback", () => {
+describe("RandomBeacon - Callback", () => {
   let requester: SignerWithAddress
   let submitter: SignerWithAddress
   let governance: SignerWithAddress
