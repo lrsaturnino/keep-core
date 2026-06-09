@@ -182,22 +182,39 @@ func (bdc *BitcoinDifficultyChain) waitDeployBackendTransactionMined(
 	return nil
 }
 
-// waitForBlockHeightCtx wraps the context-less chain.BlockCounter.WaitForBlockHeight
-// so the caller can enforce a deadline. The underlying interface does not accept
-// a context; if ctx fires before the height is reached, the wait goroutine stays
-// parked until the next block tick eventually unblocks it.
+// waitForBlockHeightCtxPollInterval is how often waitForBlockHeightCtx polls the
+// chain height. Block times on the supported networks are far larger, so this is
+// responsive without busy-looping.
+const waitForBlockHeightCtxPollInterval = 1 * time.Second
+
+// waitForBlockHeightCtx waits until the chain reaches blockNumber or ctx is
+// cancelled, whichever happens first. It polls the context-less
+// chain.BlockCounter via the non-blocking CurrentBlock rather than spawning a
+// goroutine parked in WaitForBlockHeight: callers retry this under a deadline,
+// so a goroutine that cannot be cancelled would accumulate on a stalled chain.
+// Polling leaves nothing behind once the function returns.
 func waitForBlockHeightCtx(
 	ctx context.Context,
 	bc chain.BlockCounter,
 	blockNumber uint64,
 ) error {
-	done := make(chan error, 1)
-	go func() { done <- bc.WaitForBlockHeight(blockNumber) }()
-	select {
-	case err := <-done:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
+	ticker := time.NewTicker(waitForBlockHeightCtxPollInterval)
+	defer ticker.Stop()
+
+	for {
+		current, err := bc.CurrentBlock()
+		if err != nil {
+			return fmt.Errorf("failed to read current block height: [%w]", err)
+		}
+		if current >= blockNumber {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
 	}
 }
 

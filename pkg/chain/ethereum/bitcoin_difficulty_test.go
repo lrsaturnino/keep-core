@@ -7,31 +7,27 @@ import (
 	"time"
 )
 
-// blockingBlockCounter blocks WaitForBlockHeight until ch is closed, simulating
-// a chain that has stopped producing blocks (or an RPC stuck behind a stale
-// load balancer).
-type blockingBlockCounter struct {
-	ch chan struct{}
+// stubBlockCounter reports a fixed current block height, simulating a chain that
+// has not yet reached the requested height (e.g. stalled, or an RPC stuck behind
+// a stale load balancer).
+type stubBlockCounter struct {
+	current uint64
 }
 
-func (b *blockingBlockCounter) CurrentBlock() (uint64, error)               { return 0, nil }
-func (b *blockingBlockCounter) WatchBlocks(_ context.Context) <-chan uint64 { return nil }
-func (b *blockingBlockCounter) BlockHeightWaiter(_ uint64) (<-chan uint64, error) {
+func (b *stubBlockCounter) CurrentBlock() (uint64, error)               { return b.current, nil }
+func (b *stubBlockCounter) WatchBlocks(_ context.Context) <-chan uint64 { return nil }
+func (b *stubBlockCounter) BlockHeightWaiter(_ uint64) (<-chan uint64, error) {
 	return nil, nil
 }
-func (b *blockingBlockCounter) WaitForBlockHeight(_ uint64) error {
-	<-b.ch
-	return nil
-}
+func (b *stubBlockCounter) WaitForBlockHeight(_ uint64) error { return nil }
 
-// TestWaitForBlockHeightCtx_DeadlineExceeded asserts that the context shim
-// honors the parent context's deadline when WaitForBlockHeight blocks forever.
+// TestWaitForBlockHeightCtx_DeadlineExceeded asserts that the wait honors the
+// parent context's deadline when the chain never reaches the target height.
 // Regression: the original implementation called WaitForBlockHeight without any
 // cancellation path, which could hang the maintainer indefinitely if the chain
 // stalled mid-retarget. See waitDeployBackendTransactionMinedTimeout.
 func TestWaitForBlockHeightCtx_DeadlineExceeded(t *testing.T) {
-	bc := &blockingBlockCounter{ch: make(chan struct{})}
-	defer close(bc.ch) // release the parked goroutine
+	bc := &stubBlockCounter{current: 0}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -48,11 +44,11 @@ func TestWaitForBlockHeightCtx_DeadlineExceeded(t *testing.T) {
 	}
 }
 
-// TestWaitForBlockHeightCtx_ReturnsImmediatelyOnSuccess asserts the shim does
-// not introduce extra latency when the underlying counter returns promptly.
+// TestWaitForBlockHeightCtx_ReturnsImmediatelyOnSuccess asserts the wait does
+// not introduce extra latency when the chain has already reached the target
+// height.
 func TestWaitForBlockHeightCtx_ReturnsImmediatelyOnSuccess(t *testing.T) {
-	bc := &blockingBlockCounter{ch: make(chan struct{})}
-	close(bc.ch) // pre-close: WaitForBlockHeight returns nil immediately
+	bc := &stubBlockCounter{current: 1}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
