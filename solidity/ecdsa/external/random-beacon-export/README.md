@@ -29,9 +29,11 @@ The bundled scripts intentionally mix two formats:
   package's TypeScript sources (`__awaiter` / `__generator` runtime helpers,
   `var` declarations). Treat as build artifacts; do not hand-edit.
 - **`05_approve_random_beacon_in_token_staking.js`**: hand-written modern
-  async/await. Adds an `ifaceHasFunction("approveApplication")` precheck plus
-  an exception backstop so the script is idempotent against the Threshold
-  `TokenStaking` ABI (which does not expose `approveApplication`).
+  async/await. Adds an `ifaceHasFunction("approveApplication")` precheck (so it
+  skips cleanly on the Threshold `TokenStaking` ABI, which does not expose
+  `approveApplication`) plus an idempotency guard that swallows errors only
+  while reading `applicationInfo(...)`. The `approveApplication(...)` call
+  itself is intentionally left unwrapped so a genuine revert propagates.
   **Do not regenerate from upstream without preserving this precheck** —
   blind regeneration will reintroduce a hard failure on networks running the
   Threshold staking contract.
@@ -59,7 +61,9 @@ From the repo root:
 cd solidity/random-beacon
 yarn install
 yarn prepack
-cp export/deploy/*.js ../ecdsa/external/random-beacon-export/deploy/
+# Copy every script EXCEPT 05_* — that one is hand-maintained (see below).
+cp export/deploy/0[1-4]_*.js ../ecdsa/external/random-beacon-export/deploy/
+cp export/deploy/0[6-9]_*.js ../ecdsa/external/random-beacon-export/deploy/
 ```
 
 Then verify `git diff` matches the intended deploy-script change in the
@@ -73,8 +77,11 @@ When syncing from upstream:
 
 1. Regenerate `01..04, 06..09_*.js` from `@keep-network/random-beacon`'s
    `export/deploy` source via its `tsc` build (the `yarn prepack` step above).
-2. **Skip `05_*.js`** during regeneration, or re-apply the `ifaceHasFunction`
-   precheck and the try/catch around `execute(...)` after regenerating.
+2. **Skip `05_*.js`** during bulk regeneration — it is maintained deliberately.
+   If you do regenerate it, ensure it matches
+   `solidity/random-beacon/deploy/05_approve_random_beacon_in_token_staking.ts`
+   and preserves the `ifaceHasFunction("approveApplication")` gating and the
+   `applicationInfo(...)` idempotency check.
 3. Verify by running deploys against both a network that exposes
    `approveApplication` (legacy Keep TokenStaking) and one that does not
    (Threshold TokenStaking).

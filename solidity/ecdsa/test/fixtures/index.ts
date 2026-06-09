@@ -26,12 +26,15 @@
  *
  * ## Authorization Modes
  *
- * - **TokenStaking Mode (default)**: Pre-upgrade authorization via TokenStaking contract
+ * Both modes are explicit: every call site must pass `useAllowlist` and no
+ * mode is inherited from a default.
+ *
+ * - **TokenStaking Mode (explicit `useAllowlist: false`)**: Pre-upgrade authorization via TokenStaking contract
  *   - Notification rewards configured
  *   - Operators stake via TokenStaking.stake()
  *   - Authorization via TokenStaking.increaseAuthorization()
  *
- * - **Allowlist Mode (opt-in)**: Post-upgrade authorization via Allowlist contract
+ * - **Allowlist Mode (explicit `useAllowlist: true`)**: Post-upgrade authorization via Allowlist contract
  *   - Notification rewards NOT configured (not needed)
  *   - Operators authorized via Allowlist.addStakingProvider()
  *   - WalletRegistry.initializeV2() sets allowlist address
