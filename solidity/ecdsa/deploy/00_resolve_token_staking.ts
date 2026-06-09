@@ -10,6 +10,11 @@ const func: DeployFunction = async function (hre: HardhatRuntimeEnvironment) {
   if (TokenStaking && helpers.address.isValid(TokenStaking.address)) {
     log(`using existing TokenStaking at ${TokenStaking.address}`)
   } else {
+    // In local/hardhat test runs this deployment may be intentionally absent.
+    if (hre.network.name === "hardhat" || hre.network.name === "development") {
+      log("TokenStaking not found on local network; skipping")
+      return
+    }
     throw new Error("deployed TokenStaking contract not found")
   }
 }

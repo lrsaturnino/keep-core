@@ -10,6 +10,11 @@ const func: DeployFunction = async function (hre: HardhatRuntimeEnvironment) {
   if (ReimbursementPool && helpers.address.isValid(ReimbursementPool.address)) {
     log(`using existing ReimbursementPool at ${ReimbursementPool.address}`)
   } else {
+    // In local/hardhat test runs this deployment may be intentionally absent.
+    if (hre.network.name === "hardhat" || hre.network.name === "development") {
+      log("ReimbursementPool not found on local network; skipping")
+      return
+    }
     throw new Error("deployed ReimbursementPool contract not found")
   }
 }
