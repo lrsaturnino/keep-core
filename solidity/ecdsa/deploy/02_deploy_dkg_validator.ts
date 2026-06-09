@@ -26,6 +26,36 @@ const func: DeployFunction = async (hre: HardhatRuntimeEnvironment) => {
   const redeploySafeNetworks = new Set(["hardhat", "development", "sepolia"])
   const skipIfAlreadyDeployed = !redeploySafeNetworks.has(hre.network.name)
 
+  // Fail-fast guard against EcdsaDkgValidator / WalletRegistry binding drift.
+  // The validator is bound into WalletRegistry exactly once, at proxy init
+  // (EcdsaDkg.init reverts when a validator is already set), and no deploy step
+  // re-points it. On a redeploy-safe network a validator bytecode/args change
+  // would deploy a NEW validator address and overwrite the artifact, while
+  // 03_deploy_wallet_registry skips an already-deployed WalletRegistry — leaving
+  // the on-chain WalletRegistry validating DKG against the OLD validator. Refuse
+  // that partial redeploy: the validator and WalletRegistry must be wiped and
+  // redeployed together (see full-redeploy-sepolia-stack.sh). A re-run that does
+  // not change the validator bytecode/args is unaffected (fetchIfDifferent ==
+  // false), so idempotent re-runs still work.
+  if (!skipIfAlreadyDeployed) {
+    const { differences: validatorWouldRedeploy } =
+      await deployments.fetchIfDifferent("EcdsaDkgValidator", {
+        from: deployer,
+        args: [EcdsaSortitionPool.address],
+      })
+    const existingWalletRegistry = await deployments.getOrNull("WalletRegistry")
+    if (validatorWouldRedeploy && existingWalletRegistry) {
+      throw new Error(
+        `Refusing to redeploy EcdsaDkgValidator on '${hre.network.name}': a ` +
+          "WalletRegistry deployment already exists and binds the validator " +
+          "once-only, so a validator-only redeploy would desync " +
+          `deployments/${hre.network.name}/EcdsaDkgValidator.json from the ` +
+          "on-chain binding. Wipe and redeploy the WalletRegistry in the same " +
+          "run (e.g. full-redeploy-sepolia-stack.sh) before redeploying the validator."
+      )
+    }
+  }
+
   const EcdsaDkgValidator = await deployments.deploy("EcdsaDkgValidator", {
     from: deployer,
     args: [EcdsaSortitionPool.address],
