@@ -1772,8 +1772,30 @@ func (cm *CombiningMember) ComputeGroupPublicKeyShares() {
 				} else {
 					for _, shares := range cm.revealedMisbehavedMembersShares {
 						if shares.misbehavedMemberID == qualifiedMemberID {
+							// Defensive guard. The DKG disqualification
+							// invariants should guarantee a revealed share
+							// exists here for every operating member. If one is
+							// missing we must not call ScalarBaseMult on a nil
+							// *big.Int, which panics and crashes this
+							// unrecovered goroutine (and so the whole beacon
+							// node). Log loudly and skip the term; this is not
+							// expected to happen.
+							peerShareS, ok := shares.peerSharesS[operatingMemberID]
+							if !ok || peerShareS == nil {
+								cm.logger.Errorf(
+									"[member:%v] missing revealed share for "+
+										"operating member [%v] from misbehaved "+
+										"member [%v]; skipping term (unexpected "+
+										"per DKG invariants)",
+									cm.ID,
+									operatingMemberID,
+									shares.misbehavedMemberID,
+								)
+								continue
+							}
+
 							publicKeyShare := new(bn256.G2).ScalarBaseMult(
-								shares.peerSharesS[operatingMemberID],
+								peerShareS,
 							)
 							sum = new(bn256.G2).Add(sum, publicKeyShare)
 						}
