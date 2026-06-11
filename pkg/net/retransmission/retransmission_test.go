@@ -32,8 +32,18 @@ func TestRetransmitExpectedNumberOfTimes(t *testing.T) {
 
 	<-ctx.Done()
 
-	if atomic.LoadUint64(&retransmissionsCount) != 10 {
-		t.Errorf("expected [10] retransmissions, has [%v]", retransmissionsCount)
+	// Each retransmission runs in its own goroutine spawned by the tick
+	// handler, so the last one may still be in flight when the context is
+	// done. Wait for the expected count before asserting on the final value.
+	deadline := time.Now().Add(5 * time.Second)
+	for atomic.LoadUint64(&retransmissionsCount) < 10 &&
+		time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+
+	got := atomic.LoadUint64(&retransmissionsCount)
+	if got != 10 {
+		t.Errorf("expected [10] retransmissions, has [%v]", got)
 	}
 }
 
