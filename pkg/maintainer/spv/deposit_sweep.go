@@ -154,8 +154,16 @@ func parseDepositSweepTransactionInputs(
 			)
 		}
 
-		publicKeyScript := previousTransaction.Outputs[outpointIndex].PublicKeyScript
-		value := previousTransaction.Outputs[outpointIndex].Value
+		previousOutput, err := previousTransaction.OutputAt(outpointIndex)
+		if err != nil {
+			return bitcoin.UnspentTransactionOutput{}, common.Address{}, fmt.Errorf(
+				"failed to read previous transaction output: [%v]",
+				err,
+			)
+		}
+
+		publicKeyScript := previousOutput.PublicKeyScript
+		value := previousOutput.Value
 		scriptClass := txscript.GetScriptClass(publicKeyScript)
 
 		if scriptClass == txscript.PubKeyHashTy ||

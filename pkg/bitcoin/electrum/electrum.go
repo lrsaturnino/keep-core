@@ -123,6 +123,22 @@ func (c *Connection) GetTransaction(
 		return nil, fmt.Errorf("failed to convert transaction: [%w]", err)
 	}
 
+	// Verify the server returned the transaction we actually asked for. The
+	// Electrum backend is untrusted: a malicious or MITM server could return a
+	// different (e.g. shorter) transaction for the requested hash, which would
+	// otherwise propagate downstream and trigger out-of-range panics when its
+	// outputs/inputs are indexed by an outpoint taken from another transaction.
+	// Transaction.Hash is the txid (non-witness double-SHA-256), which is what
+	// the request is keyed on.
+	if returnedHash := result.Hash(); returnedHash != transactionHash {
+		return nil, fmt.Errorf(
+			"electrum server returned transaction with hash [%s] "+
+				"but [%s] was requested",
+			returnedHash.Hex(bitcoin.ReversedByteOrder),
+			txID,
+		)
+	}
+
 	return result, nil
 }
 

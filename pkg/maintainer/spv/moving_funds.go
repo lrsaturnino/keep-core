@@ -104,7 +104,13 @@ func parseMovingFundsTransactionInput(
 	}
 
 	// Get the specific output spent by the moving funds transaction.
-	spentOutput := inputTx.Outputs[input.Outpoint.OutputIndex]
+	spentOutput, err := inputTx.OutputAt(input.Outpoint.OutputIndex)
+	if err != nil {
+		return bitcoin.UnspentTransactionOutput{}, [20]byte{}, fmt.Errorf(
+			"failed to read spent output: [%v]",
+			err,
+		)
+	}
 
 	// Build the main UTXO object based on available data.
 	mainUtxo := bitcoin.UnspentTransactionOutput{

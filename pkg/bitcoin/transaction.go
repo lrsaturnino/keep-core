@@ -3,6 +3,7 @@ package bitcoin
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 
 	"github.com/btcsuite/btcd/wire"
 )
@@ -181,6 +182,46 @@ func (t *Transaction) Hash() Hash {
 // https://github.com/bitcoin/bips/blob/master/bip-0141.mediawiki#transaction-id
 func (t *Transaction) WitnessHash() Hash {
 	return ComputeHash(t.Serialize(Witness))
+}
+
+// OutputAt returns the transaction output at the given zero-based index. It
+// returns an error if the index is out of range instead of panicking.
+//
+// Prefer this over indexing Outputs directly whenever the index originates
+// from untrusted or separately-fetched data (e.g. an outpoint from one
+// transaction used to index the outputs of another transaction fetched from
+// an Electrum backend). A backend that returns a valid-but-shorter transaction
+// for a requested hash would otherwise trigger an index-out-of-range panic
+// and crash the process.
+func (t *Transaction) OutputAt(index uint32) (*TransactionOutput, error) {
+	if index >= uint32(len(t.Outputs)) {
+		return nil, fmt.Errorf(
+			"output index [%d] is out of range for transaction [%s] "+
+				"that has [%d] output(s)",
+			index,
+			t.Hash().Hex(ReversedByteOrder),
+			len(t.Outputs),
+		)
+	}
+
+	return t.Outputs[index], nil
+}
+
+// InputAt returns the transaction input at the given zero-based index. It
+// returns an error if the index is out of range instead of panicking. See
+// OutputAt for the rationale on untrusted/separately-fetched data.
+func (t *Transaction) InputAt(index uint32) (*TransactionInput, error) {
+	if index >= uint32(len(t.Inputs)) {
+		return nil, fmt.Errorf(
+			"input index [%d] is out of range for transaction [%s] "+
+				"that has [%d] input(s)",
+			index,
+			t.Hash().Hex(ReversedByteOrder),
+			len(t.Inputs),
+		)
+	}
+
+	return t.Inputs[index], nil
 }
 
 // TransactionOutpoint represents a Bitcoin transaction outpoint.
