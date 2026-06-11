@@ -75,9 +75,9 @@ func (t *Ticker) start() {
 		t.handlersMutex.Unlock()
 	}
 
-	for ctx := range t.handlers {
-		delete(t.handlers, ctx)
-	}
+	t.handlersMutex.Lock()
+	clear(t.handlers)
+	t.handlersMutex.Unlock()
 }
 
 func (t *Ticker) onTick(ctx context.Context, fn func()) {

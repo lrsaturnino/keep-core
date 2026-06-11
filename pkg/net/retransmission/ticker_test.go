@@ -2,6 +2,7 @@ package retransmission
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -13,15 +14,15 @@ func TestOnTick(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	tickCount := 0
-	ticker.onTick(ctx, func() { tickCount++ })
+	var tickCount uint64
+	ticker.onTick(ctx, func() { atomic.AddUint64(&tickCount, 1) })
 
 	ticks <- 1
 	ticks <- 2
-	time.Sleep(10 * time.Millisecond)
+	waitForCounter(t, &tickCount, 2)
 
-	if tickCount != 2 {
-		t.Errorf("expected [2] executions of handler, had [%v]", tickCount)
+	if got := atomic.LoadUint64(&tickCount); got != 2 {
+		t.Errorf("expected [2] executions of handler, had [%v]", got)
 	}
 }
 
@@ -32,20 +33,21 @@ func TestOnTickSameContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	tickCount1 := 0
-	tickCount2 := 0
-	ticker.onTick(ctx, func() { tickCount1++ })
-	ticker.onTick(ctx, func() { tickCount2++ })
+	var tickCount1 uint64
+	var tickCount2 uint64
+	ticker.onTick(ctx, func() { atomic.AddUint64(&tickCount1, 1) })
+	ticker.onTick(ctx, func() { atomic.AddUint64(&tickCount2, 1) })
 
 	ticks <- 1
 	ticks <- 2
-	time.Sleep(10 * time.Millisecond)
+	waitForCounter(t, &tickCount1, 2)
+	waitForCounter(t, &tickCount2, 2)
 
-	if tickCount1 != 2 {
-		t.Errorf("expected [2] executions of handler, had [%v]", tickCount1)
+	if got := atomic.LoadUint64(&tickCount1); got != 2 {
+		t.Errorf("expected [2] executions of handler, had [%v]", got)
 	}
-	if tickCount2 != 2 {
-		t.Errorf("expected [2] executions of handler, had [%v]", tickCount2)
+	if got := atomic.LoadUint64(&tickCount2); got != 2 {
+		t.Errorf("expected [2] executions of handler, had [%v]", got)
 	}
 }
 
@@ -55,13 +57,15 @@ func TestOnTickTimeTicker(t *testing.T) {
 
 	ticker := NewTimeTicker(ctx, 10*time.Millisecond)
 
-	tickCount := 0
-	ticker.onTick(ctx, func() { tickCount++ })
+	var tickCount uint64
+	ticker.onTick(ctx, func() { atomic.AddUint64(&tickCount, 1) })
 
 	<-ctx.Done()
 
-	if tickCount != 10 {
-		t.Errorf("expected [10] executions of handler, had [%v]", tickCount)
+	waitForCounter(t, &tickCount, 10)
+
+	if got := atomic.LoadUint64(&tickCount); got != 10 {
+		t.Errorf("expected [10] executions of handler, had [%v]", got)
 	}
 }
 
@@ -74,11 +78,11 @@ func TestUnregisterHandler(t *testing.T) {
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel2()
 
-	tickCount1 := 0
-	ticker.onTick(ctx1, func() { tickCount1++ })
+	var tickCount1 uint64
+	ticker.onTick(ctx1, func() { atomic.AddUint64(&tickCount1, 1) })
 
-	tickCount2 := 0
-	ticker.onTick(ctx2, func() { tickCount2++ })
+	var tickCount2 uint64
+	ticker.onTick(ctx2, func() { atomic.AddUint64(&tickCount2, 1) })
 
 	ticks <- 1
 	ticks <- 2
@@ -86,13 +90,13 @@ func TestUnregisterHandler(t *testing.T) {
 	ticks <- 3
 	<-ctx2.Done()
 	ticks <- 4
-	time.Sleep(10 * time.Millisecond)
+	waitForCounter(t, &tickCount2, 3)
 
-	if tickCount1 != 2 {
-		t.Errorf("expected [2] executions of the first handler, had [%v]", tickCount1)
+	if got := atomic.LoadUint64(&tickCount1); got != 2 {
+		t.Errorf("expected [2] executions of the first handler, had [%v]", got)
 	}
-	if tickCount2 != 3 {
-		t.Errorf("expected [3] executions of the second handler, had [%v]", tickCount2)
+	if got := atomic.LoadUint64(&tickCount2); got != 3 {
+		t.Errorf("expected [3] executions of the second handler, had [%v]", got)
 	}
 }
 
@@ -103,21 +107,23 @@ func TestUnregisterHandlerSameContext(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	tickCount1 := 0
-	ticker.onTick(ctx, func() { tickCount1++ })
+	var tickCount1 uint64
+	ticker.onTick(ctx, func() { atomic.AddUint64(&tickCount1, 1) })
 
-	tickCount2 := 0
-	ticker.onTick(ctx, func() { tickCount2++ })
+	var tickCount2 uint64
+	ticker.onTick(ctx, func() { atomic.AddUint64(&tickCount2, 1) })
 
 	ticks <- 1
 	ticks <- 2
+	waitForCounter(t, &tickCount1, 2)
+	waitForCounter(t, &tickCount2, 2)
 	<-ctx.Done()
 
-	if tickCount1 != 2 {
-		t.Errorf("expected [2] executions of the first handler, had [%v]", tickCount1)
+	if got := atomic.LoadUint64(&tickCount1); got != 2 {
+		t.Errorf("expected [2] executions of the first handler, had [%v]", got)
 	}
-	if tickCount2 != 2 {
-		t.Errorf("expected [2] executions of the second handler, had [%v]", tickCount2)
+	if got := atomic.LoadUint64(&tickCount2); got != 2 {
+		t.Errorf("expected [2] executions of the second handler, had [%v]", got)
 	}
 }
 
@@ -131,14 +137,8 @@ func TestCloseTicker(t *testing.T) {
 	ticker.onTick(ctx, func() {})
 
 	close(ticks)
-	time.Sleep(10 * time.Millisecond)
 
-	if len(ticker.handlers) != 0 {
-		t.Errorf(
-			"all handlers should be unregistered, still has [%v]",
-			len(ticker.handlers),
-		)
-	}
+	waitForHandlersUnregistered(t, ticker)
 }
 
 func TestCloseTimeTicker(t *testing.T) {
@@ -151,12 +151,44 @@ func TestCloseTimeTicker(t *testing.T) {
 
 	<-ctx.Done()
 
-	time.Sleep(10 * time.Millisecond)
+	waitForHandlersUnregistered(t, ticker)
+}
 
-	if len(ticker.handlers) != 0 {
-		t.Errorf(
-			"all handlers should be unregistered, still has [%v]",
-			len(ticker.handlers),
-		)
+// waitForCounter blocks until the atomic counter reaches at least the expected
+// value, failing the test on timeout. Handlers run in the ticker's goroutine,
+// so the test must await the counter rather than sleep and read it without
+// synchronization.
+func waitForCounter(t *testing.T, counter *uint64, expected uint64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadUint64(counter) >= expected {
+			return
+		}
+		time.Sleep(time.Millisecond)
 	}
+	t.Fatalf(
+		"timed out waiting for counter to reach [%v], has [%v]",
+		expected,
+		atomic.LoadUint64(counter),
+	)
+}
+
+// waitForHandlersUnregistered blocks until the ticker has no onTick handlers
+// registered. The shutdown cleanup in the ticker's start goroutine runs
+// asynchronously after the ticks channel closes, so the postcondition must be
+// awaited rather than asserted after a fixed sleep.
+func waitForHandlersUnregistered(t *testing.T, ticker *Ticker) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		ticker.handlersMutex.Lock()
+		remaining := len(ticker.handlers)
+		ticker.handlersMutex.Unlock()
+		if remaining == 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("timed out waiting for handlers to be unregistered")
 }
