@@ -1,5 +1,8 @@
 # Hidden files and directories.
 .*
+# ...except the ClusterFuzzLite build files, which must reach the build context.
+!.clusterfuzzlite
+!.clusterfuzzlite/**
 
 # Top-level directories unrelated to the build.
 docs*/
@@ -29,6 +32,9 @@ token-tracker/
 # Go stuff.
 **/gen/_contracts
 **/gen/**/*.go
+# ...but keep the committed protobuf message code (gen/pb); the ClusterFuzzLite
+# build does not run protoc, and the unmarshaler fuzz targets need it.
+!**/gen/pb/*.go
 !**/gen/gen.go
 !**/gen/cmd/cmd.go
 

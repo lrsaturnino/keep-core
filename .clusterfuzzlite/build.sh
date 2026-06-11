@@ -1,0 +1,61 @@
+#!/bin/bash -eu
+#
+# ClusterFuzzLite / OSS-Fuzz build script for keep-core native (testing.F)
+# fuzz targets. Compiles every Fuzz* target into a libFuzzer binary. Output
+# names are path-qualified because several Fuzz funcs share a name across
+# packages (e.g. FuzzEphemeralPublicKeyMessageUnmarshal in gjkr/dkg/signing).
+#
+# Regenerate the target list with:
+#   grep -rhoE "func (Fuzz[A-Za-z0-9_]+)\(f \*testing.F\)" pkg/ --include="*_test.go"
+
+cd "$SRC/keep-core"
+
+# Fuzzers don't need VCS build stamping, and stamping can fail in the build
+# container (git "dubious ownership" / detached checkout). Disable it.
+export GOFLAGS="-buildvcs=false ${GOFLAGS:-}"
+
+# compile_native_go_fuzzer rewrites each testing.F target onto the OSS-Fuzz
+# libFuzzer shim; pull it into the module graph (build-container only, not
+# committed to go.mod).
+go get github.com/AdamKorcz/go-118-fuzz-build/testing
+
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/beacon/dkg/result FuzzDKGResultHashSignatureMessageUnmarshal beacon_dkg_result_FuzzDKGResultHashSignatureMessageUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/beacon/entry FuzzSignatureShareMessageUnmarshal beacon_entry_FuzzSignatureShareMessageUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/beacon/gjkr FuzzEphemeralPublicKeyMessageUnmarshal beacon_gjkr_FuzzEphemeralPublicKeyMessageUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/beacon/gjkr FuzzMemberCommitmentsMessageUnmarshal beacon_gjkr_FuzzMemberCommitmentsMessageUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/beacon/gjkr FuzzPeerSharesMessageUnmarshal beacon_gjkr_FuzzPeerSharesMessageUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/beacon/gjkr FuzzSecretSharesAccusationsMessageUnmarshal beacon_gjkr_FuzzSecretSharesAccusationsMessageUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/beacon/gjkr FuzzMemberPublicKeySharePointsMessageUnmarshal beacon_gjkr_FuzzMemberPublicKeySharePointsMessageUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/beacon/gjkr FuzzPointsAccusationsMessageUnmarshal beacon_gjkr_FuzzPointsAccusationsMessageUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/beacon/gjkr FuzzMisbehavedEphemeralKeysMessageUnmarshal beacon_gjkr_FuzzMisbehavedEphemeralKeysMessageUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/bitcoin FuzzNewScriptFromVarLenData bitcoin_FuzzNewScriptFromVarLenData
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/bitcoin FuzzTransactionDeserialize bitcoin_FuzzTransactionDeserialize
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/net/security/handshake FuzzAct1MessageUnmarshal net_security_handshake_FuzzAct1MessageUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/net/security/handshake FuzzAct2MessageUnmarshal net_security_handshake_FuzzAct2MessageUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/net/security/handshake FuzzAct3MessageUnmarshal net_security_handshake_FuzzAct3MessageUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/protocol/announcer FuzzAnnouncementMessageUnmarshal protocol_announcer_FuzzAnnouncementMessageUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/protocol/inactivity FuzzClaimSignatureMessageUnmarshal protocol_inactivity_FuzzClaimSignatureMessageUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/tbtc FuzzSigningDoneMessageUnmarshal tbtc_FuzzSigningDoneMessageUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/tbtc FuzzCoordinationMessageUnmarshal tbtc_FuzzCoordinationMessageUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/tbtc FuzzNoopProposalUnmarshal tbtc_FuzzNoopProposalUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/tbtc FuzzHeartbeatProposalUnmarshal tbtc_FuzzHeartbeatProposalUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/tbtc FuzzDepositSweepProposalUnmarshal tbtc_FuzzDepositSweepProposalUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/tbtc FuzzRedemptionProposalUnmarshal tbtc_FuzzRedemptionProposalUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/tbtc FuzzMovingFundsProposalUnmarshal tbtc_FuzzMovingFundsProposalUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/tbtc FuzzMovedFundsSweepProposalUnmarshal tbtc_FuzzMovedFundsSweepProposalUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/tecdsa/dkg FuzzEphemeralPublicKeyMessageUnmarshal tecdsa_dkg_FuzzEphemeralPublicKeyMessageUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/tecdsa/dkg FuzzTssRoundOneMessageUnmarshal tecdsa_dkg_FuzzTssRoundOneMessageUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/tecdsa/dkg FuzzTssRoundTwoMessageUnmarshal tecdsa_dkg_FuzzTssRoundTwoMessageUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/tecdsa/dkg FuzzTssRoundThreeMessageUnmarshal tecdsa_dkg_FuzzTssRoundThreeMessageUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/tecdsa/dkg FuzzTssFinalizationMessageUnmarshal tecdsa_dkg_FuzzTssFinalizationMessageUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/tecdsa/dkg FuzzResultSignatureMessageUnmarshal tecdsa_dkg_FuzzResultSignatureMessageUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/tecdsa/signing FuzzEphemeralPublicKeyMessageUnmarshal tecdsa_signing_FuzzEphemeralPublicKeyMessageUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/tecdsa/signing FuzzTssRoundOneMessageUnmarshal tecdsa_signing_FuzzTssRoundOneMessageUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/tecdsa/signing FuzzTssRoundTwoMessageUnmarshal tecdsa_signing_FuzzTssRoundTwoMessageUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/tecdsa/signing FuzzTssRoundThreeMessageUnmarshal tecdsa_signing_FuzzTssRoundThreeMessageUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/tecdsa/signing FuzzTssRoundFourMessageUnmarshal tecdsa_signing_FuzzTssRoundFourMessageUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/tecdsa/signing FuzzTssRoundFiveMessageUnmarshal tecdsa_signing_FuzzTssRoundFiveMessageUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/tecdsa/signing FuzzTssRoundSixMessageUnmarshal tecdsa_signing_FuzzTssRoundSixMessageUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/tecdsa/signing FuzzTssRoundSevenMessageUnmarshal tecdsa_signing_FuzzTssRoundSevenMessageUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/tecdsa/signing FuzzTssRoundEightMessageUnmarshal tecdsa_signing_FuzzTssRoundEightMessageUnmarshal
+compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/tecdsa/signing FuzzTssRoundNineMessageUnmarshal tecdsa_signing_FuzzTssRoundNineMessageUnmarshal

@@ -1,0 +1,11 @@
+# ClusterFuzzLite project configuration. For CFLite only `language` is required;
+# it is consumed by the build_fuzzers / run_fuzzers GitHub Actions.
+#
+# (The OSS-Fuzz integration for the PUBLIC upstream repo lives in the
+# google/oss-fuzz repo under projects/keep-core/ and carries additional fields
+# — homepage, primary_contact, main_repo, auto_ccs. See README.md.)
+language: go
+fuzzing_engines:
+  - libfuzzer
+sanitizers:
+  - address

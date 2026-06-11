@@ -1,0 +1,41 @@
+name: ClusterFuzzLite PR fuzzing
+
+# Builds the native Go fuzz targets and fuzzes only the code changed in a PR
+# (code-change mode), giving fast per-PR feedback. Exits on the first crash.
+# Complements the nightly -race job and the batch fuzzer below.
+on:
+  pull_request:
+    paths:
+      - "pkg/**"
+      - ".clusterfuzzlite/**"
+
+permissions: read-all
+
+jobs:
+  PR:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-${{ matrix.sanitizer }}-${{ github.ref }}
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      matrix:
+        # Go native fuzzing builds under libFuzzer + AddressSanitizer.
+        sanitizer: [address]
+    steps:
+      - name: Build fuzzers (${{ matrix.sanitizer }})
+        id: build
+        uses: google/clusterfuzzlite/actions/build_fuzzers@v1
+        with:
+          language: go
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          sanitizer: ${{ matrix.sanitizer }}
+      - name: Run fuzzers (${{ matrix.sanitizer }})
+        id: run
+        uses: google/clusterfuzzlite/actions/run_fuzzers@v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 300
+          mode: "code-change"
+          sanitizer: ${{ matrix.sanitizer }}
+          output-sarif: true
