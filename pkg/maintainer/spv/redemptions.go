@@ -138,7 +138,7 @@ func parseRedemptionTransactionInput(
 	}
 
 	// Get the specific output spent by the redemption transaction.
-	spentOutput := inputTx.Outputs[input.Outpoint.OutputIndex]
+	spentOutput := inputTx.Outputs[input.Outpoint.OutputIndex] //nolint:gocritic // F-005: OutputIndex gated by on-chain MainUtxoHash; triaged not exploitable (needs TOCTOU)
 
 	// Build the main UTXO object based on available data.
 	mainUtxo := bitcoin.UnspentTransactionOutput{

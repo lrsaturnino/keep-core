@@ -1,0 +1,39 @@
+# golangci-lint configuration (v2).
+#
+# Scope is intentionally minimal: this is additive infrastructure that hosts a
+# single project-specific rule (the Transaction-indexing ban). The existing
+# dedicated CI jobs (go vet, gofmt, staticcheck, gosec) are left as-is and are
+# NOT duplicated here, so this does not flood CI with pre-existing findings.
+# Consolidation, if ever wanted, is a separate decision.
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - gocritic
+  settings:
+    gocritic:
+      # Run ONLY the ruleguard bridge: disable gocritic's default checks (they
+      # would flood CI with pre-existing style findings) and enable just
+      # ruleguard.
+      disable-all: true
+      enabled-checks:
+        - ruleguard
+      settings:
+        ruleguard:
+          failOn: all
+          rules: "${base-path}/.golangci-ruleguard.rules.go"
+
+  exclusions:
+    rules:
+      # Tests legitimately construct and index transactions with known shapes;
+      # the untrusted-input OOB class only applies to production code paths.
+      - path: _test\.go
+        linters:
+          - gocritic
+
+issues:
+  # Surface every occurrence; a non-zero cap could silently mask a new
+  # violation behind the audited, annotated exceptions.
+  max-issues-per-linter: 0
+  max-same-issues: 0

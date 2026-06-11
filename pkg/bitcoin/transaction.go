@@ -204,7 +204,7 @@ func (t *Transaction) OutputAt(index uint32) (*TransactionOutput, error) {
 		)
 	}
 
-	return t.Outputs[index], nil
+	return t.Outputs[index], nil //nolint:gocritic // accessor body: this IS the bounds-checked access, guarded by the len() check above
 }
 
 // InputAt returns the transaction input at the given zero-based index. It
@@ -221,7 +221,7 @@ func (t *Transaction) InputAt(index uint32) (*TransactionInput, error) {
 		)
 	}
 
-	return t.Inputs[index], nil
+	return t.Inputs[index], nil //nolint:gocritic // accessor body: this IS the bounds-checked access, guarded by the len() check above
 }
 
 // TransactionOutpoint represents a Bitcoin transaction outpoint.

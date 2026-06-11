@@ -256,7 +256,7 @@ func assembleMovedFundsSweepUtxo(
 		)
 	}
 
-	movingFundsTxValue := movingFundsTx.Outputs[movingFundsTxOutputIdx].Value
+	movingFundsTxValue := movingFundsTx.Outputs[movingFundsTxOutputIdx].Value //nolint:gocritic // index sourced from trusted on-chain moving-funds proposal data
 
 	return &bitcoin.UnspentTransactionOutput{
 		Outpoint: &bitcoin.TransactionOutpoint{

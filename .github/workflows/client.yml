@@ -334,6 +334,27 @@ jobs:
           install-go: false
           checks: "-SA1019"
 
+  client-golangci:
+    needs: client-detect-changes
+    if: |
+      github.event_name == 'push'
+        || needs.client-detect-changes.outputs.path-filter == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+      # Additive: hosts only the project-specific ruleguard rule that bans raw
+      # indexing of a bitcoin.Transaction's Outputs/Inputs (use OutputAt/InputAt
+      # instead). The existing go vet / gofmt / staticcheck / gosec jobs are
+      # left intact and are not duplicated here. Config: .golangci.yml +
+      # .golangci-ruleguard.rules.go.
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12.2
+
   client-integration-test:
     needs: [client-detect-changes, electrum-integration-detect-changes, client-build-test-publish]
     if: |
