@@ -2,6 +2,7 @@ package bitcoin
 
 import (
 	"bytes"
+	"encoding/hex"
 	"testing"
 )
 
@@ -12,6 +13,11 @@ import (
 // process. Seeds include the valid examples used by the table-driven tests plus
 // a few known malformed shapes; the fuzzer mutates from there.
 //
+// Seeds are decoded with the file-local fhex helper rather than the package's
+// test-only decodeString: the OSS-Fuzz / ClusterFuzzLite native-fuzzing shim
+// compiles each target from a generated non-test file, so a target may only
+// reference symbols defined in this file or in non-test package code.
+//
 // Run locally with, e.g.:
 //
 //	go test ./pkg/bitcoin/ -run=^$ -fuzz=FuzzNewScriptFromVarLenData -fuzztime=60s
@@ -19,17 +25,29 @@ import (
 // Crashers are persisted under testdata/fuzz/<FuzzName>/ and become permanent
 // regression cases on the next normal `go test` run.
 
+// fhex decodes a hex string seed. It is intentionally defined in this file (not
+// shared with other _test.go files) so the fuzz targets remain compilable by
+// the native-fuzzing shim. Seeds are compile-time constants, so a decode error
+// is a programming mistake and yields a nil seed.
+func fhex(s string) []byte {
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
 // FuzzNewScriptFromVarLenData fuzzes the variable-length script parser. Beyond
 // "never panics", it asserts a round-trip property: any byte slice that parses
 // successfully must serialize back to exactly the input via ToVarLenData (the
 // CompactSizeUint length prefix is canonical, so this must hold).
 func FuzzNewScriptFromVarLenData(f *testing.F) {
-	f.Add(decodeString("1600148db50eb52063ea9d98b3eac91489a90f738986f6")) // valid
-	f.Add(decodeString("16"))                                             // missing script body
-	f.Add(decodeString("00148db50eb52063ea9d98b3eac91489a90f738986f6"))   // missing length prefix
-	f.Add([]byte(nil))                                                    // empty
-	f.Add([]byte{0xfd})                                                   // truncated multi-byte CompactSizeUint
-	f.Add([]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff})   // huge declared length
+	f.Add(fhex("1600148db50eb52063ea9d98b3eac91489a90f738986f6"))       // valid
+	f.Add(fhex("16"))                                                   // missing script body
+	f.Add(fhex("00148db50eb52063ea9d98b3eac91489a90f738986f6"))         // missing length prefix
+	f.Add([]byte(nil))                                                  // empty
+	f.Add([]byte{0xfd})                                                 // truncated multi-byte CompactSizeUint
+	f.Add([]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}) // huge declared length
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		script, err := NewScriptFromVarLenData(data)
@@ -58,7 +76,7 @@ func FuzzNewScriptFromVarLenData(f *testing.F) {
 // never panic on arbitrary input; an error return is the correct rejection.
 func FuzzTransactionDeserialize(f *testing.F) {
 	// A complete, valid standard (non-witness) serialized transaction.
-	f.Add(decodeString(
+	f.Add(fhex(
 		"01000000036896f9abcac13ce6bd2b80d125bedf997ff6330e999f2f60" +
 			"5ea15ea542f2eaf80000000000ffffffffed0ae94da996c6f3b89dfe967675d" +
 			"4808251db93e81022ae9e038d06f92efed400000000c948304502210092327d" +
