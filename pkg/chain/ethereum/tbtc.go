@@ -1328,21 +1328,9 @@ func (tc *TbtcChain) PastRedemptionRequestedEvents(
 
 	convertedEvents := make([]*tbtc.RedemptionRequestedEvent, 0)
 	for _, event := range events {
-		redeemerOutputScript, err := bitcoin.NewScriptFromVarLenData(
-			event.RedeemerOutputScript,
-		)
+		convertedEvent, err := convertRedemptionRequestedEvent(event)
 		if err != nil {
 			return nil, err
-		}
-
-		convertedEvent := &tbtc.RedemptionRequestedEvent{
-			WalletPublicKeyHash:  event.WalletPubKeyHash,
-			RedeemerOutputScript: redeemerOutputScript,
-			Redeemer:             chain.Address(event.Redeemer.Hex()),
-			RequestedAmount:      event.RequestedAmount,
-			TreasuryFee:          event.TreasuryFee,
-			TxMaxFee:             event.TreasuryFee,
-			BlockNumber:          event.Raw.BlockNumber,
 		}
 
 		convertedEvents = append(convertedEvents, convertedEvent)
@@ -1356,6 +1344,36 @@ func (tc *TbtcChain) PastRedemptionRequestedEvents(
 	)
 
 	return convertedEvents, err
+}
+
+// convertRedemptionRequestedEvent converts a raw on-chain RedemptionRequested
+// event into the internal tbtc.RedemptionRequestedEvent. Extracted from
+// PastRedemptionRequestedEvents so the field mapping is unit-testable without
+// a simulated chain backend.
+func convertRedemptionRequestedEvent(
+	event *tbtcabi.BridgeRedemptionRequested,
+) (*tbtc.RedemptionRequestedEvent, error) {
+	redeemerOutputScript, err := bitcoin.NewScriptFromVarLenData(
+		event.RedeemerOutputScript,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &tbtc.RedemptionRequestedEvent{
+		WalletPublicKeyHash:  event.WalletPubKeyHash,
+		RedeemerOutputScript: redeemerOutputScript,
+		Redeemer:             chain.Address(event.Redeemer.Hex()),
+		RequestedAmount:      event.RequestedAmount,
+		TreasuryFee:          event.TreasuryFee,
+		// Previously mapped from event.TreasuryFee by mistake (a copy-paste
+		// defect). TxMaxFee is a distinct fee bound and must come from the
+		// event's TxMaxFee field. Latent at the time of the fix (no consumer
+		// read the event-path TxMaxFee), corrected to prevent a future
+		// fund-relevant fee-bound bug.
+		TxMaxFee:    event.TxMaxFee,
+		BlockNumber: event.Raw.BlockNumber,
+	}, nil
 }
 
 func (tc *TbtcChain) GetDepositRequest(
