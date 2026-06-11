@@ -360,3 +360,44 @@ jobs:
             --workdir /go/src/github.com/keep-network/keep-core \
             go-build-env \
             gotestsum -- -timeout 20m -tags=integration ./...
+
+  client-race-test:
+    needs: client-build-test-publish
+    # Non-blocking by design: runs nightly (schedule) and on manual
+    # dispatch, but is intentionally NOT a required PR check until it has
+    # been green and stable for a while. The first runs on a codebase that
+    # has never had the race detector enabled are expected to surface
+    # latent races and timing-sensitive flakes; triage each before
+    # promoting this to a required check.
+    if: |
+      github.event_name == 'schedule'
+        || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Download Docker Build Image
+        uses: actions/download-artifact@v4
+        with:
+          name: go-build-env-image
+          path: /tmp
+
+      - name: Load Docker Build Image
+        run: |
+          docker load --input /tmp/go-build-env-image.tar
+
+      - name: Run Go tests with the race detector
+        # The race detector requires cgo and a C toolchain, both present in
+        # the build image (g++/gcc). It is ~2-20x slower and uses ~5-10x
+        # more memory than a normal run, hence the longer timeout and why
+        # this is a separate job rather than a flag on the main test step.
+        # The default test scope (./...) includes the in-process protocol
+        # simulations (dkgtest / entrytest / gjkr roundtrip), which is where
+        # data races in concurrent protocol code actually surface.
+        run: |
+          docker run \
+            --workdir /go/src/github.com/keep-network/keep-core \
+            --env CGO_ENABLED=1 \
+            go-build-env \
+            gotestsum -- -race -timeout 30m
