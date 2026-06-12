@@ -16,8 +16,10 @@ export GOFLAGS="-buildvcs=false ${GOFLAGS:-}"
 
 # compile_native_go_fuzzer rewrites each testing.F target onto the OSS-Fuzz
 # libFuzzer shim; pull it into the module graph (build-container only, not
-# committed to go.mod).
-go get github.com/AdamKorcz/go-118-fuzz-build/testing
+# committed to go.mod). Pinned to a commit SHA: this fetch happens outside
+# go.sum protection on every CI build, so an unpinned HEAD would execute
+# whatever upstream pushes. Bump deliberately.
+go get github.com/AdamKorcz/go-118-fuzz-build/testing@a70c2aa677fa43583571959478decabe02a96cd6
 
 compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/beacon/dkg/result FuzzDKGResultHashSignatureMessageUnmarshal beacon_dkg_result_FuzzDKGResultHashSignatureMessageUnmarshal
 compile_native_go_fuzzer github.com/keep-network/keep-core/pkg/beacon/entry FuzzSignatureShareMessageUnmarshal beacon_entry_FuzzSignatureShareMessageUnmarshal
