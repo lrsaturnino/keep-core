@@ -11,14 +11,19 @@
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 module="github.com/keep-network/keep-core"
 
+# Work from the repo root so grep emits relative paths: the absolute path
+# never enters the sed pattern, where regex metacharacters in a checkout
+# location could otherwise misparse the target list.
+cd "$repo_root"
+
 expected="$(
-	grep -rn --include='*_test.go' -E '^func Fuzz[A-Za-z0-9_]+\(f \*testing\.F\)' "$repo_root/pkg" |
-		sed -E "s|^$repo_root/(.+)/[^/]+\.go:[0-9]+:func (Fuzz[A-Za-z0-9_]+)\(.*$|$module/\1 \2|" |
+	grep -rn --include='*_test.go' -E '^func Fuzz[A-Za-z0-9_]+\(f \*testing\.F\)' pkg |
+		sed -E "s|^(.+)/[^/]+\.go:[0-9]+:func (Fuzz[A-Za-z0-9_]+)\(.*$|$module/\1 \2|" |
 		sort -u
 )"
 
 registered="$(
-	grep -E '^compile_native_go_fuzzer ' "$repo_root/.clusterfuzzlite/build.sh" |
+	grep -E '^compile_native_go_fuzzer ' .clusterfuzzlite/build.sh |
 		awk '{print $2, $3}' |
 		sort -u
 )"
