@@ -19,6 +19,7 @@ tool for this fork (OSS-Fuzz only fuzzes public projects).
 ## Adding / regenerating targets
 
 `build.sh` must list one `compile_native_go_fuzzer` line per `Fuzz*` target.
+CI enforces this (`check_targets.sh` runs on every PR and fails on drift).
 Regenerate after adding targets:
 
 ```sh
@@ -32,11 +33,21 @@ done
 
 ## Enabling corpus persistence (batch mode)
 
-Batch fuzzing benefits from carrying the corpus between runs. To enable:
+Batch fuzzing benefits from carrying the corpus between runs — without it
+every nightly run restarts from the in-tree seeds and the 1800s budget is a
+smoke test, not coverage-accumulating fuzzing. To enable:
 
 1. Create a private storage repo, e.g. `tlabs-xyz/keep-core-security-fuzz-corpus`.
-2. Add a `PERSONAL_ACCESS_TOKEN` repo secret with write access to it.
-3. Uncomment the `storage-repo*` lines in `cflite_batch.yml` (and `upload-build`).
+2. Add a `PERSONAL_ACCESS_TOKEN` repo secret. It MUST be a **fine-grained
+   PAT scoped to the storage repo only**, with `Contents: Read and write`
+   as its only permission. Never use a classic PAT here: the token is
+   interpolated into a clone URL inside a job that executes
+   repo-controlled build code (`build.sh`, `Dockerfile`), so an
+   over-scoped token would hand that code access to everything it can
+   reach. Set an expiry and rotate it.
+3. Uncomment the `storage-repo*` lines in `cflite_batch.yml` (and
+   `upload-build`). Keep persistence OUT of `cflite_pr.yml`: PR jobs run
+   proposed code and must not see the token at all.
 
 Until then, each batch run starts from the in-tree seed corpus.
 
