@@ -408,6 +408,9 @@ jobs:
       github.event_name == 'schedule'
         || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
     steps:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -435,4 +438,46 @@ jobs:
             --workdir /go/src/github.com/keep-network/keep-core \
             --env CGO_ENABLED=1 \
             go-build-env \
-            gotestsum -- -race -timeout 30m
+            gotestsum -- -race -timeout 60m
+
+      - name: Report scheduled race-detector failure
+        # A non-blocking nightly job rots red silently without this: nobody
+        # watches the Actions tab. Upsert a labeled issue so failures are
+        # visible and triaged before this job is promoted to a required
+        # check. Manual (workflow_dispatch) runs are excluded — the person
+        # who dispatched them is already watching.
+        if: failure() && github.event_name == 'schedule'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const label = "race-detector-failure";
+            const runUrl =
+              `${context.serverUrl}/${context.repo.owner}/` +
+              `${context.repo.repo}/actions/runs/${context.runId}`;
+            const body =
+              `The scheduled \`-race\` test job failed.\n\n` +
+              `Run: ${runUrl}\n\n` +
+              `Triage the race report before promoting the job to a ` +
+              `required PR check.`;
+            const open = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "open",
+              labels: label,
+            });
+            if (open.data.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: open.data[0].number,
+                body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: "Nightly race-detector run failed",
+                labels: [label],
+                body,
+              });
+            }
