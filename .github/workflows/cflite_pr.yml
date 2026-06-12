@@ -9,11 +9,11 @@ on:
       - "pkg/**"
       - ".clusterfuzzlite/**"
 
-# security-events: write is required for the run_fuzzers SARIF upload
-# (output-sarif: true) to reach the code-scanning Security tab.
+# No security-events permission: this repo has no GitHub Advanced
+# Security, so SARIF upload to code scanning would 403. Crash artifacts
+# are reported via the action's run output and artifacts instead.
 permissions:
   contents: read
-  security-events: write
 
 jobs:
   PR:
@@ -29,17 +29,16 @@ jobs:
     steps:
       - name: Build fuzzers (${{ matrix.sanitizer }})
         id: build
-        uses: google/clusterfuzzlite/actions/build_fuzzers@v1
+        uses: google/clusterfuzzlite/actions/build_fuzzers@82652fb49e77bc29c35da1167bb286e93c6bcc05 # v1
         with:
           language: go
           github-token: ${{ secrets.GITHUB_TOKEN }}
           sanitizer: ${{ matrix.sanitizer }}
       - name: Run fuzzers (${{ matrix.sanitizer }})
         id: run
-        uses: google/clusterfuzzlite/actions/run_fuzzers@v1
+        uses: google/clusterfuzzlite/actions/run_fuzzers@82652fb49e77bc29c35da1167bb286e93c6bcc05 # v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           fuzz-seconds: 300
           mode: "code-change"
           sanitizer: ${{ matrix.sanitizer }}
-          output-sarif: true

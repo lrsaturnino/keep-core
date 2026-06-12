@@ -12,11 +12,11 @@ on:
     - cron: "0 2 * * *" # daily, offset from the -race job (midnight)
   workflow_dispatch:
 
-# security-events: write is required for the run_fuzzers SARIF upload
-# (output-sarif: true) to reach the code-scanning Security tab.
+# No security-events permission: this repo has no GitHub Advanced
+# Security, so SARIF upload to code scanning would 403. Crash artifacts
+# are reported via the action's run output and artifacts instead.
 permissions:
   contents: read
-  security-events: write
 
 jobs:
   Batch:
@@ -28,20 +28,19 @@ jobs:
     steps:
       - name: Build fuzzers (${{ matrix.sanitizer }})
         id: build
-        uses: google/clusterfuzzlite/actions/build_fuzzers@v1
+        uses: google/clusterfuzzlite/actions/build_fuzzers@82652fb49e77bc29c35da1167bb286e93c6bcc05 # v1
         with:
           language: go
           sanitizer: ${{ matrix.sanitizer }}
           # upload-build: true
       - name: Run fuzzers (${{ matrix.sanitizer }})
         id: run
-        uses: google/clusterfuzzlite/actions/run_fuzzers@v1
+        uses: google/clusterfuzzlite/actions/run_fuzzers@82652fb49e77bc29c35da1167bb286e93c6bcc05 # v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           fuzz-seconds: 1800
           mode: "batch"
           sanitizer: ${{ matrix.sanitizer }}
-          output-sarif: true
           # storage-repo: https://${{ secrets.PERSONAL_ACCESS_TOKEN }}@github.com/tlabs-xyz/keep-core-security-fuzz-corpus.git
           # storage-repo-branch: main
           # storage-repo-branch-coverage: gh-pages
