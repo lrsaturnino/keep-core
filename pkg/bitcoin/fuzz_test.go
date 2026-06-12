@@ -28,11 +28,12 @@ import (
 // fhex decodes a hex string seed. It is intentionally defined in this file (not
 // shared with other _test.go files) so the fuzz targets remain compilable by
 // the native-fuzzing shim. Seeds are compile-time constants, so a decode error
-// is a programming mistake and yields a nil seed.
-func fhex(s string) []byte {
+// is a programming mistake and fails the target loudly rather than silently
+// degrading the seed corpus to nil.
+func fhex(f *testing.F, s string) []byte {
 	b, err := hex.DecodeString(s)
 	if err != nil {
-		return nil
+		f.Fatalf("invalid hex seed %q: %v", s, err)
 	}
 	return b
 }
@@ -42,9 +43,9 @@ func fhex(s string) []byte {
 // successfully must serialize back to exactly the input via ToVarLenData (the
 // CompactSizeUint length prefix is canonical, so this must hold).
 func FuzzNewScriptFromVarLenData(f *testing.F) {
-	f.Add(fhex("1600148db50eb52063ea9d98b3eac91489a90f738986f6"))       // valid
-	f.Add(fhex("16"))                                                   // missing script body
-	f.Add(fhex("00148db50eb52063ea9d98b3eac91489a90f738986f6"))         // missing length prefix
+	f.Add(fhex(f, "1600148db50eb52063ea9d98b3eac91489a90f738986f6"))    // valid
+	f.Add(fhex(f, "16"))                                                // missing script body
+	f.Add(fhex(f, "00148db50eb52063ea9d98b3eac91489a90f738986f6"))      // missing length prefix
 	f.Add([]byte(nil))                                                  // empty
 	f.Add([]byte{0xfd})                                                 // truncated multi-byte CompactSizeUint
 	f.Add([]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}) // huge declared length
@@ -74,20 +75,28 @@ func FuzzNewScriptFromVarLenData(f *testing.F) {
 // FuzzTransactionDeserialize fuzzes the transaction deserializer, the entry
 // point for untrusted transaction bytes returned by an Electrum server. It must
 // never panic on arbitrary input; an error return is the correct rejection.
+//
+// It also asserts a canonical fixed-point property: for any successfully
+// parsed transaction, our own Serialize output must re-parse and serialize to
+// identical bytes. Byte-identity with the INPUT deliberately is not asserted:
+// Deserialize reads from the front of the buffer and accepts (ignores)
+// trailing bytes, so non-canonical inputs can parse successfully — but
+// everything downstream (Hash, the SPV proofs) operates on our serialization,
+// which must be stable.
 func FuzzTransactionDeserialize(f *testing.F) {
 	// A complete, valid standard (non-witness) serialized transaction.
-	f.Add(fhex(
-		"01000000036896f9abcac13ce6bd2b80d125bedf997ff6330e999f2f60" +
-			"5ea15ea542f2eaf80000000000ffffffffed0ae94da996c6f3b89dfe967675d" +
-			"4808251db93e81022ae9e038d06f92efed400000000c948304502210092327d" +
-			"dff69a2b8c7ae787c5d590a2f14586089e6339e942d56e82aa42052cd902204" +
-			"c0d1700ba1ac617da27fee032a57937c9607f0187199ed3c46954df845643d7" +
-			"012103989d253b17a6a0f41838b84ff0d20e8898f9d7b1a98f2564da4cc29dc" +
-			"f8581d94c5c14934b98637ca318a4d6e7ca6ffd1690b8e77df6377508f9f0c9" +
-			"0d000395237576a9148db50eb52063ea9d98b3eac91489a90f738986f68763a" +
-			"c6776a914e257eccafbc07c381642ce6e7e55120fb077fbed8804e0250162b1" +
-			"75ac68ffffffffe37f552fc23fa0032bfd00c8eef5f5c22bf85fe4c6e735857" +
-			"719ff8a4ff66eb80000000000ffffffff0180ed0000000000001600148db50e" +
+	f.Add(fhex(f,
+		"01000000036896f9abcac13ce6bd2b80d125bedf997ff6330e999f2f60"+
+			"5ea15ea542f2eaf80000000000ffffffffed0ae94da996c6f3b89dfe967675d"+
+			"4808251db93e81022ae9e038d06f92efed400000000c948304502210092327d"+
+			"dff69a2b8c7ae787c5d590a2f14586089e6339e942d56e82aa42052cd902204"+
+			"c0d1700ba1ac617da27fee032a57937c9607f0187199ed3c46954df845643d7"+
+			"012103989d253b17a6a0f41838b84ff0d20e8898f9d7b1a98f2564da4cc29dc"+
+			"f8581d94c5c14934b98637ca318a4d6e7ca6ffd1690b8e77df6377508f9f0c9"+
+			"0d000395237576a9148db50eb52063ea9d98b3eac91489a90f738986f68763a"+
+			"c6776a914e257eccafbc07c381642ce6e7e55120fb077fbed8804e0250162b1"+
+			"75ac68ffffffffe37f552fc23fa0032bfd00c8eef5f5c22bf85fe4c6e735857"+
+			"719ff8a4ff66eb80000000000ffffffff0180ed0000000000001600148db50e"+
 			"b52063ea9d98b3eac91489a90f738986f600000000",
 	))
 	f.Add([]byte(nil))                          // empty
@@ -97,6 +106,35 @@ func FuzzTransactionDeserialize(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		var tx Transaction
 		// Must not panic on arbitrary input; an error return is acceptable.
-		_ = tx.Deserialize(data)
+		if err := tx.Deserialize(data); err != nil {
+			return
+		}
+
+		// Zero-input transactions are consensus-invalid but parseable from
+		// the witness encoding; their standard re-serialization starts with
+		// a 0x00 input count that collides with the segwit marker byte and
+		// cannot re-parse. That is a wire-format ambiguity, not a serializer
+		// defect, so the fixed-point property only applies to transactions
+		// with inputs.
+		if len(tx.Inputs) == 0 {
+			return
+		}
+
+		serialized := tx.Serialize()
+		var reparsed Transaction
+		if err := reparsed.Deserialize(serialized); err != nil {
+			t.Fatalf(
+				"own serialization does not re-parse: %v\n serialized: %x",
+				err,
+				serialized,
+			)
+		}
+		if reserialized := reparsed.Serialize(); !bytes.Equal(reserialized, serialized) {
+			t.Fatalf(
+				"serialization is not a fixed point\n first:  %x\n second: %x",
+				serialized,
+				reserialized,
+			)
+		}
 	})
 }
