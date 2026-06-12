@@ -34,6 +34,11 @@ type Result struct {
 	dkgResultSignatures map[group.MemberIndex][]byte
 	signers             []*dkg.ThresholdSigner
 	memberFailures      []error
+	// loggedErrors holds every Errorf message emitted by the member goroutines
+	// during the run (captured via capturingLogger). It lets Byzantine
+	// scenarios assert on protocol-internal diagnostics - e.g. the F-008
+	// reconstruction guard - that MockLogger would otherwise discard.
+	loggedErrors []string
 }
 
 // GetSigners returns all signers created from DKG protocol execution.
@@ -41,6 +46,13 @@ type Result struct {
 // is returned.
 func (r *Result) GetSigners() []*dkg.ThresholdSigner {
 	return r.signers
+}
+
+// LoggedErrors returns the Errorf messages emitted by the member goroutines
+// during the run, in capture order. Used by assertions that check whether a
+// specific protocol-internal error path was hit.
+func (r *Result) LoggedErrors() []string {
+	return r.loggedErrors
 }
 
 // RandomSeed generates a random DKG seed value. It is important to do not
@@ -158,11 +170,16 @@ func executeDKG(
 		beaconChain.Signing(),
 	)
 
+	// One capturing logger shared by all member goroutines, so member-level
+	// Errorf diagnostics (e.g. the F-008 reconstruction guard) survive the run
+	// and can be asserted on. Thread-safe; snapshotted after wg.Wait().
+	memberLogger := newCapturingLogger()
+
 	for i := 0; i < beaconConfig.GroupSize; i++ {
 		memberIndex := group.MemberIndex(i + 1) // capture for goroutine
 		go func() {
 			signer, err := dkg.ExecuteDKG(
-				&testutils.MockLogger{},
+				memberLogger,
 				seed,
 				memberIndex,
 				startBlockHeight,
@@ -198,19 +215,19 @@ func executeDKG(
 		// result was published to the chain, let's fetch it
 		dkgResult, dkgResultSignatures := lastDKGResultGetter()
 		return &Result{
-			dkgResult,
-			dkgResultSignatures,
-			signers,
-			memberFailures,
+			dkgResult:           dkgResult,
+			dkgResultSignatures: dkgResultSignatures,
+			signers:             signers,
+			memberFailures:      memberFailures,
+			loggedErrors:        memberLogger.snapshot(),
 		}, nil
 
 	case <-ctx.Done():
 		// no result published to the chain
 		return &Result{
-			nil,
-			nil,
-			signers,
-			memberFailures,
+			signers:        signers,
+			memberFailures: memberFailures,
+			loggedErrors:   memberLogger.snapshot(),
 		}, nil
 	}
 }

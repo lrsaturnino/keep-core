@@ -1,6 +1,7 @@
 package dkgtest
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/keep-network/keep-core/internal/testutils"
@@ -13,6 +14,43 @@ import (
 func AssertDkgResultPublished(t *testing.T, testResult *Result) {
 	if testResult.dkgResult == nil {
 		t.Fatal("dkg result is nil")
+	}
+}
+
+// reconstructionGuardMarker is a stable substring of the F-008 defensive guard's
+// Error message (gjkr/protocol.go ComputeGroupPublicKeyShares). Its appearance
+// means the reconstructed-share branch found peerSharesS missing an entry for an
+// operating member - i.e. the gap F-008 posits actually occurred at runtime and
+// was absorbed by the guard (upstream, without the guard, this is the crash).
+const reconstructionGuardMarker = "missing revealed share"
+
+// reconstructionGapErrors returns the captured Errorf messages that match the
+// F-008 guard marker. Pure (no *testing.T) so the detection logic is unit
+// testable independently of a full DKG run.
+func reconstructionGapErrors(testResult *Result) []string {
+	var hits []string
+	for _, msg := range testResult.loggedErrors {
+		if strings.Contains(msg, reconstructionGuardMarker) {
+			hits = append(hits, msg)
+		}
+	}
+	return hits
+}
+
+// AssertNoReconstructionGap fails if the F-008 reconstruction guard fired during
+// the run. A passing assertion is the execution-verified evidence that the
+// reconstructed-share branch found peerSharesS fully populated - corroborating
+// the reachability analysis that the gap does not occur under real execution.
+// This is distinct from the unit-level guard regression
+// (gjkr.TestComputeGroupPublicKeyShares_MissingRevealedShare), which forces the
+// gap artificially to check the guard; here we check the gap never forms.
+func AssertNoReconstructionGap(t *testing.T, testResult *Result) {
+	for _, msg := range reconstructionGapErrors(testResult) {
+		t.Errorf(
+			"F-008 reconstruction guard fired - a peerSharesS gap occurred "+
+				"at runtime (would crash upstream): %q",
+			msg,
+		)
 	}
 }
 

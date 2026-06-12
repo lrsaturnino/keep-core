@@ -28,6 +28,15 @@ func isPeerShares(m net.TaggedMarshaler) bool {
 	return ok
 }
 
+// isPublicKeySharePoints matches the GJKR phase-7 public-key-share-points
+// message. Withholding it from a member that already provided valid phase-3
+// shares makes that member inactive AFTER it qualified into the QUAL set, which
+// is what forces the share-reconstruction path (phases 11-12) to run for it.
+func isPublicKeySharePoints(m net.TaggedMarshaler) bool {
+	_, ok := m.(*gjkr.MemberPublicKeySharePointsMessage)
+	return ok
+}
+
 // TestByzantine_Withhold_member1_phase1 reproduces the hand-written
 // TestExecute_IA_member1_phase1 scenario using byzantine.Withhold, proving the
 // typed strategy library yields the same protocol outcome as the bespoke
@@ -131,4 +140,67 @@ func TestByzantine_Corrupt_member4_invalidShares(t *testing.T) {
 	dkgtest.AssertMisbehavingMembers(t, result, group.MemberIndex(4))
 	dkgtest.AssertValidGroupPublicKey(t, result)
 	dkgtest.AssertResultSupportingMembers(t, result, []group.MemberIndex{1, 2, 3, 5}...)
+}
+
+// TestByzantine_F008_ReconstructionPathExecutes is the execution-verified
+// corroboration for the F-008 reachability analysis
+// (docs/audits/keep-core/f008-reachability-analysis.md, verdict: false
+// positive). It drives a QUAL member into the share-reconstruction path and
+// confirms phase 12 completes without the contested nil-deref.
+//
+// F-008 claims an unguarded ScalarBaseMult(nil) in
+// CombiningMember.ComputeGroupPublicKeyShares (gjkr/protocol.go phase 12),
+// reachable only via its reconstruction ELSE-branch - which iterates a
+// reconstructed member's peerSharesS for every operating member. No existing
+// test reaches that branch: the other Byzantine demos disqualify a member in
+// phase 4/5 (BEFORE the QUAL set is fixed), so the member is never
+// reconstructed and the else-branch never runs.
+//
+// This scenario withholds member 3's PHASE-7 public-key-share-points message
+// AFTER member 3 has already broadcast valid phase-3 shares. Member 3 therefore
+// qualifies into QUAL, is then marked inactive in phase 8 for the missing
+// points, and so satisfies needsReconstruction (in QUAL, no valid points). The
+// honest members reveal their ephemeral keys for it (phase 10-11), reconstruct
+// its individual key (phase 11), and at phase 12 take the else-branch for it,
+// reading peerSharesS for every operating member - the exact F-008 crash site.
+//
+// A passing run is the evidence: ComputeGroupPublicKeyShares runs in an
+// unrecovered goroutine, so a ScalarBaseMult(nil) panic would crash the test
+// binary. Completion with a valid, agreed group key demonstrates that
+// peerSharesS was fully populated (no gap) when the else-branch executed -
+// exactly what the invariant chain (L1 inactivity gate + L2 completeness check
+// + L3 recovery-failure disqualification) guarantees.
+func TestByzantine_F008_ReconstructionPathExecutes(t *testing.T) {
+	t.Parallel()
+
+	groupSize := 5
+	honestThreshold := 3
+	seed := dkgtest.RandomSeed(t)
+
+	// Member 3 stays silent in phase 7 only; its phase-3 shares pass, so it
+	// enters QUAL and is reconstructed rather than excluded early.
+	strategy := byzantine.Withhold(group.MemberIndex(3), isPublicKeySharePoints)
+
+	result, err := dkgtest.RunTestWithStrategy(groupSize, honestThreshold, seed, strategy)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The four honest members complete and agree; member 3 is reconstructed
+	// (its key recovered from peers) but does not itself complete.
+	dkgtest.AssertDkgResultPublished(t, result)
+	dkgtest.AssertValidGroupPublicKey(t, result)
+	dkgtest.AssertSamePublicKey(t, result)
+	dkgtest.AssertSuccessfulSignersCount(t, result, groupSize-1)
+	dkgtest.AssertSuccessfulSigners(t, result, []group.MemberIndex{1, 2, 4, 5}...)
+	dkgtest.AssertMemberFailuresCount(t, result, 1)
+	dkgtest.AssertMisbehavingMembers(t, result, group.MemberIndex(3))
+	dkgtest.AssertResultSupportingMembers(t, result, []group.MemberIndex{1, 2, 4, 5}...)
+
+	// The teeth of the corroboration: the reconstructed-share branch executed
+	// for member 3 (it is in QUAL, lacks valid phase-7 points), and found
+	// peerSharesS fully populated - the F-008 guard never fired. Without this
+	// the PASS would be ambiguous, since the PR #27 guard prevents a crash even
+	// if the gap occurred.
+	dkgtest.AssertNoReconstructionGap(t, result)
 }
