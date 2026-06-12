@@ -9,7 +9,11 @@ on:
       - "pkg/**"
       - ".clusterfuzzlite/**"
 
-permissions: read-all
+# security-events: write is required for the run_fuzzers SARIF upload
+# (output-sarif: true) to reach the code-scanning Security tab.
+permissions:
+  contents: read
+  security-events: write
 
 jobs:
   PR:

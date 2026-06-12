@@ -12,7 +12,11 @@ on:
     - cron: "0 2 * * *" # daily, offset from the -race job (midnight)
   workflow_dispatch:
 
-permissions: read-all
+# security-events: write is required for the run_fuzzers SARIF upload
+# (output-sarif: true) to reach the code-scanning Security tab.
+permissions:
+  contents: read
+  security-events: write
 
 jobs:
   Batch:
