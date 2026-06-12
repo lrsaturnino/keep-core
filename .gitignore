@@ -54,6 +54,9 @@ yarn-error.log
 /solidity*/**/typechain/
 /solidity*/**/export.json
 
+# rapid property-test failure artifacts (persisted local seeds, not a committed corpus)
+testdata/rapid/
+
 # Go bindings generator
 # Note: Some specific _address files are committed as empty placeholders
 # to satisfy //go:embed directives during CI builds that don't run go generate
