@@ -24,6 +24,16 @@ permissions:
   contents: read
 
 jobs:
+  target-sync:
+    # build.sh's registration list is a second source of truth: a new
+    # Fuzz* function that is not registered silently gets zero CFLite
+    # coverage. Fail the PR instead.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check fuzz targets are registered in build.sh
+        run: ./.clusterfuzzlite/check_targets.sh
+
   PR:
     runs-on: ubuntu-latest
     concurrency:
