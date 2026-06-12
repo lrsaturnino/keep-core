@@ -22,11 +22,28 @@ func txBoundsCheckedIndexing(m dsl.Matcher) {
 	// (e.g. Outputs[0]) is paired with an explicit len() guard at its call
 	// site and is not the OOB class. The findings were all variable indices
 	// derived from one transaction applied to a separately fetched one.
+	//
+	// The receiver is type-constrained to bitcoin.Transaction (value and
+	// pointer) so unrelated types that happen to have an Outputs/Inputs
+	// slice field — including regenerated gen/ code, where a //nolint
+	// cannot survive — do not trip the rule.
+	//
+	// Known, accepted limitations: the rule guards against accidental
+	// reintroduction, not adversarial code. Aliasing the slice first
+	// (outs := tx.Outputs; outs[i]) bypasses the pattern, as does any
+	// helper that returns the slice. Review remains the backstop for
+	// those shapes.
+	m.Import(`github.com/keep-network/keep-core/pkg/bitcoin`)
+
 	m.Match(`$tx.Outputs[$i]`).
-		Where(!m["i"].Const).
+		Where(!m["i"].Const &&
+			(m["tx"].Type.Is(`bitcoin.Transaction`) ||
+				m["tx"].Type.Is(`*bitcoin.Transaction`))).
 		Report(`use Transaction.OutputAt($i) instead of raw Outputs[$i] indexing to bounds-check untrusted input (OOB crash class)`)
 
 	m.Match(`$tx.Inputs[$i]`).
-		Where(!m["i"].Const).
+		Where(!m["i"].Const &&
+			(m["tx"].Type.Is(`bitcoin.Transaction`) ||
+				m["tx"].Type.Is(`*bitcoin.Transaction`))).
 		Report(`use Transaction.InputAt($i) instead of raw Inputs[$i] indexing to bounds-check untrusted input (OOB crash class)`)
 }
