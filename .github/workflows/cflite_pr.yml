@@ -8,6 +8,14 @@ on:
     paths:
       - "pkg/**"
       - ".clusterfuzzlite/**"
+      # Infra the fuzz build depends on: a change here can break the
+      # CFLite build without touching pkg/, and would otherwise only be
+      # caught by the nightly batch run.
+      - "go.mod"
+      - "go.sum"
+      - ".dockerignore"
+      - ".github/workflows/cflite_pr.yml"
+      - ".github/workflows/cflite_batch.yml"
 
 # No security-events permission: this repo has no GitHub Advanced
 # Security, so SARIF upload to code scanning would 403. Crash artifacts
