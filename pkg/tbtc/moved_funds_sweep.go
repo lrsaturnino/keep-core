@@ -256,17 +256,7 @@ func assembleMovedFundsSweepUtxo(
 		)
 	}
 
-	// The moving funds transaction is fetched from the Bitcoin node, so its
-	// output count is untrusted; use the bounds-checked accessor to avoid an
-	// out-of-range panic on a short or malformed node response.
-	movingFundsTxOutput, err := movingFundsTx.OutputAt(movingFundsTxOutputIdx)
-	if err != nil {
-		return nil, fmt.Errorf(
-			"could not get moving funds transaction output: [%v]",
-			err,
-		)
-	}
-	movingFundsTxValue := movingFundsTxOutput.Value
+	movingFundsTxValue := movingFundsTx.Outputs[movingFundsTxOutputIdx].Value
 
 	return &bitcoin.UnspentTransactionOutput{
 		Outpoint: &bitcoin.TransactionOutpoint{
