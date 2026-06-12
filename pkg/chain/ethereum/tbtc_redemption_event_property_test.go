@@ -1,11 +1,14 @@
 package ethereum
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
 	"pgregory.net/rapid"
 
+	"github.com/keep-network/keep-core/pkg/bitcoin"
+	"github.com/keep-network/keep-core/pkg/chain"
 	tbtcabi "github.com/keep-network/keep-core/pkg/chain/ethereum/tbtc/gen/abi"
 )
 
@@ -24,13 +27,21 @@ func TestRapidConvertRedemptionRequestedEventFieldMapping(t *testing.T) {
 		treasuryFee := rapid.Uint64().Draw(t, "treasuryFee")
 		txMaxFee := rapid.Uint64().Draw(t, "txMaxFee")
 		blockNumber := rapid.Uint64().Draw(t, "blockNumber")
+		redeemerBytes := rapid.SliceOfN(rapid.Byte(), 20, 20).Draw(t, "redeemer")
+
+		// Draw raw script bytes and wrap them in the var-len encoding the
+		// converter parses, so the script round-trips through
+		// NewScriptFromVarLenData rather than failing on malformed input.
+		scriptBytes := rapid.SliceOfN(rapid.Byte(), 0, 64).Draw(t, "script")
+		varLenScript, err := bitcoin.Script(scriptBytes).ToVarLenData()
+		if err != nil {
+			t.Fatalf("cannot var-len encode generated script: %v", err)
+		}
 
 		event := &tbtcabi.BridgeRedemptionRequested{
-			WalletPubKeyHash: [20]byte{0x01, 0x02, 0x03},
-			// Constant, valid variable-length script (1-byte CompactSizeUint
-			// prefix + 1 script byte); script parsing is covered elsewhere.
-			RedeemerOutputScript: []byte{0x01, 0xaa},
-			Redeemer:             common.HexToAddress("0x1111111111111111111111111111111111111111"),
+			WalletPubKeyHash:     [20]byte{0x01, 0x02, 0x03},
+			RedeemerOutputScript: varLenScript,
+			Redeemer:             common.BytesToAddress(redeemerBytes),
 			RequestedAmount:      requestedAmount,
 			TreasuryFee:          treasuryFee,
 			TxMaxFee:             txMaxFee,
@@ -61,6 +72,20 @@ func TestRapidConvertRedemptionRequestedEventFieldMapping(t *testing.T) {
 		}
 		if got.WalletPublicKeyHash != event.WalletPubKeyHash {
 			t.Fatalf("WalletPublicKeyHash mismatch")
+		}
+		if got.Redeemer != chain.Address(event.Redeemer.Hex()) {
+			t.Fatalf(
+				"Redeemer: got %s, want %s",
+				got.Redeemer, event.Redeemer.Hex(),
+			)
+		}
+		// The converted script must be the decoded payload of the var-len
+		// data, i.e. exactly the raw bytes that were wrapped above.
+		if !bytes.Equal(got.RedeemerOutputScript, scriptBytes) {
+			t.Fatalf(
+				"RedeemerOutputScript: got %x, want %x",
+				got.RedeemerOutputScript, scriptBytes,
+			)
 		}
 	})
 }
