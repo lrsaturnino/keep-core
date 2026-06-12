@@ -51,6 +51,12 @@ type Outbound struct {
 // strategy-level (not byte-level) reproducibility established in Tier-2
 // work-package 0.
 //
+// The serialization is PER CHANNEL: each BroadcastChannelFor call mints a fresh
+// channel with its own lock (see BroadcastChannelFor). A stateful Strategy is
+// therefore safe only on the supported topology - one channel per run, shared
+// by the whole group. Do not hand the same stateful Strategy value to more than
+// one channel of a network; their independent locks would not serialize it.
+//
 // Boundary - what a Strategy CANNOT do, by construction: it observes a message
 // after the sender has serialized and encrypted it. For GJKR peer shares it can
 // corrupt or drop the encrypted per-receiver ciphertext (provoking a decryption
@@ -123,6 +129,11 @@ type network struct {
 	strategy Strategy
 }
 
+// BroadcastChannelFor returns a new intercepting channel each call, each with
+// its own strategyMutex. The network's Strategy is shared across them, so a
+// stateful Strategy is only race-free when a run uses a single channel (the
+// supported topology - see the Strategy contract). The current harness
+// (dkgtest.RunTestWithStrategy) calls this exactly once per run.
 func (n *network) BroadcastChannelFor(name string) (net.BroadcastChannel, error) {
 	delegate, err := n.provider.BroadcastChannelFor(name)
 	if err != nil {

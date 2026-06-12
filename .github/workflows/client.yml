@@ -169,6 +169,20 @@ jobs:
           if-no-files-found: warn
 
 
+      # The Tier-2 interceptor relies on a mutex to let a stateful Strategy run
+      # under concurrent Sends without a data race; TestStrategyConcurrentStatefulNoRace
+      # only has teeth under the race detector. Scoped to the fast, deterministic
+      # interception/byzantine packages (dkgtest is excluded: its real-DKG goroutines
+      # and wall-clock windows are timeout-amplified by -race).
+      - name: Run Go race tests (Tier-2 interceptor)
+        run: |
+          docker run \
+            --workdir /go/src/github.com/keep-network/keep-core \
+            go-build-env \
+            go test -race -timeout 15m \
+              ./pkg/internal/interception/... \
+              ./pkg/internal/byzantine/...
+
       - name: Build Docker Runtime Image
         if: github.event_name != 'workflow_dispatch'
         uses: docker/build-push-action@v5

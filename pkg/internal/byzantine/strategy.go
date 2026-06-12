@@ -13,7 +13,8 @@
 // wire, after a sender serialized and encrypted its message. They can withhold,
 // duplicate, and corrupt/replace a message, but cannot forge a chosen
 // inconsistent-but-individually-valid share (that needs a malicious member, not
-// channel interception). See docs tier2-interceptor-action-api.md.
+// channel interception). See the interception.Strategy contract for the precise
+// wire-level boundary.
 package byzantine
 
 import (

@@ -175,4 +175,16 @@ func TestDeterminismProbe(t *testing.T) {
 		t.Errorf("honest baseline is NOT verdict-stable: %d instability + %d errors over %d runs; "+
 			"DST verdicts would be ambiguous until this is pinned down", instability, runError, n)
 	}
+
+	// A handful of timeout-misses characterize the wall-clock margin and are
+	// expected. A MAJORITY of runs failing to publish is no longer a plausible
+	// margin artifact: it is a liveness / non-delivery signal that would
+	// otherwise pass silently in bucket (b). Gate on a rate budget so systematic
+	// non-publication fails the probe instead of hiding as "harness noise".
+	const timeoutMissBudget = 0.5 // fraction of runs
+	if float64(timeoutMiss) > timeoutMissBudget*float64(n) {
+		t.Errorf("timeout-miss rate %d/%d exceeds %.0f%% budget: this is no longer a plausible "+
+			"wall-clock artifact but a liveness/non-delivery signal that must be investigated "+
+			"(re-run with and without -race to confirm)", timeoutMiss, n, timeoutMissBudget*100)
+	}
 }

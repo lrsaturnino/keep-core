@@ -74,6 +74,12 @@ func TestByzantine_Withhold_member1_phase1(t *testing.T) {
 // agreed-upon group key. The resulting misbehavior classification is observed
 // (logged), not asserted, since it is the behavior this scenario is here to
 // characterize.
+//
+// This is a CHARACTERIZATION test, not a Flood regression guard: every
+// assertion below also holds for a fully honest run, so a Flood that silently
+// regressed to pass-through would still pass here. The guard that Flood
+// actually duplicates is the unit test TestFloodDuplicatesTargetMember in
+// pkg/internal/byzantine.
 // NOTE: deliberately NOT t.Parallel(). This scenario multiplies one member's
 // message volume 5x; running it concurrently with the parallel DKG suite raises
 // contention and risks the async result handler missing its 5s window - a
@@ -108,9 +114,12 @@ func TestByzantine_Flood_member1(t *testing.T) {
 // TestExecute_DQ_member4_invalidSharesMessage_phase4 scenario using
 // byzantine.Corrupt: member 4 broadcasts a peer-shares message missing the
 // share for member 1. Receivers detect the malformed message and disqualify
-// the sender. This exercises the accusation/disqualification path - the
-// stateful-protocol logic Tier 2 exists to reach, and where the contested
-// F-008 reconstructed-share finding lives.
+// the sender. The assertions below pin only the observable outcome (member 4
+// disqualified, the other four complete and agree). Reaching the
+// accusation/disqualification machinery is the motivation - it is the
+// stateful-protocol logic Tier 2 targets, near the contested F-008
+// reconstructed-share path - but this black-box test does not assert that the
+// reconstruction path itself executes.
 func TestByzantine_Corrupt_member4_invalidShares(t *testing.T) {
 	t.Parallel()
 
