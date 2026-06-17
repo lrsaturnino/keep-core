@@ -6,7 +6,7 @@ toolchain go1.24.1
 
 
 replace (
-	github.com/bnb-chain/tss-lib => github.com/threshold-network/tss-lib v0.0.0-20230901144531-2e712689cfbe
+	github.com/bnb-chain/tss-lib => github.com/threshold-network/tss-lib v0.0.0-20260615180949-86bd1a375cc0
 	// btcd in version v.0.23 extracted `btcd/btcec` to a separate package `btcd/btcec/v2`.
 	// Some of the dependencies still require the old version, which we workaround
 	// here:

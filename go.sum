@@ -618,6 +618,8 @@ github.com/threshold-network/keep-common v1.7.1-tlabs.1 h1:GcaQUb/5TOdc1Vhs4ZsbL
 github.com/threshold-network/keep-common v1.7.1-tlabs.1/go.mod h1:BufGmgx5NVFeOjsb6aKI0MUv8vTzuNRbMluWtwPb9E8=
 github.com/threshold-network/tss-lib v0.0.0-20230901144531-2e712689cfbe h1:dOKhoYxZjXwFIyGnxgU+Sa1obZPMHRhu6e44oOLkzU4=
 github.com/threshold-network/tss-lib v0.0.0-20230901144531-2e712689cfbe/go.mod h1:o3zAAo7A88ZJnCE1qpjy1hTqPn+GPQlxRsj8soz14UU=
+github.com/threshold-network/tss-lib v0.0.0-20260615180949-86bd1a375cc0 h1:FDQgvkayVQB8kXhM09GxQs5WDi6j0H5pCXjwJlj86WY=
+github.com/threshold-network/tss-lib v0.0.0-20260615180949-86bd1a375cc0/go.mod h1:V6jseKmLMG1hHD9Qws8WEPaJ+ui1tWISyDGDe0eMkQk=
 github.com/tklauser/go-sysconf v0.3.12 h1:0QaGUFOdQaIVdPgfITYzaTegZvdCjmYO52cSFAEVmqU=
 github.com/tklauser/go-sysconf v0.3.12/go.mod h1:Ho14jnntGE1fpdOqQEEaiKRpvIavV0hSfmBq8nJbHYI=
 github.com/tklauser/numcpus v0.6.1 h1:ng9scYS7az0Bk4OZLvrNXNSAO2Pxr1XXRAPyjhIx+Fk=
