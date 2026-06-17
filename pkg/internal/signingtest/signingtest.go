@@ -141,7 +141,11 @@ func RunTestWithTimeout(
 		localChain.Signing(),
 	)
 
-	sessionID := message.Text(16)
+	// Prefix with a fixed label so the session ID always clears tss-lib's
+	// 16-byte minimum-length floor (hardened in #8), regardless of how small
+	// the test message's hex encoding is. The message hex still keeps the ID
+	// unique per signed message, and all members derive the same value.
+	sessionID := "signingtest-session-" + message.Text(16)
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
