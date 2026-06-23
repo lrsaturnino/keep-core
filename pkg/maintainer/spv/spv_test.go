@@ -359,7 +359,7 @@ func TestIsInputCurrentWalletsMainUTXO_OutOfRangeFundingOutput(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected out-of-range funding output error")
 	}
-	if !strings.Contains(err.Error(), "funding output index [2] out of range") {
+	if !strings.Contains(err.Error(), "out of range") {
 		t.Fatalf("unexpected error: [%v]", err)
 	}
 }

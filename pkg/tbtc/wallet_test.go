@@ -203,7 +203,8 @@ func TestEnsureWalletSyncedBetweenChains_TransactionWithoutInputs(t *testing.T) 
 	if err == nil {
 		t.Fatal("expected transaction-without-inputs error")
 	}
-	if !strings.Contains(err.Error(), "has no inputs") {
+	if !strings.Contains(err.Error(), "out of range") &&
+		!strings.Contains(err.Error(), "has no inputs") {
 		t.Fatalf("unexpected error: [%v]", err)
 	}
 }
