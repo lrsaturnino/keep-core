@@ -18,24 +18,28 @@ const (
 func TestNotifyDKGStarted(t *testing.T) {
 	deduplicator := deduplicator{
 		dkgSeedCache: cache.NewTimeCache(testDKGSeedCachePeriod),
+		inProgress:   make(map[string]bool),
 	}
 
 	seed1 := big.NewInt(100)
 	seed2 := big.NewInt(200)
 
-	// Add the first seed.
+	// Claim and confirm the first seed.
 	canJoinDKG := deduplicator.notifyDKGStarted(seed1)
 	if !canJoinDKG {
 		t.Fatal("should be allowed to join DKG")
 	}
+	deduplicator.confirmDKGStarted(seed1)
 
-	// Add the second seed.
+	// Claim and confirm the second seed.
 	canJoinDKG = deduplicator.notifyDKGStarted(seed2)
 	if !canJoinDKG {
 		t.Fatal("should be allowed to join DKG")
 	}
+	deduplicator.confirmDKGStarted(seed2)
 
-	// Add the first seed before caching period elapses.
+	// The first seed is now a confirmed duplicate before the caching period
+	// elapses.
 	canJoinDKG = deduplicator.notifyDKGStarted(seed1)
 	if canJoinDKG {
 		t.Fatal("should not be allowed to join DKG")
@@ -44,10 +48,48 @@ func TestNotifyDKGStarted(t *testing.T) {
 	// Wait until caching period elapses.
 	time.Sleep(testDKGSeedCachePeriod)
 
-	// Add the first seed again.
+	// The first seed can be processed again after expiry.
 	canJoinDKG = deduplicator.notifyDKGStarted(seed1)
 	if !canJoinDKG {
 		t.Fatal("should be allowed to join DKG")
+	}
+}
+
+// TestNotifyDKGStarted_RetryOpenAfterAbort verifies that a DKG started event
+// whose handling did not complete (aborted) can be retried on a later
+// redelivery, and that a confirmed one is dropped as a duplicate.
+func TestNotifyDKGStarted_RetryOpenAfterAbort(t *testing.T) {
+	deduplicator := deduplicator{
+		dkgSeedCache: cache.NewTimeCache(testDKGSeedCachePeriod),
+		inProgress:   make(map[string]bool),
+	}
+
+	seed := big.NewInt(100)
+
+	// Claim the event for handling.
+	if !deduplicator.notifyDKGStarted(seed) {
+		t.Fatal("first claim should be allowed to process")
+	}
+
+	// While the claim is in progress, a concurrent duplicate delivery must be
+	// ignored.
+	if deduplicator.notifyDKGStarted(seed) {
+		t.Fatal("in-progress event should not be claimable again")
+	}
+
+	// Handling failed, so the claim is released.
+	deduplicator.abortDKGStarted(seed)
+
+	// A later redelivery of the same event must be allowed to retry, rather
+	// than being dropped as an already-processed duplicate.
+	if !deduplicator.notifyDKGStarted(seed) {
+		t.Fatal("event should be claimable again after an aborted attempt")
+	}
+
+	// Once handling completes successfully, further deliveries are duplicates.
+	deduplicator.confirmDKGStarted(seed)
+	if deduplicator.notifyDKGStarted(seed) {
+		t.Fatal("confirmed event should not be claimable again")
 	}
 }
 

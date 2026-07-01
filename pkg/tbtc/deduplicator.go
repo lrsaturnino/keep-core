@@ -114,26 +114,37 @@ func (d *deduplicator) release(key string) {
 	delete(d.inProgress, key)
 }
 
+// dkgStartedKey builds the deduplication key identifying a DKG started event.
+// The key is the hexadecimal representation of the seed.
+func dkgStartedKey(newDKGSeed *big.Int) string {
+	return newDKGSeed.Text(16)
+}
+
 // notifyDKGStarted notifies the client wants to start the distributed key
 // generation upon receiving an event. It returns boolean indicating whether the
 // client should proceed with the execution or ignore the event as a duplicate.
+//
+// A successful claim must be released with confirmDKGStarted once the event has
+// been terminally handled (the local DKG join was started, or the event turned
+// out to be unconfirmed) or with abortDKGStarted if handling did not complete,
+// so a later redelivery of the same event can retry.
 func (d *deduplicator) notifyDKGStarted(
 	newDKGSeed *big.Int,
 ) bool {
-	d.dkgSeedCache.Sweep()
+	return d.claim(d.dkgSeedCache, dkgStartedKey(newDKGSeed))
+}
 
-	// The cache key is the hexadecimal representation of the seed.
-	cacheKey := newDKGSeed.Text(16)
-	// If the key is not in the cache, that means the seed was not handled
-	// yet and the client should proceed with the execution.
-	if !d.dkgSeedCache.Has(cacheKey) {
-		d.dkgSeedCache.Add(cacheKey)
-		return true
-	}
+// confirmDKGStarted marks the given DKG started event as successfully handled
+// so subsequent deliveries of the same event are ignored as duplicates.
+func (d *deduplicator) confirmDKGStarted(newDKGSeed *big.Int) {
+	d.markCompleted(d.dkgSeedCache, dkgStartedKey(newDKGSeed))
+}
 
-	// Otherwise, the DKG seed is a duplicate and the client should not proceed
-	// with the execution.
-	return false
+// abortDKGStarted releases the in-progress claim for the given DKG started
+// event without marking it handled, so a later redelivery of the same event can
+// retry the handling.
+func (d *deduplicator) abortDKGStarted(newDKGSeed *big.Int) {
+	d.release(dkgStartedKey(newDKGSeed))
 }
 
 // dkgResultSubmittedKey builds the deduplication key identifying a DKG result

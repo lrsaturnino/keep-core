@@ -172,89 +172,98 @@ func Initialize(
 
 	_ = chain.OnDKGStarted(func(event *DKGStartedEvent) {
 		go func() {
-			if ok := deduplicator.notifyDKGStarted(
-				event.Seed,
-			); !ok {
-				logger.Infof(
-					"DKG started event with seed [0x%x] has been "+
-						"already processed",
-					event.Seed,
-				)
-				return
-			}
+			// handleDKGStartedEvent records the deduplication entry as completed
+			// only once the local DKG join has been dispatched (or the event was
+			// authoritatively found unconfirmed), so a transient early return in
+			// the handler below leaves the event retryable on redelivery.
+			handleDKGStartedEvent(
+				deduplicator,
+				event,
+				func(event *DKGStartedEvent) error {
+					confirmationBlock := event.BlockNumber + dkgStartedConfirmationBlocks
 
-			confirmationBlock := event.BlockNumber + dkgStartedConfirmationBlocks
+					logger.Infof(
+						"observed DKG started event with seed [0x%x] and "+
+							"starting block [%v]; waiting for block [%v] to confirm",
+						event.Seed,
+						event.BlockNumber,
+						confirmationBlock,
+					)
 
-			logger.Infof(
-				"observed DKG started event with seed [0x%x] and "+
-					"starting block [%v]; waiting for block [%v] to confirm",
-				event.Seed,
-				event.BlockNumber,
-				confirmationBlock,
+					if err := node.waitForBlockHeight(ctx, confirmationBlock); err != nil {
+						return fmt.Errorf(
+							"failed to confirm DKG started event: [%w]",
+							err,
+						)
+					}
+
+					dkgState, err := chain.GetDKGState()
+					if err != nil {
+						return fmt.Errorf("failed to check DKG state: [%w]", err)
+					}
+
+					if dkgState != AwaitingResult {
+						logger.Infof(
+							"DKG started event with seed [0x%x] and starting "+
+								"block [%v] was not confirmed",
+							event.Seed,
+							event.BlockNumber,
+						)
+
+						// The event was authoritatively determined to be
+						// unconfirmed; there is nothing to retry, so treat it as
+						// terminally handled.
+						return nil
+					}
+
+					// Fetch all past DKG started events starting from one
+					// confirmation period before the original event's block.
+					// If there was a chain reorg, the event we received could be
+					// moved to a block with a lower number than the one
+					// we received.
+					pastEvents, err := chain.PastDKGStartedEvents(
+						&DKGStartedEventFilter{
+							StartBlock: event.BlockNumber - dkgStartedConfirmationBlocks,
+						},
+					)
+					if err != nil {
+						return fmt.Errorf(
+							"failed to get past DKG started events: [%w]",
+							err,
+						)
+					}
+
+					// Should not happen but just in case.
+					if len(pastEvents) == 0 {
+						return fmt.Errorf("no past DKG started events")
+					}
+
+					lastEvent := pastEvents[len(pastEvents)-1]
+
+					logger.Infof(
+						"DKG started with seed [0x%x] at block [%v]",
+						lastEvent.Seed,
+						lastEvent.BlockNumber,
+					)
+
+					// The off-chain protocol should be started as close as
+					// possible to the current block or even further. Starting the
+					// off-chain protocol with a past block will likely cause a
+					// failure of the first attempt as the start block is used to
+					// synchronize the announcements and the state machine. Here we
+					// ensure a proper start point by delaying the execution by the
+					// confirmation period length.
+					node.joinDKGIfEligible(
+						lastEvent.Seed,
+						lastEvent.BlockNumber,
+						dkgStartedConfirmationBlocks,
+					)
+
+					// The local DKG join has been dispatched; the event is
+					// terminally handled.
+					return nil
+				},
 			)
-
-			err := node.waitForBlockHeight(ctx, confirmationBlock)
-			if err != nil {
-				logger.Errorf("failed to confirm DKG started event: [%v]", err)
-				return
-			}
-
-			dkgState, err := chain.GetDKGState()
-			if err != nil {
-				logger.Errorf("failed to check DKG state: [%v]", err)
-				return
-			}
-
-			if dkgState == AwaitingResult {
-				// Fetch all past DKG started events starting from one
-				// confirmation period before the original event's block.
-				// If there was a chain reorg, the event we received could be
-				// moved to a block with a lower number than the one
-				// we received.
-				pastEvents, err := chain.PastDKGStartedEvents(
-					&DKGStartedEventFilter{
-						StartBlock: event.BlockNumber - dkgStartedConfirmationBlocks,
-					},
-				)
-				if err != nil {
-					logger.Errorf("failed to get past DKG started events: [%v]", err)
-					return
-				}
-
-				// Should not happen but just in case.
-				if len(pastEvents) == 0 {
-					logger.Errorf("no past DKG started events")
-					return
-				}
-
-				lastEvent := pastEvents[len(pastEvents)-1]
-
-				logger.Infof(
-					"DKG started with seed [0x%x] at block [%v]",
-					lastEvent.Seed,
-					lastEvent.BlockNumber,
-				)
-
-				// The off-chain protocol should be started as close as possible
-				// to the current block or even further. Starting the off-chain
-				// protocol with a past block will likely cause a failure of the
-				// first attempt as the start block is used to synchronize
-				// the announcements and the state machine. Here we ensure
-				// a proper start point by delaying the execution by the
-				// confirmation period length.
-				node.joinDKGIfEligible(
-					lastEvent.Seed,
-					lastEvent.BlockNumber,
-					dkgStartedConfirmationBlocks,
-				)
-			} else {
-				logger.Infof(
-					"DKG started event with seed [0x%x] and starting "+
-						"block [%v] was not confirmed",
-					event.Seed,
-					event.BlockNumber,
-				)
-			}
 		}()
 	})
 
