@@ -96,6 +96,17 @@ func (sdc *signingDoneCheck) listen(
 	})
 
 	sdc.expectedSignersCount = len(attemptMembersIndexes)
+	// Record the members selected for this attempt so that done messages from
+	// members excluded from the current attempt can be rejected. This lookup is
+	// kept local to the listener goroutine below (captured by its closure and
+	// passed to isValidDoneMessage) instead of being stored on the shared
+	// signingDoneCheck struct. Keeping it out of shared state means concurrent
+	// listen calls on the same instance cannot race, and in particular cannot
+	// trigger a "concurrent map writes" fatal error, when populating it.
+	attemptMembers := make(map[group.MemberIndex]bool)
+	for _, memberIndex := range attemptMembersIndexes {
+		attemptMembers[memberIndex] = true
+	}
 	sdc.doneSigners = make(map[group.MemberIndex]*signingDoneMessage)
 
 	go func() {
@@ -113,6 +124,7 @@ func (sdc *signingDoneCheck) listen(
 					message,
 					attemptNumber,
 					attemptTimeoutBlock,
+					attemptMembers,
 				) {
 					continue
 				}
@@ -232,6 +244,7 @@ func (sdc *signingDoneCheck) isValidDoneMessage(
 	message *big.Int,
 	attemptNumber uint64,
 	attemptTimeoutBlock uint64,
+	attemptMembers map[group.MemberIndex]bool,
 ) bool {
 	sdc.doneSignersMutex.Lock()
 	_, signerDone := sdc.doneSigners[doneMessage.senderID]
@@ -245,6 +258,13 @@ func (sdc *signingDoneCheck) isValidDoneMessage(
 		doneMessage.senderID,
 		senderPublicKey,
 	) {
+		return false
+	}
+
+	// The sender must have been selected for the current signing attempt. A
+	// valid wallet group member that was excluded from this attempt must not
+	// count toward its completion threshold.
+	if !attemptMembers[doneMessage.senderID] {
 		return false
 	}
 
