@@ -344,6 +344,12 @@ func initCovenantSignerFlags(cmd *cobra.Command, cfg *config.Config) {
 		false,
 		"Fail startup when enabled covenant routes are missing route-level approval trust roots. Request-time validation still enforces exact reserve/network trust-root matches.",
 	)
+	cmd.Flags().BoolVar(
+		&cfg.CovenantSigner.BridgeCovenantFraudDefenseConfirmed,
+		"covenantSigner.bridgeCovenantFraudDefenseConfirmed",
+		false,
+		"Set only after confirming the tBTC Bridge covenant fraud-defense path is deployed. Until set, the covenant signer fails closed and refuses to sign, because a covenant signature would otherwise expose the wallet to an undefeatable fraud challenge.",
+	)
 }
 
 // Initialize flags for Maintainer configuration.

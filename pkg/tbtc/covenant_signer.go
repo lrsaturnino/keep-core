@@ -23,6 +23,13 @@ import (
 type covenantSignerEngine struct {
 	node                               *node
 	minimumActiveOutpointConfirmations uint
+	// bridgeFraudDefenseConfirmed records the operator's explicit confirmation
+	// that the tBTC Bridge recognizes covenant active UTXO spends as honest
+	// spends, i.e. the covenant fraud-defense path is deployed. Until it is set,
+	// the engine refuses to produce covenant signatures because a covenant
+	// SIGHASH_ALL signature over a covenant active UTXO is otherwise a valid,
+	// undefeatable tBTC fraud proof against the signing wallet.
+	bridgeFraudDefenseConfirmed bool
 }
 
 // defaultMinActiveOutpointConfirmations is the confirmation threshold applied
@@ -50,7 +57,15 @@ type qcV1SignerHandoff struct {
 // newCovenantSignerEngine creates a covenant signer engine bound to the given
 // node. When minConfirmations is zero (the Go zero-value produced by an unset
 // config field), defaultMinActiveOutpointConfirmations is used.
-func newCovenantSignerEngine(node *node, minConfirmations uint) covenantsigner.Engine {
+//
+// bridgeFraudDefenseConfirmed must be set only when the operator has confirmed
+// that the tBTC Bridge covenant fraud-defense path is deployed. When false (the
+// default), the engine fails closed and refuses to produce covenant signatures.
+func newCovenantSignerEngine(
+	node *node,
+	minConfirmations uint,
+	bridgeFraudDefenseConfirmed bool,
+) covenantsigner.Engine {
 	if minConfirmations == 0 {
 		minConfirmations = defaultMinActiveOutpointConfirmations
 	}
@@ -58,6 +73,7 @@ func newCovenantSignerEngine(node *node, minConfirmations uint) covenantsigner.E
 	return &covenantSignerEngine{
 		node:                               node,
 		minimumActiveOutpointConfirmations: minConfirmations,
+		bridgeFraudDefenseConfirmed:        bridgeFraudDefenseConfirmed,
 	}
 }
 
@@ -216,6 +232,26 @@ func (cse *covenantSignerEngine) OnSubmit(
 	ctx context.Context,
 	job *covenantsigner.Job,
 ) (*covenantsigner.Transition, error) {
+	// Fail closed unless the operator has confirmed the tBTC Bridge covenant
+	// fraud-defense path is deployed. Producing a covenant SIGHASH_ALL
+	// signature over a covenant active UTXO exposes the signing wallet to a
+	// tBTC fraud challenge it cannot defeat, because the Bridge does not
+	// recognize a covenant active UTXO spend as an honest spend in
+	// Fraud.defeatFraudChallenge; only a swept deposit, a spent main UTXO, or a
+	// processed moved-funds sweep can defeat the challenge. The complete
+	// remediation is the bridge-side covenant fraud-defense path. Until it is
+	// deployed and confirmed here, refuse to sign so a valid migration
+	// signature cannot become a slashable wallet signature.
+	if !cse.bridgeFraudDefenseConfirmed {
+		return failedTransition(
+			covenantsigner.ReasonPolicyRejected,
+			"covenant signing is disabled until the tBTC Bridge covenant "+
+				"fraud-defense path is confirmed deployed; a covenant signature "+
+				"would otherwise expose the wallet to an undefeatable fraud "+
+				"challenge",
+		), nil
+	}
+
 	switch job.Route {
 	case covenantsigner.TemplateSelfV1:
 		return cse.submitSelfV1(ctx, job), nil
@@ -855,6 +891,15 @@ func (cse *covenantSignerEngine) buildCovenantTransactionBuilder(
 	return builder, nil
 }
 
+// signCovenantTransactionInput produces the wallet's tECDSA signature over the
+// single covenant input of the migration transaction.
+//
+// This signature is a normal Bitcoin SIGHASH_ALL signature over a covenant
+// active UTXO. A covenant active UTXO is neither a swept deposit, a spent main
+// UTXO, nor a processed moved-funds sweep, so the tBTC Bridge cannot defeat a
+// fraud challenge that replays this signature. Callers must therefore only
+// reach this path once the bridge-side covenant fraud-defense has been
+// confirmed deployed; OnSubmit enforces that fail-closed gate.
 func signCovenantTransactionInput(
 	ctx context.Context,
 	signingExecutor *signingExecutor,

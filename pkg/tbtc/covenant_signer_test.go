@@ -83,7 +83,7 @@ func TestCovenantSignerEngine_SubmitSelfV1Ready(t *testing.T) {
 
 	service, err := covenantsigner.NewService(
 		newCovenantSignerMemoryHandle(),
-		newCovenantSignerEngine(node, 0),
+		newCovenantSignerEngine(node, 0, true),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -330,7 +330,7 @@ func TestCovenantSignerEngine_SubmitQcV1HandoffReady(t *testing.T) {
 
 	service, err := covenantsigner.NewService(
 		newCovenantSignerMemoryHandle(),
-		newCovenantSignerEngine(node, 0),
+		newCovenantSignerEngine(node, 0, true),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -629,7 +629,7 @@ func TestCovenantSignerEngine_SubmitQcV1RejectsInvalidBeta(t *testing.T) {
 
 	service, err := covenantsigner.NewService(
 		newCovenantSignerMemoryHandle(),
-		newCovenantSignerEngine(node, 0),
+		newCovenantSignerEngine(node, 0, true),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -745,7 +745,7 @@ func TestCovenantSignerEngine_SubmitQcV1RejectsScriptHashMismatch(t *testing.T) 
 
 	service, err := covenantsigner.NewService(
 		newCovenantSignerMemoryHandle(),
-		newCovenantSignerEngine(node, 0),
+		newCovenantSignerEngine(node, 0, true),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -891,7 +891,7 @@ func TestCovenantSignerEngine_SubmitSelfV1RejectsZeroMaturityHeight(t *testing.T
 
 	service, err := covenantsigner.NewService(
 		newCovenantSignerMemoryHandle(),
-		newCovenantSignerEngine(node, 0),
+		newCovenantSignerEngine(node, 0, true),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1131,6 +1131,49 @@ func TestArchiveClosedWallets_ArchivesClosedWallet(t *testing.T) {
 	// The closed wallet must be archived.
 	if len(node.walletRegistry.getSigners(walletPublicKey)) != 0 {
 		t.Fatal("expected the closed wallet to be archived, but it is still present")
+	}
+}
+
+// TestCovenantSignerEngine_OnSubmitFailsClosedWithoutBridgeFraudDefense verifies
+// that the engine refuses to produce covenant signatures unless the operator has
+// confirmed the tBTC Bridge covenant fraud-defense path is deployed. A covenant
+// signature would otherwise expose the signing wallet to an undefeatable fraud
+// challenge.
+func TestCovenantSignerEngine_OnSubmitFailsClosedWithoutBridgeFraudDefense(t *testing.T) {
+	node, _, _ := setupCovenantSignerTestNode(t)
+
+	// Construct the engine with the default (fail-closed) configuration: the
+	// bridge covenant fraud-defense path is not confirmed deployed.
+	engine := newCovenantSignerEngine(node, 0, false)
+
+	for _, route := range []covenantsigner.TemplateID{
+		covenantsigner.TemplateSelfV1,
+		covenantsigner.TemplateQcV1,
+	} {
+		transition, err := engine.OnSubmit(
+			context.Background(),
+			&covenantsigner.Job{Route: route},
+		)
+		if err != nil {
+			t.Fatalf("[%s] unexpected error: %v", route, err)
+		}
+		if transition == nil {
+			t.Fatalf("[%s] expected a transition", route)
+		}
+		if transition.State != covenantsigner.JobStateFailed {
+			t.Fatalf(
+				"[%s] expected a failed transition, got state [%v]",
+				route,
+				transition.State,
+			)
+		}
+		if transition.Reason != covenantsigner.ReasonPolicyRejected {
+			t.Fatalf(
+				"[%s] expected a policy rejection, got reason [%v]",
+				route,
+				transition.Reason,
+			)
+		}
 	}
 }
 
@@ -1505,7 +1548,9 @@ func TestCovenantSignerEngine_OnPollReturnsNoTransition(t *testing.T) {
 }
 
 func TestCovenantSignerEngine_SubmitRejectsUnsupportedRoute(t *testing.T) {
-	transition, err := (&covenantSignerEngine{}).OnSubmit(
+	// Confirm the bridge fraud-defense so OnSubmit reaches route validation
+	// rather than the fail-closed gate.
+	transition, err := (&covenantSignerEngine{bridgeFraudDefenseConfirmed: true}).OnSubmit(
 		context.Background(),
 		&covenantsigner.Job{
 			Route: covenantsigner.TemplateID("unsupported_route"),
@@ -1531,7 +1576,7 @@ func TestCovenantSignerEngine_SubmitRejectsUnsupportedRoute(t *testing.T) {
 func TestNewCovenantSignerEngine_DefaultMinConfirmations(t *testing.T) {
 	node, _, _ := setupCovenantSignerTestNode(t)
 
-	engine := newCovenantSignerEngine(node, 0)
+	engine := newCovenantSignerEngine(node, 0, true)
 
 	cse, ok := engine.(*covenantSignerEngine)
 	if !ok {
@@ -1549,7 +1594,7 @@ func TestNewCovenantSignerEngine_DefaultMinConfirmations(t *testing.T) {
 func TestNewCovenantSignerEngine_ExplicitMinConfirmations(t *testing.T) {
 	node, _, _ := setupCovenantSignerTestNode(t)
 
-	engine := newCovenantSignerEngine(node, 3)
+	engine := newCovenantSignerEngine(node, 3, true)
 
 	cse, ok := engine.(*covenantSignerEngine)
 	if !ok {
