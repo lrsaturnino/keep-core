@@ -45,7 +45,9 @@ func Initialize(
 		listenAddress = DefaultListenAddress
 	}
 
-	if !isLoopbackListenAddress(listenAddress) && strings.TrimSpace(config.AuthToken) == "" {
+	isLoopback := isLoopbackListenAddress(listenAddress)
+
+	if !isLoopback && strings.TrimSpace(config.AuthToken) == "" {
 		return nil, false, fmt.Errorf(
 			"covenant signer authToken is required for non-loopback listenAddress [%s]",
 			listenAddress,
@@ -63,7 +65,12 @@ func Initialize(
 	if err != nil {
 		return nil, false, err
 	}
-	if err := validateRequiredApprovalTrustRoots(config, service); err != nil {
+	// A non-loopback (production) listen address is treated as requiring the
+	// full multi-party approval model: the signer approval verifier and the
+	// route trust roots must be configured, mirroring the non-loopback authToken
+	// requirement above. Loopback deployments may still run with warnings unless
+	// requireApprovalTrustRoots is set explicitly.
+	if err := validateRequiredApprovalTrustRoots(config, service, !isLoopback); err != nil {
 		return nil, false, err
 	}
 	if service.signerApprovalVerifier == nil {
@@ -151,8 +158,9 @@ func Initialize(
 func validateRequiredApprovalTrustRoots(
 	config Config,
 	service *Service,
+	requireForNonLoopbackListenAddress bool,
 ) error {
-	if !config.RequireApprovalTrustRoots {
+	if !config.RequireApprovalTrustRoots && !requireForNonLoopbackListenAddress {
 		return nil
 	}
 
@@ -162,7 +170,7 @@ func validateRequiredApprovalTrustRoots(
 			TemplateSelfV1,
 		) {
 		return fmt.Errorf(
-			"covenant signer self_v1 routes require depositorTrustRoots when covenantSigner.requireApprovalTrustRoots=true",
+			"covenant signer self_v1 routes require depositorTrustRoots when covenantSigner.requireApprovalTrustRoots=true or for a non-loopback listen address",
 		)
 	}
 
@@ -171,7 +179,7 @@ func validateRequiredApprovalTrustRoots(
 		TemplateQcV1,
 	) {
 		return fmt.Errorf(
-			"covenant signer qc_v1 routes require depositorTrustRoots when covenantSigner.requireApprovalTrustRoots=true",
+			"covenant signer qc_v1 routes require depositorTrustRoots when covenantSigner.requireApprovalTrustRoots=true or for a non-loopback listen address",
 		)
 	}
 
@@ -180,13 +188,13 @@ func validateRequiredApprovalTrustRoots(
 		TemplateQcV1,
 	) {
 		return fmt.Errorf(
-			"covenant signer qc_v1 routes require custodianTrustRoots when covenantSigner.requireApprovalTrustRoots=true",
+			"covenant signer qc_v1 routes require custodianTrustRoots when covenantSigner.requireApprovalTrustRoots=true or for a non-loopback listen address",
 		)
 	}
 
 	if service.signerApprovalVerifier == nil {
 		return fmt.Errorf(
-			"covenant signer requires a signerApprovalVerifier when covenantSigner.requireApprovalTrustRoots=true",
+			"covenant signer requires a signerApprovalVerifier when covenantSigner.requireApprovalTrustRoots=true or for a non-loopback listen address",
 		)
 	}
 

@@ -415,6 +415,67 @@ func TestInitializeRequiresSignerApprovalVerifierWhenConfigured(t *testing.T) {
 	}
 }
 
+func TestInitializeRequiresTrustRootsForNonLoopbackListenAddress(t *testing.T) {
+	handle := newMemoryHandle()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// A non-loopback (production) listen address must fail startup when the
+	// required approval trust roots are missing, even without
+	// RequireApprovalTrustRoots being set explicitly. The engine provides a
+	// verifier, so the failure is attributable to the missing trust roots.
+	_, enabled, err := Initialize(
+		ctx,
+		Config{
+			Port:          availableLoopbackPort(t),
+			ListenAddress: "0.0.0.0",
+			AuthToken:     "test-token",
+		},
+		handle,
+		&scriptedVerifierEngine{},
+	)
+	if err == nil || enabled {
+		t.Fatalf("expected non-loopback startup without trust roots to fail, got enabled=%v err=%v", enabled, err)
+	}
+	if !strings.Contains(err.Error(), "non-loopback listen address") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestInitializeRequiresSignerApprovalVerifierForNonLoopbackListenAddress(t *testing.T) {
+	handle := newMemoryHandle()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// A non-loopback (production) listen address with all trust roots present
+	// but no signer approval verifier must fail startup.
+	_, enabled, err := Initialize(
+		ctx,
+		Config{
+			Port:          availableLoopbackPort(t),
+			ListenAddress: "0.0.0.0",
+			AuthToken:     "test-token",
+			DepositorTrustRoots: []DepositorTrustRoot{
+				testDepositorTrustRoot(TemplateQcV1),
+			},
+			CustodianTrustRoots: []CustodianTrustRoot{
+				testCustodianTrustRoot(TemplateQcV1),
+			},
+		},
+		handle,
+		&scriptedEngine{},
+	)
+	if err == nil || enabled {
+		t.Fatalf("expected non-loopback startup without a verifier to fail, got enabled=%v err=%v", enabled, err)
+	}
+	if !strings.Contains(err.Error(), "requires a signerApprovalVerifier") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "non-loopback listen address") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestIsLoopbackListenAddressAcceptsBracketedIPv6Loopback(t *testing.T) {
 	if !isLoopbackListenAddress("[::1]") {
 		t.Fatal("expected bracketed IPv6 loopback address to be recognized")
