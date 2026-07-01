@@ -415,6 +415,28 @@ func (n *node) getSigningExecutor(
 	return executor, true, nil
 }
 
+// invalidateSigningExecutor removes any cached signing executor for the given
+// wallet. It is used when a wallet is archived (closed or terminated) so that a
+// stale cached executor cannot keep the node signing for a wallet that has been
+// removed from the wallet registry. getSigningExecutor consults the executor
+// cache before the wallet registry, so without this eviction an executor
+// created while the wallet was live would remain usable after archival.
+func (n *node) invalidateSigningExecutor(walletPublicKey *ecdsa.PublicKey) error {
+	walletPublicKeyBytes, err := marshalPublicKey(walletPublicKey)
+	if err != nil {
+		return fmt.Errorf("cannot marshal wallet public key: [%v]", err)
+	}
+
+	executorKey := hex.EncodeToString(walletPublicKeyBytes)
+
+	n.signingExecutorsMutex.Lock()
+	defer n.signingExecutorsMutex.Unlock()
+
+	delete(n.signingExecutors, executorKey)
+
+	return nil
+}
+
 // getCoordinationExecutor gets the coordination executor responsible for
 // executing coordination related to a specific wallet whose part is controlled
 // by this node. The second boolean return value indicates whether the node
@@ -1383,6 +1405,17 @@ func (n *node) handleWalletClosure(walletID [32]byte) error {
 	err = n.walletRegistry.archiveWallet(walletPublicKeyHash)
 	if err != nil {
 		return fmt.Errorf("failed to archive the wallet: [%v]", err)
+	}
+
+	// Evict any cached signing executor for the archived wallet so that the
+	// closure actually deauthorizes signing for it. getSigningExecutor consults
+	// the executor cache before the wallet registry, so a stale cached executor
+	// would otherwise keep the wallet signable until the process restarts.
+	if err := n.invalidateSigningExecutor(wallet.publicKey); err != nil {
+		return fmt.Errorf(
+			"failed to invalidate signing executor for archived wallet: [%v]",
+			err,
+		)
 	}
 
 	logger.Infof(

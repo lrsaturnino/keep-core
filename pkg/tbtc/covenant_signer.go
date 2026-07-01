@@ -140,6 +140,23 @@ func (cse *covenantSignerEngine) VerifySignerApproval(
 		return err
 	}
 
+	// Fail closed for wallets that are not in a state eligible for covenant
+	// signing. The signer set hash embedded in a certificate binds only the
+	// wallet identity, members hash, and threshold, none of which change when a
+	// wallet is closed or terminated, so a certificate issued while the wallet
+	// was live would otherwise keep verifying after closure. Rejecting
+	// non-eligible states here ensures a wallet the closure path intended to
+	// deauthorize cannot be made to sign a covenant transaction.
+	if !isCovenantSigningEligibleState(walletChainData.State) {
+		return covenantsigner.NewInputError(
+			fmt.Sprintf(
+				"request.signerApproval.walletPublicKey resolves to a wallet in "+
+					"state [%v] that is not eligible for covenant signing",
+				walletChainData.State,
+			),
+		)
+	}
+
 	expectedSignerSetHash, err := computeSignerApprovalCertificateSignerSetHash(
 		signerPublicKey,
 		walletChainData,
@@ -162,6 +179,16 @@ func (cse *covenantSignerEngine) VerifySignerApproval(
 	}
 
 	return nil
+}
+
+// isCovenantSigningEligibleState reports whether a wallet in the given state is
+// eligible to receive covenant signatures. Covenant migrations are only
+// expected for live wallets, so covenant signing fails closed for every other
+// state (including closed and terminated wallets that the closure path intends
+// to deauthorize). If covenant signing must be allowed for another state in the
+// future, add it here explicitly together with justification and tests.
+func isCovenantSigningEligibleState(state WalletState) bool {
+	return state == StateLive
 }
 
 func (cse *covenantSignerEngine) resolveSignerApprovalTemplatePublicKey(

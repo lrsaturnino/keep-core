@@ -1033,6 +1033,53 @@ func TestCovenantSignerEngine_EnsureActiveOutpointFinalityRejectsUnconfirmed(t *
 	}
 }
 
+func TestNode_InvalidateSigningExecutorEvictsCachedExecutorOnArchival(t *testing.T) {
+	node, _, walletPublicKey := setupCovenantSignerTestNode(t)
+
+	// setupCovenantSignerTestNode already created and cached a signing executor
+	// for the wallet. Confirm it is served from the cache.
+	executor, ok, err := node.getSigningExecutor(walletPublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected the node to control the wallet before archival")
+	}
+
+	// Archive the wallet, removing it from the wallet registry, as the wallet
+	// closure path does.
+	walletPublicKeyHash := bitcoin.PublicKeyHash(walletPublicKey)
+	if err := node.walletRegistry.archiveWallet(walletPublicKeyHash); err != nil {
+		t.Fatal(err)
+	}
+
+	// Before invalidation, getSigningExecutor still returns the stale cached
+	// executor even though the wallet is no longer in the registry -- this is
+	// the behavior the fix must prevent.
+	staleExecutor, ok, err := node.getSigningExecutor(walletPublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || staleExecutor != executor {
+		t.Fatal("expected the stale cached executor to still be present before invalidation")
+	}
+
+	// Invalidating the signing executor (as handleWalletClosure does after
+	// archival) evicts the cached executor, so the archived wallet is no longer
+	// signable through it.
+	if err := node.invalidateSigningExecutor(walletPublicKey); err != nil {
+		t.Fatal(err)
+	}
+
+	_, ok, err = node.getSigningExecutor(walletPublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("expected the archived wallet to no longer be signable after executor invalidation")
+	}
+}
+
 func setupCovenantSignerTestNode(
 	t *testing.T,
 ) (*node, *localBitcoinChain, *ecdsa.PublicKey) {
@@ -1620,5 +1667,80 @@ func TestComputeQcV1SignerHandoffPayloadHash_DeterministicKeyOrdering(t *testing
 			expectedJSON,
 			rawJSON,
 		)
+	}
+}
+
+// TestCovenantSignerEngine_VerifySignerApprovalRejectsNonLiveWallet verifies
+// that a signer approval certificate which is otherwise valid (matching the
+// wallet identity and members hash) is rejected once the wallet leaves the live
+// state, so a closed or terminated wallet cannot be made to sign a covenant
+// transaction.
+func TestCovenantSignerEngine_VerifySignerApprovalRejectsNonLiveWallet(t *testing.T) {
+	node, _, walletPublicKey := setupCovenantSignerTestNode(t)
+
+	localChain, ok := node.chain.(*localChain)
+	if !ok {
+		t.Fatal("expected local chain implementation")
+	}
+
+	depositorPrivateKey, _ := btcec.PrivKeyFromBytes(btcec.S256(), bytes.Repeat([]byte{0x42}, 32))
+	depositorPublicKey := depositorPrivateKey.PubKey().SerializeCompressed()
+	signerPublicKey := (*btcec.PublicKey)(walletPublicKey).SerializeCompressed()
+
+	template := &covenantsigner.SelfV1Template{
+		Template:           covenantsigner.TemplateSelfV1,
+		DepositorPublicKey: "0x" + hex.EncodeToString(depositorPublicKey),
+		SignerPublicKey:    "0x" + hex.EncodeToString(signerPublicKey),
+		Delta2:             4320,
+	}
+	templateJSON, err := json.Marshal(template)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Build a request whose signer approval certificate is issued while the
+	// wallet is live, so it is genuinely valid apart from the wallet state.
+	request := covenantsigner.RouteSubmitRequest{
+		Route:                     covenantsigner.TemplateSelfV1,
+		DestinationCommitmentHash: "0x" + strings.Repeat("11", 32),
+		MigrationTransactionPlan: &covenantsigner.MigrationTransactionPlan{
+			InputValueSats:       1_000_000,
+			DestinationValueSats: 998_000,
+			AnchorValueSats:      330,
+			FeeSats:              1_670,
+			InputSequence:        0xfffffffd,
+			LockTime:             912345,
+		},
+		ScriptTemplate: templateJSON,
+		Signing: covenantsigner.SigningRequirements{
+			SignerRequired:    true,
+			CustodianRequired: false,
+		},
+	}
+	applyTestMigrationTransactionPlanCommitment(t, &request)
+	applyTestArtifactApprovals(t, node, walletPublicKey, &request, depositorPrivateKey, nil)
+
+	cse := &covenantSignerEngine{node: node}
+
+	// While the wallet is live, the otherwise-valid request is accepted.
+	if err := cse.VerifySignerApproval(request); err != nil {
+		t.Fatalf("expected a live wallet to be accepted, got: %v", err)
+	}
+
+	// Transition the wallet to the closed state, keeping otherwise-valid
+	// registry data (same identity and members hash), matching the reported
+	// scenario where a certificate for a now-closed wallet is replayed.
+	walletPublicKeyHash := bitcoin.PublicKeyHash(walletPublicKey)
+	existing, err := localChain.GetWallet(walletPublicKeyHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := *existing
+	closed.State = StateClosed
+	localChain.setWallet(walletPublicKeyHash, &closed)
+
+	// The closed wallet must now be rejected before any signing occurs.
+	if err := cse.VerifySignerApproval(request); err == nil {
+		t.Fatal("expected VerifySignerApproval to reject a closed wallet")
 	}
 }
