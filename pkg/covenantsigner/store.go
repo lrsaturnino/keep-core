@@ -12,7 +12,18 @@ import (
 	"github.com/keep-network/keep-common/pkg/persistence"
 )
 
-const jobsDirectory = "covenant-signer/jobs"
+// jobsDirectory is a single-level persistence directory name. It must not
+// contain a path separator: the disk persistence handle creates only one
+// directory level (os.Mkdir, not MkdirAll) and enumerates only one directory
+// level on load, so a nested name would fail to save and would be skipped on
+// reload.
+const jobsDirectory = "covenant-signer-jobs"
+
+// legacyJobsDirectory is the previously used nested directory name. Files that
+// an operator managed to persist under it (when the parent directory happened
+// to exist) are migrated to jobsDirectory on startup.
+const legacyJobsDirectory = "covenant-signer/jobs"
+
 const lockFileName = ".lock"
 
 type Store struct {
@@ -41,6 +52,12 @@ func NewStore(handle persistence.BasicHandle, dataDir string) (*Store, error) {
 			return nil, err
 		}
 		store.lockFile = lockFile
+
+		if err := migrateLegacyJobsDirectory(dataDir); err != nil {
+			// Release the lock if migration fails after successful acquisition.
+			store.Close() // #nosec G104 -- best-effort cleanup; original err is returned
+			return nil, err
+		}
 	}
 
 	if err := store.load(); err != nil {
@@ -95,6 +112,64 @@ func acquireFileLock(dataDir string) (*os.File, error) {
 	}
 
 	return lockFile, nil
+}
+
+// migrateLegacyJobsDirectory moves persisted job files from the previously used
+// nested legacyJobsDirectory into the flat jobsDirectory. The nested directory
+// could not be reliably created or reloaded by the single-level disk
+// persistence handle, so any job files an operator managed to persist under it
+// would otherwise be silently skipped on startup. Migration is best-effort per
+// file and idempotent: files already present in the destination are left
+// untouched, and a missing legacy directory is not an error.
+func migrateLegacyJobsDirectory(dataDir string) error {
+	legacyDir := filepath.Join(dataDir, legacyJobsDirectory)
+
+	entries, err := os.ReadDir(legacyDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf(
+			"cannot read legacy covenant signer jobs directory [%s]: %w",
+			legacyDir,
+			err,
+		)
+	}
+
+	newDir := filepath.Join(dataDir, jobsDirectory)
+	if err := os.MkdirAll(newDir, 0700); err != nil {
+		return fmt.Errorf(
+			"cannot create covenant signer jobs directory [%s]: %w",
+			newDir,
+			err,
+		)
+	}
+
+	for _, entry := range entries {
+		// Only migrate persisted job files; skip subdirectories and the lock
+		// file left behind under the legacy path.
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+
+		newPath := filepath.Join(newDir, entry.Name())
+		// Do not clobber a file already present in the destination.
+		if _, err := os.Stat(newPath); err == nil {
+			continue
+		}
+
+		oldPath := filepath.Join(legacyDir, entry.Name())
+		if err := os.Rename(oldPath, newPath); err != nil {
+			return fmt.Errorf(
+				"cannot migrate covenant signer job file [%s] to [%s]: %w",
+				oldPath,
+				newPath,
+				err,
+			)
+		}
+	}
+
+	return nil
 }
 
 // Close releases the exclusive file lock and closes the underlying lock file
@@ -172,6 +247,13 @@ func (s *Store) load() error {
 			}
 
 			if descriptor.Directory() != jobsDirectory {
+				continue
+			}
+
+			// Skip non-job files that share the jobs directory, such as the
+			// store lock file. Persisted jobs are always saved with a .json
+			// extension.
+			if filepath.Ext(descriptor.Name()) != ".json" {
 				continue
 			}
 
