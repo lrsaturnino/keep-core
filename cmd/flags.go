@@ -380,8 +380,17 @@ func initMaintainerFlags(command *cobra.Command, cfg *config.Config) {
 		&cfg.Maintainer.Spv.TransactionLimit,
 		"spv.transactionLimit",
 		spv.DefaultTransactionLimit,
-		"The maximum number of confirmed transactions returned when getting "+
-			"transactions for a public key hash.",
+		"The maximum number of matching (unproven protocol) transactions "+
+			"returned when getting transactions for a public key hash.",
+	)
+
+	command.Flags().IntVar(
+		&cfg.Maintainer.Spv.TransactionScanLimit,
+		"spv.transactionScanLimit",
+		spv.DefaultTransactionScanLimit,
+		"The maximum number of not-yet-classified confirmed transactions "+
+			"examined, per wallet, each time the maintainer searches for "+
+			"matching (unproven protocol) transactions.",
 	)
 
 	command.Flags().DurationVar(
