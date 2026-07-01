@@ -304,13 +304,17 @@ func (n *node) joinDKGIfEligible(
 // challenge. If the result is valid and the given node was involved in the DKG,
 // this function schedules an on-chain approve that is submitted once the
 // challenge period elapses.
+//
+// It returns a nil error once the result has been terminally handled and a
+// non-nil error when a transient failure prevented handling from completing,
+// so the caller can retry on a later redelivery of the same event.
 func (n *node) validateDKG(
 	seed *big.Int,
 	submissionBlock uint64,
 	result *DKGChainResult,
 	resultHash [32]byte,
-) {
-	n.dkgExecutor.executeDkgValidation(seed, submissionBlock, result, resultHash)
+) error {
+	return n.dkgExecutor.executeDkgValidation(seed, submissionBlock, result, resultHash)
 }
 
 // getSigningExecutor gets the signing executor responsible for executing

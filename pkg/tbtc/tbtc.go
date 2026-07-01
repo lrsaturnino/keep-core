@@ -260,34 +260,20 @@ func Initialize(
 
 	_ = chain.OnDKGResultSubmitted(func(event *DKGResultSubmittedEvent) {
 		go func() {
-			if ok := deduplicator.notifyDKGResultSubmitted(
-				event.Seed,
-				event.ResultHash,
-				event.BlockNumber,
-			); !ok {
-				logger.Warnf(
-					"Result with hash [0x%x] for DKG with seed [0x%x] "+
-						"and starting block [%v] has been already processed",
-					event.ResultHash,
-					event.Seed,
-					event.BlockNumber,
-				)
-				return
-			}
-
-			logger.Infof(
-				"Result with hash [0x%x] for DKG with seed [0x%x] "+
-					"submitted at block [%v]",
-				event.ResultHash,
-				event.Seed,
-				event.BlockNumber,
-			)
-
-			node.validateDKG(
-				event.Seed,
-				event.BlockNumber,
-				event.Result,
-				event.ResultHash,
+			// handleDKGResultSubmittedEvent records the deduplication entry as
+			// completed only after validation reaches a terminal state, so a
+			// transient failure below leaves the event retryable on redelivery.
+			handleDKGResultSubmittedEvent(
+				deduplicator,
+				event,
+				func(event *DKGResultSubmittedEvent) error {
+					return node.validateDKG(
+						event.Seed,
+						event.BlockNumber,
+						event.Result,
+						event.ResultHash,
+					)
+				},
 			)
 		}()
 	})

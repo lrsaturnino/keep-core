@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"math/big"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/keep-network/keep-common/pkg/cache"
@@ -39,6 +40,17 @@ type deduplicator struct {
 	dkgSeedCache       *cache.TimeCache
 	dkgResultHashCache *cache.TimeCache
 	walletClosedCache  *cache.TimeCache
+
+	// inProgressMutex guards the inProgress set below.
+	inProgressMutex sync.Mutex
+	// inProgress tracks event keys that have been claimed for handling but
+	// whose handling has not yet completed successfully. Keeping claimed but
+	// unfinished events here (rather than immediately in the completed caches
+	// above) lets concurrent duplicate deliveries be ignored while still
+	// allowing a later redelivery to retry the handling if the current attempt
+	// fails. An event key is moved into its completed cache only once its
+	// handler finishes successfully.
+	inProgress map[string]bool
 }
 
 func newDeduplicator() *deduplicator {
@@ -46,7 +58,60 @@ func newDeduplicator() *deduplicator {
 		dkgSeedCache:       cache.NewTimeCache(DKGSeedCachePeriod),
 		dkgResultHashCache: cache.NewTimeCache(DKGResultHashCachePeriod),
 		walletClosedCache:  cache.NewTimeCache(WalletClosedCachePeriod),
+		inProgress:         make(map[string]bool),
 	}
+}
+
+// claim attempts to reserve the given event, identified by key, for handling.
+// It returns true when the caller should proceed with handling the event and
+// false when the event has already been handled successfully (it lives in
+// completedCache) or is currently being handled by another goroutine (it lives
+// in the inProgress set).
+//
+// A successful claim must be paired with exactly one later call: markCompleted
+// once the handler finishes successfully, or release if the handler fails.
+// Releasing a failed claim (instead of marking it completed) is what lets a
+// later redelivery of the same event retry the handling rather than being
+// silently dropped as a duplicate.
+func (d *deduplicator) claim(completedCache *cache.TimeCache, key string) bool {
+	d.inProgressMutex.Lock()
+	defer d.inProgressMutex.Unlock()
+
+	// Drop expired entries so a long-past event can be handled again.
+	completedCache.Sweep()
+
+	if completedCache.Has(key) {
+		return false
+	}
+
+	if d.inProgress[key] {
+		return false
+	}
+
+	d.inProgress[key] = true
+	return true
+}
+
+// markCompleted records the claimed event, identified by key, as successfully
+// handled and releases the in-progress claim. Subsequent deliveries of the same
+// event are treated as duplicates until the completedCache entry expires.
+func (d *deduplicator) markCompleted(completedCache *cache.TimeCache, key string) {
+	d.inProgressMutex.Lock()
+	defer d.inProgressMutex.Unlock()
+
+	completedCache.Add(key)
+	delete(d.inProgress, key)
+}
+
+// release drops the in-progress claim for the given event, identified by key,
+// without recording it as completed. It is called when handling fails so a
+// later redelivery of the same event can be retried instead of being dropped
+// as a duplicate.
+func (d *deduplicator) release(key string) {
+	d.inProgressMutex.Lock()
+	defer d.inProgressMutex.Unlock()
+
+	delete(d.inProgress, key)
 }
 
 // notifyDKGStarted notifies the client wants to start the distributed key
@@ -71,30 +136,62 @@ func (d *deduplicator) notifyDKGStarted(
 	return false
 }
 
+// dkgResultSubmittedKey builds the deduplication key identifying a DKG result
+// submission event.
+func dkgResultSubmittedKey(
+	newDKGResultSeed *big.Int,
+	newDKGResultHash DKGChainResultHash,
+	newDKGResultBlock uint64,
+) string {
+	return newDKGResultSeed.Text(16) +
+		hex.EncodeToString(newDKGResultHash[:]) +
+		strconv.Itoa(int(newDKGResultBlock))
+}
+
 // notifyDKGResultSubmitted notifies the client wants to start some actions
 // upon the DKG result submission. It returns boolean indicating whether the
 // client should proceed with the actions or ignore the event as a duplicate.
+//
+// A successful claim must be released with confirmDKGResultSubmitted once the
+// result has been validated (challenged if invalid, or its approval scheduled
+// if valid) or with abortDKGResultSubmitted if validation did not reach a
+// terminal state, so a later redelivery of the same event can retry.
 func (d *deduplicator) notifyDKGResultSubmitted(
 	newDKGResultSeed *big.Int,
 	newDKGResultHash DKGChainResultHash,
 	newDKGResultBlock uint64,
 ) bool {
-	d.dkgResultHashCache.Sweep()
+	return d.claim(
+		d.dkgResultHashCache,
+		dkgResultSubmittedKey(newDKGResultSeed, newDKGResultHash, newDKGResultBlock),
+	)
+}
 
-	cacheKey := newDKGResultSeed.Text(16) +
-		hex.EncodeToString(newDKGResultHash[:]) +
-		strconv.Itoa(int(newDKGResultBlock))
+// confirmDKGResultSubmitted marks the given DKG result submission as
+// successfully handled so subsequent deliveries of the same event are ignored
+// as duplicates.
+func (d *deduplicator) confirmDKGResultSubmitted(
+	newDKGResultSeed *big.Int,
+	newDKGResultHash DKGChainResultHash,
+	newDKGResultBlock uint64,
+) {
+	d.markCompleted(
+		d.dkgResultHashCache,
+		dkgResultSubmittedKey(newDKGResultSeed, newDKGResultHash, newDKGResultBlock),
+	)
+}
 
-	// If the key is not in the cache, that means the result was not handled
-	// yet and the client should proceed with the execution.
-	if !d.dkgResultHashCache.Has(cacheKey) {
-		d.dkgResultHashCache.Add(cacheKey)
-		return true
-	}
-
-	// Otherwise, the DKG result is a duplicate and the client should not
-	// proceed with the execution.
-	return false
+// abortDKGResultSubmitted releases the in-progress claim for the given DKG
+// result submission without marking it handled, so a later redelivery of the
+// same event can retry the validation.
+func (d *deduplicator) abortDKGResultSubmitted(
+	newDKGResultSeed *big.Int,
+	newDKGResultHash DKGChainResultHash,
+	newDKGResultBlock uint64,
+) {
+	d.release(
+		dkgResultSubmittedKey(newDKGResultSeed, newDKGResultHash, newDKGResultBlock),
+	)
 }
 
 func (d *deduplicator) notifyWalletClosed(
