@@ -156,24 +156,28 @@ func TestNotifyDKGResultSubmitted_RetryOpenAfterAbort(t *testing.T) {
 func TestNotifyWalletClosed(t *testing.T) {
 	deduplicator := deduplicator{
 		walletClosedCache: cache.NewTimeCache(testWalletClosedCachePeriod),
+		inProgress:        make(map[string]bool),
 	}
 
 	wallet1 := [32]byte{1}
 	wallet2 := [32]byte{2}
 
-	// Add the first wallet ID.
+	// Claim and confirm the first wallet ID.
 	canProcess := deduplicator.notifyWalletClosed(wallet1)
 	if !canProcess {
 		t.Fatal("should be allowed to process")
 	}
+	deduplicator.confirmWalletClosed(wallet1)
 
-	// Add the second wallet ID.
+	// Claim and confirm the second wallet ID.
 	canProcess = deduplicator.notifyWalletClosed(wallet2)
 	if !canProcess {
 		t.Fatal("should be allowed to process")
 	}
+	deduplicator.confirmWalletClosed(wallet2)
 
-	// Add the first wallet ID before caching period elapses.
+	// The first wallet ID is now a confirmed duplicate before the caching
+	// period elapses.
 	canProcess = deduplicator.notifyWalletClosed(wallet1)
 	if canProcess {
 		t.Fatal("should not be allowed to process")
@@ -182,9 +186,47 @@ func TestNotifyWalletClosed(t *testing.T) {
 	// Wait until caching period elapses.
 	time.Sleep(testWalletClosedCachePeriod)
 
-	// Add the first wallet ID again.
+	// The first wallet ID can be processed again after expiry.
 	canProcess = deduplicator.notifyWalletClosed(wallet1)
 	if !canProcess {
 		t.Fatal("should be allowed to process")
+	}
+}
+
+// TestNotifyWalletClosed_RetryOpenAfterAbort verifies that a wallet closure
+// whose archival did not complete (aborted) can be retried on a later
+// redelivery, and that a confirmed one is dropped as a duplicate.
+func TestNotifyWalletClosed_RetryOpenAfterAbort(t *testing.T) {
+	deduplicator := deduplicator{
+		walletClosedCache: cache.NewTimeCache(testWalletClosedCachePeriod),
+		inProgress:        make(map[string]bool),
+	}
+
+	wallet := [32]byte{1}
+
+	// Claim the event for handling.
+	if !deduplicator.notifyWalletClosed(wallet) {
+		t.Fatal("first claim should be allowed to process")
+	}
+
+	// While the claim is in progress, a concurrent duplicate delivery must be
+	// ignored.
+	if deduplicator.notifyWalletClosed(wallet) {
+		t.Fatal("in-progress event should not be claimable again")
+	}
+
+	// Archival failed, so the claim is released.
+	deduplicator.abortWalletClosed(wallet)
+
+	// A later redelivery of the same event must be allowed to retry, rather
+	// than being dropped as an already-processed duplicate.
+	if !deduplicator.notifyWalletClosed(wallet) {
+		t.Fatal("event should be claimable again after an aborted attempt")
+	}
+
+	// Once archival completes successfully, further deliveries are duplicates.
+	deduplicator.confirmWalletClosed(wallet)
+	if deduplicator.notifyWalletClosed(wallet) {
+		t.Fatal("confirmed event should not be claimable again")
 	}
 }

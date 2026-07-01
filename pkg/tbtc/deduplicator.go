@@ -194,22 +194,34 @@ func (d *deduplicator) abortDKGResultSubmitted(
 	)
 }
 
+// walletClosedKey builds the deduplication key identifying a wallet closure
+// event.
+func walletClosedKey(walletID [32]byte) string {
+	return hex.EncodeToString(walletID[:])
+}
+
+// notifyWalletClosed notifies the client wants to handle a wallet closure upon
+// receiving an event. It returns a boolean indicating whether the client should
+// proceed with the handling or ignore the event as a duplicate.
+//
+// A successful claim must be released with confirmWalletClosed once the wallet
+// has actually been archived, or with abortWalletClosed if archival did not
+// complete, so a later redelivery of the same event can retry.
 func (d *deduplicator) notifyWalletClosed(
-	WalletID [32]byte,
+	walletID [32]byte,
 ) bool {
-	d.walletClosedCache.Sweep()
+	return d.claim(d.walletClosedCache, walletClosedKey(walletID))
+}
 
-	// Use wallet ID converted to string as the cache key.
-	cacheKey := hex.EncodeToString(WalletID[:])
+// confirmWalletClosed marks the given wallet closure as successfully handled so
+// subsequent deliveries of the same event are ignored as duplicates.
+func (d *deduplicator) confirmWalletClosed(walletID [32]byte) {
+	d.markCompleted(d.walletClosedCache, walletClosedKey(walletID))
+}
 
-	// If the key is not in the cache, that means the wallet closure was not
-	// handled yet and the client should proceed with the execution.
-	if !d.walletClosedCache.Has(cacheKey) {
-		d.walletClosedCache.Add(cacheKey)
-		return true
-	}
-
-	// Otherwise, the wallet closure is a duplicate and the client should not
-	// proceed with the execution.
-	return false
+// abortWalletClosed releases the in-progress claim for the given wallet closure
+// without marking it handled, so a later redelivery of the same event can retry
+// the archival.
+func (d *deduplicator) abortWalletClosed(walletID [32]byte) {
+	d.release(walletClosedKey(walletID))
 }
