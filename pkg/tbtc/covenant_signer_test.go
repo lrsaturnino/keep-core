@@ -1080,6 +1080,60 @@ func TestNode_InvalidateSigningExecutorEvictsCachedExecutorOnArchival(t *testing
 	}
 }
 
+func TestArchiveClosedWallets_SkipsWalletNotYetRegisteredOnChain(t *testing.T) {
+	node, _, walletPublicKey := setupCovenantSignerTestNode(t)
+
+	localChain, ok := node.chain.(*localChain)
+	if !ok {
+		t.Fatal("expected local chain implementation")
+	}
+
+	// Simulate a freshly generated wallet that is present in the local wallet
+	// registry but not yet recorded on-chain by the Bridge, i.e. still inside
+	// the DKG approval window.
+	walletPublicKeyHash := bitcoin.PublicKeyHash(walletPublicKey)
+	localChain.walletsMutex.Lock()
+	delete(localChain.wallets, walletPublicKeyHash)
+	localChain.walletsMutex.Unlock()
+
+	if err := node.archiveClosedWallets(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// The pending wallet must be left in place, not archived.
+	if len(node.walletRegistry.getSigners(walletPublicKey)) == 0 {
+		t.Fatal("expected the not-yet-registered wallet to be left in place, but it was archived")
+	}
+}
+
+func TestArchiveClosedWallets_ArchivesClosedWallet(t *testing.T) {
+	node, _, walletPublicKey := setupCovenantSignerTestNode(t)
+
+	localChain, ok := node.chain.(*localChain)
+	if !ok {
+		t.Fatal("expected local chain implementation")
+	}
+
+	// Transition the on-chain wallet to the closed state, keeping its identity.
+	walletPublicKeyHash := bitcoin.PublicKeyHash(walletPublicKey)
+	existing, err := localChain.GetWallet(walletPublicKeyHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := *existing
+	closed.State = StateClosed
+	localChain.setWallet(walletPublicKeyHash, &closed)
+
+	if err := node.archiveClosedWallets(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// The closed wallet must be archived.
+	if len(node.walletRegistry.getSigners(walletPublicKey)) != 0 {
+		t.Fatal("expected the closed wallet to be archived, but it is still present")
+	}
+}
+
 func setupCovenantSignerTestNode(
 	t *testing.T,
 ) (*node, *localBitcoinChain, *ecdsa.PublicKey) {

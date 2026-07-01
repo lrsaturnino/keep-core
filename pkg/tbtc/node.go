@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math/big"
 	"sync"
@@ -1301,29 +1302,31 @@ func (n *node) archiveClosedWallets() error {
 	for _, walletPublicKey := range walletPublicKeys {
 		walletPublicKeyHash := bitcoin.PublicKeyHash(walletPublicKey)
 
-		walletID, err := n.chain.CalculateWalletID(walletPublicKey)
+		walletChainData, err := n.chain.GetWallet(walletPublicKeyHash)
 		if err != nil {
+			if errors.Is(err, ErrWalletNotFound) {
+				// The wallet is not recorded on-chain by the Bridge. This is the
+				// case for a freshly generated wallet whose DKG result has not
+				// yet been approved on-chain; during that approval window the
+				// wallet exists only on the node's disk. Such a wallet must not
+				// be archived because it may be about to become active. Only
+				// wallets that were registered on-chain and are now closed or
+				// terminated should be archived, so leave this one in place.
+				continue
+			}
+
 			return fmt.Errorf(
-				"could not calculate wallet ID for wallet with public key "+
+				"could not get on-chain data for wallet with public key "+
 					"hash [0x%x]: [%v]",
 				walletPublicKeyHash,
 				err,
 			)
 		}
 
-		isRegistered, err := n.chain.IsWalletRegistered(walletID)
-		if err != nil {
-			return fmt.Errorf(
-				"could not check if wallet is registered for wallet with ID "+
-					"[0x%x]: [%v]",
-				walletPublicKeyHash,
-				err,
-			)
-		}
-
-		if !isRegistered {
-			// If the wallet is no longer registered it means the wallet has
-			// been closed or terminated.
+		// The wallet is recorded on-chain, so it has been registered. Archive it
+		// only if it has reached a closed or terminated state.
+		if walletChainData.State == StateClosed ||
+			walletChainData.State == StateTerminated {
 			err := n.walletRegistry.archiveWallet(walletPublicKeyHash)
 			if err != nil {
 				return fmt.Errorf(
@@ -1334,10 +1337,10 @@ func (n *node) archiveClosedWallets() error {
 			}
 
 			logger.Infof(
-				"successfully archived wallet with ID [0x%x] and public key "+
-					"hash [0x%x]",
-				walletID,
+				"successfully archived wallet with public key hash [0x%x] "+
+					"in state [%v]",
 				walletPublicKeyHash,
+				walletChainData.State,
 			)
 		}
 	}
