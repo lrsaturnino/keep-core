@@ -770,9 +770,23 @@ func (cse *covenantSignerEngine) buildCovenantTransactionBuilder(
 	activeUtxo *bitcoin.UnspentTransactionOutput,
 	witnessScript bitcoin.Script,
 ) (*bitcoin.TransactionBuilder, error) {
-	destinationScript, err := decodePrefixedHex(request.MigrationDestination.DepositScript)
+	destinationDepositScript, err := decodePrefixedHex(request.MigrationDestination.DepositScript)
 	if err != nil {
 		return nil, fmt.Errorf("migration destination deposit script is invalid")
+	}
+	if len(destinationDepositScript) == 0 {
+		return nil, fmt.Errorf("migration destination deposit script must not be empty")
+	}
+	// MigrationDestination.DepositScript is the plain tBTC deposit script, not a
+	// ready-made output script. The Bitcoin funding output must pay to its P2WSH
+	// script hash (OP_0 <sha256(depositScript)>), which is how the tBTC Bridge
+	// rebuilds and verifies the funding output in revealDepositWithExtraData.
+	// Using the plain deposit script directly as the output script would make
+	// the migration deposit unrevealable to the Bridge.
+	destinationWitnessScriptHash := bitcoin.WitnessScriptHash(destinationDepositScript)
+	destinationScriptPubKey, err := bitcoin.PayToWitnessScriptHash(destinationWitnessScriptHash)
+	if err != nil {
+		return nil, fmt.Errorf("cannot build migration destination locking script: %v", err)
 	}
 	destinationValue, err := toBitcoinOutputValue(
 		request.MigrationTransactionPlan.DestinationValueSats,
@@ -799,7 +813,7 @@ func (cse *covenantSignerEngine) buildCovenantTransactionBuilder(
 	builder.SetLocktime(request.MigrationTransactionPlan.LockTime)
 	builder.AddOutput(&bitcoin.TransactionOutput{
 		Value:           destinationValue,
-		PublicKeyScript: destinationScript,
+		PublicKeyScript: destinationScriptPubKey,
 	})
 
 	anchorScript, err := canonicalAnchorScriptPubKey()

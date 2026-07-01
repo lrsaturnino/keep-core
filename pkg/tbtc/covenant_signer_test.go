@@ -250,8 +250,20 @@ func TestCovenantSignerEngine_SubmitSelfV1Ready(t *testing.T) {
 	if transaction.Outputs[0].Value != int64(destinationValueSats) {
 		t.Fatalf("unexpected destination value: %d", transaction.Outputs[0].Value)
 	}
-	if !bytes.Equal(transaction.Outputs[0].PublicKeyScript, destinationScript) {
+	// The destination output must pay to the P2WSH script hash of the deposit
+	// script (OP_0 <sha256(depositScript)>), not to the plain deposit script
+	// itself; otherwise the migration deposit is unrevealable to the tBTC Bridge.
+	expectedDestinationScript, err := bitcoin.PayToWitnessScriptHash(
+		bitcoin.WitnessScriptHash(destinationScript),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(transaction.Outputs[0].PublicKeyScript, expectedDestinationScript) {
 		t.Fatal("unexpected destination output script")
+	}
+	if bytes.Equal(transaction.Outputs[0].PublicKeyScript, destinationScript) {
+		t.Fatal("destination output must not be the raw deposit script")
 	}
 
 	expectedAnchorScript, err := canonicalAnchorScriptPubKey()
@@ -517,8 +529,20 @@ func TestCovenantSignerEngine_SubmitQcV1HandoffReady(t *testing.T) {
 	if unsignedTransaction.Outputs[0].Value != int64(destinationValueSats) {
 		t.Fatalf("unexpected destination value: %d", unsignedTransaction.Outputs[0].Value)
 	}
-	if !bytes.Equal(unsignedTransaction.Outputs[0].PublicKeyScript, destinationScript) {
+	// The destination output must pay to the P2WSH script hash of the deposit
+	// script (OP_0 <sha256(depositScript)>), not to the plain deposit script
+	// itself; otherwise the migration deposit is unrevealable to the tBTC Bridge.
+	expectedDestinationScript, err := bitcoin.PayToWitnessScriptHash(
+		bitcoin.WitnessScriptHash(destinationScript),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(unsignedTransaction.Outputs[0].PublicKeyScript, expectedDestinationScript) {
 		t.Fatal("unexpected destination output script")
+	}
+	if bytes.Equal(unsignedTransaction.Outputs[0].PublicKeyScript, destinationScript) {
+		t.Fatal("destination output must not be the raw deposit script")
 	}
 
 	expectedAnchorScript, err := canonicalAnchorScriptPubKey()
