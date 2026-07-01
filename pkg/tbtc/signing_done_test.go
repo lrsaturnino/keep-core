@@ -293,6 +293,88 @@ func TestSigningDoneCheck_AnotherSignature(t *testing.T) {
 	}
 }
 
+// TestSigningDoneCheck_ConcurrentDoneSignersAccess exercises the concurrent
+// access to the doneSigners map: the listen goroutine writes to the map as done
+// messages arrive while waitUntilAllDone reads it on every tick. It is meant to
+// be run with the race detector (go test -race); without the doneSigners mutex
+// guarding every access, the concurrent read/write is a data race.
+//
+// Done messages are broadcast with the standard, stateless retransmission
+// strategy so this test isolates the doneSigners race and does not depend on
+// the separate backoff-strategy synchronization.
+func TestSigningDoneCheck_ConcurrentDoneSignersAccess(t *testing.T) {
+	groupParameters := &GroupParameters{
+		GroupSize:       5,
+		GroupQuorum:     4,
+		HonestThreshold: 3,
+	}
+
+	doneCheck := setupSigningDoneCheck(t, groupParameters)
+
+	memberIndexes := make([]group.MemberIndex, doneCheck.groupSize)
+	for i := range memberIndexes {
+		memberIndexes[i] = group.MemberIndex(i + 1)
+	}
+
+	ctx, cancelCtx := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelCtx()
+
+	message := big.NewInt(100)
+	attemptNumber := uint64(1)
+	attemptTimeoutBlock := uint64(1000)
+	attemptMemberIndexes := memberIndexes[:groupParameters.HonestThreshold]
+	result := &signing.Result{
+		Signature: &tecdsa.Signature{
+			R:          big.NewInt(200),
+			S:          big.NewInt(300),
+			RecoveryID: 2,
+		},
+	}
+
+	// Start the listener goroutine, which writes to doneSigners as messages
+	// arrive.
+	doneCheck.listen(
+		ctx,
+		message,
+		attemptNumber,
+		attemptTimeoutBlock,
+		attemptMemberIndexes,
+	)
+
+	// Concurrently broadcast every attempt member's done message so the listener
+	// writes to doneSigners while waitUntilAllDone reads it below.
+	for _, memberIndex := range attemptMemberIndexes {
+		go func(memberIndex group.MemberIndex) {
+			_ = doneCheck.broadcastChannel.Send(
+				ctx,
+				&signingDoneMessage{
+					senderID:      memberIndex,
+					message:       message,
+					attemptNumber: attemptNumber,
+					signature:     result.Signature,
+					endBlock:      500 + uint64(memberIndex),
+				},
+				net.StandardRetransmissionStrategy,
+			)
+		}(memberIndex)
+	}
+
+	returnedResult, _, err := doneCheck.waitUntilAllDone(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: [%v]", err)
+	}
+	if returnedResult == nil {
+		t.Fatal("unexpected nil result")
+	}
+	if !result.Signature.Equals(returnedResult.Signature) {
+		t.Errorf(
+			"unexpected signature\nexpected: [%v]\nactual:   [%v]",
+			result.Signature,
+			returnedResult.Signature,
+		)
+	}
+}
+
 // setupSigningDoneCheck sets up an instance of the signing done check ready
 // to perform test checks.
 func setupSigningDoneCheck(
