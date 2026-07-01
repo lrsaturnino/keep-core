@@ -260,11 +260,28 @@ func verifySignerApprovalCertificate(
 		return fmt.Errorf("cannot parse threshold signature: %w", err)
 	}
 
+	// Reject non-canonical high-S signatures. ECDSA signatures are malleable:
+	// for a valid secp256k1 signature (r, s), the signature (r, N - s) also
+	// verifies for the same message and key. Only the canonical low-S form is
+	// accepted, matching the rule already applied by the covenant signer
+	// artifact approval verifier.
+	if !isLowSSecp256k1(parsedSignature.S) {
+		return fmt.Errorf("threshold signature must be a low-S secp256k1 signature")
+	}
+
 	if !ecdsa.Verify(walletPublicKey, approvalDigest, parsedSignature.R, parsedSignature.S) {
 		return fmt.Errorf("threshold signature does not verify against wallet public key")
 	}
 
 	return nil
+}
+
+// isLowSSecp256k1 reports whether the given signature S value is in the
+// canonical low-S form (S <= N/2) for the secp256k1 curve. High-S values make
+// ECDSA signatures malleable, so only low-S signatures are accepted.
+func isLowSSecp256k1(s *big.Int) bool {
+	halfOrder := new(big.Int).Rsh(new(big.Int).Set(btcec.S256().N), 1)
+	return s.Cmp(halfOrder) <= 0
 }
 
 func decodeSignerApprovalCertificateHex(
