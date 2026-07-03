@@ -1390,8 +1390,8 @@ contract RandomBeaconGovernance is Ownable {
         emit AuthorizationDecreaseDelayUpdated(newAuthorizationDecreaseDelay);
         (
             uint96 minimumAuthorization,
-            uint64 authorizationDecreaseChangePeriod,
-
+            ,
+            uint64 authorizationDecreaseChangePeriod
         ) = randomBeacon.authorizationParameters();
         // slither-disable-next-line reentrancy-no-eth
         randomBeacon.updateAuthorizationParameters(

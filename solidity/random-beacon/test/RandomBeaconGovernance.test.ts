@@ -2906,6 +2906,19 @@ describe("RandomBeaconGovernance", () => {
         before(async () => {
           await createSnapshot()
 
+          // Set the authorization decrease change period to a value distinct
+          // from the authorization decrease delay. Finalizing a delay update
+          // must preserve the change period; keeping the two values different
+          // lets the assertions detect an accidental overwrite of the change
+          // period with the previous delay value.
+          await randomBeaconGovernance
+            .connect(governance)
+            .beginAuthorizationDecreaseChangePeriodUpdate(201_600)
+          await helpers.time.increaseTime(governanceDelay)
+          await randomBeaconGovernance
+            .connect(governance)
+            .finalizeAuthorizationDecreaseChangePeriodUpdate()
+
           await randomBeaconGovernance
             .connect(governance)
             .beginAuthorizationDecreaseDelayUpdate(123)
@@ -2925,6 +2938,12 @@ describe("RandomBeaconGovernance", () => {
           const { authorizationDecreaseDelay } =
             await randomBeacon.authorizationParameters()
           expect(authorizationDecreaseDelay).to.be.equal(123)
+        })
+
+        it("should preserve the authorization decrease change period", async () => {
+          const { authorizationDecreaseChangePeriod } =
+            await randomBeacon.authorizationParameters()
+          expect(authorizationDecreaseChangePeriod).to.be.equal(201_600)
         })
 
         it("should emit AuthorizationDecreaseDelayUpdated event", async () => {
