@@ -114,11 +114,15 @@ func TestG1HashToPointValidPoint(t *testing.T) {
 }
 
 // TestG1HashToPointWireFormat pins the marshalled G1 output for a small set of
-// known inputs. G1HashToPoint participates in BLS relay-entry signing and in
-// the GJKR DKG Pedersen generator derivation, so any change in its output for
-// the same input is a wire-breaking change requiring a coordinated network
-// upgrade (see SECURITY-BREAKING-CHANGES.md and F-02.md). If this test fails,
-// do NOT update the expected values without scheduling a network cutover.
+// known inputs. G1HashToPoint's only operational consumer is the GJKR DKG
+// Pedersen commitment generator H, which every group member derives from the
+// shared beacon seed (pkg/beacon/gjkr/protocol_parameters.go); all members must
+// derive an identical H, so its output must agree node-to-node. (The relay-entry
+// path signs and verifies raw G1 points via bls.SignG1/VerifyG1 and never routes
+// through this function.) Any change in its output for the same input is a
+// wire-breaking change requiring a coordinated network upgrade (see
+// SECURITY-BREAKING-CHANGES.md and F-02.md). If this test fails, do NOT update
+// the expected values without scheduling a network cutover.
 func TestG1HashToPointWireFormat(t *testing.T) {
 	vectors := []struct {
 		input       []byte

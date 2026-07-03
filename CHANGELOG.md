@@ -54,6 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `altbn128.G1HashToPoint` reimplemented from try-and-increment to a bounded counter-based `SHA-256(m || ctr)` (max 64 attempts); it produces a different G1 point for the same input (consensus-incompatible) and now panics if no valid point is found within the bound (#2)
 - `RandomBeacon` relay-entry gas offset `_relayEntrySubmissionGasOffset` raised from 11250 to 13450 to account for the reentrancy-guard SSTOREs (mirrored in the test fixture) (#2)
 - Enabled `storageLayout` output selection in the random-beacon Hardhat config, removed `scryptsy` from `yarn.lock`, and added `.envrc*`, `strix_runs/`, and `.claude/` to `.gitignore` (#2)
+- **Operator action required:** the `clientInfo.port` default flipped from `9601` to `0`, which turns the client-info HTTP server (`/metrics` and `/diagnostics`) off by default; operators who relied on the historical default must set `clientInfo.port` explicitly (e.g. `9601`) to keep their Prometheus scrape endpoint reachable after upgrade (#2)
 
 ### Fixed
 - Test interceptor invoked the interception rule twice per `Send`; it is now invoked exactly once per send under a mutex (#34)
