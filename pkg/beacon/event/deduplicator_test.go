@@ -4,6 +4,8 @@ import (
 	"encoding/hex"
 	"github.com/keep-network/keep-common/pkg/cache"
 	"math/big"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -49,6 +51,54 @@ func TestNotifyDKGStarted(t *testing.T) {
 	canJoinDKG = deduplicator.NotifyDKGStarted(seed1)
 	if !canJoinDKG {
 		t.Fatal("should be allowed to join DKG")
+	}
+}
+
+// TestNotifyDKGStartedConcurrent guards against a time-of-check to time-of-use
+// race in NotifyDKGStarted. An earlier implementation performed a separate
+// Has() check followed by Add(), so two goroutines racing on the same seed
+// could both observe the key as absent and both return true, admitting the
+// same DKG instance more than once. The current implementation relies on
+// cache.TimeCache.Add() being mutex-serialized and returning true only for the
+// first inserter. This test releases many goroutines on the same seed behind a
+// barrier and asserts that exactly one caller is allowed to proceed.
+func TestNotifyDKGStartedConcurrent(t *testing.T) {
+	const callers = 100
+
+	deduplicator := &Deduplicator{
+		chain:        &testChain{},
+		dkgSeedCache: cache.NewTimeCache(testDKGSeedCachePeriod),
+	}
+	seed := big.NewInt(42)
+
+	var wins int32
+	var ready, start sync.WaitGroup
+	ready.Add(callers)
+	start.Add(1)
+
+	results := make(chan bool, callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			ready.Done()
+			start.Wait()
+			results <- deduplicator.NotifyDKGStarted(seed)
+		}()
+	}
+	ready.Wait()
+	start.Done()
+
+	for i := 0; i < callers; i++ {
+		if <-results {
+			atomic.AddInt32(&wins, 1)
+		}
+	}
+	if got := atomic.LoadInt32(&wins); got != 1 {
+		t.Fatalf(
+			"%d/%d concurrent NotifyDKGStarted calls returned true; "+
+				"want exactly 1",
+			got,
+			callers,
+		)
 	}
 }
 

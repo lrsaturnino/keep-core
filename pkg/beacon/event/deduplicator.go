@@ -62,16 +62,13 @@ func (d *Deduplicator) NotifyDKGStarted(
 
 	// The cache key is the hexadecimal representation of the seed.
 	cacheKey := newDKGSeed.Text(16)
-	// If the key is not in the cache, that means the seed was not handled
-	// yet and the client should proceed with the execution.
-	if !d.dkgSeedCache.Has(cacheKey) {
-		d.dkgSeedCache.Add(cacheKey)
-		return true
-	}
-
-	// Otherwise, the DKG seed is a duplicate and the client should not proceed
-	// with the execution.
-	return false
+	// Add is mutex-serialized and atomically checks and inserts the key. It
+	// returns true only if the seed was not already present, meaning it was
+	// not handled yet and the client should proceed with the execution.
+	// Otherwise it returns false and the event is ignored as a duplicate.
+	// Performing the check and the insertion as a single atomic operation
+	// avoids a time-of-check to time-of-use race between concurrent callers.
+	return d.dkgSeedCache.Add(cacheKey)
 }
 
 // NotifyRelayEntryStarted notifies the client wants to start relay entry
