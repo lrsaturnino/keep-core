@@ -19,9 +19,6 @@ import (
 
 var logger = log.Logger("keep-maintainer-spv")
 
-// The length of the Bitcoin difficulty epoch in blocks.
-const difficultyEpochLength = 2016
-
 // The maximum number of block headers allowed in a single SPV proof. Bounds
 // the forward walk over headers when computing required confirmations
 // (relevant on testnet4 where long runs of minimum-difficulty blocks occur).
@@ -376,9 +373,11 @@ func getProofInfo(
 
 	for {
 		if headerCount >= maxProofHeaders {
-			// Could not find a decisive header or accumulate enough
-			// difficulty within a sane number of headers. Skip the
-			// transaction; it may become provable later.
+			// Reached maxProofHeaders without finding a decisive header or
+			// accumulating enough difficulty. The forward walk is anchored at
+			// the transaction's confirming block, so growing the chain does not
+			// move this window; absent a reorg the outcome is fixed and the
+			// transaction is skipped permanently, not merely deferred.
 			return false, 0, 0, nil
 		}
 
