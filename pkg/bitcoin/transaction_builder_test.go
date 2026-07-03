@@ -135,7 +135,7 @@ func TestTransactionBuilder_AddInputReturnsErrorForOutOfRangeOutputIndex(
 	if err == nil {
 		t.Fatal("expected out-of-range output index error")
 	}
-	if !strings.Contains(err.Error(), "output index [3] out of range") {
+	if !strings.Contains(err.Error(), "output index [3] is out of range") {
 		t.Fatalf("unexpected error: [%v]", err)
 	}
 }
