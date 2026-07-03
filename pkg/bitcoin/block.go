@@ -128,6 +128,15 @@ func (bh *BlockHeader) Difficulty() *big.Int {
 
 	target := bh.Target()
 
+	// A malformed or zero-mantissa `Bits` field (e.g. 0x03000000) makes
+	// Target() return zero. Guard against it, as dividing by a zero target
+	// would panic. A zero or negative target yields zero difficulty, which is
+	// the safe, non-panicking result: such a header contributes no difficulty
+	// and gracefully fails downstream proof-difficulty checks.
+	if target.Sign() <= 0 {
+		return big.NewInt(0)
+	}
+
 	difficulty := new(big.Int)
 	difficulty.Div(maxTarget, target)
 

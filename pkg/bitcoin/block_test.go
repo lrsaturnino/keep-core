@@ -226,3 +226,28 @@ func TestBlockHeaderDifficulty_LowestDifficulty(t *testing.T) {
 		actualDifficulty,
 	)
 }
+
+func TestBlockHeaderDifficulty_ZeroTarget(t *testing.T) {
+	// A malformed `Bits` field with a zero mantissa (here 0x03000000) makes
+	// Target() return zero. Difficulty() must not panic on the division and
+	// must instead report zero difficulty.
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Difficulty() panicked on a zero target: %v", r)
+		}
+	}()
+
+	blockHeader := BlockHeader{
+		Bits: 0x03000000,
+	}
+
+	actualDifficulty := blockHeader.Difficulty()
+	expectedDifficulty := big.NewInt(0)
+
+	testutils.AssertBigIntsEqual(
+		t,
+		"difficulty",
+		expectedDifficulty,
+		actualDifficulty,
+	)
+}
