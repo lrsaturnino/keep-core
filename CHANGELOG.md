@@ -33,7 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `dkgtest` log-capture harness: thread-safe `capturingLogger` (records `Errorf` output that `MockLogger` discards), `(*dkgtest.Result).LoggedErrors()` accessor, and `dkgtest.AssertNoReconstructionGap` assertion that fails the test if the guard's "missing revealed share" error ever fires, making the absence of the F-008 gap observable (#40)
 - Unit test `TestCapturingLoggerAndGapDetection` verifying the capture/detection logic (positive and negative cases) so the new assertion cannot be vacuously green (#40)
 - `security/` directory with white-box pentest deliverables: architecture, attack surface, critical paths, crypto review, threat model, and smart-contracts analysis, plus 17 verified findings (F-01 through F-17) each with a code reference and status (#2)
-- `SECURITY-BREAKING-CHANGES.md` documenting the F-02/F-03 wire-breaking changes and the required coordinated-upgrade path (#2)
+- `SECURITY-BREAKING-CHANGES.md` documenting the F-02/F-03 wire-breaking changes, the BC-1..BC-10 / OV-1..OV-3 operator reference table, and the required coordinated-upgrade path (#2)
 - Domain-separation info labels for ECDH key derivation: `gjkrEcdhInfo`, `dkgEcdhInfo` (`tecdsa-dkg`), and `signingEcdhInfo` (`tecdsa-sign`), plus a compile-time assertion that `MemberIndex` is 1 byte (#2)
 - Tests for ECDH domain separation, `G1HashToPoint` determinism/wire-format, deduplicator concurrency, and Solidity reentrancy + storage layout (#2)
 - Per-PR breaking-change, redeploy, and risk analysis notes under `keep-core-release/<org>/<repo>/<pr>.md`, covering this repo's PRs (#2, #8, #9, #10, #11, #13) and upstream Threshold repos keep-core (#3945, #3948, #3952), keep-common (#16, #17), and tss-lib (#4, #5, #6) (#14)
@@ -55,6 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RandomBeacon` relay-entry gas offset `_relayEntrySubmissionGasOffset` raised from 11250 to 13450 to account for the reentrancy-guard SSTOREs (mirrored in the test fixture) (#2)
 - Enabled `storageLayout` output selection in the random-beacon Hardhat config, removed `scryptsy` from `yarn.lock`, and added `.envrc*`, `strix_runs/`, and `.claude/` to `.gitignore` (#2)
 - **Operator action required:** the `clientInfo.port` default flipped from `9601` to `0`, which turns the client-info HTTP server (`/metrics` and `/diagnostics`) off by default; operators who relied on the historical default must set `clientInfo.port` explicitly (e.g. `9601`) to keep their Prometheus scrape endpoint reachable after upgrade (#2)
+- **Operator action required:** renamed the libp2p peer-count metric from `connected_bootstrap_count` to `connected_wellknown_peers_count` to match bootstrap removal (#3909); update dashboards and alerts that query the old name (#3909)
 
 ### Fixed
 - Test interceptor invoked the interception rule twice per `Send`; it is now invoked exactly once per send under a mutex (#34)

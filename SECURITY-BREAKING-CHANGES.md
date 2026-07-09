@@ -136,6 +136,41 @@ signing flows.
 
 ---
 
+## Security release operator reference (BC-1..BC-10, OV-1..OV-3)
+
+The table below is the operator-facing index for the coordinated security
+release (`security-release/candidate-1`). Items marked **breaking** require a
+flag-day upgrade of every participant in the same DKG or signing ceremony.
+Operator-visible (OV) items do not change wire formats but may require config or
+monitoring updates.
+
+### Breaking changes
+
+| ID | Area | What breaks | Who must act |
+|----|------|-------------|--------------|
+| **BC-1** | tss-lib | Fiat-Shamir / proof challenges use tagged hashing + session binding; old and new proofs **do not cross-verify** | **All operators simultaneously** |
+| **BC-2** | tss-lib + keep-core | `SetSessionNonce` / `SetSessionNonceBytes` **mandatory** before keygen/signing `Start()`; session ID must be ≥16 bytes | keep-core wires this; external callers with short IDs **panic** |
+| **BC-3** | tss-lib + keep-core | ECDSA signing requires positive `fullBytesLen` at construction (panic if omitted/zero) | keep-core passes curve-order byte width |
+| **BC-4** | keep-core | **Session ID formats changed** (wire): DKG `dkg-<seedHex>-<attempt:016x>`; signing `signing-<messageHex>-<startBlock:016x>-<attempt:016x>` | All parties in a ceremony |
+| **BC-5** | keep-core | Signing session ID now includes **attempt start block** — peers disagreeing on block derive different IDs | Coordinator / announcer agreement |
+| **BC-6** | keep-core | `ephemeral.PrivateKey.Ecdh(info []byte)` — **compile break** + HKDF-derived keys differ (wire-incompatible); see **F-03** above | Any external code calling the old signature |
+| **BC-7** | keep-core | `G1HashToPoint` reimplemented — **different G1 point** for the same input; see **F-02** above | Beacon / crypto paths using hash-to-curve |
+| **BC-8** | keep-core | `PrepareForSigning` returns `(wi, bigWs, err)` — **compile break** for callers | Go integrators (no in-tree keep-core callers found) |
+| **BC-9** | keep-core | Bootstrap removal (#3909): embedded well-known peers + **AllowList decoupling** — all peers pass `IsRecognized()` | Operators with custom bootstrap config |
+| **BC-10** | keep-core | RandomBeacon **new storage slot** for reentrancy guard (append-only, proxy-safe) | Contract deploy / upgrade path **only if** beacon proxy upgraded in same train |
+
+### Operator-visible (non-breaking wire)
+
+| ID | Change | Operator action |
+|----|--------|-----------------|
+| **OV-1** | Metrics/diagnostics **opt-in**: `clientInfo.port` default is **0** (HTTP server off) | Set `clientInfo.port` explicitly (e.g. `9601`) if scraping `/metrics` or `/diagnostics` |
+| **OV-2** | Metric rename: `connected_bootstrap_count` → `connected_wellknown_peers_count` | Update Grafana/Prometheus dashboards and alerts |
+| **OV-3** | `--network.bootstrap=true` deprecated (warning only) | Remove from config when convenient |
+
+**tss-lib pin (this release):** `github.com/threshold-network/tss-lib@v0.0.0-20260615180949-86bd1a375cc0` (`86bd1a3`).
+
+---
+
 ## Coordinated upgrade (flag-day) requirement
 
 These changes activate by code alone. There is no on-chain version gate and no
