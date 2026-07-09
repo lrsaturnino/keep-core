@@ -39,6 +39,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Per-PR breaking-change, redeploy, and risk analysis notes under `keep-core-release/<org>/<repo>/<pr>.md`, covering this repo's PRs (#2, #8, #9, #10, #11, #13) and upstream Threshold repos keep-core (#3945, #3948, #3952), keep-common (#16, #17), and tss-lib (#4, #5, #6) (#14)
 - `keep-core-release/<org>/<repo>/<pr>.md` directory convention for tracking post-merge release analysis going forward (#14)
 
+### Release scope (non-security)
+
+The following changes are included in this PR for convenience but are **not** part of the coordinated cryptographic flag-day (BC-1..BC-10). They do not affect DKG/signing wire compatibility and should be treated as independently reviewable operational/CI scope when bisecting or rolling back:
+
+- ClusterFuzzLite continuous fuzzing (`.clusterfuzzlite/`, `.github/workflows/cflite_pr.yml`, `.github/workflows/cflite_batch.yml`) (#37)
+- `.github/workflows/client.yml` rewrite and contract-docs workflow updates (#8, #37)
+- Kubernetes dev Ropsten statefulset/service edits and `eth-tx-rpc-ws-networkpolicy.yaml` (#8)
+- Deletion of `infrastructure/kube/keep-prd/monitoring/monitoring-ingress.yaml` (#8)
+- Private-testnet bundle guide update under `infrastructure/eth-networks/` (#8)
+
 ### Changed
 - Re-landed the Tier 0 (lint rule, race-detector CI job, bounds-checked accessors) and Tier 1 (native fuzz targets) portions of the previously reverted #33 testing/correctness hardening work as a single consolidated changeset, corresponding to the original PRs #29 and #30; the ClusterFuzzLite continuous fuzzing (#31) and rapid property tests (#32) are NOT included in this PR (#36)
 - Nightly scheduled `-race` CI job: timeout raised from 30m to 60m, and on scheduled-run failure it now upserts a labeled GitHub issue (`race-detector-failure`); behavior is CI-only and gated to scheduled runs (#37)
