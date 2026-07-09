@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math/big"
 	"sync"
@@ -23,6 +24,13 @@ var logger = log.Logger("keep-maintainer-spv")
 // the forward walk over headers when computing required confirmations
 // (relevant on testnet4 where long runs of minimum-difficulty blocks occur).
 const maxProofHeaders = 144
+
+// errProofHeaderCapExceeded is returned when the forward header walk reaches
+// maxProofHeaders without accumulating enough difficulty. The transaction
+// cannot be proven and will not become provable without a reorg.
+var errProofHeaderCapExceeded = errors.New(
+	"SPV proof header cap exceeded without sufficient difficulty",
+)
 
 func Initialize(
 	ctx context.Context,
@@ -212,6 +220,23 @@ func (sm *spvMaintainer) proveTransactions(
 			sm.btcDiffChain,
 		)
 		if err != nil {
+			if errors.Is(err, errProofHeaderCapExceeded) {
+				logger.Errorf(
+					"permanently skipped proving transaction [%s]; "+
+						"the SPV proof requires more than [%d] block headers "+
+						"without accumulating sufficient difficulty",
+					transactionHashStr,
+					maxProofHeaders,
+				)
+				if metricsRecorder := getMetricsRecorder(); metricsRecorder != nil {
+					metricsRecorder.IncrementCounter(
+						"spv_proof_permanent_skip_total",
+						1,
+					)
+				}
+				continue
+			}
+
 			return fmt.Errorf("failed to get proof info: [%v]", err)
 		}
 
@@ -378,7 +403,7 @@ func getProofInfo(
 			// the transaction's confirming block, so growing the chain does not
 			// move this window; absent a reorg the outcome is fixed and the
 			// transaction is skipped permanently, not merely deferred.
-			return false, 0, 0, nil
+			return false, 0, 0, errProofHeaderCapExceeded
 		}
 
 		blockHeight := proofStartBlock + uint64(headerCount)

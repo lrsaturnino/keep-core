@@ -2,6 +2,7 @@ package spv
 
 import (
 	"encoding/hex"
+	"errors"
 	"math/big"
 	"reflect"
 	"strings"
@@ -31,6 +32,7 @@ func TestGetProofInfo(t *testing.T) {
 		expectedIsProofWithinRelayRange  bool
 		expectedAccumulatedConfirmations uint
 		expectedRequiredConfirmations    uint
+		expectedErr                      error
 	}{
 		// All proof headers carry the current epoch difficulty. With factor 6,
 		// six headers of difficulty 32 reach 6*32.
@@ -157,9 +159,7 @@ func TestGetProofInfo(t *testing.T) {
 			headersFrom:              proofStart,
 			headersTo:                proofStart + 149,
 
-			expectedIsProofWithinRelayRange:  false,
-			expectedAccumulatedConfirmations: 0,
-			expectedRequiredConfirmations:    0,
+			expectedErr: errProofHeaderCapExceeded,
 		},
 		// The chain tip is reached before enough difficulty is accumulated.
 		// The reported requirement is one header more than currently exists,
@@ -222,7 +222,21 @@ func TestGetProofInfo(t *testing.T) {
 					localChain,
 				)
 			if err != nil {
-				t.Fatal(err)
+				if test.expectedErr == nil {
+					t.Fatal(err)
+				}
+				if !errors.Is(err, test.expectedErr) {
+					t.Fatalf(
+						"unexpected error\nexpected: %v\nactual:   %v",
+						test.expectedErr,
+						err,
+					)
+				}
+				return
+			}
+
+			if test.expectedErr != nil {
+				t.Fatalf("expected error [%v], got nil", test.expectedErr)
 			}
 
 			testutils.AssertBoolsEqual(
