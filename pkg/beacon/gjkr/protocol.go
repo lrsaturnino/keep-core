@@ -1740,80 +1740,89 @@ func (cm *CombiningMember) CombineGroupPublicKey() {
 // from given group member.
 func (cm *CombiningMember) ComputeGroupPublicKeyShares() {
 	go func() {
-		cm.logger.Infof(
-			"[member:%v] starting computation of group public key shares",
-			cm.ID,
-		)
+		shares, err := cm.computeGroupPublicKeyShares()
+		cm.groupPublicKeySharesChannel <- groupPublicKeySharesResult{
+			shares: shares,
+			err:    err,
+		}
+	}()
+}
 
-		groupPublicKeyShares := make(map[group.MemberIndex]*bn256.G2)
+func (cm *CombiningMember) computeGroupPublicKeyShares() (
+	map[group.MemberIndex]*bn256.G2,
+	error,
+) {
+	cm.logger.Infof(
+		"[member:%v] starting computation of group public key shares",
+		cm.ID,
+	)
 
-		// Calculate group public key shares for all other operating members.
-		for _, operatingMemberID := range cm.group.OperatingMemberIndexes() {
-			if operatingMemberID == cm.ID {
-				continue
-			}
+	groupPublicKeyShares := make(map[group.MemberIndex]*bn256.G2)
 
-			// Calculate the first public key share for the given operating
-			// member based on the current member public key share points.
-			sum := cm.publicKeyShare(operatingMemberID, cm.publicKeySharePoints)
+	// Calculate group public key shares for all other operating members.
+	for _, operatingMemberID := range cm.group.OperatingMemberIndexes() {
+		if operatingMemberID == cm.ID {
+			continue
+		}
 
-			// Iterate through the `QUAL` set and calculate subsequent
-			// public key share for the given operating member based on...
-			for qualifiedMemberID := range cm.receivedQualifiedSharesS {
-				// ...received and valid member's public key share points...
-				if publicKeySharePoints, ok := cm.receivedValidPeerPublicKeySharePoints[qualifiedMemberID]; ok {
-					publicKeyShare := cm.publicKeyShare(
-						operatingMemberID,
-						publicKeySharePoints,
-					)
-					sum = new(bn256.G2).Add(sum, publicKeyShare)
-					// ...OR in case given sender didn't send their public key
-					// share points, take their reconstructed share and recover
-					// the public key share.
-				} else {
-					for _, shares := range cm.revealedMisbehavedMembersShares {
-						if shares.misbehavedMemberID == qualifiedMemberID {
-							// Defensive guard. The DKG disqualification
-							// invariants should guarantee a revealed share
-							// exists here for every operating member. If one is
-							// missing we must not call ScalarBaseMult on a nil
-							// *big.Int, which panics and crashes this
-							// unrecovered goroutine (and so the whole beacon
-							// node). Log loudly and skip the term; this is not
-							// expected to happen.
-							peerShareS, ok := shares.peerSharesS[operatingMemberID]
-							if !ok || peerShareS == nil {
-								cm.logger.Errorf(
-									"[member:%v] missing revealed share for "+
-										"operating member [%v] from misbehaved "+
-										"member [%v]; skipping term (unexpected "+
-										"per DKG invariants)",
-									cm.ID,
-									operatingMemberID,
-									shares.misbehavedMemberID,
-								)
-								continue
-							}
+		// Calculate the first public key share for the given operating
+		// member based on the current member public key share points.
+		sum := cm.publicKeyShare(operatingMemberID, cm.publicKeySharePoints)
 
-							publicKeyShare := new(bn256.G2).ScalarBaseMult(
-								peerShareS,
+		// Iterate through the `QUAL` set and calculate subsequent
+		// public key share for the given operating member based on...
+		for qualifiedMemberID := range cm.receivedQualifiedSharesS {
+			// ...received and valid member's public key share points...
+			if publicKeySharePoints, ok := cm.receivedValidPeerPublicKeySharePoints[qualifiedMemberID]; ok {
+				publicKeyShare := cm.publicKeyShare(
+					operatingMemberID,
+					publicKeySharePoints,
+				)
+				sum = new(bn256.G2).Add(sum, publicKeyShare)
+				// ...OR in case given sender didn't send their public key
+				// share points, take their reconstructed share and recover
+				// the public key share.
+			} else {
+				for _, shares := range cm.revealedMisbehavedMembersShares {
+					if shares.misbehavedMemberID == qualifiedMemberID {
+						// Defensive guard. The DKG disqualification
+						// invariants should guarantee a revealed share
+						// exists here for every operating member. If one is
+						// missing we must not call ScalarBaseMult on a nil
+						// *big.Int, which panics and crashes this
+						// unrecovered goroutine (and so the whole beacon
+						// node). Fail closed instead of producing a wrong
+						// share.
+						peerShareS, ok := shares.peerSharesS[operatingMemberID]
+						if !ok || peerShareS == nil {
+							return nil, fmt.Errorf(
+								"[member:%v] missing revealed share for "+
+									"operating member [%v] from misbehaved "+
+									"member [%v] (unexpected per DKG invariants)",
+								cm.ID,
+								operatingMemberID,
+								shares.misbehavedMemberID,
 							)
-							sum = new(bn256.G2).Add(sum, publicKeyShare)
 						}
+
+						publicKeyShare := new(bn256.G2).ScalarBaseMult(
+							peerShareS,
+						)
+						sum = new(bn256.G2).Add(sum, publicKeyShare)
 					}
 				}
 			}
-
-			groupPublicKeyShares[operatingMemberID] = sum
 		}
 
-		cm.logger.Infof(
-			"[member:%v] completed computation of group public key shares",
-			cm.ID,
-		)
+		groupPublicKeyShares[operatingMemberID] = sum
+	}
 
-		cm.groupPublicKeySharesChannel <- groupPublicKeyShares
-	}()
+	cm.logger.Infof(
+		"[member:%v] completed computation of group public key shares",
+		cm.ID,
+	)
+
+	return groupPublicKeyShares, nil
 }
 
 // gjkrEcdhInfo returns the HKDF info label for ECDH-derived keys in the GJKR

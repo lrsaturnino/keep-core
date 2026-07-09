@@ -202,6 +202,13 @@ type ReconstructingMember struct {
 	reconstructedIndividualPublicKeys map[group.MemberIndex]*bn256.G2
 }
 
+// groupPublicKeySharesResult is the outcome of phase-12 group public key share
+// computation. Errors indicate the member cannot produce a valid DKG result.
+type groupPublicKeySharesResult struct {
+	shares map[group.MemberIndex]*bn256.G2
+	err    error
+}
+
 // CombiningMember represents one member in a threshold sharing group who is
 // combining individual public keys of group members to receive group public key.
 //
@@ -215,7 +222,9 @@ type CombiningMember struct {
 	// Group public key shares calculated for each QUAL group member.
 	// Public key shares calculation is time-expensive so we do it in an async
 	// manner and publish the result to this channel, once ready.
-	groupPublicKeySharesChannel chan map[group.MemberIndex]*bn256.G2
+	groupPublicKeySharesChannel chan groupPublicKeySharesResult
+	// Populated by combinationState.Initiate on the successful execution path.
+	computedGroupPublicKeyShares map[group.MemberIndex]*bn256.G2
 }
 
 // InitializeFinalization returns a member to perform next protocol operations.
@@ -334,7 +343,7 @@ func (rm *RevealingMember) InitializeReconstruction() *ReconstructingMember {
 func (rm *ReconstructingMember) InitializeCombining() *CombiningMember {
 	return &CombiningMember{
 		ReconstructingMember:        rm,
-		groupPublicKeySharesChannel: make(chan map[group.MemberIndex]*bn256.G2),
+		groupPublicKeySharesChannel: make(chan groupPublicKeySharesResult),
 	}
 }
 
@@ -376,6 +385,7 @@ func (fm *FinalizingMember) Result() *Result {
 		Group:                       fm.group,
 		GroupPublicKey:              fm.groupPublicKey, // nil if threshold not satisfied
 		GroupPrivateKeyShare:        fm.groupPrivateKeyShare,
+		groupPublicKeyShares:        fm.computedGroupPublicKeyShares,
 		groupPublicKeySharesChannel: fm.groupPublicKeySharesChannel,
 	}
 }

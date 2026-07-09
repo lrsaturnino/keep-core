@@ -2,6 +2,7 @@ package gjkr
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/keep-network/keep-core/pkg/net"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
@@ -681,8 +682,23 @@ func (cs *combinationState) ActiveBlocks() uint64 {
 }
 
 func (cs *combinationState) Initiate(ctx context.Context) error {
-	cs.member.ComputeGroupPublicKeyShares()
+	resultCh := make(chan groupPublicKeySharesResult, 1)
+	go func() {
+		shares, err := cs.member.computeGroupPublicKeyShares()
+		resultCh <- groupPublicKeySharesResult{shares: shares, err: err}
+	}()
+
 	cs.member.CombineGroupPublicKey()
+
+	result := <-resultCh
+	if result.err != nil {
+		return fmt.Errorf(
+			"failed to compute group public key shares: [%w]",
+			result.err,
+		)
+	}
+
+	cs.member.computedGroupPublicKeyShares = result.shares
 	return nil
 }
 

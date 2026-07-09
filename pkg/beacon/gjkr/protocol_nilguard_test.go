@@ -16,12 +16,9 @@ import (
 // would panic, taking the whole beacon node down.
 //
 // The DKG disqualification invariants are expected to make this branch
-// unreachable (a member that did not validly reveal its shares is evicted
-// before this phase), so this is a DEFENSIVE guard, not a confirmed-reachable
-// bug. The test only asserts the goroutine does not panic and completes (it
-// does NOT assert the resulting share is correct -- a missing share cannot
-// produce a correct share). Against the unpatched code the goroutine panics
-// and crashes the test binary.
+// missing, the computation fails closed instead of panicking or producing a
+// wrong share. Against the unpatched code the goroutine panics and crashes
+// the test binary.
 func TestComputeGroupPublicKeyShares_MissingRevealedShare(t *testing.T) {
 	dishonestThreshold := 1
 	groupSize := 3
@@ -60,9 +57,11 @@ func TestComputeGroupPublicKeyShares_MissingRevealedShare(t *testing.T) {
 
 	member.ComputeGroupPublicKeyShares()
 
-	// The goroutine must complete and deliver a result rather than panicking.
-	groupPublicKeyShares := <-member.groupPublicKeySharesChannel
-	if groupPublicKeyShares == nil {
-		t.Fatal("expected a (possibly incomplete) result, got nil")
+	result := <-member.groupPublicKeySharesChannel
+	if result.err == nil {
+		t.Fatal("expected error for missing revealed share, got nil")
+	}
+	if result.shares != nil {
+		t.Fatalf("expected nil shares on error, got %#v", result.shares)
 	}
 }

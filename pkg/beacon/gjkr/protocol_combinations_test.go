@@ -95,7 +95,11 @@ func TestCombineGroupPublicKeyShares(t *testing.T) {
 	}
 
 	member.ComputeGroupPublicKeyShares()
-	groupPublicKeyShares := <-member.groupPublicKeySharesChannel
+	result := <-member.groupPublicKeySharesChannel
+	if result.err != nil {
+		t.Fatalf("unexpected error: %v", result.err)
+	}
+	groupPublicKeyShares := result.shares
 
 	expectedGroupPublicKeySharesLength := 2 // groupSize - 1 (combining member)
 	if len(groupPublicKeyShares) != expectedGroupPublicKeySharesLength {
@@ -176,7 +180,11 @@ func TestCombineGroupPublicKeyShares_WithReconstruction(t *testing.T) {
 	}}
 
 	member.ComputeGroupPublicKeyShares()
-	groupPublicKeyShares := <-member.groupPublicKeySharesChannel
+	result := <-member.groupPublicKeySharesChannel
+	if result.err != nil {
+		t.Fatalf("unexpected error: %v", result.err)
+	}
+	groupPublicKeyShares := result.shares
 
 	expectedGroupPublicKeySharesLength := 1 // groupSize - 1 (combining member) - 1 (inactive member)
 	if len(groupPublicKeyShares) != expectedGroupPublicKeySharesLength {

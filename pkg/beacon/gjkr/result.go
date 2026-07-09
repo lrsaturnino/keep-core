@@ -21,7 +21,7 @@ type Result struct {
 	GroupPrivateKeyShare *big.Int
 
 	groupPublicKeySharesMutex   sync.Mutex
-	groupPublicKeySharesChannel <-chan map[group.MemberIndex]*bn256.G2
+	groupPublicKeySharesChannel <-chan groupPublicKeySharesResult
 	groupPublicKeyShares        map[group.MemberIndex]*bn256.G2
 }
 
@@ -43,7 +43,11 @@ func (r *Result) GroupPublicKeyShares() map[group.MemberIndex]*bn256.G2 {
 	defer r.groupPublicKeySharesMutex.Unlock()
 
 	if r.groupPublicKeyShares == nil {
-		r.groupPublicKeyShares = <-r.groupPublicKeySharesChannel
+		result := <-r.groupPublicKeySharesChannel
+		if result.err != nil {
+			return nil
+		}
+		r.groupPublicKeyShares = result.shares
 	}
 
 	return r.groupPublicKeyShares
