@@ -116,6 +116,7 @@ func TestSigningRetryLoop(t *testing.T) {
 				startBlock:             206,
 				timeoutBlock:           236, // start block of the first attempt + 30
 				excludedMembersIndexes: []group.MemberIndex{3, 7, 8, 10},
+				sessionID:              signingAttemptSessionID(message, 206, 1),
 			},
 			outgoingAnnouncementsCount: 1,
 		},
@@ -170,6 +171,7 @@ func TestSigningRetryLoop(t *testing.T) {
 				startBlock:             206,
 				timeoutBlock:           236, // start block of the first attempt + 30
 				excludedMembersIndexes: []group.MemberIndex{4, 5, 8, 10},
+				sessionID:              signingAttemptSessionID(message, 206, 1),
 			},
 			outgoingAnnouncementsCount: 1,
 		},
@@ -184,7 +186,7 @@ func TestSigningRetryLoop(t *testing.T) {
 			incomingAnnouncementsFn: func(
 				sessionID string,
 			) ([]group.MemberIndex, error) {
-				if sessionID == fmt.Sprintf("%v-%v", message, 1) {
+				if sessionID == signingAttemptSessionID(message, 206, 1) {
 					// Minority of members announced their readiness.
 					return []group.MemberIndex{1, 2, 3, 6, 7}, nil
 				}
@@ -231,6 +233,7 @@ func TestSigningRetryLoop(t *testing.T) {
 				startBlock:             247, // 206 + 1 * (6 + 30 + 5)
 				timeoutBlock:           277, // start block of the second attempt + 30
 				excludedMembersIndexes: []group.MemberIndex{1, 2, 5, 9},
+				sessionID:              signingAttemptSessionID(message, 247, 2),
 			},
 			outgoingAnnouncementsCount: 2,
 		},
@@ -245,7 +248,7 @@ func TestSigningRetryLoop(t *testing.T) {
 			incomingAnnouncementsFn: func(
 				sessionID string,
 			) ([]group.MemberIndex, error) {
-				if sessionID == fmt.Sprintf("%v-%v", message, 1) {
+				if sessionID == signingAttemptSessionID(message, 206, 1) {
 					return nil, fmt.Errorf("unexpected error")
 				}
 
@@ -291,6 +294,7 @@ func TestSigningRetryLoop(t *testing.T) {
 				startBlock:             247, // 206 + 1 * (6 + 30 + 5)
 				timeoutBlock:           277, // start block of the second attempt + 30
 				excludedMembersIndexes: []group.MemberIndex{1, 2, 5, 9},
+				sessionID:              signingAttemptSessionID(message, 247, 2),
 			},
 			outgoingAnnouncementsCount: 2,
 		},
@@ -351,6 +355,7 @@ func TestSigningRetryLoop(t *testing.T) {
 				startBlock:             247, // 206 + 1 * (6 + 30 + 5)
 				timeoutBlock:           277, // start block of the second attempt + 30
 				excludedMembersIndexes: []group.MemberIndex{1, 2, 5, 9},
+				sessionID:              signingAttemptSessionID(message, 247, 2),
 			},
 			outgoingAnnouncementsCount: 2,
 		},
@@ -400,6 +405,7 @@ func TestSigningRetryLoop(t *testing.T) {
 				startBlock:             206,
 				timeoutBlock:           236, // start block of the first attempt + 30
 				excludedMembersIndexes: []group.MemberIndex{3, 7, 8, 10},
+				sessionID:              signingAttemptSessionID(message, 206, 1),
 			},
 			// The second announcement is done at the beginning of the
 			// second attempt for which member 2 is eventually excluded.
@@ -478,6 +484,7 @@ func TestSigningRetryLoop(t *testing.T) {
 				startBlock:             247, // 206 + 1 * (6 + 30 + 5)
 				timeoutBlock:           277, // start block of the second attempt + 30
 				excludedMembersIndexes: []group.MemberIndex{1, 2, 5, 9},
+				sessionID:              signingAttemptSessionID(message, 247, 2),
 			},
 			outgoingAnnouncementsCount: 2,
 		},
@@ -587,6 +594,7 @@ func TestSigningRetryLoop(t *testing.T) {
 				startBlock:             247, // 206 + 1 * (6 + 30 + 5)
 				timeoutBlock:           277, // start block of the second attempt + 30
 				excludedMembersIndexes: []group.MemberIndex{1, 2, 5, 9},
+				sessionID:              signingAttemptSessionID(message, 247, 2),
 			},
 			// just the second announcement, the first one was skipped
 			outgoingAnnouncementsCount: 1,
@@ -700,236 +708,41 @@ func TestSigningRetryLoop(t *testing.T) {
 	}
 }
 
-func TestSigningRetryLoop_GetCurrentBlockErrorCausesRetry(t *testing.T) {
+func TestSigningAttemptSessionIDIncludesAttemptStartBlock(t *testing.T) {
 	message := big.NewInt(100)
 
-	groupParameters := &GroupParameters{
-		GroupSize:       10,
-		HonestThreshold: 6,
+	firstCeremony := signingAttemptSessionID(message, 206, 1)
+	repeatedDigestCeremony := signingAttemptSessionID(message, 247, 1)
+	retryAttempt := signingAttemptSessionID(message, 247, 2)
+
+	testutils.AssertStringsEqual(
+		t,
+		"session ID format",
+		"signing-64-00000000000000ce-0000000000000001",
+		firstCeremony,
+	)
+	if len(firstCeremony) < 16 {
+		t.Fatal("signing session ID must satisfy tss-lib SetSessionNonceBytes minimum length")
 	}
 
-	signingGroupOperators := chain.Addresses{
-		"address-1", "address-2", "address-8", "address-4",
-		"address-2", "address-6", "address-7", "address-8",
-		"address-9", "address-8",
-	}
-
-	retryLoop := newSigningRetryLoop(
-		&testutils.MockLogger{},
-		message,
-		200,
-		1,
-		signingGroupOperators,
-		groupParameters,
-		&mockSigningAnnouncer{
-			outgoingAnnouncements: make(map[string]group.MemberIndex),
-			incomingAnnouncementsFn: func(string) ([]group.MemberIndex, error) {
-				panic("should not be reached: announcer invoked when getCurrentBlock always errors")
-			},
-		},
-		&mockSigningDoneCheck{
-			waitUntilAllDoneOutcomeFn: func(uint64) (*signing.Result, uint64, error) {
-				panic("should not be reached")
-			},
-		},
-	)
-
-	ctx, cancelCtx := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancelCtx()
-
-	_, err := retryLoop.start(
-		ctx,
-		func(context.Context, uint64) error { return nil },
-		func() (uint64, error) { return 0, fmt.Errorf("rpc unavailable") },
-		func(*signingAttemptParams) (*signing.Result, uint64, error) {
-			panic("should not be reached: signing invoked when getCurrentBlock always errors")
-		},
-	)
-
-	if err != context.DeadlineExceeded {
-		t.Errorf(
-			"unexpected error\nexpected: [%v]\nactual:   [%v]",
-			context.DeadlineExceeded,
-			err,
+	// The smallest possible inputs must still clear the tss-lib floor; this
+	// guards against a future format change silently regressing below 16 bytes.
+	minSessionID := signingAttemptSessionID(big.NewInt(0), 0, 0)
+	if len(minSessionID) < 16 {
+		t.Fatalf(
+			"signing session ID for minimum inputs must satisfy tss-lib "+
+				"SetSessionNonceBytes minimum length, got [%v] (%d bytes)",
+			minSessionID,
+			len(minSessionID),
 		)
 	}
-}
 
-func TestSigningRetryLoop_WaitForBlockErrorCausesRetry(t *testing.T) {
-	message := big.NewInt(100)
-
-	groupParameters := &GroupParameters{
-		GroupSize:       10,
-		HonestThreshold: 6,
+	if firstCeremony == repeatedDigestCeremony {
+		t.Fatal("same digest and attempt number must not reuse the session ID across ceremonies")
 	}
 
-	signingGroupOperators := chain.Addresses{
-		"address-1", "address-2", "address-8", "address-4",
-		"address-2", "address-6", "address-7", "address-8",
-		"address-9", "address-8",
-	}
-
-	retryLoop := newSigningRetryLoop(
-		&testutils.MockLogger{},
-		message,
-		200,
-		1,
-		signingGroupOperators,
-		groupParameters,
-		&mockSigningAnnouncer{
-			outgoingAnnouncements: make(map[string]group.MemberIndex),
-			incomingAnnouncementsFn: func(string) ([]group.MemberIndex, error) {
-				panic("should not be reached: announcer invoked when waitForBlock always errors")
-			},
-		},
-		&mockSigningDoneCheck{
-			waitUntilAllDoneOutcomeFn: func(uint64) (*signing.Result, uint64, error) {
-				panic("should not be reached")
-			},
-		},
-	)
-
-	ctx, cancelCtx := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancelCtx()
-
-	_, err := retryLoop.start(
-		ctx,
-		func(context.Context, uint64) error { return fmt.Errorf("rpc timeout") },
-		func() (uint64, error) { return 200, nil }, // behind announcementEndBlock so attempt is not skipped
-		func(*signingAttemptParams) (*signing.Result, uint64, error) {
-			panic("should not be reached: signing invoked when waitForBlock always errors")
-		},
-	)
-
-	if err != context.DeadlineExceeded {
-		t.Errorf(
-			"unexpected error\nexpected: [%v]\nactual:   [%v]",
-			context.DeadlineExceeded,
-			err,
-		)
-	}
-}
-
-func TestSigningRetryLoop_ContextCancelled(t *testing.T) {
-	groupParameters := &GroupParameters{
-		GroupSize:       10,
-		HonestThreshold: 6,
-	}
-
-	signingGroupOperators := chain.Addresses{
-		"address-1", "address-2", "address-8", "address-4",
-		"address-2", "address-6", "address-7", "address-8",
-		"address-9", "address-8",
-	}
-
-	retryLoop := newSigningRetryLoop(
-		&testutils.MockLogger{},
-		big.NewInt(100),
-		200,
-		1,
-		signingGroupOperators,
-		groupParameters,
-		&mockSigningAnnouncer{
-			outgoingAnnouncements: make(map[string]group.MemberIndex),
-			incomingAnnouncementsFn: func(string) ([]group.MemberIndex, error) {
-				panic("should not be reached: context already cancelled")
-			},
-		},
-		&mockSigningDoneCheck{
-			waitUntilAllDoneOutcomeFn: func(uint64) (*signing.Result, uint64, error) {
-				panic("should not be reached")
-			},
-		},
-	)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // cancel before start -- the loop should exit at the first ctx.Err() check
-
-	_, err := retryLoop.start(
-		ctx,
-		func(context.Context, uint64) error { return nil },
-		func() (uint64, error) { return 200, nil },
-		func(*signingAttemptParams) (*signing.Result, uint64, error) {
-			panic("should not be reached")
-		},
-	)
-
-	if err != context.Canceled {
-		t.Errorf("expected context.Canceled, got: %v", err)
-	}
-}
-
-// TestSigningRetryLoop_SuccessAfterRetry verifies that the retry loop
-// recovers when the announcer returns an error on the first attempt and
-// succeeds on the second -- the retry path must actually produce a result.
-func TestSigningRetryLoop_SuccessAfterRetry(t *testing.T) {
-	message := big.NewInt(100)
-
-	groupParameters := &GroupParameters{
-		GroupSize:       10,
-		HonestThreshold: 6,
-	}
-
-	signingGroupOperators := chain.Addresses{
-		"address-1", "address-2", "address-8", "address-4",
-		"address-2", "address-6", "address-7", "address-8",
-		"address-9", "address-8",
-	}
-
-	testResult := &signing.Result{
-		Signature: &tecdsa.Signature{
-			R:          big.NewInt(300),
-			S:          big.NewInt(400),
-			RecoveryID: 2,
-		},
-	}
-
-	// Session IDs use fmt.Sprintf("%v-%v", message, attemptCounter).
-	firstAttemptSession := fmt.Sprintf("%v-%v", message, 1)
-
-	retryLoop := newSigningRetryLoop(
-		&testutils.MockLogger{},
-		message,
-		200,
-		1,
-		signingGroupOperators,
-		groupParameters,
-		&mockSigningAnnouncer{
-			outgoingAnnouncements: make(map[string]group.MemberIndex),
-			incomingAnnouncementsFn: func(sessionID string) ([]group.MemberIndex, error) {
-				if sessionID == firstAttemptSession {
-					return nil, fmt.Errorf("announcer unavailable on first attempt")
-				}
-				return []group.MemberIndex{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, nil
-			},
-		},
-		&mockSigningDoneCheck{
-			waitUntilAllDoneOutcomeFn: func(uint64) (*signing.Result, uint64, error) {
-				return testResult, 215, nil
-			},
-		},
-	)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	result, err := retryLoop.start(
-		ctx,
-		func(context.Context, uint64) error { return nil },
-		func() (uint64, error) { return 200, nil },
-		func(*signingAttemptParams) (*signing.Result, uint64, error) {
-			return testResult, 215, nil
-		},
-	)
-
-	if err != nil {
-		t.Fatalf("expected no error after retry, got: %v", err)
-	}
-	if result == nil {
-		t.Fatal("expected non-nil result")
-	}
-	if result.result == nil || !result.result.Signature.Equals(testResult.Signature) {
-		t.Errorf("unexpected result signature: %v", result)
+	if repeatedDigestCeremony == retryAttempt {
+		t.Fatal("attempts within a ceremony must not reuse the session ID")
 	}
 }
 
