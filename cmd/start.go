@@ -3,6 +3,9 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"os/signal"
+	"path/filepath"
+	"syscall"
 	"time"
 
 	commonEthereum "github.com/keep-network/keep-common/pkg/chain/ethereum"
@@ -89,7 +92,7 @@ type startDeps struct {
 		chain tbtc.Chain,
 		btcChain bitcoin.Chain,
 		netProvider net.Provider,
-		keyStorePersistance persistence.ProtectedHandle,
+		keyStorePersistence persistence.ProtectedHandle,
 		workPersistence persistence.BasicHandle,
 		scheduler *generator.Scheduler,
 		proposalGenerator tbtc.CoordinationProposalGenerator,
@@ -143,7 +146,8 @@ func start(cmd *cobra.Command) error {
 }
 
 func startWithDeps(cmd *cobra.Command, deps startDeps) error {
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	beaconChain, tbtcChain, blockCounter, signing, operatorPrivateKey, err :=
 		deps.connectEthereum(ctx, clientConfig.Ethereum)
@@ -257,9 +261,16 @@ func startWithDeps(cmd *cobra.Command, deps startDeps) error {
 			return fmt.Errorf("error initializing TBTC: [%v]", err)
 		}
 
+		signerConfig := clientConfig.CovenantSigner
+		if signerConfig.DataDir == "" && signerConfig.Port != 0 {
+			signerConfig.DataDir = filepath.Join(
+				filepath.Clean(clientConfig.Storage.Dir), "work", "tbtc",
+			)
+		}
+
 		_, _, err = deps.initializeSigner(
 			ctx,
-			clientConfig.CovenantSigner,
+			signerConfig,
 			tbtcDataPersistence,
 			covenantSignerEngine,
 		)

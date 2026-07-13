@@ -18,6 +18,18 @@ import (
 	"github.com/keep-network/keep-core/pkg/tecdsa"
 )
 
+var (
+	// ErrMissingWalletID is returned when wallet chain data does not
+	// include a wallet ID, typically because the wallet registry was
+	// unavailable during a fault-isolated GetWallet call.
+	ErrMissingWalletID = fmt.Errorf("wallet chain data must include wallet ID")
+
+	// ErrMissingMembersIDsHash is returned when wallet chain data does
+	// not include a members IDs hash, typically because the wallet
+	// registry was unavailable during a fault-isolated GetWallet call.
+	ErrMissingMembersIDsHash = fmt.Errorf("wallet chain data must include members IDs hash")
+)
+
 const (
 	signerApprovalCertificateVersion            uint32 = 1
 	signerApprovalCertificateSignatureAlgorithm        = "tecdsa-secp256k1"
@@ -178,10 +190,10 @@ func computeSignerApprovalCertificateSignerSetHash(
 		return "", fmt.Errorf("wallet chain data is required")
 	}
 	if walletChainData.EcdsaWalletID == ([32]byte{}) {
-		return "", fmt.Errorf("wallet chain data must include wallet ID")
+		return "", ErrMissingWalletID
 	}
 	if walletChainData.MembersIDsHash == ([32]byte{}) {
-		return "", fmt.Errorf("wallet chain data must include members IDs hash")
+		return "", ErrMissingMembersIDsHash
 	}
 
 	// Keep signer-set payload key encoding aligned with certificate issuance:
@@ -260,13 +272,9 @@ func verifySignerApprovalCertificate(
 		return fmt.Errorf("cannot parse threshold signature: %w", err)
 	}
 
-	// Reject non-canonical high-S signatures. ECDSA signatures are malleable:
-	// for a valid secp256k1 signature (r, s), the signature (r, N - s) also
-	// verifies for the same message and key. Only the canonical low-S form is
-	// accepted, matching the rule already applied by the covenant signer
-	// artifact approval verifier.
-	if !isLowSSecp256k1(parsedSignature.S) {
-		return fmt.Errorf("threshold signature must be a low-S secp256k1 signature")
+	halfOrder := new(big.Int).Rsh(btcec.S256().N, 1)
+	if parsedSignature.S.Cmp(halfOrder) > 0 {
+		return fmt.Errorf("threshold signature S value is not low-S normalized")
 	}
 
 	if !ecdsa.Verify(walletPublicKey, approvalDigest, parsedSignature.R, parsedSignature.S) {
@@ -274,14 +282,6 @@ func verifySignerApprovalCertificate(
 	}
 
 	return nil
-}
-
-// isLowSSecp256k1 reports whether the given signature S value is in the
-// canonical low-S form (S <= N/2) for the secp256k1 curve. High-S values make
-// ECDSA signatures malleable, so only low-S signatures are accepted.
-func isLowSSecp256k1(s *big.Int) bool {
-	halfOrder := new(big.Int).Rsh(new(big.Int).Set(btcec.S256().N), 1)
-	return s.Cmp(halfOrder) <= 0
 }
 
 func decodeSignerApprovalCertificateHex(

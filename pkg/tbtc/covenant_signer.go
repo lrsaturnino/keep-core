@@ -40,6 +40,11 @@ const defaultMinActiveOutpointConfirmations uint = 6
 
 const qcV1SignerHandoffKind = "qc_v1_signer_handoff_v1"
 
+// qcV1SignerHandoff is the downstream handoff artifact produced for qc_v1
+// signing jobs. Its field names and the qcV1SignerHandoffKind constant form
+// part of the external handoff API contract consumed by the handoff
+// processor. Do not rename fields or change the Kind value without a
+// corresponding schema version bump.
 type qcV1SignerHandoff struct {
 	Kind                      string
 	SignerRequestID           string
@@ -179,6 +184,12 @@ func (cse *covenantSignerEngine) VerifySignerApproval(
 		cse.node.groupParameters,
 	)
 	if err != nil {
+		if errors.Is(err, ErrMissingWalletID) || errors.Is(err, ErrMissingMembersIDsHash) {
+			return fmt.Errorf(
+				"wallet registry unavailable; signer approval verification requires registry data: %w",
+				err,
+			)
+		}
 		return fmt.Errorf(
 			"cannot compute signer approval signer set hash: %w",
 			err,
@@ -573,9 +584,13 @@ func buildQcV1WitnessScript(
 		Script()
 }
 
-func (cse *covenantSignerEngine) resolveSelfV1ActiveUtxo(
+// resolveActiveUtxo fetches and validates the active covenant UTXO against
+// the given witness script and request. templateName is used in error messages
+// to identify which template path triggered the validation failure.
+func (cse *covenantSignerEngine) resolveActiveUtxo(
 	request covenantsigner.RouteSubmitRequest,
 	witnessScript bitcoin.Script,
+	templateName string,
 ) (*bitcoin.UnspentTransactionOutput, error) {
 	activeTxHash, err := bitcoin.NewHashFromString(
 		strings.TrimPrefix(request.ActiveOutpoint.TxID, "0x"),
@@ -596,15 +611,21 @@ func (cse *covenantSignerEngine) resolveSelfV1ActiveUtxo(
 		return nil, fmt.Errorf("active outpoint output index is out of range")
 	}
 
-	expectedWitnessScriptHash := bitcoin.WitnessScriptHash(witnessScript)
-	expectedScriptPubKey, err := bitcoin.PayToWitnessScriptHash(expectedWitnessScriptHash)
+	expectedScriptPubKey, err := payToWitnessScriptHash(witnessScript)
 	if err != nil {
-		return nil, fmt.Errorf("cannot build expected self_v1 locking script: %v", err)
+		return nil, fmt.Errorf(
+			"cannot build expected %s locking script: %v",
+			templateName,
+			err,
+		)
 	}
 
 	actualOutput := transaction.Outputs[request.ActiveOutpoint.Vout]
 	if !bytes.Equal(actualOutput.PublicKeyScript, expectedScriptPubKey) {
-		return nil, fmt.Errorf("active outpoint script does not match self_v1 template")
+		return nil, fmt.Errorf(
+			"active outpoint script does not match %s template",
+			templateName,
+		)
 	}
 	if actualOutput.Value <= 0 {
 		return nil, fmt.Errorf("active outpoint value must be greater than zero")
@@ -619,7 +640,10 @@ func (cse *covenantSignerEngine) resolveSelfV1ActiveUtxo(
 		scriptHash := sha256.Sum256(expectedScriptPubKey)
 		expectedScriptHash := "0x" + hex.EncodeToString(scriptHash[:])
 		if strings.ToLower(request.ActiveOutpoint.ScriptHash) != expectedScriptHash {
-			return nil, fmt.Errorf("active outpoint script hash does not match self_v1 template")
+			return nil, fmt.Errorf(
+				"active outpoint script hash does not match %s template",
+				templateName,
+			)
 		}
 	}
 
@@ -632,63 +656,18 @@ func (cse *covenantSignerEngine) resolveSelfV1ActiveUtxo(
 	}, nil
 }
 
+func (cse *covenantSignerEngine) resolveSelfV1ActiveUtxo(
+	request covenantsigner.RouteSubmitRequest,
+	witnessScript bitcoin.Script,
+) (*bitcoin.UnspentTransactionOutput, error) {
+	return cse.resolveActiveUtxo(request, witnessScript, "self_v1")
+}
+
 func (cse *covenantSignerEngine) resolveQcV1ActiveUtxo(
 	request covenantsigner.RouteSubmitRequest,
 	witnessScript bitcoin.Script,
 ) (*bitcoin.UnspentTransactionOutput, error) {
-	activeTxHash, err := bitcoin.NewHashFromString(
-		strings.TrimPrefix(request.ActiveOutpoint.TxID, "0x"),
-		bitcoin.ReversedByteOrder,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("active outpoint txid is invalid")
-	}
-
-	transaction, err := cse.node.btcChain.GetTransaction(activeTxHash)
-	if err != nil {
-		return nil, fmt.Errorf("active outpoint transaction not found")
-	}
-	if err := cse.ensureActiveOutpointFinality(activeTxHash); err != nil {
-		return nil, err
-	}
-	if int(request.ActiveOutpoint.Vout) >= len(transaction.Outputs) {
-		return nil, fmt.Errorf("active outpoint output index is out of range")
-	}
-
-	expectedWitnessScriptHash := bitcoin.WitnessScriptHash(witnessScript)
-	expectedScriptPubKey, err := bitcoin.PayToWitnessScriptHash(expectedWitnessScriptHash)
-	if err != nil {
-		return nil, fmt.Errorf("cannot build expected qc_v1 locking script: %v", err)
-	}
-
-	actualOutput := transaction.Outputs[request.ActiveOutpoint.Vout]
-	if !bytes.Equal(actualOutput.PublicKeyScript, expectedScriptPubKey) {
-		return nil, fmt.Errorf("active outpoint script does not match qc_v1 template")
-	}
-	if actualOutput.Value <= 0 {
-		return nil, fmt.Errorf("active outpoint value must be greater than zero")
-	}
-	if uint64(actualOutput.Value) != request.MigrationTransactionPlan.InputValueSats {
-		return nil, fmt.Errorf("active outpoint value does not match migration transaction plan")
-	}
-
-	if request.ActiveOutpoint.ScriptHash != "" {
-		// The optional scriptHash convention follows the tBTC-side request
-		// contract: sha256(scriptPubKey) for the active covenant output.
-		scriptHash := sha256.Sum256(expectedScriptPubKey)
-		expectedScriptHash := "0x" + hex.EncodeToString(scriptHash[:])
-		if strings.ToLower(request.ActiveOutpoint.ScriptHash) != expectedScriptHash {
-			return nil, fmt.Errorf("active outpoint script hash does not match qc_v1 template")
-		}
-	}
-
-	return &bitcoin.UnspentTransactionOutput{
-		Outpoint: &bitcoin.TransactionOutpoint{
-			TransactionHash: activeTxHash,
-			OutputIndex:     request.ActiveOutpoint.Vout,
-		},
-		Value: actualOutput.Value,
-	}, nil
+	return cse.resolveActiveUtxo(request, witnessScript, "qc_v1")
 }
 
 func (cse *covenantSignerEngine) ensureActiveOutpointFinality(
@@ -846,8 +825,7 @@ func (cse *covenantSignerEngine) buildCovenantTransactionBuilder(
 	// rebuilds and verifies the funding output in revealDepositWithExtraData.
 	// Using the plain deposit script directly as the output script would make
 	// the migration deposit unrevealable to the Bridge.
-	destinationWitnessScriptHash := bitcoin.WitnessScriptHash(destinationDepositScript)
-	destinationScriptPubKey, err := bitcoin.PayToWitnessScriptHash(destinationWitnessScriptHash)
+	destinationScriptPubKey, err := payToWitnessScriptHash(destinationDepositScript)
 	if err != nil {
 		return nil, fmt.Errorf("cannot build migration destination locking script: %v", err)
 	}
@@ -990,8 +968,15 @@ func (handoff *qcV1SignerHandoff) toMap() map[string]any {
 }
 
 func canonicalAnchorScriptPubKey() (bitcoin.Script, error) {
-	witnessScriptHash := bitcoin.WitnessScriptHash(bitcoin.Script{txscript.OP_TRUE})
-	return bitcoin.PayToWitnessScriptHash(witnessScriptHash)
+	return payToWitnessScriptHash(bitcoin.Script{txscript.OP_TRUE})
+}
+
+// payToWitnessScriptHash derives the P2WSH locking script
+// (OP_0 <sha256(script)>) that pays to the given witness script. This is how
+// the tBTC Bridge matches an output against a script it independently
+// recomputes; callers wrap the returned error with their own context.
+func payToWitnessScriptHash(script bitcoin.Script) (bitcoin.Script, error) {
+	return bitcoin.PayToWitnessScriptHash(bitcoin.WitnessScriptHash(script))
 }
 
 func decodePrefixedHex(value string) ([]byte, error) {

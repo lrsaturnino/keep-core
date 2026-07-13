@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"crypto/sha256"
+	"encoding/asn1"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -565,57 +566,22 @@ func TestVerifySignerApprovalCertificateRejectsMalformedDERSignature(t *testing.
 
 func TestVerifySignerApprovalCertificateRejectsHighSSignature(t *testing.T) {
 	node, _, walletPublicKey := setupCovenantSignerTestNode(t)
-
-	executor, ok, err := node.getSigningExecutor(walletPublicKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatal("node is supposed to control wallet signers")
-	}
-
-	startBlock, err := executor.getCurrentBlockFn()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	approvalDigest := sha256.Sum256(
-		[]byte("psbt-covenant-signer-approval-certificate-high-s"),
+	request := validStructuredSignerApprovalVerificationRequest(
+		t,
+		node,
+		walletPublicKey,
+		covenantsigner.TemplateSelfV1,
 	)
-	certificate, err := executor.issueSignerApprovalCertificate(
-		context.Background(),
-		approvalDigest[:],
-		startBlock,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
 
-	walletChainData, err := executor.chain.GetWallet(
-		bitcoin.PublicKeyHash(executor.wallet().publicKey),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	expectedSignerSetHash, err := computeSignerApprovalCertificateSignerSetHash(
-		executor.wallet().publicKey,
-		walletChainData,
-		executor.groupParameters,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	certificate := *request.SignerApproval
 
-	// The freshly issued certificate carries a canonical low-S signature and
-	// must verify. This is the control for the malleated case below.
-	if err := verifySignerApprovalCertificate(certificate, expectedSignerSetHash); err != nil {
-		t.Fatalf("expected the issued certificate to verify: %v", err)
-	}
-
-	// Malleate the signature into its high-S counterpart (r, N - s). This is a
-	// valid ECDSA signature for the same message and key that still passes
-	// ecdsa.Verify, but it is not in the canonical low-S form.
-	signatureBytes, err := decodeSignerApprovalCertificateHex(certificate.Signature, 0)
+	// Parse the issued DER signature and construct the mathematically
+	// equivalent high-S variant (S' = N - S). ECDSA permits both (R, S) and
+	// (R, N - S) as valid signatures over the same digest; rejecting the
+	// high-S form prevents signature malleability. DER encoding is done via
+	// encoding/asn1 rather than btcec.Signature.Serialize(), which silently
+	// re-normalizes S back to the low range and would defeat this check.
+	signatureBytes, err := hex.DecodeString(strings.TrimPrefix(certificate.Signature, "0x"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -623,48 +589,47 @@ func TestVerifySignerApprovalCertificateRejectsHighSSignature(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	highS := new(big.Int).Sub(btcec.S256().N, parsedSignature.S)
+	curveOrder := btcec.S256().N
+	halfOrder := new(big.Int).Rsh(curveOrder, 1)
+	highS := new(big.Int).Set(parsedSignature.S)
+	if highS.Cmp(halfOrder) <= 0 {
+		highS.Sub(curveOrder, highS)
+	}
+	if highS.Cmp(halfOrder) <= 0 {
+		t.Fatalf("could not construct high-S candidate from S=%s", parsedSignature.S.Text(16))
+	}
+	highSignatureDER, err := asn1.Marshal(struct {
+		R, S *big.Int
+	}{R: parsedSignature.R, S: highS})
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate.Signature = "0x" + hex.EncodeToString(highSignatureDER)
 
-	malleated := *certificate
-	malleated.Signature = "0x" + hex.EncodeToString(
-		encodeDERSignatureWithoutLowSCanonicalization(parsedSignature.R, highS),
+	walletExecutor, ok, err := node.getSigningExecutor(walletPublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("node is supposed to control wallet signers")
+	}
+	walletChainData, err := walletExecutor.chain.GetWallet(bitcoin.PublicKeyHash(walletPublicKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedSignerSetHash, err := computeSignerApprovalCertificateSignerSetHash(
+		walletPublicKey,
+		walletChainData,
+		walletExecutor.groupParameters,
 	)
-
-	err = verifySignerApprovalCertificate(&malleated, expectedSignerSetHash)
-	if err == nil || !strings.Contains(err.Error(), "low-S") {
-		t.Fatalf("expected high-S signature to be rejected, got %v", err)
-	}
-}
-
-// encodeDERSignatureWithoutLowSCanonicalization DER-encodes an ECDSA (r, s)
-// pair without applying the low-S malleability breaker that
-// btcec.Signature.Serialize applies, so it can produce a non-canonical high-S
-// signature for testing.
-func encodeDERSignatureWithoutLowSCanonicalization(r, s *big.Int) []byte {
-	canonicalize := func(v *big.Int) []byte {
-		b := v.Bytes()
-		if len(b) == 0 {
-			b = []byte{0x00}
-		}
-		// Prepend 0x00 when the most significant bit is set so the value is not
-		// interpreted as negative in DER.
-		if b[0]&0x80 != 0 {
-			b = append([]byte{0x00}, b...)
-		}
-		return b
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	rb := canonicalize(r)
-	sb := canonicalize(s)
-
-	length := 6 + len(rb) + len(sb)
-	der := make([]byte, 0, length)
-	der = append(der, 0x30, byte(length-2))
-	der = append(der, 0x02, byte(len(rb)))
-	der = append(der, rb...)
-	der = append(der, 0x02, byte(len(sb)))
-	der = append(der, sb...)
-	return der
+	err = verifySignerApprovalCertificate(&certificate, expectedSignerSetHash)
+	if err == nil || !strings.Contains(err.Error(), "threshold signature S value is not low-S normalized") {
+		t.Fatalf("expected low-S normalization error, got %v", err)
+	}
 }
 
 func TestVerifySignerApprovalCertificateRejectsMalformedWalletPublicKey(t *testing.T) {
