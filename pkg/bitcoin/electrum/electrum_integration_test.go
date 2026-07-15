@@ -48,9 +48,13 @@ type testConfig struct {
 // same network-gated behavior (e.g. the low-fee estimate fallback) instead of
 // leaving Config.Network at its zero value (bitcoin.Unknown), which would
 // disable the fallback.
-func init() {
+func syncTestConfigNetworks() {
 	for key, tc := range testConfigs {
 		tc.clientConfig.Network = tc.network
+		if tc.clientConfig.ConnectRetryTimeout == 0 {
+			// Fail fast on dead public endpoints instead of the 1m production default.
+			tc.clientConfig.ConnectRetryTimeout = 15 * time.Second
+		}
 		testConfigs[key] = tc
 	}
 }
@@ -79,14 +83,6 @@ var testConfigs = map[string]testConfig{
 			URL:                 "wss://electrum.testnet.boar.network:443/QxbJgaSLUHqrgAa9BW7bDpnGPxrlhnCa",
 			RequestTimeout:      requestTimeout,
 			RequestRetryTimeout: requestRetryTimeout,
-		},
-		network: bitcoin.Testnet,
-	},
-	"fulcrum tcp": {
-		clientConfig: electrum.Config{
-			URL:                 "tcp://v22019051929289916.bestsrv.de:50001",
-			RequestTimeout:      requestTimeout * 2,
-			RequestRetryTimeout: requestRetryTimeout * 2,
 		},
 		network: bitcoin.Testnet,
 	},
@@ -156,6 +152,8 @@ func init() {
 	if err != nil {
 		panic(err)
 	}
+
+	syncTestConfigNetworks()
 }
 
 func TestConnect_Integration(t *testing.T) {
@@ -643,6 +641,9 @@ func newTestConnection(t *testing.T, config electrum.Config) (bitcoin.Chain, con
 	ctx, cancelCtx := context.WithCancel(context.Background())
 	electrum, err := electrum.Connect(ctx, config)
 	if err != nil {
+		if shouldSkipElectrumIntegrationError(err) {
+			t.Skipf("skipping due to unavailable electrum endpoint: %v", err)
+		}
 		t.Fatal(err)
 	}
 
@@ -781,5 +782,6 @@ func shouldSkipElectrumIntegrationError(err error) bool {
 
 	return strings.Contains(msg, "request timeout") ||
 		strings.Contains(msg, "retry timeout") ||
-		strings.Contains(msg, "enough information")
+		strings.Contains(msg, "enough information") ||
+		strings.Contains(msg, "connection refused")
 }
