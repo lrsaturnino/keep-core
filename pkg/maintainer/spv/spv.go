@@ -299,16 +299,16 @@ func isInputCurrentWalletsMainUTXO(
 	if err != nil {
 		return false, fmt.Errorf("failed to get previous transaction: [%v]", err)
 	}
-	if fundingOutputIndex >= uint32(len(previousTransaction.Outputs)) {
+	fundingOutput, err := previousTransaction.OutputAt(fundingOutputIndex)
+	if err != nil {
 		return false, fmt.Errorf(
-			"funding output index [%d] out of range for transaction [%s] "+
-				"with [%d] outputs",
+			"funding output index [%d] invalid for transaction [%s]: [%v]",
 			fundingOutputIndex,
 			fundingTxHash.String(),
-			len(previousTransaction.Outputs),
+			err,
 		)
 	}
-	fundingOutputValue := previousTransaction.Outputs[fundingOutputIndex].Value
+	fundingOutputValue := fundingOutput.Value
 
 	// Assume the input is the main UTXO and calculate hash.
 	mainUtxoHash := spvChain.ComputeMainUtxoHash(&bitcoin.UnspentTransactionOutput{
