@@ -76,14 +76,34 @@ func RunTest(
 	seed *big.Int,
 	rules interception.Rules,
 ) (*Result, error) {
+	return RunTestWithStrategy(
+		groupSize,
+		honestThreshold,
+		seed,
+		interception.FromRules(rules),
+	)
+}
+
+// RunTestWithStrategy executes the full DKG roundtrip test like RunTest, but
+// applies an interception.Strategy instead of the legacy modify-or-drop Rules.
+// A Strategy can additionally attribute each message to its sender, duplicate
+// it, or inject new messages - the building blocks for Byzantine-operator
+// simulation scenarios. RunTest is the special case
+// RunTestWithStrategy(..., interception.FromRules(rules)).
+func RunTestWithStrategy(
+	groupSize int,
+	honestThreshold int,
+	seed *big.Int,
+	strategy interception.Strategy,
+) (*Result, error) {
 	operatorPrivateKey, operatorPublicKey, err := operator.GenerateKeyPair(local_v1.DefaultCurve)
 	if err != nil {
 		return nil, err
 	}
 
-	network := interception.NewNetwork(
+	network := interception.NewNetworkWithStrategy(
 		netLocal.ConnectWithKey(operatorPublicKey),
-		rules,
+		strategy,
 	)
 
 	localChain := local_v1.ConnectWithKey(
