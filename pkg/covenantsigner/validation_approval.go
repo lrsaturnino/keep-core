@@ -171,16 +171,21 @@ func normalizeSignerApprovalCertificate(
 		}
 	}
 
-	if signerApproval.EndBlock != nil {
-		if err := validateUint32Range(
-			"request.signerApproval.endBlock",
-			*signerApproval.EndBlock,
-		); err != nil {
-			return nil, err
+	// EndBlock is a required v2 certificate field: a missing or null EndBlock
+	// must fail closed rather than being treated as "never expires".
+	if signerApproval.EndBlock == nil {
+		return nil, &inputError{
+			"request.signerApproval.endBlock is required",
 		}
-		endBlock := *signerApproval.EndBlock
-		normalizedSignerApproval.EndBlock = &endBlock
 	}
+	if err := validateUint32Range(
+		"request.signerApproval.endBlock",
+		*signerApproval.EndBlock,
+	); err != nil {
+		return nil, err
+	}
+	endBlock := *signerApproval.EndBlock
+	normalizedSignerApproval.EndBlock = &endBlock
 
 	return normalizedSignerApproval, nil
 }

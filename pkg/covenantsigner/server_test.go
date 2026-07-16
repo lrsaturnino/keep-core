@@ -415,6 +415,95 @@ func TestInitializeRequiresSignerApprovalVerifierWhenConfigured(t *testing.T) {
 	}
 }
 
+// verifierOnlyEngine implements Engine and SignerApprovalVerifier but
+// deliberately not CurrentBlockHeightProvider, so NewService succeeds (there
+// is nothing to auto-detect a provider from) while Initialize's post-NewService
+// invariant check -- a verifier without a way to determine expiry -- must
+// still reject startup.
+type verifierOnlyEngine struct{}
+
+func (verifierOnlyEngine) OnSubmit(context.Context, *Job) (*Transition, error) {
+	return nil, nil
+}
+
+func (verifierOnlyEngine) OnPoll(context.Context, *Job) (*Transition, error) {
+	return nil, nil
+}
+
+func (verifierOnlyEngine) VerifySignerApproval(RouteSubmitRequest) error {
+	return nil
+}
+
+func TestInitializeRejectsVerifierWithoutBlockHeightProvider(t *testing.T) {
+	handle := newMemoryHandle()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	_, enabled, err := Initialize(
+		ctx,
+		Config{Port: availableLoopbackPort(t)},
+		handle,
+		&verifierOnlyEngine{},
+	)
+	if err == nil || enabled {
+		t.Fatalf("expected startup to fail for a verifier without a block height provider, got enabled=%v err=%v", enabled, err)
+	}
+	if !strings.Contains(err.Error(), "CurrentBlockHeightProvider") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestInitializeReleasesStoreLockAfterLaterStartupFailure proves that a
+// startup failure occurring after NewService has already acquired the
+// store's exclusive file lock still releases it: a first Initialize attempt
+// fails on the verifier/provider invariant (after successfully constructing
+// the service and its store), and a second attempt over the very same data
+// directory must be able to acquire the lock and succeed. Without the
+// deferred cleanup in Initialize, the second attempt would fail with a
+// lock-contention error instead of starting.
+func TestInitializeReleasesStoreLockAfterLaterStartupFailure(t *testing.T) {
+	dataDir := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	_, enabled, err := Initialize(
+		ctx,
+		Config{
+			Port:    availableLoopbackPort(t),
+			DataDir: dataDir,
+		},
+		newMemoryHandle(),
+		&verifierOnlyEngine{},
+	)
+	if err == nil || enabled {
+		t.Fatalf("expected the first startup attempt to fail, got enabled=%v err=%v", enabled, err)
+	}
+	// Assert this failed for the verifier/provider invariant, not because the
+	// data directory's lock was already held (which would defeat the point
+	// of this test: proving the *first* attempt's lock gets released).
+	if !strings.Contains(err.Error(), "CurrentBlockHeightProvider") {
+		t.Fatalf("expected a verifier/provider invariant error, got: %v", err)
+	}
+
+	server, enabled, err := Initialize(
+		ctx,
+		Config{
+			Port:    availableLoopbackPort(t),
+			DataDir: dataDir,
+		},
+		newMemoryHandle(),
+		&scriptedVerifierEngine{},
+	)
+	if err != nil || !enabled || server == nil {
+		t.Fatalf(
+			"expected retry over the same data directory to succeed, got enabled=%v server=%v err=%v",
+			enabled,
+			server != nil,
+			err,
+		)
+	}
+}
+
 func TestInitializeRequiresTrustRootsForNonLoopbackListenAddress(t *testing.T) {
 	handle := newMemoryHandle()
 	ctx, cancel := context.WithCancel(context.Background())

@@ -178,6 +178,28 @@ func (se *scriptedEngine) CurrentBlockHeight(context.Context) (uint64, error) {
 	return se.currentBlockHeight, se.currentBlockErr
 }
 
+// hookedHeightEngine is a minimal Engine used only by the expiry-recheck
+// regression tests below. Unlike scriptedEngine's static currentBlockHeight
+// field, blockHeight is an injectable function so a test can deterministically
+// control exactly what each individual call observes and synchronize with a
+// concurrent goroutine.
+type hookedHeightEngine struct {
+	onSubmit    func(*Job) (*Transition, error)
+	blockHeight func(context.Context) (uint64, error)
+}
+
+func (hhe *hookedHeightEngine) OnSubmit(_ context.Context, job *Job) (*Transition, error) {
+	return hhe.onSubmit(job)
+}
+
+func (hhe *hookedHeightEngine) OnPoll(context.Context, *Job) (*Transition, error) {
+	return nil, nil
+}
+
+func (hhe *hookedHeightEngine) CurrentBlockHeight(ctx context.Context) (uint64, error) {
+	return hhe.blockHeight(ctx)
+}
+
 func mustJSON(t *testing.T, value any) []byte {
 	t.Helper()
 	data, err := json.Marshal(value)
@@ -3412,7 +3434,9 @@ func TestMigrationTransactionPlanCommitmentHashMatchesCanonicalVectors(t *testin
 
 // TestServicePollPropagatesCurrentBlockProviderError verifies P1-A: when the
 // currentBlockProvider returns an error, Poll returns a wrapped error rather
-// than panicking or silently proceeding.
+// than panicking or silently proceeding. The provider only starts failing
+// after Submit succeeds, since Submit now also fetches the current height for
+// a certificate-bearing request; this isolates the failure to Poll.
 func TestServicePollPropagatesCurrentBlockProviderError(t *testing.T) {
 	handle := newMemoryHandle()
 	wantErr := errors.New("blockchain is unavailable")
@@ -3424,9 +3448,8 @@ func TestServicePollPropagatesCurrentBlockProviderError(t *testing.T) {
 			return &Transition{State: JobStatePending, Detail: "polling"}, nil
 		},
 		currentBlockHeight: 100,
-		currentBlockErr:    wantErr,
 	}
-	service, err := NewService(handle, engine, WithCurrentBlockProvider(engine), WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(request RouteSubmitRequest) error {
+	service, err := NewService(handle, engine, WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(request RouteSubmitRequest) error {
 		return nil
 	})))
 	if err != nil {
@@ -3445,6 +3468,8 @@ func TestServicePollPropagatesCurrentBlockProviderError(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	engine.currentBlockErr = wantErr
+
 	_, err = service.Poll(context.Background(), TemplateSelfV1, SignerPollInput{
 		RouteRequestID: "poll_err",
 		RequestID:      submitResult.RequestID,
@@ -3461,7 +3486,8 @@ func TestServicePollPropagatesCurrentBlockProviderError(t *testing.T) {
 
 // TestServiceLoadPollJobPropagatesCurrentBlockProviderError verifies P1-A: when
 // loadPollJob calls the currentBlockProvider and it returns an error, the job
-// load fails with a wrapped error.
+// load fails with a wrapped error. As above, the provider only starts failing
+// after Submit succeeds.
 func TestServiceLoadPollJobPropagatesCurrentBlockProviderError(t *testing.T) {
 	handle := newMemoryHandle()
 	wantErr := errors.New("blockchain is unavailable")
@@ -3473,9 +3499,8 @@ func TestServiceLoadPollJobPropagatesCurrentBlockProviderError(t *testing.T) {
 			return &Transition{State: JobStatePending, Detail: "polling"}, nil
 		},
 		currentBlockHeight: 100,
-		currentBlockErr:    wantErr,
 	}
-	service, err := NewService(handle, engine, WithCurrentBlockProvider(engine), WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(request RouteSubmitRequest) error {
+	service, err := NewService(handle, engine, WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(request RouteSubmitRequest) error {
 		return nil
 	})))
 	if err != nil {
@@ -3491,6 +3516,8 @@ func TestServiceLoadPollJobPropagatesCurrentBlockProviderError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	engine.currentBlockErr = wantErr
 
 	// loadPollJob is called by Poll; the error should propagate through Poll.
 	_, err = service.Poll(context.Background(), TemplateSelfV1, SignerPollInput{
@@ -3507,9 +3534,11 @@ func TestServiceLoadPollJobPropagatesCurrentBlockProviderError(t *testing.T) {
 	}
 }
 
-// TestServicePollRejectsExpiredCertificate verifies P2-D: when the current block
-// has reached or passed EndBlock, the certificate is considered expired and Poll
-// returns an error.
+// TestServicePollRejectsExpiredCertificate verifies P2-D: when the current
+// block is past EndBlock, the certificate is considered expired and Poll
+// returns an error. The height stays below EndBlock through Submit (which now
+// also enforces expiry) and only advances past it before Poll, so the
+// certificate genuinely expires between submission and polling.
 func TestServicePollRejectsExpiredCertificate(t *testing.T) {
 	handle := newMemoryHandle()
 	engine := &scriptedEngine{
@@ -3519,10 +3548,9 @@ func TestServicePollRejectsExpiredCertificate(t *testing.T) {
 		poll: func(*Job) (*Transition, error) {
 			return &Transition{State: JobStatePending, Detail: "polling"}, nil
 		},
-		currentBlockHeight: 200, // EndBlock is 123456; set >= EndBlock to trigger expiration
+		currentBlockHeight: 100, // EndBlock is 123456; well below it at submit time
 	}
-	engine.currentBlockHeight = 123456 // satisfy expiration: currentBlock >= EndBlock
-	service, err := NewService(handle, engine, WithCurrentBlockProvider(engine), WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(request RouteSubmitRequest) error {
+	service, err := NewService(handle, engine, WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(request RouteSubmitRequest) error {
 		return nil
 	})))
 	if err != nil {
@@ -3530,6 +3558,7 @@ func TestServicePollRejectsExpiredCertificate(t *testing.T) {
 	}
 
 	request := structuredSignerApprovalRequest(TemplateSelfV1)
+	endBlock := *request.SignerApproval.EndBlock
 	submitResult, err := service.Submit(context.Background(), TemplateSelfV1, SignerSubmitInput{
 		RouteRequestID: "expired",
 		Stage:          StageSignerCoordination,
@@ -3538,6 +3567,9 @@ func TestServicePollRejectsExpiredCertificate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	// Advance the current block height one past EndBlock before polling.
+	engine.currentBlockHeight = endBlock + 1
 
 	_, err = service.Poll(context.Background(), TemplateSelfV1, SignerPollInput{
 		RouteRequestID: "expired",
@@ -3550,6 +3582,52 @@ func TestServicePollRejectsExpiredCertificate(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "signer approval certificate has expired") {
 		t.Fatalf("expected expiration error, got %v", err)
+	}
+}
+
+// TestServicePollAcceptsCertificateExactlyAtEndBlock verifies EndBlock is an
+// inclusive upper bound: a certificate remains valid, not expired, when the
+// current block equals EndBlock exactly.
+func TestServicePollAcceptsCertificateExactlyAtEndBlock(t *testing.T) {
+	handle := newMemoryHandle()
+	engine := &scriptedEngine{
+		submit: func(*Job) (*Transition, error) {
+			return &Transition{State: JobStatePending, Detail: "queued"}, nil
+		},
+		poll: func(*Job) (*Transition, error) {
+			return &Transition{State: JobStatePending, Detail: "polling"}, nil
+		},
+		currentBlockHeight: 100,
+	}
+	service, err := NewService(handle, engine, WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(request RouteSubmitRequest) error {
+		return nil
+	})))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := structuredSignerApprovalRequest(TemplateSelfV1)
+	endBlock := *request.SignerApproval.EndBlock
+	submitResult, err := service.Submit(context.Background(), TemplateSelfV1, SignerSubmitInput{
+		RouteRequestID: "at_end_block",
+		Stage:          StageSignerCoordination,
+		Request:        request,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The current block is now exactly EndBlock -- still valid (inclusive).
+	engine.currentBlockHeight = endBlock
+
+	_, err = service.Poll(context.Background(), TemplateSelfV1, SignerPollInput{
+		RouteRequestID: "at_end_block",
+		RequestID:      submitResult.RequestID,
+		Stage:          StageSignerCoordination,
+		Request:        request,
+	})
+	if err != nil {
+		t.Fatalf("expected no error at exactly EndBlock, got %v", err)
 	}
 }
 
@@ -3593,19 +3671,13 @@ func TestServicePollAcceptsValidCertificate(t *testing.T) {
 	}
 }
 
-// TestServicePollSkipsBlockProviderWhenNoExpiration verifies P2-D: when the
-// SignerApproval has a nil EndBlock (no expiration), Poll proceeds without
-// error even though currentBlockProvider is called unconditionally at line 461.
-// The actual expiration gate (loadPollJob line 283) correctly skips the check.
-func TestServicePollSkipsBlockProviderWhenNoExpiration(t *testing.T) {
+// TestServiceSubmitRejectsSignerApprovalWithMissingEndBlock verifies that a
+// signer approval certificate without an EndBlock is rejected at Submit.
+// EndBlock is a mandatory v2 field: there is no fail-open "never expires"
+// certificate state.
+func TestServiceSubmitRejectsSignerApprovalWithMissingEndBlock(t *testing.T) {
 	handle := newMemoryHandle()
 	service, err := NewService(handle, &scriptedEngine{
-		submit: func(*Job) (*Transition, error) {
-			return &Transition{State: JobStatePending, Detail: "queued"}, nil
-		},
-		poll: func(*Job) (*Transition, error) {
-			return &Transition{State: JobStatePending, Detail: "polling"}, nil
-		},
 		currentBlockHeight: 100,
 	}, WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(RouteSubmitRequest) error {
 		return nil
@@ -3617,8 +3689,482 @@ func TestServicePollSkipsBlockProviderWhenNoExpiration(t *testing.T) {
 	request := structuredSignerApprovalRequest(TemplateSelfV1)
 	request.SignerApproval.EndBlock = nil
 
+	_, err = service.Submit(context.Background(), TemplateSelfV1, SignerSubmitInput{
+		RouteRequestID: "missing_end_block",
+		Stage:          StageSignerCoordination,
+		Request:        request,
+	})
+	if err == nil || !strings.Contains(err.Error(), "endBlock is required") {
+		t.Fatalf("expected missing endBlock error, got %v", err)
+	}
+}
+
+// TestServiceSubmitRejectsSignerApprovalMissingCurrentBlockProvider verifies
+// that a certificate-bearing Submit fails closed -- rather than treating the
+// certificate as unexpired -- when no current block height provider is
+// configured at all (the engine implements neither SignerApprovalVerifier nor
+// CurrentBlockHeightProvider, so nothing auto-detects a provider).
+func TestServiceSubmitRejectsSignerApprovalMissingCurrentBlockProvider(t *testing.T) {
+	handle := newMemoryHandle()
+	service, err := NewService(handle, &passiveEngineWithoutBlockHeight{}, WithSignerApprovalVerifier(
+		SignerApprovalVerifierFunc(func(RouteSubmitRequest) error { return nil }),
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := structuredSignerApprovalRequest(TemplateSelfV1)
+
+	_, err = service.Submit(context.Background(), TemplateSelfV1, SignerSubmitInput{
+		RouteRequestID: "missing_provider",
+		Stage:          StageSignerCoordination,
+		Request:        request,
+	})
+	if err == nil || !strings.Contains(err.Error(), "no current block height is available") {
+		t.Fatalf("expected missing provider error, got %v", err)
+	}
+}
+
+// passiveEngineWithoutBlockHeight implements Engine and SignerApprovalVerifier
+// but deliberately not CurrentBlockHeightProvider, to exercise the "verifier
+// present, provider absent" fail-closed path at the Service level (Initialize
+// rejects this combination at startup; Service itself must also fail closed
+// per-request for callers that construct a Service directly).
+type passiveEngineWithoutBlockHeight struct{}
+
+func (passiveEngineWithoutBlockHeight) OnSubmit(context.Context, *Job) (*Transition, error) {
+	return nil, nil
+}
+
+func (passiveEngineWithoutBlockHeight) OnPoll(context.Context, *Job) (*Transition, error) {
+	return nil, nil
+}
+
+func (passiveEngineWithoutBlockHeight) VerifySignerApproval(RouteSubmitRequest) error {
+	return nil
+}
+
+// TestServiceSubmitRejectsExpiryDiscoveredBeforeOnSubmit verifies the
+// pre-OnSubmit recheck: if the certificate has expired by the time the
+// in-flight slot is acquired (e.g. it expired while waiting on the signer
+// approval verifier or for a slot), Submit must reject before ever invoking
+// OnSubmit -- synchronous threshold signing must never start on an
+// authorization that has already lapsed.
+func TestServiceSubmitRejectsExpiryDiscoveredBeforeOnSubmit(t *testing.T) {
+	handle := newMemoryHandle()
+	callCount := 0
+	onSubmitCalled := false
+
+	engine := &hookedHeightEngine{
+		onSubmit: func(*Job) (*Transition, error) {
+			onSubmitCalled = true
+			return &Transition{State: JobStateArtifactReady, Detail: "ready", PSBTHash: "0xdeadbeef"}, nil
+		},
+	}
+	engine.blockHeight = func(context.Context) (uint64, error) {
+		callCount++
+		if callCount == 1 {
+			return 100, nil // valid at the initial top-of-Submit validation
+		}
+		return 999999999, nil // expired by the pre-OnSubmit recheck onward
+	}
+
+	service, err := NewService(
+		handle,
+		engine,
+		WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(RouteSubmitRequest) error {
+			return nil
+		})),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := structuredSignerApprovalRequest(TemplateSelfV1)
+
+	_, err = service.Submit(context.Background(), TemplateSelfV1, SignerSubmitInput{
+		RouteRequestID: "expire_before_submit",
+		Stage:          StageSignerCoordination,
+		Request:        request,
+	})
+	if err == nil || !strings.Contains(err.Error(), "signer approval certificate has expired") {
+		t.Fatalf("expected an expiry rejection, got %v", err)
+	}
+	if onSubmitCalled {
+		t.Fatal("expected OnSubmit to never be called once expiry was discovered pre-signing")
+	}
+}
+
+// TestServiceSubmitRejectsExpiryDiscoveredAfterOnSubmit verifies the
+// post-OnSubmit, pre-lock fast recheck: if synchronous threshold signing
+// itself takes long enough for the certificate to expire, Submit must reject
+// the now-stale result rather than persisting or returning it.
+func TestServiceSubmitRejectsExpiryDiscoveredAfterOnSubmit(t *testing.T) {
+	handle := newMemoryHandle()
+	callCount := 0
+
+	engine := &hookedHeightEngine{
+		onSubmit: func(*Job) (*Transition, error) {
+			return &Transition{State: JobStateArtifactReady, Detail: "ready", PSBTHash: "0xdeadbeef"}, nil
+		},
+	}
+	engine.blockHeight = func(context.Context) (uint64, error) {
+		callCount++
+		if callCount <= 2 {
+			// Valid for both the top-of-Submit validation and the
+			// pre-OnSubmit recheck.
+			return 100, nil
+		}
+		// Expired for the post-OnSubmit fast recheck onward, simulating
+		// signing itself having taken long enough to cross EndBlock.
+		return 999999999, nil
+	}
+
+	service, err := NewService(
+		handle,
+		engine,
+		WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(RouteSubmitRequest) error {
+			return nil
+		})),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := structuredSignerApprovalRequest(TemplateSelfV1)
+
+	_, err = service.Submit(context.Background(), TemplateSelfV1, SignerSubmitInput{
+		RouteRequestID: "expire_after_submit",
+		Stage:          StageSignerCoordination,
+		Request:        request,
+	})
+	if err == nil || !strings.Contains(err.Error(), "signer approval certificate has expired") {
+		t.Fatalf("expected an expiry rejection, got %v", err)
+	}
+
+	job, ok, err := service.store.GetByRouteRequest(TemplateSelfV1, "expire_after_submit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected the job to still be present in the store")
+	}
+	if job.State != JobStateSubmitted {
+		t.Fatalf(
+			"expected the job to remain in its prior JobStateSubmitted state, got %v",
+			job.State,
+		)
+	}
+	if job.PSBTHash != "" {
+		t.Fatal("expected the ready artifact to not be persisted after post-signing expiry")
+	}
+}
+
+// TestServiceSubmitRejectsExpiryDiscoveredWhileWaitingForMutex is the
+// deterministic concurrency regression test for the authoritative,
+// mutex-held expiry recheck. The pre-lock fast check observes a still-valid
+// certificate; while that check is resolving, another goroutine acquires
+// s.mutex, advances the current height past EndBlock, and releases it before
+// Submit's own s.mutex.Lock() call. Submit must reject once it acquires the
+// mutex, and the ready artifact must never be persisted -- this is the
+// TOCTOU window between the fast check and the store write that the
+// authoritative check closes.
+func TestServiceSubmitRejectsExpiryDiscoveredWhileWaitingForMutex(t *testing.T) {
+	handle := newMemoryHandle()
+
+	height := uint64(100)
+	callCount := 0
+	resumeRequests := make(chan chan struct{})
+
+	engine := &hookedHeightEngine{
+		onSubmit: func(*Job) (*Transition, error) {
+			return &Transition{State: JobStateArtifactReady, Detail: "ready", PSBTHash: "0xdeadbeef"}, nil
+		},
+	}
+	engine.blockHeight = func(context.Context) (uint64, error) {
+		callCount++
+		if callCount == 3 {
+			// This is the post-OnSubmit, pre-lock fast check (step 6 of
+			// Submit's sequence). Block until another goroutine has acquired
+			// s.mutex, advanced the height past EndBlock, and released it --
+			// simulating a concurrent Submit/Poll racing in right as this
+			// call is about to return a still-valid answer.
+			resume := make(chan struct{})
+			resumeRequests <- resume
+			<-resume
+			return 100, nil // still valid for THIS (pre-lock) check
+		}
+		return height, nil
+	}
+
+	service, err := NewService(
+		handle,
+		engine,
+		WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(RouteSubmitRequest) error {
+			return nil
+		})),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := structuredSignerApprovalRequest(TemplateSelfV1)
+	endBlock := *request.SignerApproval.EndBlock
+
+	submitDone := make(chan struct{})
+	var submitErr error
+	go func() {
+		defer close(submitDone)
+		_, submitErr = service.Submit(context.Background(), TemplateSelfV1, SignerSubmitInput{
+			RouteRequestID: "mutex_race",
+			Stage:          StageSignerCoordination,
+			Request:        request,
+		})
+	}()
+
+	resume := <-resumeRequests
+	service.mutex.Lock()
+	height = endBlock + 1
+	service.mutex.Unlock()
+	close(resume)
+
+	<-submitDone
+	if submitErr == nil || !strings.Contains(submitErr.Error(), "signer approval certificate has expired") {
+		t.Fatalf("expected an expiry rejection after acquiring the mutex, got %v", submitErr)
+	}
+
+	job, ok, err := service.store.GetByRouteRequest(TemplateSelfV1, "mutex_race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected the job to still be present in the store")
+	}
+	if job.State != JobStateSubmitted {
+		t.Fatalf(
+			"expected the job to remain in its prior JobStateSubmitted state, got %v",
+			job.State,
+		)
+	}
+	if job.PSBTHash != "" {
+		t.Fatal("expected the ready artifact to not be persisted after expiry was discovered under the mutex")
+	}
+}
+
+// TestServiceSubmitRejectsAlreadyExpiredCertificate verifies that Submit
+// fails closed on the very first, top-of-function expiry check when the
+// certificate is already expired before any validation or signing work
+// begins.
+func TestServiceSubmitRejectsAlreadyExpiredCertificate(t *testing.T) {
+	handle := newMemoryHandle()
+	service, err := NewService(handle, &scriptedEngine{
+		currentBlockHeight: 999999999,
+	}, WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(RouteSubmitRequest) error {
+		return nil
+	})))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := structuredSignerApprovalRequest(TemplateSelfV1)
+
+	_, err = service.Submit(context.Background(), TemplateSelfV1, SignerSubmitInput{
+		RouteRequestID: "already_expired",
+		Stage:          StageSignerCoordination,
+		Request:        request,
+	})
+	if err == nil || !strings.Contains(err.Error(), "signer approval certificate has expired") {
+		t.Fatalf("expected an expiry rejection, got %v", err)
+	}
+}
+
+// TestServiceSubmitPropagatesCurrentBlockProviderError verifies that Submit
+// (not just Poll) fails closed with a wrapped error when the current block
+// height provider itself errors for a certificate-bearing request.
+func TestServiceSubmitPropagatesCurrentBlockProviderError(t *testing.T) {
+	handle := newMemoryHandle()
+	wantErr := errors.New("blockchain is unavailable")
+	service, err := NewService(handle, &scriptedEngine{
+		currentBlockErr: wantErr,
+	}, WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(RouteSubmitRequest) error {
+		return nil
+	})))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := structuredSignerApprovalRequest(TemplateSelfV1)
+
+	_, err = service.Submit(context.Background(), TemplateSelfV1, SignerSubmitInput{
+		RouteRequestID: "submit_provider_err",
+		Stage:          StageSignerCoordination,
+		Request:        request,
+	})
+	if err == nil || !strings.Contains(err.Error(), wantErr.Error()) {
+		t.Fatalf("expected error containing %q, got %v", wantErr.Error(), err)
+	}
+}
+
+// TestServicePollRejectsMissingCurrentBlockProvider verifies Poll fails
+// closed -- rather than treating the certificate as unexpired -- when no
+// current block height provider is configured, even though the job was
+// submitted successfully through a different, provider-backed service
+// instance sharing the same underlying storage. This models a deployment
+// misconfiguration where the poll path loses access to the provider that the
+// submit path had.
+func TestServicePollRejectsMissingCurrentBlockProvider(t *testing.T) {
+	handle := newMemoryHandle()
+
+	submitService, err := NewService(handle, &scriptedEngine{
+		submit:             func(*Job) (*Transition, error) { return &Transition{State: JobStatePending, Detail: "queued"}, nil },
+		currentBlockHeight: 100,
+	}, WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(RouteSubmitRequest) error {
+		return nil
+	})))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := structuredSignerApprovalRequest(TemplateSelfV1)
+	submitResult, err := submitService.Submit(context.Background(), TemplateSelfV1, SignerSubmitInput{
+		RouteRequestID: "poll_missing_provider",
+		Stage:          StageSignerCoordination,
+		Request:        request,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pollService, err := NewService(handle, &passiveEngineWithoutBlockHeight{}, WithSignerApprovalVerifier(
+		SignerApprovalVerifierFunc(func(RouteSubmitRequest) error { return nil }),
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = pollService.Poll(context.Background(), TemplateSelfV1, SignerPollInput{
+		RouteRequestID: "poll_missing_provider",
+		RequestID:      submitResult.RequestID,
+		Stage:          StageSignerCoordination,
+		Request:        request,
+	})
+	// The exact rejection point (top-of-Poll validation of the resubmitted
+	// certificate, or the stored-job recheck) is an implementation detail;
+	// both independently fail closed on a missing provider. What matters is
+	// that Poll rejects rather than treating the certificate as unexpired.
+	if err == nil || !strings.Contains(err.Error(), "no current block height") {
+		t.Fatalf("expected a missing-provider rejection, got %v", err)
+	}
+}
+
+// TestServicePollRejectsLegacyStoredJobWithMissingEndBlock models a job
+// persisted before v2 EndBlock enforcement rolled out: its SignerApproval has
+// no EndBlock at all, because that was legal under v1. Such a job cannot have
+// passed through the current (v2-enforcing) Submit path, so it is
+// constructed directly against the store, the way an on-disk legacy file
+// would load. Polling it must fail closed rather than treat the missing
+// EndBlock as "never expires".
+//
+// The poll is resubmitted with a fresh, structurally valid v2 request (not
+// the stored legacy one) so that top-of-Poll input validation passes and the
+// rejection is specifically attributable to loadPollJob's stored-job recheck,
+// not to the resubmitted certificate itself being malformed. A real client
+// replaying its only (legacy) certificate would be rejected even earlier, at
+// input validation -- also intentionally failing closed, just at a different
+// layer.
+func TestServicePollRejectsLegacyStoredJobWithMissingEndBlock(t *testing.T) {
+	handle := newMemoryHandle()
+	service, err := NewService(handle, &scriptedEngine{
+		poll:               func(*Job) (*Transition, error) { return nil, nil },
+		currentBlockHeight: 100,
+	}, WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(RouteSubmitRequest) error {
+		return nil
+	})))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	legacyRequest := structuredSignerApprovalRequest(TemplateSelfV1)
+	legacyRequest.SignerApproval.CertificateVersion = 1
+	legacyRequest.SignerApproval.EndBlock = nil
+
+	// The stored request digest is irrelevant to this test: loadPollJob's
+	// ensureStoredCertificateTimely check runs, and must reject, before the
+	// digest is ever compared. It is also no longer computable through the
+	// normal requestDigest path, since normalization now rejects a nil
+	// EndBlock unconditionally -- exactly like a real legacy v1 job file
+	// loaded from disk, whose digest predates that requirement.
+	legacyJob := &Job{
+		RequestID:      "kcs_self_legacy",
+		RouteRequestID: "legacy_no_end_block",
+		Route:          TemplateSelfV1,
+		RequestDigest:  "0xdeadbeef",
+		State:          JobStatePending,
+		Detail:         "queued",
+		CreatedAt:      "2026-01-01T00:00:00Z",
+		UpdatedAt:      "2026-01-01T00:00:00Z",
+		Request:        legacyRequest,
+	}
+	if err := service.store.Put(legacyJob); err != nil {
+		t.Fatal(err)
+	}
+
+	freshPollBody := structuredSignerApprovalRequest(TemplateSelfV1)
+
+	_, err = service.Poll(context.Background(), TemplateSelfV1, SignerPollInput{
+		RouteRequestID: "legacy_no_end_block",
+		RequestID:      "kcs_self_legacy",
+		Stage:          StageSignerCoordination,
+		Request:        freshPollBody,
+	})
+	if err == nil || !strings.Contains(err.Error(), "signer approval certificate has expired") {
+		t.Fatalf("expected a legacy job with a missing end block to fail closed, got %v", err)
+	}
+}
+
+// TestServicePollRejectsExpiryDiscoveredDuringOnPoll verifies Poll's
+// equivalent of Submit's post-signing recheck: loadPollJob is called both
+// before and after OnPoll, so a certificate that was still valid when Poll
+// started but expires while OnPoll is running (e.g. OnPoll itself triggers
+// slow work) is still caught by the second, mutex-held loadPollJob call
+// before any transition is persisted.
+func TestServicePollRejectsExpiryDiscoveredDuringOnPoll(t *testing.T) {
+	handle := newMemoryHandle()
+	callCount := 0
+
+	engine := &hookedHeightEngine{
+		onSubmit: func(*Job) (*Transition, error) {
+			// Left non-terminal so the job is still pollable afterward.
+			return &Transition{State: JobStatePending, Detail: "queued"}, nil
+		},
+	}
+	engine.blockHeight = func(context.Context) (uint64, error) {
+		callCount++
+		if callCount <= 6 {
+			// Valid through Submit's four checks, Poll's top-of-function
+			// validation, and the first (pre-OnPoll) loadPollJob call.
+			return 100, nil
+		}
+		// Expired for the second (post-OnPoll, mutex-held) loadPollJob call
+		// onward, simulating OnPoll itself having taken long enough to cross
+		// EndBlock.
+		return 999999999, nil
+	}
+
+	service, err := NewService(
+		handle,
+		engine,
+		WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(RouteSubmitRequest) error {
+			return nil
+		})),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := structuredSignerApprovalRequest(TemplateSelfV1)
 	submitResult, err := service.Submit(context.Background(), TemplateSelfV1, SignerSubmitInput{
-		RouteRequestID: "no_exp",
+		RouteRequestID: "expire_during_poll",
 		Stage:          StageSignerCoordination,
 		Request:        request,
 	})
@@ -3627,12 +4173,25 @@ func TestServicePollSkipsBlockProviderWhenNoExpiration(t *testing.T) {
 	}
 
 	_, err = service.Poll(context.Background(), TemplateSelfV1, SignerPollInput{
-		RouteRequestID: "no_exp",
+		RouteRequestID: "expire_during_poll",
 		RequestID:      submitResult.RequestID,
 		Stage:          StageSignerCoordination,
 		Request:        request,
 	})
-	if err != nil {
-		t.Fatalf("expected no error for nil EndBlock, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "signer approval certificate has expired") {
+		t.Fatalf("expected an expiry rejection, got %v", err)
+	}
+}
+
+// TestNormalizeSignerApprovalCertificateRejectsV1CertificateVersion verifies
+// that a v1 signerApproval certificate is rejected outright rather than
+// accepted through a compatibility path.
+func TestNormalizeSignerApprovalCertificateRejectsV1CertificateVersion(t *testing.T) {
+	request := structuredSignerApprovalRequest(TemplateSelfV1)
+	request.SignerApproval.CertificateVersion = 1
+
+	_, err := normalizeSignerApprovalCertificate(request)
+	if err == nil || !strings.Contains(err.Error(), "request.signerApproval.certificateVersion must equal 2") {
+		t.Fatalf("expected v1 certificate version rejection, got %v", err)
 	}
 }
