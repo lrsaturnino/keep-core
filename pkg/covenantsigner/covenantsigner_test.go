@@ -14,6 +14,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"os"
 	"reflect"
@@ -1092,6 +1093,270 @@ func TestServiceSubmitReturnsExistingJobWhileInitialEngineCallIsInFlight(t *test
 	}
 	if firstResult.RequestID != secondResult.RequestID {
 		t.Fatalf("expected in-flight dedupe to reuse request id, got %s vs %s", firstResult.RequestID, secondResult.RequestID)
+	}
+}
+
+// TestServiceSubmitDedupRejectsStaleResultWhenCertificateExpiresWhileOriginalSubmitIsInFlight
+// proves createOrDedup's dedup hit is freshly rechecked rather than blindly
+// echoed back. The first Submit call creates the job and then blocks inside
+// OnSubmit; while that call is still in flight (the job is durable but only
+// JobStateSubmitted, not yet terminal), the current-block height advances
+// past EndBlock and a second, deduplicating Submit call for the same
+// routeRequestId must observe that expiry -- proving the dedup return path
+// itself now rechecks, not just the fresh-job pipeline the other expiry
+// regression tests above exercise.
+func TestServiceSubmitDedupRejectsStaleResultWhenCertificateExpiresWhileOriginalSubmitIsInFlight(t *testing.T) {
+	handle := newMemoryHandle()
+	engineStarted := make(chan struct{})
+	releaseEngine := make(chan struct{})
+	callCount := 0
+
+	engine := &hookedHeightEngine{
+		onSubmit: func(*Job) (*Transition, error) {
+			close(engineStarted)
+			<-releaseEngine
+			return &Transition{State: JobStatePending, Detail: "queued"}, nil
+		},
+	}
+	engine.blockHeight = func(context.Context) (uint64, error) {
+		callCount++
+		if callCount <= 3 {
+			// Valid for the first Submit call's top-of-function validation
+			// (1), its pre-OnSubmit recheck (2), and the second Submit
+			// call's own top-of-function validation (3) -- the second call
+			// must pass ordinary validation and reach createOrDedup on its
+			// own merits.
+			return 100, nil
+		}
+		// Expired from the second Submit call's dedup fresh-check (4)
+		// onward, simulating the certificate lapsing while the first call's
+		// OnSubmit is still in flight.
+		return 999999999, nil
+	}
+
+	service, err := NewService(
+		handle,
+		engine,
+		WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(RouteSubmitRequest) error {
+			return nil
+		})),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := structuredSignerApprovalRequest(TemplateSelfV1)
+	input := SignerSubmitInput{
+		RouteRequestID: "dedup_expires_in_flight",
+		Stage:          StageSignerCoordination,
+		Request:        request,
+	}
+
+	firstDone := make(chan struct{})
+	var firstErr error
+	go func() {
+		defer close(firstDone)
+		_, firstErr = service.Submit(context.Background(), TemplateSelfV1, input)
+	}()
+
+	<-engineStarted
+
+	_, secondErr := service.Submit(context.Background(), TemplateSelfV1, input)
+	if secondErr == nil || !strings.Contains(secondErr.Error(), "signer approval certificate has expired") {
+		t.Fatalf("expected the deduplicated submit to reject on fresh expiry, got %v", secondErr)
+	}
+
+	close(releaseEngine)
+	<-firstDone
+	if firstErr == nil || !strings.Contains(firstErr.Error(), "signer approval certificate has expired") {
+		t.Fatalf("expected the original submit to also reject once its own post-signing recheck runs, got %v", firstErr)
+	}
+
+	job, ok, err := service.store.GetByRouteRequest(TemplateSelfV1, "dedup_expires_in_flight")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected the job to still be present in the store")
+	}
+	if job.State != JobStateSubmitted {
+		t.Fatalf("expected the job to remain in its prior JobStateSubmitted state, got %v", job.State)
+	}
+}
+
+// TestServiceSubmitDedupRejectsStaleReadyResultAfterCertificateExpires proves
+// that a second Submit call for an already-completed (terminal, ready) job
+// does not simply echo back the stored ready artifact once the certificate
+// has since expired: createOrDedup's fresh recheck must reject it instead of
+// returning the stale ready result, and must leave the durable job untouched.
+//
+// The height hook is deliberately structured so the second Submit call's own
+// pre-existing top-of-function validation (on the freshly resubmitted,
+// byte-identical certificate) still observes a VALID height and would let the
+// request through on its own -- only createOrDedup's fresh recheck of the
+// STORED job observes the expired height. This isolates the new dedup-path
+// check: without it, this test fails closed for the wrong reason (or not at
+// all), since a naive "advance a static height between two sequential Submit
+// calls" design would trip the pre-existing top-of-function check instead and
+// pass regardless of whether createOrDedup rechecks anything.
+func TestServiceSubmitDedupRejectsStaleReadyResultAfterCertificateExpires(t *testing.T) {
+	handle := newMemoryHandle()
+	firstJobCreated := false
+	dedupCallCount := 0
+	onSubmitCallCount := 0
+
+	engine := &hookedHeightEngine{
+		onSubmit: func(*Job) (*Transition, error) {
+			onSubmitCallCount++
+			return &Transition{State: JobStateArtifactReady, Detail: "ready", PSBTHash: "0xdeadbeef"}, nil
+		},
+	}
+	engine.blockHeight = func(context.Context) (uint64, error) {
+		if !firstJobCreated {
+			// Unconditionally valid while the original job is created and
+			// completed. This test does not depend on exactly how many
+			// provider calls that pipeline makes internally.
+			return 100, nil
+		}
+		dedupCallCount++
+		if dedupCallCount == 1 {
+			// The second Submit call's own top-of-function validation --
+			// still valid.
+			return 100, nil
+		}
+		// createOrDedup's fresh recheck of the stored job -- expired.
+		return 999999999, nil
+	}
+
+	service, err := NewService(
+		handle,
+		engine,
+		WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(RouteSubmitRequest) error {
+			return nil
+		})),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := structuredSignerApprovalRequest(TemplateSelfV1)
+	input := SignerSubmitInput{
+		RouteRequestID: "dedup_stale_ready",
+		Stage:          StageSignerCoordination,
+		Request:        request,
+	}
+
+	first, err := service.Submit(context.Background(), TemplateSelfV1, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Status != StepStatusReady {
+		t.Fatalf("expected the first submit to complete as ready, got %v", first.Status)
+	}
+	firstJobCreated = true
+
+	_, err = service.Submit(context.Background(), TemplateSelfV1, input)
+	if err == nil || !strings.Contains(err.Error(), "signer approval certificate has expired") {
+		t.Fatalf("expected the deduplicated submit to reject the stale ready result, got %v", err)
+	}
+	if onSubmitCallCount != 1 {
+		t.Fatalf("expected OnSubmit to be called exactly once, for the original job only, got %d calls", onSubmitCallCount)
+	}
+
+	job, ok, err := service.store.GetByRouteRequest(TemplateSelfV1, "dedup_stale_ready")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected the job to still be present in the store")
+	}
+	if job.State != JobStateArtifactReady {
+		t.Fatalf("expected the durable job to remain ArtifactReady, got %v", job.State)
+	}
+	if job.PSBTHash != "0xdeadbeef" {
+		t.Fatalf("expected the original ready artifact to remain untouched, got %q", job.PSBTHash)
+	}
+}
+
+// TestServiceSubmitDedupRejectsStaleReadyResultWhenProviderStartsFailing
+// proves createOrDedup's fresh recheck also fails closed -- rather than
+// returning the stale ready artifact -- when the current block height
+// provider itself starts erroring after the original job completed. As
+// above, the second Submit call's own top-of-function validation still
+// observes a healthy provider; only createOrDedup's fresh recheck of the
+// stored job observes the failure, isolating the new dedup-path check.
+func TestServiceSubmitDedupRejectsStaleReadyResultWhenProviderStartsFailing(t *testing.T) {
+	handle := newMemoryHandle()
+	wantErr := errors.New("blockchain is unavailable")
+	firstJobCreated := false
+	dedupCallCount := 0
+	onSubmitCallCount := 0
+
+	engine := &hookedHeightEngine{
+		onSubmit: func(*Job) (*Transition, error) {
+			onSubmitCallCount++
+			return &Transition{State: JobStateArtifactReady, Detail: "ready", PSBTHash: "0xdeadbeef"}, nil
+		},
+	}
+	engine.blockHeight = func(context.Context) (uint64, error) {
+		if !firstJobCreated {
+			return 100, nil
+		}
+		dedupCallCount++
+		if dedupCallCount == 1 {
+			// The second Submit call's own top-of-function validation --
+			// the provider is still healthy at this point.
+			return 100, nil
+		}
+		// createOrDedup's fresh recheck of the stored job -- the provider
+		// has now started failing.
+		return 0, wantErr
+	}
+
+	service, err := NewService(
+		handle,
+		engine,
+		WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(RouteSubmitRequest) error {
+			return nil
+		})),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := structuredSignerApprovalRequest(TemplateSelfV1)
+	input := SignerSubmitInput{
+		RouteRequestID: "dedup_provider_fails",
+		Stage:          StageSignerCoordination,
+		Request:        request,
+	}
+
+	first, err := service.Submit(context.Background(), TemplateSelfV1, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Status != StepStatusReady {
+		t.Fatalf("expected the first submit to complete as ready, got %v", first.Status)
+	}
+	firstJobCreated = true
+
+	_, err = service.Submit(context.Background(), TemplateSelfV1, input)
+	if err == nil || !strings.Contains(err.Error(), wantErr.Error()) {
+		t.Fatalf("expected the deduplicated submit to propagate the provider error, got %v", err)
+	}
+	if onSubmitCallCount != 1 {
+		t.Fatalf("expected OnSubmit to be called exactly once, for the original job only, got %d calls", onSubmitCallCount)
+	}
+
+	job, ok, err := service.store.GetByRouteRequest(TemplateSelfV1, "dedup_provider_fails")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected the job to still be present in the store")
+	}
+	if job.State != JobStateArtifactReady {
+		t.Fatalf("expected the durable job to remain ArtifactReady, got %v", job.State)
 	}
 }
 
@@ -3699,6 +3964,68 @@ func TestServiceSubmitRejectsSignerApprovalWithMissingEndBlock(t *testing.T) {
 	}
 }
 
+// TestServiceAcceptsSignerApprovalCertificateWithEndBlockAboveUint32Range
+// proves EndBlock is not artificially capped to uint32. The certificate v2
+// signing digest binds EndBlock as a full 8-byte big-endian uint64 (see
+// signerApprovalCertificateSigningDigest in pkg/tbtc), so request
+// normalization -- and the full Submit/Poll round trip -- must accept and
+// preserve a value above math.MaxUint32 rather than rejecting it.
+func TestServiceAcceptsSignerApprovalCertificateWithEndBlockAboveUint32Range(t *testing.T) {
+	handle := newMemoryHandle()
+	endBlock := uint64(math.MaxUint32) + 100000
+	if endBlock <= math.MaxUint32 {
+		t.Fatalf("test vector must exceed math.MaxUint32, got %d", endBlock)
+	}
+
+	service, err := NewService(handle, &scriptedEngine{
+		submit: func(*Job) (*Transition, error) {
+			return &Transition{State: JobStateArtifactReady, Detail: "ready", PSBTHash: "0xdeadbeef"}, nil
+		},
+		currentBlockHeight: 100,
+	}, WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(RouteSubmitRequest) error {
+		return nil
+	})))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := structuredSignerApprovalRequest(TemplateSelfV1)
+	request.SignerApproval.EndBlock = &endBlock
+
+	normalized, err := normalizeSignerApprovalCertificate(request)
+	if err != nil {
+		t.Fatalf("expected EndBlock above math.MaxUint32 to normalize, got %v", err)
+	}
+	if normalized.EndBlock == nil || *normalized.EndBlock != endBlock {
+		t.Fatalf("expected normalized EndBlock to equal %d, got %v", endBlock, normalized.EndBlock)
+	}
+
+	submitResult, err := service.Submit(context.Background(), TemplateSelfV1, SignerSubmitInput{
+		RouteRequestID: "uint64_end_block",
+		Stage:          StageSignerCoordination,
+		Request:        request,
+	})
+	if err != nil {
+		t.Fatalf("expected submit to accept EndBlock above math.MaxUint32, got %v", err)
+	}
+	if submitResult.Status != StepStatusReady {
+		t.Fatalf("expected ready status, got %v", submitResult.Status)
+	}
+
+	pollResult, err := service.Poll(context.Background(), TemplateSelfV1, SignerPollInput{
+		RouteRequestID: "uint64_end_block",
+		RequestID:      submitResult.RequestID,
+		Stage:          StageSignerCoordination,
+		Request:        request,
+	})
+	if err != nil {
+		t.Fatalf("expected poll to accept EndBlock above math.MaxUint32, got %v", err)
+	}
+	if pollResult.Status != StepStatusReady {
+		t.Fatalf("expected ready status on poll, got %v", pollResult.Status)
+	}
+}
+
 // TestServiceSubmitRejectsSignerApprovalMissingCurrentBlockProvider verifies
 // that a certificate-bearing Submit fails closed -- rather than treating the
 // certificate as unexpired -- when no current block height provider is
@@ -3792,6 +4119,93 @@ func TestServiceSubmitRejectsExpiryDiscoveredBeforeOnSubmit(t *testing.T) {
 	}
 	if onSubmitCalled {
 		t.Fatal("expected OnSubmit to never be called once expiry was discovered pre-signing")
+	}
+}
+
+// TestServiceSubmitRejectsExpiryDiscoveredAfterRealInFlightSemaphoreWait
+// proves the pre-OnSubmit recheck catches expiry that occurs while Submit is
+// genuinely blocked waiting for a WithMaxInFlight slot -- an actual blocking
+// send on the production s.inFlightSlots channel, not a mocked or simulated
+// wait. The test occupies the sole slot itself (rather than via a second,
+// concurrent Submit call), which makes the blocking point unambiguous and
+// race-free by construction: Submit cannot possibly acquire the slot, and
+// therefore cannot reach the pre-OnSubmit recheck or OnSubmit itself, until
+// the test explicitly releases it.
+func TestServiceSubmitRejectsExpiryDiscoveredAfterRealInFlightSemaphoreWait(t *testing.T) {
+	handle := newMemoryHandle()
+	callCount := 0
+	onSubmitCalled := false
+
+	engine := &hookedHeightEngine{
+		onSubmit: func(*Job) (*Transition, error) {
+			onSubmitCalled = true
+			return &Transition{State: JobStateArtifactReady, Detail: "ready", PSBTHash: "0xdeadbeef"}, nil
+		},
+	}
+	engine.blockHeight = func(context.Context) (uint64, error) {
+		callCount++
+		if callCount == 1 {
+			return 100, nil // valid at the initial top-of-Submit validation
+		}
+		// Expired by the pre-OnSubmit recheck, which is only reachable after
+		// the real semaphore wait below is released.
+		return 999999999, nil
+	}
+
+	service, err := NewService(
+		handle,
+		engine,
+		WithMaxInFlight(1),
+		WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(RouteSubmitRequest) error {
+			return nil
+		})),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Occupy the sole in-flight slot before Submit ever runs, using the real
+	// production channel directly (this test is in-package). Submit's own
+	// semaphore acquire is then guaranteed to block for real, rather than
+	// possibly racing ahead of a second goroutine that would otherwise need
+	// to be observed blocking.
+	service.inFlightSlots <- struct{}{}
+
+	request := structuredSignerApprovalRequest(TemplateSelfV1)
+
+	submitDone := make(chan struct{})
+	var submitErr error
+	go func() {
+		defer close(submitDone)
+		_, submitErr = service.Submit(context.Background(), TemplateSelfV1, SignerSubmitInput{
+			RouteRequestID: "real_semaphore_wait",
+			Stage:          StageSignerCoordination,
+			Request:        request,
+		})
+	}()
+
+	select {
+	case <-submitDone:
+		t.Fatal("expected Submit to block on the in-flight slot semaphore before completing")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Release the slot: Submit's semaphore acquire can now proceed, and the
+	// pre-OnSubmit recheck that immediately follows observes the expired
+	// height.
+	<-service.inFlightSlots
+
+	select {
+	case <-submitDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected Submit to finish after the in-flight slot was released")
+	}
+
+	if submitErr == nil || !strings.Contains(submitErr.Error(), "signer approval certificate has expired") {
+		t.Fatalf("expected an expiry rejection after the real semaphore wait, got %v", submitErr)
+	}
+	if onSubmitCalled {
+		t.Fatal("expected OnSubmit to never be called once expiry was discovered after the semaphore wait")
 	}
 }
 

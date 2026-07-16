@@ -265,14 +265,24 @@ func sameJobRevision(current *Job, snapshot *Job) bool {
 
 // currentBlockForRequest returns the current block height needed to validate
 // request's signer approval certificate expiry, or nil if request carries no
-// certificate at all (expiry does not apply, and the provider is not queried
-// unnecessarily). When request does carry a certificate but no block height
-// provider is configured, this returns (nil, nil) rather than a fabricated
-// zero height: the absence stays distinguishable so callers fail closed
-// instead of silently treating the certificate as unexpired. Provider errors
-// are propagated so callers fail closed on provider failures too.
+// certificate at all, or the certificate has no EndBlock (expiry does not
+// apply either way, and the provider is not queried unnecessarily). Gating on
+// EndBlock here -- not just on SignerApproval being present -- keeps the
+// required validation order (EndBlock structural presence before any
+// provider query) even though this helper runs ahead of full request
+// validation: a request with a present-but-nil EndBlock must never trigger a
+// provider RPC before normalizeSignerApprovalCertificate gets a chance to
+// reject it structurally. When request does carry a certificate with an
+// EndBlock but no block height provider is configured, this returns (nil,
+// nil) rather than a fabricated zero height: the absence stays
+// distinguishable so callers fail closed instead of silently treating the
+// certificate as unexpired. Provider errors are propagated so callers fail
+// closed on provider failures too.
 func (s *Service) currentBlockForRequest(request RouteSubmitRequest) (*uint64, error) {
 	if request.SignerApproval == nil {
+		return nil, nil
+	}
+	if request.SignerApproval.EndBlock == nil {
 		return nil, nil
 	}
 	if s.currentBlockProvider == nil {
@@ -369,6 +379,16 @@ func (s *Service) loadPollJob(route TemplateID, input SignerPollInput) (*Job, er
 // createOrDedup creates a new job under the service mutex, or returns the
 // existing job result if the route request is already known. Returns
 // (job, nil, nil) for a new job, or (nil, result, nil) for a dedup hit.
+//
+// A dedup hit -- including one that resolves to an already-terminal
+// ready/failed job -- is only returned after a fresh ensureStoredCertificateTimely
+// check, run here while s.mutex is held. Without this, a certificate that was
+// valid when the original job was created but has since expired (or whose
+// provider now errors) could be echoed back as if it were still valid: the
+// dedup path short-circuits Submit before any of its other expiry/provider
+// rechecks ever run. On failure this returns the expiry/provider error and
+// leaves the durable job untouched, the same fail-closed contract Submit
+// itself uses for its own rechecks.
 func (s *Service) createOrDedup(
 	route TemplateID,
 	input SignerSubmitInput,
@@ -385,6 +405,9 @@ func (s *Service) createOrDedup(
 			return nil, nil, &inputError{
 				"routeRequestId already exists with a different request payload",
 			}
+		}
+		if err := s.ensureStoredCertificateTimely(existing); err != nil {
+			return nil, nil, err
 		}
 		result := mapJobResult(existing)
 		return nil, &result, nil
