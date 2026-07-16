@@ -4365,6 +4365,142 @@ func TestServiceSubmitRejectsExpiryDiscoveredWhileWaitingForMutex(t *testing.T) 
 	}
 }
 
+// TestServiceSubmitRejectsStaleTerminalResultWhenCertificateExpiresWhileOnSubmitIsInFlight
+// proves that Submit's mutex-held early-return path -- the one that hands
+// back a concurrently-advanced or terminal currentJob instead of applying
+// this call's own transition -- rechecks certificate freshness before
+// returning that job, not after (or never, if the early return fires first).
+//
+// OnSubmit blocks. While it is in flight, another operation (simulating a
+// concurrent Poll racing this Submit call) advances the same durable job
+// straight to a terminal ArtifactReady state via the store. Submit's
+// post-OnSubmit, pre-lock recheck runs against the ORIGINAL pre-OnSubmit job
+// snapshot held in a local variable, not the store, so it does not observe
+// this mutation and still passes on a valid height -- the race is only
+// observable by whatever reloads the job from the store under the mutex.
+//
+// The height provider is call-counted: calls 1-3 cover Submit's own
+// top-of-function validation, pre-OnSubmit recheck, and post-OnSubmit
+// pre-lock recheck, and must all observe a valid height for the race to be
+// genuine. A 4th call is the mutex-held recheck of the freshly reloaded
+// currentJob; it must happen at all (proving the early return did not skip
+// it) and it must observe the expired height (proving the check runs before,
+// not after, the early return). Without the fix, the early return fires as
+// soon as currentJob.State is seen to be terminal, the 4th call never
+// happens, and the stale ArtifactReady result leaks out with an expired
+// certificate.
+func TestServiceSubmitRejectsStaleTerminalResultWhenCertificateExpiresWhileOnSubmitIsInFlight(t *testing.T) {
+	handle := newMemoryHandle()
+	onSubmitStarted := make(chan struct{})
+	releaseOnSubmit := make(chan struct{})
+	callCount := 0
+
+	engine := &hookedHeightEngine{
+		onSubmit: func(*Job) (*Transition, error) {
+			close(onSubmitStarted)
+			<-releaseOnSubmit
+			return &Transition{State: JobStatePending, Detail: "queued"}, nil
+		},
+	}
+	engine.blockHeight = func(context.Context) (uint64, error) {
+		callCount++
+		if callCount <= 3 {
+			// Valid through Submit's top-of-function validation (1),
+			// pre-OnSubmit recheck (2), and post-OnSubmit pre-lock recheck
+			// (3) -- none of these reload the concurrently-mutated store, so
+			// they must all pass on their own merits for the race below to
+			// be the only thing standing between the stale result and the
+			// caller.
+			return 100, nil
+		}
+		// The 4th call, if it happens, is the mutex-held recheck of the
+		// freshly reloaded currentJob -- it must observe the certificate as
+		// expired.
+		return 999999999, nil
+	}
+
+	service, err := NewService(
+		handle,
+		engine,
+		WithSignerApprovalVerifier(SignerApprovalVerifierFunc(func(RouteSubmitRequest) error {
+			return nil
+		})),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := structuredSignerApprovalRequest(TemplateSelfV1)
+	input := SignerSubmitInput{
+		RouteRequestID: "submit_terminal_race",
+		Stage:          StageSignerCoordination,
+		Request:        request,
+	}
+
+	submitDone := make(chan struct{})
+	var submitResult StepResult
+	var submitErr error
+	go func() {
+		defer close(submitDone)
+		submitResult, submitErr = service.Submit(context.Background(), TemplateSelfV1, input)
+	}()
+
+	<-onSubmitStarted
+
+	// Simulate a concurrent Poll advancing the same durable job straight to a
+	// terminal ArtifactReady state while this Submit call's OnSubmit is still
+	// in flight -- exactly the race the "another poll already advanced the
+	// stored job" early return exists to handle.
+	storedJob, ok, err := service.store.GetByRouteRequest(TemplateSelfV1, input.RouteRequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected the submitted job to be durable while OnSubmit is in flight")
+	}
+	storedJob.State = JobStateArtifactReady
+	storedJob.Detail = "ready"
+	storedJob.PSBTHash = "0xleaked"
+	storedJob.CompletedAt = "2024-01-01T00:00:00Z"
+	storedJob.UpdatedAt = storedJob.CompletedAt
+	if err := service.store.Put(storedJob); err != nil {
+		t.Fatal(err)
+	}
+
+	close(releaseOnSubmit)
+	<-submitDone
+
+	if submitErr == nil || !strings.Contains(submitErr.Error(), "signer approval certificate has expired") {
+		t.Fatalf(
+			"expected Submit to reject the stale terminal result on fresh expiry, got result=%#v err=%v",
+			submitResult, submitErr,
+		)
+	}
+	if submitResult.PSBTHash == "0xleaked" {
+		t.Fatal("expected the concurrently-persisted terminal result to not be returned")
+	}
+	if callCount != 4 {
+		t.Fatalf(
+			"expected the mutex-held recheck to run as a 4th provider call before the early return, got %d calls",
+			callCount,
+		)
+	}
+
+	persisted, ok, err := service.store.GetByRequestID(storedJob.RequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected the job to still be present in the store")
+	}
+	if persisted.State != JobStateArtifactReady || persisted.PSBTHash != "0xleaked" {
+		t.Fatalf(
+			"expected the concurrently-persisted terminal job to remain untouched, got %#v",
+			persisted,
+		)
+	}
+}
+
 // TestServiceSubmitRejectsAlreadyExpiredCertificate verifies that Submit
 // fails closed on the very first, top-of-function expiry check when the
 // certificate is already expired before any validation or signing work

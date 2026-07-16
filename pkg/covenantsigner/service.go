@@ -546,20 +546,26 @@ func (s *Service) Submit(ctx context.Context, route TemplateID, input SignerSubm
 		return StepResult{}, errJobNotFound
 	}
 
+	// Authoritative recheck: the last point before any stored job state --
+	// whether this call's own transition or a newer/terminal state a
+	// concurrent Submit or Poll already persisted -- is persisted or
+	// returned, running while s.mutex is held so no concurrent Submit or
+	// Poll can advance the current height and slip past it. This closes the
+	// TOCTOU window between the fast check above and the store write/return
+	// below. It must run here, immediately after currentJob is loaded and
+	// before the early-return just below: a concurrently-advanced or
+	// terminal currentJob must never be handed back without this check, the
+	// same fail-closed contract createOrDedup's dedup hit and loadPollJob's
+	// every call site already use.
+	if err := s.ensureStoredCertificateTimely(currentJob); err != nil {
+		return StepResult{}, err
+	}
+
 	// Another poll already advanced the stored job while submit was waiting on
 	// signer work. Return the newer durable state instead of overwriting it with
 	// a transition computed from an older snapshot.
 	if !sameJobRevision(currentJob, job) || isTerminalJobState(currentJob.State) {
 		return mapJobResult(currentJob), nil
-	}
-
-	// Authoritative recheck: the last point before the ready artifact is
-	// persisted or returned, running while s.mutex is held so no concurrent
-	// Submit or Poll can advance the current height and slip past it. This
-	// closes the TOCTOU window between the fast check above and the store
-	// write below.
-	if err := s.ensureStoredCertificateTimely(currentJob); err != nil {
-		return StepResult{}, err
 	}
 
 	applyTransition(currentJob, transition, s.now())
