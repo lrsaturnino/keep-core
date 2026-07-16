@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"math"
 	"math/big"
 	"strings"
 	"testing"
@@ -212,6 +213,74 @@ func TestSigningExecutorCanIssueSignerApprovalCertificateForArbitraryDigest(t *t
 			certificate.EndBlock,
 			requestedEndBlock,
 		)
+	}
+}
+
+// TestSigningExecutorIssueSignerApprovalCertificateAcceptsEndBlockAboveUint32Range
+// proves an EndBlock above math.MaxUint32 round-trips correctly through
+// issuance (signing) and verification. The certificate v2 digest binds
+// EndBlock as a full 8-byte big-endian uint64 (see
+// signerApprovalCertificateSigningDigest), so the full uint64 range must be
+// usable end to end, not just the low 32 bits.
+func TestSigningExecutorIssueSignerApprovalCertificateAcceptsEndBlockAboveUint32Range(t *testing.T) {
+	node, _, walletPublicKey := setupCovenantSignerTestNode(t)
+
+	executor, ok, err := node.getSigningExecutor(walletPublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("node is supposed to control wallet signers")
+	}
+
+	startBlock, err := executor.getCurrentBlockFn()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	approvalDigest := sha256.Sum256(
+		[]byte("psbt-covenant-signer-approval-certificate-uint64-end-block"),
+	)
+	requestedEndBlock := uint64(math.MaxUint32) + 100000
+	if requestedEndBlock <= math.MaxUint32 {
+		t.Fatalf("test vector must exceed math.MaxUint32, got %d", requestedEndBlock)
+	}
+
+	certificate, err := executor.issueSignerApprovalCertificate(
+		context.Background(),
+		approvalDigest[:],
+		startBlock,
+		requestedEndBlock,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if certificate.EndBlock == nil || *certificate.EndBlock != requestedEndBlock {
+		t.Fatalf(
+			"expected end block [%v] to equal the requested end block [%v]",
+			certificate.EndBlock,
+			requestedEndBlock,
+		)
+	}
+
+	walletChainData, err := executor.chain.GetWallet(
+		bitcoin.PublicKeyHash(executor.wallet().publicKey),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expectedSignerSetHash, err := computeSignerApprovalCertificateSignerSetHash(
+		executor.wallet().publicKey,
+		walletChainData,
+		executor.groupParameters,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verifySignerApprovalCertificate(certificate, expectedSignerSetHash); err != nil {
+		t.Fatalf("expected certificate verification to succeed: %v", err)
 	}
 }
 
@@ -876,6 +945,70 @@ func TestSignerApprovalCertificateSigningDigestMatchesCrossLanguageVector(t *tes
 	//   0x000000000001e240
 	// )
 	const expectedPinnedHex = "0x636bf1d70b67dd7f54e1d4e090fd258928cce229b66a9a8cae3a5e75e288e19d"
+	if expectedDigestHex != expectedPinnedHex {
+		t.Fatalf(
+			"test vector itself is inconsistent\nindependent: %s\npinned:      %s",
+			expectedDigestHex,
+			expectedPinnedHex,
+		)
+	}
+
+	actualDigest, err := signerApprovalCertificateSigningDigest(approvalDigest, endBlock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actualDigestHex := "0x" + hex.EncodeToString(actualDigest)
+
+	if actualDigestHex != expectedDigestHex {
+		t.Fatalf(
+			"unexpected v2 signing digest\nexpected: %s\nactual:   %s",
+			expectedDigestHex,
+			actualDigestHex,
+		)
+	}
+}
+
+// TestSignerApprovalCertificateSigningDigestMatchesCrossLanguageVectorAboveUint32Range
+// pins a second cross-language vector whose EndBlock exceeds math.MaxUint32,
+// so the digest's high-order 4 bytes are nonzero. The vector above alone
+// cannot catch an implementation that silently truncates EndBlock to 32 bits
+// before hashing it, since 123456 fits entirely in the low-order bytes; this
+// one specifically exercises the full 8-byte big-endian encoding.
+func TestSignerApprovalCertificateSigningDigestMatchesCrossLanguageVectorAboveUint32Range(t *testing.T) {
+	approvalDigest, err := hex.DecodeString(strings.Repeat("11", 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One past math.MaxUint32, plus the same 123456 low-order value used by
+	// the vector above.
+	const endBlock = uint64(math.MaxUint32) + 1 + 123456
+	if endBlock <= math.MaxUint32 {
+		t.Fatalf("test vector must exceed math.MaxUint32, got %d", endBlock)
+	}
+
+	// Independently constructed preimage and digest -- deliberately not
+	// calling the production helper -- so this test actually catches a
+	// broken implementation rather than just echoing it back.
+	preimage := append(
+		[]byte("covenant-signer-approval-certificate-v2:"),
+		approvalDigest...,
+	)
+	var endBlockBytes [8]byte
+	binary.BigEndian.PutUint64(endBlockBytes[:], endBlock)
+	if endBlockBytes != ([8]byte{0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0xe2, 0x40}) {
+		t.Fatalf("unexpected big-endian encoding of endBlock: %x", endBlockBytes)
+	}
+	preimage = append(preimage, endBlockBytes[:]...)
+	expectedDigest := sha256.Sum256(preimage)
+	expectedDigestHex := "0x" + hex.EncodeToString(expectedDigest[:])
+
+	// Pinned exact value, independently computed (Python hashlib, not this
+	// Go codebase): SHA256(
+	//   "covenant-signer-approval-certificate-v2:" ||
+	//   0x1111111111111111111111111111111111111111111111111111111111111111 ||
+	//   0x000000010001e240
+	// )
+	const expectedPinnedHex = "0x67e035629f14cad309d349046c6c6ec0ec2c18a79b0c948796a6668b15d4dd60"
 	if expectedDigestHex != expectedPinnedHex {
 		t.Fatalf(
 			"test vector itself is inconsistent\nindependent: %s\npinned:      %s",
