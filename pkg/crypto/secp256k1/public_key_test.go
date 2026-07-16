@@ -82,6 +82,7 @@ func TestUnmarshalMalformedPublicKey(t *testing.T) {
 
 func TestMarshalRejectsInvalidPublicKey(t *testing.T) {
 	p256 := elliptic.P256()
+	secp256k1 := btcec.S256()
 	tests := map[string]*ecdsa.PublicKey{
 		"nil": nil,
 		"non-secp256k1 curve": {
@@ -90,9 +91,46 @@ func TestMarshalRejectsInvalidPublicKey(t *testing.T) {
 			Y:     p256.Params().Gy,
 		},
 		"point off the curve": {
-			Curve: btcec.S256(),
+			Curve: secp256k1,
 			X:     new(big.Int),
 			Y:     new(big.Int),
+		},
+		"negative x coordinate": {
+			Curve: secp256k1,
+			X:     big.NewInt(-1),
+			Y:     new(big.Int).Set(secp256k1.Params().Gy),
+		},
+		"negative y coordinate": {
+			Curve: secp256k1,
+			X:     new(big.Int).Set(secp256k1.Params().Gx),
+			Y:     big.NewInt(-1),
+		},
+		"oversized x coordinate": {
+			Curve: secp256k1,
+			X: new(big.Int).Add(
+				new(big.Int).Set(secp256k1.Params().P),
+				big.NewInt(1),
+			),
+			Y: new(big.Int).Set(secp256k1.Params().Gy),
+		},
+		"oversized y coordinate": {
+			Curve: secp256k1,
+			X:     new(big.Int).Set(secp256k1.Params().Gx),
+			Y: new(big.Int).Add(
+				new(big.Int).Set(secp256k1.Params().P),
+				big.NewInt(1),
+			),
+		},
+		"shifted generator coordinates": {
+			Curve: secp256k1,
+			X: new(big.Int).Lsh(
+				new(big.Int).Set(secp256k1.Params().Gx),
+				8,
+			),
+			Y: new(big.Int).Lsh(
+				new(big.Int).Set(secp256k1.Params().Gy),
+				8,
+			),
 		},
 	}
 

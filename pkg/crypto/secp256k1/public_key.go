@@ -20,6 +20,10 @@ func Marshal(publicKey *ecdsa.PublicKey) []byte {
 		publicKey.X == nil ||
 		publicKey.Y == nil ||
 		publicKey.Curve.Params().Name != curve.Params().Name ||
+		publicKey.X.Sign() < 0 ||
+		publicKey.Y.Sign() < 0 ||
+		publicKey.X.Cmp(curve.Params().P) >= 0 ||
+		publicKey.Y.Cmp(curve.Params().P) >= 0 ||
 		!curve.IsOnCurve(publicKey.X, publicKey.Y) {
 		panic("invalid secp256k1 public key")
 	}
