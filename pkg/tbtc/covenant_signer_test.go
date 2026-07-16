@@ -1497,10 +1497,17 @@ func applyTestArtifactApprovals(
 		t.Fatal(err)
 	}
 
+	// Generously far in the future: these submit-flow tests exercise
+	// certificate expiry enforcement incidentally (through the real engine's
+	// CurrentBlockHeight wiring), and only care that the certificate is
+	// valid, not about a specific expiry block.
+	requestedEndBlock := startBlock + 100000
+
 	signerApproval, err := executor.issueSignerApprovalCertificate(
 		context.Background(),
 		testArtifactApprovalDigest(t, payload),
 		startBlock,
+		requestedEndBlock,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1570,6 +1577,45 @@ func TestCovenantSignerEngine_SubmitRejectsUnsupportedRoute(t *testing.T) {
 	}
 	if !strings.Contains(transition.Detail, "unsupported covenant route") {
 		t.Fatalf("expected unsupported route detail, got %q", transition.Detail)
+	}
+}
+
+// TestCovenantSignerEngine_CurrentBlockHeightUsesNodeHostChain verifies that
+// the production covenantSignerEngine.CurrentBlockHeight is backed by
+// node.chain.BlockCounter() (the host/Ethereum chain), matching whatever the
+// same block counter reports directly -- never node.btcChain.
+func TestCovenantSignerEngine_CurrentBlockHeightUsesNodeHostChain(t *testing.T) {
+	node, _, _ := setupCovenantSignerTestNode(t)
+
+	engine := newCovenantSignerEngine(node, 0, true)
+	cse, ok := engine.(*covenantSignerEngine)
+	if !ok {
+		t.Fatal("expected engine to be *covenantSignerEngine")
+	}
+
+	var provider covenantsigner.CurrentBlockHeightProvider = cse
+	height, err := provider.CurrentBlockHeight(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	blockCounter, err := node.chain.BlockCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedHeight, err := blockCounter.CurrentBlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The two reads are not atomic with each other, so tolerate the local
+	// block counter having ticked forward by exactly one block in between.
+	if height != expectedHeight && height != expectedHeight+1 {
+		t.Fatalf(
+			"expected CurrentBlockHeight [%d] to match node.chain.BlockCounter() [%d] (+/- 1 tick)",
+			height,
+			expectedHeight,
+		)
 	}
 }
 

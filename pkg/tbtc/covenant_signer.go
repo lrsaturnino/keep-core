@@ -32,6 +32,17 @@ type covenantSignerEngine struct {
 	bridgeFraudDefenseConfirmed bool
 }
 
+// Compile-time assertions that covenantSignerEngine satisfies the full
+// covenant signer contract, including CurrentBlockHeightProvider. Signer
+// approval certificate expiry enforcement depends on every verifier-capable
+// engine also providing a current block height; losing this interface
+// silently would make certificates never expire.
+var (
+	_ covenantsigner.Engine                     = (*covenantSignerEngine)(nil)
+	_ covenantsigner.SignerApprovalVerifier     = (*covenantSignerEngine)(nil)
+	_ covenantsigner.CurrentBlockHeightProvider = (*covenantSignerEngine)(nil)
+)
+
 // defaultMinActiveOutpointConfirmations is the confirmation threshold applied
 // when the operator config does not specify a custom value. It aligns with
 // DepositSweepRequiredFundingTxConfirmations to ensure consistent reorg safety
@@ -282,6 +293,21 @@ func (cse *covenantSignerEngine) OnPoll(
 	*covenantsigner.Job,
 ) (*covenantsigner.Transition, error) {
 	return nil, nil
+}
+
+// CurrentBlockHeight returns the current height of the host chain (e.g.
+// Ethereum), obtained through the same node chain connection the signing
+// executors use. It is deliberately the host chain, not cse.node.btcChain:
+// signer approval certificate EndBlock values are defined in host-chain block
+// units so expiry can be enforced independently of Bitcoin's slower,
+// reorg-prone confirmation times.
+func (cse *covenantSignerEngine) CurrentBlockHeight(context.Context) (uint64, error) {
+	blockCounter, err := cse.node.chain.BlockCounter()
+	if err != nil {
+		return 0, fmt.Errorf("cannot get host chain block counter: %w", err)
+	}
+
+	return blockCounter.CurrentBlock()
 }
 
 func (cse *covenantSignerEngine) submitSelfV1(
