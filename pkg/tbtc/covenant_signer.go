@@ -30,6 +30,11 @@ type covenantSignerEngine struct {
 	// SIGHASH_ALL signature over a covenant active UTXO is otherwise a valid,
 	// undefeatable tBTC fraud proof against the signing wallet.
 	bridgeFraudDefenseConfirmed bool
+	// eip712ChainID and eip712Salt define the EIP-712 domain used to recompute
+	// the v2 artifact approval digest during signer approval verification. They
+	// must match the covenant signer service's configured domain.
+	eip712ChainID uint64
+	eip712Salt    [32]byte
 }
 
 // Compile-time assertions that covenantSignerEngine satisfies the full
@@ -81,6 +86,8 @@ func newCovenantSignerEngine(
 	node *node,
 	minConfirmations uint,
 	bridgeFraudDefenseConfirmed bool,
+	eip712ChainID uint64,
+	eip712Salt [32]byte,
 ) covenantsigner.Engine {
 	if minConfirmations == 0 {
 		minConfirmations = defaultMinActiveOutpointConfirmations
@@ -90,6 +97,8 @@ func newCovenantSignerEngine(
 		node:                               node,
 		minimumActiveOutpointConfirmations: minConfirmations,
 		bridgeFraudDefenseConfirmed:        bridgeFraudDefenseConfirmed,
+		eip712ChainID:                      eip712ChainID,
+		eip712Salt:                         eip712Salt,
 	}
 }
 
@@ -109,6 +118,8 @@ func (cse *covenantSignerEngine) VerifySignerApproval(
 
 	expectedApprovalDigest, err := covenantsigner.ComputeArtifactApprovalDigest(
 		request.ArtifactApprovals.Payload,
+		cse.eip712ChainID,
+		cse.eip712Salt,
 	)
 	if err != nil {
 		return covenantsigner.NewInputError(

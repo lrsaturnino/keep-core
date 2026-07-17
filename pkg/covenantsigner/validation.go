@@ -16,10 +16,14 @@ import (
 )
 
 const (
-	canonicalCovenantInputSequence     uint32 = 0xFFFFFFFD
-	canonicalAnchorValueSats           uint64 = 330
-	migrationTransactionPlanVersion    uint32 = 1
-	artifactApprovalVersion            uint32 = 1
+	canonicalCovenantInputSequence  uint32 = 0xFFFFFFFD
+	canonicalAnchorValueSats        uint64 = 330
+	migrationTransactionPlanVersion uint32 = 1
+	// artifactApprovalVersion and signerApprovalCertificateVersion version two
+	// different nested objects: the EIP-712 domain-wrapped artifact approval and
+	// the threshold-signed signer approval certificate respectively. They are
+	// bumped independently; neither value supersedes the other.
+	artifactApprovalVersion            uint32 = 2
 	signerApprovalCertificateVersion   uint32 = 2
 	migrationPlanQuoteVersion          uint32 = 1
 	migrationPlanQuoteSignatureVersion uint32 = 1
@@ -30,6 +34,13 @@ const (
 	migrationPlanQuoteSigningDomain      = "migration-plan-quote-v1:"
 	signerApprovalSignatureAlgorithm     = "tecdsa-secp256k1"
 	covenantSignerRequestDigestDomain    = "covenant-signer-request-v1:"
+	// artifactApprovalDomainName and artifactApprovalDomainVersion are the
+	// EIP-712 domain identity for the v2 domain-wrapped artifact approval. They
+	// are part of the signed contract and must match the values a wallet's
+	// eth_signTypedData_v4 domain carries; keep them aligned with the client
+	// (covenant-manager / dashboard / verification kit) domain construction.
+	artifactApprovalDomainName    = "tBTC Covenant Artifact Approval"
+	artifactApprovalDomainVersion = "2"
 )
 
 var artifactApprovalTypeHash = crypto.Keccak256Hash([]byte(
@@ -39,6 +50,22 @@ var artifactApprovalTypeHash = crypto.Keccak256Hash([]byte(
 		"bytes32 scriptTemplateId," +
 		"bytes32 destinationCommitmentHash," +
 		"bytes32 planCommitmentHash)",
+))
+
+// eip712DomainTypeHash is the EIP-712 typehash of the domain separator used to
+// wrap the artifact approval struct hash. The domain omits verifyingContract
+// (the approval is verified off-chain, not by a contract) and instead pins a
+// program salt alongside name, version, and chainId.
+var eip712DomainTypeHash = crypto.Keccak256Hash([]byte(
+	"EIP712Domain(string name,string version,uint256 chainId,bytes32 salt)",
+))
+
+// defaultArtifactApprovalDomainSalt is the fixed program-namespace salt used
+// when the signer config does not pin an explicit salt. Cross-covenant replay
+// is already prevented by scriptTemplateId inside the struct hash, so a single
+// published salt keeps the client domain construction trivial.
+var defaultArtifactApprovalDomainSalt = [32]byte(crypto.Keccak256Hash(
+	[]byte("tBTC Covenant Artifact Approval Domain v2"),
 ))
 
 var canonicalTimestampPattern = regexp.MustCompile(
@@ -80,6 +107,11 @@ type validationOptions struct {
 	signerApprovalVerifier            SignerApprovalVerifier
 	policyIndependentDigest           bool
 	currentBlock                      *uint64
+	// eip712ChainID and eip712Salt define the EIP-712 domain the artifact
+	// approval digest is wrapped with. They must be identical across Submit,
+	// Poll, and normalization so recomputed digests match stored ones.
+	eip712ChainID uint64
+	eip712Salt    [32]byte
 }
 
 // requestDigest accepts raw requests because Poll validates equivalence against
@@ -210,6 +242,8 @@ func normalizeRouteSubmitRequest(
 	normalizedArtifactApprovals, normalizedSignerApproval, normalizedArtifactSignatures, err := normalizeArtifactApprovals(
 		request.Route,
 		request,
+		options.eip712ChainID,
+		options.eip712Salt,
 	)
 	if err != nil {
 		return RouteSubmitRequest{}, err
@@ -336,7 +370,7 @@ func validateCommonRequest(
 			"request.signerApproval is required when the signer approval verifier is configured",
 		}
 	}
-	if err := validateArtifactApprovals(route, request); err != nil {
+	if err := validateArtifactApprovals(route, request, options.eip712ChainID, options.eip712Salt); err != nil {
 		return err
 	}
 
@@ -360,6 +394,7 @@ func validateCommonRequest(
 		}
 
 		depositorPublicKey := template.DepositorPublicKey
+		depositorEthAddress := ""
 		if len(options.depositorTrustRoots) > 0 && !options.policyIndependentDigest {
 			expectedDepositorPublicKey, ok := resolveExpectedDepositorPublicKey(
 				request,
@@ -376,12 +411,19 @@ func validateCommonRequest(
 				}
 			}
 			depositorPublicKey = expectedDepositorPublicKey
+			depositorEthAddress = resolveExpectedDepositorEthAddress(
+				request,
+				options.depositorTrustRoots,
+			)
 		}
 
 		if err := validateArtifactApprovalAuthenticity(
 			request,
 			depositorPublicKey,
+			depositorEthAddress,
 			"",
+			options.eip712ChainID,
+			options.eip712Salt,
 		); err != nil {
 			return err
 		}
@@ -407,6 +449,7 @@ func validateCommonRequest(
 		}
 
 		depositorPublicKey := template.DepositorPublicKey
+		depositorEthAddress := ""
 		if len(options.depositorTrustRoots) > 0 && !options.policyIndependentDigest {
 			expectedDepositorPublicKey, ok := resolveExpectedDepositorPublicKey(
 				request,
@@ -423,6 +466,10 @@ func validateCommonRequest(
 				}
 			}
 			depositorPublicKey = expectedDepositorPublicKey
+			depositorEthAddress = resolveExpectedDepositorEthAddress(
+				request,
+				options.depositorTrustRoots,
+			)
 		}
 
 		custodianPublicKey := template.CustodianPublicKey
@@ -447,7 +494,10 @@ func validateCommonRequest(
 		if err := validateArtifactApprovalAuthenticity(
 			request,
 			depositorPublicKey,
+			depositorEthAddress,
 			custodianPublicKey,
+			options.eip712ChainID,
+			options.eip712Salt,
 		); err != nil {
 			return err
 		}

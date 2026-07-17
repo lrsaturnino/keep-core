@@ -243,7 +243,7 @@ func loadApprovalContractVector(
 ) (RouteSubmitRequest, string, string) {
 	t.Helper()
 
-	data, err := os.ReadFile("testdata/covenant_recovery_approval_vectors_v1.json")
+	data, err := os.ReadFile("testdata/covenant_recovery_approval_vectors_v2.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,10 +252,10 @@ func loadApprovalContractVector(
 	if err := strictUnmarshal(data, &vectors); err != nil {
 		t.Fatal(err)
 	}
-	if vectors.Version != 1 {
+	if vectors.Version != 2 {
 		t.Fatalf("unexpected vector version: %d", vectors.Version)
 	}
-	if vectors.Scope != "covenant_recovery_approval_contract_v1" {
+	if vectors.Scope != "covenant_recovery_approval_contract_v2" {
 		t.Fatalf("unexpected vector scope: %s", vectors.Scope)
 	}
 
@@ -294,6 +294,17 @@ const (
 	testDepositorPrivateKeyHex = "0x1111111111111111111111111111111111111111111111111111111111111111"
 	testSignerPrivateKeyHex    = "0x2222222222222222222222222222222222222222222222222222222222222222"
 	testCustodianPrivateKeyHex = "0x3333333333333333333333333333333333333333333333333333333333333333"
+)
+
+// testEIP712ChainID and testEIP712Salt are the EIP-712 domain params used across
+// tests. They are the zero value so that every existing validationOptions{} and
+// NewService (which default these to zero) stays consistent with signatures and
+// pinned digests. The domain-wrap code path is still fully exercised; realistic
+// wallet compatibility (chainId + salt) is proven separately by the real-wallet
+// signature vector test.
+var (
+	testEIP712ChainID uint64
+	testEIP712Salt    [32]byte
 )
 
 var (
@@ -368,7 +379,7 @@ func mustArtifactApprovalSignature(
 	privateKey *btcec.PrivateKey,
 	payload ArtifactApprovalPayload,
 ) string {
-	digest, err := artifactApprovalDigest(payload)
+	digest, err := artifactApprovalDigest(payload, testEIP712ChainID, testEIP712Salt)
 	if err != nil {
 		panic(err)
 	}
@@ -595,7 +606,7 @@ func validSignerApproval(
 		panic("artifact approvals are required")
 	}
 
-	digest, err := artifactApprovalDigest(artifactApprovals.Payload)
+	digest, err := artifactApprovalDigest(artifactApprovals.Payload, testEIP712ChainID, testEIP712Salt)
 	if err != nil {
 		panic(err)
 	}
@@ -3363,17 +3374,17 @@ func TestRequestDigestRejectsArtifactApprovalsWithoutMigrationTransactionPlan(t 
 	}
 }
 
-func TestArtifactApprovalDigestMatchesPhase1Contract(t *testing.T) {
+func TestArtifactApprovalDigestMatchesV2Contract(t *testing.T) {
 	expectedDigests := map[TemplateID]string{
-		TemplateQcV1:   "0x4e1c72624e85c41d8d8a050d75704dc881ec6cd2dcfe1d240052887feef87ad8",
-		TemplateSelfV1: "0x960d7082d6eac550d7647d8fbeb90781e6cbd001b4d433e6635aa447dd937e79",
+		TemplateQcV1:   "0xc8246daca36f0116377210140056949b23c37b3de3a5c48ec8d125405a9f05fe",
+		TemplateSelfV1: "0x063735af147351025209ba54a606b38598d67e60848d463bbd4bcfcbdf3506c7",
 	}
 
 	for _, route := range []TemplateID{TemplateQcV1, TemplateSelfV1} {
 		t.Run(string(route), func(t *testing.T) {
 			request := canonicalArtifactApprovalRequest(route)
 
-			digest, err := artifactApprovalDigest(request.ArtifactApprovals.Payload)
+			digest, err := artifactApprovalDigest(request.ArtifactApprovals.Payload, testEIP712ChainID, testEIP712Salt)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -3391,7 +3402,7 @@ func TestApprovalContractVectorsMatchExpectedRequestDigests(t *testing.T) {
 		t.Run(vectorKey, func(t *testing.T) {
 			request, expectedApprovalDigest, expectedDigest := loadApprovalContractVector(t, vectorKey)
 
-			digestBytes, err := artifactApprovalDigest(request.ArtifactApprovals.Payload)
+			digestBytes, err := artifactApprovalDigest(request.ArtifactApprovals.Payload, testEIP712ChainID, testEIP712Salt)
 			if err != nil {
 				t.Fatal(err)
 			}

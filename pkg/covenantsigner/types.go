@@ -158,6 +158,12 @@ type DepositorTrustRoot struct {
 	Reserve   string     `json:"reserve" mapstructure:"reserve"`
 	Network   string     `json:"network" mapstructure:"network"`
 	PublicKey string     `json:"publicKey" mapstructure:"publicKey"`
+	// EthAddress optionally pins the depositor's Ethereum identity (20-byte
+	// address). When set, the v2 artifact approval's depositor signature is
+	// verified against it via ecrecover-and-compare, enabling wallet-signed
+	// (eth_signTypedData_v4) approvals. When empty, verification falls back to
+	// the secp256k1 PublicKey above.
+	EthAddress string `json:"ethAddress" mapstructure:"ethAddress"`
 }
 
 type CustodianTrustRoot struct {

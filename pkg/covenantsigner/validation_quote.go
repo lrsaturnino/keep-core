@@ -145,7 +145,7 @@ func normalizeScopedTrustRoots[T any](
 func normalizeDepositorTrustRoots(
 	trustRoots []DepositorTrustRoot,
 ) ([]DepositorTrustRoot, error) {
-	return normalizeScopedTrustRoots(
+	normalized, err := normalizeScopedTrustRoots(
 		"depositorTrustRoots",
 		trustRoots,
 		func(t DepositorTrustRoot) (TemplateID, string, string, string) {
@@ -158,6 +158,42 @@ func normalizeDepositorTrustRoots(
 			}
 		},
 	)
+	if err != nil {
+		return nil, err
+	}
+
+	// normalizeScopedTrustRoots preserves input order, so entries are
+	// index-aligned with trustRoots. Attach the optional pinned depositor ETH
+	// address (enables ecrecover-based v2 approval verification).
+	for i := range normalized {
+		ethAddress := strings.TrimSpace(trustRoots[i].EthAddress)
+		if ethAddress == "" {
+			continue
+		}
+		normalizedEth, err := normalizeEthAddress(
+			fmt.Sprintf("depositorTrustRoots[%d].ethAddress", i),
+			ethAddress,
+		)
+		if err != nil {
+			return nil, err
+		}
+		normalized[i].EthAddress = normalizedEth
+	}
+
+	return normalized, nil
+}
+
+// normalizeEthAddress validates a 20-byte hex Ethereum address and returns it in
+// lowercase 0x-prefixed form.
+func normalizeEthAddress(name, value string) (string, error) {
+	trimmed := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(value)), "0x")
+	raw, err := hex.DecodeString(trimmed)
+	if err != nil || len(raw) != 20 {
+		return "", &inputError{
+			fmt.Sprintf("%s must be a 20-byte hex ETH address", name),
+		}
+	}
+	return "0x" + trimmed, nil
 }
 
 func normalizeCustodianTrustRoots(

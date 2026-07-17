@@ -27,6 +27,8 @@ type Service struct {
 	migrationPlanQuoteTrustRoots []MigrationPlanQuoteTrustRoot
 	depositorTrustRoots          []DepositorTrustRoot
 	custodianTrustRoots          []CustodianTrustRoot
+	eip712ChainID                uint64
+	eip712Salt                   [32]byte
 }
 
 type ServiceOption func(*Service)
@@ -59,6 +61,33 @@ func WithCustodianTrustRoots(
 	return func(service *Service) {
 		service.custodianTrustRoots = cloned
 	}
+}
+
+// WithEIP712Domain pins the EIP-712 domain (chainId + salt) used to compute the
+// v2 domain-wrapped artifact approval digest. An empty saltHex falls back to the
+// default program-namespace salt. The chainId and salt must match the client
+// (wallet / covenant-manager / dashboard) domain construction.
+func WithEIP712Domain(chainID uint64, saltHex string) (ServiceOption, error) {
+	salt, err := ResolveEIP712DomainSalt(saltHex)
+	if err != nil {
+		return nil, err
+	}
+
+	return func(service *Service) {
+		service.eip712ChainID = chainID
+		service.eip712Salt = salt
+	}, nil
+}
+
+// ResolveEIP712DomainSalt resolves the EIP-712 domain salt from its configured
+// hex form, defaulting to the fixed program-namespace salt when empty. It is the
+// single source of truth shared by the signer service and the tBTC engine so
+// both compute identical approval digests.
+func ResolveEIP712DomainSalt(saltHex string) ([32]byte, error) {
+	if trimmed := strings.TrimSpace(saltHex); trimmed != "" {
+		return decodeBytes32HexString("eip712Salt", trimmed)
+	}
+	return defaultArtifactApprovalDomainSalt, nil
 }
 
 func WithCurrentBlockProvider(engine Engine) ServiceOption {
@@ -364,6 +393,8 @@ func (s *Service) loadPollJob(route TemplateID, input SignerPollInput) (*Job, er
 		input.Request,
 		validationOptions{
 			policyIndependentDigest: true,
+			eip712ChainID:           s.eip712ChainID,
+			eip712Salt:              s.eip712Salt,
 		},
 	)
 	if err != nil {
@@ -465,6 +496,8 @@ func (s *Service) Submit(ctx context.Context, route TemplateID, input SignerSubm
 		migrationPlanQuoteVerificationNow: s.now(),
 		signerApprovalVerifier:            s.signerApprovalVerifier,
 		currentBlock:                      currentBlock,
+		eip712ChainID:                     s.eip712ChainID,
+		eip712Salt:                        s.eip712Salt,
 	}
 	if err := validateSubmitInput(route, input, submitValidationOptions); err != nil {
 		return StepResult{}, err
@@ -477,6 +510,8 @@ func (s *Service) Submit(ctx context.Context, route TemplateID, input SignerSubm
 			depositorTrustRoots:          s.depositorTrustRoots,
 			custodianTrustRoots:          s.custodianTrustRoots,
 			signerApprovalVerifier:       s.signerApprovalVerifier,
+			eip712ChainID:                s.eip712ChainID,
+			eip712Salt:                   s.eip712Salt,
 		},
 	)
 	if err != nil {
@@ -587,6 +622,8 @@ func (s *Service) Poll(ctx context.Context, route TemplateID, input SignerPollIn
 		validationOptions{
 			policyIndependentDigest: true,
 			currentBlock:            currentBlock,
+			eip712ChainID:           s.eip712ChainID,
+			eip712Salt:              s.eip712Salt,
 		},
 	); err != nil {
 		return StepResult{}, err
