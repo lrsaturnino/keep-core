@@ -293,6 +293,19 @@ type walletTransactionExecutor struct {
 	signingExecutor walletSigningExecutor
 
 	waitForBlockFn waitForBlockFn
+
+	// transactionMonitor is optional. When set, successfully broadcast
+	// transactions are registered with it so they can be watched for
+	// confirmation and alerted on if they get stuck.
+	transactionMonitor *transactionMonitor
+}
+
+// setTransactionMonitor wires an optional transaction monitor that is notified
+// of successfully broadcast transactions.
+func (wte *walletTransactionExecutor) setTransactionMonitor(
+	monitor *transactionMonitor,
+) {
+	wte.transactionMonitor = monitor
 }
 
 func newWalletTransactionExecutor(
@@ -442,6 +455,14 @@ func (wte *walletTransactionExecutor) broadcastTransaction(
 			}
 
 			broadcastTxLogger.Infof("transaction is known on Bitcoin chain")
+
+			if wte.transactionMonitor != nil {
+				wte.transactionMonitor.track(
+					txHash,
+					bitcoin.PublicKeyHash(wte.executingWallet.publicKey),
+				)
+			}
+
 			return nil
 		}
 	}

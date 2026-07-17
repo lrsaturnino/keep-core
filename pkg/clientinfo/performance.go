@@ -123,6 +123,7 @@ func (pm *PerformanceMetrics) registerAllMetrics() {
 		MetricWalletActionSuccessTotal,
 		MetricWalletActionFailedTotal,
 		MetricWalletHeartbeatFailuresTotal,
+		MetricStuckWalletTransactionsTotal,
 		MetricCoordinationWindowsDetectedTotal,
 		MetricCoordinationProceduresExecutedTotal,
 		MetricCoordinationFailedTotal,
@@ -640,6 +641,7 @@ const (
 	MetricWalletActionFailedTotal      = "wallet_action_failed_total"
 	MetricWalletActionDurationSeconds  = "wallet_action_duration_seconds"
 	MetricWalletHeartbeatFailuresTotal = "wallet_heartbeat_failures_total"
+	MetricStuckWalletTransactionsTotal = "stuck_wallet_transactions_total"
 
 	// Wallet Action Metrics (per-action type)
 	// These are generated dynamically using WalletActionMetricName helper function
