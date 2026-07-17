@@ -215,12 +215,19 @@ func normalizeCustodianTrustRoots(
 }
 
 func trustRootLookupScope(request RouteSubmitRequest) (TemplateID, string, string) {
+	// The trust-root scope network comes from the destination reservation for the
+	// request's action (migration/redeem/renew).
 	network := ""
-	if request.MigrationDestination != nil {
-		network = strings.ToLower(strings.TrimSpace(request.MigrationDestination.Network))
+	switch {
+	case request.MigrationDestination != nil:
+		network = request.MigrationDestination.Network
+	case request.RedeemDestination != nil:
+		network = request.RedeemDestination.Network
+	case request.RenewDestination != nil:
+		network = request.RenewDestination.Network
 	}
 
-	return request.Route, normalizeLowerHex(request.Reserve), network
+	return request.Route, normalizeLowerHex(request.Reserve), strings.ToLower(strings.TrimSpace(network))
 }
 
 func migrationPlanQuoteSigningPayloadBytes(

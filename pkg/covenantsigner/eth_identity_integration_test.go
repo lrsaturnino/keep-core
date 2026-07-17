@@ -88,6 +88,49 @@ func TestServiceAcceptsSelfV1WithPinnedDepositorEthIdentity(t *testing.T) {
 	}
 }
 
+// TestServiceAcceptsRedeemWithPinnedDepositorEthIdentity is the headline flow of
+// vba-dashboard#172: a cooperative REDEEM whose depositor artifact approval is
+// signed by a connected ETH wallet (eth_signTypedData_v4-shaped) and verified via
+// the pinned depositor ETH identity.
+func TestServiceAcceptsRedeemWithPinnedDepositorEthIdentity(t *testing.T) {
+	privateKey, err := crypto.HexToECDSA(testDepositorEthPrivateKeyHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ethAddress := crypto.PubkeyToAddress(privateKey.PublicKey).Hex()
+
+	trustRoot := testDepositorTrustRoot(TemplateSelfV1)
+	trustRoot.EthAddress = ethAddress
+
+	service, err := NewService(
+		newMemoryHandle(),
+		&scriptedEngine{},
+		WithDepositorTrustRoots([]DepositorTrustRoot{trustRoot}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := redeemSelfV1Request(t)
+	request.ArtifactApprovals.Approvals[0].Signature = mustEthArtifactApprovalSignature(
+		t,
+		testDepositorEthPrivateKeyHex,
+		request.ArtifactApprovals.Payload,
+	)
+	request.ArtifactSignatures = canonicalArtifactSignatures(
+		request.Route,
+		request.ArtifactApprovals,
+	)
+
+	if _, err := service.Submit(context.Background(), TemplateSelfV1, SignerSubmitInput{
+		RouteRequestID: "ors_redeem_eth_identity",
+		Stage:          StageSignerCoordination,
+		Request:        request,
+	}); err != nil {
+		t.Fatalf("expected wallet-signed redeem to be accepted, got %v", err)
+	}
+}
+
 func TestServiceRejectsSelfV1WithWrongDepositorEthIdentity(t *testing.T) {
 	// Pin a different ETH address than the one that signed the approval.
 	trustRoot := testDepositorTrustRoot(TemplateSelfV1)
