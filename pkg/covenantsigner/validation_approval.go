@@ -737,6 +737,16 @@ func validateArtifactApprovalAuthenticity(
 			); err != nil {
 				return err
 			}
+		default:
+			// normalizeArtifactApprovals already rejects unrecognized roles
+			// before this loop runs; fail closed here as defense in depth so an
+			// unexpected role can never be silently skipped without verification.
+			return &inputError{
+				fmt.Sprintf(
+					"request.artifactApprovals.approvals[%d].role is not a recognized role",
+					i,
+				),
+			}
 		}
 	}
 

@@ -54,8 +54,7 @@ const (
 
 // CovenantAction discriminates the covenant lifecycle action a submit request
 // performs. It selects which destination/plan the request carries and which
-// transaction output the signer builds. An empty Action is treated as MIGRATION
-// for backward compatibility with requests that predate the field.
+// transaction output the signer builds. An empty Action defaults to MIGRATION.
 type CovenantAction string
 
 const (

@@ -180,6 +180,30 @@ func normalizeDepositorTrustRoots(
 		normalized[i].EthAddress = normalizedEth
 	}
 
+	// Prevent a silent ETH->secp verification downgrade: within a single
+	// (route, reserve) pair, ethAddress must be set on every network entry or on
+	// none of them. A mix would let a request steer verification to the
+	// secp-only sibling scope through its (partially caller-influenced) network
+	// value, bypassing an operator's intended wallet-signed enforcement.
+	ethPresenceByPair := make(map[string]bool, len(normalized))
+	for i := range normalized {
+		pairKey := string(normalized[i].Route) + "|" + normalized[i].Reserve
+		hasEth := normalized[i].EthAddress != ""
+		if existing, ok := ethPresenceByPair[pairKey]; ok {
+			if existing != hasEth {
+				return nil, &inputError{
+					fmt.Sprintf(
+						"depositorTrustRoots for route %s reserve %s must set ethAddress on all network entries or on none",
+						normalized[i].Route,
+						normalized[i].Reserve,
+					),
+				}
+			}
+		} else {
+			ethPresenceByPair[pairKey] = hasEth
+		}
+	}
+
 	return normalized, nil
 }
 
@@ -191,6 +215,14 @@ func normalizeEthAddress(name, value string) (string, error) {
 	if err != nil || len(raw) != 20 {
 		return "", &inputError{
 			fmt.Sprintf("%s must be a 20-byte hex ETH address", name),
+		}
+	}
+	// Reject the zero address: an operator misconfiguring it would make the
+	// ecrecover-based approval check compare against 0x0, silently weakening the
+	// depositor binding to whatever recovers to the zero address.
+	if strings.Trim(trimmed, "0") == "" {
+		return "", &inputError{
+			fmt.Sprintf("%s must not be the zero ETH address", name),
 		}
 	}
 	return "0x" + trimmed, nil

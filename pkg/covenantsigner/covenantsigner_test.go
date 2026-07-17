@@ -3231,6 +3231,46 @@ func TestNewServiceRejectsDuplicateDepositorTrustRootScope(t *testing.T) {
 	}
 }
 
+func TestNewServiceRejectsMixedEthAddressPresenceForSameReserve(t *testing.T) {
+	handle := newMemoryHandle()
+
+	// Same (route, reserve) but different networks: one pins an ethAddress, the
+	// other does not. Allowing this mix would let a request steer verification
+	// to the secp-only sibling scope via its network value, downgrading an
+	// operator's intended wallet-signed enforcement.
+	withEth := testDepositorTrustRoot(TemplateSelfV1)
+	withEth.Network = "regtest"
+	withEth.EthAddress = "0x000000000000000000000000000000000000dEaD"
+
+	withoutEth := testDepositorTrustRoot(TemplateSelfV1)
+	withoutEth.Network = "testnet"
+
+	_, err := NewService(
+		handle,
+		&scriptedEngine{},
+		WithDepositorTrustRoots([]DepositorTrustRoot{withEth, withoutEth}),
+	)
+	if err == nil || !strings.Contains(
+		err.Error(),
+		"must set ethAddress on all network entries or on none",
+	) {
+		t.Fatalf("expected mixed ethAddress presence error, got %v", err)
+	}
+}
+
+func TestNormalizeEthAddressRejectsZeroAddress(t *testing.T) {
+	_, err := normalizeEthAddress(
+		"depositorTrustRoots[0].ethAddress",
+		"0x0000000000000000000000000000000000000000",
+	)
+	if err == nil || !strings.Contains(
+		err.Error(),
+		"must not be the zero ETH address",
+	) {
+		t.Fatalf("expected zero ETH address rejection, got %v", err)
+	}
+}
+
 func TestNewServiceRejectsInvalidCustodianTrustRootPublicKey(t *testing.T) {
 	handle := newMemoryHandle()
 

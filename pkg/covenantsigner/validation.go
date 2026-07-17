@@ -61,9 +61,14 @@ var eip712DomainTypeHash = crypto.Keccak256Hash([]byte(
 ))
 
 // defaultArtifactApprovalDomainSalt is the fixed program-namespace salt used
-// when the signer config does not pin an explicit salt. Cross-covenant replay
-// is already prevented by scriptTemplateId inside the struct hash, so a single
-// published salt keeps the client domain construction trivial.
+// when the signer config does not pin an explicit salt. This salt does NOT by
+// itself separate approvals across covenant deployments: scriptTemplateId only
+// carries the route type (qc_v1/self_v1), which is identical across deployments,
+// and the domain omits verifyingContract. Cross-deployment separation instead
+// comes from the globally-unique reserve/vault bound inside
+// destinationCommitmentHash plus the signer's trust-root scoping. Operators
+// running multiple deployments on the same chainId that could share a reserve
+// should pin a per-deployment eip712Salt to guarantee domain separation.
 var defaultArtifactApprovalDomainSalt = [32]byte(crypto.Keccak256Hash(
 	[]byte("tBTC Covenant Artifact Approval Domain v2"),
 ))
