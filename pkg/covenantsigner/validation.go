@@ -285,8 +285,11 @@ func normalizeRouteSubmitRequest(
 				return normalizeLowerHex(request.ActiveOutpoint.ScriptHash)
 			}(),
 		},
+		Action:                    request.Action,
 		DestinationCommitmentHash: normalizeLowerHex(request.DestinationCommitmentHash),
 		MigrationDestination:      normalizeMigrationDestination(request.MigrationDestination),
+		RedeemDestination:         normalizeRedeemDestination(request.RedeemDestination),
+		RenewDestination:          normalizeRenewDestination(request.RenewDestination),
 		MigrationPlanQuote:        normalizedMigrationPlanQuote,
 		MigrationTransactionPlan:  normalizeMigrationTransactionPlan(request.MigrationTransactionPlan),
 		ArtifactApprovals:         normalizedArtifactApprovals,
@@ -347,20 +350,23 @@ func validateCommonRequest(
 	if err := validateHexString("request.destinationCommitmentHash", request.DestinationCommitmentHash); err != nil {
 		return err
 	}
-	// This intentionally creates a deployment ordering constraint: the
-	// orchestrator must supply the concrete migration destination artifact
-	// before this signer version can accept requests.
-	if err := validateMigrationDestination(request, request.MigrationDestination); err != nil {
+	// Validate the destination for the request's action (MIGRATION/REDEEM/RENEW).
+	// For MIGRATION this preserves the deployment ordering constraint: the
+	// orchestrator must supply the concrete destination artifact before this
+	// signer version can accept requests.
+	if err := validateActionDestination(request); err != nil {
 		return err
 	}
-	// This intentionally creates the next deployment ordering constraint: the
-	// orchestrator must supply the canonical migration transaction plan before
-	// this signer version can accept requests.
+	// The migration transaction plan carries the shared output/anchor/fee/
+	// sequence/locktime parameters used to build the transaction for every action.
 	if err := validateMigrationTransactionPlan(request, request.MigrationTransactionPlan); err != nil {
 		return err
 	}
-	if _, err := normalizeMigrationPlanQuote(request, options); err != nil {
-		return err
+	// The migration plan quote authority path applies only to MIGRATION.
+	if request.ResolvedAction() == CovenantActionMigration {
+		if _, err := normalizeMigrationPlanQuote(request, options); err != nil {
+			return err
+		}
 	}
 	if request.ArtifactApprovals == nil {
 		return &inputError{"request.artifactApprovals is required"}

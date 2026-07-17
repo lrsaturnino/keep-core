@@ -48,7 +48,30 @@ type ReservationRoute string
 
 const (
 	ReservationRouteMigration ReservationRoute = "MIGRATION"
+	ReservationRouteRedeem    ReservationRoute = "REDEEM"
+	ReservationRouteRenew     ReservationRoute = "RENEW"
 )
+
+// CovenantAction discriminates the covenant lifecycle action a submit request
+// performs. It selects which destination/plan the request carries and which
+// transaction output the signer builds. An empty Action is treated as MIGRATION
+// for backward compatibility with requests that predate the field.
+type CovenantAction string
+
+const (
+	CovenantActionMigration CovenantAction = "MIGRATION"
+	CovenantActionRedeem    CovenantAction = "REDEEM"
+	CovenantActionRenew     CovenantAction = "RENEW"
+)
+
+// ResolvedAction returns the request's action, defaulting an empty value to
+// MIGRATION.
+func (r RouteSubmitRequest) ResolvedAction() CovenantAction {
+	if r.Action == "" {
+		return CovenantActionMigration
+	}
+	return r.Action
+}
 
 type ReservationStatus string
 
@@ -220,6 +243,7 @@ type RouteSubmitRequest struct {
 	IdempotencyKey            string                            `json:"idempotencyKey"`
 	RequestType               RequestType                       `json:"requestType"`
 	Route                     TemplateID                        `json:"route"`
+	Action                    CovenantAction                    `json:"action,omitempty"`
 	Strategy                  string                            `json:"strategy"`
 	Reserve                   string                            `json:"reserve"`
 	Epoch                     uint64                            `json:"epoch"`
@@ -227,6 +251,8 @@ type RouteSubmitRequest struct {
 	ActiveOutpoint            CovenantOutpoint                  `json:"activeOutpoint"`
 	DestinationCommitmentHash string                            `json:"destinationCommitmentHash"`
 	MigrationDestination      *MigrationDestinationReservation  `json:"migrationDestination,omitempty"`
+	RedeemDestination         *RedeemDestinationReservation     `json:"redeemDestination,omitempty"`
+	RenewDestination          *RenewDestinationReservation      `json:"renewDestination,omitempty"`
 	MigrationPlanQuote        *MigrationDestinationPlanQuote    `json:"migrationPlanQuote,omitempty"`
 	MigrationTransactionPlan  *MigrationTransactionPlan         `json:"migrationTransactionPlan,omitempty"`
 	ArtifactApprovals         *ArtifactApprovalEnvelope         `json:"artifactApprovals,omitempty"`
@@ -235,6 +261,45 @@ type RouteSubmitRequest struct {
 	Artifacts                 map[RecoveryPathID]ArtifactRecord `json:"artifacts"`
 	ScriptTemplate            json.RawMessage                   `json:"scriptTemplate"`
 	Signing                   SigningRequirements               `json:"signing"`
+}
+
+// RedeemDestinationReservation is the cooperative-REDEEM destination: a payout
+// output the signer pays directly. Its commitment binds the covenant identity
+// (reserve/epoch/route/revealer/vault/network) to the payout (output scriptPubKey
+// + value), so the depositor's artifact approval authorizes exactly that payout.
+type RedeemDestinationReservation struct {
+	ReservationID             string            `json:"reservationId,omitempty"`
+	Reserve                   string            `json:"reserve"`
+	Epoch                     uint64            `json:"epoch"`
+	Route                     ReservationRoute  `json:"route"`
+	Revealer                  string            `json:"revealer"`
+	Vault                     string            `json:"vault"`
+	Network                   string            `json:"network"`
+	Status                    ReservationStatus `json:"status"`
+	OutputScript              string            `json:"outputScript"`
+	OutputScriptHash          string            `json:"outputScriptHash"`
+	OutputValueSats           uint64            `json:"outputValueSats"`
+	DestinationCommitmentHash string            `json:"destinationCommitmentHash"`
+}
+
+// RenewDestinationReservation is the cooperative-RENEW destination: the value is
+// re-locked into the next-epoch covenant output. Its commitment binds the
+// covenant identity to the next covenant scriptPubKey, its maturity height, and
+// the re-locked value.
+type RenewDestinationReservation struct {
+	ReservationID             string            `json:"reservationId,omitempty"`
+	Reserve                   string            `json:"reserve"`
+	Epoch                     uint64            `json:"epoch"`
+	Route                     ReservationRoute  `json:"route"`
+	Revealer                  string            `json:"revealer"`
+	Vault                     string            `json:"vault"`
+	Network                   string            `json:"network"`
+	Status                    ReservationStatus `json:"status"`
+	NextCovenantScript        string            `json:"nextCovenantScript"`
+	NextCovenantScriptHash    string            `json:"nextCovenantScriptHash"`
+	NextMaturityHeight        uint64            `json:"nextMaturityHeight"`
+	OutputValueSats           uint64            `json:"outputValueSats"`
+	DestinationCommitmentHash string            `json:"destinationCommitmentHash"`
 }
 
 type SignerSubmitInput struct {

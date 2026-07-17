@@ -844,31 +844,75 @@ func (cse *covenantSignerEngine) buildQcV1SignerHandoff(
 	}, nil
 }
 
+// covenantDestinationOutputScript returns the destination output scriptPubKey
+// for the request's covenant action. The redeem payout script and the renew
+// next-covenant script are already output scripts and are paid directly, but a
+// migration's deposit script is not: it is wrapped into its P2WSH scriptPubKey
+// first. Validation has already recompute-and-compared each of these against the
+// action's destination commitment, so the built output is exactly what the
+// depositor's artifact approval authorized.
+func covenantDestinationOutputScript(
+	request covenantsigner.RouteSubmitRequest,
+) (bitcoin.Script, error) {
+	switch request.ResolvedAction() {
+	case covenantsigner.CovenantActionMigration:
+		if request.MigrationDestination == nil {
+			return nil, fmt.Errorf("migration destination is required")
+		}
+		script, err := decodePrefixedHex(request.MigrationDestination.DepositScript)
+		if err != nil {
+			return nil, fmt.Errorf("migration destination deposit script is invalid")
+		}
+		if len(script) == 0 {
+			return nil, fmt.Errorf("migration destination deposit script must not be empty")
+		}
+		// MigrationDestination.DepositScript is the plain tBTC deposit script, not
+		// a ready-made output script. The Bitcoin funding output must pay to its
+		// P2WSH script hash (OP_0 <sha256(depositScript)>), which is how the tBTC
+		// Bridge rebuilds and verifies the funding output in
+		// revealDepositWithExtraData. Using the plain deposit script directly as
+		// the output script would make the migration deposit unrevealable to the
+		// Bridge.
+		scriptPubKey, err := payToWitnessScriptHash(script)
+		if err != nil {
+			return nil, fmt.Errorf("cannot build migration destination locking script: %v", err)
+		}
+		return scriptPubKey, nil
+	case covenantsigner.CovenantActionRedeem:
+		if request.RedeemDestination == nil {
+			return nil, fmt.Errorf("redeem destination is required")
+		}
+		script, err := decodePrefixedHex(request.RedeemDestination.OutputScript)
+		if err != nil {
+			return nil, fmt.Errorf("redeem destination output script is invalid")
+		}
+		return script, nil
+	case covenantsigner.CovenantActionRenew:
+		if request.RenewDestination == nil {
+			return nil, fmt.Errorf("renew destination is required")
+		}
+		script, err := decodePrefixedHex(request.RenewDestination.NextCovenantScript)
+		if err != nil {
+			return nil, fmt.Errorf("renew destination next covenant script is invalid")
+		}
+		return script, nil
+	default:
+		return nil, fmt.Errorf("unsupported covenant action %q", request.ResolvedAction())
+	}
+}
+
 func (cse *covenantSignerEngine) buildCovenantTransactionBuilder(
 	request covenantsigner.RouteSubmitRequest,
 	activeUtxo *bitcoin.UnspentTransactionOutput,
 	witnessScript bitcoin.Script,
 ) (*bitcoin.TransactionBuilder, error) {
-	destinationDepositScript, err := decodePrefixedHex(request.MigrationDestination.DepositScript)
+	destinationScriptPubKey, err := covenantDestinationOutputScript(request)
 	if err != nil {
-		return nil, fmt.Errorf("migration destination deposit script is invalid")
-	}
-	if len(destinationDepositScript) == 0 {
-		return nil, fmt.Errorf("migration destination deposit script must not be empty")
-	}
-	// MigrationDestination.DepositScript is the plain tBTC deposit script, not a
-	// ready-made output script. The Bitcoin funding output must pay to its P2WSH
-	// script hash (OP_0 <sha256(depositScript)>), which is how the tBTC Bridge
-	// rebuilds and verifies the funding output in revealDepositWithExtraData.
-	// Using the plain deposit script directly as the output script would make
-	// the migration deposit unrevealable to the Bridge.
-	destinationScriptPubKey, err := payToWitnessScriptHash(destinationDepositScript)
-	if err != nil {
-		return nil, fmt.Errorf("cannot build migration destination locking script: %v", err)
+		return nil, err
 	}
 	destinationValue, err := toBitcoinOutputValue(
 		request.MigrationTransactionPlan.DestinationValueSats,
-		"migration destination value",
+		"covenant destination value",
 	)
 	if err != nil {
 		return nil, err
