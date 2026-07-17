@@ -84,7 +84,7 @@ var testConfigs = map[string]testConfig{
 	},
 	"fulcrum tcp": {
 		clientConfig: electrum.Config{
-			URL:                 "tcp://v22019051929289916.bestsrv.de:50001",
+			URL:                 "tcp://testnet.aranguren.org:51001",
 			RequestTimeout:      requestTimeout * 2,
 			RequestRetryTimeout: requestRetryTimeout * 2,
 		},
