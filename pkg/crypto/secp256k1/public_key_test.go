@@ -80,6 +80,37 @@ func TestUnmarshalMalformedPublicKey(t *testing.T) {
 	}
 }
 
+func TestMarshalAcceptsRelabeledSecp256k1Curve(t *testing.T) {
+	// A secp256k1 key may be held with a curve implementation that labels
+	// itself differently than btcec (e.g. a plain elliptic.CurveParams
+	// copy). Such keys must marshal successfully because the curve is
+	// identified by its parameters, not by its name.
+	relabeled := *btcec.S256().Params()
+	relabeled.Name = "relabeled-secp256k1"
+
+	publicKey := &ecdsa.PublicKey{
+		Curve: &relabeled,
+		X:     new(big.Int).Set(btcec.S256().Params().Gx),
+		Y:     new(big.Int).Set(btcec.S256().Params().Gy),
+	}
+
+	marshaled := Marshal(publicKey)
+
+	if len(marshaled) != btcec.PubKeyBytesLenUncompressed {
+		t.Fatalf("unexpected marshaled length: [%v]", len(marshaled))
+	}
+
+	unmarshaled, err := Unmarshal(marshaled)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if unmarshaled.X.Cmp(publicKey.X) != 0 ||
+		unmarshaled.Y.Cmp(publicKey.Y) != 0 {
+		t.Fatal("unexpected public key after roundtrip")
+	}
+}
+
 func TestMarshalRejectsInvalidPublicKey(t *testing.T) {
 	p256 := elliptic.P256()
 	secp256k1 := btcec.S256()

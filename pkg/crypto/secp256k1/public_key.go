@@ -4,12 +4,26 @@ package secp256k1
 
 import (
 	"crypto/ecdsa"
+	"crypto/elliptic"
 	"fmt"
 
 	"github.com/btcsuite/btcd/btcec"
 )
 
 const uncompressedPublicKeyPrefix = byte(0x04)
+
+// isSecp256k1 checks that the given curve parameters describe the secp256k1
+// curve. The comparison uses the field prime and group order instead of the
+// curve name so that keys held with any secp256k1 implementation are
+// accepted, regardless of how that implementation labels itself.
+func isSecp256k1(params *elliptic.CurveParams) bool {
+	s256 := btcec.S256().Params()
+	return params != nil &&
+		params.P != nil &&
+		params.N != nil &&
+		params.P.Cmp(s256.P) == 0 &&
+		params.N.Cmp(s256.N) == 0
+}
 
 // Marshal converts a secp256k1 public key to the 65-byte uncompressed form
 // specified in SEC 1, Version 2.0, Section 2.3.3.
@@ -19,7 +33,7 @@ func Marshal(publicKey *ecdsa.PublicKey) []byte {
 		publicKey.Curve == nil ||
 		publicKey.X == nil ||
 		publicKey.Y == nil ||
-		publicKey.Curve.Params().Name != curve.Params().Name ||
+		!isSecp256k1(publicKey.Curve.Params()) ||
 		publicKey.X.Sign() < 0 ||
 		publicKey.Y.Sign() < 0 ||
 		publicKey.X.Cmp(curve.Params().P) >= 0 ||
