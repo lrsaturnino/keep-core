@@ -174,9 +174,12 @@ func (tm *transactionMonitor) check() {
 	tm.mu.Unlock()
 
 	for txHash, t := range snapshot {
-		// Bound the wall-clock time of a single pass so one slow chain call
-		// cannot stall monitoring of every transaction behind it; the remaining
-		// transactions are picked up on the next pass.
+		// Bound the wall-clock time of a single pass so a run of slow chain calls
+		// cannot stall monitoring of every transaction behind them; the remaining
+		// transactions are picked up on the next pass. The deadline is checked
+		// between calls; each individual GetTransactionConfirmations call is
+		// separately bounded by the Electrum client's own operation timeouts, so a
+		// single call cannot block the pass indefinitely.
 		if time.Now().After(deadline) {
 			logger.Warnf(
 				"transaction monitor check pass exceeded its time budget [%s]; "+

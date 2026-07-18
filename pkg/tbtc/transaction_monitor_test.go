@@ -76,8 +76,11 @@ func TestTransactionMonitor(t *testing.T) {
 		t.Fatalf("expected no alert for a fresh transaction; got counter [%v]", got)
 	}
 
-	// At/just below the threshold: still not stuck. The alert condition is
-	// strictly greater than the threshold, so the boundary itself does not fire.
+	// Just below the threshold: still not stuck. The alert condition is strictly
+	// greater than the threshold. Testing exactly at the threshold is omitted
+	// deliberately: with a real clock the check-time drift always nudges the
+	// elapsed time a hair past any exact backdated value, so it cannot be pinned
+	// deterministically without an injectable clock.
 	ageTransaction(monitor, txHash, defaultStuckTransactionThreshold-time.Minute)
 	monitor.check()
 	if got := stuckCount(); got != 0 {
