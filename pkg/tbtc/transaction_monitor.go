@@ -33,6 +33,12 @@ const (
 	// duration prevents never-confirming transactions from filling up the
 	// tracking table and starving monitoring of new transactions (~24 hours).
 	transactionMonitorMaxTrackingAge = 24 * time.Hour
+
+	// transactionMonitorCheckBudget bounds the wall-clock time of a single check
+	// pass so that a slow chain call cannot stall monitoring of every remaining
+	// transaction; transactions not reached within the budget are handled on the
+	// next pass.
+	transactionMonitorCheckBudget = 2 * time.Minute
 )
 
 // trackedTransaction holds the monitoring state of a single broadcast wallet
@@ -99,19 +105,29 @@ func (tm *transactionMonitor) track(
 	walletPublicKeyHash [20]byte,
 ) {
 	tm.mu.Lock()
-	defer tm.mu.Unlock()
 
 	if _, ok := tm.tracked[txHash]; ok {
+		tm.mu.Unlock()
 		return
 	}
 
 	if len(tm.tracked) >= transactionMonitorMaxTracked {
+		// A full table means a real broadcast transaction goes unmonitored;
+		// surface it as a metric (emitted outside the lock) as well as a log.
+		recorder := tm.metricsRecorder
+		tm.mu.Unlock()
+
 		logger.Warnf(
-			"transaction monitor tracking table is full ([%d]); not tracking "+
-				"transaction [%s]",
+			"transaction monitor tracking table is full ([%d]); transaction "+
+				"[%s] will not be monitored",
 			transactionMonitorMaxTracked,
 			txHash.Hex(bitcoin.ReversedByteOrder),
 		)
+		if recorder != nil {
+			recorder.IncrementCounter(
+				clientinfo.MetricUnmonitoredWalletTransactionsTotal, 1,
+			)
+		}
 		return
 	}
 
@@ -119,6 +135,7 @@ func (tm *transactionMonitor) track(
 		walletPublicKeyHash: walletPublicKeyHash,
 		broadcastAt:         time.Now(),
 	}
+	tm.mu.Unlock()
 }
 
 // run starts the monitor's polling loop. It blocks until the context is done.
@@ -146,6 +163,7 @@ func (tm *transactionMonitor) run(ctx context.Context) {
 // only ever mutated here, under the mutex.
 func (tm *transactionMonitor) check() {
 	now := time.Now()
+	deadline := now.Add(transactionMonitorCheckBudget)
 
 	// Snapshot the tracked set so chain calls are not made under the lock.
 	tm.mu.Lock()
@@ -156,6 +174,18 @@ func (tm *transactionMonitor) check() {
 	tm.mu.Unlock()
 
 	for txHash, t := range snapshot {
+		// Bound the wall-clock time of a single pass so one slow chain call
+		// cannot stall monitoring of every transaction behind it; the remaining
+		// transactions are picked up on the next pass.
+		if time.Now().After(deadline) {
+			logger.Warnf(
+				"transaction monitor check pass exceeded its time budget [%s]; "+
+					"deferring the remaining transactions to the next pass",
+				transactionMonitorCheckBudget,
+			)
+			break
+		}
+
 		confirmations, err := tm.btcChain.GetTransactionConfirmations(txHash)
 		if err == nil && confirmations >= transactionMonitorMinConfirmations {
 			// The transaction is mined; stop tracking it.
@@ -168,6 +198,38 @@ func (tm *transactionMonitor) check() {
 		// confirmed and may be transient.
 		outstanding := now.Sub(t.broadcastAt)
 
+		// Alert (once) if the transaction has been unconfirmed past the stuck
+		// threshold. This runs before the give-up eviction below so that a
+		// transaction first observed after the maximum tracking age still fires
+		// exactly one alert instead of being silently evicted.
+		if outstanding > tm.threshold && !t.alerted {
+			logger.Warnf(
+				"wallet transaction [%s] for wallet [0x%x] has been unconfirmed "+
+					"for [%s] (threshold [%s]); it may be stuck in the mempool "+
+					"and blocking subsequent wallet transactions - consider "+
+					"fee-bumping or accelerating it",
+				txHash.Hex(bitcoin.ReversedByteOrder),
+				t.walletPublicKeyHash,
+				outstanding.Round(time.Minute),
+				tm.threshold,
+			)
+
+			// Mark as alerted under the lock, but emit the metric outside the
+			// lock to avoid holding it during an external call.
+			tm.mu.Lock()
+			if tracked, ok := tm.tracked[txHash]; ok {
+				tracked.alerted = true
+			}
+			recorder := tm.metricsRecorder
+			tm.mu.Unlock()
+
+			if recorder != nil {
+				recorder.IncrementCounter(
+					clientinfo.MetricStuckWalletTransactionsTotal, 1,
+				)
+			}
+		}
+
 		// Give up on transactions that have been unconfirmed for too long (e.g.
 		// dropped from the mempool) so they cannot fill the tracking table.
 		if outstanding > transactionMonitorMaxTrackingAge {
@@ -179,37 +241,6 @@ func (tm *transactionMonitor) check() {
 				outstanding.Round(time.Minute),
 			)
 			tm.remove(txHash)
-			continue
-		}
-
-		if outstanding <= tm.threshold || t.alerted {
-			continue
-		}
-
-		logger.Warnf(
-			"wallet transaction [%s] for wallet [0x%x] has been unconfirmed "+
-				"for [%s] (threshold [%s]); it may be stuck in the mempool and "+
-				"blocking subsequent wallet transactions - consider fee-bumping "+
-				"or accelerating it",
-			txHash.Hex(bitcoin.ReversedByteOrder),
-			t.walletPublicKeyHash,
-			outstanding.Round(time.Minute),
-			tm.threshold,
-		)
-
-		// Mark as alerted and read the recorder under the lock, but emit the
-		// metric outside the lock to avoid holding it during an external call.
-		tm.mu.Lock()
-		if tracked, ok := tm.tracked[txHash]; ok {
-			tracked.alerted = true
-		}
-		recorder := tm.metricsRecorder
-		tm.mu.Unlock()
-
-		if recorder != nil {
-			recorder.IncrementCounter(
-				clientinfo.MetricStuckWalletTransactionsTotal, 1,
-			)
 		}
 	}
 }

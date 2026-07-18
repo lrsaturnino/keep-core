@@ -308,6 +308,18 @@ func (wte *walletTransactionExecutor) setTransactionMonitor(
 	wte.transactionMonitor = monitor
 }
 
+// trackTransaction registers a broadcast transaction with the transaction
+// monitor, if one is configured. It is safe to call multiple times for the
+// same transaction.
+func (wte *walletTransactionExecutor) trackTransaction(txHash bitcoin.Hash) {
+	if wte.transactionMonitor != nil {
+		wte.transactionMonitor.track(
+			txHash,
+			bitcoin.PublicKeyHash(wte.executingWallet.publicKey),
+		)
+	}
+}
+
 func newWalletTransactionExecutor(
 	btcChain bitcoin.Chain,
 	executingWallet wallet,
@@ -426,6 +438,10 @@ func (wte *walletTransactionExecutor) broadcastTransaction(
 				)
 			} else {
 				broadcastTxLogger.Infof("broadcasting completed")
+				// Register the transaction for stuck-transaction monitoring as
+				// soon as the broadcast succeeds, without waiting on the
+				// confirmation lookup below (which may itself fail).
+				wte.trackTransaction(txHash)
 			}
 
 			broadcastTxLogger.Infof(
@@ -456,12 +472,10 @@ func (wte *walletTransactionExecutor) broadcastTransaction(
 
 			broadcastTxLogger.Infof("transaction is known on Bitcoin chain")
 
-			if wte.transactionMonitor != nil {
-				wte.transactionMonitor.track(
-					txHash,
-					bitcoin.PublicKeyHash(wte.executingWallet.publicKey),
-				)
-			}
+			// Also register here in case this operator's own broadcast call
+			// errored but the transaction is nonetheless known on-chain (e.g.
+			// broadcast by another operator). trackTransaction is idempotent.
+			wte.trackTransaction(txHash)
 
 			return nil
 		}
