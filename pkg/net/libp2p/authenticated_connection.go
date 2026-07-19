@@ -14,6 +14,8 @@ import (
 	libp2pnetwork "github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 
+	"golang.org/x/time/rate"
+
 	"github.com/keep-network/keep-core/pkg/clientinfo"
 	"github.com/keep-network/keep-core/pkg/firewall"
 	keepNet "github.com/keep-network/keep-core/pkg/net"
@@ -28,6 +30,44 @@ import (
 
 // Enough space for a proto-encoded envelope with a message, peer.ID, and sig.
 const maxFrameSize = 1024
+
+// connectionFailureLogInterval and connectionFailureLogBurst configure the rate
+// limiter that throttles the INFO-level connection-failure log lines emitted by
+// newAuthenticatedInboundConnection and newAuthenticatedOutboundConnection.
+// Opening and failing a connection is cheap for a remote peer, so without
+// throttling a single noisy or hostile peer could emit one log line per failed
+// attempt and flood the logs. The limiter permits a short burst of lines to be
+// logged in full - covering normal, infrequent failures - then caps the
+// sustained rate so a flood cannot grow without bound. The per-reason failure
+// metrics are still incremented on every failure, so throttling the log line
+// never suppresses the observability signal.
+const (
+	connectionFailureLogInterval = 1 * time.Second
+	connectionFailureLogBurst    = 20
+)
+
+// connectionFailureLogLimiter throttles the connection-failure log lines. It is
+// a package-level limiter shared across all connection attempts so the cap
+// bounds total connection-failure log volume regardless of the remote source.
+var connectionFailureLogLimiter = newConnectionFailureLogLimiter()
+
+func newConnectionFailureLogLimiter() *rate.Limiter {
+	return rate.NewLimiter(
+		rate.Every(connectionFailureLogInterval),
+		connectionFailureLogBurst,
+	)
+}
+
+// logConnectionFailure emits an INFO-level connection-failure log line subject
+// to connectionFailureLogLimiter. When the limiter is saturated the line is
+// dropped, but callers still record the corresponding failure metrics on every
+// failure, so the observability signal is preserved even while the log output
+// is throttled.
+func logConnectionFailure(format string, args ...interface{}) {
+	if connectionFailureLogLimiter.Allow() {
+		logger.Infof(format, args...)
+	}
+}
 
 // authenticatedConnection turns inbound and outbound unauthenticated,
 // plain-text connections into authenticated, plain-text connections. Noticeably,
@@ -123,7 +163,7 @@ func newAuthenticatedInboundConnection(
 			metricsRecorder.IncrementCounter(clientinfo.NetworkJoinFailureMetricName(failureReason), 1)
 		}
 
-		logger.Infof(
+		logConnectionFailure(
 			"inbound connection handshake failed with reason [%v]: "+
 				"remote address [%v], remote peer [%v]: [%v]",
 			failureReason,
@@ -149,7 +189,7 @@ func newAuthenticatedInboundConnection(
 			metricsRecorder.IncrementCounter(clientinfo.NetworkJoinFailureMetricName(failureReason), 1)
 		}
 
-		logger.Infof(
+		logConnectionFailure(
 			"inbound connection rejected by firewall with reason [%v]: "+
 				"remote address [%v], remote peer [%v]: [%v]",
 			failureReason,
@@ -193,7 +233,7 @@ func newAuthenticatedOutboundConnection(
 
 	remotePublicKey, err := remotePeerID.ExtractPublicKey()
 	if err != nil {
-		logger.Infof(
+		logConnectionFailure(
 			"outbound connection setup failed with reason [%v]: "+
 				"remote address [%v], remote peer [%v]: [%v]",
 			clientinfo.JoinFailureReasonProtocolCrypto,
@@ -222,7 +262,7 @@ func newAuthenticatedOutboundConnection(
 	ac.initializePipe()
 
 	if err := ac.runHandshakeAsInitiator(); err != nil {
-		logger.Infof(
+		logConnectionFailure(
 			"outbound connection handshake failed with reason [%v]: "+
 				"remote address [%v], remote peer [%v]: [%v]",
 			classifyHandshakeFailure(err),
@@ -239,7 +279,7 @@ func newAuthenticatedOutboundConnection(
 	}
 
 	if failureReason, err := ac.checkFirewallRules(); err != nil {
-		logger.Infof(
+		logConnectionFailure(
 			"outbound connection rejected by firewall with reason [%v]: "+
 				"remote address [%v], remote peer [%v]: [%v]",
 			failureReason,
