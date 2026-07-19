@@ -68,4 +68,14 @@ tmp/
 out/
 data/
 logs/
-storage/
+storage/.ralph/
+__pycache__/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+target/
+dist/
+build/
+.DS_Store
