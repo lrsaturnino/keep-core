@@ -68,7 +68,8 @@ tmp/
 out/
 data/
 logs/
-storage/.ralph/
+storage/
+.ralph/
 __pycache__/
 .venv/
 venv/
