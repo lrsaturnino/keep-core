@@ -3,9 +3,11 @@ package libp2p
 import (
 	"bufio"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"syscall"
 	"time"
 
 	libp2pcrypto "github.com/libp2p/go-libp2p/core/crypto"
@@ -13,6 +15,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 
 	"github.com/keep-network/keep-core/pkg/clientinfo"
+	"github.com/keep-network/keep-core/pkg/firewall"
 	keepNet "github.com/keep-network/keep-core/pkg/net"
 	"github.com/keep-network/keep-core/pkg/net/gen/pb"
 	"github.com/keep-network/keep-core/pkg/net/security/handshake"
@@ -112,10 +115,22 @@ func newAuthenticatedInboundConnection(
 	ac.initializePipe()
 
 	if err := ac.runHandshakeAsResponder(); err != nil {
+		failureReason := classifyHandshakeFailure(err)
+
 		// Track failed join request (handshake failure)
 		if metricsRecorder != nil {
 			metricsRecorder.IncrementCounter(clientinfo.MetricNetworkJoinRequestsFailedTotal, 1)
+			metricsRecorder.IncrementCounter(clientinfo.NetworkJoinFailureMetricName(failureReason), 1)
 		}
+
+		logger.Infof(
+			"inbound connection handshake failed with reason [%v]: "+
+				"remote address [%v], remote peer [%v]: [%v]",
+			failureReason,
+			ac.RemoteAddr(),
+			ac.remotePeerID,
+			err,
+		)
 
 		// close the conn before returning (if it hasn't already)
 		// otherwise we leak.
@@ -126,12 +141,22 @@ func newAuthenticatedInboundConnection(
 		return nil, fmt.Errorf("connection handshake failed: [%v]", err)
 	}
 
-	if err := ac.checkFirewallRules(); err != nil {
+	if failureReason, err := ac.checkFirewallRules(); err != nil {
 		// Track firewall rejection
 		if metricsRecorder != nil {
 			metricsRecorder.IncrementCounter(clientinfo.MetricFirewallRejectionsTotal, 1)
 			metricsRecorder.IncrementCounter(clientinfo.MetricNetworkJoinRequestsFailedTotal, 1)
+			metricsRecorder.IncrementCounter(clientinfo.NetworkJoinFailureMetricName(failureReason), 1)
 		}
+
+		logger.Infof(
+			"inbound connection rejected by firewall with reason [%v]: "+
+				"remote address [%v], remote peer [%v]: [%v]",
+			failureReason,
+			ac.RemoteAddr(),
+			ac.remotePeerID,
+			err,
+		)
 
 		if closeErr := ac.Close(); closeErr != nil {
 			logger.Debugf("could not close the connection: [%v]", closeErr)
@@ -168,6 +193,15 @@ func newAuthenticatedOutboundConnection(
 
 	remotePublicKey, err := remotePeerID.ExtractPublicKey()
 	if err != nil {
+		logger.Infof(
+			"outbound connection setup failed with reason [%v]: "+
+				"remote address [%v], remote peer [%v]: [%v]",
+			clientinfo.JoinFailureReasonProtocolCrypto,
+			unauthenticatedConn.RemoteAddr(),
+			remotePeerID,
+			err,
+		)
+
 		return nil, fmt.Errorf(
 			"could not create new authenticated outbound connection: [%v]",
 			err,
@@ -188,6 +222,15 @@ func newAuthenticatedOutboundConnection(
 	ac.initializePipe()
 
 	if err := ac.runHandshakeAsInitiator(); err != nil {
+		logger.Infof(
+			"outbound connection handshake failed with reason [%v]: "+
+				"remote address [%v], remote peer [%v]: [%v]",
+			classifyHandshakeFailure(err),
+			ac.RemoteAddr(),
+			ac.remotePeerID,
+			err,
+		)
+
 		if closeErr := ac.Close(); closeErr != nil {
 			logger.Debugf("could not close the connection: [%v]", closeErr)
 		}
@@ -195,7 +238,16 @@ func newAuthenticatedOutboundConnection(
 		return nil, fmt.Errorf("connection handshake failed: [%v]", err)
 	}
 
-	if err := ac.checkFirewallRules(); err != nil {
+	if failureReason, err := ac.checkFirewallRules(); err != nil {
+		logger.Infof(
+			"outbound connection rejected by firewall with reason [%v]: "+
+				"remote address [%v], remote peer [%v]: [%v]",
+			failureReason,
+			ac.RemoteAddr(),
+			ac.remotePeerID,
+			err,
+		)
+
 		if closeErr := ac.Close(); closeErr != nil {
 			logger.Debugf("could not close the connection: [%v]", closeErr)
 		}
@@ -211,16 +263,46 @@ func newAuthenticatedOutboundConnection(
 	return ac, nil
 }
 
-func (ac *authenticatedConnection) checkFirewallRules() error {
+// classifyHandshakeFailure maps a handshake error to one of the
+// low-cardinality join failure reasons defined in the clientinfo package.
+func classifyHandshakeFailure(err error) string {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return clientinfo.JoinFailureReasonTimeout
+	}
+
+	if errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.EPIPE) {
+		return clientinfo.JoinFailureReasonEOFReset
+	}
+
+	return clientinfo.JoinFailureReasonProtocolCrypto
+}
+
+// checkFirewallRules validates the remote peer against the firewall. On
+// failure, it returns the join failure reason alongside the error so callers
+// can label metrics and logs without re-deriving the cause.
+func (ac *authenticatedConnection) checkFirewallRules() (string, error) {
 	operatorPublicKey, err := networkPublicKeyToOperatorPublicKey(ac.remotePeerPublicKey)
 	if err != nil {
-		return fmt.Errorf(
+		return clientinfo.JoinFailureReasonProtocolCrypto, fmt.Errorf(
 			"cannot convert libp2p public key to operator public key: [%v]",
 			err,
 		)
 	}
 
-	return ac.firewall.Validate(operatorPublicKey)
+	if err := ac.firewall.Validate(operatorPublicKey); err != nil {
+		if errors.Is(err, firewall.ErrNotRecognized) {
+			return clientinfo.JoinFailureReasonFirewallUnrecognized, err
+		}
+		return clientinfo.JoinFailureReasonFirewallRPCError, err
+	}
+
+	return "", nil
 }
 
 func (ac *authenticatedConnection) runHandshakeAsInitiator() error {
