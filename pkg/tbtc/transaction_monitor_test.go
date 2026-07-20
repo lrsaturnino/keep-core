@@ -169,3 +169,43 @@ func TestTransactionMonitor_CapacityBound(t *testing.T) {
 		)
 	}
 }
+
+// TestTransactionMonitor_SnapshotByAge verifies the check pass iterates tracked
+// transactions oldest-first, so an old transaction near the stuck threshold is
+// never starved when a pass hits its time budget (Go map order is randomized).
+func TestTransactionMonitor_SnapshotByAge(t *testing.T) {
+	monitor := newTransactionMonitor(newLocalBitcoinChain())
+
+	var h1, h2, h3 bitcoin.Hash
+	h1[0], h2[0], h3[0] = 1, 2, 3
+	monitor.track(h1, [20]byte{})
+	monitor.track(h2, [20]byte{})
+	monitor.track(h3, [20]byte{})
+
+	// Backdate broadcast times so the age order is h2 (oldest), h3, h1 (newest).
+	// The hour-scale gaps dwarf the sub-second differences in track() times.
+	ageTransaction(monitor, h1, 1*time.Hour)
+	ageTransaction(monitor, h2, 3*time.Hour)
+	ageTransaction(monitor, h3, 2*time.Hour)
+
+	ordered := monitor.snapshotByAge()
+
+	want := []bitcoin.Hash{h2, h3, h1}
+	if len(ordered) != len(want) {
+		t.Fatalf("expected [%d] entries; got [%d]", len(want), len(ordered))
+	}
+	for i, w := range want {
+		if ordered[i].hash != w {
+			t.Fatalf(
+				"snapshotByAge not oldest-first at index [%d]\nexpected: %v\ngot:      %v",
+				i, want, []bitcoin.Hash{ordered[0].hash, ordered[1].hash, ordered[2].hash},
+			)
+		}
+	}
+	// Broadcast times must be non-decreasing across the ordered snapshot.
+	for i := 1; i < len(ordered); i++ {
+		if ordered[i].broadcastAt.Before(ordered[i-1].broadcastAt) {
+			t.Fatalf("entry [%d] is older than entry [%d]; not sorted oldest-first", i, i-1)
+		}
+	}
+}

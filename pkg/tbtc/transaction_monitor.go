@@ -2,6 +2,7 @@ package tbtc
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"time"
 
@@ -47,6 +48,35 @@ type trackedTransaction struct {
 	walletPublicKeyHash [20]byte
 	broadcastAt         time.Time
 	alerted             bool
+}
+
+// trackedTransactionSnapshot pairs a copy of a tracked transaction with its hash
+// so the check loop can iterate an ordered snapshot outside the lock.
+type trackedTransactionSnapshot struct {
+	hash bitcoin.Hash
+	trackedTransaction
+}
+
+// snapshotByAge returns a copy of the tracked transactions ordered by broadcast
+// time, oldest first. Checking oldest first ensures the transactions closest to
+// the stuck threshold are never starved when a check pass hits its time budget:
+// Go map iteration order is randomized, so without an explicit ordering an
+// unlucky old transaction could be skipped pass after pass and miss its
+// threshold; with it, only the newest transactions - furthest from alerting -
+// are ever deferred. The copy is taken under the lock; the sort is not.
+func (tm *transactionMonitor) snapshotByAge() []trackedTransactionSnapshot {
+	tm.mu.Lock()
+	ordered := make([]trackedTransactionSnapshot, 0, len(tm.tracked))
+	for hash, t := range tm.tracked {
+		ordered = append(ordered, trackedTransactionSnapshot{hash, *t})
+	}
+	tm.mu.Unlock()
+
+	sort.Slice(ordered, func(i, j int) bool {
+		return ordered[i].broadcastAt.Before(ordered[j].broadcastAt)
+	})
+
+	return ordered
 }
 
 // transactionMonitor watches broadcast wallet transactions (deposit sweeps,
@@ -165,15 +195,12 @@ func (tm *transactionMonitor) check() {
 	now := time.Now()
 	deadline := now.Add(transactionMonitorCheckBudget)
 
-	// Snapshot the tracked set so chain calls are not made under the lock.
-	tm.mu.Lock()
-	snapshot := make(map[bitcoin.Hash]trackedTransaction, len(tm.tracked))
-	for hash, t := range tm.tracked {
-		snapshot[hash] = *t
-	}
-	tm.mu.Unlock()
-
-	for txHash, t := range snapshot {
+	// Iterate the tracked set oldest-first (see snapshotByAge) so a pass that
+	// hits its time budget never starves the transactions closest to the stuck
+	// threshold; only the newest, furthest-from-alerting ones are deferred to the
+	// next pass. Chain calls are made on the copy, outside the lock.
+	for _, t := range tm.snapshotByAge() {
+		txHash := t.hash
 		// Bound the wall-clock time of a single pass so a run of slow chain calls
 		// cannot stall monitoring of every transaction behind them; the remaining
 		// transactions are picked up on the next pass. The deadline is checked
