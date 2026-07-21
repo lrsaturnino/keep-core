@@ -232,7 +232,16 @@ func TestTransactionMonitor_CheckBudgetBoundsLookup(t *testing.T) {
 	confirmedTxHash := confirmedTx.Hash()
 	monitor.track(confirmedTxHash, [20]byte{})
 
-	monitor.check(context.Background())
+	secondCheckDone := make(chan struct{})
+	go func() {
+		monitor.check(context.Background())
+		close(secondCheckDone)
+	}()
+	select {
+	case <-secondCheckDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second check pass stalled on the in-flight lookup")
+	}
 
 	if got := chain.getLookupCount(); got != 1 {
 		t.Fatalf("expected one in-flight lookup; got [%d]", got)
