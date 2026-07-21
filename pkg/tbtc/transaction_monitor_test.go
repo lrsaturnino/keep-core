@@ -1,6 +1,8 @@
 package tbtc
 
 import (
+	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -55,6 +57,53 @@ func trackedCount(tm *transactionMonitor) int {
 	return len(tm.tracked)
 }
 
+type blockingTransactionConfirmationsChain struct {
+	*localBitcoinChain
+
+	blockedHash   bitcoin.Hash
+	lookupMutex   sync.Mutex
+	lookupCount   int
+	startedOnce   sync.Once
+	doneOnce      sync.Once
+	lookupStarted chan struct{}
+	lookupRelease chan struct{}
+	lookupDone    chan struct{}
+}
+
+func newBlockingTransactionConfirmationsChain(
+	blockedHash bitcoin.Hash,
+) *blockingTransactionConfirmationsChain {
+	return &blockingTransactionConfirmationsChain{
+		localBitcoinChain: newLocalBitcoinChain(),
+		blockedHash:       blockedHash,
+		lookupStarted:     make(chan struct{}),
+		lookupRelease:     make(chan struct{}),
+		lookupDone:        make(chan struct{}),
+	}
+}
+
+func (c *blockingTransactionConfirmationsChain) GetTransactionConfirmations(
+	transactionHash bitcoin.Hash,
+) (uint, error) {
+	if transactionHash == c.blockedHash {
+		c.lookupMutex.Lock()
+		c.lookupCount++
+		c.lookupMutex.Unlock()
+
+		c.startedOnce.Do(func() { close(c.lookupStarted) })
+		<-c.lookupRelease
+		c.doneOnce.Do(func() { close(c.lookupDone) })
+	}
+
+	return c.localBitcoinChain.GetTransactionConfirmations(transactionHash)
+}
+
+func (c *blockingTransactionConfirmationsChain) getLookupCount() int {
+	c.lookupMutex.Lock()
+	defer c.lookupMutex.Unlock()
+	return c.lookupCount
+}
+
 func TestTransactionMonitor(t *testing.T) {
 	chain := newLocalBitcoinChain()
 	recorder := newCountingMetricsRecorder()
@@ -71,7 +120,7 @@ func TestTransactionMonitor(t *testing.T) {
 	}
 
 	// Fresh: not yet stuck.
-	monitor.check()
+	monitor.check(context.Background())
 	if got := stuckCount(); got != 0 {
 		t.Fatalf("expected no alert for a fresh transaction; got counter [%v]", got)
 	}
@@ -82,15 +131,15 @@ func TestTransactionMonitor(t *testing.T) {
 	// elapsed time a hair past any exact backdated value, so it cannot be pinned
 	// deterministically without an injectable clock.
 	ageTransaction(monitor, txHash, defaultStuckTransactionThreshold-time.Minute)
-	monitor.check()
+	monitor.check(context.Background())
 	if got := stuckCount(); got != 0 {
 		t.Fatalf("expected no alert at the threshold boundary; got counter [%v]", got)
 	}
 
 	// Past the threshold: flagged as stuck exactly once across repeated checks.
 	ageTransaction(monitor, txHash, 2*time.Minute) // now threshold + 1 minute total
-	monitor.check()
-	monitor.check()
+	monitor.check(context.Background())
+	monitor.check(context.Background())
 	if got := stuckCount(); got != 1 {
 		t.Fatalf("expected exactly one alert; got counter [%v]", got)
 	}
@@ -99,7 +148,7 @@ func TestTransactionMonitor(t *testing.T) {
 	if err := chain.BroadcastTransaction(tx); err != nil {
 		t.Fatalf("unexpected error confirming transaction: [%v]", err)
 	}
-	monitor.check()
+	monitor.check(context.Background())
 	if isTracked(monitor, txHash) {
 		t.Fatal("expected confirmed transaction to be untracked")
 	}
@@ -122,7 +171,7 @@ func TestTransactionMonitor_GivesUpOnNeverConfirming(t *testing.T) {
 	// stuck alert (the alert runs before eviction) and then be evicted rather
 	// than tracked forever.
 	ageTransaction(monitor, txHash, transactionMonitorMaxTrackingAge+time.Minute)
-	monitor.check()
+	monitor.check(context.Background())
 
 	if got := recorder.GetCounterValue(
 		clientinfo.MetricStuckWalletTransactionsTotal,
@@ -131,6 +180,75 @@ func TestTransactionMonitor_GivesUpOnNeverConfirming(t *testing.T) {
 	}
 	if isTracked(monitor, txHash) {
 		t.Fatal("expected a never-confirming transaction to be evicted")
+	}
+}
+
+// TestTransactionMonitor_CheckBudgetBoundsLookup verifies that a chain lookup
+// cannot keep the monitor's sole check goroutine blocked beyond the check
+// budget.
+func TestTransactionMonitor_CheckBudgetBoundsLookup(t *testing.T) {
+	blockedTxHash := bitcoin.Hash{1}
+	chain := newBlockingTransactionConfirmationsChain(blockedTxHash)
+	monitor := newTransactionMonitor(chain)
+
+	monitor.track(blockedTxHash, [20]byte{})
+
+	lookupReleased := false
+	defer func() {
+		if !lookupReleased {
+			close(chain.lookupRelease)
+		}
+	}()
+
+	checkDone := make(chan struct{})
+	go func() {
+		monitor.checkWithBudget(context.Background(), 500*time.Millisecond)
+		close(checkDone)
+	}()
+
+	select {
+	case <-chain.lookupStarted:
+	case <-time.After(time.Second):
+		t.Fatal("confirmation lookup did not start")
+	}
+
+	// The backend remains blocked while the budget must release the check.
+	select {
+	case <-checkDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("transaction check remained blocked after its budget expired")
+	}
+
+	if !isTracked(monitor, blockedTxHash) {
+		t.Fatal("expected transaction with an incomplete lookup to remain tracked")
+	}
+
+	// A later pass must skip the lookup that is still in flight, avoid starting
+	// a duplicate, and continue checking other transactions.
+	confirmedTx := &bitcoin.Transaction{}
+	if err := chain.BroadcastTransaction(confirmedTx); err != nil {
+		t.Fatalf("unexpected error confirming transaction: [%v]", err)
+	}
+	confirmedTxHash := confirmedTx.Hash()
+	monitor.track(confirmedTxHash, [20]byte{})
+
+	monitor.check(context.Background())
+
+	if got := chain.getLookupCount(); got != 1 {
+		t.Fatalf("expected one in-flight lookup; got [%d]", got)
+	}
+	if isTracked(monitor, confirmedTxHash) {
+		t.Fatal("expected the other confirmed transaction to be untracked")
+	}
+
+	// Release the intentionally blocked backend and wait for it to finish so the
+	// test does not leave a goroutine behind.
+	close(chain.lookupRelease)
+	lookupReleased = true
+	select {
+	case <-chain.lookupDone:
+	case <-time.After(time.Second):
+		t.Fatal("confirmation lookup did not finish after being released")
 	}
 }
 

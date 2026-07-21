@@ -100,8 +100,9 @@ func (tm *transactionMonitor) snapshotByAge() []trackedTransactionSnapshot {
 type transactionMonitor struct {
 	btcChain bitcoin.Chain
 
-	mu      sync.Mutex
-	tracked map[bitcoin.Hash]*trackedTransaction
+	mu                          sync.Mutex
+	tracked                     map[bitcoin.Hash]*trackedTransaction
+	inFlightConfirmationLookups map[bitcoin.Hash]struct{}
 
 	threshold time.Duration
 
@@ -110,9 +111,10 @@ type transactionMonitor struct {
 
 func newTransactionMonitor(btcChain bitcoin.Chain) *transactionMonitor {
 	return &transactionMonitor{
-		btcChain:  btcChain,
-		tracked:   make(map[bitcoin.Hash]*trackedTransaction),
-		threshold: defaultStuckTransactionThreshold,
+		btcChain:                    btcChain,
+		tracked:                     make(map[bitcoin.Hash]*trackedTransaction),
+		inFlightConfirmationLookups: make(map[bitcoin.Hash]struct{}),
+		threshold:                   defaultStuckTransactionThreshold,
 	}
 }
 
@@ -178,7 +180,7 @@ func (tm *transactionMonitor) run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			tm.check()
+			tm.check(ctx)
 		}
 	}
 }
@@ -191,9 +193,21 @@ func (tm *transactionMonitor) run(ctx context.Context) {
 // check is only ever called from the single run loop goroutine. track may run
 // concurrently but only inserts new entries, so the per-entry alerted flag is
 // only ever mutated here, under the mutex.
-func (tm *transactionMonitor) check() {
+func (tm *transactionMonitor) check(ctx context.Context) {
+	tm.checkWithBudget(ctx, transactionMonitorCheckBudget)
+}
+
+func (tm *transactionMonitor) checkWithBudget(
+	ctx context.Context,
+	checkBudget time.Duration,
+) {
+	checkCtx, cancelCheck := context.WithTimeout(
+		ctx,
+		checkBudget,
+	)
+	defer cancelCheck()
+
 	now := time.Now()
-	deadline := now.Add(transactionMonitorCheckBudget)
 
 	// Iterate the tracked set oldest-first (see snapshotByAge) so a pass that
 	// hits its time budget never starves the transactions closest to the stuck
@@ -201,31 +215,34 @@ func (tm *transactionMonitor) check() {
 	// next pass. Chain calls are made on the copy, outside the lock.
 	for _, t := range tm.snapshotByAge() {
 		txHash := t.hash
-		// Bound the wall-clock time of a single pass so a run of slow chain calls
-		// cannot stall monitoring of every transaction behind them; the remaining
-		// transactions are picked up on the next pass. The deadline is checked
-		// between calls; each individual GetTransactionConfirmations call is
-		// separately bounded by the Electrum client's own operation timeouts, so a
-		// single call cannot block the pass indefinitely.
-		if time.Now().After(deadline) {
-			logger.Warnf(
-				"transaction monitor check pass exceeded its time budget [%s]; "+
-					"deferring the remaining transactions to the next pass",
-				transactionMonitorCheckBudget,
-			)
-			break
+		confirmations, err, lookupCompleted :=
+			tm.getTransactionConfirmations(checkCtx, txHash)
+		if checkCtx.Err() != nil {
+			// Do not warn when the monitor itself is shutting down. Otherwise,
+			// the check budget expired and the remaining transactions will be
+			// handled on the next pass.
+			if ctx.Err() == nil {
+				logger.Warnf(
+					"transaction monitor check pass exceeded its time budget [%s]; "+
+						"deferring the remaining transactions to the next pass",
+					checkBudget,
+				)
+			}
+			return
 		}
 
-		confirmations, err := tm.btcChain.GetTransactionConfirmations(txHash)
-		if err == nil && confirmations >= transactionMonitorMinConfirmations {
+		if lookupCompleted &&
+			err == nil &&
+			confirmations >= transactionMonitorMinConfirmations {
 			// The transaction is mined; stop tracking it.
 			tm.remove(txHash)
 			continue
 		}
 
-		// Still unconfirmed (in the mempool) or not found. A lookup error is
-		// treated the same as unconfirmed: it does not indicate the transaction
-		// confirmed and may be transient.
+		// Still unconfirmed (in the mempool), not found, or a previous lookup is
+		// still in flight. An incomplete lookup or lookup error is treated the
+		// same as unconfirmed: it does not indicate the transaction confirmed and
+		// may be transient.
 		outstanding := now.Sub(t.broadcastAt)
 
 		// Alert (once) if the transaction has been unconfirmed past the stuck
@@ -272,6 +289,55 @@ func (tm *transactionMonitor) check() {
 			)
 			tm.remove(txHash)
 		}
+	}
+}
+
+type transactionConfirmationsResult struct {
+	confirmations uint
+	err           error
+}
+
+// getTransactionConfirmations isolates the synchronous chain call so a slow or
+// hung backend cannot keep the monitor's sole run-loop goroutine blocked beyond
+// the current check deadline. The boolean result indicates whether the lookup
+// completed. An already in-flight lookup is not duplicated, which bounds
+// abandoned backend calls while allowing the check to continue with other
+// transactions on later passes.
+func (tm *transactionMonitor) getTransactionConfirmations(
+	ctx context.Context,
+	txHash bitcoin.Hash,
+) (uint, error, bool) {
+	if err := ctx.Err(); err != nil {
+		return 0, err, false
+	}
+
+	tm.mu.Lock()
+	_, lookupInFlight := tm.inFlightConfirmationLookups[txHash]
+	lookupCapacityReached :=
+		len(tm.inFlightConfirmationLookups) >= transactionMonitorMaxTracked
+	if lookupInFlight || lookupCapacityReached {
+		tm.mu.Unlock()
+		return 0, nil, false
+	}
+	tm.inFlightConfirmationLookups[txHash] = struct{}{}
+	tm.mu.Unlock()
+
+	resultChan := make(chan transactionConfirmationsResult, 1)
+	go func() {
+		confirmations, err := tm.btcChain.GetTransactionConfirmations(txHash)
+
+		tm.mu.Lock()
+		delete(tm.inFlightConfirmationLookups, txHash)
+		tm.mu.Unlock()
+
+		resultChan <- transactionConfirmationsResult{confirmations, err}
+	}()
+
+	select {
+	case result := <-resultChan:
+		return result.confirmations, result.err, true
+	case <-ctx.Done():
+		return 0, ctx.Err(), false
 	}
 }
 
