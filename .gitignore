@@ -83,3 +83,13 @@ strix_runs/
 
 # Claude Code session state
 .claude/
+.ralph/
+__pycache__/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+target/
+dist/
+.DS_Store
