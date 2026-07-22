@@ -506,6 +506,14 @@ func (dst *DepositSweepTask) ProposeDepositsSweep(
 			perDepositMaxFee,
 		)
 		if err != nil {
+			// A failure here means no sweep proposal is produced this round, so
+			// the deposits stay unswept. Log it distinctly at WARN so operators
+			// can tell this apart from a benign "no deposits to sweep" outcome;
+			// in particular, a safe-minimum-fee abort (see
+			// minSweepTxSatPerVByteFee) can indicate a misconfigured, too-low
+			// per-deposit maximum fee that will strand deposits until governance
+			// raises it.
+			taskLogger.Warnf("cannot estimate sweep transaction fee: [%v]", err)
 			return nil, fmt.Errorf("cannot estimate sweep transaction fee: [%v]", err)
 		}
 
@@ -571,8 +579,10 @@ func (dst *DepositSweepTask) ProposeDepositsSweep(
 //     be underestimated in some rare cases.
 //   - 1 P2WPKH output
 //
-// If any of the estimated fees exceed the maximum fee allowed by the Bridge
-// contract, an error is returned as result.
+// An error is returned if any estimated fee exceeds the maximum fee allowed by
+// the Bridge contract, or if the minimum safe sweep fee (see
+// minSweepTxSatPerVByteFee) required to avoid a stuck, unbumpable sweep would
+// itself exceed that Bridge maximum.
 func EstimateDepositsSweepFee(
 	chain Chain,
 	btcChain bitcoin.Chain,
@@ -692,6 +702,10 @@ func estimateDepositsSweepFee(
 	// can land slightly below the floor for such (rare) sweeps. It still dominates
 	// the 1 sat/vByte relay floor this fix targets; a fully accurate floor would
 	// require deposit-type-aware sizing.
+	// rate is an exact integer here because EstimateFee returns totalFee as
+	// satPerVByteFee * transactionSize (an exact multiple of the size), so the
+	// buffer is applied without truncation loss. If that contract changes, apply
+	// the buffer to totalFee directly instead of to the truncated rate.
 	rate := totalFee / transactionSize
 	rate = (rate*5 + 3) / 4 // ceil(rate * 1.25)
 	if rate < minSweepTxSatPerVByteFee {
@@ -699,6 +713,8 @@ func estimateDepositsSweepFee(
 	}
 	totalFee = rate * transactionSize
 	if uint64(totalFee) > totalMaxFee {
+		// totalMaxFee is bounded by Bitcoin's total supply (~2.1e15 sat), far
+		// below math.MaxInt64, so this narrowing cast cannot overflow.
 		totalFee = int64(totalMaxFee)
 	}
 
