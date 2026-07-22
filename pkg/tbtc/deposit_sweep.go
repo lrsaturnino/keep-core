@@ -1,6 +1,7 @@
 package tbtc
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"fmt"
 	"math/big"
@@ -343,6 +344,7 @@ func ValidateDepositSweepProposal(
 		)
 
 		confirmations, err := btcChain.GetTransactionConfirmations(
+			context.Background(),
 			depositKey.FundingTxHash,
 		)
 		if err != nil {

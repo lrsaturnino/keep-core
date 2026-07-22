@@ -100,9 +100,8 @@ func (tm *transactionMonitor) snapshotByAge() []trackedTransactionSnapshot {
 type transactionMonitor struct {
 	btcChain bitcoin.Chain
 
-	mu                          sync.Mutex
-	tracked                     map[bitcoin.Hash]*trackedTransaction
-	inFlightConfirmationLookups map[bitcoin.Hash]struct{}
+	mu      sync.Mutex
+	tracked map[bitcoin.Hash]*trackedTransaction
 
 	threshold time.Duration
 
@@ -111,10 +110,9 @@ type transactionMonitor struct {
 
 func newTransactionMonitor(btcChain bitcoin.Chain) *transactionMonitor {
 	return &transactionMonitor{
-		btcChain:                    btcChain,
-		tracked:                     make(map[bitcoin.Hash]*trackedTransaction),
-		inFlightConfirmationLookups: make(map[bitcoin.Hash]struct{}),
-		threshold:                   defaultStuckTransactionThreshold,
+		btcChain:  btcChain,
+		tracked:   make(map[bitcoin.Hash]*trackedTransaction),
+		threshold: defaultStuckTransactionThreshold,
 	}
 }
 
@@ -215,8 +213,12 @@ func (tm *transactionMonitor) checkWithBudget(
 	// next pass. Chain calls are made on the copy, outside the lock.
 	for _, t := range tm.snapshotByAge() {
 		txHash := t.hash
-		confirmations, err, lookupCompleted :=
-			tm.getTransactionConfirmations(checkCtx, txHash)
+		// The chain call is bounded by checkCtx, so a slow or hung backend cannot
+		// keep this run loop blocked past the check budget: when the budget
+		// expires the call is cancelled and returns, and the checkCtx.Err() guard
+		// below defers the remaining transactions to the next pass.
+		confirmations, err :=
+			tm.btcChain.GetTransactionConfirmations(checkCtx, txHash)
 		if checkCtx.Err() != nil {
 			// Do not warn when the monitor itself is shutting down. Otherwise,
 			// the check budget expired and the remaining transactions will be
@@ -231,18 +233,16 @@ func (tm *transactionMonitor) checkWithBudget(
 			return
 		}
 
-		if lookupCompleted &&
-			err == nil &&
+		if err == nil &&
 			confirmations >= transactionMonitorMinConfirmations {
 			// The transaction is mined; stop tracking it.
 			tm.remove(txHash)
 			continue
 		}
 
-		// Still unconfirmed (in the mempool), not found, or a previous lookup is
-		// still in flight. An incomplete lookup or lookup error is treated the
-		// same as unconfirmed: it does not indicate the transaction confirmed and
-		// may be transient.
+		// Still unconfirmed (in the mempool), not found, or the lookup returned a
+		// transient error. A lookup error is treated the same as unconfirmed: it
+		// does not indicate the transaction confirmed and may be transient.
 		outstanding := now.Sub(t.broadcastAt)
 
 		// Alert (once) if the transaction has been unconfirmed past the stuck
@@ -289,55 +289,6 @@ func (tm *transactionMonitor) checkWithBudget(
 			)
 			tm.remove(txHash)
 		}
-	}
-}
-
-type transactionConfirmationsResult struct {
-	confirmations uint
-	err           error
-}
-
-// getTransactionConfirmations isolates the synchronous chain call so a slow or
-// hung backend cannot keep the monitor's sole run-loop goroutine blocked beyond
-// the current check deadline. The boolean result indicates whether the lookup
-// completed. An already in-flight lookup is not duplicated, which bounds
-// abandoned backend calls while allowing the check to continue with other
-// transactions on later passes.
-func (tm *transactionMonitor) getTransactionConfirmations(
-	ctx context.Context,
-	txHash bitcoin.Hash,
-) (uint, error, bool) {
-	if err := ctx.Err(); err != nil {
-		return 0, err, false
-	}
-
-	tm.mu.Lock()
-	_, lookupInFlight := tm.inFlightConfirmationLookups[txHash]
-	lookupCapacityReached :=
-		len(tm.inFlightConfirmationLookups) >= transactionMonitorMaxTracked
-	if lookupInFlight || lookupCapacityReached {
-		tm.mu.Unlock()
-		return 0, nil, false
-	}
-	tm.inFlightConfirmationLookups[txHash] = struct{}{}
-	tm.mu.Unlock()
-
-	resultChan := make(chan transactionConfirmationsResult, 1)
-	go func() {
-		confirmations, err := tm.btcChain.GetTransactionConfirmations(txHash)
-
-		tm.mu.Lock()
-		delete(tm.inFlightConfirmationLookups, txHash)
-		tm.mu.Unlock()
-
-		resultChan <- transactionConfirmationsResult{confirmations, err}
-	}()
-
-	select {
-	case result := <-resultChan:
-		return result.confirmations, result.err, true
-	case <-ctx.Done():
-		return 0, ctx.Err(), false
 	}
 }
 

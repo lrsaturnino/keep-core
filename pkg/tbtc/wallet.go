@@ -460,7 +460,10 @@ func (wte *walletTransactionExecutor) broadcastTransaction(
 				"checking whether the transaction is known on Bitcoin chain",
 			)
 
-			_, err = wte.btcChain.GetTransactionConfirmations(txHash)
+			_, err = wte.btcChain.GetTransactionConfirmations(
+				context.Background(),
+				txHash,
+			)
 			if err != nil {
 				broadcastTxLogger.Warnf(
 					"cannot say whether the transaction is known "+

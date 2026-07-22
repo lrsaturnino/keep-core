@@ -83,6 +83,7 @@ func newBlockingTransactionConfirmationsChain(
 }
 
 func (c *blockingTransactionConfirmationsChain) GetTransactionConfirmations(
+	ctx context.Context,
 	transactionHash bitcoin.Hash,
 ) (uint, error) {
 	if transactionHash == c.blockedHash {
@@ -91,11 +92,17 @@ func (c *blockingTransactionConfirmationsChain) GetTransactionConfirmations(
 		c.lookupMutex.Unlock()
 
 		c.startedOnce.Do(func() { close(c.lookupStarted) })
-		<-c.lookupRelease
-		c.doneOnce.Do(func() { close(c.lookupDone) })
+		// Block until released, but honor the context so a check pass that hits
+		// its budget can cancel the lookup instead of stalling on the backend.
+		select {
+		case <-c.lookupRelease:
+			c.doneOnce.Do(func() { close(c.lookupDone) })
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
 	}
 
-	return c.localBitcoinChain.GetTransactionConfirmations(transactionHash)
+	return c.localBitcoinChain.GetTransactionConfirmations(ctx, transactionHash)
 }
 
 func (c *blockingTransactionConfirmationsChain) getLookupCount() int {
@@ -193,10 +200,13 @@ func TestTransactionMonitor_CheckBudgetBoundsLookup(t *testing.T) {
 
 	monitor.track(blockedTxHash, [20]byte{})
 
+	// Ensure the intentionally blocked backend is released even if the test
+	// fails, so the mock's lookup goroutine is never left parked.
 	lookupReleased := false
 	defer func() {
 		if !lookupReleased {
 			close(chain.lookupRelease)
+			lookupReleased = true
 		}
 	}()
 
@@ -212,52 +222,24 @@ func TestTransactionMonitor_CheckBudgetBoundsLookup(t *testing.T) {
 		t.Fatal("confirmation lookup did not start")
 	}
 
-	// The backend remains blocked while the budget must release the check.
+	// The backend never unblocks, so only the check budget can release the pass.
+	// This is the crux: the monitor threads the budgeted context into the chain
+	// call, so budget expiry cancels the lookup and the pass returns. If it did
+	// not, this would block until the timeout below and fail.
 	select {
 	case <-checkDone:
 	case <-time.After(2 * time.Second):
 		t.Fatal("transaction check remained blocked after its budget expired")
 	}
 
-	if !isTracked(monitor, blockedTxHash) {
-		t.Fatal("expected transaction with an incomplete lookup to remain tracked")
-	}
-
-	// A later pass must skip the lookup that is still in flight, avoid starting
-	// a duplicate, and continue checking other transactions.
-	confirmedTx := &bitcoin.Transaction{}
-	if err := chain.BroadcastTransaction(confirmedTx); err != nil {
-		t.Fatalf("unexpected error confirming transaction: [%v]", err)
-	}
-	confirmedTxHash := confirmedTx.Hash()
-	monitor.track(confirmedTxHash, [20]byte{})
-
-	secondCheckDone := make(chan struct{})
-	go func() {
-		monitor.check(context.Background())
-		close(secondCheckDone)
-	}()
-	select {
-	case <-secondCheckDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("second check pass stalled on the in-flight lookup")
-	}
-
 	if got := chain.getLookupCount(); got != 1 {
-		t.Fatalf("expected one in-flight lookup; got [%d]", got)
-	}
-	if isTracked(monitor, confirmedTxHash) {
-		t.Fatal("expected the other confirmed transaction to be untracked")
+		t.Fatalf("expected exactly one confirmation lookup; got [%d]", got)
 	}
 
-	// Release the intentionally blocked backend and wait for it to finish so the
-	// test does not leave a goroutine behind.
-	close(chain.lookupRelease)
-	lookupReleased = true
-	select {
-	case <-chain.lookupDone:
-	case <-time.After(time.Second):
-		t.Fatal("confirmation lookup did not finish after being released")
+	// The cancelled lookup is treated as unconfirmed, so the transaction stays
+	// tracked and is retried on a later pass.
+	if !isTracked(monitor, blockedTxHash) {
+		t.Fatal("expected transaction with a cancelled lookup to remain tracked")
 	}
 }
 
