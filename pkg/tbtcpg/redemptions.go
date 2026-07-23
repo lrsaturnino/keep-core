@@ -221,7 +221,7 @@ func (rt *RedemptionTask) ProposeRedemption(
 	if fee <= 0 {
 		taskLogger.Infof("estimating redemption transaction fee")
 
-		_, _, _, txMaxTotalFee, _, _, _, err := rt.chain.GetRedemptionParameters()
+		_, _, txMaxFee, txMaxTotalFee, _, _, _, err := rt.chain.GetRedemptionParameters()
 		if err != nil {
 			return nil, fmt.Errorf(
 				"cannot get redemption tx max total fee: [%w]",
@@ -242,6 +242,25 @@ func (rt *RedemptionTask) ProposeRedemption(
 		}
 
 		fee = estimatedFee
+
+		// The safe-minimum floor raises the total fee and therefore each
+		// request's even fee share (~ totalFee / requestsCount). When that
+		// share exceeds the per-request maximum fee, on-chain validation
+		// rejects the whole proposal and the batch is aborted with no
+		// lower-fee retry. Emit a distinct warning so operators can tell this
+		// apart from a generic validation failure. txMaxFee is the current
+		// governance parameter; the actually enforced cap is the value
+		// snapshotted per request at creation, so this is a best-effort
+		// diagnostic rather than an exact predictor.
+		if share := fee / int64(len(redeemersOutputScripts)); uint64(share) > txMaxFee {
+			taskLogger.Warnf(
+				"floored redemption fee share [%d] exceeds the per-request "+
+					"maximum fee [%d]; the proposal will likely be rejected "+
+					"by on-chain validation",
+				share,
+				txMaxFee,
+			)
+		}
 	}
 
 	taskLogger.Infof("redemption transaction fee: [%d]", fee)

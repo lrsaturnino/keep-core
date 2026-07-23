@@ -34,8 +34,16 @@ const minWalletTxSatPerVByteFee = 5
 //
 // It returns an error if the minimum floor alone would exceed maxTotalFee - a
 // safe transaction cannot be built, so the caller must not broadcast an
-// underpriced one. estimatedFee is the raw oracle fee and txVsize is the
-// estimated transaction virtual size, both in the usual sat / vByte units.
+// underpriced one. estimatedFee is the raw oracle fee in satoshis and txVsize
+// is the estimated transaction virtual size in vBytes.
+//
+// The 25% buffer is applied to the truncated per-vByte rate
+// (estimatedFee / txVsize). This is lossless only because EstimateFee returns
+// the fee as satPerVByteFee * txVsize (an exact multiple of the vsize), so the
+// integer division recovers the exact rate. If that contract ever changes so
+// estimatedFee is no longer an exact multiple of txVsize, apply the buffer to
+// estimatedFee directly instead of to the truncated rate; otherwise up to
+// txVsize-1 sat is silently dropped before buffering and the tx is underpriced.
 //
 // maxTotalFee bounds only the total transaction fee. Where the Bridge also
 // enforces a per-request cap (e.g. the redemption TxMaxFee), satisfying that

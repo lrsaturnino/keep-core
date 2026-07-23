@@ -651,28 +651,39 @@ func TestMovingFundsAction_ProposeMovingFunds(t *testing.T) {
 
 func TestEstimateMovingFundsFee(t *testing.T) {
 	var tests = map[string]struct {
-		txMaxTotalFee uint64
-		expectedFee   uint64
-		expectedError error
+		estimateSatPerVByte int64
+		txMaxTotalFee       uint64
+		expectedFee         uint64
+		expectedError       error
 	}{
 		"estimated fee correct": {
-			txMaxTotalFee: 6000,
+			estimateSatPerVByte: 16,
+			txMaxTotalFee:       6000,
 			// raw 3248 (203 vByte * 16 sat/vByte), buffered to
 			// ceil(16*1.25)=20 sat/vByte * 203 = 4060, below the cap.
 			expectedFee:   4060,
 			expectedError: nil,
 		},
+		"low estimate is raised to the minimum floor": {
+			estimateSatPerVByte: 1,
+			txMaxTotalFee:       6000,
+			// raw 203 (203 vByte * 1 sat/vByte), buffered ceil(1*1.25)=2 is
+			// below the 5 sat/vByte floor, so clamped to 5 * 203 = 1015.
+			expectedFee:   1015,
+			expectedError: nil,
+		},
 		"estimated fee too high": {
-			txMaxTotalFee: 3000,
-			expectedFee:   0,
-			expectedError: tbtcpg.ErrFeeTooHigh,
+			estimateSatPerVByte: 16,
+			txMaxTotalFee:       3000,
+			expectedFee:         0,
+			expectedError:       tbtcpg.ErrFeeTooHigh,
 		},
 	}
 
 	for testName, test := range tests {
 		t.Run(testName, func(t *testing.T) {
 			btcChain := tbtcpg.NewLocalBitcoinChain()
-			btcChain.SetEstimateSatPerVByteFee(1, 16)
+			btcChain.SetEstimateSatPerVByteFee(1, test.estimateSatPerVByte)
 
 			targetWalletsCount := 4
 

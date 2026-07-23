@@ -56,6 +56,11 @@ func TestEstimateRedemptionFee(t *testing.T) {
 			txMaxTotalFee:       uint64(3 * vsize), // below the 5 sat/vByte floor
 			expectErrorContains: "minimum safe transaction fee",
 		},
+		"raw estimate above the cap returns an error": {
+			estimateSatPerVByte: 16,   // raw 16*250 = 4000
+			txMaxTotalFee:       3000, // below the raw estimate
+			expectErrorContains: "estimated fee exceeds the maximum fee",
+		},
 	}
 
 	for name, tc := range tests {
