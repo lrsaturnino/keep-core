@@ -243,6 +243,78 @@ func TestTransactionMonitor_CheckBudgetBoundsLookup(t *testing.T) {
 	}
 }
 
+// TestTransactionMonitor_BudgetExpiryStillAlertsOldest verifies that when a
+// check pass hits its time budget while looking up the oldest tracked
+// transaction, that transaction still fires its stuck alert (the alert needs no
+// network data) instead of being starved pass after pass. The remaining
+// transactions are deferred to the next pass rather than alerted on without a
+// lookup, so they cannot false-alert on age alone. This is the multi-transaction
+// dual of CheckBudgetBoundsLookup: it guards against head-of-line starvation
+// when a hung backend consistently eats the whole budget on the oldest entry.
+func TestTransactionMonitor_BudgetExpiryStillAlertsOldest(t *testing.T) {
+	blockedTxHash := bitcoin.Hash{1} // oldest; its lookup hangs until the budget expires
+	chain := newBlockingTransactionConfirmationsChain(blockedTxHash)
+	recorder := newCountingMetricsRecorder()
+	monitor := newTransactionMonitor(chain)
+	monitor.setMetricsRecorder(recorder)
+
+	newerTxHash := bitcoin.Hash{2}
+	monitor.track(blockedTxHash, [20]byte{})
+	monitor.track(newerTxHash, [20]byte{})
+
+	// Both transactions are past the stuck threshold; the blocked one is older so
+	// oldest-first ordering checks it first and its lookup consumes the budget.
+	ageTransaction(monitor, blockedTxHash, defaultStuckTransactionThreshold+2*time.Hour)
+	ageTransaction(monitor, newerTxHash, defaultStuckTransactionThreshold+time.Hour)
+
+	// Release the intentionally blocked backend on exit so its lookup goroutine
+	// is never left parked.
+	lookupReleased := false
+	defer func() {
+		if !lookupReleased {
+			close(chain.lookupRelease)
+			lookupReleased = true
+		}
+	}()
+
+	checkDone := make(chan struct{})
+	go func() {
+		monitor.checkWithBudget(context.Background(), 200*time.Millisecond)
+		close(checkDone)
+	}()
+
+	select {
+	case <-checkDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("check pass did not return after its budget expired")
+	}
+
+	// The oldest transaction's lookup was cancelled by the budget, but its
+	// age-based alert must still fire - exactly once, for the oldest only. Before
+	// the fix the pass returned on budget expiry before alerting, leaving this at
+	// 0; if the never-looked-up newer transaction were also alerted it would be 2.
+	if got := recorder.GetCounterValue(
+		clientinfo.MetricStuckWalletTransactionsTotal,
+	); got != 1 {
+		t.Fatalf("expected exactly one stuck alert (oldest only); got counter [%v]", got)
+	}
+
+	// A cancelled lookup is not a confirmation, so the oldest stays tracked; the
+	// newer transaction was deferred, not confirmed, so it stays tracked too.
+	if !isTracked(monitor, blockedTxHash) {
+		t.Fatal("expected the oldest transaction to remain tracked after a cancelled lookup")
+	}
+	if !isTracked(monitor, newerTxHash) {
+		t.Fatal("expected the deferred newer transaction to remain tracked")
+	}
+
+	// Only the oldest transaction's lookup was attempted; the pass returned
+	// before reaching the newer one.
+	if got := chain.getLookupCount(); got != 1 {
+		t.Fatalf("expected exactly one lookup (only the oldest was attempted); got [%d]", got)
+	}
+}
+
 // TestTransactionMonitor_CapacityBound verifies the tracking table does not grow
 // past its bound.
 func TestTransactionMonitor_CapacityBound(t *testing.T) {

@@ -461,7 +461,7 @@ func (wte *walletTransactionExecutor) broadcastTransaction(
 			)
 
 			_, err = wte.btcChain.GetTransactionConfirmations(
-				context.Background(),
+				broadcastCtx,
 				txHash,
 			)
 			if err != nil {

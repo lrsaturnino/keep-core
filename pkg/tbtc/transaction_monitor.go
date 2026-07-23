@@ -72,7 +72,7 @@ func (tm *transactionMonitor) snapshotByAge() []trackedTransactionSnapshot {
 	}
 	tm.mu.Unlock()
 
-	sort.Slice(ordered, func(i, j int) bool {
+	sort.SliceStable(ordered, func(i, j int) bool {
 		return ordered[i].broadcastAt.Before(ordered[j].broadcastAt)
 	})
 
@@ -215,25 +215,27 @@ func (tm *transactionMonitor) checkWithBudget(
 		txHash := t.hash
 		// The chain call is bounded by checkCtx, so a slow or hung backend cannot
 		// keep this run loop blocked past the check budget: when the budget
-		// expires the call is cancelled and returns, and the checkCtx.Err() guard
-		// below defers the remaining transactions to the next pass.
+		// expires the call is cancelled and returns.
 		confirmations, err :=
 			tm.btcChain.GetTransactionConfirmations(checkCtx, txHash)
-		if checkCtx.Err() != nil {
-			// Do not warn when the monitor itself is shutting down. Otherwise,
-			// the check budget expired and the remaining transactions will be
-			// handled on the next pass.
-			if ctx.Err() == nil {
-				logger.Warnf(
-					"transaction monitor check pass exceeded its time budget [%s]; "+
-						"deferring the remaining transactions to the next pass",
-					checkBudget,
-				)
-			}
+
+		// Stop immediately if the monitor itself is shutting down.
+		if ctx.Err() != nil {
 			return
 		}
 
-		if err == nil &&
+		// The budget may have expired during the lookup above. The age-based
+		// alert and eviction below need no network data, so still run them for
+		// the current transaction - whose lookup was attempted and cancelled -
+		// before deferring the rest. Otherwise a backend that hangs on the oldest
+		// tracked transaction every pass would keep it (the one closest to the
+		// stuck threshold) from ever alerting or being evicted. The remaining
+		// transactions are deferred, not alerted: alerting on a transaction we
+		// never looked up this pass could raise a false alert for one that has
+		// in fact confirmed.
+		budgetExpired := checkCtx.Err() != nil
+
+		if !budgetExpired && err == nil &&
 			confirmations >= transactionMonitorMinConfirmations {
 			// The transaction is mined; stop tracking it.
 			tm.remove(txHash)
@@ -288,6 +290,19 @@ func (tm *transactionMonitor) checkWithBudget(
 				outstanding.Round(time.Minute),
 			)
 			tm.remove(txHash)
+		}
+
+		if budgetExpired {
+			// The check budget expired during this transaction's lookup; its
+			// age-based alert/eviction ran above, and the remaining transactions
+			// are deferred to the next pass. The monitor is not shutting down here
+			// (that returned earlier), so the warning is unconditional.
+			logger.Warnf(
+				"transaction monitor check pass exceeded its time budget [%s]; "+
+					"deferring the remaining transactions to the next pass",
+				checkBudget,
+			)
+			return
 		}
 	}
 }
