@@ -495,10 +495,11 @@ func (dst *DepositSweepTask) ProposeDepositsSweep(
 	if fee <= 0 {
 		taskLogger.Infof("estimating sweep transaction fee")
 		var err error
-		_, _, perDepositMaxFee, _, err := dst.chain.GetDepositParameters()
+		depositParameters, err := dst.chain.GetDepositParameters()
 		if err != nil {
 			return nil, fmt.Errorf("cannot get deposit tx max fee: [%w]", err)
 		}
+		perDepositMaxFee := depositParameters.TxMaxFee
 
 		estimatedFee, _, err := estimateDepositsSweepFee(
 			dst.btcChain,
@@ -594,10 +595,11 @@ func EstimateDepositsSweepFee(
 	},
 	error,
 ) {
-	_, _, perDepositMaxFee, _, err := chain.GetDepositParameters()
+	depositParameters, err := chain.GetDepositParameters()
 	if err != nil {
 		return nil, fmt.Errorf("cannot get deposit tx max fee: [%v]", err)
 	}
+	perDepositMaxFee := depositParameters.TxMaxFee
 
 	fees := make(map[int]struct {
 		TotalFee       int64

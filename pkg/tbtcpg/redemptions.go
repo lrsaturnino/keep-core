@@ -152,13 +152,14 @@ func (rt *RedemptionTask) FindPendingRedemptions(
 		)
 	}
 
-	_, _, _, _, requestTimeout, _, _, err := rt.chain.GetRedemptionParameters()
+	redemptionParameters, err := rt.chain.GetRedemptionParameters()
 	if err != nil {
 		return nil, fmt.Errorf(
 			"failed to get redemption parameters: [%w]",
 			err,
 		)
 	}
+	requestTimeout := redemptionParameters.Timeout
 
 	taskLogger.Infof("fetching pending redemption requests")
 
