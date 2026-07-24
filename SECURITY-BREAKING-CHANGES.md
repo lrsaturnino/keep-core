@@ -190,8 +190,8 @@ a "beacon proxy upgrade":
 This distinguishes RandomBeacon from legitimately proxied components (e.g.
 `LightRelayMaintainerProxy`), which this row does not cover.
 
-**F-09 note — RandomBeacon relay-entry reimbursement offset (reviewed design
-decision).** Both `submitRelayEntry` overloads share a single
+**F-09 note — RandomBeacon relay-entry reimbursement offset (proposed design
+decision — pending owner ratification).** Both `submitRelayEntry` overloads share a single
 `_relayEntrySubmissionGasOffset = 13_450`
 (`contracts/RandomBeacon.sol:475,1072,1138`; fixture
 `test/fixtures/index.ts:59`). The offset was raised from `11_250` to `13_450` to
@@ -201,13 +201,13 @@ cover ~2,118 gas of reimbursement work that executes **after** the in-function
 partly unmeasured — plus headroom, tuned for the heavier
 `submitRelayEntry(bytes,uint32[])` overload.
 
-- **Structural asymmetry (accepted).** The heavier overload's `uint32[64]`
+- **Structural asymmetry (observed).** The heavier overload's `uint32[64]`
   `membersIDs` argument is charged as intrinsic **calldata** gas *before* the
   in-function snapshot and is therefore never measured; the lighter
   `submitRelayEntry(bytes)` overload carries none of that calldata, so the shared
   offset structurally **over-reimburses** the lighter overload by a fixed
   ~9,563 gas. This is a property of the single-offset design, not a defect.
-- **Decision.** Keep one shared offset rather than splitting it into two
+- **Proposed decision (pending ratification).** Keep one shared offset rather than splitting it into two
   governance-settable offsets. Rationale: (1) avoids adding a second storage slot
   plus governance setter and the associated upgrade/migration surface on a
   security-release contract; (2) the only harmful direction —

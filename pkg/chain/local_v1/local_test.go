@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/big"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -603,6 +604,87 @@ func TestLocalSubmitDKGResultWithSignatures(t *testing.T) {
 				)
 			}
 		})
+	}
+}
+
+// TestGetLastDKGResultConcurrentAccess pins the synchronization contract between
+// SubmitDKGResult, which writes lastSubmittedDKGResult and
+// lastSubmittedDKGResultSignatures under handlerMutex, and GetLastDKGResult,
+// which must read those same fields under the same lock. When multiple members
+// publish DKG results concurrently while other callers read the last result,
+// an unsynchronized getter is a data race even though the functional assertions
+// below still pass. This test therefore only fails meaningfully under
+// `go test -race`, where a lock-free getter is reported as a race against the
+// concurrent writers.
+func TestGetLastDKGResultConcurrentAccess(t *testing.T) {
+	groupSize := 10
+	honestThreshold := 4
+
+	chainHandle := Connect(groupSize, honestThreshold)
+
+	const submitters = 8
+	const readers = 8
+	const readsPerReader = 50
+
+	// A threshold-satisfying signature set reused by every submitter; the map is
+	// never mutated in place, matching SubmitDKGResult's reassign-only contract.
+	signatures := map[beaconchain.GroupMemberIndex][]byte{
+		1: {101},
+		2: {102},
+		3: {103},
+		4: {104},
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(submitters + readers)
+
+	// Start the readers first so they observe the concurrent writes.
+	for i := 0; i < readers; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < readsPerReader; j++ {
+				result, sigs := chainHandle.GetLastDKGResult()
+				// Touch the returned snapshot so the read of the shared fields
+				// is observable and cannot be optimized away.
+				if result != nil {
+					_ = len(result.GroupPublicKey)
+					_ = len(sigs)
+				}
+			}
+		}()
+	}
+
+	for i := 0; i < submitters; i++ {
+		go func(index int) {
+			defer wg.Done()
+			memberIndex := beaconchain.GroupMemberIndex(uint8(index%groupSize) + 1)
+			result := &beaconchain.DKGResult{
+				GroupPublicKey: []byte{byte(index)},
+			}
+			if err := chainHandle.SubmitDKGResult(
+				memberIndex,
+				result,
+				signatures,
+			); err != nil {
+				t.Errorf("unexpected error submitting DKG result: [%v]", err)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	// After every submission completes, the getter must return one of the
+	// submitted results together with its signatures.
+	result, sigs := chainHandle.GetLastDKGResult()
+	if result == nil {
+		t.Fatal("expected a last DKG result after concurrent submissions")
+	}
+	if len(sigs) != len(signatures) {
+		t.Fatalf(
+			"unexpected signatures count\nexpected: [%v]\nactual:   [%v]",
+			len(signatures),
+			len(sigs),
+		)
 	}
 }
 

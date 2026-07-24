@@ -383,6 +383,17 @@ func (c *localChain) GetLastDKGResult() (
 	*beaconchain.DKGResult,
 	map[beaconchain.GroupMemberIndex][]byte,
 ) {
+	c.handlerMutex.Lock()
+	defer c.handlerMutex.Unlock()
+
+	// Read these fields under the same lock SubmitDKGResult holds while writing
+	// them. The deferred unlock runs only after the return values are evaluated,
+	// so the field reads happen inside the critical section and establish the
+	// happens-before edge the race detector requires. SubmitDKGResult only ever
+	// reassigns lastSubmittedDKGResult and lastSubmittedDKGResultSignatures (it
+	// never mutates the pointed-to result or the signatures map in place), so the
+	// references returned here remain a stable snapshot after the lock is
+	// released.
 	return c.lastSubmittedDKGResult, c.lastSubmittedDKGResultSignatures
 }
 
