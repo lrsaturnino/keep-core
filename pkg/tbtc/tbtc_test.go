@@ -5,6 +5,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/keep-network/keep-core/pkg/clientinfo"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 )
 
 // countingCloser is a race-safe rosterLifecycleCloser test double that records
@@ -24,43 +27,6 @@ func (c *countingCloser) count() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.closes
-}
-
-// idempotentCountingCloser mirrors the real *participation.CutoverPeerRoster.Close
-// contract used on the initialization-error path: Close may be invoked more than
-// once (the deferred cleanup in Initialize closes the roster directly while the
-// lifecycle goroutine closes it again after observing the stop signal), and the
-// underlying stop-and-join effect MUST run exactly once through sync.Once. It
-// records both raw invocations and effective (once-guarded) closes so a test can
-// prove the double invocation is safe.
-type idempotentCountingCloser struct {
-	mu        sync.Mutex
-	once      sync.Once
-	rawCalls  int
-	effective int
-}
-
-func (c *idempotentCountingCloser) Close() {
-	c.mu.Lock()
-	c.rawCalls++
-	c.mu.Unlock()
-	c.once.Do(func() {
-		c.mu.Lock()
-		c.effective++
-		c.mu.Unlock()
-	})
-}
-
-func (c *idempotentCountingCloser) rawCount() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.rawCalls
-}
-
-func (c *idempotentCountingCloser) effectiveCount() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.effective
 }
 
 // TestCloseRosterOnShutdownOrInitError_StopReleasesOnInitError reproduces the
@@ -164,55 +130,90 @@ func TestCloseRosterOnShutdownOrInitError_StopAndCancelCloseOnce(t *testing.T) {
 }
 
 // TestCloseRosterOnShutdownOrInitError_ErrorPathDoubleCloseIsIdempotent
-// reproduces the exact initialization-error cleanup in Initialize: the deferred
-// cleanup releases the lifecycle goroutine by closing the stop channel and then
-// closes the roster directly, while the goroutine independently closes the roster
-// after observing stop. Close is therefore invoked twice and races on the same
-// roster; because the real roster guards its stop-and-join with sync.Once, that
-// underlying effect must run exactly once. The parent context stays alive for the
-// whole test, matching a caller that keeps ctx open after Initialize returns an
-// error.
+// reproduces the exact initialization-error cleanup in Initialize against a REAL
+// *participation.CutoverPeerRoster with a live background sweep loop — not a fake
+// that supplies its own sync.Once. The deferred cleanup releases the lifecycle
+// goroutine by closing the stop channel and then closes the roster directly
+// (tbtc.go: close(rosterStop); cutoverRoster.Close()), while the goroutine
+// independently closes the same roster after observing stop. Close is therefore
+// invoked twice and races on the real roster.
+//
+// The real roster's Close cancels the loop context and joins the sweep goroutine
+// under sync.Once, so both concurrent callers must return without panicking,
+// double-closing the join channel, or blocking forever on the join. If the real
+// roster lost its Close idempotency (for example by joining or signalling more
+// than once), one of the closers would panic or hang and this test — which is
+// part of the targeted `-race` subset — would fail. The parent context stays
+// alive for the whole test, matching a caller that keeps ctx open after
+// Initialize returns an error, so the roster is released only through Close.
 func TestCloseRosterOnShutdownOrInitError_ErrorPathDoubleCloseIsIdempotent(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	roster := &idempotentCountingCloser{}
+	// A real roster, constructed exactly as Initialize does: same parent context,
+	// a live sweep loop, and the no-op recorder used on the port-zero path.
+	roster, err := participation.NewCutoverPeerRoster(
+		ctx,
+		&cutoverFakeBlockCounter{block: 5000},
+		1500,
+		&clientinfo.NoOpPerformanceMetrics{},
+	)
+	if err != nil {
+		t.Fatalf("cannot build cutover peer roster: %v", err)
+	}
+
 	stop := make(chan struct{})
 
-	done := make(chan struct{})
+	// The lifecycle goroutine, exactly as started by Initialize.
+	goroutineDone := make(chan struct{})
 	go func() {
 		closeRosterOnShutdownOrInitError(ctx, stop, roster)
-		close(done)
+		close(goroutineDone)
 	}()
 
-	// The deferred error-path cleanup, in Initialize's order (tbtc.go): release the
-	// goroutine through stop, then close the roster directly. This direct close and
-	// the goroutine's close race on the same roster.
+	// The deferred error-path cleanup, in Initialize's order: release the goroutine
+	// through stop, then close the roster directly. The direct close and the
+	// goroutine's close now race on the same real roster and its single sweep loop.
 	close(stop)
-	roster.Close()
+	directDone := make(chan struct{})
+	go func() {
+		roster.Close()
+		close(directDone)
+	}()
 
+	// Both concurrent closers must return. Each real Close waits on the sweep
+	// loop's join channel, so if the double invocation were unsafe — a panic on a
+	// second join-channel close, or a caller stuck on the join — one of these would
+	// never complete and the test would time out.
+	for _, w := range []struct {
+		name string
+		done <-chan struct{}
+	}{
+		{"lifecycle goroutine close", goroutineDone},
+		{"direct error-path close", directDone},
+	} {
+		select {
+		case <-w.done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf(
+				"%s did not return; the real roster Close did not safely join the "+
+					"sweep loop under the double-close overlap",
+				w.name,
+			)
+		}
+	}
+
+	// Both closers returning proves the single sweep loop was joined (each Close
+	// blocks until the loop goroutine has exited). A further Close after shutdown
+	// must remain a safe no-op, confirming idempotency across repeated signals.
+	thirdDone := make(chan struct{})
+	go func() {
+		roster.Close()
+		close(thirdDone)
+	}()
 	select {
-	case <-done:
+	case <-thirdDone:
 	case <-time.After(5 * time.Second):
-		t.Fatal(
-			"lifecycle goroutine did not return on the initialization-error path",
-		)
-	}
-
-	// Waiting on done guarantees the goroutine's Close has completed, and the
-	// direct close above has too, so both counts are settled and race-free.
-	if got := roster.rawCount(); got != 2 {
-		t.Fatalf(
-			"expected the error path to invoke Close twice (deferred cleanup plus "+
-				"lifecycle goroutine), got %d",
-			got,
-		)
-	}
-	if got := roster.effectiveCount(); got != 1 {
-		t.Fatalf(
-			"expected the idempotent Close to run its stop-and-join effect exactly "+
-				"once despite the double invocation, got %d",
-			got,
-		)
+		t.Fatal("a third Close on the real roster blocked; Close is not idempotent")
 	}
 }
