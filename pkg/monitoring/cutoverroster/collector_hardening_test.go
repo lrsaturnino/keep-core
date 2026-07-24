@@ -141,7 +141,7 @@ func TestCollector_PreCutoverSightingIgnored(t *testing.T) {
 
 	// CutoverBlock is 1000; a sighting at block 900 is pre-cutover.
 	sightings := []LegacySighting{
-		{OperatorAddress: "op1", Block: 900, ObservedAt: tc.now},
+		{OperatorAddress: opAddr("op1"), Block: 900, ObservedAt: tc.now},
 	}
 	reports := map[string]InstanceReport{"i1": exactReport("i1", "op1", tc.now)}
 	snap, err := tc.collector.Collect(inv, reports, sightings, 1100)
@@ -164,7 +164,7 @@ func TestCollector_FutureSightingIgnored(t *testing.T) {
 	resolveOperator(t, tc, inv, "i1", "op1", 1000)
 
 	sightings := []LegacySighting{
-		{OperatorAddress: "op1", Block: 5000, ObservedAt: tc.now},
+		{OperatorAddress: opAddr("op1"), Block: 5000, ObservedAt: tc.now},
 	}
 	reports := map[string]InstanceReport{"i1": exactReport("i1", "op1", tc.now)}
 	snap, err := tc.collector.Collect(inv, reports, sightings, 1100)

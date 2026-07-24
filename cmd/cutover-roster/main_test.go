@@ -188,7 +188,11 @@ func TestCollectOnce_InventoryUnavailableFailsClosed(t *testing.T) {
 		inventoryFile: filepath.Join(t.TempDir(), "does-not-exist.json"),
 	}
 
-	collectOnce(context.Background(), opts, collector)
+	fetcher, err := buildReportFetcher(opts)
+	if err != nil {
+		t.Fatalf("cannot build report fetcher: %v", err)
+	}
+	collectOnce(context.Background(), opts, collector, fetcher)
 
 	snap := collector.Snapshot()
 	if snap.Complete {

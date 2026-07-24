@@ -282,25 +282,39 @@ func TestCutoverPeerRoster_ObserveLegacyStampsFreshBlockAtCutover(t *testing.T) 
 	}
 }
 
-func TestCutoverPeerRoster_ObserveLegacyClockErrorFallsBackToCached(t *testing.T) {
-	// On a transient clock error at observation time the straggler is still
-	// recorded — evidence is never silently dropped — stamped with the last known
-	// cached height, and the clock is marked unavailable.
+func TestCutoverPeerRoster_ObserveLegacyClockErrorRetainsStateMintsNothing(t *testing.T) {
+	// On a clock-read failure at observation time the roster must retain existing
+	// state and mint NO new sighting: stamping a sighting with the stale cached
+	// height risks placing a genuinely post-cutover observation below C, where the
+	// central fleet collector would discard it as pre-cutover evidence. An
+	// existing entry (recorded while the clock was healthy) is preserved unchanged.
 	const seeded = 900
 	roster, bc, _ := newTestRoster(t, seeded, 1000)
 
-	bc.set(0, fmt.Errorf("clock unavailable"))
+	// First observe a straggler while the clock is healthy so there is existing
+	// state to preserve.
 	observeStraggler(roster, "p", 1, validAddress(1))
+	before := roster.Snapshot()
+	if len(before.Peers) != 1 {
+		t.Fatalf("precondition: expected 1 peer recorded while healthy, got %d", len(before.Peers))
+	}
+
+	// Now a different straggler is observed at the instant the clock fails.
+	bc.set(0, fmt.Errorf("clock unavailable"))
+	observeStraggler(roster, "p", 1, validAddress(2))
 
 	snapshot := roster.Snapshot()
 	if len(snapshot.Peers) != 1 {
 		t.Fatalf(
-			"expected the straggler to still be recorded on a clock error, got %d peers",
+			"a clock error must mint no new sighting; expected the 1 existing peer, got %d",
 			len(snapshot.Peers),
 		)
 	}
-	if got := snapshot.Peers[0].Sightings[0].FirstSeenBlock; got != seeded {
-		t.Errorf("expected fallback to cached height %d, got %d", seeded, got)
+	if snapshot.Peers[0].OperatorAddress != before.Peers[0].OperatorAddress {
+		t.Errorf(
+			"existing state must be retained unchanged on a clock error: got %s, want %s",
+			snapshot.Peers[0].OperatorAddress, before.Peers[0].OperatorAddress,
+		)
 	}
 	if snapshot.ClockAvailable {
 		t.Error("expected the clock to be marked unavailable after a failed read")

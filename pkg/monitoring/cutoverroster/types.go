@@ -67,6 +67,13 @@ type InventoryInstance struct {
 	ExpectedImageDigest   string `json:"expected_image_digest"`
 	TrustedReportTarget   string `json:"-"`
 	QuarantineEvidenceRef string `json:"quarantine_evidence_ref,omitempty"`
+
+	// DisappearedFromDiscovery is set by the command layer when the instance's
+	// operator is present in the authoritative inventory but absent from the
+	// production service-discovery target set for this cycle. It is in-memory only
+	// (never serialized) and drives reconciliation rule 2: disappearance from
+	// service discovery is offline_unknown and never resolves central state.
+	DisappearedFromDiscovery bool `json:"-"`
 }
 
 // InventoryInstanceInput is the on-disk inventory input form. Unlike
@@ -87,12 +94,23 @@ type InventoryInstanceInput struct {
 }
 
 // ToInventoryInstance converts the on-disk input form to the in-memory
-// InventoryInstance, carrying the trusted report target across. The two structs
-// share identical fields (differing only in JSON tags), so the conversion is a
-// direct struct conversion; adding a field to one but not the other becomes a
-// compile error, keeping the input and in-memory forms in lockstep.
+// InventoryInstance, carrying the trusted report target across. The in-memory
+// form additionally carries DisappearedFromDiscovery, which is never sourced from
+// operator input — it is computed by the command layer from the production
+// service-discovery target set — so the conversion maps the shared fields
+// explicitly and leaves that field at its zero value.
 func (i InventoryInstanceInput) ToInventoryInstance() InventoryInstance {
-	return InventoryInstance(i)
+	return InventoryInstance{
+		InstanceID:            i.InstanceID,
+		OperatorAddress:       i.OperatorAddress,
+		StakingProvider:       i.StakingProvider,
+		CeremonyEligible:      i.CeremonyEligible,
+		ExpectedRevision:      i.ExpectedRevision,
+		ExpectedEpoch:         i.ExpectedEpoch,
+		ExpectedImageDigest:   i.ExpectedImageDigest,
+		TrustedReportTarget:   i.TrustedReportTarget,
+		QuarantineEvidenceRef: i.QuarantineEvidenceRef,
+	}
 }
 
 // InstanceReport is one attested report obtained from an instance's trusted
@@ -122,14 +140,29 @@ type LegacySighting struct {
 // verified quarantine evidence, so a reader can see exactly why an operator is
 // blocking without joining separate inputs.
 type FleetInstanceStatus struct {
-	InstanceID        string    `json:"instance_id"`
-	OperatorAddress   string    `json:"operator_address"`
-	Class             string    `json:"class"`
-	Reason            string    `json:"reason"`
-	Reported          bool      `json:"reported"`
-	ObservedRevision  string    `json:"observed_revision,omitempty"`
-	ObservedEpoch     string    `json:"observed_epoch,omitempty"`
-	ObservedDigest    string    `json:"observed_image_digest,omitempty"`
+	InstanceID      string `json:"instance_id"`
+	OperatorAddress string `json:"operator_address"`
+	Class           string `json:"class"`
+	Reason          string `json:"reason"`
+	// Reported means the instance has ever produced an accepted report.
+	Reported bool `json:"reported"`
+	// ReportedThisCycle means an accepted report was obtained in the current
+	// collection cycle. It is deliberately distinct from Reported so an auditor
+	// can tell a currently-reporting instance from a historical one.
+	ReportedThisCycle bool `json:"reported_this_cycle"`
+	// Per-instance authoritative inventory expectations, exposed so the dashboard
+	// and audit trail can show exactly what the instance was expected to report.
+	CeremonyEligible    bool   `json:"ceremony_eligible"`
+	StakingProvider     string `json:"staking_provider,omitempty"`
+	ExpectedRevision    string `json:"expected_revision,omitempty"`
+	ExpectedEpoch       string `json:"expected_epoch,omitempty"`
+	ExpectedImageDigest string `json:"expected_image_digest,omitempty"`
+	ObservedRevision    string `json:"observed_revision,omitempty"`
+	ObservedEpoch       string `json:"observed_epoch,omitempty"`
+	ObservedDigest      string `json:"observed_image_digest,omitempty"`
+	// ReporterRevision is the reporter-revision of the latest accepted report,
+	// exposed for auditability alongside the observed artifact identity.
+	ReporterRevision  uint64    `json:"reporter_revision,omitempty"`
 	AttestedAt        time.Time `json:"attested_at,omitempty"`
 	ConsecutiveExact  uint      `json:"consecutive_exact"`
 	ConsecutiveMissed uint      `json:"consecutive_missed"`

@@ -30,7 +30,12 @@ type operatorRecord struct {
 	ResolvedAt      time.Time   `json:"resolved_at"`
 }
 
-// instanceRecord is the persisted per-instance report history.
+// instanceRecord is the persisted per-instance report history and the
+// authoritative inventory expectations that were last reconciled for the
+// instance. The per-instance expectations (ceremony eligibility, staking
+// provider, and expected revision/epoch/digest) are persisted so an audit or a
+// restarted collector can see exactly what each instance was expected to report,
+// not only whether it reported.
 type instanceRecord struct {
 	InstanceID        string          `json:"instance_id"`
 	OperatorAddress   string          `json:"operator_address"`
@@ -42,6 +47,29 @@ type instanceRecord struct {
 	// LastReporterRevision is the highest accepted InstanceReport.ReporterRevision
 	// for this instance. It guards against replayed or downgraded attestations.
 	LastReporterRevision uint64 `json:"last_reporter_revision"`
+
+	// Per-instance authoritative inventory expectations, last observed for the
+	// instance. They are recorded for auditability so a reader can see the exact
+	// per-instance expected artifact identity rather than only the collector-wide
+	// configured expectation.
+	CeremonyEligible    bool   `json:"ceremony_eligible"`
+	StakingProvider     string `json:"staking_provider,omitempty"`
+	ExpectedRevision    string `json:"expected_revision,omitempty"`
+	ExpectedEpoch       string `json:"expected_epoch,omitempty"`
+	ExpectedImageDigest string `json:"expected_image_digest,omitempty"`
+
+	// ReportedThisCycle records whether a report from this instance was accepted
+	// in the most recent collection cycle. It is deliberately distinct from
+	// "LatestReport != nil" (which means "ever reported"): the unresolved-operator
+	// log and the per-instance status use this to count only instances that
+	// reported in the current cycle, not historical reporters.
+	ReportedThisCycle bool `json:"reported_this_cycle"`
+
+	// DisappearedFromDiscovery records whether the instance was absent from the
+	// production service-discovery target set in the most recent cycle while still
+	// present in the authoritative inventory. Disappearance from service discovery
+	// is offline_unknown and never resolves central state.
+	DisappearedFromDiscovery bool `json:"disappeared_from_discovery"`
 }
 
 // Store is the transactional bbolt persistence for the fleet collector.

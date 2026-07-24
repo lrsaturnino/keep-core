@@ -231,7 +231,7 @@ func TestCollector_SnapshotInventoryCountsAndInstanceStatuses(t *testing.T) {
 	inventory := []InventoryInstance{
 		eligibleInstance("i1", "op1"),
 		eligibleInstance("i2", "op1"),
-		{InstanceID: "i3", OperatorAddress: "op2", CeremonyEligible: false},
+		{InstanceID: "i3", OperatorAddress: opAddr("op2"), CeremonyEligible: false},
 	}
 	// i1 reports exact; i2 never reports, so op1 is blocking (i2 offline).
 	reports := map[string]InstanceReport{"i1": exactReport("i1", "op1", tc.now)}
@@ -249,7 +249,7 @@ func TestCollector_SnapshotInventoryCountsAndInstanceStatuses(t *testing.T) {
 
 	var op1 *FleetOperatorEntry
 	for i := range snap.Blocking {
-		if snap.Blocking[i].OperatorAddress == "op1" {
+		if snap.Blocking[i].OperatorAddress == opAddr("op1") {
 			op1 = &snap.Blocking[i]
 		}
 	}

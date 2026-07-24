@@ -3,14 +3,34 @@ package cutoverroster
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+// opAddr maps a symbolic test operator name to a canonical (lowercase 0x + 40
+// hex) address so tests can keep using readable names while the collector
+// enforces canonical addresses. An empty name maps to the empty string (so the
+// malformed-identity tests still exercise a missing address), and a value that
+// already looks like a 0x address is passed through lowercased.
+func opAddr(name string) string {
+	if name == "" {
+		return ""
+	}
+	lower := strings.ToLower(strings.TrimSpace(name))
+	if strings.HasPrefix(lower, "0x") && len(lower) == 42 {
+		return lower
+	}
+	sum := sha256.Sum256([]byte(name))
+	return "0x" + hex.EncodeToString(sum[:20])
+}
 
 const (
 	testRevision = "abc123def456"
@@ -70,11 +90,11 @@ func testConfig() CollectorConfig {
 	}
 }
 
-func eligibleInstance(instanceID, operatorAddr string) InventoryInstance {
+func eligibleInstance(instanceID, operatorName string) InventoryInstance {
 	return InventoryInstance{
 		InstanceID:          instanceID,
-		OperatorAddress:     operatorAddr,
-		StakingProvider:     "sp-" + operatorAddr,
+		OperatorAddress:     opAddr(operatorName),
+		StakingProvider:     "sp-" + operatorName,
 		CeremonyEligible:    true,
 		ExpectedRevision:    testRevision,
 		ExpectedEpoch:       ExpectedEpochSecurityV2Cutover,
@@ -90,10 +110,10 @@ func reporterRevisionFor(at time.Time) uint64 {
 	return uint64(at.Unix())
 }
 
-func exactReport(instanceID, operatorAddr string, at time.Time) InstanceReport {
+func exactReport(instanceID, operatorName string, at time.Time) InstanceReport {
 	return InstanceReport{
 		InstanceID:       instanceID,
-		OperatorAddress:  operatorAddr,
+		OperatorAddress:  opAddr(operatorName),
 		Revision:         testRevision,
 		Epoch:            ExpectedEpochSecurityV2Cutover,
 		ImageDigest:      testDigest,
@@ -102,10 +122,10 @@ func exactReport(instanceID, operatorAddr string, at time.Time) InstanceReport {
 	}
 }
 
-func staleReport(instanceID, operatorAddr string, at time.Time) InstanceReport {
+func staleReport(instanceID, operatorName string, at time.Time) InstanceReport {
 	return InstanceReport{
 		InstanceID:       instanceID,
-		OperatorAddress:  operatorAddr,
+		OperatorAddress:  opAddr(operatorName),
 		Revision:         "old-revision",
 		Epoch:            ExpectedEpochSecurityV2Cutover,
 		ImageDigest:      testDigest,
@@ -119,8 +139,8 @@ func staleReport(instanceID, operatorAddr string, at time.Time) InstanceReport {
 // a restart; any reference not listed here fails verification (fail closed).
 func testQuarantineVerifier() QuarantineVerifier {
 	return NewAllowlistQuarantineVerifier([]VerifiedQuarantineEntry{
-		{InstanceID: "i1", OperatorAddress: "op1", EvidenceRef: "evidence://verified/op1"},
-		{InstanceID: "i-quar", OperatorAddress: "opQuarantined", EvidenceRef: "evidence://verified/opQuarantined"},
+		{InstanceID: "i1", OperatorAddress: opAddr("op1"), EvidenceRef: "evidence://verified/op1"},
+		{InstanceID: "i-quar", OperatorAddress: opAddr("opQuarantined"), EvidenceRef: "evidence://verified/opQuarantined"},
 	})
 }
 
@@ -159,9 +179,9 @@ func newTestCollectorAtPath(t *testing.T, path string) *testCollector {
 }
 
 func operatorStatus(snapshot FleetSnapshot, addr string) (FleetStatus, bool) {
-	// Operator addresses are normalized (lowercased) on ingestion, so normalize
-	// the query too.
-	want := normalizeAddress(addr)
+	// Operator addresses are canonicalized on ingestion, so map the query (a
+	// symbolic test name or a raw address) through the same mapping.
+	want := opAddr(addr)
 	for _, group := range [][]FleetOperatorEntry{
 		snapshot.Blocking, snapshot.Quarantined, snapshot.RecentlyResolved,
 	} {
@@ -303,7 +323,7 @@ func TestCollector_PostCutoverLegacyReopens(t *testing.T) {
 
 	// A fresh post-cutover legacy sighting reopens the operator.
 	sightings := []LegacySighting{
-		{OperatorAddress: "op1", Block: 1100, ObservedAt: tc.now},
+		{OperatorAddress: opAddr("op1"), Block: 1100, ObservedAt: tc.now},
 	}
 	reports := map[string]InstanceReport{"i1": exactReport("i1", "op1", tc.now)}
 	snap, err := tc.collector.Collect(inventory, reports, sightings, 1100)
@@ -475,11 +495,17 @@ func TestCollector_DistinctStatesSurviveRestart(t *testing.T) {
 	assertStates(t, snap)
 }
 
-func TestCollector_ResolvedPurgedAfter30Days(t *testing.T) {
+// TestCollector_ResolvedWhollyVanishedReopensOfflineNotPurged is the fail-closed
+// regression test for reconciliation rule 6: a resolved_current operator whose
+// every instance disappears entirely from the authoritative inventory (and whose
+// sightings are also absent) must REOPEN as offline_unknown, not silently stay
+// resolved and later be purged. Removal from inventory never resolves central
+// state, so its unresolved history is then retained indefinitely.
+func TestCollector_ResolvedWhollyVanishedReopensOfflineNotPurged(t *testing.T) {
 	tc := newTestCollector(t)
 	resolvedInv := []InventoryInstance{eligibleInstance("ir", "opR")}
 
-	// Resolve opR.
+	// Resolve opR across three exact collections while it is present.
 	for cycle := 0; cycle < 3; cycle++ {
 		r := map[string]InstanceReport{"ir": exactReport("ir", "opR", tc.now)}
 		if _, err := tc.collector.Collect(resolvedInv, r, nil, 1000); err != nil {
@@ -487,19 +513,43 @@ func TestCollector_ResolvedPurgedAfter30Days(t *testing.T) {
 		}
 		tc.now = tc.now.Add(time.Minute)
 	}
-	if _, ok := operatorStatus(tc.collector.Snapshot(), "opR"); !ok {
-		t.Fatal("operator opR should be present (resolved) before purge")
+	if status, ok := operatorStatus(tc.collector.Snapshot(), "opR"); !ok || status != FleetResolvedCurrent {
+		t.Fatalf("precondition: opR must be resolved before it vanishes, got %s (present=%t)", status, ok)
 	}
 
-	// opR leaves the authoritative inventory (cutover complete) and the clock
-	// advances past the retention window. Its resolved record ages out.
-	tc.now = tc.now.Add(ResolvedRetention + time.Hour)
-	snap, err := tc.collector.Collect(nil, nil, nil, 2000)
+	// opR wholly vanishes from the authoritative inventory and current sightings.
+	tc.now = tc.now.Add(time.Minute)
+	snap, err := tc.collector.Collect(nil, nil, nil, 1005)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := operatorStatus(snap, "opR"); ok {
-		t.Errorf("expected resolved operator to be purged after the retention window")
+	status, ok := operatorStatus(snap, "opR")
+	if !ok {
+		t.Fatal("a wholly-vanished resolved operator must be retained, not dropped")
+	}
+	if status == FleetResolvedCurrent {
+		t.Fatalf("a wholly-vanished resolved operator must reopen, not stay resolved_current")
+	}
+	if status != FleetOfflineUnknown {
+		t.Fatalf("expected the vanished operator to reopen as offline_unknown, got %s", status)
+	}
+	if snap.Complete {
+		t.Error("readiness must not be complete while a reopened operator blocks")
+	}
+
+	// Advance far past the resolved-retention window and reconcile again with the
+	// operator still absent: it must NOT be purged, because it is now blocking
+	// (unresolved) and unresolved history is retained indefinitely.
+	tc.now = tc.now.Add(ResolvedRetention + time.Hour)
+	snap, err = tc.collector.Collect(nil, nil, nil, 2000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status, ok := operatorStatus(snap, "opR"); !ok || status != FleetOfflineUnknown {
+		t.Errorf(
+			"a reopened (blocking) operator must be retained indefinitely, not purged; got %s (present=%t)",
+			status, ok,
+		)
 	}
 }
 
@@ -552,9 +602,17 @@ func TestCollector_ReadinessAPIDeterministicAndDenies(t *testing.T) {
 	if len(snap.Blocking) != 2 {
 		t.Fatalf("expected 2 blocking operators, got %d", len(snap.Blocking))
 	}
-	// Addresses are normalized to lowercase on ingestion and sorted.
-	if snap.Blocking[0].OperatorAddress != "opa" || snap.Blocking[1].OperatorAddress != "opb" {
+	// Blocking operators are sorted deterministically by canonical operator
+	// address, and both expected operators are present.
+	if snap.Blocking[0].OperatorAddress >= snap.Blocking[1].OperatorAddress {
 		t.Errorf("blocking operators are not sorted deterministically: %+v", snap.Blocking)
+	}
+	present := map[string]bool{
+		snap.Blocking[0].OperatorAddress: true,
+		snap.Blocking[1].OperatorAddress: true,
+	}
+	if !present[opAddr("opA")] || !present[opAddr("opB")] {
+		t.Errorf("expected both opA and opB in the blocking set, got %+v", snap.Blocking)
 	}
 	if bytes.Contains(rec.Body.Bytes(), []byte("reports.example")) {
 		t.Errorf("TrustedReportTarget must never be exposed in the API")
@@ -583,7 +641,7 @@ func TestServer_BindsToConfiguredAddress(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	server, err := NewServer("127.0.0.1:0", tc.collector, nil)
+	server, err := NewServer("127.0.0.1:0", tc.collector, nil, nil)
 	if err != nil {
 		t.Fatalf("cannot start server: %v", err)
 	}

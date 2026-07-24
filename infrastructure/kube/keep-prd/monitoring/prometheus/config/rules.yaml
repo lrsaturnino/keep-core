@@ -50,3 +50,38 @@ groups:
             breakdown (performance_network_join_requests_failed_*_total)
             to tell genuine non-recognition (firewall_unrecognized) apart
             from firewall RPC errors, timeouts, and connection resets.
+
+  # Cutover-readiness fleet alerts, emitted by the cutover-roster collector
+  # (pkg/monitoring/cutoverroster). These mirror cutoverroster.AlertRules(),
+  # which is the programmatic source of truth; keep the two in sync. Both fire
+  # only after two consecutive one-minute evaluations and are routed to the
+  # Release and Operator Coordination teams.
+  - name: cutover-roster
+    rules:
+      - alert: CutoverBlockingOperatorsPresent
+        expr: performance_cutover_fleet_blocking_operators > 0
+        for: 2m
+        labels:
+          severity: critical
+          team: release
+          route_to: release,operator-coordination
+        annotations:
+          summary: Cutover-eligible operators remain in a blocking status.
+          description: >-
+            One or more authoritative operators are not exact-R1 or
+            independently quarantined. Cutover readiness is not met.
+      - alert: CutoverRosterIncomplete
+        expr: >-
+          performance_cutover_fleet_blocking_operators > 0
+          or performance_cutover_reporters_stale > 0
+          or performance_cutover_inventory_unreconciled > 0
+        for: 2m
+        labels:
+          severity: warning
+          team: release
+          route_to: release,operator-coordination
+        annotations:
+          summary: Cutover fleet roster is incomplete.
+          description: >-
+            Blocking operators, stale reporters, or unreconciled inventory are
+            present. The go/no-go completeness criteria are not met.

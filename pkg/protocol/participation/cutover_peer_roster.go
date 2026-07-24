@@ -309,9 +309,7 @@ func (r *CutoverPeerRoster) ObserveLegacy(
 	// block C the cached height can still lag below C; a straggler stamped below C
 	// would be discarded by the central fleet collector as pre-cutover evidence,
 	// losing a genuine post-cutover legacy sighting. The read happens outside the
-	// lock so a slow chain call never blocks Snapshot/Sweep. On a transient clock
-	// error the last known height is used as a best-effort fallback so the
-	// evidence is recorded rather than silently dropped.
+	// lock so a slow chain call never blocks Snapshot/Sweep.
 	currentBlock, clockErr := r.blockCounter.CurrentBlock()
 	now := r.clock()
 
@@ -319,11 +317,18 @@ func (r *CutoverPeerRoster) ObserveLegacy(
 	defer r.mu.Unlock()
 
 	if clockErr != nil {
+		// On a clock-read failure, retain existing roster state and mint no new
+		// sighting. Stamping a sighting with the stale cached height risks placing
+		// a genuinely post-cutover observation below C, where the central fleet
+		// collector would discard it as pre-cutover evidence — a worse outcome than
+		// deferring the record until the clock recovers, when the same persistent
+		// straggler will be re-observed with a correct height. The block-clock rule
+		// is to retain state and evict/record nothing on clock failure.
 		r.clockAvailable = false
-	} else {
-		r.currentBlock = currentBlock
-		r.clockAvailable = true
+		return
 	}
+	r.currentBlock = currentBlock
+	r.clockAvailable = true
 	block := r.currentBlock
 
 	entry, existed := r.peers[normalized]
@@ -341,6 +346,12 @@ func (r *CutoverPeerRoster) ObserveLegacy(
 		r.metrics.IncrementCounter(metricLegacyPeerAdditionsTotal, 1)
 
 		if r.logLimiter.Allow() {
+			// The spec's log form also includes [cutoverBlock=%d], but the cutover
+			// block C is owned by Part A's release gate, which is deliberately out
+			// of scope for this pass (this package has no C). The field is omitted
+			// rather than fabricated: emitting a placeholder or zero C would be
+			// misleading evidence during a go/no-go. Part A can add the field here
+			// once it supplies the canonical C.
 			rosterLogger.Infof(
 				"protocol legacy peer entered cutover roster "+
 					"[operator=%s] [protocol=%s] [member=%d] "+

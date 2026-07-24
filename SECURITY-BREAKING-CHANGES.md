@@ -231,10 +231,13 @@ identify who has not converged:
 epoch `security_v2_cutover`. Exporting that epoch (and the cutover block) as a
 `client_info` label and diagnostics field is part of the not-yet-landed gate
 change and is NOT present in this build; today the go/no-go evidence is a node's
-exact revision (already in `client_info`/diagnostics) plus the stranded-peer
-observability below, not the container tag. The `cutover-roster` aggregator's
-`--expectedEpoch` flag carries the expected `security_v2_cutover` value as plain
-operator-supplied configuration until the gate ships.
+exact revision plus the stranded-peer observability below, not the container tag.
+Note the exact revision is carried by the `/diagnostics` `client_info` field
+only; the `client_info` **Prometheus metric** carries just the `version` label in
+this build (revision/epoch labels arrive with the not-yet-landed gate change). The
+`cutover-roster` aggregator's `--expectedEpoch` flag carries the expected
+`security_v2_cutover` value as plain operator-supplied configuration until the
+gate ships.
 
 ---
 

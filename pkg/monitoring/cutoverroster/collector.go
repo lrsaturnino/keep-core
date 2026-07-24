@@ -22,6 +22,21 @@ type QuarantineVerifier interface {
 	Verify(instanceID, operatorAddress, evidenceRef string) bool
 }
 
+// IdentityVerifier independently confirms the operator→staking-provider identity
+// asserted by the authoritative inventory against the on-chain WalletRegistry
+// mapping, at a block no earlier than the observation. It is the authoritative
+// join required by the spec so a forged or stale inventory staking-provider claim
+// cannot contribute to a resolved status. When no verifier is configured the
+// collector cannot confirm identity on chain; the command layer logs that gap
+// explicitly rather than silently trusting the inventory.
+type IdentityVerifier interface {
+	// OperatorStakingProviderAtBlock returns the canonical (lowercase 0x + 40 hex)
+	// staking-provider address the WalletRegistry maps the operator to at the given
+	// block. A zero/empty return means the operator is not registered. block 0
+	// means "latest".
+	OperatorStakingProviderAtBlock(operatorAddress string, block uint64) (string, error)
+}
+
 // MetricsSink is the metrics interface the collector needs. The fleet-level
 // gauges are label-less; the operator-level gauges carry
 // {operator_address, staking_provider, status} labels.
@@ -53,6 +68,7 @@ type Collector struct {
 	metrics  MetricsSink
 	clock    func() time.Time
 	verifier QuarantineVerifier
+	identity IdentityVerifier
 
 	// mu guards the mutable central state (operators/instances) and
 	// lastSnapshot against concurrent Collect and HTTP Snapshot access.
@@ -68,6 +84,16 @@ func (c *Collector) SetQuarantineVerifier(verifier QuarantineVerifier) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.verifier = verifier
+}
+
+// SetIdentityVerifier installs the on-chain operator→staking-provider identity
+// verifier. When set, every eligible operator's inventory staking-provider claim
+// must match the WalletRegistry mapping at the current block or the operator is
+// treated as an inventory-reconciliation fault (fail closed): it cannot resolve.
+func (c *Collector) SetIdentityVerifier(identity IdentityVerifier) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.identity = identity
 }
 
 // NewCollector constructs a collector, loading any persisted central state from
@@ -140,6 +166,14 @@ func (c *Collector) Collect(
 
 	now := c.clock()
 
+	// Reset the per-cycle transient flags on every known instance so a stale value
+	// from a prior cycle never leaks into this cycle's reporter count or
+	// discovery-disappearance classification.
+	for _, inst := range c.instances {
+		inst.ReportedThisCycle = false
+		inst.DisappearedFromDiscovery = false
+	}
+
 	eligibleByOperator := map[string][]InventoryInstance{}
 	stakingProviderByOperator := map[string]string{}
 	// seenInstanceIDs records which instances were present and eligible in the
@@ -161,18 +195,27 @@ func (c *Collector) Collect(
 
 		// Reject a malformed, duplicated, or internally-contradictory
 		// authoritative inventory entry as an inventory-reconciliation fault
-		// before it can contribute to a resolved status. A missing instance or
-		// operator identity cannot be joined or tracked; a duplicate instance ID
-		// within one cycle would let one entry silently overwrite another; a
-		// per-instance expected identity that contradicts the collector's
-		// configured expected release means the inventory disagrees with itself
-		// about what "current" is for that instance. Any of these forces readiness
+		// before it can contribute to a resolved status. A missing instance
+		// identity or a non-canonical operator address cannot be joined or
+		// tracked; a duplicate instance ID within one cycle would let one entry
+		// silently overwrite another; a blank required inventory field (staking
+		// provider, expected revision/epoch/digest) leaves the entry unable to
+		// prove what "current" is for that instance; a per-instance expected
+		// identity that contradicts the collector's configured expected release
+		// means the inventory disagrees with itself. Any of these forces readiness
 		// closed (unreconciled > 0) rather than silently contributing to success.
-		if inv.InstanceID == "" || inv.OperatorAddress == "" {
+		if inv.InstanceID == "" || !isCanonicalAddress(inv.OperatorAddress) {
 			unreconciled++
 			continue
 		}
 		if seenInstanceIDs[inv.InstanceID] {
+			unreconciled++
+			continue
+		}
+		if inv.StakingProvider == "" ||
+			inv.ExpectedRevision == "" ||
+			inv.ExpectedEpoch == "" ||
+			inv.ExpectedImageDigest == "" {
 			unreconciled++
 			continue
 		}
@@ -192,6 +235,15 @@ func (c *Collector) Collect(
 
 		record := c.instanceForInventory(inv)
 
+		// Record the per-instance authoritative inventory expectations for
+		// auditability so a reader (or a restarted collector) can see exactly what
+		// this instance was expected to report, not only whether it reported.
+		record.CeremonyEligible = inv.CeremonyEligible
+		record.StakingProvider = inv.StakingProvider
+		record.ExpectedRevision = inv.ExpectedRevision
+		record.ExpectedEpoch = inv.ExpectedEpoch
+		record.ExpectedImageDigest = inv.ExpectedImageDigest
+
 		// Quarantine evidence is accepted only when independently verified; a
 		// bare reference, absent a verifier, never quarantines (fail closed). A
 		// verified-quarantined instance is intentionally removed, so it is
@@ -204,6 +256,16 @@ func (c *Collector) Collect(
 			)
 
 		report, reported := reports[inv.InstanceID]
+
+		// Reconciliation rule 2: an eligible instance present in the authoritative
+		// inventory but absent from the production service-discovery target set has
+		// disappeared from discovery. It is offline_unknown for this cycle — its
+		// report (if any) is not accepted (the stale/missed accounting below then
+		// applies) — unless it is independently quarantined.
+		if inv.DisappearedFromDiscovery {
+			record.DisappearedFromDiscovery = true
+			reported = false
+		}
 
 		// A missing trusted report target is an inventory-reconciliation failure
 		// (unless the instance is quarantined and thus not expected to report).
@@ -258,6 +320,7 @@ func (c *Collector) Collect(
 			r.OperatorAddress = inv.OperatorAddress
 			record.LatestReport = &r
 			record.LastReporterRevision = report.ReporterRevision
+			record.ReportedThisCycle = true
 			record.ConsecutiveMissed = 0
 			if c.reportIsExact(report) {
 				record.ConsecutiveExact++
@@ -279,13 +342,27 @@ func (c *Collector) Collect(
 	freshLegacy := map[string]bool{}
 	for _, sighting := range sightings {
 		operator := normalizeAddress(sighting.OperatorAddress)
-		if operator == "" {
+		// A non-canonical operator address cannot be joined to an operator and
+		// must not create straggler evidence.
+		if !isCanonicalAddress(operator) {
 			continue
 		}
+		// A sighting before the cutover block, or after the current block, is not
+		// valid post-cutover straggler evidence.
 		if sighting.Block < c.config.CutoverBlock {
 			continue
 		}
 		if currentBlock > 0 && sighting.Block > currentBlock {
+			continue
+		}
+		// Reject a zero or future observation timestamp outright rather than
+		// admitting the sighting while skipping LastLegacyAt. Admitting it would
+		// create an observed_legacy status yet leave LastLegacyAt at zero, which
+		// makes the "every report newer than the last legacy observation"
+		// resolution proof pass trivially — weakening the required post-sighting
+		// resolution evidence. Genuine node-local sightings always carry a real
+		// clock timestamp, so this only rejects malformed input.
+		if sighting.ObservedAt.IsZero() || sighting.ObservedAt.After(now) {
 			continue
 		}
 		op := c.operatorForAddress(operator, stakingProviderByOperator)
@@ -293,25 +370,9 @@ func (c *Collector) Collect(
 		if sighting.Block > op.LastLegacyBlock {
 			op.LastLegacyBlock = sighting.Block
 		}
-		// Advance the last-legacy timestamp only from a non-zero, non-future
-		// observation. The block bound above is the primary validity gate; a
-		// zero or future ObservedAt must not push LastLegacyAt (which would make
-		// resolution impossible) but does not invalidate the block evidence.
-		if !sighting.ObservedAt.IsZero() &&
-			!sighting.ObservedAt.After(now) &&
-			sighting.ObservedAt.After(op.LastLegacyAt) {
+		if sighting.ObservedAt.After(op.LastLegacyAt) {
 			op.LastLegacyAt = sighting.ObservedAt
 		}
-	}
-
-	// Reconcile each operator that has eligible instances this cycle, plus any
-	// operator with a fresh legacy sighting.
-	toReconcile := map[string]bool{}
-	for op := range eligibleByOperator {
-		toReconcile[op] = true
-	}
-	for op := range freshLegacy {
-		toReconcile[op] = true
 	}
 
 	// Group every known instance record by operator so instances that were
@@ -322,6 +383,35 @@ func (c *Collector) Collect(
 		instancesByOperator[inst.OperatorAddress] = append(
 			instancesByOperator[inst.OperatorAddress], inst,
 		)
+	}
+
+	// Verify operator→staking-provider identity on chain when a verifier is
+	// configured. A mismatch or a lookup failure is an inventory-reconciliation
+	// fault: the operator cannot resolve this cycle (fail closed).
+	identityFailed := c.verifyOperatorIdentities(
+		stakingProviderByOperator, currentBlock, &unreconciled,
+	)
+
+	// Reconcile every operator with eligible instances this cycle, every operator
+	// with a fresh legacy sighting, AND every operator that still has persisted
+	// state (instance records or an operator record) even if it vanished entirely
+	// from this cycle's inventory and sightings. Reconciling the vanished set is
+	// the fail-closed safety property: a previously resolved_current operator whose
+	// instances all disappear must reopen as offline_unknown, not silently stay
+	// resolved (and later be purged) — removal from inventory never resolves
+	// central state.
+	toReconcile := map[string]bool{}
+	for op := range eligibleByOperator {
+		toReconcile[op] = true
+	}
+	for op := range freshLegacy {
+		toReconcile[op] = true
+	}
+	for op := range instancesByOperator {
+		toReconcile[op] = true
+	}
+	for op := range c.operators {
+		toReconcile[op] = true
 	}
 
 	for operatorAddress := range toReconcile {
@@ -342,6 +432,14 @@ func (c *Collector) Collect(
 			op.LastLegacyAt,
 		)
 
+		// A failed on-chain identity verification is fail-closed: the operator's
+		// asserted staking-provider identity could not be confirmed against the
+		// WalletRegistry, so it must not resolve regardless of what it reports.
+		if identityFailed[operatorAddress] && status == FleetResolvedCurrent {
+			status = FleetOfflineUnknown
+			reason = "on-chain operator→staking-provider identity unverified"
+		}
+
 		if op.FirstSeenBlock == 0 {
 			op.FirstSeenBlock = currentBlock
 		}
@@ -350,11 +448,14 @@ func (c *Collector) Collect(
 		op.Reason = reason
 
 		if status == FleetResolvedCurrent {
-			// Refresh the resolution timestamp every cycle it stays resolved, so
-			// the 30-day retention counts from when the operator was last
-			// confirmed resolved. Only a resolved operator that drops out of the
-			// authoritative inventory (and is therefore no longer reconciled)
-			// ages out and is purged; an actively-resolved operator never does.
+			// Refresh the resolution timestamp every cycle the operator stays
+			// resolved. Because every persisted operator is now reconciled each
+			// cycle (a vanished resolved operator reopens as offline_unknown rather
+			// than staying resolved), an actively-resolved operator's record never
+			// ages out — its resolution is continuously re-confirmed. purgeResolved
+			// remains a defensive backstop for any resolved record that stops being
+			// reconciled; it never removes an operator that vanished, since such an
+			// operator is no longer resolved.
 			op.ResolvedAt = now
 			if previousStatus != FleetResolvedCurrent {
 				logger.Infof(
@@ -499,9 +600,68 @@ func (c *Collector) isComplete(
 // trimmed and lowercased. It is lenient — a value that is not a 0x-prefixed hex
 // address is returned lowercased rather than dropped — so inventory, reports,
 // and sightings that refer to one operator with different casing deduplicate to
-// a single record.
+// a single record. Canonical-form enforcement is a separate step
+// (isCanonicalAddress); normalization alone must not reject, so that a
+// case-different but otherwise valid address still deduplicates correctly.
 func normalizeAddress(address string) string {
 	return strings.ToLower(strings.TrimSpace(address))
+}
+
+// isCanonicalAddress reports whether s is a canonical operator address: lowercase
+// "0x" followed by exactly 40 hexadecimal characters. Identity joins require a
+// canonical address so a malformed or truncated identity cannot contribute to a
+// resolved status.
+func isCanonicalAddress(s string) bool {
+	if len(s) != 42 || s[0] != '0' || s[1] != 'x' {
+		return false
+	}
+	for _, c := range s[2:] {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+// verifyOperatorIdentities verifies each eligible operator's inventory
+// staking-provider claim against the on-chain WalletRegistry mapping when an
+// identity verifier is configured. A mismatch or a lookup failure marks the
+// operator failed and increments the unreconciled counter (fail closed). When no
+// verifier is configured it returns an empty set: the command layer is
+// responsible for surfacing the unverified-identity gap. The caller holds c.mu.
+func (c *Collector) verifyOperatorIdentities(
+	stakingProviderByOperator map[string]string,
+	currentBlock uint64,
+	unreconciled *int,
+) map[string]bool {
+	failed := map[string]bool{}
+	if c.identity == nil {
+		return failed
+	}
+	for operatorAddress, claimedProvider := range stakingProviderByOperator {
+		onChain, err := c.identity.OperatorStakingProviderAtBlock(
+			operatorAddress, currentBlock,
+		)
+		if err != nil {
+			logger.Errorf(
+				"cannot verify operator identity on chain [operator=%s]: %v",
+				operatorAddress, err,
+			)
+			failed[operatorAddress] = true
+			*unreconciled++
+			continue
+		}
+		if normalizeAddress(onChain) != normalizeAddress(claimedProvider) {
+			logger.Errorf(
+				"operator staking-provider identity mismatch [operator=%s]: "+
+					"inventory claim does not match the on-chain WalletRegistry mapping",
+				operatorAddress,
+			)
+			failed[operatorAddress] = true
+			*unreconciled++
+		}
+	}
+	return failed
 }
 
 // inventoryExpectationContradicts reports whether an authoritative inventory
@@ -595,6 +755,11 @@ func (c *Collector) reconcileOperatorStatus(
 }
 
 func (c *Collector) classifyInstance(inst *instanceRecord) instanceClass {
+	// Disappearance from the production service-discovery target set is
+	// offline_unknown immediately (rule 2): offline is never ready.
+	if inst.DisappearedFromDiscovery {
+		return classOfflineUnknown
+	}
 	if inst.ConsecutiveMissed >= c.config.MissedThreshold {
 		return classOfflineUnknown
 	}
@@ -791,20 +956,27 @@ func (c *Collector) operatorEntry(op *operatorRecord) FleetOperatorEntry {
 func (c *Collector) instanceStatus(inst *instanceRecord) FleetInstanceStatus {
 	class := c.classifyInstance(inst)
 	status := FleetInstanceStatus{
-		InstanceID:        inst.InstanceID,
-		OperatorAddress:   inst.OperatorAddress,
-		Class:             instanceClassString(class),
-		Reason:            c.instanceReason(inst, class),
-		Reported:          inst.LatestReport != nil,
-		ConsecutiveExact:  inst.ConsecutiveExact,
-		ConsecutiveMissed: inst.ConsecutiveMissed,
-		Quarantined:       inst.HasQuarantine,
-		QuarantineRef:     inst.QuarantineRef,
+		InstanceID:          inst.InstanceID,
+		OperatorAddress:     inst.OperatorAddress,
+		Class:               instanceClassString(class),
+		Reason:              c.instanceReason(inst, class),
+		Reported:            inst.LatestReport != nil,
+		ReportedThisCycle:   inst.ReportedThisCycle,
+		CeremonyEligible:    inst.CeremonyEligible,
+		StakingProvider:     inst.StakingProvider,
+		ExpectedRevision:    inst.ExpectedRevision,
+		ExpectedEpoch:       inst.ExpectedEpoch,
+		ExpectedImageDigest: inst.ExpectedImageDigest,
+		ConsecutiveExact:    inst.ConsecutiveExact,
+		ConsecutiveMissed:   inst.ConsecutiveMissed,
+		Quarantined:         inst.HasQuarantine,
+		QuarantineRef:       inst.QuarantineRef,
 	}
 	if inst.LatestReport != nil {
 		status.ObservedRevision = inst.LatestReport.Revision
 		status.ObservedEpoch = inst.LatestReport.Epoch
 		status.ObservedDigest = inst.LatestReport.ImageDigest
+		status.ReporterRevision = inst.LatestReport.ReporterRevision
 		status.AttestedAt = inst.LatestReport.AttestedAt
 	}
 	return status
@@ -915,12 +1087,14 @@ func (c *Collector) logCycle(snapshot FleetSnapshot) {
 	)
 
 	for _, op := range snapshot.Blocking {
-		// reporters is the number of instances that produced an accepted report,
-		// which is distinct from the total instance count (the latter includes
-		// offline/never-reported and disappeared authoritative instances).
+		// reporters is the number of instances that produced an accepted report in
+		// THIS collection cycle (not "ever reported"), which is distinct from the
+		// total instance count (the latter includes offline/never-reported and
+		// disappeared authoritative instances, plus historical reporters that did
+		// not report this cycle).
 		reporters := 0
 		for _, st := range op.InstanceStatuses {
-			if st.Reported {
+			if st.ReportedThisCycle {
 				reporters++
 			}
 		}

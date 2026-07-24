@@ -44,10 +44,15 @@ type options struct {
 	successThreshold       uint
 	dbPath                 string
 	apiAddr                string
+	allowedCIDRs           string
 	inventoryFile          string
+	serviceDiscoveryFile   string
 	sightingsFile          string
 	quarantineEvidenceFile string
+	attestedDigestsFile    string
+	reportFormat           string
 	ethereumRPC            string
+	walletRegistryAddress  string
 }
 
 func parseOptions() options {
@@ -73,15 +78,36 @@ func parseOptions() options {
 		"bbolt database path for persisted central state.")
 	flag.StringVar(&opts.apiAddr, "apiAddr", "127.0.0.1:9701",
 		"Monitoring-only bind address for the readiness API and /metrics. Do not expose publicly.")
+	flag.StringVar(&opts.allowedCIDRs, "allowedCIDRs", "",
+		"Comma-separated CIDR allowlist for the readiness API (monitoring trust "+
+			"boundary). When set, only clients in these networks are served; all "+
+			"others receive 403. Loopback is always allowed.")
 	flag.StringVar(&opts.inventoryFile, "inventoryFile", "",
 		"Path to the authoritative ceremony-eligible inventory JSON file.")
+	flag.StringVar(&opts.serviceDiscoveryFile, "serviceDiscoveryFile", "",
+		"Optional path to the production Prometheus file_sd target file "+
+			"(keep-sd.json). When set, an eligible operator absent from discovery is "+
+			"offline_unknown, and discovered /metrics targets are used to fetch reports.")
 	flag.StringVar(&opts.sightingsFile, "sightingsFile", "",
 		"Optional path to a JSON file of aggregated post-cutover legacy sightings.")
 	flag.StringVar(&opts.quarantineEvidenceFile, "quarantineEvidenceFile", "",
 		"Optional path to a JSON file of independently-verified quarantine/removal "+
 			"evidence. Without it, no quarantine evidence is accepted (fail closed).")
+	flag.StringVar(&opts.attestedDigestsFile, "attestedDigestsFile", "",
+		"Optional path to a JSON file of independently-attested per-instance image "+
+			"digests (and, until the node emits it, release epoch). The running "+
+			"binary does not know its own image digest, so this is external attestation.")
+	flag.StringVar(&opts.reportFormat, "reportFormat", "metrics",
+		"How to fetch per-instance reports: 'metrics' scrapes the node's real "+
+			"/metrics and /diagnostics endpoints (production); 'json' fetches a "+
+			"dedicated JSON attestation endpoint from each trusted report target.")
 	flag.StringVar(&opts.ethereumRPC, "ethereumRPC", "",
-		"Optional Ethereum JSON-RPC URL used to read the current block height.")
+		"Optional Ethereum JSON-RPC URL used to read the current block height and, "+
+			"with --walletRegistryAddress, to verify operator→staking-provider identity.")
+	flag.StringVar(&opts.walletRegistryAddress, "walletRegistryAddress", "",
+		"Optional WalletRegistry contract address. With --ethereumRPC, enables "+
+			"on-chain operator→staking-provider identity verification (fail closed on "+
+			"mismatch). Without it, identity is NOT verified on chain.")
 
 	flag.Parse()
 
@@ -140,7 +166,40 @@ func run(opts options) error {
 		)
 	}
 
-	server, err := cutoverroster.NewServer(opts.apiAddr, collector, metrics)
+	// Install the on-chain operator→staking-provider identity verifier when an
+	// RPC endpoint and a WalletRegistry address are configured. Without it,
+	// inventory identity claims are NOT confirmed on chain — surface that gap
+	// explicitly rather than silently trusting the inventory.
+	if opts.ethereumRPC != "" && opts.walletRegistryAddress != "" {
+		verifier, verr := cutoverroster.NewEthCallIdentityVerifier(
+			opts.ethereumRPC, opts.walletRegistryAddress, nil,
+		)
+		if verr != nil {
+			return fmt.Errorf("cannot construct identity verifier: %w", verr)
+		}
+		collector.SetIdentityVerifier(verifier)
+		logger.Infof(
+			"on-chain operator→staking-provider identity verification enabled " +
+				"against the configured WalletRegistry",
+		)
+	} else {
+		logger.Warnf(
+			"on-chain operator→staking-provider identity verification is DISABLED; " +
+				"set --ethereumRPC and --walletRegistryAddress to verify inventory " +
+				"identity claims against the WalletRegistry",
+		)
+	}
+
+	fetcher, err := buildReportFetcher(opts)
+	if err != nil {
+		return fmt.Errorf("cannot build report fetcher: %w", err)
+	}
+
+	allowlist, err := cutoverroster.ParseCIDRAllowlist(opts.allowedCIDRs)
+	if err != nil {
+		return fmt.Errorf("cannot parse --allowedCIDRs: %w", err)
+	}
+	server, err := cutoverroster.NewServer(opts.apiAddr, collector, metrics, allowlist)
 	if err != nil {
 		return fmt.Errorf("cannot start API server: %w", err)
 	}
@@ -160,7 +219,7 @@ func run(opts options) error {
 		server.Addr(),
 	)
 
-	runCollectionLoop(ctx, opts, collector)
+	runCollectionLoop(ctx, opts, collector, fetcher)
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -171,11 +230,12 @@ func runCollectionLoop(
 	ctx context.Context,
 	opts options,
 	collector *cutoverroster.Collector,
+	fetcher reportFetcher,
 ) {
 	ticker := time.NewTicker(opts.collectionInterval)
 	defer ticker.Stop()
 
-	collectOnce(ctx, opts, collector)
+	collectOnce(ctx, opts, collector, fetcher)
 
 	for {
 		select {
@@ -183,7 +243,7 @@ func runCollectionLoop(
 			logger.Infof("shutdown requested; stopping collection loop")
 			return
 		case <-ticker.C:
-			collectOnce(ctx, opts, collector)
+			collectOnce(ctx, opts, collector, fetcher)
 		}
 	}
 }
@@ -192,6 +252,7 @@ func collectOnce(
 	ctx context.Context,
 	opts options,
 	collector *cutoverroster.Collector,
+	fetcher reportFetcher,
 ) {
 	// Read the chain height first so it can stamp even a failed-closed snapshot;
 	// it is independent of the authoritative inputs read below.
@@ -211,6 +272,23 @@ func collectOnce(
 		return
 	}
 
+	// Reconcile against the production service-discovery target file when one is
+	// configured: an eligible operator absent from discovery is offline_unknown,
+	// and discovered /metrics targets supply the report scrape URL.
+	if opts.serviceDiscoveryFile != "" {
+		sd, sdErr := loadServiceDiscovery(opts.serviceDiscoveryFile)
+		if sdErr != nil {
+			logger.Errorf(
+				"cannot load service-discovery target file; failing readiness "+
+					"closed for this cycle: %v", sdErr,
+			)
+			collector.RecordInputUnavailable(currentBlock)
+			return
+		}
+		inventory = cutoverroster.ReconcileWithDiscovery(inventory, sd)
+		applyDiscoveredTargets(inventory, sd)
+	}
+
 	sightings, err := loadSightings(opts.sightingsFile)
 	if err != nil {
 		logger.Errorf(
@@ -221,7 +299,7 @@ func collectOnce(
 		return
 	}
 
-	reports := pollReports(ctx, inventory)
+	reports := pollReports(ctx, inventory, fetcher)
 
 	// Collect itself fails readiness closed on any internal error (a persistence
 	// write failure supersedes the served snapshot with an incomplete one and a
@@ -285,21 +363,107 @@ func loadSightings(path string) ([]cutoverroster.LegacySighting, error) {
 	return sightings, nil
 }
 
-// pollReports fetches each eligible instance's report from its trusted target.
+// reportFetcher fetches one instance's attested report. Implementations must not
+// leak the raw transport error (which embeds the target host/URL) to the caller.
+type reportFetcher interface {
+	fetch(
+		ctx context.Context, inv cutoverroster.InventoryInstance,
+	) (cutoverroster.InstanceReport, error)
+}
+
+// buildReportFetcher constructs the configured report fetcher. The default
+// 'metrics' fetcher scrapes the node's real /metrics and /diagnostics endpoints;
+// 'json' fetches a dedicated JSON attestation endpoint from each trusted target.
+func buildReportFetcher(opts options) (reportFetcher, error) {
+	var attestation cutoverroster.AttestationSource
+	if opts.attestedDigestsFile != "" {
+		att, err := loadAttestation(opts.attestedDigestsFile)
+		if err != nil {
+			return nil, err
+		}
+		attestation = att
+	}
+
+	switch opts.reportFormat {
+	case "", "metrics":
+		return &metricsFetcher{
+			source: cutoverroster.NewMetricsReportSource(nil, attestation),
+		}, nil
+	case "json":
+		return &jsonFetcher{client: &http.Client{Timeout: 10 * time.Second}}, nil
+	default:
+		return nil, fmt.Errorf(
+			"unknown --reportFormat %q (want 'metrics' or 'json')", opts.reportFormat,
+		)
+	}
+}
+
+// metricsFetcher scrapes the node's real /metrics and /diagnostics endpoints.
+type metricsFetcher struct {
+	source *cutoverroster.MetricsReportSource
+}
+
+func (m *metricsFetcher) fetch(
+	ctx context.Context, inv cutoverroster.InventoryInstance,
+) (cutoverroster.InstanceReport, error) {
+	return m.source.Fetch(ctx, inv)
+}
+
+// jsonFetcher fetches a dedicated JSON attestation endpoint.
+type jsonFetcher struct {
+	client *http.Client
+}
+
+func (j *jsonFetcher) fetch(
+	ctx context.Context, inv cutoverroster.InventoryInstance,
+) (cutoverroster.InstanceReport, error) {
+	var report cutoverroster.InstanceReport
+
+	// #nosec G107 -- the report target is operator-supplied trusted inventory.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, inv.TrustedReportTarget, nil)
+	if err != nil {
+		return report, err
+	}
+
+	resp, err := j.client.Do(req)
+	if err != nil {
+		// Sanitize: the raw transport error embeds the requested URL (host/IP),
+		// which the spec forbids from appearing in logs.
+		return report, fmt.Errorf("report request failed")
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return report, fmt.Errorf("unexpected status %d", resp.StatusCode)
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&report); err != nil {
+		return report, fmt.Errorf("cannot decode report")
+	}
+
+	// Do not fabricate the report's identity or attestation time from inventory
+	// or the local clock. The collector validates the instance's own attested
+	// identity, freshness, and reporter revision and rejects anything missing or
+	// mismatched, so a fabricated field could mask a stale or foreign report.
+	return report, nil
+}
+
+// pollReports fetches each eligible instance's report via the configured fetcher.
 // A target that is unreachable or returns a malformed body is simply omitted,
-// which the collector treats as a missed collection.
+// which the collector treats as a missed collection. Only the sanitized
+// (URL-free) fetch error is logged, and only at debug level.
 func pollReports(
 	ctx context.Context,
 	inventory []cutoverroster.InventoryInstance,
+	fetcher reportFetcher,
 ) map[string]cutoverroster.InstanceReport {
 	reports := make(map[string]cutoverroster.InstanceReport)
-	client := &http.Client{Timeout: 10 * time.Second}
 
 	for _, inv := range inventory {
 		if !inv.CeremonyEligible || inv.TrustedReportTarget == "" {
 			continue
 		}
-		report, err := fetchReport(ctx, client, inv)
+		report, err := fetcher.fetch(ctx, inv)
 		if err != nil {
 			logger.Debugf("no report from instance %s: %v", inv.InstanceID, err)
 			continue
@@ -310,38 +474,53 @@ func pollReports(
 	return reports
 }
 
-func fetchReport(
-	ctx context.Context,
-	client *http.Client,
-	inv cutoverroster.InventoryInstance,
-) (cutoverroster.InstanceReport, error) {
-	var report cutoverroster.InstanceReport
-
-	// #nosec G107 -- the report target is operator-supplied trusted inventory.
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, inv.TrustedReportTarget, nil)
+// loadServiceDiscovery reads and parses the production Prometheus file_sd target
+// file (keep-sd.json).
+func loadServiceDiscovery(path string) (*cutoverroster.ServiceDiscovery, error) {
+	// #nosec G304 -- operator-supplied service-discovery path for the monitoring tool.
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return report, err
+		return nil, err
 	}
+	return cutoverroster.ParseServiceDiscovery(data)
+}
 
-	resp, err := client.Do(req)
+// applyDiscoveredTargets sets each eligible instance's report target to its
+// discovered /metrics base URL when service discovery knows the operator and the
+// inventory did not already carry an explicit trusted target.
+func applyDiscoveredTargets(
+	inventory []cutoverroster.InventoryInstance,
+	sd *cutoverroster.ServiceDiscovery,
+) {
+	for i := range inventory {
+		if !inventory[i].CeremonyEligible || inventory[i].TrustedReportTarget != "" {
+			continue
+		}
+		if url := sd.MetricsURL(inventory[i].OperatorAddress); url != "" {
+			inventory[i].TrustedReportTarget = url
+		}
+	}
+}
+
+// loadAttestation reads the independently-attested per-instance image digests
+// (and, until the node emits it, release epochs).
+func loadAttestation(path string) (cutoverroster.AttestationSource, error) {
+	// #nosec G304 -- operator-supplied attestation path for the monitoring tool.
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return report, err
+		return nil, err
 	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return report, fmt.Errorf("unexpected status %d", resp.StatusCode)
+	var payload struct {
+		Digests map[string]string `json:"digests"`
+		Epochs  map[string]string `json:"epochs"`
 	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&report); err != nil {
-		return report, fmt.Errorf("cannot decode report: %w", err)
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return nil, fmt.Errorf("cannot decode attestation file: %w", err)
 	}
-
-	// Do not fabricate the report's identity or attestation time from inventory
-	// or the local clock. The collector validates the instance's own attested
-	// identity, freshness, and reporter revision and rejects anything missing or
-	// mismatched, so a fabricated field could mask a stale or foreign report.
-	return report, nil
+	return &cutoverroster.MapAttestationSource{
+		Digests: payload.Digests,
+		Epochs:  payload.Epochs,
+	}, nil
 }
 
 // readCurrentBlock reads the current block height via eth_blockNumber. When a
@@ -399,7 +578,9 @@ func ethRPCResult(ctx context.Context, rpcURL, method string) (string, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		// Sanitize: the raw transport error embeds the RPC URL (host/IP), which
+		// the spec forbids from appearing in logs.
+		return "", fmt.Errorf("ethereum RPC request failed")
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -414,7 +595,7 @@ func ethRPCResult(ctx context.Context, rpcURL, method string) (string, error) {
 		} `json:"error"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&rpcResponse); err != nil {
-		return "", err
+		return "", fmt.Errorf("cannot decode RPC response")
 	}
 	if rpcResponse.Error != nil {
 		return "", fmt.Errorf("rpc error: %s", rpcResponse.Error.Message)

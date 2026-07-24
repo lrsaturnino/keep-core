@@ -1,0 +1,127 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Coordinated protocol cutover fleet readiness: blocking, quarantined, and recently-resolved operators from the cutover-roster collector. Per-instance reasons are in the readiness API (GET /api/v1/cutover-readiness); node metrics deliberately omit instance/session labels.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "P09205B1DD12FB1C6" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "id": 1,
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "pluginVersion": "9.3.0",
+      "targets": [ { "datasource": { "type": "prometheus", "uid": "P09205B1DD12FB1C6" }, "expr": "performance_cutover_fleet_blocking_operators", "instant": true, "refId": "A" } ],
+      "title": "Blocking operators",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "P09205B1DD12FB1C6" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 1 } ] } }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "id": 2,
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "pluginVersion": "9.3.0",
+      "targets": [ { "datasource": { "type": "prometheus", "uid": "P09205B1DD12FB1C6" }, "expr": "performance_cutover_fleet_observed_legacy", "instant": true, "refId": "A" } ],
+      "title": "Observed legacy (post-cutover)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "P09205B1DD12FB1C6" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 1 } ] } }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "id": 3,
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "pluginVersion": "9.3.0",
+      "targets": [ { "datasource": { "type": "prometheus", "uid": "P09205B1DD12FB1C6" }, "expr": "performance_cutover_reporters_stale", "instant": true, "refId": "A" } ],
+      "title": "Reporters stale",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "P09205B1DD12FB1C6" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "id": 4,
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "pluginVersion": "9.3.0",
+      "targets": [ { "datasource": { "type": "prometheus", "uid": "P09205B1DD12FB1C6" }, "expr": "performance_cutover_inventory_unreconciled", "instant": true, "refId": "A" } ],
+      "title": "Inventory unreconciled",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "P09205B1DD12FB1C6" },
+      "description": "Operators in any blocking status (offline_unknown, noncutover_revision, observed_legacy) with their staking provider and last-seen block.",
+      "fieldConfig": { "defaults": { "custom": { "align": "auto", "displayMode": "auto" } }, "overrides": [] },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 4 },
+      "id": 5,
+      "options": { "showHeader": true },
+      "pluginVersion": "9.3.0",
+      "targets": [ { "datasource": { "type": "prometheus", "uid": "P09205B1DD12FB1C6" }, "expr": "performance_cutover_operator_last_seen_block{status=~\"offline_unknown|noncutover_revision|observed_legacy\"}", "format": "table", "instant": true, "refId": "A" } ],
+      "title": "Blocking operators",
+      "transformations": [ { "id": "labelsToFields", "options": {} }, { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true, "job": true, "instance": true }, "renameByName": { "Value": "last_seen_block" } } } ],
+      "type": "table"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "P09205B1DD12FB1C6" },
+      "description": "Operators whose otherwise-blocking instances have independently-verified network/eligibility quarantine or removal evidence.",
+      "fieldConfig": { "defaults": { "custom": { "align": "auto", "displayMode": "auto" } }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 13 },
+      "id": 6,
+      "options": { "showHeader": true },
+      "pluginVersion": "9.3.0",
+      "targets": [ { "datasource": { "type": "prometheus", "uid": "P09205B1DD12FB1C6" }, "expr": "performance_cutover_operator_last_seen_block{status=\"quarantined\"}", "format": "table", "instant": true, "refId": "A" } ],
+      "title": "Quarantined operators",
+      "transformations": [ { "id": "labelsToFields", "options": {} }, { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true, "job": true, "instance": true }, "renameByName": { "Value": "last_seen_block" } } } ],
+      "type": "table"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "P09205B1DD12FB1C6" },
+      "description": "Operators confirmed resolved_current (retained for 30 days as go/no-go evidence).",
+      "fieldConfig": { "defaults": { "custom": { "align": "auto", "displayMode": "auto" } }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 13 },
+      "id": 7,
+      "options": { "showHeader": true },
+      "pluginVersion": "9.3.0",
+      "targets": [ { "datasource": { "type": "prometheus", "uid": "P09205B1DD12FB1C6" }, "expr": "performance_cutover_operator_last_seen_block{status=\"resolved_current\"}", "format": "table", "instant": true, "refId": "A" } ],
+      "title": "Recently resolved operators",
+      "transformations": [ { "id": "labelsToFields", "options": {} }, { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true, "job": true, "instance": true }, "renameByName": { "Value": "last_seen_block" } } } ],
+      "type": "table"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "P09205B1DD12FB1C6" },
+      "gridPos": { "h": 5, "w": 24, "x": 0, "y": 21 },
+      "id": 8,
+      "options": { "content": "### Per-instance reasons\n\nNode/collector metrics deliberately omit per-instance and session labels. The per-instance reconciliation reasons (ceremony eligibility, per-instance expected vs. observed revision/epoch/digest, reported-this-cycle, quarantine evidence) are exposed by the collector's readiness API:\n\n```\nGET /api/v1/cutover-readiness\n```\n\nEach blocking/quarantined/recently-resolved operator entry carries an `instance_statuses` array with the per-instance `class`, `reason`, and expected/observed identity.", "mode": "markdown" },
+      "pluginVersion": "9.3.0",
+      "title": "Instance-level reasons",
+      "type": "text"
+    }
+  ],
+  "refresh": "1m",
+  "schemaVersion": 37,
+  "style": "dark",
+  "tags": ["keep", "cutover", "release"],
+  "templating": { "list": [] },
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Cutover Readiness",
+  "uid": "cutover-readiness",
+  "version": 1,
+  "weekStart": ""
+}

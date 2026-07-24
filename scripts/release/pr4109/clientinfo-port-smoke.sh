@@ -49,18 +49,55 @@
 #
 set -euo pipefail
 
-IMAGE="${IMAGE:-keep-client:candidate}"
-NETWORK="cutover-port-smoke-net"
-PROBE_IMAGE="curlimages/curl:8.10.1"
+# Immutable-digest requirement: both the candidate and the probe image MUST be
+# pinned by @sha256: digest, not a mutable tag, so a smoke run tests exactly the
+# reviewed artifact and cannot be silently repointed between checks. Supply
+# digest-pinned references via IMAGE / PROBE_IMAGE. The placeholders below are not
+# valid digests and are rejected by require_digest until replaced; the live Docker
+# run itself remains manual/ops follow-up (see the SCOPE NOTE above).
+IMAGE="${IMAGE:-keep-client@sha256:REPLACE_WITH_CANDIDATE_IMAGE_DIGEST}"
+PROBE_IMAGE="${PROBE_IMAGE:-curlimages/curl@sha256:REPLACE_WITH_CURL_IMAGE_DIGEST}"
+
+# Network mode: start the node in an explicit non-mainnet network so the harness
+# never resolves the mainnet default (config.go). Override to --developer if the
+# candidate image is built for developer mode.
+NETWORK_MODE="${NETWORK_MODE:---testnet}"
+
+# Unique per-run suffix so a failed setup only ever force-removes THIS run's
+# containers/network, never unrelated resources that happen to share a fixed name.
+RUN_ID="${RUN_ID:-$$-${RANDOM}}"
+NETWORK="cutover-port-smoke-net-${RUN_ID}"
+
+# The six case container names, uniquely suffixed per run.
+CASES=(default toml9601 cli9601 custom cli0 toml0)
+cname() { printf 'case-%s-%s' "$1" "${RUN_ID}"; }
+
 READY_TIMEOUT="${READY_TIMEOUT:-180}"
 # The endpoint answering is the definitive readiness signal, so the positive
 # probe retries with a bounded backoff instead of assuming the listener is up
 # the instant a log line appears (which would race listener initialization).
 PROBE_RETRIES="${PROBE_RETRIES:-20}"
 PROBE_INTERVAL="${PROBE_INTERVAL:-3}"
+# The negative (no-listener) probe re-checks over a short settling window so a
+# listener that binds slightly after startup cannot false-pass a "disabled" case.
+NEGATIVE_PROBE_ATTEMPTS="${NEGATIVE_PROBE_ATTEMPTS:-5}"
+NEGATIVE_PROBE_INTERVAL="${NEGATIVE_PROBE_INTERVAL:-3}"
 CUSTOM_PORT="${CUSTOM_PORT:-9137}"
 
 WORKDIR=""
+
+# require_digest fails unless ref is pinned by an immutable @sha256: digest.
+require_digest() {
+  local ref="$1" what="$2"
+  case "${ref}" in
+    *@sha256:REPLACE_*|*REPLACE_*)
+      fail "${what} is a placeholder; set ${what} to an immutable @sha256: digest" ;;
+    *@sha256:[0-9a-f]*)
+      [[ "${#ref}" -ge 80 ]] || fail "${what} digest looks malformed: ${ref}" ;;
+    *)
+      fail "${what} must be pinned by an immutable @sha256: digest, not a mutable tag (${ref})" ;;
+  esac
+}
 
 # Metric names every positive /metrics response must contain. The first six are
 # backed by the current performance constants; the rest are the stranded-peer /
@@ -93,6 +130,7 @@ fail() { printf '[port-smoke][FAIL] %s\n' "$*" >&2; exit 1; }
 # image-default-check: Docker-only, no chain. Proves the runtime image bakes the
 # 9601 compatibility default and the trusted-network help text.
 image_default_check() {
+  require_digest "${IMAGE}" "IMAGE"
   log "checking that ${IMAGE} bakes the 9601 compatibility default"
   local help
   help="$(docker run --rm --entrypoint keep-client "${IMAGE}" start --help)"
@@ -133,11 +171,13 @@ EOF
 start_node_case() {
   local name="$1" config="$2"
   shift 2
+  # NETWORK_MODE forces an explicit non-mainnet network so the node never
+  # resolves mainnet defaults.
   docker run -d --name "${name}" --network "${NETWORK}" \
     -e KEEP_ETHEREUM_PASSWORD="${KEY_PASSWORD}" \
     -v "${config}:/config/config.toml:ro" \
     -v "${KEY_FILE}:/keys/operator.json:ro" \
-    "${IMAGE}" start --config /config/config.toml "$@" >/dev/null \
+    "${IMAGE}" start ${NETWORK_MODE} --config /config/config.toml "$@" >/dev/null \
     || fail "case ${name}: container failed to start"
 }
 
@@ -197,23 +237,33 @@ assert_listens() {
   log "OK: ${container} listens on ${port} with meaningful /metrics and /diagnostics content"
 }
 
-# assert_no_listener <container> <port> — require the port to be closed while the
-# node process itself keeps running.
+# assert_no_listener <container> <port> — require the port to STAY closed across a
+# short settling window while the node process itself keeps running. A single
+# immediate probe would false-pass if the listener binds slightly after startup,
+# so re-probe NEGATIVE_PROBE_ATTEMPTS times: if a listener EVER answers, fail.
 assert_no_listener() {
-  local container="$1" port="$2"
-  if docker run --rm --network "${NETWORK}" "${PROBE_IMAGE}" \
-      -fsS --max-time 5 "http://${container}:${port}/metrics" >/dev/null 2>&1; then
-    fail "case ${container}: expected NO listener on ${port}, but one answered"
-  fi
-  docker ps --filter "name=${container}" --filter "status=running" \
-    --format '{{.Names}}' | grep -q "${container}" \
-    || fail "case ${container}: node container is not running"
-  log "OK: ${container} has no client-info listener but the node is still running"
+  local container="$1" port="$2" attempt
+  for (( attempt = 1; attempt <= NEGATIVE_PROBE_ATTEMPTS; attempt++ )); do
+    if docker run --rm --network "${NETWORK}" "${PROBE_IMAGE}" \
+        -fsS --max-time 5 "http://${container}:${port}/metrics" >/dev/null 2>&1; then
+      fail "case ${container}: expected NO listener on ${port}, but one answered on attempt ${attempt}"
+    fi
+    # The node must stay up throughout — a disabled listener must not mean a dead
+    # node.
+    docker ps --filter "name=${container}" --filter "status=running" \
+      --format '{{.Names}}' | grep -q "${container}" \
+      || fail "case ${container}: node container is not running"
+    sleep "${NEGATIVE_PROBE_INTERVAL}"
+  done
+  log "OK: ${container} has no client-info listener across ${NEGATIVE_PROBE_ATTEMPTS} probes but the node is still running"
 }
 
 cleanup() {
-  docker rm -f case-default case-toml9601 case-cli9601 case-custom \
-    case-cli0 case-toml0 >/dev/null 2>&1 || true
+  # Only this run's uniquely-named containers/network are ever removed.
+  local base
+  for base in "${CASES[@]}"; do
+    docker rm -f "$(cname "${base}")" >/dev/null 2>&1 || true
+  done
   docker network rm "${NETWORK}" >/dev/null 2>&1 || true
   [[ -n "${WORKDIR}" ]] && rm -rf "${WORKDIR}"
 }
@@ -223,6 +273,10 @@ listener_matrix() {
   : "${BTC_ELECTRUM_URL:?set BTC_ELECTRUM_URL to a reachable Electrum endpoint}"
   : "${KEY_FILE:?set KEY_FILE to an operator key file the node can start with}"
   : "${KEY_PASSWORD:?set KEY_PASSWORD for the operator key file}"
+
+  # Enforce immutable digests before doing anything destructive.
+  require_digest "${IMAGE}" "IMAGE"
+  require_digest "${PROBE_IMAGE}" "PROBE_IMAGE"
 
   WORKDIR="$(mktemp -d)"
   docker network create "${NETWORK}" >/dev/null 2>&1 || true
@@ -237,26 +291,27 @@ listener_matrix() {
   write_config "${WORKDIR}/custom.toml" "[clientInfo]"$'\n'"Port = ${CUSTOM_PORT}"
   write_config "${WORKDIR}/toml0.toml" $'[clientInfo]\nPort = 0'
 
-  log "starting the six client-info port cases"
-  start_node_case case-default  "${WORKDIR}/default.toml"
-  start_node_case case-toml9601 "${WORKDIR}/toml9601.toml"
-  start_node_case case-cli9601  "${WORKDIR}/cli.toml"    --clientInfo.port 9601
-  start_node_case case-custom   "${WORKDIR}/custom.toml"
-  start_node_case case-cli0     "${WORKDIR}/cli.toml"    --clientInfo.port 0
-  start_node_case case-toml0    "${WORKDIR}/toml0.toml"
+  log "starting the six client-info port cases (network mode: ${NETWORK_MODE})"
+  start_node_case "$(cname default)"  "${WORKDIR}/default.toml"
+  start_node_case "$(cname toml9601)" "${WORKDIR}/toml9601.toml"
+  start_node_case "$(cname cli9601)"  "${WORKDIR}/cli.toml"    --clientInfo.port 9601
+  start_node_case "$(cname custom)"   "${WORKDIR}/custom.toml"
+  start_node_case "$(cname cli0)"     "${WORKDIR}/cli.toml"    --clientInfo.port 0
+  start_node_case "$(cname toml0)"    "${WORKDIR}/toml0.toml"
 
-  for c in case-default case-toml9601 case-cli9601 case-custom case-cli0 case-toml0; do
-    wait_ready "${c}"
+  local base
+  for base in "${CASES[@]}"; do
+    wait_ready "$(cname "${base}")"
   done
 
-  assert_listens     case-default  9601
-  assert_listens     case-toml9601 9601
-  assert_listens     case-cli9601  9601
-  assert_listens     case-custom   "${CUSTOM_PORT}"
+  assert_listens     "$(cname default)"  9601
+  assert_listens     "$(cname toml9601)" 9601
+  assert_listens     "$(cname cli9601)"  9601
+  assert_listens     "$(cname custom)"   "${CUSTOM_PORT}"
   # The custom-port case must NOT also answer on 9601.
-  assert_no_listener case-custom   9601
-  assert_no_listener case-cli0     9601
-  assert_no_listener case-toml0    9601
+  assert_no_listener "$(cname custom)"   9601
+  assert_no_listener "$(cname cli0)"     9601
+  assert_no_listener "$(cname toml0)"    9601
 
   log "OK: full client-info port listener matrix passed"
 }
