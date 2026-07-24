@@ -124,7 +124,7 @@ func Initialize(
 	clientInfo *clientinfo.Registry,
 	perfMetrics *clientinfo.PerformanceMetrics,
 	ethereumNetwork ethereum.Network,
-) error {
+) (err error) {
 	groupParameters := defaultGroupParameters(ethereumNetwork)
 
 	if ethChain, ok := chain.(interface {
@@ -204,6 +204,18 @@ func Initialize(
 		return fmt.Errorf("cannot create cutover peer roster: [%v]", err)
 	}
 	node.setCutoverPeerRoster(cutoverRoster)
+
+	// If initialization fails after the roster is constructed, stop and join its
+	// background sweep loop before returning. The sweep loop is bound to ctx, but
+	// a failed Initialize does not necessarily cancel ctx (the caller may keep the
+	// parent context alive), which would otherwise leak the loop and its periodic
+	// chain-clock reads. On the success path err is nil and the ctx-bound
+	// goroutine below closes the roster at process shutdown instead.
+	defer func() {
+		if err != nil {
+			cutoverRoster.Close()
+		}
+	}()
 
 	// Join the roster's background sweep loop to the process lifecycle. The
 	// sweep loop is already bound to ctx, but Close performs an explicit

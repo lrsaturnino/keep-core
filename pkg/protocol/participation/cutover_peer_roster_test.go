@@ -249,6 +249,64 @@ func TestCutoverPeerRoster_ObserveLegacyRecordsStraggler(t *testing.T) {
 	}
 }
 
+func TestCutoverPeerRoster_ObserveLegacyStampsFreshBlockAtCutover(t *testing.T) {
+	// The roster's cached height is only refreshed by the 30-second sweep loop.
+	// A straggler observed the instant the chain reaches the cutover block C must
+	// be stamped at C, not the stale C-1 the cache still holds, or the central
+	// fleet collector would discard it as pre-cutover evidence.
+	const cutover = 1000
+	roster, bc, _ := newTestRoster(t, cutover-1, 1000)
+
+	// The chain advances to C, but no sweep has run yet: the cached height is
+	// still C-1.
+	bc.set(cutover, nil)
+
+	observeStraggler(roster, "tbtc-dkg", 3, validAddress(1))
+
+	snapshot := roster.Snapshot()
+	if len(snapshot.Peers) != 1 {
+		t.Fatalf("expected 1 peer, got %d", len(snapshot.Peers))
+	}
+	sighting := snapshot.Peers[0].Sightings[0]
+	if sighting.FirstSeenBlock != cutover || sighting.LastSeenBlock != cutover {
+		t.Errorf(
+			"straggler must be stamped at the fresh height C=%d, got first=%d last=%d",
+			cutover, sighting.FirstSeenBlock, sighting.LastSeenBlock,
+		)
+	}
+	if snapshot.Peers[0].FirstSeenBlock != cutover {
+		t.Errorf(
+			"peer first-seen must reflect the fresh height C=%d, got %d",
+			cutover, snapshot.Peers[0].FirstSeenBlock,
+		)
+	}
+}
+
+func TestCutoverPeerRoster_ObserveLegacyClockErrorFallsBackToCached(t *testing.T) {
+	// On a transient clock error at observation time the straggler is still
+	// recorded — evidence is never silently dropped — stamped with the last known
+	// cached height, and the clock is marked unavailable.
+	const seeded = 900
+	roster, bc, _ := newTestRoster(t, seeded, 1000)
+
+	bc.set(0, fmt.Errorf("clock unavailable"))
+	observeStraggler(roster, "p", 1, validAddress(1))
+
+	snapshot := roster.Snapshot()
+	if len(snapshot.Peers) != 1 {
+		t.Fatalf(
+			"expected the straggler to still be recorded on a clock error, got %d peers",
+			len(snapshot.Peers),
+		)
+	}
+	if got := snapshot.Peers[0].Sightings[0].FirstSeenBlock; got != seeded {
+		t.Errorf("expected fallback to cached height %d, got %d", seeded, got)
+	}
+	if snapshot.ClockAvailable {
+		t.Error("expected the clock to be marked unavailable after a failed read")
+	}
+}
+
 func TestCutoverPeerRoster_ObserveLegacyFiltersNonStragglers(t *testing.T) {
 	roster, _, _ := newTestRoster(t, 500, 1000)
 

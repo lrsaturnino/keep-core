@@ -304,11 +304,27 @@ func (r *CutoverPeerRoster) ObserveLegacy(
 		return
 	}
 
+	// Stamp the sighting with a synchronously read chain height rather than the
+	// height cached by the 30-second sweep loop. Immediately after the cutover
+	// block C the cached height can still lag below C; a straggler stamped below C
+	// would be discarded by the central fleet collector as pre-cutover evidence,
+	// losing a genuine post-cutover legacy sighting. The read happens outside the
+	// lock so a slow chain call never blocks Snapshot/Sweep. On a transient clock
+	// error the last known height is used as a best-effort fallback so the
+	// evidence is recorded rather than silently dropped.
+	currentBlock, clockErr := r.blockCounter.CurrentBlock()
+	now := r.clock()
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if clockErr != nil {
+		r.clockAvailable = false
+	} else {
+		r.currentBlock = currentBlock
+		r.clockAvailable = true
+	}
 	block := r.currentBlock
-	now := r.clock()
 
 	entry, existed := r.peers[normalized]
 	if !existed {

@@ -215,17 +215,20 @@ func (c *Collector) Collect(
 		}
 
 		// Reject an attestation whose identity, freshness, or reporter revision
-		// cannot be validated, rather than silently accepting it. An identity
-		// fault is also an inventory-reconciliation failure; a stale/replayed
-		// attestation is merely a missed collection.
+		// cannot be validated, rather than silently accepting it. A report must
+		// self-identify with the same instance ID and operator address as the
+		// authoritative inventory entry it answers for: a missing or a mismatched
+		// identity is an inventory-reconciliation failure, so a report that does
+		// not name itself cannot stand in for the trusted instance (the reporter
+		// deliberately does not fabricate these fields from inventory). A
+		// stale/replayed attestation is merely a missed collection.
 		unreconciledFault := false
 		if reported {
 			normalizedReportOperator := normalizeAddress(report.OperatorAddress)
 			switch {
-			case report.InstanceID != "" && report.InstanceID != inv.InstanceID:
+			case report.InstanceID != inv.InstanceID:
 				reported, unreconciledFault = false, true
-			case normalizedReportOperator != "" &&
-				normalizedReportOperator != inv.OperatorAddress:
+			case normalizedReportOperator != inv.OperatorAddress:
 				reported, unreconciledFault = false, true
 			case report.AttestedAt.IsZero():
 				// Missing attestation time cannot prove freshness.

@@ -317,6 +317,50 @@ func TestCollector_MalformedIdentityRejected(t *testing.T) {
 	}
 }
 
+// TestCollector_MissingReportIdentityRejected proves a report that does not
+// self-identify — an empty instance ID or operator address — is rejected as an
+// unreconciled fault and cannot resolve the operator, matching the reporter's
+// documented contract that missing identity is rejected rather than fabricated
+// from inventory.
+func TestCollector_MissingReportIdentityRejected(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		mutate func(*InstanceReport)
+	}{
+		{"empty instance id", func(r *InstanceReport) { r.InstanceID = "" }},
+		{"empty operator address", func(r *InstanceReport) { r.OperatorAddress = "" }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tc := newTestCollector(t)
+			inv := []InventoryInstance{eligibleInstance("i1", "op1")}
+
+			var snap FleetSnapshot
+			for cycle := 0; cycle < 3; cycle++ {
+				report := exactReport("i1", "op1", tc.now)
+				tt.mutate(&report)
+				var err error
+				snap, err = tc.collector.Collect(
+					inv, map[string]InstanceReport{"i1": report}, nil, 1001,
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				tc.now = tc.now.Add(time.Minute)
+			}
+
+			if status, _ := operatorStatus(snap, "op1"); status == FleetResolvedCurrent {
+				t.Errorf("a report without a self-identity must not resolve the operator")
+			}
+			if snap.Inventory.Unreconciled == 0 {
+				t.Errorf("a report without a self-identity must count as unreconciled")
+			}
+			if tc.sink.gauge(MetricInventoryUnreconciled) == 0 {
+				t.Errorf("a missing report identity must raise the unreconciled gauge")
+			}
+		})
+	}
+}
+
 // TestCollector_DuplicateInstanceIDRejected proves a duplicate instance ID within
 // one inventory cycle is flagged: the first entry is reconciled, the duplicate
 // cannot silently overwrite it or create a second operator record, and readiness

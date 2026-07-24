@@ -60,6 +60,67 @@ func TestCollector_DisappearedInstanceKeepsOperatorBlocking(t *testing.T) {
 	}
 }
 
+// TestCollector_WholeOperatorDisappearanceStaysBlocking proves the fail-closed
+// safety property for a whole-operator disappearance alongside a still-resolved
+// operator: an operator that is blocking when every one of its instances vanishes
+// from the authoritative inventory remains blocking (its removal is not treated
+// as convergence), while a separate operator that keeps reporting exact resolves
+// independently. The readiness determination must not become complete while the
+// vanished operator is still blocking.
+func TestCollector_WholeOperatorDisappearanceStaysBlocking(t *testing.T) {
+	tc := newTestCollector(t)
+
+	both := []InventoryInstance{
+		eligibleInstance("i1", "opBlocking"),
+		eligibleInstance("i2", "opResolving"),
+	}
+
+	// Cycles 1-3: opBlocking never reports (offline_unknown, blocking) while
+	// opResolving reports exact and accrues its confirmation streak.
+	block := uint64(1001)
+	for cycle := 1; cycle <= 3; cycle++ {
+		reports := map[string]InstanceReport{
+			"i2": exactReport("i2", "opResolving", tc.now),
+		}
+		if _, err := tc.collector.Collect(both, reports, nil, block); err != nil {
+			t.Fatal(err)
+		}
+		tc.now = tc.now.Add(time.Minute)
+		block++
+	}
+
+	// Cycle 4: opBlocking's only instance disappears from the inventory entirely.
+	// opResolving remains and reports exact, so it resolves; opBlocking must not
+	// silently drop out of the blocking set just because it vanished.
+	onlyResolving := []InventoryInstance{eligibleInstance("i2", "opResolving")}
+	reports := map[string]InstanceReport{
+		"i2": exactReport("i2", "opResolving", tc.now),
+	}
+	snap, err := tc.collector.Collect(onlyResolving, reports, nil, block)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	blockingStatus, ok := operatorStatus(snap, "opBlocking")
+	if !ok {
+		t.Fatal("vanished blocking operator must be retained in the snapshot")
+	}
+	if !blockingStatus.IsBlocking() {
+		t.Fatalf(
+			"vanished operator must stay blocking, got %s", blockingStatus,
+		)
+	}
+	if resolvingStatus, _ := operatorStatus(snap, "opResolving"); resolvingStatus != FleetResolvedCurrent {
+		t.Fatalf(
+			"still-present exact operator must resolve independently, got %s",
+			resolvingStatus,
+		)
+	}
+	if snap.Complete {
+		t.Error("readiness must not be complete while the vanished operator blocks")
+	}
+}
+
 // TestNewCollector_RejectsNonPositiveCollectionInterval proves the collection
 // interval is validated at construction, so a zero or negative interval cannot
 // reach time.NewTicker and panic the collection loop.
