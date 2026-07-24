@@ -608,17 +608,31 @@ func TestLocalSubmitDKGResultWithSignatures(t *testing.T) {
 }
 
 // TestGetLastDKGResultConcurrentAccess pins the synchronization contract between
-// SubmitDKGResult, which writes lastSubmittedDKGResult and
+// SubmitDKGResult, which reassigns lastSubmittedDKGResult and
 // lastSubmittedDKGResultSignatures under handlerMutex, and GetLastDKGResult,
-// which must read those same fields under the same lock. When multiple members
-// publish DKG results concurrently while other callers read the last result,
-// an unsynchronized getter is a data race even though the functional assertions
-// below still pass. This test therefore only fails meaningfully under
-// `go test -race`, where a lock-free getter is reported as a race against the
-// concurrent writers. Readers spin on GetLastDKGResult until every writer has
-// returned, so their reads deterministically overlap the writers' field
-// reassignments instead of relying on a fixed read count that could finish
-// before the first write lands.
+// which must read those same fields under the same lock. A lock-free getter is a
+// data race against the concurrent writers even though the functional assertions
+// below still pass, so this test is only meaningful under `go test -race`.
+//
+// The goroutines are coordinated so the race is exercised reliably rather than
+// by luck of the scheduler:
+//   - every reader enters a read loop and reports readiness only after it has
+//     executed GetLastDKGResult at least once;
+//   - the writers stay blocked until all readers have reported readiness, so no
+//     field reassignment can begin before the readers are already reading;
+//   - the readers keep reading until writesComplete is closed, which happens
+//     strictly after every writer has returned.
+//
+// Consequently each reader keeps looping over GetLastDKGResult across the whole
+// window in which the writers reassign the shared fields, and those reads carry
+// no happens-before edge ordering them against the writes — the condition the
+// race detector needs to flag a lock-free getter. Keeping the readers live and
+// reading for the entire write window (rather than doing a fixed number of reads
+// that could all land before the first write) also keeps the racy read and write
+// temporally adjacent, which is what makes -race report the race deterministically
+// instead of missing it once the writer's shadow state is evicted. The
+// coordination uses only WaitGroups and channel closes: no sleeps, timeouts, or
+// fixed read counts.
 func TestGetLastDKGResultConcurrentAccess(t *testing.T) {
 	groupSize := 10
 	honestThreshold := 4
@@ -637,41 +651,53 @@ func TestGetLastDKGResultConcurrentAccess(t *testing.T) {
 		4: {104},
 	}
 
-	// start is a starting gun: closing it releases every reader and writer at
-	// once, so their critical sections actually interleave instead of running in
-	// whatever order the scheduler happened to launch the goroutines.
-	start := make(chan struct{})
+	// writersStart gates the writers. It is closed only after readersReady
+	// reports that every reader is already inside its read loop, so no writer can
+	// reassign lastSubmittedDKGResult / lastSubmittedDKGResultSignatures until the
+	// readers are actively reading those same fields.
+	writersStart := make(chan struct{})
 	// writesComplete is closed only after every writer has returned from
-	// SubmitDKGResult. Readers loop until they observe it closed, so at least one
-	// reader is guaranteed to be calling GetLastDKGResult() throughout the entire
-	// window in which writers reassign lastSubmittedDKGResult and
-	// lastSubmittedDKGResultSignatures. This removes the false-negative window of
-	// a fixed read count, where every read could complete before the first write
-	// landed and the race detector would observe no overlap.
+	// SubmitDKGResult. Readers keep calling GetLastDKGResult until they observe it
+	// closed, so they stay live for the entire window in which the writers
+	// reassign the shared fields. This removes the false-negative window of a
+	// fixed read count, where every read could complete before the first write
+	// landed and the race detector would observe no overlapping accesses.
 	writesComplete := make(chan struct{})
 
+	// readersReady lets the main goroutine wait until every reader has entered
+	// its read loop (and taken at least one read) before releasing the writers.
+	// readersWg tracks reader shutdown; writersWg tracks writer completion.
+	var readersReady sync.WaitGroup
 	var readersWg sync.WaitGroup
 	var writersWg sync.WaitGroup
+	readersReady.Add(readers)
 	readersWg.Add(readers)
 	writersWg.Add(submitters)
 
 	for i := 0; i < readers; i++ {
 		go func() {
 			defer readersWg.Done()
-			<-start
+			reported := false
 			for {
-				// Read first so every reader touches the shared fields at least
-				// once after the starting gun, then check whether the writers
-				// have finished. This keeps readers live for the whole write
-				// phase without any sleep or timing tolerance.
+				// Read the shared fields, then touch the returned snapshot so
+				// the read cannot be optimized away.
 				result, sigs := chainHandle.GetLastDKGResult()
-				// Touch the returned snapshot so the read of the shared fields
-				// is observable and cannot be optimized away.
 				if result != nil {
 					_ = len(result.GroupPublicKey)
 					_ = len(sigs)
 				}
 
+				// Report readiness once, after the first read has executed, so
+				// the main goroutine only releases the writers once every reader
+				// is provably already reading GetLastDKGResult.
+				if !reported {
+					reported = true
+					readersReady.Done()
+				}
+
+				// Keep reading until every writer has returned. This keeps the
+				// reader live for the whole write phase with no sleep, timeout,
+				// or fixed read count.
 				select {
 				case <-writesComplete:
 					return
@@ -684,7 +710,7 @@ func TestGetLastDKGResultConcurrentAccess(t *testing.T) {
 	for i := 0; i < submitters; i++ {
 		go func(index int) {
 			defer writersWg.Done()
-			<-start
+			<-writersStart
 			memberIndex := beaconchain.GroupMemberIndex(uint8(index%groupSize) + 1)
 			result := &beaconchain.DKGResult{
 				GroupPublicKey: []byte{byte(index)},
@@ -699,10 +725,13 @@ func TestGetLastDKGResultConcurrentAccess(t *testing.T) {
 		}(i)
 	}
 
-	// Release everyone at once, wait for all writers to finish, then signal the
-	// readers to stop. Because readers only stop after writesComplete is closed,
-	// their reads and the writers' field reassignments are guaranteed to overlap.
-	close(start)
+	// Barrier: wait until every reader is inside its read loop, then release the
+	// writers. Because the readers are already reading and only stop once
+	// writesComplete is closed (strictly after every writer returns), each reader
+	// keeps calling GetLastDKGResult throughout the writers' reassignment window,
+	// with no happens-before edge ordering those reads against the writes.
+	readersReady.Wait()
+	close(writersStart)
 	writersWg.Wait()
 	close(writesComplete)
 	readersWg.Wait()
