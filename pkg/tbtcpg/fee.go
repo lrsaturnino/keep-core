@@ -1,6 +1,18 @@
 package tbtcpg
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
+
+// ErrMaxFeeTooLow indicates that the Bridge maximum total fee is too low to
+// build a wallet transaction at the safe minimum fee rate, so a non-underpriced
+// transaction cannot be constructed. It mirrors the raw-estimate-too-high
+// sentinels (ErrFeeTooHigh, ErrSweepTxFeeTooHigh): both signal an unserviceable
+// fee configuration, one bounding from above and one from below.
+var ErrMaxFeeTooLow = errors.New(
+	"minimum safe transaction fee exceeds the maximum fee",
+)
 
 // minWalletTxSatPerVByteFee is the minimum fee rate, in sat/vByte, applied to
 // wallet Bitcoin transactions (deposit sweeps, redemptions, moving funds, moved
@@ -32,10 +44,10 @@ const minWalletTxSatPerVByteFee = 5
 //   - bounds the result by maxTotalFee (the Bridge maximum total fee for the
 //     transaction).
 //
-// It returns an error if the minimum floor alone would exceed maxTotalFee - a
-// safe transaction cannot be built, so the caller must not broadcast an
-// underpriced one. estimatedFee is the raw oracle fee in satoshis and txVsize
-// is the estimated transaction virtual size in vBytes.
+// It returns ErrMaxFeeTooLow if the minimum floor alone would exceed
+// maxTotalFee - a safe transaction cannot be built, so the caller must not
+// broadcast an underpriced one. estimatedFee is the raw oracle fee in satoshis
+// and txVsize is the estimated transaction virtual size in vBytes.
 //
 // The 25% buffer is applied to the truncated per-vByte rate
 // (estimatedFee / txVsize). This is lossless only because EstimateFee returns
@@ -69,7 +81,8 @@ func applyWalletTxFeeFloor(
 	// cannot be constructed; error rather than silently broadcast underpriced.
 	if uint64(minWalletTxSatPerVByteFee*txVsize) > maxTotalFee {
 		return 0, fmt.Errorf(
-			"minimum safe transaction fee [%d] exceeds the maximum fee [%d]",
+			"%w: minimum fee [%d], maximum fee [%d]",
+			ErrMaxFeeTooLow,
 			minWalletTxSatPerVByteFee*txVsize,
 			maxTotalFee,
 		)

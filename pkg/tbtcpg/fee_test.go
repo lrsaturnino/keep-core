@@ -33,6 +33,18 @@ func TestApplyWalletTxFeeFloor(t *testing.T) {
 			maxTotalFee:  4500, // below the buffered 5000
 			expectedFee:  4500,
 		},
+		"buffered fee exactly at the cap is not clamped": {
+			estimatedFee: 4000, // rate 20 -> buffered 25 sat/vByte * 200 = 5000
+			txVsize:      vsize,
+			maxTotalFee:  5000, // exactly the buffered total
+			expectedFee:  5000,
+		},
+		"minimum floor exactly at the cap is allowed": {
+			estimatedFee: 100, // rate 0 -> floored to 5 sat/vByte
+			txVsize:      vsize,
+			maxTotalFee:  1000, // exactly the 5 sat/vByte floor total (5*200)
+			expectedFee:  1000,
+		},
 		"minimum floor above the cap returns an error": {
 			estimatedFee:        100,
 			txVsize:             vsize,

@@ -244,20 +244,26 @@ func (rt *RedemptionTask) ProposeRedemption(
 		fee = estimatedFee
 
 		// The safe-minimum floor raises the total fee and therefore each
-		// request's even fee share (~ totalFee / requestsCount). When that
-		// share exceeds the per-request maximum fee, on-chain validation
-		// rejects the whole proposal and the batch is aborted with no
-		// lower-fee retry. Emit a distinct warning so operators can tell this
-		// apart from a generic validation failure. txMaxFee is the current
-		// governance parameter; the actually enforced cap is the value
-		// snapshotted per request at creation, so this is a best-effort
+		// request's fee share. When a share exceeds the per-request maximum
+		// fee, on-chain validation rejects the whole proposal and the batch is
+		// aborted with no lower-fee retry. Emit a distinct warning so operators
+		// can tell this apart from a generic validation failure. The largest
+		// share is the worst case to check: the on-chain fee distribution
+		// (see withRedemptionTotalFee) splits the total evenly and assigns the
+		// division remainder to the last request, so that request pays
+		// floor(total/count) + total%count. Checking only the even floor share
+		// would miss a rejection caused solely by the remainder. txMaxFee is
+		// the current governance parameter; the actually enforced cap is the
+		// value snapshotted per request at creation, so this is a best-effort
 		// diagnostic rather than an exact predictor.
-		if share := fee / int64(len(redeemersOutputScripts)); uint64(share) > txMaxFee {
+		requestsCount := int64(len(redeemersOutputScripts))
+		maxShare := fee/requestsCount + fee%requestsCount
+		if uint64(maxShare) > txMaxFee {
 			taskLogger.Warnf(
 				"floored redemption fee share [%d] exceeds the per-request "+
 					"maximum fee [%d]; the proposal will likely be rejected "+
 					"by on-chain validation",
-				share,
+				maxShare,
 				txMaxFee,
 			)
 		}

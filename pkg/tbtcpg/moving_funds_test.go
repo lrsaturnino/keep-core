@@ -678,6 +678,15 @@ func TestEstimateMovingFundsFee(t *testing.T) {
 			expectedFee:         0,
 			expectedError:       tbtcpg.ErrFeeTooHigh,
 		},
+		"minimum floor exceeds the max total fee": {
+			estimateSatPerVByte: 1,
+			// raw 203 (203 vByte * 1 sat/vByte) is below the cap, so it passes
+			// the raw-estimate guard, but the 5 sat/vByte floor total (1015)
+			// exceeds the cap, so a safe transaction cannot be built.
+			txMaxTotalFee: 500,
+			expectedFee:   0,
+			expectedError: tbtcpg.ErrMaxFeeTooLow,
+		},
 	}
 
 	for testName, test := range tests {

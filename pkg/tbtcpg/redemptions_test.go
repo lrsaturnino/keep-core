@@ -2,6 +2,7 @@ package tbtcpg_test
 
 import (
 	"encoding/hex"
+	"fmt"
 	"math/big"
 	"strings"
 	"testing"
@@ -269,6 +270,127 @@ func TestRedemptionAction_ProposeRedemption(t *testing.T) {
 
 			if diff := deep.Equal(proposal, test.expectedProposal); diff != nil {
 				t.Errorf("invalid redemption proposal: %v", diff)
+			}
+		})
+	}
+}
+
+// warnCapturingLogger records Warnf messages so tests can assert on the
+// per-request fee warning emitted during redemption fee estimation. All other
+// log methods are inherited as no-ops from testutils.MockLogger.
+type warnCapturingLogger struct {
+	testutils.MockLogger
+	warnings []string
+}
+
+func (l *warnCapturingLogger) Warnf(format string, args ...interface{}) {
+	l.warnings = append(l.warnings, fmt.Sprintf(format, args...))
+}
+
+// TestRedemptionAction_ProposeRedemption_PerRequestFeeWarning verifies that the
+// diagnostic warning about a floored fee share exceeding the per-request maximum
+// fee (TxMaxFee) is emitted for the worst-case (largest) share. The on-chain fee
+// distribution assigns the division remainder to the last request, so that
+// request pays floor(total/count)+total%count. The warning must reflect that
+// last-request share, not the smaller even share.
+func TestRedemptionAction_ProposeRedemption_PerRequestFeeWarning(t *testing.T) {
+	fromHex := func(hexString string) []byte {
+		bytes, err := hex.DecodeString(hexString)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return bytes
+	}
+
+	var walletPublicKeyHash [20]byte
+	copy(walletPublicKeyHash[:], fromHex(""))
+
+	// Three redeemer output scripts make the estimated fee (6496 at 25 sat/vByte
+	// buffered to 32) indivisible by the request count: the even share is
+	// 6496/3 = 2165 and the last request pays 2165 + 6496%3 = 2166.
+	redeemersOutputScripts := []bitcoin.Script{
+		fromHex("00140000000000000000000000000000000000000001"),
+		fromHex("00140000000000000000000000000000000000000002"),
+		fromHex("00140000000000000000000000000000000000000003"),
+	}
+
+	var tests = map[string]struct {
+		txMaxFee      uint64
+		expectWarning bool
+	}{
+		"worst-case share within the per-request cap": {
+			txMaxFee:      3000, // 2166 <= 3000
+			expectWarning: false,
+		},
+		"even share at the cap but last-request share exceeds it": {
+			// The even share 2165 equals the cap (a floor-division check would
+			// not warn), but the last request pays 2166 and would be rejected.
+			txMaxFee:      2165,
+			expectWarning: true,
+		},
+	}
+
+	for testName, test := range tests {
+		t.Run(testName, func(t *testing.T) {
+			tbtcChain := tbtcpg.NewLocalChain()
+			btcChain := tbtcpg.NewLocalBitcoinChain()
+
+			btcChain.SetEstimateSatPerVByteFee(1, 25)
+
+			// txMaxFee at index 2; txMaxTotalFee at index 3, set comfortably
+			// above the estimated total (6496) so it does not bound the fee.
+			tbtcChain.SetRedemptionParameters(0, 0, test.txMaxFee, 8000, 0, nil, 0)
+
+			for _, script := range redeemersOutputScripts {
+				tbtcChain.SetPendingRedemptionRequest(
+					walletPublicKeyHash,
+					&tbtc.RedemptionRequest{
+						RedeemerOutputScript: script,
+					},
+				)
+			}
+
+			expectedProposal := &tbtc.RedemptionProposal{
+				RedeemersOutputScripts: redeemersOutputScripts,
+				RedemptionTxFee:        big.NewInt(6496),
+			}
+
+			err := tbtcChain.SetRedemptionProposalValidationResult(
+				walletPublicKeyHash,
+				expectedProposal,
+				true,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			task := tbtcpg.NewRedemptionTask(tbtcChain, btcChain)
+
+			logger := &warnCapturingLogger{}
+
+			_, err = task.ProposeRedemption(
+				logger,
+				walletPublicKeyHash,
+				redeemersOutputScripts,
+				0, // trigger fee estimation
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			warned := false
+			for _, w := range logger.warnings {
+				if strings.Contains(w, "exceeds the per-request maximum fee") {
+					warned = true
+					break
+				}
+			}
+
+			if warned != test.expectWarning {
+				t.Errorf(
+					"per-request fee warning emitted = %v, want %v\nwarnings: %v",
+					warned, test.expectWarning, logger.warnings,
+				)
 			}
 		})
 	}
