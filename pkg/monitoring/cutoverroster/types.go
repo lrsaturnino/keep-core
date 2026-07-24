@@ -124,8 +124,16 @@ func (i InventoryInstanceInput) ToInventoryInstance() InventoryInstance {
 // InstanceReport is one attested report obtained from an instance's trusted
 // report target during a collection cycle.
 type InstanceReport struct {
-	InstanceID       string    `json:"instance_id"`
-	OperatorAddress  string    `json:"operator_address"`
+	InstanceID      string `json:"instance_id"`
+	OperatorAddress string `json:"operator_address"`
+	// NetworkID is the responding node's OWN self-attested libp2p network identity
+	// (from its /diagnostics client_info), NOT copied from inventory. It is the
+	// per-instance identity the node proves for itself, so one responding node —
+	// which can attest only a single network ID — cannot stand in for two distinct
+	// same-operator inventory instances. The metrics report source populates it and
+	// rejects a report whose attested network ID does not match the inventory
+	// instance it answers for.
+	NetworkID        string    `json:"network_id"`
 	Revision         string    `json:"revision"`
 	Epoch            string    `json:"epoch"`
 	ImageDigest      string    `json:"image_digest"`

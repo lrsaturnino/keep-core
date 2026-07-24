@@ -112,6 +112,25 @@ func (s *ServiceDiscovery) Has(operatorAddress string) bool {
 	return s.operatorsPresent[normalizeAddress(operatorAddress)]
 }
 
+// HasInstance reports whether the specific instance identified by the full
+// (operatorAddress, networkID) identity tuple is present in the service-discovery
+// target set. It is the per-instance disambiguator: unlike Has (which is true for
+// an operator with any discovered instance), this requires the exact network ID
+// to be discovered AND to belong to the claimed operator, so a second instance of
+// one operator that never appears in discovery is not covered by a sibling
+// instance's presence.
+func (s *ServiceDiscovery) HasInstance(operatorAddress, networkID string) bool {
+	networkID = strings.TrimSpace(networkID)
+	if networkID == "" {
+		return false
+	}
+	target, ok := s.byNetworkID[networkID]
+	if !ok {
+		return false
+	}
+	return target.operator == normalizeAddress(operatorAddress)
+}
+
 // instanceBaseURL returns the discovered scrape base URL for the specific
 // instance identified by (operatorAddress, networkID), or "". It requires the
 // network ID (the per-instance key) and confirms the discovered target belongs
@@ -157,9 +176,13 @@ func (s *ServiceDiscovery) Len() int {
 }
 
 // ReconcileWithDiscovery annotates the authoritative inventory against the
-// production service-discovery target set. An eligible instance whose operator is
-// absent from discovery is flagged DisappearedFromDiscovery (reconciliation rule
-// 2: disappearance from service discovery is offline_unknown). It returns the
+// production service-discovery target set. An eligible instance whose exact
+// (operator, networkID) identity is absent from discovery is flagged
+// DisappearedFromDiscovery (reconciliation rule 2: disappearance from service
+// discovery is offline_unknown). Keying by the full identity tuple — not the
+// operator alone — is what keeps distinct instances of one operator from
+// collapsing: a second instance that never appears in discovery is flagged even
+// when a sibling instance of the same operator is discovered. It returns the
 // inventory with the flags applied. A nil ServiceDiscovery leaves the inventory
 // unchanged (no discovery feed configured).
 func ReconcileWithDiscovery(
@@ -173,7 +196,7 @@ func ReconcileWithDiscovery(
 		if !inventory[i].CeremonyEligible {
 			continue
 		}
-		if !sd.Has(inventory[i].OperatorAddress) {
+		if !sd.HasInstance(inventory[i].OperatorAddress, inventory[i].NetworkID) {
 			inventory[i].DisappearedFromDiscovery = true
 		}
 	}

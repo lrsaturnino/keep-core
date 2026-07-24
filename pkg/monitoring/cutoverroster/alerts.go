@@ -14,9 +14,17 @@ type AlertRule struct {
 	Annotations map[string]string
 }
 
-// AlertRules returns the two required fleet-readiness alerts. Both fire only
-// after two consecutive one-minute evaluations and are routed to the Release and
-// Operator Coordination teams via routing labels.
+// CutoverRosterJob is the Prometheus scrape job that collects the fleet metrics
+// (infrastructure/kube/keep-prd/monitoring/prometheus/config/config.yaml). The
+// collector-down alert keys on it: if the collector dies, every
+// performance_cutover_* series vanishes, so a value-threshold alert on those
+// series would itself evaluate absent and never fire. An up/absent() alert on the
+// scrape target catches that hole.
+const CutoverRosterJob = "cutover-roster"
+
+// AlertRules returns the required fleet-readiness alerts. All fire only after two
+// consecutive one-minute evaluations and are routed to the Release and Operator
+// Coordination teams via routing labels.
 func AlertRules() []AlertRule {
 	routing := func(severity string) map[string]string {
 		return map[string]string{
@@ -53,6 +61,28 @@ func AlertRules() []AlertRule {
 				"summary": "Cutover fleet roster is incomplete.",
 				"description": "Blocking operators, stale reporters, or unreconciled " +
 					"inventory are present. The go/no-go completeness criteria are not met.",
+			},
+		},
+		{
+			// A dead or unscraped collector makes every performance_cutover_* series
+			// vanish, so the two alerts above would evaluate absent and never fire.
+			// This alert fires when the collector scrape target is down (up == 0) OR
+			// has disappeared entirely from the scrape config (absent), so a missing
+			// collector can never leave both roster alerts silently absent.
+			Alert: "CutoverRosterCollectorDown",
+			Expr: fmt.Sprintf(
+				"up{job=%q} == 0 or absent(up{job=%q})",
+				CutoverRosterJob, CutoverRosterJob,
+			),
+			For:    "2m",
+			Labels: routing("critical"),
+			Annotations: map[string]string{
+				"summary": "Cutover-roster collector scrape target is down or absent.",
+				"description": "Prometheus cannot scrape the cutover-roster collector " +
+					"(job cutover-roster): the target is down or has disappeared from the " +
+					"scrape config. Every performance_cutover_* series is therefore stale " +
+					"or absent, so the other roster alerts can be silently absent. Cutover " +
+					"readiness cannot be evaluated until the collector is restored.",
 			},
 		},
 	}

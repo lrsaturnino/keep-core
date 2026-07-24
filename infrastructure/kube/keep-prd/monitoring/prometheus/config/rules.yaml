@@ -85,3 +85,24 @@ groups:
           description: >-
             Blocking operators, stale reporters, or unreconciled inventory are
             present. The go/no-go completeness criteria are not met.
+      # A dead or unscraped collector makes every performance_cutover_* series
+      # vanish, so the two alerts above would evaluate absent and never fire. This
+      # up/absent() alert catches that hole: it fires when the collector target is
+      # down (up == 0) or has disappeared from the scrape config (absent).
+      - alert: CutoverRosterCollectorDown
+        expr: >-
+          up{job="cutover-roster"} == 0
+          or absent(up{job="cutover-roster"})
+        for: 2m
+        labels:
+          severity: critical
+          team: release
+          route_to: release,operator-coordination
+        annotations:
+          summary: Cutover-roster collector scrape target is down or absent.
+          description: >-
+            Prometheus cannot scrape the cutover-roster collector (job
+            cutover-roster): the target is down or has disappeared from the scrape
+            config. Every performance_cutover_* series is therefore stale or
+            absent, so the other roster alerts can be silently absent. Cutover
+            readiness cannot be evaluated until the collector is restored.

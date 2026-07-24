@@ -40,7 +40,10 @@ spec:
           args:
             - --apiAddr=0.0.0.0:9701
             # REPLACE_WITH_MONITORING_POD_CIDR: the Prometheus/monitoring pod
-            # network allowed to reach the API. Required for a non-loopback bind.
+            # network allowed to reach the DATA endpoints (readiness API + /metrics).
+            # Required for a non-loopback bind. It need NOT include the node/kubelet
+            # IPs: the liveness/readiness probes below target /healthz, which is
+            # served outside this allowlist, so probes from the node IP still succeed.
             - --allowedCIDRs=REPLACE_WITH_MONITORING_POD_CIDR
             - --dbPath=/var/lib/cutover-roster/roster.db
             - --inventoryFile=/etc/cutover-roster/inventory.json
@@ -61,11 +64,23 @@ spec:
           ports:
             - name: api
               containerPort: 9701
+          # Probes target /healthz, which the collector serves OUTSIDE the
+          # --allowedCIDRs boundary (the data endpoints stay behind it). The kubelet
+          # sends probes from the node IP — not on the monitoring pod CIDR and not
+          # loopback — so probing an allowlisted data endpoint would return 403 and
+          # keep the pod permanently unready.
           readinessProbe:
             httpGet:
-              path: /api/v1/cutover-readiness
+              path: /healthz
               port: api
             initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: api
+            initialDelaySeconds: 15
             periodSeconds: 30
             timeoutSeconds: 2
           resources:

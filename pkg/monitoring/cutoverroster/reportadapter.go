@@ -110,6 +110,11 @@ func (s *MetricsReportSource) Fetch(
 	ctx context.Context,
 	inv InventoryInstance,
 ) (InstanceReport, error) {
+	// InstanceID is only the inventory's label for this instance; it is NOT the
+	// node's proven identity. The trust binding below is (operator address,
+	// network ID), both taken from the responding node's own attestation and
+	// matched against inventory. The collector separately re-validates that the
+	// report's InstanceID equals the inventory instance it answers for.
 	report := InstanceReport{
 		InstanceID: inv.InstanceID,
 	}
@@ -165,16 +170,36 @@ func (s *MetricsReportSource) Fetch(
 	}
 	// The report's operator address comes from the node's own attestation.
 	report.OperatorAddress = observedOperator
-	// When inventory pins the instance's network ID, the node's self-attested
-	// network_id must match it, so one operator's responding target cannot stand
-	// in for a different instance of the same operator.
-	if strings.TrimSpace(inv.NetworkID) != "" {
-		if strings.TrimSpace(diag.ClientInfo.NetworkID) != strings.TrimSpace(inv.NetworkID) {
-			return report, fmt.Errorf(
-				"responding node network identity mismatch for %s", inv.InstanceID,
-			)
-		}
+
+	// Bind the report to the responding node's OWN network identity,
+	// unconditionally — this is the per-instance guarantee that closes the
+	// collapse where one responding node certifies several same-operator
+	// inventory instances. The inventory must pin the instance's network ID, the
+	// node must self-attest a network ID, and the two must match. A single node
+	// attests exactly one network ID, so it can satisfy at most the one inventory
+	// instance whose NetworkID equals it; a same-operator instance carrying a
+	// different (or absent) network ID is rejected here rather than certified from
+	// an inventory-copied identity. The network ID stored on the report is the
+	// node's attested value, never inventory.
+	expectedNetworkID := strings.TrimSpace(inv.NetworkID)
+	observedNetworkID := strings.TrimSpace(diag.ClientInfo.NetworkID)
+	if expectedNetworkID == "" {
+		return report, fmt.Errorf(
+			"inventory does not pin a network ID for %s; cannot bind report identity",
+			inv.InstanceID,
+		)
 	}
+	if observedNetworkID == "" {
+		return report, fmt.Errorf(
+			"responding node did not attest a network ID for %s", inv.InstanceID,
+		)
+	}
+	if observedNetworkID != expectedNetworkID {
+		return report, fmt.Errorf(
+			"responding node network identity mismatch for %s", inv.InstanceID,
+		)
+	}
+	report.NetworkID = observedNetworkID
 
 	// The image digest is always external attestation; the release epoch is taken
 	// from attestation only when the node did not report it via client_info.

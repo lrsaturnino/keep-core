@@ -235,6 +235,12 @@ func (c *Collector) CollectContext(
 	// current inventory, so the reconciliation step can detect instances that
 	// have disappeared from service discovery since an earlier cycle.
 	seenInstanceIDs := map[string]bool{}
+	// seenNetworkIDs records which per-instance network identities have already
+	// been claimed this cycle. A network ID is a globally unique libp2p identity,
+	// so two eligible instances asserting the same one cannot be two distinct
+	// nodes; the duplicate is rejected so a single responding node cannot certify
+	// more than one same-operator inventory instance.
+	seenNetworkIDs := map[string]bool{}
 	totalInstances := len(inventory)
 	unreconciled := 0
 	stale := 0
@@ -294,6 +300,20 @@ func (c *Collector) CollectContext(
 		if c.inventoryExpectationContradicts(inv) {
 			unreconciled++
 			continue
+		}
+		// The per-instance network ID is the identity that keeps distinct
+		// same-operator instances from collapsing onto one responding node. When
+		// on-chain identity or service-discovery verification is required it is a
+		// mandatory inventory field and must be unique across the cycle: a missing
+		// or duplicated network ID means a single node could stand in for more than
+		// one instance, so it is an inventory-reconciliation fault (fail closed).
+		if c.networkIdentityRequired() {
+			networkID := strings.TrimSpace(inv.NetworkID)
+			if networkID == "" || seenNetworkIDs[networkID] {
+				unreconciled++
+				continue
+			}
+			seenNetworkIDs[networkID] = true
 		}
 
 		reconciledEligible++
@@ -656,6 +676,17 @@ func (c *Collector) publishFailClosed(now time.Time, currentBlock uint64) FleetS
 	c.logCycle(snapshot)
 
 	return snapshot
+}
+
+// networkIdentityRequired reports whether the per-instance network ID is a
+// mandatory, unique inventory field this run. It is required whenever the
+// authoritative trust chain is enforced — on-chain identity verification or
+// production service-discovery reconciliation — because both rely on the network
+// ID to bind one responding node to exactly one inventory instance. A
+// developer/test collector with neither requirement leaves it optional so
+// narrowly-scoped fixtures need not carry it.
+func (c *Collector) networkIdentityRequired() bool {
+	return c.config.RequireIdentityVerification || c.config.RequireServiceDiscovery
 }
 
 // isComplete fails closed: readiness is "complete" only with a nonempty

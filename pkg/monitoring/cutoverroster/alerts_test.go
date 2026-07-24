@@ -37,6 +37,34 @@ func TestAlertRules_NamesForAndRouting(t *testing.T) {
 	}
 }
 
+// TestAlertRules_CollectorDownAlert proves the up/absent() alert exists so a dead
+// collector — which makes every performance_cutover_* series vanish — cannot leave
+// both roster alerts silently absent.
+func TestAlertRules_CollectorDownAlert(t *testing.T) {
+	var found bool
+	for _, r := range AlertRules() {
+		if r.Alert != "CutoverRosterCollectorDown" {
+			continue
+		}
+		found = true
+		if !strings.Contains(r.Expr, `up{job="cutover-roster"}`) {
+			t.Errorf("collector-down alert must key on the cutover-roster scrape job: %q", r.Expr)
+		}
+		if !strings.Contains(r.Expr, "absent(") {
+			t.Errorf("collector-down alert must use absent() so a vanished target fires: %q", r.Expr)
+		}
+		if r.For != "2m" {
+			t.Errorf("collector-down alert for=%q, want 2m", r.For)
+		}
+		if route := r.Labels["route_to"]; !strings.Contains(route, "release") {
+			t.Errorf("collector-down alert must route to release, got %q", route)
+		}
+	}
+	if !found {
+		t.Fatal("expected a CutoverRosterCollectorDown alert to be defined")
+	}
+}
+
 func TestRenderAlertRulesYAML(t *testing.T) {
 	yaml := RenderAlertRulesYAML()
 

@@ -32,6 +32,23 @@ reconciliation reasons from the readiness API via the Infinity datasource. The
 route to Alertmanager, whose tree matches their `route_to` label and fans them to
 the Release and Operator Coordination receivers.
 
+Three operational details make the stack internally deployable:
+
+* The Infinity datasource plugin is pinned to `2.3.1` in
+`grafana/grafana-deployment.yaml` — the newest Infinity release compatible with
+the pinned Grafana `9.2.5` (its `grafanaDependency` is `>=8.4.7`). An unversioned
+install resolves to the latest Infinity, which requires Grafana `>= 11.6`. Drop
+the pin if Grafana is upgraded.
+* The collector serves `/healthz` OUTSIDE the `--allowedCIDRs` boundary, and the
+`cutover-roster` Deployment's liveness/readiness probes target it. Kubelet probes
+originate from the node IP (not the monitoring pod CIDR, not loopback), so probing
+an allowlisted data endpoint would return `403` and keep the pod permanently
+unready. The data endpoints (readiness API + `/metrics`) stay behind the allowlist.
+* A third alert, `CutoverRosterCollectorDown`
+(`up{job="cutover-roster"} == 0 or absent(...)`), fires when the collector target
+is down or absent. Without it a dead collector makes every `performance_cutover_*`
+series vanish, so the other two roster alerts would evaluate absent and never fire.
+
 NOTE: The `cutover-roster/deployment.yaml` and `alertmanager/` manifests are
 reviewable skeletons. Before apply, fill the `REPLACE_` placeholders: the
 collector image `@sha256:` digest, the monitoring pod CIDR (`--allowedCIDRs`),

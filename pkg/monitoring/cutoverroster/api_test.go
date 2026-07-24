@@ -58,6 +58,55 @@ func TestCIDRAllowlist_EnforcesMonitoringBoundary(t *testing.T) {
 	}
 }
 
+// stubSnapshotSource is a minimal snapshotSource for handler routing tests.
+type stubSnapshotSource struct{}
+
+func (stubSnapshotSource) Snapshot() FleetSnapshot { return FleetSnapshot{} }
+
+// TestHealthzServedOutsideAllowlist proves the kubelet-probe fix: /healthz is
+// served to any source (including an IP outside the monitoring pod CIDR, which is
+// where kubelet probes originate), while the authoritative readiness data stays
+// behind the allowlist and is denied to that same untrusted source. Without this,
+// an allowlisted probe from the node IP would 403 and keep the pod permanently
+// unready.
+func TestHealthzServedOutsideAllowlist(t *testing.T) {
+	allowlist, err := ParseCIDRAllowlist("10.1.0.0/16")
+	if err != nil {
+		t.Fatalf("parse allowlist: %v", err)
+	}
+	handler := serverHandler(allowlist, stubSnapshotSource{}, nil)
+
+	// A kubelet-style probe from a node IP outside the allowlisted pod CIDR.
+	const nodeIP = "192.168.1.10:41234"
+
+	// /healthz must be served regardless of source IP.
+	healthReq := httptest.NewRequest(http.MethodGet, healthzPath, nil)
+	healthReq.RemoteAddr = nodeIP
+	healthRec := httptest.NewRecorder()
+	handler.ServeHTTP(healthRec, healthReq)
+	if healthRec.Code != http.StatusOK {
+		t.Errorf("/healthz from a node IP must be served, got %d", healthRec.Code)
+	}
+
+	// The authoritative readiness data from that same untrusted source is denied.
+	dataReq := httptest.NewRequest(http.MethodGet, readinessPath, nil)
+	dataReq.RemoteAddr = nodeIP
+	dataRec := httptest.NewRecorder()
+	handler.ServeHTTP(dataRec, dataReq)
+	if dataRec.Code != http.StatusForbidden {
+		t.Errorf("readiness data from an untrusted source must be denied, got %d", dataRec.Code)
+	}
+
+	// The readiness data from an allowed-CIDR source is served.
+	okReq := httptest.NewRequest(http.MethodGet, readinessPath, nil)
+	okReq.RemoteAddr = "10.1.2.3:5555"
+	okRec := httptest.NewRecorder()
+	handler.ServeHTTP(okRec, okReq)
+	if okRec.Code != http.StatusOK {
+		t.Errorf("readiness data from an allowed CIDR must be served, got %d", okRec.Code)
+	}
+}
+
 // TestParseCIDRAllowlist_Validation proves an empty allowlist parses to nil and
 // an invalid CIDR is rejected.
 func TestParseCIDRAllowlist_Validation(t *testing.T) {

@@ -23,8 +23,16 @@ spec:
             # cutover-roster readiness API (JSON), which needs the Infinity
             # datasource plugin. It installs into the writable grafana PVC at
             # /var/lib/grafana/plugins, so readOnlyRootFilesystem is preserved.
+            #
+            # The version is PINNED to 2.3.1 (the newest Infinity release whose
+            # plugin.json grafanaDependency is ">=8.4.7", so it loads on the pinned
+            # Grafana 9.2.5 below). An unversioned install resolves to the latest
+            # Infinity, which now requires Grafana >= 11.6 and would silently fail
+            # to load here, leaving the instance-reason table broken. The plugin id
+            # and version are space-separated per Grafana's docker install format.
+            # If Grafana is upgraded to >= 11.6, this pin can be dropped.
             - name: GF_INSTALL_PLUGINS
-              value: yesoreyeram-infinity-datasource
+              value: yesoreyeram-infinity-datasource 2.3.1
             - name: GF_SERVER_DOMAIN
               value: monitoring.threshold.network
             - name: GF_SERVER_ROOT_URL

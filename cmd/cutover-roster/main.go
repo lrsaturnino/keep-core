@@ -100,9 +100,11 @@ func parseOptions() options {
 			"digests (and, until the node emits it, release epoch). The running "+
 			"binary does not know its own image digest, so this is external attestation.")
 	flag.StringVar(&opts.reportFormat, "reportFormat", "metrics",
-		"How to fetch per-instance reports: 'metrics' scrapes the node's real "+
-			"/metrics and /diagnostics endpoints (production); 'json' fetches a "+
-			"dedicated JSON attestation endpoint from each trusted report target.")
+		"How to fetch per-instance reports. Only 'metrics' is supported: it scrapes "+
+			"each node's real /metrics and /diagnostics endpoints and validates the "+
+			"node's self-attested chain address and network ID, so one responding node "+
+			"cannot certify another instance. A raw 'json' attestation blob cannot "+
+			"prove a node's own per-instance identity and is rejected.")
 	flag.StringVar(&opts.ethereumRPC, "ethereumRPC", "",
 		"Optional Ethereum JSON-RPC URL used to read the current block height and, "+
 			"with --walletRegistryAddress, to verify operator→staking-provider identity.")
@@ -414,10 +416,21 @@ func buildReportFetcher(opts options) (reportFetcher, error) {
 			source: cutoverroster.NewMetricsReportSource(nil, attestation),
 		}, nil
 	case "json":
-		return &jsonFetcher{client: &http.Client{Timeout: 10 * time.Second}}, nil
+		// A raw JSON attestation blob is self-declared: a single endpoint can echo
+		// back whatever identity the collector expects, so it cannot prove the
+		// responding node's OWN per-instance (operator, network ID) identity the way
+		// the metrics path does by reading each node's /diagnostics. It therefore
+		// cannot provide the per-instance guarantee that keeps one node from
+		// certifying several instances, and is refused rather than left as a silent
+		// gap in a "complete" readiness determination.
+		return nil, fmt.Errorf(
+			"--reportFormat=json is not supported: a JSON attestation blob cannot " +
+				"prove a node's own per-instance identity and must not contribute to a " +
+				"complete readiness determination; use 'metrics'",
+		)
 	default:
 		return nil, fmt.Errorf(
-			"unknown --reportFormat %q (want 'metrics' or 'json')", opts.reportFormat,
+			"unknown --reportFormat %q (want 'metrics')", opts.reportFormat,
 		)
 	}
 }
@@ -431,45 +444,6 @@ func (m *metricsFetcher) fetch(
 	ctx context.Context, inv cutoverroster.InventoryInstance,
 ) (cutoverroster.InstanceReport, error) {
 	return m.source.Fetch(ctx, inv)
-}
-
-// jsonFetcher fetches a dedicated JSON attestation endpoint.
-type jsonFetcher struct {
-	client *http.Client
-}
-
-func (j *jsonFetcher) fetch(
-	ctx context.Context, inv cutoverroster.InventoryInstance,
-) (cutoverroster.InstanceReport, error) {
-	var report cutoverroster.InstanceReport
-
-	// #nosec G107 -- the report target is operator-supplied trusted inventory.
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, inv.TrustedReportTarget, nil)
-	if err != nil {
-		return report, err
-	}
-
-	resp, err := j.client.Do(req)
-	if err != nil {
-		// Sanitize: the raw transport error embeds the requested URL (host/IP),
-		// which the spec forbids from appearing in logs.
-		return report, fmt.Errorf("report request failed")
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return report, fmt.Errorf("unexpected status %d", resp.StatusCode)
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&report); err != nil {
-		return report, fmt.Errorf("cannot decode report")
-	}
-
-	// Do not fabricate the report's identity or attestation time from inventory
-	// or the local clock. The collector validates the instance's own attested
-	// identity, freshness, and reporter revision and rejects anything missing or
-	// mismatched, so a fabricated field could mask a stale or foreign report.
-	return report, nil
 }
 
 // pollReports fetches each eligible instance's report via the configured fetcher.
@@ -509,27 +483,32 @@ func loadServiceDiscovery(path string) (*cutoverroster.ServiceDiscovery, error) 
 	return cutoverroster.ParseServiceDiscovery(data)
 }
 
-// applyDiscoveredTargets sets each eligible instance's report target to its
-// discovered /metrics base URL when service discovery knows that specific
-// instance (by operator address and network ID) and the inventory did not
-// already carry an explicit trusted target. Keying by network ID means multiple
-// instances of one operator each resolve to their own discovered target rather
-// than collapsing onto a single operator-level URL; an instance without a
-// discovered per-instance target is left untargeted (offline, fail closed).
+// applyDiscoveredTargets makes production service discovery authoritative for
+// each eligible instance's report target. It sets the target to the discovered
+// /metrics base URL for the exact (operator address, network ID) instance and
+// otherwise clears it. Keying by network ID means multiple instances of one
+// operator each resolve to their own discovered target rather than collapsing
+// onto a single operator-level URL.
+//
+// Crucially, a discovered target OVERRIDES any inventory-supplied
+// trusted_report_target, and an instance service discovery does not know is left
+// untargeted (offline, fail closed) even if inventory named a target. This closes
+// the bypass where an inventory-supplied target routed around the discovered
+// per-instance identity: an explicit target can no longer stand in for a distinct
+// instance that never appears in discovery. ReconcileWithDiscovery has already
+// flagged such an instance DisappearedFromDiscovery, so it cannot resolve either
+// way; clearing its target additionally stops it from being polled at all.
 func applyDiscoveredTargets(
 	inventory []cutoverroster.InventoryInstance,
 	sd *cutoverroster.ServiceDiscovery,
 ) {
 	for i := range inventory {
-		if !inventory[i].CeremonyEligible || inventory[i].TrustedReportTarget != "" {
+		if !inventory[i].CeremonyEligible {
 			continue
 		}
-		url := sd.MetricsURLForInstance(
+		inventory[i].TrustedReportTarget = sd.MetricsURLForInstance(
 			inventory[i].OperatorAddress, inventory[i].NetworkID,
 		)
-		if url != "" {
-			inventory[i].TrustedReportTarget = url
-		}
 	}
 }
 

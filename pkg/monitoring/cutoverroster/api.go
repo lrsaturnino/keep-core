@@ -15,6 +15,15 @@ import (
 // readinessPath is the single authoritative readiness endpoint.
 const readinessPath = "/api/v1/cutover-readiness"
 
+// healthzPath is an unauthenticated liveness/readiness endpoint for the process
+// itself. It is deliberately served OUTSIDE the CIDR allowlist because Kubernetes
+// kubelet probes originate from the node IP, which is not on the monitoring pod
+// network and is not loopback — an allowlisted probe would return 403 and leave
+// the pod permanently unready. It exposes no fleet data (only "ok"), so serving
+// it openly is safe; the authoritative readiness data and /metrics stay behind
+// the allowlist.
+const healthzPath = "/healthz"
+
 // CIDRAllowlist is the monitoring-network trust boundary for the readiness API.
 // When configured, only clients whose source IP is loopback or within one of the
 // allowed networks are served; every other client is denied. It is a defensive
@@ -95,6 +104,23 @@ func bindIsLoopbackOnly(addr string) bool {
 		return false
 	}
 	return ip.IsLoopback()
+}
+
+// healthzHandler serves the unauthenticated liveness/readiness endpoint. It
+// always returns 200 with a tiny body once the HTTP server is accepting
+// connections, which is exactly what a kubelet probe needs to mark the pod ready
+// so Prometheus and Grafana can reach it. It intentionally reflects only that the
+// process is serving, not fleet readiness, and exposes no fleet data.
+func healthzHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok\n"))
+	})
 }
 
 // withAllowlist wraps next so a request from outside the monitoring trust
@@ -191,11 +217,25 @@ func NewServer(
 
 	return &Server{
 		httpServer: &http.Server{
-			Handler:           withAllowlist(allowlist, NewHandler(source, metrics)),
+			Handler:           serverHandler(allowlist, source, metrics),
 			ReadHeaderTimeout: 10 * time.Second,
 		},
 		listener: listener,
 	}, nil
+}
+
+// serverHandler builds the top-level HTTP handler. /healthz is routed OUTSIDE the
+// CIDR allowlist so kubelet liveness/readiness probes from the node IP succeed,
+// while the authoritative readiness data and /metrics stay behind the allowlist.
+func serverHandler(
+	allowlist *CIDRAllowlist,
+	source snapshotSource,
+	metrics *PrometheusMetrics,
+) http.Handler {
+	top := http.NewServeMux()
+	top.Handle(healthzPath, healthzHandler())
+	top.Handle("/", withAllowlist(allowlist, NewHandler(source, metrics)))
+	return top
 }
 
 // Addr returns the actual bound address (useful when addr requested port 0).

@@ -76,14 +76,18 @@ func TestServiceDiscovery_MultipleInstancesPerOperatorStayDistinct(t *testing.T)
 	}
 }
 
-// TestReconcileWithDiscovery proves an eligible instance whose operator is absent
-// from service discovery is flagged DisappearedFromDiscovery, while a discovered
-// operator is not.
+// TestReconcileWithDiscovery proves an eligible instance whose exact
+// (operator, networkID) identity is absent from service discovery is flagged
+// DisappearedFromDiscovery, while a discovered instance is not — and, critically,
+// that a SECOND instance of a discovered operator whose own network ID is not in
+// discovery is still flagged. Per-instance keying is what keeps distinct
+// same-operator instances from collapsing on a sibling's presence.
 func TestReconcileWithDiscovery(t *testing.T) {
 	present := "0xabcdef0000000000000000000000000000000001"
 	absent := "0xabcdef0000000000000000000000000000000002"
 	raw := fmt.Sprintf(
-		`[{"targets": ["h:9601"], "labels": {"__meta_chain_address": "%s"}}]`, present,
+		`[{"targets": ["h:9601"], "labels": {"__meta_chain_address": "%s", "__meta_network_id": "net-1"}}]`,
+		present,
 	)
 	sd, err := ParseServiceDiscovery([]byte(raw))
 	if err != nil {
@@ -91,20 +95,27 @@ func TestReconcileWithDiscovery(t *testing.T) {
 	}
 
 	inventory := []InventoryInstance{
-		{InstanceID: "i1", OperatorAddress: present, CeremonyEligible: true},
-		{InstanceID: "i2", OperatorAddress: absent, CeremonyEligible: true},
+		{InstanceID: "i1", OperatorAddress: present, NetworkID: "net-1", CeremonyEligible: true},
+		{InstanceID: "i2", OperatorAddress: absent, NetworkID: "net-2", CeremonyEligible: true},
+		// A second instance of the discovered operator whose own network ID is NOT
+		// in discovery: it must still be flagged, because a sibling instance's
+		// presence does not cover a distinct network identity.
+		{InstanceID: "i3", OperatorAddress: present, NetworkID: "net-UNKNOWN", CeremonyEligible: true},
 	}
 	out := ReconcileWithDiscovery(inventory, sd)
 	if out[0].DisappearedFromDiscovery {
-		t.Error("discovered operator must not be flagged disappeared")
+		t.Error("discovered instance (operator+networkID) must not be flagged disappeared")
 	}
 	if !out[1].DisappearedFromDiscovery {
 		t.Error("operator absent from discovery must be flagged disappeared")
 	}
+	if !out[2].DisappearedFromDiscovery {
+		t.Error("a same-operator instance whose network ID is not discovered must be flagged disappeared")
+	}
 
 	// A nil discovery feed leaves the inventory untouched.
 	untouched := ReconcileWithDiscovery(
-		[]InventoryInstance{{InstanceID: "i1", OperatorAddress: absent, CeremonyEligible: true}},
+		[]InventoryInstance{{InstanceID: "i1", OperatorAddress: absent, NetworkID: "net-2", CeremonyEligible: true}},
 		nil,
 	)
 	if untouched[0].DisappearedFromDiscovery {
@@ -226,7 +237,7 @@ func TestMetricsReportSource_ReporterRevisionSurvivesRestart(t *testing.T) {
 		case "/diagnostics":
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
 				"client_info": map[string]string{
-					"revision": "abc123def456", "chain_address": operator,
+					"revision": "abc123def456", "chain_address": operator, "network_id": "net-1",
 				},
 			})
 		default:
@@ -236,7 +247,7 @@ func TestMetricsReportSource_ReporterRevisionSurvivesRestart(t *testing.T) {
 	defer srv.Close()
 
 	inv := InventoryInstance{
-		InstanceID: "i1", OperatorAddress: operator, TrustedReportTarget: srv.URL,
+		InstanceID: "i1", OperatorAddress: operator, NetworkID: "net-1", TrustedReportTarget: srv.URL,
 	}
 
 	// The pre-restart source runs many cycles, driving any process-local counter
@@ -367,4 +378,163 @@ func TestEthCallIdentityVerifier(t *testing.T) {
 	if _, err := NewEthCallIdentityVerifier(srv.URL, "not-an-address", srv.Client()); err == nil {
 		t.Error("expected rejection of a non-canonical contract address")
 	}
+}
+
+// newExactAttestingNode is a fake keep node that self-attests exactly ONE
+// identity — the given (operator chain address, network id) — and reports the
+// exact cutover revision/epoch. It is the single physical responder used to prove
+// one node cannot certify a second same-operator instance.
+func newExactAttestingNode(t *testing.T, operator, networkID string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case metricsPath:
+			_, _ = io.WriteString(w,
+				`client_info{version="v2.0.0",revision="`+testRevision+
+					`",protocol_epoch="`+ExpectedEpochSecurityV2Cutover+`"} 1`+"\n")
+		case diagnosticsPath:
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"client_info": map[string]string{
+					"version": "v2.0.0", "revision": testRevision,
+					"chain_address": operator, "network_id": networkID,
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// fetchAllReports mirrors the command's pollReports over the REAL
+// MetricsReportSource: every eligible instance with a target is fetched, and a
+// fetch error (e.g. an identity mismatch) simply omits that instance, exactly as
+// production treats a missed collection.
+func fetchAllReports(
+	source *MetricsReportSource, inventory []InventoryInstance,
+) map[string]InstanceReport {
+	reports := map[string]InstanceReport{}
+	for _, in := range inventory {
+		if !in.CeremonyEligible || in.TrustedReportTarget == "" {
+			continue
+		}
+		r, err := source.Fetch(context.Background(), in)
+		if err != nil {
+			continue
+		}
+		reports[in.InstanceID] = r
+	}
+	return reports
+}
+
+// TestEndToEnd_OneNodeCannotCertifyTwoSameOperatorInstances is the fix-round-3
+// regression guard for the per-instance trust-chain bypass. It drives the real
+// metrics fetch path (as the command's pollReports does) into the collector and
+// proves a single responding node can never satisfy two distinct same-operator
+// inventory instances — the exact collapse the earlier round left reachable.
+func TestEndToEnd_OneNodeCannotCertifyTwoSameOperatorInstances(t *testing.T) {
+	// run drives `cycles` full collection cycles over the real fetch path, keeping
+	// the report clock and the collector clock in lockstep so each cycle's
+	// attestation is strictly newer than the last.
+	run := func(
+		t *testing.T, tc *testCollector, source *MetricsReportSource,
+		inv []InventoryInstance, cycles int,
+	) FleetSnapshot {
+		source.clock = func() time.Time { return tc.now }
+		var snap FleetSnapshot
+		for i := 0; i < cycles; i++ {
+			tc.now = tc.now.Add(time.Minute)
+			reports := fetchAllReports(source, inv)
+			var err error
+			snap, err = tc.collector.Collect(inv, reports, nil, 2000)
+			if err != nil {
+				t.Fatalf("collect: %v", err)
+			}
+		}
+		return snap
+	}
+
+	twoTargets := func(node string, id1, net1, id2, net2 string) []InventoryInstance {
+		a := eligibleInstance(id1, "op1")
+		a.NetworkID = net1
+		a.TrustedReportTarget = node
+		b := eligibleInstance(id2, "op1")
+		b.NetworkID = net2
+		b.TrustedReportTarget = node
+		return []InventoryInstance{a, b}
+	}
+
+	// The exact original bypass: two same-operator inventory entries with EMPTY
+	// network ids and the same explicit target, both answered by one node. On the
+	// pre-fix code both were certified; now neither can be.
+	t.Run("empty network ids answered by one node are not certified", func(t *testing.T) {
+		node := newExactAttestingNode(t, opAddr("op1"), "net-1")
+		source := NewMetricsReportSource(node.Client(), &MapAttestationSource{
+			Digests: map[string]string{"i1": testDigest, "i2": testDigest},
+		})
+		inv := twoTargets(node.URL, "i1", "", "i2", "")
+
+		tc := newTestCollector(t)
+		snap := run(t, tc, source, inv, 4)
+
+		if status, ok := operatorStatus(snap, "op1"); ok && status == FleetResolvedCurrent {
+			t.Fatal("two empty-network-id instances answered by one node must not certify the operator")
+		}
+		if snap.Complete {
+			t.Fatal("readiness must not be complete when instances lack a per-instance network id")
+		}
+		if snap.Inventory.Unreconciled == 0 {
+			t.Fatal("empty per-instance network ids must count as an inventory-reconciliation fault")
+		}
+	})
+
+	// Even with well-formed distinct network ids, one node (attesting net-1)
+	// cannot cover a second same-operator instance declared as net-2: the metrics
+	// adapter rejects the mismatched fetch, so that instance stays offline and the
+	// operator never resolves.
+	t.Run("distinct network ids: one node cannot cover the second instance", func(t *testing.T) {
+		node := newExactAttestingNode(t, opAddr("op1"), "net-1")
+		source := NewMetricsReportSource(node.Client(), &MapAttestationSource{
+			Digests: map[string]string{"i1": testDigest, "i2": testDigest},
+		})
+		inv := twoTargets(node.URL, "i1", "net-1", "i2", "net-2")
+
+		tc := newTestCollector(t)
+		snap := run(t, tc, source, inv, 4)
+
+		status, ok := operatorStatus(snap, "op1")
+		if !ok || status == FleetResolvedCurrent {
+			t.Fatalf(
+				"one node answering net-1 must not certify an operator whose second "+
+					"instance is net-2; got ok=%v status=%v", ok, status,
+			)
+		}
+		if snap.Complete {
+			t.Fatal("readiness must not be complete while the second same-operator instance is uncovered")
+		}
+	})
+
+	// Positive control: a single legitimate instance whose own node attests the
+	// matching identity still resolves through the exact same fetch path, so the
+	// fix does not block real convergence.
+	t.Run("a legitimate single node-attested instance still resolves", func(t *testing.T) {
+		node := newExactAttestingNode(t, opAddr("op1"), "net-1")
+		source := NewMetricsReportSource(node.Client(), &MapAttestationSource{
+			Digests: map[string]string{"i1": testDigest},
+		})
+		i1 := eligibleInstance("i1", "op1")
+		i1.NetworkID = "net-1"
+		i1.TrustedReportTarget = node.URL
+
+		tc := newTestCollector(t)
+		snap := run(t, tc, source, []InventoryInstance{i1}, 4)
+
+		if status, ok := operatorStatus(snap, "op1"); !ok || status != FleetResolvedCurrent {
+			t.Fatalf("a legitimate node-attested instance must resolve; got ok=%v status=%v", ok, status)
+		}
+		if !snap.Complete {
+			t.Fatal("a fully resolved single-instance fleet must be complete")
+		}
+	})
 }

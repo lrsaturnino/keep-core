@@ -126,9 +126,14 @@ func testConfig() CollectorConfig {
 func eligibleInstance(instanceID, operatorName string) InventoryInstance {
 	op := opAddr(operatorName)
 	return InventoryInstance{
-		InstanceID:          instanceID,
-		OperatorAddress:     op,
-		StakingProvider:     spForOperator(op),
+		InstanceID:      instanceID,
+		OperatorAddress: op,
+		StakingProvider: spForOperator(op),
+		// A unique per-instance network ID: the collector now requires one (and
+		// requires it to be distinct) whenever the trust chain is enforced, so two
+		// instances cannot collapse onto one responding node. Derived from the
+		// instance ID so every fixture instance is automatically distinct.
+		NetworkID:           "net-" + instanceID,
 		CeremonyEligible:    true,
 		ExpectedRevision:    testRevision,
 		ExpectedEpoch:       ExpectedEpochSecurityV2Cutover,
@@ -148,6 +153,7 @@ func exactReport(instanceID, operatorName string, at time.Time) InstanceReport {
 	return InstanceReport{
 		InstanceID:       instanceID,
 		OperatorAddress:  opAddr(operatorName),
+		NetworkID:        "net-" + instanceID,
 		Revision:         testRevision,
 		Epoch:            ExpectedEpochSecurityV2Cutover,
 		ImageDigest:      testDigest,
@@ -160,6 +166,7 @@ func staleReport(instanceID, operatorName string, at time.Time) InstanceReport {
 	return InstanceReport{
 		InstanceID:       instanceID,
 		OperatorAddress:  opAddr(operatorName),
+		NetworkID:        "net-" + instanceID,
 		Revision:         "old-revision",
 		Epoch:            ExpectedEpochSecurityV2Cutover,
 		ImageDigest:      testDigest,
