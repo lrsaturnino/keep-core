@@ -371,7 +371,14 @@ func (c *localChain) CurrentRequestGroupPublicKey() ([]byte, error) {
 }
 
 func (c *localChain) GetRelayEntryTimeoutReports() []uint64 {
-	return c.relayEntryTimeoutReports
+	c.relayEntryTimeoutReportsMutex.Lock()
+	defer c.relayEntryTimeoutReportsMutex.Unlock()
+
+	// Return a snapshot copy so callers can read the reports without racing a
+	// concurrent ReportRelayEntryTimeout append.
+	reports := make([]uint64, len(c.relayEntryTimeoutReports))
+	copy(reports, c.relayEntryTimeoutReports)
+	return reports
 }
 
 // CalculateDKGResultHash calculates a 256-bit hash of the DKG result.

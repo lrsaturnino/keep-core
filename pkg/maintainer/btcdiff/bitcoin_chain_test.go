@@ -2,6 +2,7 @@ package btcdiff
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/keep-network/keep-core/pkg/bitcoin"
 )
@@ -10,7 +11,11 @@ var errNoBlocksSet = fmt.Errorf("blockchain does not contain any blocks")
 
 // localBitcoinChain represents a local Bitcoin chain.
 type localBitcoinChain struct {
-	blockHeaders map[uint]*bitcoin.BlockHeader
+	// blockHeadersMutex guards blockHeaders. The maintainer reads it from its
+	// proving goroutine (GetLatestBlockHeight, GetBlockHeader) while the test's
+	// main goroutine replaces it via SetBlockHeaders.
+	blockHeadersMutex sync.Mutex
+	blockHeaders      map[uint]*bitcoin.BlockHeader
 }
 
 // GetTransaction gets the transaction with the given transaction hash.
@@ -45,6 +50,9 @@ func (lbc *localBitcoinChain) BroadcastTransaction(
 // GetLatestBlockHeight gets the height of the latest block (tip). If the
 // latest block was not determined, this function returns an error.
 func (lbc *localBitcoinChain) GetLatestBlockHeight() (uint, error) {
+	lbc.blockHeadersMutex.Lock()
+	defer lbc.blockHeadersMutex.Unlock()
+
 	blockchainTip := uint(0)
 	for blockHeaderHeight := range lbc.blockHeaders {
 		if blockHeaderHeight > blockchainTip {
@@ -65,6 +73,9 @@ func (lbc *localBitcoinChain) GetLatestBlockHeight() (uint, error) {
 func (lbc *localBitcoinChain) GetBlockHeader(
 	blockNumber uint,
 ) (*bitcoin.BlockHeader, error) {
+	lbc.blockHeadersMutex.Lock()
+	defer lbc.blockHeadersMutex.Unlock()
+
 	blockHeader, found := lbc.blockHeaders[blockNumber]
 	if !found {
 		return nil, fmt.Errorf(
@@ -118,6 +129,9 @@ func (lbc *localBitcoinChain) GetMempoolUtxosForPublicKeyHash(
 func (lbc *localBitcoinChain) SetBlockHeaders(
 	blockHeaders map[uint]*bitcoin.BlockHeader,
 ) {
+	lbc.blockHeadersMutex.Lock()
+	defer lbc.blockHeadersMutex.Unlock()
+
 	lbc.blockHeaders = blockHeaders
 }
 

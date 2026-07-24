@@ -222,6 +222,12 @@ func (c *Chain) GetOperatorID(
 }
 
 func (c *Chain) SetCurrentTimestamp(currentTimestamp *big.Int) {
+	// currentTimestamp is read by canRestoreRewardEligibility under
+	// ineligibleForRewardsUntilMutex, so guard the write with the same mutex to
+	// avoid racing the monitoring goroutine.
+	c.ineligibleForRewardsUntilMutex.Lock()
+	defer c.ineligibleForRewardsUntilMutex.Unlock()
+
 	c.currentTimestamp = currentTimestamp
 }
 

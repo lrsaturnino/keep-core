@@ -77,21 +77,13 @@ func maintainers(cmd *cobra.Command, args []string) error {
 	}
 
 	// Wire client-info metrics when the client-info endpoint is enabled (opt-in
-	// via [clientInfo] Port / --clientInfo.port). The SPV maintainer records its
-	// redemption-proof counters through the global recorder set here. When the
-	// port is 0 the endpoint stays disabled and the recorder stays nil, so proof
+	// via [clientInfo] Port / --clientInfo.port). This must happen before
+	// maintainer.Initialize so the SPV control loop records its redemption-proof
+	// counters through a recorder that is already in place. When the port is 0
+	// the endpoint stays disabled and the recorder stays nil, so proof
 	// submission is unaffected.
-	if performanceMetrics := initializeMaintainerClientInfo(
-		ctx,
-		clientConfig,
-		btcChain,
-	); performanceMetrics != nil {
-		spv.SetMetricsRecorder(performanceMetrics)
-		defer func() {
-			spv.SetMetricsRecorder(nil)
-			performanceMetrics.Stop()
-		}()
-	}
+	stopMetrics := wireMaintainerMetrics(ctx, clientConfig, btcChain)
+	defer stopMetrics()
 
 	maintainer.Initialize(
 		ctx,
@@ -140,4 +132,29 @@ func initializeMaintainerClientInfo(
 	)
 
 	return performanceMetrics
+}
+
+// wireMaintainerMetrics enables the optional client-info metrics endpoint and
+// wires its PerformanceMetrics recorder into the SPV maintainer. Callers must
+// invoke it before maintainer.Initialize so the recorder is in place before the
+// SPV control loop starts recording redemption-proof counters. It returns a
+// cleanup function that resets the global recorder and stops the metrics
+// goroutines; the cleanup is a no-op when the endpoint is disabled (port 0),
+// leaving the recorder nil and proof submission unaffected.
+func wireMaintainerMetrics(
+	ctx context.Context,
+	config *config.Config,
+	btcChain bitcoin.Chain,
+) func() {
+	performanceMetrics := initializeMaintainerClientInfo(ctx, config, btcChain)
+	if performanceMetrics == nil {
+		return func() {}
+	}
+
+	spv.SetMetricsRecorder(performanceMetrics)
+
+	return func() {
+		spv.SetMetricsRecorder(nil)
+		performanceMetrics.Stop()
+	}
 }

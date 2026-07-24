@@ -276,12 +276,20 @@ func TestWatchBlocks(t *testing.T) {
 
 	watcher1ReceivedCount := 0
 	watcher2ReceivedCount := 0
+	// The watcher channels are closed once their context is cancelled, so each
+	// consumer goroutine exits its range loop then. Closing a done channel on
+	// exit gives the main goroutine a happens-before edge to read the counters
+	// without racing the increments.
+	watcher1Done := make(chan struct{})
+	watcher2Done := make(chan struct{})
 	go func() {
+		defer close(watcher1Done)
 		for range watcher1 {
 			watcher1ReceivedCount++
 		}
 	}()
 	go func() {
+		defer close(watcher2Done)
 		for range watcher2 {
 			watcher2ReceivedCount++
 		}
@@ -291,6 +299,10 @@ func TestWatchBlocks(t *testing.T) {
 	cancel1()
 	time.Sleep(600 * time.Millisecond)
 	cancel2()
+
+	// Wait for both consumers to drain and exit before reading their counters.
+	<-watcher1Done
+	<-watcher2Done
 
 	if watcher1ReceivedCount != 1 {
 		t.Errorf("watcher 1 should receive [1] block, has [%v]", watcher1ReceivedCount)
@@ -314,13 +326,19 @@ func TestWatchBlocksNonBlocking(t *testing.T) {
 	watcher := blockCounter.WatchBlocks(ctx) // does read blocks
 
 	var receivedCount uint64
+	// The watcher channel is closed once the context is cancelled, so the
+	// consumer goroutine exits its range loop then. Closing done on exit gives
+	// the main goroutine a happens-before edge to read receivedCount.
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		for range watcher {
 			receivedCount++
 		}
 	}()
 
 	<-ctx.Done()
+	<-done
 
 	if receivedCount != 2 {
 		t.Errorf("watcher should receive [2] blocks, has [%v]", receivedCount)

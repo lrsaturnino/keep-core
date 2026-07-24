@@ -42,6 +42,7 @@ func Initialize(
 		spvChain:     spvChain,
 		btcDiffChain: btcDiffChain,
 		btcChain:     btcChain,
+		proofTypes:   proofTypes,
 	}
 
 	go spvMaintainer.startControlLoop(ctx)
@@ -75,12 +76,26 @@ func getMetricsRecorder() interface {
 	return globalMetricsRecorder
 }
 
-// proofTypes holds the information about proof types supported by the
-// SPV maintainer.
-var proofTypes = map[tbtc.WalletActionType]struct {
+// MetricsRecorder returns the metrics recorder currently wired into the SPV
+// maintainer, or nil when none is set. It is the exported read counterpart to
+// SetMetricsRecorder and lets the maintainer startup path assert that the
+// recorder was actually wired, without duplicating the wiring in tests.
+func MetricsRecorder() interface {
+	IncrementCounter(name string, value float64)
+} {
+	return getMetricsRecorder()
+}
+
+// proofType bundles the unproven-transactions source and the proof submitter
+// for a single SPV proof type.
+type proofType struct {
 	unprovenTransactionsGetter unprovenTransactionsGetter
 	transactionProofSubmitter  transactionProofSubmitter
-}{
+}
+
+// proofTypes holds the information about proof types supported by the
+// SPV maintainer.
+var proofTypes = map[tbtc.WalletActionType]proofType{
 	tbtc.ActionDepositSweep: {
 		unprovenTransactionsGetter: getUnprovenDepositSweepTransactions,
 		transactionProofSubmitter:  SubmitDepositSweepProof,
@@ -104,6 +119,10 @@ type spvMaintainer struct {
 	spvChain     Chain
 	btcDiffChain btcdiff.Chain
 	btcChain     bitcoin.Chain
+	// proofTypes are the proof types processed in each maintainSpv pass. It
+	// defaults to the package-level proofTypes map and is a field so tests can
+	// drive a real pass with controlled proof types.
+	proofTypes map[tbtc.WalletActionType]proofType
 }
 
 func (sm *spvMaintainer) startControlLoop(ctx context.Context) {
@@ -181,7 +200,7 @@ func (sm *spvMaintainer) maintainSpv(ctx context.Context) error {
 		// survive a reorg between passes.
 		headerCache := newBlockHeaderCache(sm.btcChain.GetBlockHeader)
 
-		for action, v := range proofTypes {
+		for action, v := range sm.proofTypes {
 			logger.Infof("starting [%s] proof task execution...", action)
 
 			if err := sm.proveTransactions(

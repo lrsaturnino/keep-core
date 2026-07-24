@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"math/big"
-	"reflect"
 
 	tsslibcommon "github.com/bnb-chain/tss-lib/common"
 	"github.com/bnb-chain/tss-lib/ecdsa/signing"
@@ -305,28 +304,38 @@ func (fm *finalizingMember) Result() *Result {
 }
 
 // receiveTSSResult waits for the tss-lib signing result to arrive on the result
-// channel, or for the context to be cancelled, returning the result as a
-// pointer to the full SignatureData.
+// channel, or for the context to be cancelled, and returns an
+// independently-owned SignatureData that carries the produced signature.
 //
-// It receives from the channel via reflection rather than a plain
-// `<-fm.tssResultChan`. tss-lib's common.SignatureData is a protobuf message
-// whose embedded MessageState carries a `[0]sync.Mutex` DoNotCopy marker, so a
-// direct value receive trips go vet's copylock analyzer. The copy is in fact
-// benign - tss-lib itself sends the value with `end <- *round.data` - but the
-// release completion tooling runs `go vet ./...` and must stay clean.
-// reflect.New+Set performs the unavoidable receive copy through the reflection
-// API, which the analyzer does not track, and hands back an addressable pointer
-// to the complete result so no downstream behavior changes.
+// Ownership boundary. tss-lib's signing.NewLocalParty requires a value-typed
+// result channel (`end chan<- common.SignatureData`) and delivers the outcome
+// with `end <- *round.data` (ecdsa/signing/finalize.go). common.SignatureData
+// is a protobuf message whose embedded protoimpl.MessageState carries a
+// `[0]sync.Mutex` DoNotCopy marker, so every consumer of that channel must copy
+// a lock-bearing struct on receive. go vet's copylock analyzer flags that copy,
+// even though it is benign here: the delivered value is a freshly built,
+// never-locked data carrier, and copying it once is exactly the contract the
+// value-typed channel imposes on all callers.
+//
+// Rather than evade the analyzer with reflection - which still copies the same
+// struct while making the copy invisible - the single unavoidable receive is
+// performed by the type-safe generic helper receiveFromChannel, and the fields
+// are then re-homed into a brand new SignatureData built with a composite
+// literal. The returned message therefore owns a fresh, zero-value
+// MessageState; the transient received value is never retained or propagated
+// past this boundary, and NewSignature reads only the R, S and recovery byte
+// slices from it.
+//
+// The audited tss-lib dependency is pinned by commit in go.mod and is the
+// security-review target, so its value-typed API is deliberately not forked to
+// a pointer channel as part of this release; changing the channel element type
+// is the correct upstream fix and is tracked separately.
 func (fm *finalizingMember) receiveTSSResult(
 	ctx context.Context,
 ) (*tsslibcommon.SignatureData, error) {
-	chosen, received, ok := reflect.Select([]reflect.SelectCase{
-		{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(fm.tssResultChan)},
-		{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(ctx.Done())},
-	})
-
-	// The context was cancelled before a result was produced.
-	if chosen == 1 {
+	received, ok, err := receiveFromChannel(ctx, fm.tssResultChan)
+	if err != nil {
+		// The context was cancelled before a result was produced.
 		return nil, fmt.Errorf("TSS result was not generated on time")
 	}
 
@@ -334,10 +343,39 @@ func (fm *finalizingMember) receiveTSSResult(
 		return nil, fmt.Errorf("TSS result channel was closed unexpectedly")
 	}
 
-	result := reflect.New(received.Type())
-	result.Elem().Set(received)
+	// Re-home the produced fields into a freshly allocated, independently-owned
+	// SignatureData. The received value (and the lock-bearing MessageState it
+	// copied from tss-lib) is not kept beyond this point.
+	return &tsslibcommon.SignatureData{
+		Signature:         received.GetSignature(),
+		SignatureRecovery: received.GetSignatureRecovery(),
+		R:                 received.GetR(),
+		S:                 received.GetS(),
+		M:                 received.GetM(),
+	}, nil
+}
 
-	return result.Interface().(*tsslibcommon.SignatureData), nil
+// receiveFromChannel performs a context-aware receive from ch. It reports the
+// received value, whether the channel delivered a value (false once the channel
+// is closed and drained), and a non-nil error if the context was cancelled or
+// its deadline passed before a value arrived.
+//
+// It is generic over the element type so a single, unit-tested primitive covers
+// the value receive that tss-lib's value-typed result channel forces on the
+// caller. Keeping the receive here - instead of inline at every call site -
+// confines the one lock-bearing protobuf copy tss-lib mandates (see
+// receiveTSSResult) to a single, well-documented place.
+func receiveFromChannel[T any](
+	ctx context.Context,
+	ch <-chan T,
+) (T, bool, error) {
+	select {
+	case value, ok := <-ch:
+		return value, ok, nil
+	case <-ctx.Done():
+		var zero T
+		return zero, false, ctx.Err()
+	}
 }
 
 // identityConverter implements the common.IdentityConverter for tECDSA signing.

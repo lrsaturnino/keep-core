@@ -1,10 +1,15 @@
 package spv
 
 import (
+	"context"
+	"errors"
 	"math/big"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/keep-network/keep-core/pkg/bitcoin"
+	"github.com/keep-network/keep-core/pkg/tbtc"
 )
 
 func TestBlockHeaderCache(t *testing.T) {
@@ -215,15 +220,32 @@ func TestGetProofInfoUsesPassHeaderCache(t *testing.T) {
 	}
 }
 
-// TestProveTransactionsSharesHeaderCacheAcrossProofTypes proves that the single
-// pass-scoped cache maintainSpv creates above the proofTypes loop
-// (spv.go: newBlockHeaderCache before `for action, v := range proofTypes`) is
-// shared across every proof type in a pass, not just across transactions within
-// one proof type. It drives sm.proveTransactions once per simulated proof type
-// with the same cache - exactly as maintainSpv does - and asserts each distinct
-// height is fetched from the backend once across all proof types, then that the
-// next pass's fresh cache refetches.
-func TestProveTransactionsSharesHeaderCacheAcrossProofTypes(t *testing.T) {
+// countingBitcoinChain wraps a localBitcoinChain and counts GetBlockHeader
+// backend fetches. maintainSpv builds its per-pass cache from
+// sm.btcChain.GetBlockHeader, so wiring this as sm.btcChain lets a test count
+// exactly the backend header fetches that cache makes through the real
+// production pass structure. All other bitcoin.Chain methods are promoted from
+// the embedded localBitcoinChain.
+type countingBitcoinChain struct {
+	*localBitcoinChain
+	getter *countingHeaderGetter
+}
+
+func (c *countingBitcoinChain) GetBlockHeader(
+	blockHeight uint,
+) (*bitcoin.BlockHeader, error) {
+	return c.getter.get(blockHeight)
+}
+
+// TestMaintainSpvSharesHeaderCacheAcrossProofTypes proves, by driving the real
+// maintainSpv, that the single pass-scoped cache it creates above the proofTypes
+// loop (spv.go: newBlockHeaderCache before `for action, v := range
+// sm.proofTypes`) is shared across every proof type in a pass. Unlike a test
+// that hand-assembles the shared cache, this fails if production ever moves the
+// cache construction inside the loop (a per-proof-type cache would refetch the
+// overlapping heights). It also asserts the next pass builds a fresh cache and
+// refetches, so height-keyed entries never survive across passes.
+func TestMaintainSpvSharesHeaderCacheAcrossProofTypes(t *testing.T) {
 	const proofStart = 790270
 
 	// Two transactions with distinct hashes and overlapping proof windows, each
@@ -254,81 +276,104 @@ func TestProveTransactionsSharesHeaderCacheAcrossProofTypes(t *testing.T) {
 	btcChain.addTransactionConfirmations(depositSweepTx.Hash(), 20)
 	btcChain.addTransactionConfirmations(redemptionTx.Hash(), 18)
 
-	getter := newCountingHeaderGetter(btcChain.GetBlockHeader)
-
-	sm := &spvMaintainer{
-		config:       Config{HistoryDepth: 100, TransactionLimit: 10},
-		spvChain:     localChain,
-		btcDiffChain: localChain,
-		btcChain:     btcChain,
+	counting := &countingBitcoinChain{
+		localBitcoinChain: btcChain,
+		getter:            newCountingHeaderGetter(btcChain.GetBlockHeader),
 	}
 
-	// A getter standing in for one proof type's unproven-transactions source.
-	proofTypeGetter := func(tx *bitcoin.Transaction) unprovenTransactionsGetter {
-		return func(
-			uint64,
-			int,
-			bitcoin.Chain,
-			Chain,
-		) ([]*bitcoin.Transaction, error) {
-			return []*bitcoin.Transaction{tx}, nil
-		}
-	}
-	noopSubmitter := func(
-		bitcoin.Hash,
-		uint,
-		bitcoin.Chain,
-		Chain,
-	) error {
+	noopSubmitter := func(bitcoin.Hash, uint, bitcoin.Chain, Chain) error {
 		return nil
 	}
 
-	runPass := func(cache *blockHeaderCache) {
-		// Two proof types, one shared cache - the maintainSpv structure.
-		if err := sm.proveTransactions(
-			proofTypeGetter(depositSweepTx),
-			noopSubmitter,
-			cache,
-		); err != nil {
-			t.Fatalf("deposit-sweep proof type failed: %v", err)
+	sm := &spvMaintainer{
+		// A long idle backoff guarantees exactly one pass runs per maintainSpv
+		// call: after the pass, the post-pass select observes the cancelled
+		// context and returns instead of starting another pass.
+		config: Config{
+			HistoryDepth:     100,
+			TransactionLimit: 10,
+			IdleBackoffTime:  time.Hour,
+		},
+		spvChain:     localChain,
+		btcDiffChain: localChain,
+		btcChain:     counting,
+	}
+
+	// runPass drives one real maintainSpv pass. It ends the pass deterministically
+	// by cancelling the context once both proof types' getters have run (the
+	// getter is the first call proveTransactions makes). proveTransactions is not
+	// ctx-aware, so both proof types still process fully - fetching their header
+	// windows through the single per-pass cache - and only maintainSpv's post-pass
+	// select observes the cancellation.
+	runPass := func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		var getterCalls int32
+		mkGetter := func(tx *bitcoin.Transaction) unprovenTransactionsGetter {
+			return func(
+				uint64,
+				int,
+				bitcoin.Chain,
+				Chain,
+			) ([]*bitcoin.Transaction, error) {
+				if atomic.AddInt32(&getterCalls, 1) == 2 {
+					cancel()
+				}
+				return []*bitcoin.Transaction{tx}, nil
+			}
 		}
-		if err := sm.proveTransactions(
-			proofTypeGetter(redemptionTx),
-			noopSubmitter,
-			cache,
-		); err != nil {
-			t.Fatalf("redemption proof type failed: %v", err)
+
+		sm.proofTypes = map[tbtc.WalletActionType]proofType{
+			tbtc.ActionDepositSweep: {
+				unprovenTransactionsGetter: mkGetter(depositSweepTx),
+				transactionProofSubmitter:  noopSubmitter,
+			},
+			tbtc.ActionRedemption: {
+				unprovenTransactionsGetter: mkGetter(redemptionTx),
+				transactionProofSubmitter:  noopSubmitter,
+			},
+		}
+
+		if err := sm.maintainSpv(ctx); !errors.Is(err, context.Canceled) {
+			t.Fatalf(
+				"expected maintainSpv to stop with context.Canceled, got [%v]",
+				err,
+			)
 		}
 	}
 
-	passCache := newBlockHeaderCache(getter.get)
-	runPass(passCache)
+	// One real maintainSpv pass creates a single cache above the proofTypes loop,
+	// so the 8 distinct heights across the two overlapping proof-type walks are
+	// fetched from the backend exactly once.
+	runPass()
 
-	if got := getter.totalCalls(); got != 8 {
+	if got := counting.getter.totalCalls(); got != 8 {
 		t.Fatalf(
-			"expected 8 backend calls for 8 distinct heights shared across "+
-				"proof types in one pass, got [%d]",
+			"expected 8 backend header fetches shared across proof types in one "+
+				"maintainSpv pass, got [%d] (12 would mean the cache is created "+
+				"per proof type instead of once per pass)",
 			got,
 		)
 	}
 	for h := uint(proofStart); h <= proofStart+7; h++ {
-		if got := getter.callsAt(h); got != 1 {
+		if got := counting.getter.callsAt(h); got != 1 {
 			t.Fatalf(
-				"expected height [%d] fetched once across all proof types in "+
-					"the pass, got [%d]",
+				"expected height [%d] fetched once in the pass, got [%d]",
 				h,
 				got,
 			)
 		}
 	}
 
-	// A new pass uses a fresh cache and refetches the shared heights.
-	runPass(newBlockHeaderCache(getter.get))
+	// A second maintainSpv pass builds a fresh cache and refetches the shared
+	// heights, so height-keyed entries never survive across passes (reorg safety).
+	runPass()
 
-	if got := getter.totalCalls(); got != 16 {
+	if got := counting.getter.totalCalls(); got != 16 {
 		t.Fatalf(
-			"expected 16 total backend calls after the second pass refetch, "+
-				"got [%d]",
+			"expected 16 total backend header fetches after a second maintainSpv "+
+				"pass refetch, got [%d]",
 			got,
 		)
 	}

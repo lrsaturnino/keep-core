@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -112,12 +113,19 @@ func TestUnregisterHandler(t *testing.T) {
 			// Handlers are fired asynchronously; wait for them
 			time.Sleep(500 * time.Millisecond)
 
-			sort.Strings(handlersFired)
-			if !reflect.DeepEqual(test.handlersFired, handlersFired) {
+			// Read under the same mutex the handlers write under, taking a
+			// snapshot so the comparison cannot race a still-firing handler.
+			handlersFiredMutex.Lock()
+			firedSnapshot := make([]string, len(handlersFired))
+			copy(firedSnapshot, handlersFired)
+			handlersFiredMutex.Unlock()
+
+			sort.Strings(firedSnapshot)
+			if !reflect.DeepEqual(test.handlersFired, firedSnapshot) {
 				t.Errorf(
 					"Unexpected handlers fired\nExpected: %v\nActual:   %v\n",
 					test.handlersFired,
-					handlersFired,
+					firedSnapshot,
 				)
 			}
 		})
@@ -129,13 +137,13 @@ func TestUnregisterWhenHandling(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	receivedCount := 0
-	stopAt := 90
+	// receivedCount is written by the Recv handler goroutine and read by the
+	// main goroutine, so it is accessed atomically to avoid a data race.
+	var receivedCount atomic.Int64
+	stopAt := int64(90)
 
 	channel.Recv(ctx, func(msg net.Message) {
-		receivedCount++
-
-		if receivedCount == stopAt {
+		if receivedCount.Add(1) == stopAt {
 			cancel()
 		}
 	})
@@ -148,8 +156,8 @@ func TestUnregisterWhenHandling(t *testing.T) {
 
 	time.Sleep(500 * time.Millisecond)
 
-	if receivedCount != stopAt {
-		t.Fatalf("unexpected number of received messages: [%v]", receivedCount)
+	if final := receivedCount.Load(); final != stopAt {
+		t.Fatalf("unexpected number of received messages: [%v]", final)
 	}
 }
 
@@ -159,10 +167,12 @@ func TestUnregisterWhenHandlingBlocked(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	receivedCount := 0
+	// receivedCount is written by the Recv handler goroutine and read by the
+	// main goroutine, so it is accessed atomically to avoid a data race.
+	var receivedCount atomic.Int64
 
 	channel.Recv(ctx, func(msg net.Message) {
-		receivedCount++
+		receivedCount.Add(1)
 		receiver <- msg // there is no receiver, this call will block
 	})
 
@@ -174,10 +184,15 @@ func TestUnregisterWhenHandlingBlocked(t *testing.T) {
 	cancel()
 	time.Sleep(100 * time.Millisecond)
 
-	if receivedCount != 1 {
+	if final := receivedCount.Load(); final != 1 {
 		t.Fatalf("expected just one Recv call")
 	}
-	if len(channel.messageHandlers) != 0 {
+	// removeHandler mutates messageHandlers under messageHandlersMutex from the
+	// handler lifecycle goroutine, so read its length under the same lock.
+	channel.messageHandlersMutex.Lock()
+	remainingHandlers := len(channel.messageHandlers)
+	channel.messageHandlersMutex.Unlock()
+	if remainingHandlers != 0 {
 		t.Fatalf("expected the handler to be unregistered")
 	}
 }

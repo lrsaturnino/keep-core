@@ -737,6 +737,7 @@ describe("RandomBeacon - Relay", () => {
 
         context("when result is submitted after the soft timeout", () => {
           let initialSubmitterBalance: BigNumber
+          let initialReimbursementPoolBalance: BigNumber
           // `relayEntrySubmissionFailureSlashingAmount = 1000e18`.
           // 75% of the soft timeout period elapsed so we expect
           // `750e18` to be slashed.
@@ -765,11 +766,15 @@ describe("RandomBeacon - Relay", () => {
             initialSubmitterBalance = await provider.getBalance(
               submitter.address
             )
+            initialReimbursementPoolBalance = await provider.getBalance(
+              reimbursementPool.address
+            )
             submissionTx = await randomBeacon
               .connect(submitter)
               ["submitRelayEntry(bytes,uint32[])"](
                 blsData.groupSignature,
-                membersIDs
+                membersIDs,
+                { gasPrice: RELAY_ENTRY_GAS_PRICE }
               )
 
             slashingTx = await staking.processSlashing(membersAddresses.length)
@@ -813,15 +818,34 @@ describe("RandomBeacon - Relay", () => {
             expect(await randomBeacon.isRelayRequestInProgress()).to.be.false
           })
 
-          it("should refund ETH", async () => {
-            const postNotifierBalance = await provider.getBalance(
-              submitter.address
+          it("should fully reimburse the submitter within the tuned over-reimbursement tolerance", async () => {
+            // The slashingTx that ran after submissionTx in the before hook is a
+            // separate staking.processSlashing call sent by another signer; it
+            // seizes staked T tokens and touches neither the submitter's ETH
+            // balance nor the reimbursement pool, so the measured net below is
+            // exactly submissionTx's reimbursement.
+            const measurement = await measureRelayEntryReimbursement(
+              reimbursementPool,
+              submitter,
+              initialSubmitterBalance,
+              initialReimbursementPoolBalance,
+              submissionTx
             )
-            const diff = postNotifierBalance.sub(initialSubmitterBalance)
-            expect(diff).to.be.gt(0)
-            expect(diff).to.be.lt(
-              ethers.utils.parseUnits("1000000", "gwei") // 0,001 ETH
-            )
+
+            // Same offset economics as the before-soft-timeout path: the delay
+            // slashing is only queued inside the measured gasStart..gasleft()
+            // window (the actual seizure happens in the separate slashingTx), and
+            // the unmeasured intrinsic-calldata slack is identical because the
+            // arguments are the same bytes + uint32[] pair. The submitter is made
+            // whole with only the tuned over-reimbursement margin.
+            expect(
+              measurement.netWei,
+              "submitter was under-reimbursed at the current offset"
+            ).to.be.gte(0)
+            expect(
+              measurement.netGas,
+              "over-reimbursement exceeds the tuned tolerance"
+            ).to.be.lte(TUNED_OVER_REIMBURSEMENT_GAS_TOLERANCE)
           })
         })
       })

@@ -3,6 +3,8 @@ package generator
 import (
 	"context"
 	"math/big"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,6 +13,33 @@ import (
 
 var one = big.NewInt(1)
 
+// safeCounter is a goroutine-safe counter used by the scheduler tests. The
+// scheduler runs worker functions in their own goroutines while the test's main
+// goroutine reads the accumulated results, so both the increment and the
+// snapshot read must be synchronized to avoid a data race.
+type safeCounter struct {
+	mu    sync.Mutex
+	value *big.Int
+}
+
+func newSafeCounter() *safeCounter {
+	return &safeCounter{value: big.NewInt(0)}
+}
+
+func (c *safeCounter) increment() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.value.Add(c.value, one)
+}
+
+// snapshot returns an independent copy of the current value that the caller can
+// compare without holding the lock.
+func (c *safeCounter) snapshot() *big.Int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return new(big.Int).Set(c.value)
+}
+
 // TestComputeStop tests the situation when two new worker functions are added
 // to a scheduler in a working state. The test ensures the worker functions
 // starts doing their work. Then, the scheduler is stopped and the test ensures
@@ -18,22 +47,22 @@ var one = big.NewInt(1)
 func TestComputeStop(t *testing.T) {
 	scheduler := new(Scheduler)
 
-	number1 := big.NewInt(0)
-	number2 := big.NewInt(0)
+	number1 := newSafeCounter()
+	number2 := newSafeCounter()
 
 	scheduler.compute(func(context.Context) {
-		number1.Add(number1, one)
+		number1.increment()
 	})
 	scheduler.compute(func(context.Context) {
-		number2.Add(number2, one)
+		number2.increment()
 	})
 
 	// give some time to perform computations
 	time.Sleep(10 * time.Millisecond)
 
 	// ensure computations started
-	testutils.AssertBigIntNonZero(t, "computation result", number1)
-	testutils.AssertBigIntNonZero(t, "computation result", number2)
+	testutils.AssertBigIntNonZero(t, "computation result", number1.snapshot())
+	testutils.AssertBigIntNonZero(t, "computation result", number2.snapshot())
 
 	// send the stop signal and give some time to stop computations
 	scheduler.stop()
@@ -41,8 +70,8 @@ func TestComputeStop(t *testing.T) {
 
 	// at this point, all computations should be stopped, capture the current
 	// result
-	result1 := new(big.Int).Set(number1)
-	result2 := new(big.Int).Set(number2)
+	result1 := number1.snapshot()
+	result2 := number2.snapshot()
 
 	// wait some time and ensure computations stopped
 	time.Sleep(20 * time.Millisecond)
@@ -50,13 +79,13 @@ func TestComputeStop(t *testing.T) {
 		t,
 		"computation result after stop signal",
 		result1,
-		number1,
+		number1.snapshot(),
 	)
 	testutils.AssertBigIntsEqual(
 		t,
 		"computation result after stop signal",
 		result2,
-		number2,
+		number2.snapshot(),
 	)
 }
 
@@ -66,18 +95,20 @@ func TestComputeStop(t *testing.T) {
 func TestComputeStopContext(t *testing.T) {
 	scheduler := new(Scheduler)
 
-	cancelled1 := false
-	cancelled2 := false
+	// cancelled1/cancelled2 are written by the worker goroutines and read by the
+	// main goroutine, so they are accessed atomically.
+	var cancelled1 atomic.Bool
+	var cancelled2 atomic.Bool
 
 	scheduler.compute(func(ctx context.Context) {
 		// this simulates a long-running task
 		<-ctx.Done()
-		cancelled1 = true
+		cancelled1.Store(true)
 	})
 	scheduler.compute(func(ctx context.Context) {
 		// this simulates a long-running task
 		<-ctx.Done()
-		cancelled2 = true
+		cancelled2.Store(true)
 	})
 
 	// give some time to perform computations
@@ -88,10 +119,10 @@ func TestComputeStopContext(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// ensure context got cancelled
-	if !cancelled1 {
+	if !cancelled1.Load() {
 		t.Errorf("expected context to be cancelled")
 	}
-	if !cancelled2 {
+	if !cancelled2.Load() {
 		t.Errorf("expected context to be cancelled")
 	}
 }
@@ -104,14 +135,14 @@ func TestComputeStopResume(t *testing.T) {
 	scheduler := new(Scheduler)
 	defer scheduler.stop()
 
-	number1 := big.NewInt(0)
-	number2 := big.NewInt(0)
+	number1 := newSafeCounter()
+	number2 := newSafeCounter()
 
 	scheduler.compute(func(context.Context) {
-		number1.Add(number1, one)
+		number1.increment()
 	})
 	scheduler.compute(func(context.Context) {
-		number2.Add(number2, one)
+		number2.increment()
 	})
 
 	// send the stop signal and give some time to stop computations
@@ -120,8 +151,8 @@ func TestComputeStopResume(t *testing.T) {
 
 	// at this point, all computations should be stopped, capture the current
 	// result
-	intermediateResult1 := new(big.Int).Set(number1)
-	intermediateResult2 := new(big.Int).Set(number2)
+	intermediateResult1 := number1.snapshot()
+	intermediateResult2 := number2.snapshot()
 
 	// send the resume signal and give some time to resume computations
 	scheduler.resume()
@@ -132,13 +163,13 @@ func TestComputeStopResume(t *testing.T) {
 		t,
 		"computation results after resume signal",
 		intermediateResult1,
-		number1,
+		number1.snapshot(),
 	)
 	testutils.AssertBigIntsNotEqual(
 		t,
 		"computation results after resume signal",
 		intermediateResult2,
-		number2,
+		number2.snapshot(),
 	)
 }
 
@@ -149,14 +180,14 @@ func TestComputeStopResume(t *testing.T) {
 func TestComputeStopResumeStop(t *testing.T) {
 	scheduler := new(Scheduler)
 
-	number1 := big.NewInt(0)
-	number2 := big.NewInt(0)
+	number1 := newSafeCounter()
+	number2 := newSafeCounter()
 
 	scheduler.compute(func(context.Context) {
-		number1.Add(number1, one)
+		number1.increment()
 	})
 	scheduler.compute(func(context.Context) {
-		number2.Add(number2, one)
+		number2.increment()
 	})
 
 	scheduler.stop()
@@ -165,8 +196,8 @@ func TestComputeStopResumeStop(t *testing.T) {
 
 	// at this point, all computations should be stopped, capture the current
 	// result
-	result1 := new(big.Int).Set(number1)
-	result2 := new(big.Int).Set(number2)
+	result1 := number1.snapshot()
+	result2 := number2.snapshot()
 
 	// wait some time and ensure computations stopped
 	time.Sleep(20 * time.Millisecond)
@@ -174,13 +205,13 @@ func TestComputeStopResumeStop(t *testing.T) {
 		t,
 		"computation result after stop signal",
 		result1,
-		number1,
+		number1.snapshot(),
 	)
 	testutils.AssertBigIntsEqual(
 		t,
 		"computation result after stop signal",
 		result2,
-		number2,
+		number2.snapshot(),
 	)
 }
 
@@ -194,19 +225,19 @@ func TestStopComputeResume(t *testing.T) {
 
 	scheduler.stop()
 
-	number1 := big.NewInt(0)
-	number2 := big.NewInt(0)
+	number1 := newSafeCounter()
+	number2 := newSafeCounter()
 
 	scheduler.compute(func(context.Context) {
-		number1.Add(number1, one)
+		number1.increment()
 	})
 	scheduler.compute(func(context.Context) {
-		number2.Add(number2, one)
+		number2.increment()
 	})
 
 	// assert computations have not started - the scheduler is stopped
-	testutils.AssertBigIntsEqual(t, "computation result", big.NewInt(0), number1)
-	testutils.AssertBigIntsEqual(t, "computation result", big.NewInt(0), number2)
+	testutils.AssertBigIntsEqual(t, "computation result", big.NewInt(0), number1.snapshot())
+	testutils.AssertBigIntsEqual(t, "computation result", big.NewInt(0), number2.snapshot())
 
 	scheduler.resume()
 	// give some time to perform computations;
@@ -215,8 +246,8 @@ func TestStopComputeResume(t *testing.T) {
 	time.Sleep(250 * time.Millisecond)
 
 	// ensure computations started
-	testutils.AssertBigIntNonZero(t, "computation result", number1)
-	testutils.AssertBigIntNonZero(t, "computation result", number2)
+	testutils.AssertBigIntNonZero(t, "computation result", number1.snapshot())
+	testutils.AssertBigIntNonZero(t, "computation result", number2.snapshot())
 }
 
 // TestCheckProtocols_NoProtocols ensures the execution of checkProtocols
@@ -225,14 +256,14 @@ func TestCheckProtocols_NoProtocols(t *testing.T) {
 	scheduler := new(Scheduler)
 	defer scheduler.stop()
 
-	number1 := big.NewInt(0)
-	number2 := big.NewInt(0)
+	number1 := newSafeCounter()
+	number2 := newSafeCounter()
 
 	scheduler.compute(func(context.Context) {
-		number1.Add(number1, one)
+		number1.increment()
 	})
 	scheduler.compute(func(context.Context) {
-		number2.Add(number2, one)
+		number2.increment()
 	})
 
 	// give some time to perform computations
@@ -245,21 +276,21 @@ func TestCheckProtocols_NoProtocols(t *testing.T) {
 
 	// there are no protocols executed, nothing can stop the scheduler;
 	// ensure the computations are performed
-	intermediateResult1 := new(big.Int).Set(number1)
-	intermediateResult2 := new(big.Int).Set(number2)
+	intermediateResult1 := number1.snapshot()
+	intermediateResult2 := number2.snapshot()
 
 	time.Sleep(20 * time.Millisecond)
 	testutils.AssertBigIntsNotEqual(
 		t,
 		"computation result after stop signal",
 		intermediateResult1,
-		number1,
+		number1.snapshot(),
 	)
 	testutils.AssertBigIntsNotEqual(
 		t,
 		"computation result after stop signal",
 		intermediateResult2,
-		number2,
+		number2.snapshot(),
 	)
 }
 
@@ -270,14 +301,14 @@ func TestCheckProtocols_ProtocolNotExecuting(t *testing.T) {
 	scheduler := new(Scheduler)
 	defer scheduler.stop()
 
-	number1 := big.NewInt(0)
-	number2 := big.NewInt(0)
+	number1 := newSafeCounter()
+	number2 := newSafeCounter()
 
 	scheduler.compute(func(context.Context) {
-		number1.Add(number1, one)
+		number1.increment()
 	})
 	scheduler.compute(func(context.Context) {
-		number2.Add(number2, one)
+		number2.increment()
 	})
 
 	protocol1 := &mockProtocol{}
@@ -295,21 +326,21 @@ func TestCheckProtocols_ProtocolNotExecuting(t *testing.T) {
 
 	// there are two protocols but they are not executing;
 	// ensure the computations are performed
-	intermediateResult1 := new(big.Int).Set(number1)
-	intermediateResult2 := new(big.Int).Set(number2)
+	intermediateResult1 := number1.snapshot()
+	intermediateResult2 := number2.snapshot()
 
 	time.Sleep(20 * time.Millisecond)
 	testutils.AssertBigIntsNotEqual(
 		t,
 		"computation result after stop signal",
 		intermediateResult1,
-		number1,
+		number1.snapshot(),
 	)
 	testutils.AssertBigIntsNotEqual(
 		t,
 		"computation result after stop signal",
 		intermediateResult2,
-		number2,
+		number2.snapshot(),
 	)
 }
 
@@ -319,14 +350,14 @@ func TestCheckProtocols_ProtocolExecuting(t *testing.T) {
 	scheduler := new(Scheduler)
 	defer scheduler.stop()
 
-	number1 := big.NewInt(0)
-	number2 := big.NewInt(0)
+	number1 := newSafeCounter()
+	number2 := newSafeCounter()
 
 	scheduler.compute(func(context.Context) {
-		number1.Add(number1, one)
+		number1.increment()
 	})
 	scheduler.compute(func(context.Context) {
-		number2.Add(number2, one)
+		number2.increment()
 	})
 
 	protocol1 := &mockProtocol{}
@@ -345,21 +376,21 @@ func TestCheckProtocols_ProtocolExecuting(t *testing.T) {
 
 	// there are two protocols and the second one is executing
 	// ensure the computations are stopped
-	intermediateResult1 := new(big.Int).Set(number1)
-	intermediateResult2 := new(big.Int).Set(number2)
+	intermediateResult1 := number1.snapshot()
+	intermediateResult2 := number2.snapshot()
 
 	time.Sleep(20 * time.Millisecond)
 	testutils.AssertBigIntsEqual(
 		t,
 		"computation result after stop signal",
 		intermediateResult1,
-		number1,
+		number1.snapshot(),
 	)
 	testutils.AssertBigIntsEqual(
 		t,
 		"computation result after stop signal",
 		intermediateResult2,
-		number2,
+		number2.snapshot(),
 	)
 }
 
@@ -370,14 +401,14 @@ func TestCheckProtocols_ProtocolFinishedExecution(t *testing.T) {
 	scheduler := new(Scheduler)
 	defer scheduler.stop()
 
-	number1 := big.NewInt(0)
-	number2 := big.NewInt(0)
+	number1 := newSafeCounter()
+	number2 := newSafeCounter()
 
 	scheduler.compute(func(context.Context) {
-		number1.Add(number1, one)
+		number1.increment()
 	})
 	scheduler.compute(func(context.Context) {
-		number2.Add(number2, one)
+		number2.increment()
 	})
 
 	protocol1 := &mockProtocol{}
@@ -402,21 +433,21 @@ func TestCheckProtocols_ProtocolFinishedExecution(t *testing.T) {
 
 	// there are two protocols, the second one was executing, but it has
 	// finished; ensure the computations are resumed
-	intermediateResult1 := new(big.Int).Set(number1)
-	intermediateResult2 := new(big.Int).Set(number2)
+	intermediateResult1 := number1.snapshot()
+	intermediateResult2 := number2.snapshot()
 
 	time.Sleep(20 * time.Millisecond)
 	testutils.AssertBigIntsNotEqual(
 		t,
 		"computation result after stop signal",
 		intermediateResult1,
-		number1,
+		number1.snapshot(),
 	)
 	testutils.AssertBigIntsNotEqual(
 		t,
 		"computation result after stop signal",
 		intermediateResult2,
-		number2,
+		number2.snapshot(),
 	)
 }
 

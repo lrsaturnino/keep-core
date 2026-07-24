@@ -3,6 +3,7 @@ package watchtower
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -68,10 +69,17 @@ func newMockFirewall() *mockFirewall {
 }
 
 type mockFirewall struct {
-	meetsCriteria map[uint64]bool
+	// meetsCriteria is read by the Guard's asynchronous checkFirewallRules
+	// goroutine (via Validate) while the test updates it (via updatePeer), so
+	// access is guarded by a mutex.
+	meetsCriteriaMutex sync.Mutex
+	meetsCriteria      map[uint64]bool
 }
 
 func (mf *mockFirewall) Validate(remotePeerPublicKey *operator.PublicKey) error {
+	mf.meetsCriteriaMutex.Lock()
+	defer mf.meetsCriteriaMutex.Unlock()
+
 	if !mf.meetsCriteria[remotePeerPublicKey.X.Uint64()] {
 		return fmt.Errorf("remote peer does not meet firewall criteria")
 	}
@@ -82,6 +90,9 @@ func (mf *mockFirewall) updatePeer(
 	remotePeerOperatorPublicKey *operator.PublicKey,
 	meetsCriteria bool,
 ) {
+	mf.meetsCriteriaMutex.Lock()
+	defer mf.meetsCriteriaMutex.Unlock()
+
 	x := remotePeerOperatorPublicKey.X.Uint64()
 	mf.meetsCriteria[x] = meetsCriteria
 }

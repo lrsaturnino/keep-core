@@ -37,36 +37,56 @@ func TestMaintainerCommandExposesClientInfoFlags(t *testing.T) {
 	}
 }
 
-// TestInitializeMaintainerClientInfoDisabled verifies that a client-info port of
-// 0 leaves metrics disabled: no PerformanceMetrics is created, so the SPV
-// recorder is never wired and proof submission is unaffected.
-func TestInitializeMaintainerClientInfoDisabled(t *testing.T) {
+// TestWireMaintainerMetricsDisabled verifies that a client-info port of 0 leaves
+// metrics disabled: no PerformanceMetrics is created and the production wiring
+// helper leaves the SPV recorder unset, so proof submission is unaffected.
+func TestWireMaintainerMetricsDisabled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Start from a clean recorder so the assertion reflects this call only.
+	spv.SetMetricsRecorder(nil)
+	defer spv.SetMetricsRecorder(nil)
 
 	cfg := &config.Config{}
 	cfg.ClientInfo.Port = 0
 
-	performanceMetrics := initializeMaintainerClientInfo(ctx, cfg, nil)
-	if performanceMetrics != nil {
+	// The initializer creates no recorder when the endpoint is disabled...
+	if pm := initializeMaintainerClientInfo(ctx, cfg, nil); pm != nil {
 		t.Fatal("expected no performance metrics when client-info port is 0")
+	}
+
+	// ...and the production wiring helper therefore leaves the SPV recorder nil.
+	stop := wireMaintainerMetrics(ctx, cfg, nil)
+	defer stop()
+	if spv.MetricsRecorder() != nil {
+		t.Fatal("expected the SPV metrics recorder to stay nil when port is 0")
 	}
 }
 
-// TestInitializeMaintainerClientInfoEnabled verifies that a configured
-// client-info port creates a PerformanceMetrics recorder, that the recorder is
-// wired into the SPV maintainer exactly as the production maintainer startup
-// path does (spv.SetMetricsRecorder, cmd/maintainer.go, before
-// maintainer.Initialize), and that the three SPV redemption-proof series are
-// present at zero when the /metrics endpoint is scraped so Prometheus sees them
-// from startup.
+// TestWireMaintainerMetricsEnabled verifies that a configured client-info port
+// drives the exact production wiring helper (wireMaintainerMetrics in
+// cmd/maintainer.go, the same call the maintainer startup path uses before
+// maintainer.Initialize), that the helper actually wires the recorder into the
+// SPV maintainer, and that the three SPV redemption-proof series are present at
+// zero when the /metrics endpoint is scraped so Prometheus sees them from
+// startup.
+//
+// Driving wireMaintainerMetrics rather than calling spv.SetMetricsRecorder here
+// means this test fails if production stops wiring the recorder - the gap the
+// previous version could not catch.
 //
 // This is the single enabled-port test in the cmd package: keep-common's
 // EnableServer registers "/metrics" on the global http.DefaultServeMux, which
 // panics on a second registration, so all enabled-endpoint assertions live here.
-func TestInitializeMaintainerClientInfoEnabled(t *testing.T) {
+func TestWireMaintainerMetricsEnabled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Start from a clean recorder and guarantee it is reset even if an
+	// assertion below fails before the cleanup runs.
+	spv.SetMetricsRecorder(nil)
+	defer spv.SetMetricsRecorder(nil)
 
 	port, err := freeTCPPort()
 	if err != nil {
@@ -76,22 +96,21 @@ func TestInitializeMaintainerClientInfoEnabled(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.ClientInfo.Port = port
 
-	performanceMetrics := initializeMaintainerClientInfo(
+	// Drive the production wiring helper, exactly as the maintainer startup path
+	// does before maintainer.Initialize.
+	stop := wireMaintainerMetrics(
 		ctx,
 		cfg,
 		&stubBitcoinChain{latestBlockHeight: 100},
 	)
-	if performanceMetrics == nil {
-		t.Fatal("expected performance metrics when a client-info port is set")
-	}
-	defer performanceMetrics.Stop()
+	defer stop()
 
-	// Wire the recorder into the SPV maintainer the same way the production
-	// startup path does, before maintainer.Initialize would start the control
-	// loop. Reset to nil afterwards so the package-global recorder does not leak
-	// into other tests.
-	spv.SetMetricsRecorder(performanceMetrics)
-	defer spv.SetMetricsRecorder(nil)
+	// Production wiring must have installed the recorder into the SPV maintainer.
+	if spv.MetricsRecorder() == nil {
+		t.Fatal(
+			"expected wireMaintainerMetrics to wire the SPV metrics recorder",
+		)
+	}
 
 	// The three SPV redemption-proof series must be scrapeable at zero from
 	// startup so operators never see a gap before the first submission.
