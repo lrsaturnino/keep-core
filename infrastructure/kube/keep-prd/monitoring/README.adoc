@@ -15,8 +15,30 @@ The monitoring stack has the following components:
 1. Prometheus
 2. Trickster
 3. Grafana
+4. Alertmanager (cutover-roster alert routing)
+5. cutover-roster (coordinated-cutover fleet readiness collector)
 
 The production monitoring is based on the configuration described in the link:../../keep-test/monitoring/README.adoc[keep-test monitoring documentation].
+
+## Cutover-roster fleet readiness
+
+The `cutover-roster` collector answers the coordinated-cutover go/no-go question
+("which ceremony-eligible instance has not reported the exact cutover release?").
+It exposes the `performance_cutover_*` metrics (Prometheus job `cutover-roster`)
+and a readiness API (`GET /api/v1/cutover-readiness`). The **Cutover Readiness**
+Grafana dashboard reads the fleet gauges from Prometheus and the per-instance
+reconciliation reasons from the readiness API via the Infinity datasource. The
+`cutover-roster` alerts (`prometheus/config/rules.yaml`, group `cutover-roster`)
+route to Alertmanager, whose tree matches their `route_to` label and fans them to
+the Release and Operator Coordination receivers.
+
+NOTE: The `cutover-roster/deployment.yaml` and `alertmanager/` manifests are
+reviewable skeletons. Before apply, fill the `REPLACE_` placeholders: the
+collector image `@sha256:` digest, the monitoring pod CIDR (`--allowedCIDRs`),
+the authoritative inventory `ConfigMap` / secrets (Ethereum RPC URL,
+WalletRegistry address, expected revision/digest, cutover block), and the
+Alertmanager receiver integrations. These are operator-supplied and are
+intentionally not committed.
 
 Resources are exposed publicly under the following URLs:
 

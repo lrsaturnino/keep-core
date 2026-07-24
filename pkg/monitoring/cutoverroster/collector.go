@@ -1,6 +1,7 @@
 package cutoverroster
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -33,8 +34,11 @@ type IdentityVerifier interface {
 	// OperatorStakingProviderAtBlock returns the canonical (lowercase 0x + 40 hex)
 	// staking-provider address the WalletRegistry maps the operator to at the given
 	// block. A zero/empty return means the operator is not registered. block 0
-	// means "latest".
-	OperatorStakingProviderAtBlock(operatorAddress string, block uint64) (string, error)
+	// means "latest". It honors ctx so a canceled collection/shutdown context
+	// aborts the lookup promptly.
+	OperatorStakingProviderAtBlock(
+		ctx context.Context, operatorAddress string, block uint64,
+	) (string, error)
 }
 
 // MetricsSink is the metrics interface the collector needs. The fleet-level
@@ -70,12 +74,28 @@ type Collector struct {
 	verifier QuarantineVerifier
 	identity IdentityVerifier
 
+	// serviceDiscoveryConfigured records whether the command wired a production
+	// service-discovery feed. Completeness requires it when
+	// config.RequireServiceDiscovery is set, so a collector run without discovery
+	// can never certify readiness.
+	serviceDiscoveryConfigured bool
+
 	// mu guards the mutable central state (operators/instances) and
 	// lastSnapshot against concurrent Collect and HTTP Snapshot access.
 	mu           sync.RWMutex
 	operators    map[string]*operatorRecord
 	instances    map[string]*instanceRecord
 	lastSnapshot FleetSnapshot
+}
+
+// SetServiceDiscoveryConfigured records whether the production service-discovery
+// feed is wired. When config.RequireServiceDiscovery is set, completeness is
+// blocked until this is true, so a missing discovery feed blocks readiness
+// rather than silently degrading to an inventory-only view.
+func (c *Collector) SetServiceDiscoveryConfigured(configured bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.serviceDiscoveryConfigured = configured
 }
 
 // SetQuarantineVerifier installs the independent quarantine-evidence verifier.
@@ -150,21 +170,51 @@ func newCollectorWithClock(
 	}, nil
 }
 
-// Collect runs one collection cycle. reports maps instance ID to the report
-// obtained this cycle; a missing key means the instance was not reachable.
-// sightings are post-cutover node-local legacy sightings aggregated this cycle.
-// It updates and persists central state, refreshes metrics, emits logs, and
-// returns the resulting snapshot.
+// Collect runs one collection cycle with a background context. It is retained
+// for callers (and tests) that do not thread a cancellation context; production
+// uses CollectContext so identity-verification RPCs honor shutdown.
 func (c *Collector) Collect(
 	inventory []InventoryInstance,
 	reports map[string]InstanceReport,
 	sightings []LegacySighting,
 	currentBlock uint64,
 ) (FleetSnapshot, error) {
+	return c.CollectContext(context.Background(), inventory, reports, sightings, currentBlock)
+}
+
+// CollectContext runs one collection cycle. reports maps instance ID to the
+// report obtained this cycle; a missing key means the instance was not
+// reachable. sightings are post-cutover node-local legacy sightings aggregated
+// this cycle. It updates and persists central state, refreshes metrics, emits
+// logs, and returns the resulting snapshot.
+//
+// On-chain identity verification runs BEFORE the central-state lock is taken, so
+// a degraded WalletRegistry RPC endpoint can never block readiness snapshots (or
+// concurrent HTTP readers) for the duration of the whole per-operator RPC
+// sweep. The verifier is captured under a short read lock; its results are then
+// applied inside the write lock.
+func (c *Collector) CollectContext(
+	ctx context.Context,
+	inventory []InventoryInstance,
+	reports map[string]InstanceReport,
+	sightings []LegacySighting,
+	currentBlock uint64,
+) (FleetSnapshot, error) {
+	now := c.clock()
+
+	// Phase 1 — no lock held. Verify each eligible operator's inventory
+	// staking-provider claim against the on-chain WalletRegistry via network RPCs.
+	// This is pure with respect to central state (it only reads the inventory
+	// argument and the captured verifier), so holding the lock across it would
+	// needlessly serialize readers behind a slow endpoint.
+	c.mu.RLock()
+	identity := c.identity
+	c.mu.RUnlock()
+	claims := eligibleStakingClaims(inventory)
+	identityFailed := verifyOperatorIdentities(ctx, identity, claims, currentBlock)
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	now := c.clock()
 
 	// Reset the per-cycle transient flags on every known instance so a stale value
 	// from a prior cycle never leaks into this cycle's reporter count or
@@ -176,6 +226,11 @@ func (c *Collector) Collect(
 
 	eligibleByOperator := map[string][]InventoryInstance{}
 	stakingProviderByOperator := map[string]string{}
+	// contradicted records operators whose eligible instances asserted more than
+	// one distinct staking provider in this cycle. A cross-instance contradiction
+	// means the inventory disagrees with itself about the operator's identity, so
+	// the operator must not resolve (the last assignment must not silently win).
+	contradicted := map[string]bool{}
 	// seenInstanceIDs records which instances were present and eligible in the
 	// current inventory, so the reconciliation step can detect instances that
 	// have disappeared from service discovery since an earlier cycle.
@@ -219,6 +274,23 @@ func (c *Collector) Collect(
 			unreconciled++
 			continue
 		}
+		// The staking provider is an on-chain identity: it must be a canonical
+		// address and must not be the zero address (an unregistered/blank
+		// operator). A non-address or zero staking provider cannot be joined to the
+		// WalletRegistry mapping and must not contribute to a resolved status.
+		normalizedStakingProvider := normalizeAddress(inv.StakingProvider)
+		if !isCanonicalAddress(normalizedStakingProvider) ||
+			isZeroAddress(normalizedStakingProvider) {
+			unreconciled++
+			continue
+		}
+		// The expected image digest must be a full, immutable content digest
+		// (sha256:<64 hex>). An abbreviated or malformed digest cannot pin the
+		// exact runtime image, so it must not certify what "current" is.
+		if !isValidImageDigest(inv.ExpectedImageDigest) {
+			unreconciled++
+			continue
+		}
 		if c.inventoryExpectationContradicts(inv) {
 			unreconciled++
 			continue
@@ -229,8 +301,17 @@ func (c *Collector) Collect(
 		eligibleByOperator[inv.OperatorAddress] = append(
 			eligibleByOperator[inv.OperatorAddress], inv,
 		)
-		if inv.StakingProvider != "" {
-			stakingProviderByOperator[inv.OperatorAddress] = inv.StakingProvider
+		// Record the operator's staking provider, rejecting a cross-instance
+		// contradiction rather than letting the last assignment silently win. The
+		// first canonical claim is retained; a differing later claim marks the
+		// operator contradicted so it cannot resolve this cycle.
+		if existing, ok := stakingProviderByOperator[inv.OperatorAddress]; ok {
+			if existing != normalizedStakingProvider {
+				contradicted[inv.OperatorAddress] = true
+				unreconciled++
+			}
+		} else {
+			stakingProviderByOperator[inv.OperatorAddress] = normalizedStakingProvider
 		}
 
 		record := c.instanceForInventory(inv)
@@ -385,12 +466,16 @@ func (c *Collector) Collect(
 		)
 	}
 
-	// Verify operator→staking-provider identity on chain when a verifier is
-	// configured. A mismatch or a lookup failure is an inventory-reconciliation
-	// fault: the operator cannot resolve this cycle (fail closed).
-	identityFailed := c.verifyOperatorIdentities(
-		stakingProviderByOperator, currentBlock, &unreconciled,
-	)
+	// Fold the pre-lock on-chain identity verification into the unreconciled
+	// count: every eligible operator whose asserted staking-provider identity
+	// could not be confirmed against the WalletRegistry is an
+	// inventory-reconciliation fault (fail closed). The verification itself ran
+	// before the lock (Phase 1) so a slow RPC never blocked readers.
+	for op := range eligibleByOperator {
+		if identityFailed[op] {
+			unreconciled++
+		}
+	}
 
 	// Reconcile every operator with eligible instances this cycle, every operator
 	// with a fresh legacy sighting, AND every operator that still has persisted
@@ -438,6 +523,13 @@ func (c *Collector) Collect(
 		if identityFailed[operatorAddress] && status == FleetResolvedCurrent {
 			status = FleetOfflineUnknown
 			reason = "on-chain operator→staking-provider identity unverified"
+		}
+		// A cross-instance staking-provider contradiction is likewise fail-closed:
+		// the inventory disagrees with itself about who this operator is, so it
+		// cannot resolve until the inventory is made self-consistent.
+		if contradicted[operatorAddress] && status == FleetResolvedCurrent {
+			status = FleetOfflineUnknown
+			reason = "contradictory staking-provider claims across instances"
 		}
 
 		if op.FirstSeenBlock == 0 {
@@ -589,8 +681,21 @@ func (c *Collector) isComplete(
 	}
 	if c.config.ExpectedRevision == "" ||
 		c.config.ExpectedEpoch == "" ||
-		c.config.ExpectedImageDigest == "" ||
-		c.config.ChainID == "" {
+		c.config.ChainID == "" ||
+		!isValidImageDigest(c.config.ExpectedImageDigest) {
+		return false
+	}
+	// Identity verification against the WalletRegistry is a mandatory part of the
+	// authoritative trust chain: without an installed verifier the collector would
+	// certify trusted-file staking-provider assertions on their own. A missing
+	// verifier blocks readiness rather than degrading to trusting the inventory.
+	if c.config.RequireIdentityVerification && c.identity == nil {
+		return false
+	}
+	// Reconciliation against production service discovery is likewise mandatory:
+	// without it a single responding target could stand in for several inventory
+	// instances of one operator. A missing discovery feed blocks readiness.
+	if c.config.RequireServiceDiscovery && !c.serviceDiscoveryConfigured {
 		return false
 	}
 	return len(snapshot.Blocking) == 0 && stale == 0 && unreconciled == 0
@@ -623,24 +728,67 @@ func isCanonicalAddress(s string) bool {
 	return true
 }
 
+// eligibleStakingClaims extracts each eligible operator's canonical
+// staking-provider claim from the inventory, applying the same identity-relevant
+// validation the reconciliation loop uses so on-chain verification runs over the
+// same operator set. It is pure with respect to central state, so it can run
+// before the collector lock is taken. An operator with a cross-instance
+// staking-provider contradiction is excluded: it cannot resolve regardless of
+// the on-chain answer, and there is no single claim to verify.
+func eligibleStakingClaims(inventory []InventoryInstance) map[string]string {
+	claims := map[string]string{}
+	seenInstances := map[string]bool{}
+	contradicted := map[string]bool{}
+	for _, raw := range inventory {
+		operator := normalizeAddress(raw.OperatorAddress)
+		if !raw.CeremonyEligible {
+			continue
+		}
+		if raw.InstanceID == "" || !isCanonicalAddress(operator) {
+			continue
+		}
+		if seenInstances[raw.InstanceID] {
+			continue
+		}
+		seenInstances[raw.InstanceID] = true
+		provider := normalizeAddress(raw.StakingProvider)
+		if !isCanonicalAddress(provider) || isZeroAddress(provider) {
+			continue
+		}
+		if existing, ok := claims[operator]; ok {
+			if existing != provider {
+				contradicted[operator] = true
+			}
+			continue
+		}
+		claims[operator] = provider
+	}
+	for operator := range contradicted {
+		delete(claims, operator)
+	}
+	return claims
+}
+
 // verifyOperatorIdentities verifies each eligible operator's inventory
-// staking-provider claim against the on-chain WalletRegistry mapping when an
-// identity verifier is configured. A mismatch or a lookup failure marks the
-// operator failed and increments the unreconciled counter (fail closed). When no
-// verifier is configured it returns an empty set: the command layer is
-// responsible for surfacing the unverified-identity gap. The caller holds c.mu.
-func (c *Collector) verifyOperatorIdentities(
-	stakingProviderByOperator map[string]string,
+// staking-provider claim against the on-chain WalletRegistry mapping. A mismatch
+// or a lookup failure marks the operator failed (fail closed). When no verifier
+// is configured it returns an empty set: the command layer is responsible for
+// surfacing the unverified-identity gap, and completeness is blocked separately
+// when identity verification is required. It performs only network I/O and holds
+// no lock, so it MUST run outside c.mu.
+func verifyOperatorIdentities(
+	ctx context.Context,
+	identity IdentityVerifier,
+	claims map[string]string,
 	currentBlock uint64,
-	unreconciled *int,
 ) map[string]bool {
 	failed := map[string]bool{}
-	if c.identity == nil {
+	if identity == nil {
 		return failed
 	}
-	for operatorAddress, claimedProvider := range stakingProviderByOperator {
-		onChain, err := c.identity.OperatorStakingProviderAtBlock(
-			operatorAddress, currentBlock,
+	for operatorAddress, claimedProvider := range claims {
+		onChain, err := identity.OperatorStakingProviderAtBlock(
+			ctx, operatorAddress, currentBlock,
 		)
 		if err != nil {
 			logger.Errorf(
@@ -648,7 +796,6 @@ func (c *Collector) verifyOperatorIdentities(
 				operatorAddress, err,
 			)
 			failed[operatorAddress] = true
-			*unreconciled++
 			continue
 		}
 		if normalizeAddress(onChain) != normalizeAddress(claimedProvider) {
@@ -658,10 +805,38 @@ func (c *Collector) verifyOperatorIdentities(
 				operatorAddress,
 			)
 			failed[operatorAddress] = true
-			*unreconciled++
 		}
 	}
 	return failed
+}
+
+// zeroAddress is the all-zero Ethereum address, returned by the WalletRegistry
+// for an unregistered operator and never a valid staking-provider identity.
+const zeroAddress = "0x0000000000000000000000000000000000000000"
+
+// isZeroAddress reports whether s normalizes to the all-zero address.
+func isZeroAddress(s string) bool {
+	return normalizeAddress(s) == zeroAddress
+}
+
+// isValidImageDigest reports whether s is a full, immutable content digest of the
+// form sha256:<64 lowercase hex>. An abbreviated or mutable-tag digest is
+// rejected so it cannot only partially pin the exact runtime image.
+func isValidImageDigest(s string) bool {
+	const prefix = "sha256:"
+	if !strings.HasPrefix(s, prefix) {
+		return false
+	}
+	hexPart := s[len(prefix):]
+	if len(hexPart) != 64 {
+		return false
+	}
+	for _, ch := range hexPart {
+		if !((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
 
 // inventoryExpectationContradicts reports whether an authoritative inventory

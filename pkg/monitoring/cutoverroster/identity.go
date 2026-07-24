@@ -58,7 +58,10 @@ func NewEthCallIdentityVerifier(
 // OperatorStakingProviderAtBlock reads WalletRegistry.operatorToStakingProvider
 // for operatorAddress at the given block (0 = latest) and returns the canonical
 // staking-provider address. A zero address means the operator is not registered.
+// The RPC honors ctx, so a canceled collection/shutdown context aborts the call
+// promptly rather than blocking for the full fixed timeout.
 func (v *EthCallIdentityVerifier) OperatorStakingProviderAtBlock(
+	ctx context.Context,
 	operatorAddress string,
 	block uint64,
 ) (string, error) {
@@ -83,15 +86,17 @@ func (v *EthCallIdentityVerifier) OperatorStakingProviderAtBlock(
 		blockTag = fmt.Sprintf("0x%x", block)
 	}
 
-	result, err := v.ethCall("0x"+hex.EncodeToString(callData), blockTag)
+	result, err := v.ethCall(ctx, "0x"+hex.EncodeToString(callData), blockTag)
 	if err != nil {
 		return "", err
 	}
 	return decodeAddressResult(result)
 }
 
-// ethCall performs a single eth_call and returns the hex "result" string.
-func (v *EthCallIdentityVerifier) ethCall(data, blockTag string) (string, error) {
+// ethCall performs a single eth_call and returns the hex "result" string. The
+// per-call timeout is bounded to 10s but derives from ctx, so cancellation of
+// the passed-in context takes effect immediately.
+func (v *EthCallIdentityVerifier) ethCall(ctx context.Context, data, blockTag string) (string, error) {
 	payload := map[string]interface{}{
 		"jsonrpc": "2.0",
 		"id":      1,
@@ -106,7 +111,7 @@ func (v *EthCallIdentityVerifier) ethCall(data, blockTag string) (string, error)
 		return "", err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	// #nosec G107 -- the RPC URL is operator-supplied monitoring configuration.

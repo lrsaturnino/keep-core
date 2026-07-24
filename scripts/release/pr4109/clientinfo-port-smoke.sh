@@ -33,14 +33,14 @@
 # Usage:
 #   # Docker-only, no chain: confirm the image bakes the 9601 compatibility
 #   # default into `keep-client start --help`.
-#   IMAGE=keep-client:candidate ./clientinfo-port-smoke.sh image-default-check
+#   IMAGE=keep-client@sha256:<candidate-digest> ./clientinfo-port-smoke.sh image-default-check
 #
 #   # Full listener matrix. Starts each of the six cases itself as a node
 #   # container on a private network and probes the internal endpoints from a
 #   # sibling container. A chain endpoint and an operator key are required
 #   # because a node only brings up the client-info listener after it connects
 #   # to Ethereum (cmd/start.go), so these are inherent inputs, not a scaffold.
-#   IMAGE=keep-client:candidate \
+#   IMAGE=keep-client@sha256:<candidate-digest> \
 #   ETH_RPC=wss://... \
 #   BTC_ELECTRUM_URL=tcp://electrum:50001 \
 #   KEY_FILE=/abs/path/to/keyfile.json \

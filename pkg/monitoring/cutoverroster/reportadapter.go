@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync/atomic"
 	"time"
 )
 
@@ -61,7 +60,6 @@ type MetricsReportSource struct {
 	client      *http.Client
 	attestation AttestationSource
 	clock       func() time.Time
-	seq         atomic.Uint64
 }
 
 // NewMetricsReportSource constructs a MetricsReportSource. A nil attestation
@@ -83,12 +81,14 @@ func NewMetricsReportSource(
 
 // diagnosticsPayload is the subset of the /diagnostics JSON the adapter reads.
 // The /diagnostics endpoint returns a JSON object keyed by diagnostic source
-// name; the "client_info" source carries the exact version and revision
-// (pkg/clientinfo/diagnostics.go).
+// name; the "client_info" source carries the exact version and revision plus the
+// node's self-attested chain address and network ID (pkg/clientinfo/diagnostics.go).
 type diagnosticsPayload struct {
 	ClientInfo struct {
-		Version  string `json:"version"`
-		Revision string `json:"revision"`
+		Version      string `json:"version"`
+		Revision     string `json:"revision"`
+		ChainAddress string `json:"chain_address"`
+		NetworkID    string `json:"network_id"`
 	} `json:"client_info"`
 }
 
@@ -98,13 +98,20 @@ type diagnosticsPayload struct {
 // node's client_info metric when present or otherwise from external attestation,
 // and its image digest from external attestation. A missing endpoint or an
 // unparseable body is an error (treated by the collector as a missed collection).
+//
+// The responding node's identity is validated against its OWN diagnostics
+// payload rather than copied from inventory: the report's operator address is
+// taken from the node's self-attested chain_address, and it must match the
+// inventory operator address the target answers for. When the inventory carries
+// the instance's network ID, the node's self-attested network_id must match it
+// too. A mismatch means the responding target is not the trusted instance, and
+// the fetch fails (a missed collection) rather than certifying a foreign report.
 func (s *MetricsReportSource) Fetch(
 	ctx context.Context,
 	inv InventoryInstance,
 ) (InstanceReport, error) {
 	report := InstanceReport{
-		InstanceID:      inv.InstanceID,
-		OperatorAddress: inv.OperatorAddress,
+		InstanceID: inv.InstanceID,
 	}
 
 	base := strings.TrimSuffix(strings.TrimSpace(inv.TrustedReportTarget), "/")
@@ -127,8 +134,8 @@ func (s *MetricsReportSource) Fetch(
 	report.Revision = labels["revision"]
 	report.Epoch = labels["protocol_epoch"]
 
-	// /diagnostics: read the exact revision, which the current build exposes here
-	// rather than in the client_info metric.
+	// /diagnostics: read the exact revision (which the current build exposes here
+	// rather than in the client_info metric) and the node's self-attested identity.
 	diagBody, err := s.get(ctx, base+diagnosticsPath)
 	if err != nil {
 		return report, err
@@ -139,6 +146,34 @@ func (s *MetricsReportSource) Fetch(
 	}
 	if report.Revision == "" {
 		report.Revision = strings.TrimSpace(diag.ClientInfo.Revision)
+	}
+
+	// Validate the responding node's self-attested identity instead of copying it
+	// from inventory. The chain address it reports for itself must be canonical and
+	// must equal the operator address the inventory says this target answers for.
+	observedOperator := normalizeAddress(diag.ClientInfo.ChainAddress)
+	if !isCanonicalAddress(observedOperator) {
+		return report, fmt.Errorf(
+			"diagnostics chain address is not a canonical operator address for %s",
+			inv.InstanceID,
+		)
+	}
+	if observedOperator != normalizeAddress(inv.OperatorAddress) {
+		return report, fmt.Errorf(
+			"responding node operator identity mismatch for %s", inv.InstanceID,
+		)
+	}
+	// The report's operator address comes from the node's own attestation.
+	report.OperatorAddress = observedOperator
+	// When inventory pins the instance's network ID, the node's self-attested
+	// network_id must match it, so one operator's responding target cannot stand
+	// in for a different instance of the same operator.
+	if strings.TrimSpace(inv.NetworkID) != "" {
+		if strings.TrimSpace(diag.ClientInfo.NetworkID) != strings.TrimSpace(inv.NetworkID) {
+			return report, fmt.Errorf(
+				"responding node network identity mismatch for %s", inv.InstanceID,
+			)
+		}
 	}
 
 	// The image digest is always external attestation; the release epoch is taken
@@ -155,11 +190,13 @@ func (s *MetricsReportSource) Fetch(
 	}
 
 	report.AttestedAt = s.clock()
-	// ReporterRevision is a monotonically increasing per-source scrape sequence.
-	// The node does not emit its own reporter revision in this build, so the
-	// collector's replay/downgrade guard is fed a value that genuinely advances
-	// each successful scrape rather than a fabricated constant.
-	report.ReporterRevision = s.seq.Add(1)
+	// ReporterRevision is derived from the attestation timestamp (wall-clock
+	// nanoseconds) rather than a process-local counter, so the collector's
+	// replay/downgrade high-water-mark guard keeps accepting reports immediately
+	// after a collector restart. A resettable in-memory sequence would start below
+	// the persisted high-water mark and reject every report for as many cycles as
+	// the previous process had run.
+	report.ReporterRevision = uint64(report.AttestedAt.UnixNano())
 
 	return report, nil
 }

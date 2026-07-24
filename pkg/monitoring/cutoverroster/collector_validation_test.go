@@ -1,6 +1,7 @@
 package cutoverroster
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -112,7 +113,7 @@ type fakeIdentityVerifier struct {
 }
 
 func (f *fakeIdentityVerifier) OperatorStakingProviderAtBlock(
-	operatorAddress string, _ uint64,
+	_ context.Context, operatorAddress string, _ uint64,
 ) (string, error) {
 	if p, ok := f.providers[normalizeAddress(operatorAddress)]; ok {
 		return p, nil

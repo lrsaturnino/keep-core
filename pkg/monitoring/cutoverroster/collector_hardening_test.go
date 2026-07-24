@@ -23,6 +23,10 @@ func newTestCollectorConfig(t *testing.T, cfg CollectorConfig) *testCollector {
 		t.Fatalf("cannot construct collector: %v", err)
 	}
 	collector.SetQuarantineVerifier(testQuarantineVerifier())
+	// Match newTestCollectorAtPath: satisfy the mandatory trust-chain completeness
+	// requirements so configuration-specific tests still exercise completeness.
+	collector.SetIdentityVerifier(derivedIdentityVerifier{})
+	collector.SetServiceDiscoveryConfigured(true)
 	tc.collector = collector
 	t.Cleanup(func() { _ = store.Close() })
 	return tc

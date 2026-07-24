@@ -58,9 +58,15 @@ func (s FleetStatus) IsBlocking() bool {
 // InventoryInstance is one authoritative ceremony-eligible instance record. It
 // is operator-supplied inventory, not a discovered scrape target.
 type InventoryInstance struct {
-	InstanceID            string `json:"instance_id"`
-	OperatorAddress       string `json:"operator_address"`
-	StakingProvider       string `json:"staking_provider"`
+	InstanceID      string `json:"instance_id"`
+	OperatorAddress string `json:"operator_address"`
+	StakingProvider string `json:"staking_provider"`
+	// NetworkID is the instance's libp2p network identity (the node's own
+	// network_id, exposed by /diagnostics client_info). It is the per-instance
+	// join key against production service discovery and the responding node's
+	// self-attested identity, so multiple instances of one operator resolve to
+	// distinct discovered targets rather than collapsing onto one.
+	NetworkID             string `json:"network_id"`
 	CeremonyEligible      bool   `json:"ceremony_eligible"`
 	ExpectedRevision      string `json:"expected_revision"`
 	ExpectedEpoch         string `json:"expected_epoch"`
@@ -85,6 +91,7 @@ type InventoryInstanceInput struct {
 	InstanceID            string `json:"instance_id"`
 	OperatorAddress       string `json:"operator_address"`
 	StakingProvider       string `json:"staking_provider"`
+	NetworkID             string `json:"network_id"`
 	CeremonyEligible      bool   `json:"ceremony_eligible"`
 	ExpectedRevision      string `json:"expected_revision"`
 	ExpectedEpoch         string `json:"expected_epoch"`
@@ -104,6 +111,7 @@ func (i InventoryInstanceInput) ToInventoryInstance() InventoryInstance {
 		InstanceID:            i.InstanceID,
 		OperatorAddress:       i.OperatorAddress,
 		StakingProvider:       i.StakingProvider,
+		NetworkID:             i.NetworkID,
 		CeremonyEligible:      i.CeremonyEligible,
 		ExpectedRevision:      i.ExpectedRevision,
 		ExpectedEpoch:         i.ExpectedEpoch,
@@ -226,6 +234,19 @@ type CollectorConfig struct {
 	CollectionInterval  time.Duration
 	MissedThreshold     uint
 	SuccessThreshold    uint
+
+	// RequireServiceDiscovery makes reconciliation against the production
+	// service-discovery target set mandatory for completeness. When true, a
+	// collector that was not told service discovery is configured can never
+	// certify readiness — a missing discovery feed blocks readiness rather than
+	// silently degrading to trusting the inventory alone.
+	RequireServiceDiscovery bool
+	// RequireIdentityVerification makes an installed on-chain
+	// operator→staking-provider identity verifier mandatory for completeness.
+	// When true and no verifier is installed, readiness can never be complete —
+	// a missing WalletRegistry verification blocks readiness rather than
+	// certifying trusted-file identity assertions on their own.
+	RequireIdentityVerification bool
 }
 
 // Metric names for the authoritative fleet aggregation.

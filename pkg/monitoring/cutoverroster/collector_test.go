@@ -34,8 +34,36 @@ func opAddr(name string) string {
 
 const (
 	testRevision = "abc123def456"
-	testDigest   = "sha256:deadbeefcafe"
+	// testDigest is a full, immutable content digest (sha256:<64 hex>). The
+	// collector now rejects an abbreviated digest, so the fixture uses a complete
+	// one (this happens to be the sha256 of the empty string).
+	testDigest = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 )
+
+// spForOperator derives a canonical (lowercase 0x + 40 hex) staking-provider
+// address deterministically from an operator address, so test inventory carries
+// a canonical staking provider (the collector now rejects a non-address one) and
+// the default identity verifier can independently reproduce the expected mapping.
+func spForOperator(operatorAddress string) string {
+	sum := sha256.Sum256([]byte("sp:" + normalizeAddress(operatorAddress)))
+	return "0x" + hex.EncodeToString(sum[:20])
+}
+
+// derivedIdentityVerifier is the default test identity verifier. It returns the
+// same canonical staking provider spForOperator derives, so an operator whose
+// inventory claim matches verifies successfully while a mismatched or non-derived
+// claim fails — a real verification, not an echo of the inventory claim.
+type derivedIdentityVerifier struct{}
+
+func (derivedIdentityVerifier) OperatorStakingProviderAtBlock(
+	_ context.Context, operatorAddress string, _ uint64,
+) (string, error) {
+	op := normalizeAddress(operatorAddress)
+	if !isCanonicalAddress(op) {
+		return "", errNoIdentity
+	}
+	return spForOperator(op), nil
+}
 
 var fleetBaseTime = time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
 
@@ -87,14 +115,20 @@ func testConfig() CollectorConfig {
 		CollectionInterval:  time.Minute,
 		MissedThreshold:     2,
 		SuccessThreshold:    3,
+		// Production readiness requires the full trust chain. The test collector
+		// (newTestCollectorAtPath) installs the default identity verifier and marks
+		// discovery configured, so completeness is reachable while these stay on.
+		RequireServiceDiscovery:     true,
+		RequireIdentityVerification: true,
 	}
 }
 
 func eligibleInstance(instanceID, operatorName string) InventoryInstance {
+	op := opAddr(operatorName)
 	return InventoryInstance{
 		InstanceID:          instanceID,
-		OperatorAddress:     opAddr(operatorName),
-		StakingProvider:     "sp-" + operatorName,
+		OperatorAddress:     op,
+		StakingProvider:     spForOperator(op),
 		CeremonyEligible:    true,
 		ExpectedRevision:    testRevision,
 		ExpectedEpoch:       ExpectedEpochSecurityV2Cutover,
@@ -173,6 +207,11 @@ func newTestCollectorAtPath(t *testing.T, path string) *testCollector {
 		t.Fatalf("cannot construct collector: %v", err)
 	}
 	collector.SetQuarantineVerifier(testQuarantineVerifier())
+	// Install the default identity verifier and mark discovery configured so the
+	// mandatory-trust-chain completeness requirements are satisfied. Tests that
+	// exercise identity mismatch install their own verifier over this default.
+	collector.SetIdentityVerifier(derivedIdentityVerifier{})
+	collector.SetServiceDiscoveryConfigured(true)
 	tc.collector = collector
 	t.Cleanup(func() { _ = store.Close() })
 	return tc
@@ -549,6 +588,59 @@ func TestCollector_ResolvedWhollyVanishedReopensOfflineNotPurged(t *testing.T) {
 		t.Errorf(
 			"a reopened (blocking) operator must be retained indefinitely, not purged; got %s (present=%t)",
 			status, ok,
+		)
+	}
+}
+
+// TestCollector_ReportsAcceptedImmediatelyAfterRestart is the regression for the
+// restart-durable reporter revision (net-new finding 1). The collector persists
+// the highest accepted reporter revision as a high-water mark and rejects
+// anything below it. If the reporter revision were a process-local counter that
+// reset on restart, every post-restart report would sit below the persisted
+// high-water mark and be rejected for as many cycles as the previous process had
+// run, silently reopening a resolved operator. Because the reporter revision is
+// derived from the (monotonic wall-clock) attestation timestamp, a report taken
+// after a restart still exceeds the persisted high-water mark and is accepted
+// immediately, keeping the operator resolved.
+func TestCollector_ReportsAcceptedImmediatelyAfterRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "roster.db")
+	tc := newTestCollectorAtPath(t, path)
+	inv := []InventoryInstance{eligibleInstance("i1", "op1")}
+
+	// Run many pre-restart cycles so the persisted reporter-revision high-water
+	// mark is large (mirroring a long-running previous process).
+	for cycle := 0; cycle < 20; cycle++ {
+		reports := map[string]InstanceReport{"i1": exactReport("i1", "op1", tc.now)}
+		if _, err := tc.collector.Collect(inv, reports, nil, 1000); err != nil {
+			t.Fatal(err)
+		}
+		tc.now = tc.now.Add(time.Minute)
+	}
+	if status, _ := operatorStatus(tc.collector.Snapshot(), "op1"); status != FleetResolvedCurrent {
+		t.Fatalf("precondition: op1 must be resolved before restart, got %s", status)
+	}
+
+	// Restart the collector against the same bbolt file (a fresh process resets
+	// any in-memory reporter-revision counter).
+	if err := tc.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened := newTestCollectorAtPath(t, path)
+	reopened.now = tc.now.Add(time.Minute)
+
+	// A single exact report immediately after restart must be ACCEPTED (its
+	// timestamp-derived reporter revision exceeds the persisted high-water mark),
+	// keeping the operator resolved. A rejected report would drop the operator's
+	// exact-confirmation streak and reopen it as offline_unknown.
+	reports := map[string]InstanceReport{"i1": exactReport("i1", "op1", reopened.now)}
+	snap, err := reopened.collector.Collect(inv, reports, nil, 1001)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status, _ := operatorStatus(snap, "op1"); status != FleetResolvedCurrent {
+		t.Fatalf(
+			"a report taken after restart must be accepted immediately, keeping op1 "+
+				"resolved; got %s (a reset reporter revision would reject it)", status,
 		)
 	}
 }

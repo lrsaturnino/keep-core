@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestParseServiceDiscovery proves the Prometheus file_sd target file (keep-sd.json)
@@ -32,11 +33,46 @@ func TestParseServiceDiscovery(t *testing.T) {
 	if !sd.Has(op) {
 		t.Errorf("expected operator %s present (case-insensitive)", op)
 	}
-	if got := sd.MetricsURL(op); got != "http://10.0.0.5:9601/metrics" {
+	// Discovery is keyed by network ID (the per-instance disambiguator); the
+	// usable entry carries network_id "1".
+	if got := sd.MetricsURLForInstance(op, "1"); got != "http://10.0.0.5:9601/metrics" {
 		t.Errorf("metrics URL = %q", got)
 	}
-	if got := sd.DiagnosticsURL(op); got != "http://10.0.0.5:9601/diagnostics" {
+	if got := sd.DiagnosticsURLForInstance(op, "1"); got != "http://10.0.0.5:9601/diagnostics" {
 		t.Errorf("diagnostics URL = %q", got)
+	}
+	// A different operator claiming the same network ID does not match.
+	if got := sd.MetricsURLForInstance("0x1111111111111111111111111111111111111111", "1"); got != "" {
+		t.Errorf("network id must not resolve for a mismatched operator: %q", got)
+	}
+	// A missing network ID yields no per-instance target even for a present operator.
+	if got := sd.MetricsURLForInstance(op, ""); got != "" {
+		t.Errorf("empty network id must not resolve a target: %q", got)
+	}
+}
+
+// TestServiceDiscovery_MultipleInstancesPerOperatorStayDistinct proves two
+// instances of one operator resolve to distinct discovered targets rather than
+// collapsing onto a single operator-level URL.
+func TestServiceDiscovery_MultipleInstancesPerOperatorStayDistinct(t *testing.T) {
+	op := "0xabcdef0000000000000000000000000000000001"
+	raw := fmt.Sprintf(`[
+		{"targets": ["10.0.0.5:9601"], "labels": {"__meta_chain_address": "%s", "__meta_network_id": "net-a"}},
+		{"targets": ["10.0.0.6:9601"], "labels": {"__meta_chain_address": "%s", "__meta_network_id": "net-b"}}
+	]`, op, op)
+
+	sd, err := ParseServiceDiscovery([]byte(raw))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got := sd.MetricsURLForInstance(op, "net-a"); got != "http://10.0.0.5:9601/metrics" {
+		t.Errorf("instance net-a URL = %q", got)
+	}
+	if got := sd.MetricsURLForInstance(op, "net-b"); got != "http://10.0.0.6:9601/metrics" {
+		t.Errorf("instance net-b URL = %q", got)
+	}
+	if sd.Len() != 1 {
+		t.Errorf("two instances of one operator are still one operator, got Len %d", sd.Len())
 	}
 }
 
@@ -103,16 +139,20 @@ client_info{version="v2.0.0",revision="abc123",protocol_epoch="security_v2_cutov
 // diagnostics when the client_info metric carries only the version (the current
 // build), and folding in the externally-attested digest and epoch.
 func TestMetricsReportSource_Fetch(t *testing.T) {
+	const operator = "0xabcdef0000000000000000000000000000000001"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/metrics":
 			// Current build: client_info carries only version.
 			_, _ = io.WriteString(w, "client_info{version=\"v2.0.0\"} 1\n")
 		case "/diagnostics":
+			// The node self-attests its identity (chain address + network id).
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
 				"client_info": map[string]string{
-					"version":  "v2.0.0",
-					"revision": "abc123def456",
+					"version":       "v2.0.0",
+					"revision":      "abc123def456",
+					"chain_address": operator,
+					"network_id":    "net-1",
 				},
 			})
 		default:
@@ -125,10 +165,15 @@ func TestMetricsReportSource_Fetch(t *testing.T) {
 		Digests: map[string]string{"i1": "sha256:deadbeef"},
 		Epochs:  map[string]string{"i1": ExpectedEpochSecurityV2Cutover},
 	})
+	// Control the clock so the reporter revision (derived from the attestation
+	// timestamp) is deterministic across the two scrapes.
+	scrapeAt := fleetBaseTime
+	source.clock = func() time.Time { return scrapeAt }
 
 	inv := InventoryInstance{
 		InstanceID:          "i1",
-		OperatorAddress:     "0xabcdef0000000000000000000000000000000001",
+		OperatorAddress:     operator,
+		NetworkID:           "net-1",
 		TrustedReportTarget: srv.URL,
 	}
 	report, err := source.Fetch(context.Background(), inv)
@@ -137,6 +182,10 @@ func TestMetricsReportSource_Fetch(t *testing.T) {
 	}
 	if report.Revision != "abc123def456" {
 		t.Errorf("revision from diagnostics = %q", report.Revision)
+	}
+	// The operator address comes from the node's own attestation, not inventory.
+	if report.OperatorAddress != operator {
+		t.Errorf("operator address from diagnostics = %q", report.OperatorAddress)
 	}
 	if report.Epoch != ExpectedEpochSecurityV2Cutover {
 		t.Errorf("epoch from attestation = %q", report.Epoch)
@@ -151,7 +200,8 @@ func TestMetricsReportSource_Fetch(t *testing.T) {
 		t.Error("attested time must be stamped")
 	}
 
-	// A second scrape advances the reporter revision (monotonic).
+	// A later scrape advances the reporter revision (monotonic with the clock).
+	scrapeAt = scrapeAt.Add(time.Minute)
 	report2, err := source.Fetch(context.Background(), inv)
 	if err != nil {
 		t.Fatal(err)
@@ -159,6 +209,114 @@ func TestMetricsReportSource_Fetch(t *testing.T) {
 	if report2.ReporterRevision <= report.ReporterRevision {
 		t.Errorf("reporter revision must be monotonic: %d then %d", report.ReporterRevision, report2.ReporterRevision)
 	}
+}
+
+// TestMetricsReportSource_ReporterRevisionSurvivesRestart proves the reporter
+// revision is durable across a collector/reporter restart: a fresh
+// MetricsReportSource (a "restart", losing any in-process counter) still produces
+// a revision strictly greater than the one persisted before the restart, so the
+// collector's high-water-mark guard keeps accepting reports immediately rather
+// than rejecting them for as many cycles as the previous process had run.
+func TestMetricsReportSource_ReporterRevisionSurvivesRestart(t *testing.T) {
+	const operator = "0xabcdef0000000000000000000000000000000001"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/metrics":
+			_, _ = io.WriteString(w, "client_info{version=\"v2.0.0\"} 1\n")
+		case "/diagnostics":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"client_info": map[string]string{
+					"revision": "abc123def456", "chain_address": operator,
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	inv := InventoryInstance{
+		InstanceID: "i1", OperatorAddress: operator, TrustedReportTarget: srv.URL,
+	}
+
+	// The pre-restart source runs many cycles, driving any process-local counter
+	// high. Its persisted high-water mark is the last revision it produced.
+	before := NewMetricsReportSource(srv.Client(), nil)
+	at := fleetBaseTime
+	before.clock = func() time.Time { return at }
+	var highWater uint64
+	for i := 0; i < 500; i++ {
+		at = at.Add(time.Second)
+		r, err := before.Fetch(context.Background(), inv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		highWater = r.ReporterRevision
+	}
+
+	// The restarted source has no memory of the counter. Its first report at a
+	// later wall-clock time must still exceed the persisted high-water mark.
+	after := NewMetricsReportSource(srv.Client(), nil)
+	restartAt := at.Add(time.Second)
+	after.clock = func() time.Time { return restartAt }
+	r, err := after.Fetch(context.Background(), inv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.ReporterRevision <= highWater {
+		t.Errorf(
+			"reporter revision must survive restart: got %d, high-water %d",
+			r.ReporterRevision, highWater,
+		)
+	}
+}
+
+// TestMetricsReportSource_RejectsIdentityMismatch proves the responding node's
+// self-attested identity is validated: a node whose diagnostics chain address (or
+// network id) does not match the inventory the target answers for is rejected
+// rather than accepted with an inventory-copied identity.
+func TestMetricsReportSource_RejectsIdentityMismatch(t *testing.T) {
+	const inventoryOperator = "0xabcdef0000000000000000000000000000000001"
+	newSource := func(chainAddr, networkID string) (*MetricsReportSource, InventoryInstance) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/metrics":
+				_, _ = io.WriteString(w, "client_info{version=\"v2.0.0\"} 1\n")
+			case "/diagnostics":
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"client_info": map[string]string{
+						"revision": "abc123def456", "chain_address": chainAddr, "network_id": networkID,
+					},
+				})
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		t.Cleanup(srv.Close)
+		return NewMetricsReportSource(srv.Client(), nil), InventoryInstance{
+			InstanceID: "i1", OperatorAddress: inventoryOperator,
+			NetworkID: "net-1", TrustedReportTarget: srv.URL,
+		}
+	}
+
+	t.Run("operator mismatch rejected", func(t *testing.T) {
+		src, inv := newSource("0x2222222222222222222222222222222222222222", "net-1")
+		if _, err := src.Fetch(context.Background(), inv); err == nil {
+			t.Error("a foreign chain address must be rejected")
+		}
+	})
+	t.Run("network id mismatch rejected", func(t *testing.T) {
+		src, inv := newSource(inventoryOperator, "net-OTHER")
+		if _, err := src.Fetch(context.Background(), inv); err == nil {
+			t.Error("a mismatched network id must be rejected")
+		}
+	})
+	t.Run("matching identity accepted", func(t *testing.T) {
+		src, inv := newSource(inventoryOperator, "net-1")
+		if _, err := src.Fetch(context.Background(), inv); err != nil {
+			t.Errorf("a matching self-attested identity must be accepted: %v", err)
+		}
+	})
 }
 
 // TestEthCallIdentityVerifier proves the verifier ABI-encodes the
@@ -197,7 +355,7 @@ func TestEthCallIdentityVerifier(t *testing.T) {
 	if err != nil {
 		t.Fatalf("construct: %v", err)
 	}
-	got, err := verifier.OperatorStakingProviderAtBlock(operator, 12345)
+	got, err := verifier.OperatorStakingProviderAtBlock(context.Background(), operator, 12345)
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}

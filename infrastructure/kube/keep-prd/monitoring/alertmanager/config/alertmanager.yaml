@@ -1,0 +1,38 @@
+# Alertmanager routing for the cutover-roster fleet alerts.
+#
+# The cutover-roster rules (prometheus/config/rules.yaml, group cutover-roster;
+# mirrored by cutoverroster.AlertRules()) set a route_to label of
+# "release,operator-coordination". The routing tree below matches that label and
+# fans the alert out to both teams. The receiver integrations themselves
+# (Slack/PagerDuty/email endpoints) are REPLACE_ placeholders — fill them in from
+# a Secret at deploy time; do not commit real webhook URLs.
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: default
+  group_by: ["alertname", "team"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    # Cutover alerts carry route_to=release,operator-coordination. Match the
+    # "release" audience and continue so the operator-coordination route below
+    # also fires for the same alert.
+    - matchers:
+        - route_to =~ ".*release.*"
+      receiver: release
+      continue: true
+    - matchers:
+        - route_to =~ ".*operator-coordination.*"
+      receiver: operator-coordination
+      continue: true
+
+receivers:
+  - name: default
+  - name: release
+    # REPLACE_WITH_RELEASE_RECEIVER: e.g. a slack_configs / pagerduty_configs /
+    # email_configs block for the Release team, sourced from a Secret.
+  - name: operator-coordination
+    # REPLACE_WITH_OPERATOR_COORDINATION_RECEIVER: the Operator Coordination
+    # team's integration, sourced from a Secret.

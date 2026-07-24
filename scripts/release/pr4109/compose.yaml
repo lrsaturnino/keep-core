@@ -19,7 +19,9 @@
 
 services:
   node:
-    image: ${IMAGE:-keep-client:candidate}
+    # Pin IMAGE by an immutable @sha256: digest, not a mutable tag, so the smoke
+    # run tests exactly the bytes operators will deploy.
+    image: ${IMAGE:-keep-client@sha256:REPLACE_WITH_CANDIDATE_IMAGE_DIGEST}
     container_name: cutover-port-smoke-node
     # No `ports:` mapping — 9601 stays internal to the private network.
     networks:

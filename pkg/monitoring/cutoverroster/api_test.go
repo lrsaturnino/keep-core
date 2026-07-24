@@ -1,6 +1,7 @@
 package cutoverroster
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -65,5 +66,39 @@ func TestParseCIDRAllowlist_Validation(t *testing.T) {
 	}
 	if _, err := ParseCIDRAllowlist("not-a-cidr"); err == nil {
 		t.Error("expected an error for an invalid CIDR")
+	}
+}
+
+// TestNewServer_RequiresAllowlistForNonLoopbackBind proves a non-loopback bind
+// without an allowlist is refused at startup (fail closed), while a loopback bind
+// or a non-loopback bind with an allowlist is accepted.
+func TestNewServer_RequiresAllowlistForNonLoopbackBind(t *testing.T) {
+	allowlist, err := ParseCIDRAllowlist("10.0.0.0/8")
+	if err != nil {
+		t.Fatalf("parse allowlist: %v", err)
+	}
+
+	// Non-loopback bind, no allowlist: refused.
+	if s, err := NewServer("0.0.0.0:0", nil, nil, nil); err == nil {
+		t.Error("a non-loopback bind without an allowlist must be refused")
+		if s != nil {
+			_ = s.Close(context.Background())
+		}
+	}
+
+	// Loopback bind, no allowlist: accepted (loopback is the mitigation).
+	loopback, err := NewServer("127.0.0.1:0", nil, nil, nil)
+	if err != nil {
+		t.Errorf("a loopback bind without an allowlist must be accepted: %v", err)
+	} else {
+		_ = loopback.Close(context.Background())
+	}
+
+	// Non-loopback bind WITH an allowlist: accepted.
+	guarded, err := NewServer("0.0.0.0:0", nil, nil, allowlist)
+	if err != nil {
+		t.Errorf("a non-loopback bind with an allowlist must be accepted: %v", err)
+	} else {
+		_ = guarded.Close(context.Background())
 	}
 }

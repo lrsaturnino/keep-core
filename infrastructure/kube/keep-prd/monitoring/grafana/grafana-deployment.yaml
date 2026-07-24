@@ -19,6 +19,12 @@ spec:
         - name: grafana
           image: grafana/grafana:9.2.5
           env:
+            # The Cutover Readiness dashboard's instance-reason table reads the
+            # cutover-roster readiness API (JSON), which needs the Infinity
+            # datasource plugin. It installs into the writable grafana PVC at
+            # /var/lib/grafana/plugins, so readOnlyRootFilesystem is preserved.
+            - name: GF_INSTALL_PLUGINS
+              value: yesoreyeram-infinity-datasource
             - name: GF_SERVER_DOMAIN
               value: monitoring.threshold.network
             - name: GF_SERVER_ROOT_URL

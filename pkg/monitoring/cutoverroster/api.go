@@ -73,6 +73,30 @@ func (a *CIDRAllowlist) Allowed(remoteAddr string) bool {
 	return false
 }
 
+// bindIsLoopbackOnly reports whether addr binds only the loopback interface. An
+// empty host, "0.0.0.0", "::", or a hostname it cannot classify are treated as
+// non-loopback (routable) so the safe default is to demand an allowlist.
+func bindIsLoopbackOnly(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		// No host = all interfaces.
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		// A hostname we cannot resolve to an IP here; do not assume it is loopback.
+		return false
+	}
+	return ip.IsLoopback()
+}
+
 // withAllowlist wraps next so a request from outside the monitoring trust
 // boundary is denied with 403 before reaching the readiness data. A nil
 // allowlist means no application-level boundary is configured and next is served
@@ -140,12 +164,26 @@ type Server struct {
 // readiness API. Bind addr to the monitoring interface only. When allowlist is
 // non-nil, it enforces the monitoring-network trust boundary: only loopback and
 // allowed-CIDR clients are served, everything else is denied with 403.
+//
+// A non-loopback bind with no allowlist is refused: exposing the authoritative
+// readiness data on a routable interface without an application-level trust
+// boundary is a misconfiguration, so it fails closed at startup rather than
+// silently serving every client.
 func NewServer(
 	addr string,
 	source snapshotSource,
 	metrics *PrometheusMetrics,
 	allowlist *CIDRAllowlist,
 ) (*Server, error) {
+	if allowlist == nil && !bindIsLoopbackOnly(addr) {
+		return nil, fmt.Errorf(
+			"refusing to bind the readiness API to non-loopback address [%s] without "+
+				"an allowlist; set --allowedCIDRs to define the monitoring trust boundary "+
+				"or bind to loopback",
+			addr,
+		)
+	}
+
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("cannot bind cutover-roster API on [%s]: %w", addr, err)

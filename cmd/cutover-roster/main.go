@@ -85,9 +85,11 @@ func parseOptions() options {
 	flag.StringVar(&opts.inventoryFile, "inventoryFile", "",
 		"Path to the authoritative ceremony-eligible inventory JSON file.")
 	flag.StringVar(&opts.serviceDiscoveryFile, "serviceDiscoveryFile", "",
-		"Optional path to the production Prometheus file_sd target file "+
-			"(keep-sd.json). When set, an eligible operator absent from discovery is "+
-			"offline_unknown, and discovered /metrics targets are used to fetch reports.")
+		"Path to the production Prometheus file_sd target file (keep-sd.json). "+
+			"REQUIRED for a complete readiness determination: an eligible operator "+
+			"absent from discovery is offline_unknown, and discovered per-instance "+
+			"/metrics targets (keyed by network ID) are used to fetch reports. Without "+
+			"it, readiness can never be certified complete.")
 	flag.StringVar(&opts.sightingsFile, "sightingsFile", "",
 		"Optional path to a JSON file of aggregated post-cutover legacy sightings.")
 	flag.StringVar(&opts.quarantineEvidenceFile, "quarantineEvidenceFile", "",
@@ -105,9 +107,11 @@ func parseOptions() options {
 		"Optional Ethereum JSON-RPC URL used to read the current block height and, "+
 			"with --walletRegistryAddress, to verify operator→staking-provider identity.")
 	flag.StringVar(&opts.walletRegistryAddress, "walletRegistryAddress", "",
-		"Optional WalletRegistry contract address. With --ethereumRPC, enables "+
-			"on-chain operator→staking-provider identity verification (fail closed on "+
-			"mismatch). Without it, identity is NOT verified on chain.")
+		"WalletRegistry contract address. With --ethereumRPC, enables on-chain "+
+			"operator→staking-provider identity verification (fail closed on "+
+			"mismatch). REQUIRED for a complete readiness determination: without it, "+
+			"identity is NOT verified on chain and readiness can never be certified "+
+			"complete.")
 
 	flag.Parse()
 
@@ -142,12 +146,30 @@ func run(opts options) error {
 			CollectionInterval:  opts.collectionInterval,
 			MissedThreshold:     opts.missedThreshold,
 			SuccessThreshold:    opts.successThreshold,
+			// Production readiness requires the full authoritative trust chain:
+			// service-discovery reconciliation and on-chain identity verification
+			// are mandatory for complete=true. A missing feed blocks readiness
+			// rather than silently degrading to trusting the inventory alone.
+			RequireServiceDiscovery:     true,
+			RequireIdentityVerification: true,
 		},
 		store,
 		metrics,
 	)
 	if err != nil {
 		return fmt.Errorf("cannot construct collector: %w", err)
+	}
+
+	// Record whether the production service-discovery feed is wired. Without it,
+	// completeness is blocked (RequireServiceDiscovery): an eligible operator's
+	// instances cannot be reconciled one-to-one against discovered targets.
+	collector.SetServiceDiscoveryConfigured(opts.serviceDiscoveryFile != "")
+	if opts.serviceDiscoveryFile == "" {
+		logger.Warnf(
+			"service-discovery reconciliation is DISABLED; readiness cannot be " +
+				"certified complete until --serviceDiscoveryFile is set so eligible " +
+				"instances reconcile one-to-one against discovered targets",
+		)
 	}
 
 	// Install the independent quarantine-evidence verifier. Absent one, the
@@ -185,8 +207,9 @@ func run(opts options) error {
 	} else {
 		logger.Warnf(
 			"on-chain operator→staking-provider identity verification is DISABLED; " +
-				"set --ethereumRPC and --walletRegistryAddress to verify inventory " +
-				"identity claims against the WalletRegistry",
+				"readiness cannot be certified complete until --ethereumRPC and " +
+				"--walletRegistryAddress are set to verify inventory identity claims " +
+				"against the WalletRegistry",
 		)
 	}
 
@@ -304,8 +327,9 @@ func collectOnce(
 	// Collect itself fails readiness closed on any internal error (a persistence
 	// write failure supersedes the served snapshot with an incomplete one and a
 	// nonzero unreconciled gauge), so logging the error here is sufficient; the
-	// stale "complete=true" snapshot is already gone.
-	if _, err := collector.Collect(inventory, reports, sightings, currentBlock); err != nil {
+	// stale "complete=true" snapshot is already gone. CollectContext threads the
+	// cycle context so a degraded WalletRegistry RPC honors shutdown.
+	if _, err := collector.CollectContext(ctx, inventory, reports, sightings, currentBlock); err != nil {
 		logger.Errorf("collection cycle failed: %v", err)
 	}
 }
@@ -486,8 +510,12 @@ func loadServiceDiscovery(path string) (*cutoverroster.ServiceDiscovery, error) 
 }
 
 // applyDiscoveredTargets sets each eligible instance's report target to its
-// discovered /metrics base URL when service discovery knows the operator and the
-// inventory did not already carry an explicit trusted target.
+// discovered /metrics base URL when service discovery knows that specific
+// instance (by operator address and network ID) and the inventory did not
+// already carry an explicit trusted target. Keying by network ID means multiple
+// instances of one operator each resolve to their own discovered target rather
+// than collapsing onto a single operator-level URL; an instance without a
+// discovered per-instance target is left untargeted (offline, fail closed).
 func applyDiscoveredTargets(
 	inventory []cutoverroster.InventoryInstance,
 	sd *cutoverroster.ServiceDiscovery,
@@ -496,7 +524,10 @@ func applyDiscoveredTargets(
 		if !inventory[i].CeremonyEligible || inventory[i].TrustedReportTarget != "" {
 			continue
 		}
-		if url := sd.MetricsURL(inventory[i].OperatorAddress); url != "" {
+		url := sd.MetricsURLForInstance(
+			inventory[i].OperatorAddress, inventory[i].NetworkID,
+		)
+		if url != "" {
 			inventory[i].TrustedReportTarget = url
 		}
 	}

@@ -103,13 +103,39 @@
       "type": "table"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "P09205B1DD12FB1C6" },
-      "gridPos": { "h": 5, "w": 24, "x": 0, "y": 21 },
+      "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "cutover-roster-api" },
+      "description": "Per-instance reconciliation detail for every blocking operator, read from the collector readiness API (GET /api/v1/cutover-readiness). Node/collector metrics deliberately omit per-instance labels, so this table sources the API directly rather than Prometheus.",
+      "fieldConfig": { "defaults": { "custom": { "align": "auto", "displayMode": "auto" } }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 21 },
       "id": 8,
-      "options": { "content": "### Per-instance reasons\n\nNode/collector metrics deliberately omit per-instance and session labels. The per-instance reconciliation reasons (ceremony eligibility, per-instance expected vs. observed revision/epoch/digest, reported-this-cycle, quarantine evidence) are exposed by the collector's readiness API:\n\n```\nGET /api/v1/cutover-readiness\n```\n\nEach blocking/quarantined/recently-resolved operator entry carries an `instance_statuses` array with the per-instance `class`, `reason`, and expected/observed identity.", "mode": "markdown" },
+      "options": { "showHeader": true },
       "pluginVersion": "9.3.0",
-      "title": "Instance-level reasons",
-      "type": "text"
+      "targets": [
+        {
+          "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "cutover-roster-api" },
+          "refId": "A",
+          "type": "json",
+          "source": "url",
+          "format": "table",
+          "parser": "backend",
+          "url": "http://cutover-roster:9701/api/v1/cutover-readiness",
+          "url_options": { "method": "GET" },
+          "root_selector": "blocking.instance_statuses.{\"operator_address\": %.operator_address, \"staking_provider\": %.staking_provider, \"instance_id\": instance_id, \"class\": class, \"reason\": reason, \"reported_this_cycle\": reported_this_cycle, \"expected_revision\": expected_revision, \"observed_revision\": observed_revision, \"expected_image_digest\": expected_image_digest, \"observed_image_digest\": observed_image_digest, \"quarantined\": quarantined}",
+          "columns": [
+            { "selector": "operator_address", "text": "Operator", "type": "string" },
+            { "selector": "staking_provider", "text": "Staking provider", "type": "string" },
+            { "selector": "instance_id", "text": "Instance", "type": "string" },
+            { "selector": "class", "text": "Class", "type": "string" },
+            { "selector": "reason", "text": "Reason", "type": "string" },
+            { "selector": "reported_this_cycle", "text": "Reported this cycle", "type": "string" },
+            { "selector": "expected_revision", "text": "Expected rev", "type": "string" },
+            { "selector": "observed_revision", "text": "Observed rev", "type": "string" },
+            { "selector": "quarantined", "text": "Quarantined", "type": "string" }
+          ]
+        }
+      ],
+      "title": "Instance-level reasons (blocking operators)",
+      "type": "table"
     }
   ],
   "refresh": "1m",

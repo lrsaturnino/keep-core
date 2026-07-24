@@ -4,7 +4,27 @@ global:
   evaluation_interval: 1m
 rule_files:
   - /etc/prometheus/rules.yaml
+# Route the cutover-roster alerts (rules.yaml, group cutover-roster) to
+# Alertmanager, whose routing tree matches their route_to label
+# (monitoring/alertmanager/config/alertmanager.yaml). The Alertmanager workload
+# itself is provisioned under monitoring/alertmanager.
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
 scrape_configs:
+  # The authoritative cutover-roster fleet collector. It exposes the
+  # performance_cutover_* metrics the cutover-roster rules alert on. The
+  # keep-discovered-nodes job below scrapes individual nodes and does NOT cover
+  # these fleet metrics, so this dedicated job is their committed source.
+  - job_name: cutover-roster
+    honor_timestamps: true
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets:
+          - cutover-roster:9701
   - job_name: keep-discovered-nodes
     honor_timestamps: true
     metrics_path: /metrics

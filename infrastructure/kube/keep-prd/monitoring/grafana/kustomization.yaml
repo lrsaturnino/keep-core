@@ -19,6 +19,7 @@ configMapGenerator:
     files:
       - dashboards/keep/keep-nodes-public.json
       - dashboards/keep/keep-nodes.json
+      - dashboards/keep/cutover-readiness.json
 
 generatorOptions:
   disableNameSuffixHash: true

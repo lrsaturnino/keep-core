@@ -44,9 +44,13 @@ cases require a node that can actually start against a chain (developer network
 or a testnet RPC + operator key). Provide those and run:
 
 ```
-IMAGE=keep-client:candidate ETH_RPC=... KEY_FILE=... KEY_PASSWORD=... \
+IMAGE=keep-client@sha256:<candidate-image-digest> ETH_RPC=... KEY_FILE=... KEY_PASSWORD=... \
   ./clientinfo-port-smoke.sh listener-matrix
 ```
+
+The harness's `require_digest` rejects a mutable tag: `IMAGE` (and `PROBE_IMAGE`)
+MUST be pinned by an immutable `@sha256:` digest so a smoke run tests exactly the
+bytes operators will deploy.
 
 The harness runs each case as a node container on a **private user-defined
 bridge network** and probes the client-info port from a sibling `curl` container
