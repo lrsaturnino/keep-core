@@ -290,10 +290,26 @@ For each action type, the following metrics are available:
 
 The coordinated security release adds stranded/legacy-peer observability so that
 cutover readiness can identify which operators remain nonconverged. The
-following node-local roster metrics are recorded by the node-local cutover peer
-roster (`pkg/protocol/participation`). They deduplicate every post-cutover
-legacy-wire sighting down to the normalized operator address; they never carry
-operator, session, or peer labels.
+following node-local metrics are recorded by the tBTC DKG and signing announcer
+mismatch observer and the node-local cutover peer roster
+(`pkg/protocol/participation`). They deduplicate every post-cutover legacy-wire
+sighting down to the normalized operator address; they never carry operator,
+session, or peer labels.
+
+NOTE: These observability metrics do not require the block-height cutover gate
+and are exposed today. The gate itself, and its `performance_participation_*`
+gate-state metrics, are a separate future change and are NOT exposed by this
+build.
+
+==== `performance_announcer_session_id_mismatch_total`
+*Type*: Counter
+*Description*: Unique membership-valid senders per announce call whose announced session ID differs from the local one
+*Labels*: None
+
+==== `performance_announcer_cross_format_peer_total`
+*Type*: Counter
+*Description*: Subset of session-ID mismatches classified as a legacy-versus-hardened cross-format difference
+*Labels*: None
 
 ==== `performance_announcer_legacy_peers_current`
 *Type*: Gauge

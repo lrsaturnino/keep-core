@@ -13,6 +13,7 @@ import (
 	"golang.org/x/time/rate"
 
 	"github.com/keep-network/keep-core/pkg/chain"
+	"github.com/keep-network/keep-core/pkg/clientinfo"
 	"github.com/keep-network/keep-core/pkg/protocol/announcer"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 )
@@ -29,12 +30,17 @@ const CutoverPeerRosterSchemaVersion uint32 = 1
 // projected to metrics without precision loss and are rejected at construction.
 const maxSafeMetricInteger = uint64(1) << 53
 
+// The roster reports through the client-info performance registry, which adds
+// the "performance_" application prefix. These are therefore the internal
+// (unprefixed) names; they are exposed as performance_announcer_legacy_peer*.
+// Referencing the clientinfo constants keeps a single source of truth for the
+// exact exported metric names.
 const (
-	metricLegacyPeersCurrent        = "performance_announcer_legacy_peers_current"
-	metricLegacyPeerOldestAgeBlocks = "performance_announcer_legacy_peer_oldest_age_blocks"
-	metricLegacyPeerRosterRevision  = "performance_announcer_legacy_peer_roster_revision"
-	metricLegacyPeerAdditionsTotal  = "performance_announcer_legacy_peer_additions_total"
-	metricLegacyPeerEvictionsTotal  = "performance_announcer_legacy_peer_evictions_total"
+	metricLegacyPeersCurrent        = clientinfo.MetricAnnouncerLegacyPeersCurrent
+	metricLegacyPeerOldestAgeBlocks = clientinfo.MetricAnnouncerLegacyPeerOldestAgeBlocks
+	metricLegacyPeerRosterRevision  = clientinfo.MetricAnnouncerLegacyPeerRosterRevision
+	metricLegacyPeerAdditionsTotal  = clientinfo.MetricAnnouncerLegacyPeerAdditionsTotal
+	metricLegacyPeerEvictionsTotal  = clientinfo.MetricAnnouncerLegacyPeerEvictionsTotal
 )
 
 const (

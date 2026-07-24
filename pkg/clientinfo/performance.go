@@ -140,6 +140,10 @@ func (pm *PerformanceMetrics) registerAllMetrics() {
 		MetricFirewallRejectionsTotal,
 		MetricFirewallOnChainChecksTotal,
 		MetricWalletDispatcherRejectedTotal,
+		MetricAnnouncerSessionIDMismatchTotal,
+		MetricAnnouncerCrossFormatPeerTotal,
+		MetricAnnouncerLegacyPeerAdditionsTotal,
+		MetricAnnouncerLegacyPeerEvictionsTotal,
 	}
 
 	// Register per-reason network join failure counters
@@ -307,6 +311,9 @@ func (pm *PerformanceMetrics) registerAllMetrics() {
 		MetricCPULoadPercent,
 		MetricRAMUtilizationPercent,
 		MetricSwapUtilizationPercent,
+		MetricAnnouncerLegacyPeersCurrent,
+		MetricAnnouncerLegacyPeerOldestAgeBlocks,
+		MetricAnnouncerLegacyPeerRosterRevision,
 	}
 
 	// First, initialize all gauges in the map
@@ -692,6 +699,21 @@ const (
 	MetricCPULoadPercent         = "cpu_load_percent"
 	MetricRAMUtilizationPercent  = "ram_utilization_percent"
 	MetricSwapUtilizationPercent = "swap_utilization_percent"
+
+	// Cutover observability Metrics
+	//
+	// These are the internal (unprefixed) names; they are exposed with the
+	// application prefix as performance_announcer_* by ObserveApplicationSource.
+	// They back the announcer session-ID mismatch observer and the node-local
+	// cutover peer roster used to identify operators that remain on the legacy
+	// release across a coordinated security-v2 cutover.
+	MetricAnnouncerSessionIDMismatchTotal    = "announcer_session_id_mismatch_total"
+	MetricAnnouncerCrossFormatPeerTotal      = "announcer_cross_format_peer_total"
+	MetricAnnouncerLegacyPeersCurrent        = "announcer_legacy_peers_current"
+	MetricAnnouncerLegacyPeerOldestAgeBlocks = "announcer_legacy_peer_oldest_age_blocks"
+	MetricAnnouncerLegacyPeerRosterRevision  = "announcer_legacy_peer_roster_revision"
+	MetricAnnouncerLegacyPeerAdditionsTotal  = "announcer_legacy_peer_additions_total"
+	MetricAnnouncerLegacyPeerEvictionsTotal  = "announcer_legacy_peer_evictions_total"
 )
 
 // Network join request failure reasons. These are the low-cardinality

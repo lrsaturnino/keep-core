@@ -3,12 +3,24 @@ package cutoverroster
 import (
 	"fmt"
 	"sort"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/ipfs/go-log/v2"
 )
 
 var logger = log.Logger("keep-cutover-roster")
+
+// QuarantineVerifier independently verifies that a quarantine/removal evidence
+// reference is real before the collector accepts it. A note, unreachable
+// endpoint, or self-report must not verify. When no verifier is configured, the
+// collector fails closed and accepts no quarantine evidence.
+type QuarantineVerifier interface {
+	// Verify reports whether evidenceRef is independently verified network or
+	// eligibility quarantine/removal evidence for the given instance.
+	Verify(instanceID, operatorAddress, evidenceRef string) bool
+}
 
 // MetricsSink is the metrics interface the collector needs. The fleet-level
 // gauges are label-less; the operator-level gauges carry
@@ -36,15 +48,26 @@ const (
 // attestations, and node-local legacy sightings into a per-operator fleet
 // status. It persists central state transactionally and refreshes metrics.
 type Collector struct {
-	config  CollectorConfig
-	store   *Store
-	metrics MetricsSink
-	clock   func() time.Time
+	config   CollectorConfig
+	store    *Store
+	metrics  MetricsSink
+	clock    func() time.Time
+	verifier QuarantineVerifier
 
-	operators map[string]*operatorRecord
-	instances map[string]*instanceRecord
-
+	// mu guards the mutable central state (operators/instances) and
+	// lastSnapshot against concurrent Collect and HTTP Snapshot access.
+	mu           sync.RWMutex
+	operators    map[string]*operatorRecord
+	instances    map[string]*instanceRecord
 	lastSnapshot FleetSnapshot
+}
+
+// SetQuarantineVerifier installs the independent quarantine-evidence verifier.
+// Until one is set, the collector accepts no quarantine evidence (fail closed).
+func (c *Collector) SetQuarantineVerifier(verifier QuarantineVerifier) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.verifier = verifier
 }
 
 // NewCollector constructs a collector, loading any persisted central state from
@@ -106,17 +129,25 @@ func (c *Collector) Collect(
 	sightings []LegacySighting,
 	currentBlock uint64,
 ) (FleetSnapshot, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	now := c.clock()
 
 	eligibleByOperator := map[string][]InventoryInstance{}
 	stakingProviderByOperator := map[string]string{}
 	unreconciled := 0
 	stale := 0
+	reconciledEligible := 0
 
-	for _, inv := range inventory {
+	for _, rawInv := range inventory {
+		inv := rawInv
+		inv.OperatorAddress = normalizeAddress(inv.OperatorAddress)
+
 		if !inv.CeremonyEligible {
 			continue
 		}
+		reconciledEligible++
 		eligibleByOperator[inv.OperatorAddress] = append(
 			eligibleByOperator[inv.OperatorAddress], inv,
 		)
@@ -126,25 +157,65 @@ func (c *Collector) Collect(
 
 		record := c.instanceForInventory(inv)
 
-		// Identity/target reconciliation failures.
-		if inv.TrustedReportTarget == "" {
-			unreconciled++
-		}
+		// Quarantine evidence is accepted only when independently verified; a
+		// bare reference, absent a verifier, never quarantines (fail closed). A
+		// verified-quarantined instance is intentionally removed, so it is
+		// excluded from the stale and unreconciled counts below.
+		record.QuarantineRef = inv.QuarantineEvidenceRef
+		record.HasQuarantine = inv.QuarantineEvidenceRef != "" &&
+			c.verifier != nil &&
+			c.verifier.Verify(
+				inv.InstanceID, inv.OperatorAddress, inv.QuarantineEvidenceRef,
+			)
 
 		report, reported := reports[inv.InstanceID]
+
+		// A missing trusted report target is an inventory-reconciliation failure
+		// (unless the instance is quarantined and thus not expected to report).
 		if inv.TrustedReportTarget == "" {
 			reported = false
+			if !record.HasQuarantine {
+				unreconciled++
+			}
 		}
-		if reported && report.OperatorAddress != "" &&
-			report.OperatorAddress != inv.OperatorAddress {
-			// Identity mismatch: the reported operator does not match inventory.
+
+		// Reject an attestation whose identity, freshness, or reporter revision
+		// cannot be validated, rather than silently accepting it. An identity
+		// fault is also an inventory-reconciliation failure; a stale/replayed
+		// attestation is merely a missed collection.
+		unreconciledFault := false
+		if reported {
+			normalizedReportOperator := normalizeAddress(report.OperatorAddress)
+			switch {
+			case report.InstanceID != "" && report.InstanceID != inv.InstanceID:
+				reported, unreconciledFault = false, true
+			case normalizedReportOperator != "" &&
+				normalizedReportOperator != inv.OperatorAddress:
+				reported, unreconciledFault = false, true
+			case report.AttestedAt.IsZero():
+				// Missing attestation time cannot prove freshness.
+				reported, unreconciledFault = false, true
+			case report.ReporterRevision == 0:
+				// Missing reporter revision.
+				reported, unreconciledFault = false, true
+			case record.LatestReport != nil &&
+				!report.AttestedAt.After(record.LatestReport.AttestedAt):
+				// Stale or replayed attestation (not newer than the last one).
+				reported = false
+			case report.ReporterRevision < record.LastReporterRevision:
+				// Reporter-revision downgrade.
+				reported = false
+			}
+		}
+		if unreconciledFault {
 			unreconciled++
-			reported = false
 		}
 
 		if reported {
 			r := report
+			r.OperatorAddress = inv.OperatorAddress
 			record.LatestReport = &r
+			record.LastReporterRevision = report.ReporterRevision
 			record.ConsecutiveMissed = 0
 			if c.reportIsExact(report) {
 				record.ConsecutiveExact++
@@ -152,20 +223,31 @@ func (c *Collector) Collect(
 				record.ConsecutiveExact = 0
 			}
 		} else {
-			stale++
+			if !record.HasQuarantine {
+				stale++
+			}
 			record.ConsecutiveMissed++
 			record.ConsecutiveExact = 0
 		}
-
-		record.HasQuarantine = inv.QuarantineEvidenceRef != ""
-		record.QuarantineRef = inv.QuarantineEvidenceRef
 	}
 
-	// Fold in this cycle's legacy sightings.
+	// Fold in this cycle's post-cutover legacy sightings. A sighting before the
+	// cutover block, or after the current block, is not valid post-cutover
+	// straggler evidence and is ignored.
 	freshLegacy := map[string]bool{}
 	for _, sighting := range sightings {
-		op := c.operatorForAddress(sighting.OperatorAddress, stakingProviderByOperator)
-		freshLegacy[sighting.OperatorAddress] = true
+		operator := normalizeAddress(sighting.OperatorAddress)
+		if operator == "" {
+			continue
+		}
+		if sighting.Block < c.config.CutoverBlock {
+			continue
+		}
+		if currentBlock > 0 && sighting.Block > currentBlock {
+			continue
+		}
+		op := c.operatorForAddress(operator, stakingProviderByOperator)
+		freshLegacy[operator] = true
 		if sighting.Block > op.LastLegacyBlock {
 			op.LastLegacyBlock = sighting.Block
 		}
@@ -236,12 +318,49 @@ func (c *Collector) Collect(
 	}
 
 	snapshot := c.buildSnapshot(now, currentBlock)
+	snapshot.Complete = c.isComplete(
+		snapshot, reconciledEligible, stale, unreconciled, currentBlock,
+	)
 	c.lastSnapshot = snapshot
 
 	c.updateMetrics(snapshot, stale, unreconciled)
 	c.logCycle(snapshot)
 
 	return snapshot, nil
+}
+
+// isComplete fails closed: readiness is "complete" only with a nonempty
+// reconciled authoritative inventory, a fresh current block, fully specified
+// expected artifact identity and chain ID, and zero blocking/stale/unreconciled.
+// An empty or missing inventory, an unavailable chain clock, or an unset
+// expected identity can never produce complete=true.
+func (c *Collector) isComplete(
+	snapshot FleetSnapshot,
+	reconciledEligible, stale, unreconciled int,
+	currentBlock uint64,
+) bool {
+	if reconciledEligible == 0 {
+		return false
+	}
+	if currentBlock == 0 {
+		return false
+	}
+	if c.config.ExpectedRevision == "" ||
+		c.config.ExpectedEpoch == "" ||
+		c.config.ExpectedImageDigest == "" ||
+		c.config.ChainID == "" {
+		return false
+	}
+	return len(snapshot.Blocking) == 0 && stale == 0 && unreconciled == 0
+}
+
+// normalizeAddress normalizes an operator/staking address for identity joins:
+// trimmed and lowercased. It is lenient — a value that is not a 0x-prefixed hex
+// address is returned lowercased rather than dropped — so inventory, reports,
+// and sightings that refer to one operator with different casing deduplicate to
+// a single record.
+func normalizeAddress(address string) string {
+	return strings.ToLower(strings.TrimSpace(address))
 }
 
 // reconcileOperatorStatus applies the six reconciliation rules to one operator's
@@ -433,14 +552,14 @@ func (c *Collector) buildSnapshot(now time.Time, currentBlock uint64) FleetSnaps
 	sortEntries(quarantined)
 	sortEntries(resolved)
 
-	complete := len(blocking) == 0
-
+	// Complete is decided by the caller's fail-closed isComplete; never derive
+	// it from an empty blocking list alone, which would pass an empty inventory.
 	return FleetSnapshot{
 		SchemaVersion:    FleetSnapshotSchemaVersion,
 		GeneratedAt:      now,
 		CurrentBlock:     currentBlock,
 		CutoverBlock:     c.config.CutoverBlock,
-		Complete:         complete,
+		Complete:         false,
 		ExpectedRevision: c.config.ExpectedRevision,
 		ExpectedEpoch:    c.config.ExpectedEpoch,
 		ExpectedDigest:   c.config.ExpectedImageDigest,
@@ -458,7 +577,15 @@ func (c *Collector) operatorEntry(op *operatorRecord) FleetOperatorEntry {
 		}
 		if inst.LatestReport != nil {
 			instances = append(instances, *inst.LatestReport)
+			continue
 		}
+		// Offline / never-reported authoritative instance: surface its identity
+		// so the audit trail lists every instance the operator owns, not only
+		// those that produced a report this window.
+		instances = append(instances, InstanceReport{
+			InstanceID:      inst.InstanceID,
+			OperatorAddress: inst.OperatorAddress,
+		})
 	}
 	sort.Slice(instances, func(i, j int) bool {
 		return instances[i].InstanceID < instances[j].InstanceID
@@ -564,7 +691,10 @@ func (c *Collector) logCycle(snapshot FleetSnapshot) {
 	}
 }
 
-// Snapshot returns the most recently computed fleet snapshot.
+// Snapshot returns the most recently computed fleet snapshot. It is safe to call
+// concurrently with Collect.
 func (c *Collector) Snapshot() FleetSnapshot {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.lastSnapshot
 }

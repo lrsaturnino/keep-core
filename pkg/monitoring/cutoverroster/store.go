@@ -39,6 +39,9 @@ type instanceRecord struct {
 	ConsecutiveMissed uint            `json:"consecutive_missed"`
 	HasQuarantine     bool            `json:"has_quarantine"`
 	QuarantineRef     string          `json:"quarantine_ref,omitempty"`
+	// LastReporterRevision is the highest accepted InstanceReport.ReporterRevision
+	// for this instance. It guards against replayed or downgraded attestations.
+	LastReporterRevision uint64 `json:"last_reporter_revision"`
 }
 
 // Store is the transactional bbolt persistence for the fleet collector.

@@ -32,19 +32,20 @@ import (
 var logger = log.Logger("keep-cutover-roster")
 
 type options struct {
-	expectedRevision    string
-	expectedEpoch       string
-	expectedImageDigest string
-	cutoverBlock        uint64
-	chainID             string
-	collectionInterval  time.Duration
-	missedThreshold     uint
-	successThreshold    uint
-	dbPath              string
-	apiAddr             string
-	inventoryFile       string
-	sightingsFile       string
-	ethereumRPC         string
+	expectedRevision       string
+	expectedEpoch          string
+	expectedImageDigest    string
+	cutoverBlock           uint64
+	chainID                string
+	collectionInterval     time.Duration
+	missedThreshold        uint
+	successThreshold       uint
+	dbPath                 string
+	apiAddr                string
+	inventoryFile          string
+	sightingsFile          string
+	quarantineEvidenceFile string
+	ethereumRPC            string
 }
 
 func parseOptions() options {
@@ -74,6 +75,9 @@ func parseOptions() options {
 		"Path to the authoritative ceremony-eligible inventory JSON file.")
 	flag.StringVar(&opts.sightingsFile, "sightingsFile", "",
 		"Optional path to a JSON file of aggregated post-cutover legacy sightings.")
+	flag.StringVar(&opts.quarantineEvidenceFile, "quarantineEvidenceFile", "",
+		"Optional path to a JSON file of independently-verified quarantine/removal "+
+			"evidence. Without it, no quarantine evidence is accepted (fail closed).")
 	flag.StringVar(&opts.ethereumRPC, "ethereumRPC", "",
 		"Optional Ethereum JSON-RPC URL used to read the current block height.")
 
@@ -116,6 +120,22 @@ func run(opts options) error {
 	)
 	if err != nil {
 		return fmt.Errorf("cannot construct collector: %w", err)
+	}
+
+	// Install the independent quarantine-evidence verifier. Absent one, the
+	// collector accepts no quarantine evidence (fail closed).
+	if opts.quarantineEvidenceFile != "" {
+		entries, verifierErr := loadQuarantineEvidence(opts.quarantineEvidenceFile)
+		if verifierErr != nil {
+			return fmt.Errorf("cannot load quarantine evidence: %w", verifierErr)
+		}
+		collector.SetQuarantineVerifier(
+			cutoverroster.NewAllowlistQuarantineVerifier(entries),
+		)
+		logger.Infof(
+			"loaded %d independently-verified quarantine evidence entries",
+			len(entries),
+		)
 	}
 
 	server, err := cutoverroster.NewServer(opts.apiAddr, collector, metrics)
@@ -200,11 +220,32 @@ func loadInventory(path string) ([]cutoverroster.InventoryInstance, error) {
 	if err != nil {
 		return nil, err
 	}
-	var inventory []cutoverroster.InventoryInstance
-	if err := json.Unmarshal(data, &inventory); err != nil {
+	// Decode into the input form, which carries trusted_report_target under an
+	// explicit JSON key; InventoryInstance itself never serializes that field.
+	var inputs []cutoverroster.InventoryInstanceInput
+	if err := json.Unmarshal(data, &inputs); err != nil {
 		return nil, fmt.Errorf("cannot decode inventory: %w", err)
 	}
+	inventory := make([]cutoverroster.InventoryInstance, 0, len(inputs))
+	for _, in := range inputs {
+		inventory = append(inventory, in.ToInventoryInstance())
+	}
 	return inventory, nil
+}
+
+func loadQuarantineEvidence(
+	path string,
+) ([]cutoverroster.VerifiedQuarantineEntry, error) {
+	// #nosec G304 -- operator-supplied evidence path for the monitoring tool.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var entries []cutoverroster.VerifiedQuarantineEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return nil, fmt.Errorf("cannot decode quarantine evidence: %w", err)
+	}
+	return entries, nil
 }
 
 func loadSightings(path string) ([]cutoverroster.LegacySighting, error) {
@@ -275,14 +316,10 @@ func fetchReport(
 		return report, fmt.Errorf("cannot decode report: %w", err)
 	}
 
-	report.InstanceID = inv.InstanceID
-	if report.OperatorAddress == "" {
-		report.OperatorAddress = inv.OperatorAddress
-	}
-	if report.AttestedAt.IsZero() {
-		report.AttestedAt = time.Now()
-	}
-
+	// Do not fabricate the report's identity or attestation time from inventory
+	// or the local clock. The collector validates the instance's own attested
+	// identity, freshness, and reporter revision and rejects anything missing or
+	// mismatched, so a fabricated field could mask a stale or foreign report.
 	return report, nil
 }
 

@@ -83,26 +83,45 @@ func eligibleInstance(instanceID, operatorAddr string) InventoryInstance {
 	}
 }
 
+// reporterRevisionFor derives a nonzero, monotonically non-decreasing reporter
+// revision from the attestation time so the collector's replay/downgrade guard
+// accepts a genuinely advancing report while rejecting a stale replay.
+func reporterRevisionFor(at time.Time) uint64 {
+	return uint64(at.Unix())
+}
+
 func exactReport(instanceID, operatorAddr string, at time.Time) InstanceReport {
 	return InstanceReport{
-		InstanceID:      instanceID,
-		OperatorAddress: operatorAddr,
-		Revision:        testRevision,
-		Epoch:           ExpectedEpochSecurityV2Cutover,
-		ImageDigest:     testDigest,
-		AttestedAt:      at,
+		InstanceID:       instanceID,
+		OperatorAddress:  operatorAddr,
+		Revision:         testRevision,
+		Epoch:            ExpectedEpochSecurityV2Cutover,
+		ImageDigest:      testDigest,
+		AttestedAt:       at,
+		ReporterRevision: reporterRevisionFor(at),
 	}
 }
 
 func staleReport(instanceID, operatorAddr string, at time.Time) InstanceReport {
 	return InstanceReport{
-		InstanceID:      instanceID,
-		OperatorAddress: operatorAddr,
-		Revision:        "old-revision",
-		Epoch:           ExpectedEpochSecurityV2Cutover,
-		ImageDigest:     testDigest,
-		AttestedAt:      at,
+		InstanceID:       instanceID,
+		OperatorAddress:  operatorAddr,
+		Revision:         "old-revision",
+		Epoch:            ExpectedEpochSecurityV2Cutover,
+		ImageDigest:      testDigest,
+		AttestedAt:       at,
+		ReporterRevision: reporterRevisionFor(at),
 	}
+}
+
+// testQuarantineVerifier verifies the specific evidence references used by the
+// tests. It is installed on every test collector so verified quarantine survives
+// a restart; any reference not listed here fails verification (fail closed).
+func testQuarantineVerifier() QuarantineVerifier {
+	return NewAllowlistQuarantineVerifier([]VerifiedQuarantineEntry{
+		{InstanceID: "i1", OperatorAddress: "op1", EvidenceRef: "evidence://verified/op1"},
+		{InstanceID: "i-quar", OperatorAddress: "opQuarantined", EvidenceRef: "evidence://verified/opQuarantined"},
+	})
 }
 
 type testCollector struct {
@@ -133,17 +152,21 @@ func newTestCollectorAtPath(t *testing.T, path string) *testCollector {
 	if err != nil {
 		t.Fatalf("cannot construct collector: %v", err)
 	}
+	collector.SetQuarantineVerifier(testQuarantineVerifier())
 	tc.collector = collector
 	t.Cleanup(func() { _ = store.Close() })
 	return tc
 }
 
 func operatorStatus(snapshot FleetSnapshot, addr string) (FleetStatus, bool) {
+	// Operator addresses are normalized (lowercased) on ingestion, so normalize
+	// the query too.
+	want := normalizeAddress(addr)
 	for _, group := range [][]FleetOperatorEntry{
 		snapshot.Blocking, snapshot.Quarantined, snapshot.RecentlyResolved,
 	} {
 		for _, e := range group {
-			if e.OperatorAddress == addr {
+			if e.OperatorAddress == want {
 				return e.Status, true
 			}
 		}
@@ -359,6 +382,36 @@ func TestCollector_VerifiedQuarantineOnly(t *testing.T) {
 	}
 }
 
+// TestCollector_UnverifiedQuarantineStaysBlocking is the negative quarantine
+// case: an evidence reference that is not independently verified (absent from
+// the verifier allowlist) does not quarantine the operator; it stays blocking.
+func TestCollector_UnverifiedQuarantineStaysBlocking(t *testing.T) {
+	tc := newTestCollector(t)
+
+	unverified := eligibleInstance("i1", "op1")
+	// A plausible-looking but not independently-verified reference.
+	unverified.QuarantineEvidenceRef = "evidence://unverified/op1"
+
+	var snap FleetSnapshot
+	for cycle := 0; cycle < 2; cycle++ {
+		var err error
+		snap, err = tc.collector.Collect(
+			[]InventoryInstance{unverified}, map[string]InstanceReport{}, nil, 1000,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tc.now = tc.now.Add(time.Minute)
+	}
+
+	if status, _ := operatorStatus(snap, "op1"); status != FleetOfflineUnknown {
+		t.Fatalf("unverified quarantine evidence must not quarantine; got %s", status)
+	}
+	if snap.Complete {
+		t.Errorf("snapshot must not be complete with an unverified, blocking operator")
+	}
+}
+
 func TestCollector_DistinctStatesSurviveRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "roster.db")
 	tc := newTestCollectorAtPath(t, path)
@@ -499,7 +552,8 @@ func TestCollector_ReadinessAPIDeterministicAndDenies(t *testing.T) {
 	if len(snap.Blocking) != 2 {
 		t.Fatalf("expected 2 blocking operators, got %d", len(snap.Blocking))
 	}
-	if snap.Blocking[0].OperatorAddress != "opA" || snap.Blocking[1].OperatorAddress != "opB" {
+	// Addresses are normalized to lowercase on ingestion and sorted.
+	if snap.Blocking[0].OperatorAddress != "opa" || snap.Blocking[1].OperatorAddress != "opb" {
 		t.Errorf("blocking operators are not sorted deterministically: %+v", snap.Blocking)
 	}
 	if bytes.Contains(rec.Body.Bytes(), []byte("reports.example")) {

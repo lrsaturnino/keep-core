@@ -2,6 +2,7 @@ package tbtc
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"runtime"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/clientinfo"
 	"github.com/keep-network/keep-core/pkg/generator"
 	"github.com/keep-network/keep-core/pkg/net"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/sortition"
 )
 
@@ -81,6 +83,14 @@ const (
 	DefaultPreParamsGenerationDelay       = 10 * time.Second
 	DefaultPreParamsGenerationConcurrency = 1
 )
+
+// cutoverPeerRosterRetentionBlocks bounds how long a legacy peer sighting is
+// retained without a fresh observation before it is evicted as "not recently
+// observed". It is a placeholder for the Part A cutover gate's
+// tbtc.MaximumLegacyCompletionBlocks() + reviewed margin: the longest tBTC
+// wallet-action validity is 1200 blocks (deposit sweep), and a 300-block margin
+// covers RPC and processing skew.
+const cutoverPeerRosterRetentionBlocks = uint64(1200 + 300)
 
 var DefaultKeyGenerationConcurrency = runtime.GOMAXPROCS(0)
 
@@ -162,6 +172,42 @@ func Initialize(
 
 	deduplicator := newDeduplicator()
 
+	// Construct one node-local cutover peer roster unconditionally, beside the
+	// (future) participation gate — including when client-info is disabled
+	// (port 0). It deduplicates post-cutover legacy peer sightings observed by
+	// the DKG and signing announcers so operators that have not adopted the
+	// security-v2 release can be identified. With client-info enabled it records
+	// through the same performance registry that backs /metrics; with
+	// client-info disabled it records to a no-op sink so its logs and state
+	// still function.
+	var rosterMetrics participation.CutoverRosterMetricsRecorder
+	if clientInfo != nil {
+		if perfMetrics == nil {
+			perfMetrics = clientinfo.NewPerformanceMetrics(ctx, clientInfo)
+		}
+		rosterMetrics = perfMetrics
+	} else {
+		rosterMetrics = &clientinfo.NoOpPerformanceMetrics{}
+	}
+
+	blockCounter, err := chain.BlockCounter()
+	if err != nil {
+		return fmt.Errorf(
+			"cannot get block counter for cutover peer roster: [%v]",
+			err,
+		)
+	}
+	cutoverRoster, err := participation.NewCutoverPeerRoster(
+		ctx,
+		blockCounter,
+		cutoverPeerRosterRetentionBlocks,
+		rosterMetrics,
+	)
+	if err != nil {
+		return fmt.Errorf("cannot create cutover peer roster: [%v]", err)
+	}
+	node.setCutoverPeerRoster(cutoverRoster)
+
 	if clientInfo != nil {
 		// only if client info endpoint is configured
 		clientInfo.ObserveApplicationSource(
@@ -173,10 +219,26 @@ func Initialize(
 			},
 		)
 
-		if perfMetrics == nil {
-			perfMetrics = clientinfo.NewPerformanceMetrics(ctx, clientInfo)
-		}
 		node.setPerformanceMetrics(perfMetrics)
+
+		// Expose the node-local cutover peer roster snapshot as a top-level
+		// diagnostics object so port-enabled nodes surface which operators are
+		// observed on the legacy release across the cutover.
+		clientInfo.RegisterDiagnosticSource(
+			"cutover_legacy_peers",
+			func() string {
+				snapshot := cutoverRoster.Snapshot()
+				bytes, err := json.Marshal(snapshot)
+				if err != nil {
+					logger.Errorf(
+						"error on serializing cutover peer roster to JSON: [%v]",
+						err,
+					)
+					return ""
+				}
+				return string(bytes)
+			},
+		)
 
 		// Register coordination windows as a diagnostic source
 		clientInfo.RegisterApplicationSource(

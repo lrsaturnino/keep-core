@@ -198,13 +198,17 @@ mixed-version set through a live DKG or signing session.
 
 ### Coordinated release-model context
 
-The mixed-version hazard above is why this ships as a single coordinated security
-release with one required operator update and one release-baked cutover block
-(`C`): before `C` participants speak the legacy wire formats, and canonically
-post-`C` work speaks security-v2. The block-height cutover gate and its
-per-ceremony mode strategies land in their own separately reviewable commits;
-the fail-closed property stated above holds regardless (mismatched cryptography
-does not decrypt or verify and never yields a valid-but-wrong result).
+The mixed-version hazard above is why the coordinated release is _designed_
+around a single required operator update and one release-baked cutover block
+(`C`): under that design, before `C` participants speak the legacy wire formats
+and canonically post-`C` work speaks security-v2. That block-height cutover gate,
+and its per-ceremony legacy/security-v2 mode strategies, are a separate,
+not-yet-landed change. **This build does not contain the gate and therefore
+still requires the atomic flag-day upgrade described in the section above — there
+is no runtime height switch yet.** The fail-closed property holds regardless
+(mismatched cryptography does not decrypt or verify and never yields a
+valid-but-wrong result), so an un-upgraded peer that meets upgraded peers in a
+ceremony loses liveness rather than fund safety.
 
 Two supporting changes ship to keep the coordinated release observable and to
 identify who has not converged:
@@ -223,9 +227,14 @@ identify who has not converged:
   inventory so readiness is measured against exact revision/epoch/digest, not
   merely a quiet mismatch counter.
 
-**Release epoch.** The coordinated cutover artifact reports the release epoch
-`security_v2_cutover` in `client_info` and diagnostics; a node's exact revision,
-epoch, and cutover block are the go/no-go evidence, not the container tag.
+**Release epoch.** The coordinated cutover artifact is identified by the release
+epoch `security_v2_cutover`. Exporting that epoch (and the cutover block) as a
+`client_info` label and diagnostics field is part of the not-yet-landed gate
+change and is NOT present in this build; today the go/no-go evidence is a node's
+exact revision (already in `client_info`/diagnostics) plus the stranded-peer
+observability below, not the container tag. The `cutover-roster` aggregator's
+`--expectedEpoch` flag carries the expected `security_v2_cutover` value as plain
+operator-supplied configuration until the gate ships.
 
 ---
 

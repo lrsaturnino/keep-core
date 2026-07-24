@@ -69,6 +69,32 @@ type InventoryInstance struct {
 	QuarantineEvidenceRef string `json:"quarantine_evidence_ref,omitempty"`
 }
 
+// InventoryInstanceInput is the on-disk inventory input form. Unlike
+// InventoryInstance — whose TrustedReportTarget is `json:"-"` so it is never
+// serialized back out — this input form carries the trusted report target under
+// an explicit JSON key so operator inventory can supply it. The collector copies
+// it into the in-memory InventoryInstance, which never serializes the target.
+type InventoryInstanceInput struct {
+	InstanceID            string `json:"instance_id"`
+	OperatorAddress       string `json:"operator_address"`
+	StakingProvider       string `json:"staking_provider"`
+	CeremonyEligible      bool   `json:"ceremony_eligible"`
+	ExpectedRevision      string `json:"expected_revision"`
+	ExpectedEpoch         string `json:"expected_epoch"`
+	ExpectedImageDigest   string `json:"expected_image_digest"`
+	TrustedReportTarget   string `json:"trusted_report_target"`
+	QuarantineEvidenceRef string `json:"quarantine_evidence_ref,omitempty"`
+}
+
+// ToInventoryInstance converts the on-disk input form to the in-memory
+// InventoryInstance, carrying the trusted report target across. The two structs
+// share identical fields (differing only in JSON tags), so the conversion is a
+// direct struct conversion; adding a field to one but not the other becomes a
+// compile error, keeping the input and in-memory forms in lockstep.
+func (i InventoryInstanceInput) ToInventoryInstance() InventoryInstance {
+	return InventoryInstance(i)
+}
+
 // InstanceReport is one attested report obtained from an instance's trusted
 // report target during a collection cycle.
 type InstanceReport struct {
