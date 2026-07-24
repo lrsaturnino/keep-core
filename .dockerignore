@@ -12,7 +12,6 @@ tmp/
 
 # Top-level files unrealted to the build.
 CODEOWNERS
-crytic-config.json
 Dockerfile
 *.adoc
 
@@ -20,7 +19,6 @@ Dockerfile
 **/node_modules/*
 
 # Solidity stuff.
-solidity-v1/
 solidity/
 
 # Token Stakedrop stuff.
@@ -37,10 +35,6 @@ token-tracker/
 !**/gen/pb/*.go
 !**/gen/gen.go
 !**/gen/cmd/cmd.go
-
-# Legacy V1 contracts bindings.
-# We won't generate new bindings in the docker build process, but use the existing ones.
-!pkg/chain/gen
 
 # Contract addresses.
 # We do not want to overwrite extracted contract addresses with empty content while
