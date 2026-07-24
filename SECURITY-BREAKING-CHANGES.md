@@ -190,8 +190,8 @@ a "beacon proxy upgrade":
 This distinguishes RandomBeacon from legitimately proxied components (e.g.
 `LightRelayMaintainerProxy`), which this row does not cover.
 
-**F-09 note — RandomBeacon relay-entry reimbursement offset (proposed design
-decision — pending owner ratification).** Both `submitRelayEntry` overloads share a single
+**F-09 note — RandomBeacon relay-entry reimbursement offset (design decision,
+approved 2026-07-24).** Both `submitRelayEntry` overloads share a single
 `_relayEntrySubmissionGasOffset = 13_450`
 (`contracts/RandomBeacon.sol:475,1072,1138`; fixture
 `test/fixtures/index.ts:59`). The offset was raised from `11_250` to `13_450` to
@@ -207,7 +207,7 @@ partly unmeasured — plus headroom, tuned for the heavier
   `submitRelayEntry(bytes)` overload carries none of that calldata, so the shared
   offset structurally **over-reimburses** the lighter overload by a fixed
   ~9,563 gas. This is a property of the single-offset design, not a defect.
-- **Proposed decision (pending ratification).** Keep one shared offset rather than splitting it into two
+- **Decision (approved 2026-07-24).** Keep one shared offset rather than splitting it into two
   governance-settable offsets. Rationale: (1) avoids adding a second storage slot
   plus governance setter and the associated upgrade/migration surface on a
   security-release contract; (2) the only harmful direction —
@@ -237,16 +237,24 @@ partly unmeasured — plus headroom, tuned for the heavier
 
 **tECDSA signing copylock fix (this candidate, reviewed and accepted 2026-07-24).**
 Merging current `main` exposed a `go vet` copylock failure in
-`pkg/tecdsa/signing/member.go`: a generic channel receive was copying tss-lib's
-`common.SignatureData` (which embeds a `DoNotCopy` lock marker) by value. The
-fix (`finalizingMember.receiveTSSResult`) drains the channel via
-`reflect.Select` + `reflect.New`/`Set` instead of a plain value receive, so
-`go vet` no longer flags the copy. This is a receive-side mechanical change
-only — it does not alter session handling, message content, or any
-cryptographic computation, and tss-lib's own send side already copies the same
-value (`end <- *round.data`). It is reviewed and accepted separately from, and
-does not substitute for, the external `tss-lib` dependency security audit
-tracked as a separate release action item above.
+`pkg/tecdsa/signing/member.go`: tss-lib's `signing.NewLocalParty` requires a
+value-typed result channel and delivers via `end <- *round.data`
+(`ecdsa/signing/finalize.go`), so every consumer must copy the lock-bearing
+`common.SignatureData` (a protobuf message with a `DoNotCopy` marker) on
+receive. `finalizingMember.receiveTSSResult` performs that single unavoidable
+receive through the type-safe generic helper `receiveFromChannel` (no
+reflection), then re-homes only the signature-relevant fields (`Signature`,
+`SignatureRecovery`, `R`, `S`, `M`) into a freshly allocated `SignatureData`
+built with a composite literal. The returned value owns a brand-new, never-locked
+`MessageState`, so `go vet` has nothing to flag, and the transient received
+value (with its copied lock) is discarded at the function boundary rather than
+propagated. This is a receive-side mechanical change only — it does not alter
+session handling, message content, or any cryptographic computation. It is
+reviewed and accepted separately from, and does not substitute for, the
+external `tss-lib` dependency security audit tracked as a separate release
+action item above; the ideal upstream fix (forking tss-lib's channel to a
+pointer type) is intentionally out of scope for this release and tracked
+separately.
 
 ---
 
