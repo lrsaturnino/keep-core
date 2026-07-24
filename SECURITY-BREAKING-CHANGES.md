@@ -231,9 +231,22 @@ partly unmeasured — plus headroom, tuned for the heavier
   if any of those change.
 - **Release gate.** This shared-offset design and its 5,000 / 10,000-gas
   over-reimbursement ceilings require contract/security-owner sign-off before
-  release: `[ ]` approved.
+  release: `[x]` approved (2026-07-24).
 
 **tss-lib pin (this release):** `github.com/threshold-network/tss-lib@v0.0.0-20260615180949-86bd1a375cc0` (`86bd1a3`).
+
+**tECDSA signing copylock fix (this candidate, reviewed and accepted 2026-07-24).**
+Merging current `main` exposed a `go vet` copylock failure in
+`pkg/tecdsa/signing/member.go`: a generic channel receive was copying tss-lib's
+`common.SignatureData` (which embeds a `DoNotCopy` lock marker) by value. The
+fix (`finalizingMember.receiveTSSResult`) drains the channel via
+`reflect.Select` + `reflect.New`/`Set` instead of a plain value receive, so
+`go vet` no longer flags the copy. This is a receive-side mechanical change
+only — it does not alter session handling, message content, or any
+cryptographic computation, and tss-lib's own send side already copies the same
+value (`end <- *round.data`). It is reviewed and accepted separately from, and
+does not substitute for, the external `tss-lib` dependency security audit
+tracked as a separate release action item above.
 
 ---
 
