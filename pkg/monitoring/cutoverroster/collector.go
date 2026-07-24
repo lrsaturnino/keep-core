@@ -158,6 +158,29 @@ func (c *Collector) Collect(
 		if !inv.CeremonyEligible {
 			continue
 		}
+
+		// Reject a malformed, duplicated, or internally-contradictory
+		// authoritative inventory entry as an inventory-reconciliation fault
+		// before it can contribute to a resolved status. A missing instance or
+		// operator identity cannot be joined or tracked; a duplicate instance ID
+		// within one cycle would let one entry silently overwrite another; a
+		// per-instance expected identity that contradicts the collector's
+		// configured expected release means the inventory disagrees with itself
+		// about what "current" is for that instance. Any of these forces readiness
+		// closed (unreconciled > 0) rather than silently contributing to success.
+		if inv.InstanceID == "" || inv.OperatorAddress == "" {
+			unreconciled++
+			continue
+		}
+		if seenInstanceIDs[inv.InstanceID] {
+			unreconciled++
+			continue
+		}
+		if c.inventoryExpectationContradicts(inv) {
+			unreconciled++
+			continue
+		}
+
 		reconciledEligible++
 		seenInstanceIDs[inv.InstanceID] = true
 		eligibleByOperator[inv.OperatorAddress] = append(
@@ -418,6 +441,29 @@ func (c *Collector) isComplete(
 // a single record.
 func normalizeAddress(address string) string {
 	return strings.ToLower(strings.TrimSpace(address))
+}
+
+// inventoryExpectationContradicts reports whether an authoritative inventory
+// entry's own expected release identity contradicts the collector's configured
+// expected release. A per-instance expected revision, epoch, or image digest
+// that is set but differs from the configured value means the inventory is
+// internally inconsistent about what the cutover release is for that instance;
+// the entry is treated as an inventory-reconciliation fault so it cannot
+// contribute to a resolved status.
+func (c *Collector) inventoryExpectationContradicts(inv InventoryInstance) bool {
+	if inv.ExpectedRevision != "" &&
+		inv.ExpectedRevision != c.config.ExpectedRevision {
+		return true
+	}
+	if inv.ExpectedEpoch != "" &&
+		inv.ExpectedEpoch != c.config.ExpectedEpoch {
+		return true
+	}
+	if inv.ExpectedImageDigest != "" &&
+		inv.ExpectedImageDigest != c.config.ExpectedImageDigest {
+		return true
+	}
+	return false
 }
 
 // reconcileOperatorStatus applies the six reconciliation rules to one operator's

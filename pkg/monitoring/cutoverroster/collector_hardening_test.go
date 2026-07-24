@@ -282,3 +282,112 @@ func TestCollector_ConcurrentCollectAndSnapshot(t *testing.T) {
 	close(stop)
 	wg.Wait()
 }
+
+// TestCollector_MalformedIdentityRejected proves an eligible inventory entry with
+// a missing instance or operator identity is rejected as an inventory-
+// reconciliation fault: it cannot be reconciled or counted as an eligible
+// instance, and it forces readiness closed.
+func TestCollector_MalformedIdentityRejected(t *testing.T) {
+	tc := newTestCollector(t)
+	inv := []InventoryInstance{
+		eligibleInstance("", "op1"), // missing instance ID
+		eligibleInstance("i2", ""),  // missing operator address
+	}
+	snap, err := tc.collector.Collect(inv, nil, nil, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Complete {
+		t.Errorf("a malformed inventory identity must not yield completeness")
+	}
+	if snap.Inventory.EligibleInstances != 0 {
+		t.Errorf(
+			"malformed entries must not count as reconciled eligible; got %d",
+			snap.Inventory.EligibleInstances,
+		)
+	}
+	if snap.Inventory.Unreconciled < 2 {
+		t.Errorf(
+			"both malformed entries must count as unreconciled; got %d",
+			snap.Inventory.Unreconciled,
+		)
+	}
+	if tc.sink.gauge(MetricInventoryUnreconciled) == 0 {
+		t.Errorf("a malformed identity must raise the unreconciled gauge")
+	}
+}
+
+// TestCollector_DuplicateInstanceIDRejected proves a duplicate instance ID within
+// one inventory cycle is flagged: the first entry is reconciled, the duplicate
+// cannot silently overwrite it or create a second operator record, and readiness
+// fails closed.
+func TestCollector_DuplicateInstanceIDRejected(t *testing.T) {
+	tc := newTestCollector(t)
+	inv := []InventoryInstance{
+		eligibleInstance("i1", "op1"),
+		eligibleInstance("i1", "op2"), // duplicate instance ID, different operator
+	}
+	snap, err := tc.collector.Collect(
+		inv,
+		map[string]InstanceReport{"i1": exactReport("i1", "op1", tc.now)},
+		nil,
+		1000,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Complete {
+		t.Errorf("a duplicate instance ID must not yield completeness")
+	}
+	// Exactly one entry is reconciled eligible (the first i1); the duplicate is a
+	// fault, not a second eligible instance.
+	if snap.Inventory.EligibleInstances != 1 {
+		t.Errorf(
+			"expected 1 reconciled eligible instance, got %d",
+			snap.Inventory.EligibleInstances,
+		)
+	}
+	if snap.Inventory.Unreconciled == 0 {
+		t.Errorf("the duplicate instance ID must count as unreconciled")
+	}
+	if _, ok := operatorStatus(snap, "op2"); ok {
+		t.Errorf("the duplicate entry must not create a second operator record")
+	}
+	if tc.sink.gauge(MetricInventoryUnreconciled) == 0 {
+		t.Errorf("the duplicate instance ID must raise the unreconciled gauge")
+	}
+}
+
+// TestCollector_ContradictoryInstanceExpectationRejected proves an eligible
+// inventory entry whose own expected release identity contradicts the collector's
+// configured expected release is rejected as an inventory-reconciliation fault
+// and cannot resolve the operator even with otherwise-exact reports.
+func TestCollector_ContradictoryInstanceExpectationRejected(t *testing.T) {
+	tc := newTestCollector(t)
+	contradictory := eligibleInstance("i1", "op1")
+	contradictory.ExpectedRevision = "some-other-revision" // contradicts config
+	inv := []InventoryInstance{contradictory}
+
+	// Even three exact reports (matching the collector config) must not resolve
+	// the operator, because the inventory disagrees with the config about what the
+	// cutover release is for this instance.
+	var snap FleetSnapshot
+	for cycle := 0; cycle < 3; cycle++ {
+		reports := map[string]InstanceReport{"i1": exactReport("i1", "op1", tc.now)}
+		var err error
+		snap, err = tc.collector.Collect(inv, reports, nil, 1000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tc.now = tc.now.Add(time.Minute)
+	}
+	if snap.Complete {
+		t.Errorf("a contradictory per-instance expectation must not yield completeness")
+	}
+	if snap.Inventory.Unreconciled == 0 {
+		t.Errorf("a contradictory per-instance expectation must count as unreconciled")
+	}
+	if status, _ := operatorStatus(snap, "op1"); status == FleetResolvedCurrent {
+		t.Errorf("a contradictory per-instance expectation must not resolve the operator")
+	}
+}
