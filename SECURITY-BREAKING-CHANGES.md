@@ -163,7 +163,7 @@ monitoring updates.
 
 | ID | Change | Operator action |
 |----|--------|-----------------|
-| **OV-1** | Metrics/diagnostics **opt-in**: `clientInfo.port` default is **0** (HTTP server off) | Set `clientInfo.port` explicitly (e.g. `9601`) if scraping `/metrics` or `/diagnostics` |
+| **OV-1** | Metrics/diagnostics **temporary compatibility default**: `clientInfo.port` stays `9601` for this coordinated release (HTTP server on) so a node's exact revision and stranded-peer evidence stay visible through the cutover; explicit `clientInfo.port = 0` disables it. The follow-up R2 release flips the default back to `0` after the monitoring migration. | Commit an explicit `clientInfo.port` value now, expose it only over a trusted path, and migrate scrape targets before R2 |
 | **OV-2** | Metric rename: `connected_bootstrap_count` → `connected_wellknown_peers_count` | Update Grafana/Prometheus dashboards and alerts |
 | **OV-3** | `--network.bootstrap=true` deprecated (warning only) | Remove from config when convenient |
 
@@ -282,6 +282,49 @@ consensus-safety issue -- mismatched cryptography fails closed (shares do not
 decrypt, signatures do not verify) and never yields a valid-but-wrong result.
 Operators must upgrade the entire ceremony fleet atomically and must not run a
 mixed-version set through a live DKG or signing session.
+
+### Coordinated release-model context
+
+The mixed-version hazard above is why the coordinated release is _designed_
+around a single required operator update and one release-baked cutover block
+(`C`): under that design, before `C` participants speak the legacy wire formats
+and canonically post-`C` work speaks security-v2. That block-height cutover gate,
+and its per-ceremony legacy/security-v2 mode strategies, are a separate,
+not-yet-landed change. **This build does not contain the gate and therefore
+still requires the atomic flag-day upgrade described in the section above — there
+is no runtime height switch yet.** The fail-closed property holds regardless
+(mismatched cryptography does not decrypt or verify and never yields a
+valid-but-wrong result), so an un-upgraded peer that meets upgraded peers in a
+ceremony loses liveness rather than fund safety.
+
+Two supporting changes ship to keep the coordinated release observable and to
+identify who has not converged:
+
+- **Client-info compatibility (Part B).** The `clientInfo.port` default is
+  retained at `9601` for the release window (see OV-1). This keeps the
+  unauthenticated metrics/diagnostics channel — the primary source of a node's
+  exact revision and stranded-peer evidence — alive through the cutover.
+  Expose it only over a trusted path. R2 flips the default back to `0` after the
+  monitoring migration is complete.
+- **Stranded/legacy-peer observability.** An announcer session-ID mismatch
+  observer classifies each membership-valid announcement as legacy or hardened
+  and a node-local, deduplicated cutover peer roster records post-cutover legacy
+  sightings by normalized operator address. A separate `cutover-roster`
+  aggregator joins those sightings to the authoritative eligible-instance
+  inventory so readiness is measured against exact revision/epoch/digest, not
+  merely a quiet mismatch counter.
+
+**Release epoch.** The coordinated cutover artifact is identified by the release
+epoch `security_v2_cutover`. Exporting that epoch (and the cutover block) as a
+`client_info` label and diagnostics field is part of the not-yet-landed gate
+change and is NOT present in this build; today the go/no-go evidence is a node's
+exact revision plus the stranded-peer observability below, not the container tag.
+Note the exact revision is carried by the `/diagnostics` `client_info` field
+only; the `client_info` **Prometheus metric** carries just the `version` label in
+this build (revision/epoch labels arrive with the not-yet-landed gate change). The
+`cutover-roster` aggregator's `--expectedEpoch` flag carries the expected
+`security_v2_cutover` value as plain operator-supplied configuration until the
+gate ships.
 
 ---
 

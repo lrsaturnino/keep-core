@@ -1,0 +1,15 @@
+---
+# Durable storage for the collector's bbolt central state (roster.db). Central
+# state (resolved/blocking/quarantined operator history) must survive collector
+# restarts, so it is persisted rather than kept in an emptyDir.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cutover-roster-pvc
+spec:
+  storageClassName: monitoring-storage
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi

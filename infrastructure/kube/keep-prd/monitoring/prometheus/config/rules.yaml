@@ -50,3 +50,59 @@ groups:
             breakdown (performance_network_join_requests_failed_*_total)
             to tell genuine non-recognition (firewall_unrecognized) apart
             from firewall RPC errors, timeouts, and connection resets.
+
+  # Cutover-readiness fleet alerts, emitted by the cutover-roster collector
+  # (pkg/monitoring/cutoverroster). These mirror cutoverroster.AlertRules(),
+  # which is the programmatic source of truth; keep the two in sync. Both fire
+  # only after two consecutive one-minute evaluations and are routed to the
+  # Release and Operator Coordination teams.
+  - name: cutover-roster
+    rules:
+      - alert: CutoverBlockingOperatorsPresent
+        expr: performance_cutover_fleet_blocking_operators > 0
+        for: 2m
+        labels:
+          severity: critical
+          team: release
+          route_to: release,operator-coordination
+        annotations:
+          summary: Cutover-eligible operators remain in a blocking status.
+          description: >-
+            One or more authoritative operators are not exact-R1 or
+            independently quarantined. Cutover readiness is not met.
+      - alert: CutoverRosterIncomplete
+        expr: >-
+          performance_cutover_fleet_blocking_operators > 0
+          or performance_cutover_reporters_stale > 0
+          or performance_cutover_inventory_unreconciled > 0
+        for: 2m
+        labels:
+          severity: warning
+          team: release
+          route_to: release,operator-coordination
+        annotations:
+          summary: Cutover fleet roster is incomplete.
+          description: >-
+            Blocking operators, stale reporters, or unreconciled inventory are
+            present. The go/no-go completeness criteria are not met.
+      # A dead or unscraped collector makes every performance_cutover_* series
+      # vanish, so the two alerts above would evaluate absent and never fire. This
+      # up/absent() alert catches that hole: it fires when the collector target is
+      # down (up == 0) or has disappeared from the scrape config (absent).
+      - alert: CutoverRosterCollectorDown
+        expr: >-
+          up{job="cutover-roster"} == 0
+          or absent(up{job="cutover-roster"})
+        for: 2m
+        labels:
+          severity: critical
+          team: release
+          route_to: release,operator-coordination
+        annotations:
+          summary: Cutover-roster collector scrape target is down or absent.
+          description: >-
+            Prometheus cannot scrape the cutover-roster collector (job
+            cutover-roster): the target is down or has disappeared from the scrape
+            config. Every performance_cutover_* series is therefore stale or
+            absent, so the other roster alerts can be silently absent. Cutover
+            readiness cannot be evaluated until the collector is restored.

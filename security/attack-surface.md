@@ -145,6 +145,15 @@ Password is held in memory in plaintext for the lifetime of the process. No zero
 
 An HTTP server listens on port 9601 by default (`--clientInfo.port`). No authentication.
 
+The `9601` default is a **temporary compatibility default** for the coordinated
+security release: it keeps the metrics/diagnostics evidence channel reachable
+through the cutover. Explicit `clientInfo.port = 0` disables the server. Because
+the endpoint is unauthenticated, it MUST be reached only over a trusted network
+path (firewall/VPN or an authenticated proxy) and MUST NOT be published on a
+public interface. The follow-up R2 release flips the default back to `0`
+(disabled) after the monitoring migration completes; see the monitoring
+migration tracking issue for owner and dated expiry.
+
 Exposed information:
 - Connected peer addresses and identities
 - Ethereum and Bitcoin RPC health metrics

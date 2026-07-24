@@ -93,8 +93,15 @@ To validate the running client check the metrics for the number of connected pee
 The client should connect to the bootstrap nodes (at least 2) and other nodes that
 are working in the network. There should be at least 10 connections.
 
-The metrics endpoint is opt-in: enable it by setting `clientInfo.port` in the
-client configuration, then probe the configured port:
+For the coordinated security release the metrics endpoint listens on the
+compatibility default port `9601`. Set an explicit port in the client
+configuration to pin it (recommended), or set `clientInfo.port = 0` to disable
+it; then probe the configured port over a trusted network path only:
+
+```
+[clientInfo]
+Port = 9601
+```
 
 ```
 curl localhost:<clientInfo.port>/metrics

@@ -7,8 +7,15 @@ through the `/metrics` endpoint when the client info endpoint is configured.
 == Metrics Endpoint
 
 Metrics are exposed via HTTP at the `/metrics` endpoint on the port configured
-in the `ClientInfo` section of the configuration file. The endpoint is disabled
-by default and should only be exposed on a trusted network.
+in the `ClientInfo` section of the configuration file. For the coordinated
+security release the client-info server listens on the compatibility default
+port `9601`; this is a temporary compatibility default. Set an explicit
+`[clientInfo] Port = 9601` (or another port) to keep it, or `[clientInfo]
+Port = 0` to explicitly disable it. The endpoint is unauthenticated and MUST be
+exposed only on a trusted/private network path (firewall/VPN or an
+authenticated proxy). The follow-up R2 release will flip the default back to
+`0` (disabled) once the monitoring migration is complete; commit an explicit
+`clientInfo.port` value before then.
 
 Example:
 ----
@@ -278,3 +285,59 @@ For each action type, the following metrics are available:
 *Type*: Counter
 *Description*: Total number of relay entry timeouts reported on-chain
 *Labels*: None
+
+=== Cutover-Readiness Observability Metrics
+
+The coordinated security release adds stranded/legacy-peer observability so that
+cutover readiness can identify which operators remain nonconverged. The
+following node-local metrics are recorded by the tBTC DKG and signing announcer
+mismatch observer and the node-local cutover peer roster
+(`pkg/protocol/participation`). They deduplicate every post-cutover legacy-wire
+sighting down to the normalized operator address; they never carry operator,
+session, or peer labels.
+
+NOTE: These observability metrics do not require the block-height cutover gate
+and are exposed today. The gate itself, and its `performance_participation_*`
+gate-state metrics, are a separate future change and are NOT exposed by this
+build.
+
+==== `performance_announcer_session_id_mismatch_total`
+*Type*: Counter
+*Description*: Unique membership-valid senders per announce call whose announced session ID differs from the local one
+*Labels*: None
+
+==== `performance_announcer_cross_format_peer_total`
+*Type*: Counter
+*Description*: Subset of session-ID mismatches classified as a legacy-versus-hardened cross-format difference
+*Labels*: None
+
+==== `performance_announcer_legacy_peers_current`
+*Type*: Gauge
+*Description*: Deduplicated operator addresses currently retained in the local cutover roster
+*Labels*: None
+
+==== `performance_announcer_legacy_peer_oldest_age_blocks`
+*Type*: Gauge
+*Description*: Current block minus the oldest retained first-seen block
+*Labels*: None
+
+==== `performance_announcer_legacy_peer_roster_revision`
+*Type*: Gauge
+*Description*: Monotonic process-local roster revision
+*Labels*: None
+
+==== `performance_announcer_legacy_peer_additions_total`
+*Type*: Counter
+*Description*: Absent-to-present operator transitions in the local cutover roster
+*Labels*: None
+
+==== `performance_announcer_legacy_peer_evictions_total`
+*Type*: Counter
+*Description*: Final-sighting retention evictions from the local cutover roster
+*Labels*: None
+
+The authoritative fleet view is produced by the separate `cutover-roster`
+aggregator (`cmd/cutover-roster`), which exposes its own
+`performance_cutover_fleet_*` and `performance_cutover_operator_*` metrics on a
+monitoring-only endpoint. Those metrics are documented with that tool and are
+not served from a node's `/metrics` endpoint.

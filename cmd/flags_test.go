@@ -174,7 +174,7 @@ var cmdFlagsTests = map[string]struct {
 		flagName:              "--clientInfo.port",
 		flagValue:             "9870",
 		expectedValueFromFlag: 9870,
-		defaultValue:          0,
+		defaultValue:          9601,
 	},
 	"clientInfo.networkMetricsTick": {
 		readValueFunc:         func(c *config.Config) interface{} { return c.ClientInfo.NetworkMetricsTick },
@@ -484,6 +484,103 @@ func TestFlags_Mixed(t *testing.T) {
 				t.Errorf("\nexpected: %s\nactual:   %s", expected, actual)
 			}
 		})
+	}
+}
+
+// TestFlags_ClientInfoPortExplicitZero proves that an explicit `--clientInfo.port 0`
+// on the command line resolves to zero even though the bound flag default is now
+// 9601. This is the CLI half of the two explicit-zero acceptance paths; it cannot
+// stand in for the TOML path because flag binding and Viper unmarshalling have
+// different precedence rules.
+func TestFlags_ClientInfoPortExplicitZero(t *testing.T) {
+	testCommand, testConfig, _ := initTestCommand()
+
+	args := []string{
+		cmdFlagsTests["ethereum.url"].flagName, cmdFlagsTests["ethereum.url"].flagValue,
+		cmdFlagsTests["ethereum.keyFile"].flagName, cmdFlagsTests["ethereum.keyFile"].flagValue,
+		cmdFlagsTests["bitcoin.electrum.url"].flagName, cmdFlagsTests["bitcoin.electrum.url"].flagValue,
+		cmdFlagsTests["storage.dir"].flagName, cmdFlagsTests["storage.dir"].flagValue,
+		"--clientInfo.port", "0",
+	}
+	testCommand.SetArgs(args)
+
+	testCommand.Execute()
+
+	if testConfig.ClientInfo.Port != 0 {
+		t.Errorf(
+			"expected clientInfo.port to be 0 when explicitly set on the CLI, got [%d]",
+			testConfig.ClientInfo.Port,
+		)
+	}
+}
+
+// TestFlags_ClientInfoPortZeroFromConfig proves that an explicit `[clientInfo] Port = 0`
+// in a TOML file resolves to zero despite the bound flag default of 9601. This is the
+// TOML half of the two explicit-zero acceptance paths; Viper must preserve a config-file
+// zero over the CLI-bound default.
+func TestFlags_ClientInfoPortZeroFromConfig(t *testing.T) {
+	testCommand, testConfig, _ := initTestCommand()
+
+	args := []string{
+		"--config", "../test/config_clientinfo_zero.toml",
+	}
+	testCommand.SetArgs(args)
+
+	testCommand.Execute()
+
+	if testConfig.ClientInfo.Port != 0 {
+		t.Errorf(
+			"expected clientInfo.port to be 0 when set to 0 in the config file, got [%d]",
+			testConfig.ClientInfo.Port,
+		)
+	}
+}
+
+// TestFlags_ClientInfoPortExplicit9601 proves that an explicit
+// `--clientInfo.port 9601` on the command line resolves to the 9601 compatibility
+// port (i.e. a nonzero, server-enabling value). It is the explicit counterpart of
+// the bound-default case: an operator may pin 9601 to make the intent explicit.
+func TestFlags_ClientInfoPortExplicit9601(t *testing.T) {
+	testCommand, testConfig, _ := initTestCommand()
+
+	args := []string{
+		cmdFlagsTests["ethereum.url"].flagName, cmdFlagsTests["ethereum.url"].flagValue,
+		cmdFlagsTests["ethereum.keyFile"].flagName, cmdFlagsTests["ethereum.keyFile"].flagValue,
+		cmdFlagsTests["bitcoin.electrum.url"].flagName, cmdFlagsTests["bitcoin.electrum.url"].flagValue,
+		cmdFlagsTests["storage.dir"].flagName, cmdFlagsTests["storage.dir"].flagValue,
+		"--clientInfo.port", "9601",
+	}
+	testCommand.SetArgs(args)
+
+	testCommand.Execute()
+
+	if testConfig.ClientInfo.Port != 9601 {
+		t.Errorf(
+			"expected clientInfo.port to be 9601 when explicitly set on the CLI, got [%d]",
+			testConfig.ClientInfo.Port,
+		)
+	}
+}
+
+// TestFlags_ClientInfoPort9601FromConfig proves that an explicit
+// `[clientInfo] Port = 9601` in a TOML file resolves to 9601 (a nonzero,
+// server-enabling value). It is the TOML counterpart of the explicit CLI 9601
+// case.
+func TestFlags_ClientInfoPort9601FromConfig(t *testing.T) {
+	testCommand, testConfig, _ := initTestCommand()
+
+	args := []string{
+		"--config", "../test/config_clientinfo_9601.toml",
+	}
+	testCommand.SetArgs(args)
+
+	testCommand.Execute()
+
+	if testConfig.ClientInfo.Port != 9601 {
+		t.Errorf(
+			"expected clientInfo.port to be 9601 when set to 9601 in the config file, got [%d]",
+			testConfig.ClientInfo.Port,
+		)
 	}
 }
 

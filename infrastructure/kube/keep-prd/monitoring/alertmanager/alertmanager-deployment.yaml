@@ -1,0 +1,65 @@
+---
+# Alertmanager for the cutover-roster fleet alerts. Prometheus (config.yaml
+# alerting block) forwards alerts here; the routing tree in
+# config/alertmanager.yaml matches their route_to label and fans them out to the
+# Release and Operator Coordination receivers.
+#
+# FOLLOW-UP BEFORE APPLY: fill the receiver integrations in
+# config/alertmanager.yaml from a Secret (Slack/PagerDuty/email); this skeleton
+# routes but does not deliver until a receiver is configured.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: alertmanager
+      type: monitoring
+  template:
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        runAsNonRoot: true
+      containers:
+        - name: alertmanager
+          image: prom/alertmanager:v0.26.0
+          args:
+            - --config.file=/etc/alertmanager/alertmanager.yaml
+            - --storage.path=/alertmanager
+            - --web.external-url=/alertmanager/
+          ports:
+            - name: alertmanager
+              containerPort: 9093
+          readinessProbe:
+            httpGet:
+              path: /alertmanager/-/ready
+              port: alertmanager
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 2
+          resources:
+            limits:
+              cpu: 200m
+              memory: 256Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          volumeMounts:
+            - name: alertmanager-config-volume
+              mountPath: /etc/alertmanager/
+            - name: alertmanager-storage-volume
+              mountPath: /alertmanager
+          securityContext:
+            readOnlyRootFilesystem: true
+      volumes:
+        - name: alertmanager-config-volume
+          configMap:
+            name: alertmanager-config
+        - name: alertmanager-storage-volume
+          emptyDir: {}

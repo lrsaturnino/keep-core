@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"golang.org/x/exp/maps"
+	"golang.org/x/time/rate"
 
 	"go.uber.org/zap"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/net"
 	"github.com/keep-network/keep-core/pkg/protocol/announcer"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/tecdsa/dkg"
 )
 
@@ -74,6 +76,15 @@ type dkgExecutor struct {
 		SetGauge(name string, value float64)
 		RecordDuration(name string, duration time.Duration)
 	}
+
+	// cutoverPeerRoster is optional and, when set, records post-cutover legacy
+	// peer sightings observed by the DKG announcer.
+	cutoverPeerRoster *participation.CutoverPeerRoster
+
+	// announcerMismatchLogLimiter bounds the volume of session-ID mismatch INFO
+	// logs to a burst of 5 with one line every 30 seconds, matching the
+	// observability contract. Metrics retain every event.
+	announcerMismatchLogLimiter *rate.Limiter
 }
 
 // newDkgExecutor creates a new instance of dkgExecutor struct. There should
@@ -103,15 +114,16 @@ func newDkgExecutor(
 	)
 
 	return &dkgExecutor{
-		groupParameters: groupParameters,
-		operatorIDFn:    operatorIDFn,
-		operatorAddress: operatorAddress,
-		chain:           chain,
-		netProvider:     netProvider,
-		walletRegistry:  walletRegistry,
-		protocolLatch:   protocolLatch,
-		tecdsaExecutor:  tecdsaExecutor,
-		waitForBlockFn:  waitForBlockFn,
+		groupParameters:             groupParameters,
+		operatorIDFn:                operatorIDFn,
+		operatorAddress:             operatorAddress,
+		chain:                       chain,
+		netProvider:                 netProvider,
+		walletRegistry:              walletRegistry,
+		protocolLatch:               protocolLatch,
+		tecdsaExecutor:              tecdsaExecutor,
+		waitForBlockFn:              waitForBlockFn,
+		announcerMismatchLogLimiter: rate.NewLimiter(rate.Every(30*time.Second), 5),
 	}
 }
 
@@ -122,6 +134,12 @@ func (de *dkgExecutor) setMetricsRecorder(recorder interface {
 	RecordDuration(name string, duration time.Duration)
 }) {
 	de.metricsRecorder = recorder
+}
+
+// setCutoverPeerRoster sets the node-local cutover peer roster for the DKG
+// executor.
+func (de *dkgExecutor) setCutoverPeerRoster(roster *participation.CutoverPeerRoster) {
+	de.cutoverPeerRoster = roster
 }
 
 // preParamsCount returns the current count of the ECDSA DKG pre-parameters.
@@ -337,10 +355,42 @@ func (de *dkgExecutor) generateSigningGroup(
 				})
 			defer subscription.Unsubscribe()
 
+			// currentMode is the local node's protocol mode for this ceremony.
+			// It classifies our own announcement so the mismatch observer can
+			// tell legacy peers apart from hardened ones during a coordinated
+			// cutover.
+			// TODO: replace with permit.Mode() once the Part A cutover gate
+			// lands; for now it is the hardened mode unconditionally.
+			currentMode := participation.ModeSecurityV2
+			// operatorAddresses maps a sender's group member index (1-based) to
+			// its operator address so a mismatch can be attributed to an
+			// operator in the node-local cutover roster.
+			operatorAddresses := groupSelectionResult.OperatorsAddresses
+			sessionMismatchObserver := func(
+				protocolID string,
+				sender group.MemberIndex,
+				expectedFormat announcer.SessionIDFormat,
+				observedFormat announcer.SessionIDFormat,
+			) {
+				handleAnnouncerSessionMismatch(
+					dkgLogger,
+					de.announcerMismatchLogLimiter,
+					de.metricsRecorder,
+					de.cutoverPeerRoster,
+					currentMode,
+					operatorAddresses,
+					protocolID,
+					sender,
+					expectedFormat,
+					observedFormat,
+				)
+			}
+
 			announcer := announcer.New(
 				fmt.Sprintf("%v-%v", ProtocolName, "dkg"),
 				broadcastChannel,
 				membershipValidator,
+				announcer.WithSessionMismatchObserver(sessionMismatchObserver),
 			)
 
 			retryLoop := newDkgRetryLoop(

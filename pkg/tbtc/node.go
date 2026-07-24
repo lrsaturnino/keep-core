@@ -22,6 +22,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/protocol/announcer"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/protocol/inactivity"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/tecdsa/signing"
 )
 
@@ -123,6 +124,13 @@ type node struct {
 
 	// windowMetricsTracker tracks detailed metrics for individual coordination windows
 	windowMetricsTracker *coordinationWindowMetrics
+
+	// cutoverPeerRoster is the node-local, deduplicated record of post-cutover
+	// legacy peer sightings. It is constructed unconditionally beside the
+	// (future) participation gate, including when client-info is disabled, and
+	// is shared by the DKG and signing executors. It may be nil in tests that
+	// do not exercise the cutover observability path.
+	cutoverPeerRoster *participation.CutoverPeerRoster
 }
 
 func newNode(
@@ -237,6 +245,30 @@ func (n *node) setPerformanceMetrics(metrics interface {
 		executor.setMetricsRecorder(metrics)
 	}
 	n.coordinationExecutorsMutex.Unlock()
+}
+
+// setCutoverPeerRoster sets the node-local cutover peer roster and propagates it
+// into the components that observe announcer session-ID mismatches. It is called
+// once during initialization, before the coordination layer starts, so in
+// practice no signing executor exists yet; the propagation loop is a defensive
+// safeguard for any executor created by an early coordination round.
+//
+// The field write is guarded by signingExecutorsMutex because getSigningExecutor
+// reads n.cutoverPeerRoster under the same lock when wiring a freshly created
+// executor; without this the read/write pair would be an unsynchronized race.
+func (n *node) setCutoverPeerRoster(roster *participation.CutoverPeerRoster) {
+	n.signingExecutorsMutex.Lock()
+	n.cutoverPeerRoster = roster
+	for _, executor := range n.signingExecutors {
+		executor.setCutoverPeerRoster(roster)
+	}
+	n.signingExecutorsMutex.Unlock()
+
+	// The DKG executor is created once in newNode and never mutated
+	// concurrently, so it is wired directly.
+	if n.dkgExecutor != nil {
+		n.dkgExecutor.setCutoverPeerRoster(roster)
+	}
 }
 
 // GetCoordinationWindowsSummary returns a summary of coordination window metrics.
@@ -407,6 +439,12 @@ func (n *node) getSigningExecutor(
 	// Wire metrics recorder if available
 	if n.performanceMetrics != nil {
 		executor.setMetricsRecorder(n.performanceMetrics)
+	}
+
+	// Wire the node-local cutover peer roster so the signing announcer can
+	// record post-cutover legacy peer sightings.
+	if n.cutoverPeerRoster != nil {
+		executor.setCutoverPeerRoster(n.cutoverPeerRoster)
 	}
 
 	n.signingExecutors[executorKey] = executor

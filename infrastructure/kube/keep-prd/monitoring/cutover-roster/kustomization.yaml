@@ -1,0 +1,10 @@
+resources:
+  - deployment.yaml
+  - service.yaml
+  - pvc.yaml
+
+namespace: monitoring
+
+commonLabels:
+  app: cutover-roster
+  type: monitoring

@@ -1,0 +1,20 @@
+---
+# Monitoring-only Service for the cutover-roster fleet collector. It fronts the
+# readiness API and /metrics endpoint (port 9701) so Prometheus (job
+# cutover-roster) and the Grafana Infinity datasource (Cutover Roster API) can
+# reach it by DNS name on the monitoring network. It is a ClusterIP service and
+# is never exposed publicly; the readiness data is authoritative but not public.
+apiVersion: v1
+kind: Service
+metadata:
+  name: cutover-roster
+spec:
+  type: ClusterIP
+  selector:
+    app: cutover-roster
+    type: monitoring
+  ports:
+    - name: api
+      port: 9701
+      targetPort: api
+      protocol: TCP

@@ -24,7 +24,7 @@ Flags:
       --network.announcedAddresses strings                  Overwrites the default Keep client address announced in the network. Should be used for NAT or when more advanced firewall rules are applied.
       --network.disseminationTime int                       Specifies courtesy message dissemination time in seconds for topics the node is not subscribed to. Should be used only on selected bootstrap nodes. (0 = none)
       --storage.dir string                                  Location to store the Keep client key shares and other sensitive data.
-      --clientInfo.port int                                 Client Info HTTP server listening port. Disabled by default.
+      --clientInfo.port int                                 Client Info HTTP server listening port. Set to 0 to disable; expose only on a trusted network. (default 9601)
       --clientInfo.networkMetricsTick duration              Client Info network metrics check tick in seconds. (default 1m0s)
       --clientInfo.ethereumMetricsTick duration             Client info Ethereum metrics check tick in seconds. (default 10m0s)
       --tbtc.preParamsPoolSize int                          tECDSA pre-parameters pool size. (default 1000)

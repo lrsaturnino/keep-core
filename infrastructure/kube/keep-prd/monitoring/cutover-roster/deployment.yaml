@@ -1,0 +1,138 @@
+---
+# cutover-roster fleet collector Deployment.
+#
+# FOLLOW-UP BEFORE APPLY (see monitoring/README.adoc): this manifest is a
+# reviewable skeleton. The values marked REPLACE_ must be filled at release time:
+#   * spec.template.spec.containers[cutover-roster].image — pin the collector
+#     image by an immutable @sha256: digest (never a mutable tag), matching the
+#     single-release immutable-digest requirement.
+#   * --allowedCIDRs — the monitoring/Prometheus pod CIDR that is allowed to
+#     scrape the API (the collector refuses a non-loopback bind without it).
+#   * the cutover-roster-inventory ConfigMap and cutover-roster-secrets Secret —
+#     the authoritative inventory JSON, attested digests, quarantine evidence,
+#     Ethereum RPC URL, and WalletRegistry address. These are operator-supplied
+#     and are intentionally not committed here.
+#   * --expectedRevision / --expectedImageDigest / --cutoverBlock / --chainID —
+#     become meaningful once the real cutover release ships.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cutover-roster
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: cutover-roster
+      type: monitoring
+  template:
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        runAsNonRoot: true
+      containers:
+        - name: cutover-roster
+          # REPLACE_WITH_IMMUTABLE_DIGEST: pin by @sha256: digest before apply.
+          image: keepnetwork/cutover-roster@sha256:REPLACE_WITH_IMMUTABLE_DIGEST
+          args:
+            - --apiAddr=0.0.0.0:9701
+            # REPLACE_WITH_MONITORING_POD_CIDR: the Prometheus/monitoring pod
+            # network allowed to reach the DATA endpoints (readiness API + /metrics).
+            # Required for a non-loopback bind. It need NOT include the node/kubelet
+            # IPs: the liveness/readiness probes below target /healthz, which is
+            # served outside this allowlist, so probes from the node IP still succeed.
+            - --allowedCIDRs=REPLACE_WITH_MONITORING_POD_CIDR
+            - --dbPath=/var/lib/cutover-roster/roster.db
+            - --inventoryFile=/etc/cutover-roster/inventory.json
+            - --serviceDiscoveryFile=/etc/prometheus/sd/keep-sd.json
+            - --attestedDigestsFile=/etc/cutover-roster/attested-digests.json
+            - --quarantineEvidenceFile=/etc/cutover-roster/quarantine-evidence.json
+            - --expectedRevision=REPLACE_WITH_RELEASE_REVISION
+            - --expectedImageDigest=REPLACE_WITH_RELEASE_IMAGE_DIGEST
+            - --expectedEpoch=security_v2_cutover
+            - --cutoverBlock=REPLACE_WITH_CUTOVER_BLOCK
+            - --chainID=1
+            # REPLACE_ these from the cutover-roster-secrets Secret at deploy time
+            # (the collector reads them as flags; template them in rather than
+            # committing the RPC URL / registry address). Both are REQUIRED for a
+            # complete readiness determination.
+            - --ethereumRPC=REPLACE_WITH_ETHEREUM_RPC_URL
+            - --walletRegistryAddress=REPLACE_WITH_WALLET_REGISTRY_ADDRESS
+          ports:
+            - name: api
+              containerPort: 9701
+          # Probes target /healthz, which the collector serves OUTSIDE the
+          # --allowedCIDRs boundary (the data endpoints stay behind it). The kubelet
+          # sends probes from the node IP — not on the monitoring pod CIDR and not
+          # loopback — so probing an allowlisted data endpoint would return 403 and
+          # keep the pod permanently unready.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: api
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: api
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 2
+          resources:
+            limits:
+              cpu: 500m
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          volumeMounts:
+            - name: cutover-roster-db
+              mountPath: /var/lib/cutover-roster/
+            - name: cutover-roster-inventory
+              mountPath: /etc/cutover-roster/
+              readOnly: true
+            - name: cutover-roster-sd
+              mountPath: /etc/prometheus/sd/
+              readOnly: true
+          securityContext:
+            readOnlyRootFilesystem: true
+        # keep-sd sidecar produces the same keep-sd.json service-discovery target
+        # file the collector reconciles against, so an eligible operator absent
+        # from discovery is offline_unknown and discovered per-instance targets
+        # (keyed by network id) supply the report scrape URLs.
+        - name: keep-sd
+          image: keepnetwork/keep-prometheus-sd
+          args:
+            - --output.file=/etc/prometheus/sd/keep-sd.json
+            - --source.address=bst-a01.tbtc.boar.network:9601
+            - --source.address=bst-b01.tbtc.boar.network:9601
+            - --refresh.interval=5m
+            - --scan.timeout=3s
+            - --log.json
+          resources:
+            limits:
+              cpu: 500m
+              memory: 256Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          volumeMounts:
+            - name: cutover-roster-sd
+              mountPath: /etc/prometheus/sd/
+          securityContext:
+            readOnlyRootFilesystem: true
+      volumes:
+        - name: cutover-roster-db
+          persistentVolumeClaim:
+            claimName: cutover-roster-pvc
+        - name: cutover-roster-inventory
+          configMap:
+            name: cutover-roster-inventory
+            optional: true
+        - name: cutover-roster-sd
+          emptyDir: {}

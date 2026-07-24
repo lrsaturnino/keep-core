@@ -1,0 +1,19 @@
+resources:
+  - alertmanager-deployment.yaml
+  - alertmanager-service.yaml
+
+namespace: monitoring
+
+commonLabels:
+  app: alertmanager
+  type: monitoring
+
+configMapGenerator:
+  - name: alertmanager-config
+    files:
+      - config/alertmanager.yaml
+
+generatorOptions:
+  disableNameSuffixHash: true
+  annotations:
+    note: generated

@@ -8,3 +8,20 @@ datasources:
     url: http://trickster:8480/prometheus
     version: 1
     isDefault: true
+  # JSON datasource for the cutover-roster readiness API. The per-instance
+  # reconciliation detail (instance_statuses) is exposed only by the API — node
+  # and collector metrics deliberately omit per-instance/session labels — so the
+  # instance-reason table on the Cutover Readiness dashboard reads it here rather
+  # than from Prometheus. Reaches the collector Service on the monitoring network.
+  - name: Cutover Roster API
+    uid: cutover-roster-api
+    type: yesoreyeram-infinity-datasource
+    access: proxy
+    editable: true
+    orgId: 1
+    url: http://cutover-roster:9701
+    version: 1
+    jsonData:
+      auth_method: none
+      allowedHosts:
+        - http://cutover-roster:9701

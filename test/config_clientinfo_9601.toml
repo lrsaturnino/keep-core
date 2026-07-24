@@ -1,0 +1,23 @@
+# Config fixture proving that an explicit `[clientInfo] Port = 9601` in a TOML
+# file resolves to 9601 (the temporary compatibility default). It carries the
+# minimum valid Ethereum, Bitcoin Electrum, network, and storage values required
+# by config validation so the only property under test is the explicit
+# client-info port.
+
+[ethereum]
+URL = "ws://192.168.0.158:8546"
+KeyFile = "/tmp/UTC--2018-03-11T01-37-33.202765887Z--c2a56884538778bacd91aa5bf343bf882c5fb18b"
+
+[bitcoin.electrum]
+URL = "tcp://url.to.electrum:18332"
+
+[network]
+Port = 3919
+
+[storage]
+Dir = "/my/secure/location"
+
+[clientInfo]
+# Explicit 9601 is the temporary compatibility default; an operator may pin it
+# to make the intent explicit ahead of the R2 default-off change.
+Port = 9601

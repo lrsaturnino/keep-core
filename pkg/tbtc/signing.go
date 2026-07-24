@@ -13,10 +13,12 @@ import (
 	"github.com/keep-network/keep-core/pkg/net"
 	"github.com/keep-network/keep-core/pkg/protocol/announcer"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/tecdsa"
 	"github.com/keep-network/keep-core/pkg/tecdsa/signing"
 	"go.uber.org/zap"
 	"golang.org/x/sync/semaphore"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -67,6 +69,15 @@ type signingExecutor struct {
 		SetGauge(name string, value float64)
 		RecordDuration(name string, duration time.Duration)
 	}
+
+	// cutoverPeerRoster is optional and, when set, records post-cutover legacy
+	// peer sightings observed by the signing announcer.
+	cutoverPeerRoster *participation.CutoverPeerRoster
+
+	// announcerMismatchLogLimiter bounds the volume of session-ID mismatch INFO
+	// logs to a burst of 5 with one line every 30 seconds, matching the
+	// observability contract. Metrics retain every event.
+	announcerMismatchLogLimiter *rate.Limiter
 }
 
 func newSigningExecutor(
@@ -80,16 +91,23 @@ func newSigningExecutor(
 	signingAttemptsLimit uint,
 ) *signingExecutor {
 	return &signingExecutor{
-		lock:                 semaphore.NewWeighted(1),
-		signers:              signers,
-		broadcastChannel:     broadcastChannel,
-		membershipValidator:  membershipValidator,
-		groupParameters:      groupParameters,
-		protocolLatch:        protocolLatch,
-		getCurrentBlockFn:    getCurrentBlockFn,
-		waitForBlockFn:       waitForBlockFn,
-		signingAttemptsLimit: signingAttemptsLimit,
+		lock:                        semaphore.NewWeighted(1),
+		signers:                     signers,
+		broadcastChannel:            broadcastChannel,
+		membershipValidator:         membershipValidator,
+		groupParameters:             groupParameters,
+		protocolLatch:               protocolLatch,
+		getCurrentBlockFn:           getCurrentBlockFn,
+		waitForBlockFn:              waitForBlockFn,
+		signingAttemptsLimit:        signingAttemptsLimit,
+		announcerMismatchLogLimiter: rate.NewLimiter(rate.Every(30*time.Second), 5),
 	}
+}
+
+// setCutoverPeerRoster sets the node-local cutover peer roster for the signing
+// executor.
+func (se *signingExecutor) setCutoverPeerRoster(roster *participation.CutoverPeerRoster) {
+	se.cutoverPeerRoster = roster
 }
 
 // signBatch performs the signing process for each message from the given
@@ -239,10 +257,42 @@ func (se *signingExecutor) sign(
 
 			defer wg.Done()
 
+			// currentMode is the local node's protocol mode for this ceremony.
+			// It classifies our own announcement so the mismatch observer can
+			// tell legacy peers apart from hardened ones during a coordinated
+			// cutover.
+			// TODO: replace with permit.Mode() once the Part A cutover gate
+			// lands; for now it is the hardened mode unconditionally.
+			currentMode := participation.ModeSecurityV2
+			// operatorAddresses maps a sender's signing-group member index
+			// (1-based) to its operator address so a mismatch can be attributed
+			// to an operator in the node-local cutover roster.
+			operatorAddresses := wallet.signingGroupOperators
+			sessionMismatchObserver := func(
+				protocolID string,
+				sender group.MemberIndex,
+				expectedFormat announcer.SessionIDFormat,
+				observedFormat announcer.SessionIDFormat,
+			) {
+				handleAnnouncerSessionMismatch(
+					signingLogger,
+					se.announcerMismatchLogLimiter,
+					se.metricsRecorder,
+					se.cutoverPeerRoster,
+					currentMode,
+					operatorAddresses,
+					protocolID,
+					sender,
+					expectedFormat,
+					observedFormat,
+				)
+			}
+
 			announcer := announcer.New(
 				fmt.Sprintf("%v-%v", ProtocolName, "signing"),
 				se.broadcastChannel,
 				se.membershipValidator,
+				announcer.WithSessionMismatchObserver(sessionMismatchObserver),
 			)
 
 			doneCheck := newSigningDoneCheck(
