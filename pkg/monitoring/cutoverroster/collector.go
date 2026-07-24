@@ -375,6 +375,14 @@ func (c *Collector) Collect(
 	c.purgeResolved(now)
 
 	if err := c.store.Save(c.operators, c.instances); err != nil {
+		// Persisting the reconciled central state failed. Fail readiness closed
+		// for this cycle — supersede any earlier "complete=true" snapshot and its
+		// zero watched gauges with an incomplete one carrying a nonzero
+		// unreconciled signal — before surfacing the error to the caller. Leaving
+		// the prior snapshot served would keep certifying readiness after a failed
+		// write, exactly the false-ready signal an unreadable input already guards
+		// against.
+		c.publishFailClosed(now, currentBlock)
 		return FleetSnapshot{}, fmt.Errorf("cannot persist central state: %w", err)
 	}
 
@@ -423,14 +431,24 @@ func (c *Collector) RecordInputUnavailable(currentBlock uint64) FleetSnapshot {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	now := c.clock()
+	return c.publishFailClosed(c.clock(), currentBlock)
+}
 
+// publishFailClosed forces the served snapshot incomplete with a nonzero
+// inventory-unreconciled signal and refreshes the fleet metrics and cycle log, so
+// a stale "complete=true" snapshot from an earlier cycle can never keep certifying
+// readiness after a cycle that could not be completed — whether an authoritative
+// input was unreadable or persisting the reconciled central state failed. Any
+// persisted blocking operators stay visible via buildSnapshot; forcing
+// unreconciled to at least one guarantees a nonzero watched gauge (so the
+// CutoverRosterIncomplete alert fires) even when nothing was blocking.
+//
+// It does not itself mutate persisted operator/instance history. The caller MUST
+// hold c.mu.
+func (c *Collector) publishFailClosed(now time.Time, currentBlock uint64) FleetSnapshot {
 	snapshot := c.buildSnapshot(now, currentBlock)
 	snapshot.Complete = false
 
-	// The input failure is itself an inventory-reconciliation fault. Any persisted
-	// blocking operators stay visible via buildSnapshot; forcing unreconciled to at
-	// least one guarantees a nonzero watched gauge even when nothing was blocking.
 	const stale = 0
 	const unreconciled = 1
 	snapshot.Inventory = FleetInventoryCounts{

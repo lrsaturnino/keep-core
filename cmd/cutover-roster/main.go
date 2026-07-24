@@ -223,6 +223,10 @@ func collectOnce(
 
 	reports := pollReports(ctx, inventory)
 
+	// Collect itself fails readiness closed on any internal error (a persistence
+	// write failure supersedes the served snapshot with an incomplete one and a
+	// nonzero unreconciled gauge), so logging the error here is sufficient; the
+	// stale "complete=true" snapshot is already gone.
 	if _, err := collector.Collect(inventory, reports, sightings, currentBlock); err != nil {
 		logger.Errorf("collection cycle failed: %v", err)
 	}

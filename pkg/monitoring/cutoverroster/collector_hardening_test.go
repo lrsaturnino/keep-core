@@ -493,3 +493,65 @@ func TestCollector_RecordInputUnavailableFailsClosed(t *testing.T) {
 		t.Errorf("expected op1 to remain resolved_current after the input failure, got %s (present=%t)", status, ok)
 	}
 }
+
+// TestCollector_PersistenceFailureFailsClosed proves that a collection cycle whose
+// central-state write fails also fails readiness closed: even though the inputs
+// were fully readable and the reconciliation succeeded, a persistence error must
+// supersede a previously-certified "complete=true" snapshot with an incomplete one
+// carrying a nonzero inventory-unreconciled signal, rather than leaving the stale
+// complete snapshot and its zero gauges served. This covers the Collect error path,
+// complementing the unreadable-input path above.
+func TestCollector_PersistenceFailureFailsClosed(t *testing.T) {
+	tc := newTestCollector(t)
+	inventory := []InventoryInstance{eligibleInstance("i1", "op1")}
+
+	// Drive the operator to resolved_current across three exact collections so the
+	// last published snapshot is genuinely complete with zero watched gauges.
+	var snap FleetSnapshot
+	for cycle := 1; cycle <= 3; cycle++ {
+		reports := map[string]InstanceReport{"i1": exactReport("i1", "op1", tc.now)}
+		var err error
+		snap, err = tc.collector.Collect(inventory, reports, nil, uint64(1000+cycle))
+		if err != nil {
+			t.Fatal(err)
+		}
+		tc.now = tc.now.Add(time.Minute)
+	}
+	if !snap.Complete {
+		t.Fatalf("precondition failed: expected a complete snapshot after three exact reports")
+	}
+	if tc.sink.gauge(MetricInventoryUnreconciled) != 0 {
+		t.Fatalf("precondition failed: expected zero unreconciled before the persistence failure")
+	}
+
+	// Force the next cycle's central-state write to fail by closing the bbolt store
+	// out from under the collector. The inputs are still perfectly readable.
+	if err := tc.store.Close(); err != nil {
+		t.Fatalf("cannot close store to induce a persistence failure: %v", err)
+	}
+
+	reports := map[string]InstanceReport{"i1": exactReport("i1", "op1", tc.now)}
+	_, err := tc.collector.Collect(inventory, reports, nil, 1004)
+	if err == nil {
+		t.Fatalf("expected Collect to return an error when persistence fails")
+	}
+
+	// The most recently served snapshot must be the incomplete one, not the stale
+	// complete snapshot from the prior cycle.
+	served := tc.collector.Snapshot()
+	if served.Complete {
+		t.Errorf("the served snapshot must be incomplete after a persistence failure")
+	}
+	if served.Inventory.Unreconciled == 0 {
+		t.Errorf("a persistence failure must surface as unreconciled")
+	}
+	if tc.sink.gauge(MetricInventoryUnreconciled) == 0 {
+		t.Errorf("expected a nonzero unreconciled gauge after the persistence failure")
+	}
+
+	// Persisted history is untouched: op1 remains resolved_current in the served
+	// snapshot; the failed write neither aged it out nor reopened it.
+	if status, ok := operatorStatus(served, "op1"); !ok || status != FleetResolvedCurrent {
+		t.Errorf("expected op1 to remain resolved_current after the persistence failure, got %s (present=%t)", status, ok)
+	}
+}
