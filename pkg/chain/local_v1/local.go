@@ -44,6 +44,15 @@ type localChain struct {
 	dkgStartedHandlers       map[int]func(submission *event.DKGStarted)
 	resultSubmissionHandlers map[int]func(submission *event.DKGResultSubmission)
 
+	// resultSubmissionRegisteredSignal, when non-nil, receives an empty value
+	// after each DKG result submission handler is installed via
+	// OnDKGResultSubmitted. It is test-only instrumentation that lets a test
+	// deterministically wait until a member has installed its result submission
+	// subscription before triggering a competing submission, eliminating the
+	// race between a result submission and a concurrent subscription setup.
+	// Access is guarded by handlerMutex.
+	resultSubmissionRegisteredSignal chan<- struct{}
+
 	simulatedHeight uint64
 	blockCounter    chain.BlockCounter
 
@@ -80,14 +89,15 @@ func (c *localChain) SubmitRelayEntry(newEntry []byte) error {
 	}
 
 	c.handlerMutex.Lock()
+	// Record the last submitted entry under the same lock that guards it in
+	// GetLastRelayEntry so concurrent submissions/reads do not race.
+	c.lastSubmittedRelayEntry = newEntry
 	for _, handler := range c.relayEntryHandlers {
 		go func(handler func(entry *event.RelayEntrySubmitted), entry *event.RelayEntrySubmitted) {
 			handler(entry)
 		}(handler, entry)
 	}
 	c.handlerMutex.Unlock()
-
-	c.lastSubmittedRelayEntry = newEntry
 
 	return nil
 }
@@ -110,6 +120,9 @@ func (c *localChain) OnRelayEntrySubmitted(
 }
 
 func (c *localChain) GetLastRelayEntry() []byte {
+	c.handlerMutex.Lock()
+	defer c.handlerMutex.Unlock()
+
 	return c.lastSubmittedRelayEntry
 }
 
@@ -236,6 +249,9 @@ func (c *localChain) IsStaleGroup(groupPublicKey []byte) (bool, error) {
 }
 
 func (c *localChain) IsGroupRegistered(groupPublicKey []byte) (bool, error) {
+	c.handlerMutex.Lock()
+	defer c.handlerMutex.Unlock()
+
 	for _, group := range c.groups {
 		if bytes.Equal(group.groupPublicKey, groupPublicKey) {
 			return true, nil
@@ -274,9 +290,6 @@ func (c *localChain) SubmitDKGResult(
 		groupPublicKey:          resultToPublish.GroupPublicKey,
 		registrationBlockHeight: currentBlock,
 	}
-	c.groups = append(c.groups, myGroup)
-	c.lastSubmittedDKGResult = resultToPublish
-	c.lastSubmittedDKGResultSignatures = signatures
 
 	groupRegistrationEvent := &event.GroupRegistration{
 		GroupPublicKey: resultToPublish.GroupPublicKey[:],
@@ -284,6 +297,14 @@ func (c *localChain) SubmitDKGResult(
 	}
 
 	c.handlerMutex.Lock()
+	// Register the group and record the last submitted result under the same
+	// lock that guards these fields in IsGroupRegistered, IsStaleGroup, and
+	// GetLastDKGResult. Concurrent DKG result publications by multiple members
+	// would otherwise race on the groups slice.
+	c.groups = append(c.groups, myGroup)
+	c.lastSubmittedDKGResult = resultToPublish
+	c.lastSubmittedDKGResultSignatures = signatures
+
 	for _, handler := range c.resultSubmissionHandlers {
 		go func(handler func(*event.DKGResultSubmission), dkgResultPublication *event.DKGResultSubmission) {
 			handler(dkgResultPublicationEvent)
@@ -326,12 +347,36 @@ func (c *localChain) OnDKGResultSubmitted(
 	handlerID := GenerateHandlerID()
 	c.resultSubmissionHandlers[handlerID] = handler
 
+	// Notify any test synchronization listener that a result submission handler
+	// has been installed. The send is non-blocking so chain operation is never
+	// blocked; a sufficiently buffered listener channel guarantees delivery.
+	if c.resultSubmissionRegisteredSignal != nil {
+		select {
+		case c.resultSubmissionRegisteredSignal <- struct{}{}:
+		default:
+		}
+	}
+
 	return subscription.NewEventSubscription(func() {
 		c.handlerMutex.Lock()
 		defer c.handlerMutex.Unlock()
 
 		delete(c.resultSubmissionHandlers, handlerID)
 	})
+}
+
+// SetResultSubmissionRegisteredSignal installs a test-only signal channel that
+// receives an empty value after each DKG result submission handler is registered
+// via OnDKGResultSubmitted. It lets tests synchronize on subscription
+// installation without relying on timing, for example to guarantee a member has
+// installed its subscription before a competing member submits a result. The
+// provided channel should be buffered so signals are never dropped; pass nil to
+// disable notifications.
+func (c *localChain) SetResultSubmissionRegisteredSignal(signal chan<- struct{}) {
+	c.handlerMutex.Lock()
+	defer c.handlerMutex.Unlock()
+
+	c.resultSubmissionRegisteredSignal = signal
 }
 
 func (c *localChain) GetLastDKGResult() (

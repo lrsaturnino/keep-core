@@ -67,9 +67,19 @@ func SignAndSubmit(
 
 	selfShare := signer.CalculateSignatureShare(previousEntry)
 
+	// Marshal the local signature share once, on this goroutine, before the
+	// share is used by both the broadcast goroutine and the signature-recovery
+	// path. bn256.G1.Marshal normalizes the point in place (MakeAffine), so
+	// letting broadcastShare marshal the same *bn256.G1 concurrently with
+	// completeSignature reading it via ScalarMult is a data race. Marshaling
+	// here and handing broadcastShare only the resulting bytes confines all
+	// access to the point to this goroutine. Normalizing to affine does not
+	// change the point's value, so signature recovery is unaffected.
+	selfShareBytes := selfShare.Marshal()
+
 	sessionID := hex.EncodeToString(previousEntryBytes)
 
-	go broadcastShare(ctx, logger, signer.MemberID(), selfShare, channel, sessionID)
+	go broadcastShare(ctx, logger, signer.MemberID(), selfShareBytes, channel, sessionID)
 
 	receiveChannel := make(chan net.Message, 64)
 	channel.Recv(ctx, func(netMessage net.Message) {
@@ -164,13 +174,13 @@ func broadcastShare(
 	ctx context.Context,
 	logger log.StandardLogger,
 	memberID group.MemberIndex,
-	share *bn256.G1,
+	shareBytes []byte,
 	channel net.BroadcastChannel,
 	sessionID string,
 ) {
 	message := &SignatureShareMessage{
 		memberID,
-		share.Marshal(),
+		shareBytes,
 		sessionID,
 	}
 

@@ -326,10 +326,13 @@ func (fm *finalizingMember) Result() *Result {
 // past this boundary, and NewSignature reads only the R, S and recovery byte
 // slices from it.
 //
-// The audited tss-lib dependency is pinned by commit in go.mod and is the
-// security-review target, so its value-typed API is deliberately not forked to
-// a pointer channel as part of this release; changing the channel element type
-// is the correct upstream fix and is tracked separately.
+// The tss-lib dependency is pinned by commit in go.mod. Its external security
+// review is a separate release-gate action (not yet archived), so this comment
+// does not assert the dependency is already audited. Its value-typed API is
+// deliberately not forked to a pointer channel as part of this release;
+// changing the channel element type is the correct upstream fix and is tracked
+// separately. Until that upstream change lands, the single mandated copy is
+// confined here and its lock-bearing MessageState is never retained.
 func (fm *finalizingMember) receiveTSSResult(
 	ctx context.Context,
 ) (*tsslibcommon.SignatureData, error) {

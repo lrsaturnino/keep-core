@@ -159,18 +159,38 @@ func TestConcurrentPublishResult(t *testing.T) {
 	}
 	for testName, test := range tests {
 		t.Run(testName, func(t *testing.T) {
-			beaconChain, blockCounter, initialBlock, err :=
-				initChainHandle(honestThreshold, groupSize)
+			// Use the concrete local chain so the test can install a
+			// subscription-registration signal and remove the race between
+			// member1's result submission and member2's subscription setup.
+			chainHandle := local_v1.Connect(groupSize, honestThreshold)
+
+			blockCounter, err := chainHandle.BlockCounter()
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			config := beaconChain.GetConfig()
+			initialBlockChan, err := blockCounter.BlockHeightWaiter(1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			initialBlock := <-initialBlockChan
+
+			config := chainHandle.GetConfig()
 
 			tStep := config.ResultPublicationBlockStep
 
 			expectedBlockEnd1 := initialBlock + test.expectedDuration1(tStep)
 			expectedBlockEnd2 := initialBlock + test.expectedDuration2(tStep)
+
+			// member2 (P4) only leaves early by observing member1's (P1)
+			// submission event. If member1 submits before member2 installs its
+			// subscription, member2 misses the event and waits until its own
+			// much later P4 eligibility, making the test flaky under scheduler
+			// contention. Gate member1 behind a signal proving member2's
+			// subscription is installed first. The buffer absorbs member1's own
+			// later registration signal without blocking the chain.
+			subscriptionRegistered := make(chan struct{}, groupSize)
+			chainHandle.SetResultSubmissionRegisteredSignal(subscriptionRegistered)
 
 			result1Chan := make(chan uint64)
 			defer close(result1Chan)
@@ -178,26 +198,10 @@ func TestConcurrentPublishResult(t *testing.T) {
 			defer close(result2Chan)
 
 			go func() {
-				err := member1.SubmitDKGResult(
-					test.resultToPublish1,
-					signatures,
-					beaconChain,
-					blockCounter,
-					initialBlock,
-				)
-				if err != nil {
-					t.Error(err)
-				}
-
-				currentBlock, _ := blockCounter.CurrentBlock()
-				result1Chan <- currentBlock
-			}()
-
-			go func() {
 				err := member2.SubmitDKGResult(
 					test.resultToPublish2,
 					signatures,
-					beaconChain,
+					chainHandle,
 					blockCounter,
 					initialBlock,
 				)
@@ -207,6 +211,27 @@ func TestConcurrentPublishResult(t *testing.T) {
 
 				currentBlock, _ := blockCounter.CurrentBlock()
 				result2Chan <- currentBlock
+			}()
+
+			// Barrier: wait until member2 has installed its subscription before
+			// releasing member1. This proves both subscriptions are installed
+			// before member1 can submit.
+			<-subscriptionRegistered
+
+			go func() {
+				err := member1.SubmitDKGResult(
+					test.resultToPublish1,
+					signatures,
+					chainHandle,
+					blockCounter,
+					initialBlock,
+				)
+				if err != nil {
+					t.Error(err)
+				}
+
+				currentBlock, _ := blockCounter.CurrentBlock()
+				result1Chan <- currentBlock
 			}()
 
 			if result1 := <-result1Chan; result1 != expectedBlockEnd1 {

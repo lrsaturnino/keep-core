@@ -190,6 +190,49 @@ a "beacon proxy upgrade":
 This distinguishes RandomBeacon from legitimately proxied components (e.g.
 `LightRelayMaintainerProxy`), which this row does not cover.
 
+**F-09 note — RandomBeacon relay-entry reimbursement offset (reviewed design
+decision).** Both `submitRelayEntry` overloads share a single
+`_relayEntrySubmissionGasOffset = 13_450`
+(`contracts/RandomBeacon.sol:475,1072,1138`; fixture
+`test/fixtures/index.ts:59`). The offset was raised from `11_250` to `13_450` to
+cover ~2,118 gas of reimbursement work that executes **after** the in-function
+`gasStart - gasleft()` snapshot — the inline `nonReentrant` guard writes
+`_reentrancyStatus` after the function body, and the reimbursement call itself is
+partly unmeasured — plus headroom, tuned for the heavier
+`submitRelayEntry(bytes,uint32[])` overload.
+
+- **Structural asymmetry (accepted).** The heavier overload's `uint32[64]`
+  `membersIDs` argument is charged as intrinsic **calldata** gas *before* the
+  in-function snapshot and is therefore never measured; the lighter
+  `submitRelayEntry(bytes)` overload carries none of that calldata, so the shared
+  offset structurally **over-reimburses** the lighter overload by a fixed
+  ~9,563 gas. This is a property of the single-offset design, not a defect.
+- **Decision.** Keep one shared offset rather than splitting it into two
+  governance-settable offsets. Rationale: (1) avoids adding a second storage slot
+  plus governance setter and the associated upgrade/migration surface on a
+  security-release contract; (2) the only harmful direction —
+  **under-reimbursement** — never occurs on either overload at `13_450` (the
+  submitter is always at least made whole); (3) over-reimbursement is bounded and
+  paid from the operator-funded `ReimbursementPool`, never from user funds;
+  (4) governance may still retune the offset post-deployment through the existing
+  `updateGasParameters` (`onlyGovernance`) path if measurements change.
+- **Enforced invariants** (`test/RandomBeacon.Relay.test.ts`,
+  `test/RandomBeacon.StorageLayout.test.ts`): no under-reimbursement on either
+  overload at `13_450`; heavier-overload over-reimbursement ≤ **5,000** gas
+  (`TUNED_OVER_REIMBURSEMENT_GAS_TOLERANCE`); lighter-overload over-reimbursement
+  ≤ **10,000** gas (`BYTES_ONLY_OVER_REIMBURSEMENT_CEILING_GAS`, bracketing the
+  measured ~9,563 with headroom so it cannot silently grow); negative control —
+  the heavier overload **under-reimburses at the pre-fix `11_250` offset**
+  (proving the ~2,200-gas fix is necessary and that the test is sensitive to it),
+  while the lighter overload stays fully reimbursed even at `11_250` (+7,363 gas),
+  confirming the fix is not needed for that path; and a storage-layout regression
+  pinning the slot and the `13_450` value. Gas figures are measured under the
+  pinned Hardhat compiler/optimizer/EVM-hardfork settings and must be remeasured
+  if any of those change.
+- **Release gate.** This shared-offset design and its 5,000 / 10,000-gas
+  over-reimbursement ceilings require contract/security-owner sign-off before
+  release: `[ ]` approved.
+
 **tss-lib pin (this release):** `github.com/threshold-network/tss-lib@v0.0.0-20260615180949-86bd1a375cc0` (`86bd1a3`).
 
 ---
