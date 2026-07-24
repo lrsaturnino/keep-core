@@ -734,15 +734,13 @@ func (fm *finalizingMember) tssFinalize(
 		}
 	}
 
-	select {
-	case tssResult := <-fm.tssResultChan:
-		fm.tssResult = &tssResult
-		return nil
-	case <-ctx.Done():
-		return fmt.Errorf(
-			"TSS result was not generated on time",
-		)
+	tssResult, err := fm.receiveTSSResult(ctx)
+	if err != nil {
+		return err
 	}
+	fm.tssResult = tssResult
+
+	return nil
 }
 
 // signingEcdhInfo returns the HKDF info label for ECDH-derived keys in the

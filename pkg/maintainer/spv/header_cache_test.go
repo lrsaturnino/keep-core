@@ -214,3 +214,122 @@ func TestGetProofInfoUsesPassHeaderCache(t *testing.T) {
 		)
 	}
 }
+
+// TestProveTransactionsSharesHeaderCacheAcrossProofTypes proves that the single
+// pass-scoped cache maintainSpv creates above the proofTypes loop
+// (spv.go: newBlockHeaderCache before `for action, v := range proofTypes`) is
+// shared across every proof type in a pass, not just across transactions within
+// one proof type. It drives sm.proveTransactions once per simulated proof type
+// with the same cache - exactly as maintainSpv does - and asserts each distinct
+// height is fetched from the backend once across all proof types, then that the
+// next pass's fresh cache refetches.
+func TestProveTransactionsSharesHeaderCacheAcrossProofTypes(t *testing.T) {
+	const proofStart = 790270
+
+	// Two transactions with distinct hashes and overlapping proof windows, each
+	// surfaced by a different proof type.
+	depositSweepTx := &bitcoin.Transaction{Version: 1}
+	redemptionTx := &bitcoin.Transaction{Version: 2}
+	if depositSweepTx.Hash() == redemptionTx.Hash() {
+		t.Fatal("expected the two fixtures to have distinct hashes")
+	}
+
+	localChain := newLocalChain()
+	localChain.setTxProofDifficultyFactor(big.NewInt(6))
+	localChain.setCurrentEpoch(392)
+	localChain.setCurrentAndPrevEpochDifficulty(big.NewInt(32), big.NewInt(16))
+
+	btcChain := newLocalBitcoinChain()
+	if err := populateBlockHeaders(
+		btcChain,
+		proofStart,
+		proofStart+19,
+		func(uint) *big.Int { return big.NewInt(32) },
+	); err != nil {
+		t.Fatal(err)
+	}
+	// latestBlockHeight = 790289. depositSweepTx: 20 confirmations -> walks
+	// 790270..790275; redemptionTx: 18 confirmations -> walks 790272..790277.
+	// Distinct heights across both proof types: 790270..790277 = 8.
+	btcChain.addTransactionConfirmations(depositSweepTx.Hash(), 20)
+	btcChain.addTransactionConfirmations(redemptionTx.Hash(), 18)
+
+	getter := newCountingHeaderGetter(btcChain.GetBlockHeader)
+
+	sm := &spvMaintainer{
+		config:       Config{HistoryDepth: 100, TransactionLimit: 10},
+		spvChain:     localChain,
+		btcDiffChain: localChain,
+		btcChain:     btcChain,
+	}
+
+	// A getter standing in for one proof type's unproven-transactions source.
+	proofTypeGetter := func(tx *bitcoin.Transaction) unprovenTransactionsGetter {
+		return func(
+			uint64,
+			int,
+			bitcoin.Chain,
+			Chain,
+		) ([]*bitcoin.Transaction, error) {
+			return []*bitcoin.Transaction{tx}, nil
+		}
+	}
+	noopSubmitter := func(
+		bitcoin.Hash,
+		uint,
+		bitcoin.Chain,
+		Chain,
+	) error {
+		return nil
+	}
+
+	runPass := func(cache *blockHeaderCache) {
+		// Two proof types, one shared cache - the maintainSpv structure.
+		if err := sm.proveTransactions(
+			proofTypeGetter(depositSweepTx),
+			noopSubmitter,
+			cache,
+		); err != nil {
+			t.Fatalf("deposit-sweep proof type failed: %v", err)
+		}
+		if err := sm.proveTransactions(
+			proofTypeGetter(redemptionTx),
+			noopSubmitter,
+			cache,
+		); err != nil {
+			t.Fatalf("redemption proof type failed: %v", err)
+		}
+	}
+
+	passCache := newBlockHeaderCache(getter.get)
+	runPass(passCache)
+
+	if got := getter.totalCalls(); got != 8 {
+		t.Fatalf(
+			"expected 8 backend calls for 8 distinct heights shared across "+
+				"proof types in one pass, got [%d]",
+			got,
+		)
+	}
+	for h := uint(proofStart); h <= proofStart+7; h++ {
+		if got := getter.callsAt(h); got != 1 {
+			t.Fatalf(
+				"expected height [%d] fetched once across all proof types in "+
+					"the pass, got [%d]",
+				h,
+				got,
+			)
+		}
+	}
+
+	// A new pass uses a fresh cache and refetches the shared heights.
+	runPass(newBlockHeaderCache(getter.get))
+
+	if got := getter.totalCalls(); got != 16 {
+		t.Fatalf(
+			"expected 16 total backend calls after the second pass refetch, "+
+				"got [%d]",
+			got,
+		)
+	}
+}

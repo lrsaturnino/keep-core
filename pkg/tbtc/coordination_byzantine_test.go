@@ -171,7 +171,7 @@ func runByzantineCoordination(
 	operator3 := generateOperator(3, 3)
 
 	coordinatedWallet := wallet{
-		publicKey: unmarshalPublicKey(publicKeyHex),
+		publicKey: mustUnmarshalPublicKey(t, publicKeyHex),
 		signingGroupOperators: []chain.Address{
 			operator2.address,
 			operator3.address,

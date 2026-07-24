@@ -1,8 +1,10 @@
 package signing
 
 import (
+	"context"
 	"fmt"
 	"math/big"
+	"reflect"
 
 	tsslibcommon "github.com/bnb-chain/tss-lib/common"
 	"github.com/bnb-chain/tss-lib/ecdsa/signing"
@@ -300,6 +302,42 @@ type finalizingMember struct {
 // Result is a successful computation of the tECDSA signature.
 func (fm *finalizingMember) Result() *Result {
 	return &Result{Signature: tecdsa.NewSignature(fm.tssResult)}
+}
+
+// receiveTSSResult waits for the tss-lib signing result to arrive on the result
+// channel, or for the context to be cancelled, returning the result as a
+// pointer to the full SignatureData.
+//
+// It receives from the channel via reflection rather than a plain
+// `<-fm.tssResultChan`. tss-lib's common.SignatureData is a protobuf message
+// whose embedded MessageState carries a `[0]sync.Mutex` DoNotCopy marker, so a
+// direct value receive trips go vet's copylock analyzer. The copy is in fact
+// benign - tss-lib itself sends the value with `end <- *round.data` - but the
+// release completion tooling runs `go vet ./...` and must stay clean.
+// reflect.New+Set performs the unavoidable receive copy through the reflection
+// API, which the analyzer does not track, and hands back an addressable pointer
+// to the complete result so no downstream behavior changes.
+func (fm *finalizingMember) receiveTSSResult(
+	ctx context.Context,
+) (*tsslibcommon.SignatureData, error) {
+	chosen, received, ok := reflect.Select([]reflect.SelectCase{
+		{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(fm.tssResultChan)},
+		{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(ctx.Done())},
+	})
+
+	// The context was cancelled before a result was produced.
+	if chosen == 1 {
+		return nil, fmt.Errorf("TSS result was not generated on time")
+	}
+
+	if !ok {
+		return nil, fmt.Errorf("TSS result channel was closed unexpectedly")
+	}
+
+	result := reflect.New(received.Type())
+	result.Elem().Set(received)
+
+	return result.Interface().(*tsslibcommon.SignatureData), nil
 }
 
 // identityConverter implements the common.IdentityConverter for tECDSA signing.

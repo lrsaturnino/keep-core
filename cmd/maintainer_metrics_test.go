@@ -2,11 +2,18 @@ package cmd
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/keep-network/keep-core/config"
 	"github.com/keep-network/keep-core/pkg/bitcoin"
+	"github.com/keep-network/keep-core/pkg/clientinfo"
+	"github.com/keep-network/keep-core/pkg/maintainer/spv"
 )
 
 // TestMaintainerCommandExposesClientInfoFlags verifies that, after ClientInfo is
@@ -47,8 +54,16 @@ func TestInitializeMaintainerClientInfoDisabled(t *testing.T) {
 }
 
 // TestInitializeMaintainerClientInfoEnabled verifies that a configured
-// client-info port creates a PerformanceMetrics recorder the maintainer can wire
-// into the SPV maintainer before maintainer.Initialize.
+// client-info port creates a PerformanceMetrics recorder, that the recorder is
+// wired into the SPV maintainer exactly as the production maintainer startup
+// path does (spv.SetMetricsRecorder, cmd/maintainer.go, before
+// maintainer.Initialize), and that the three SPV redemption-proof series are
+// present at zero when the /metrics endpoint is scraped so Prometheus sees them
+// from startup.
+//
+// This is the single enabled-port test in the cmd package: keep-common's
+// EnableServer registers "/metrics" on the global http.DefaultServeMux, which
+// panics on a second registration, so all enabled-endpoint assertions live here.
 func TestInitializeMaintainerClientInfoEnabled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -69,7 +84,78 @@ func TestInitializeMaintainerClientInfoEnabled(t *testing.T) {
 	if performanceMetrics == nil {
 		t.Fatal("expected performance metrics when a client-info port is set")
 	}
-	performanceMetrics.Stop()
+	defer performanceMetrics.Stop()
+
+	// Wire the recorder into the SPV maintainer the same way the production
+	// startup path does, before maintainer.Initialize would start the control
+	// loop. Reset to nil afterwards so the package-global recorder does not leak
+	// into other tests.
+	spv.SetMetricsRecorder(performanceMetrics)
+	defer spv.SetMetricsRecorder(nil)
+
+	// The three SPV redemption-proof series must be scrapeable at zero from
+	// startup so operators never see a gap before the first submission.
+	redemptionProofSeries := []string{
+		"performance_" + clientinfo.MetricRedemptionProofSubmissionsTotal,
+		"performance_" + clientinfo.MetricRedemptionProofSubmissionsSuccessTotal,
+		"performance_" + clientinfo.MetricRedemptionProofSubmissionsFailedTotal,
+	}
+
+	metrics := scrapeMetricsEndpoint(t, port)
+	for _, series := range redemptionProofSeries {
+		value, ok := metricValue(metrics, series)
+		if !ok {
+			t.Errorf("expected series [%s] to be exposed at /metrics", series)
+			continue
+		}
+		if value != "0" {
+			t.Errorf(
+				"expected series [%s] to be zero at startup, got [%s]",
+				series,
+				value,
+			)
+		}
+	}
+}
+
+// scrapeMetricsEndpoint fetches the /metrics body from the client-info endpoint,
+// retrying briefly while the server goroutine started by EnableServer comes up.
+func scrapeMetricsEndpoint(t *testing.T, port int) string {
+	t.Helper()
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/metrics", port)
+
+	var lastErr error
+	for attempt := 0; attempt < 50; attempt++ {
+		resp, err := http.Get(url) //nolint:gosec // fixed loopback test URL
+		if err != nil {
+			lastErr = err
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatalf("could not read /metrics response: %v", err)
+		}
+		return string(body)
+	}
+
+	t.Fatalf("could not scrape /metrics on port %d: %v", port, lastErr)
+	return ""
+}
+
+// metricValue extracts the value of a non-labelled metric series from the
+// exposed text. Lines are formatted as "<name> <value> <timestamp>".
+func metricValue(metrics, series string) (string, bool) {
+	for _, line := range strings.Split(metrics, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == series {
+			return fields[1], true
+		}
+	}
+	return "", false
 }
 
 // freeTCPPort asks the OS for an unused TCP port.

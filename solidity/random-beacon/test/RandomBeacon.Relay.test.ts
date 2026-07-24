@@ -92,8 +92,12 @@ async function fixture() {
 //
 // Measurement environment (must stay in sync with hardhat.config.ts): solc
 // 0.8.17 with the optimizer enabled at its default 200 runs and the default EVM
-// version (london). These settings define the measured gas; changing any of
-// them can move the required offset and forces a re-measurement.
+// version (london). The Hardhat network hardfork is pinned to "london" in
+// hardhat.config.ts; Hardhat 2.10.0 would otherwise default to "arrowGlacier",
+// which is gas-identical to london (it only delays the difficulty bomb), so the
+// pin makes the network hardfork explicit and aligned with the solc EVM target
+// without changing any measured gas. These settings define the measured gas;
+// changing any of them can move the required offset and forces a re-measurement.
 const RELAY_ENTRY_GAS_PRICE = ethers.utils.parseUnits("100", "gwei")
 
 // RELAY_ENTRY_OFFSET_FIX is the current relay entry submission gas offset;
@@ -109,10 +113,23 @@ const RELAY_ENTRY_OFFSET_ADJUSTMENT = BigNumber.from(
 // the submitter may be refunded at the current offset for the overload the
 // offset is tuned for: submitRelayEntry(bytes,uint32[]). The offset is set to
 // just cover that overload (measured ~82 gas of headroom), so this bound is
-// tight. The bytes-only overload carries far less calldata and is intentionally
-// over-reimbursed by a larger, still-safe margin; it is checked only for
-// no-under-reimbursement and exact offset sensitivity.
+// tight.
 const TUNED_OVER_REIMBURSEMENT_GAS_TOLERANCE = BigNumber.from(5_000)
+
+// BYTES_ONLY_OVER_REIMBURSEMENT_CEILING_GAS bounds the over-reimbursement of the
+// lighter submitRelayEntry(bytes) overload. Both overloads share a single
+// _relayEntrySubmissionGasOffset. That offset is tuned for the heavier
+// bytes,uint32[] overload, whose uint32[64] membersIDs array is charged as
+// intrinsic calldata gas BEFORE the in-function `gasStart = gasleft()` snapshot
+// and so is never measured. The bytes-only overload carries none of that
+// calldata, so the shared offset structurally over-reimburses it by exactly that
+// fixed slack: measured +9,563 gas at the current offset (and +7,363 gas at the
+// pre-fix offset, i.e. still fully reimbursed - the fix is not needed for this
+// path). The lighter overload therefore CANNOT satisfy the 5,000-gas tuned
+// tolerance nor under-reimburse at the pre-fix offset; that is a property of the
+// single-offset contract design, not a gap in the test. This ceiling brackets
+// the measured 9,563-gas slack with headroom so it cannot silently grow.
+const BYTES_ONLY_OVER_REIMBURSEMENT_CEILING_GAS = BigNumber.from(10_000)
 
 interface ReimbursementMeasurement {
   netWei: BigNumber
@@ -450,10 +467,25 @@ describe("RandomBeacon - Relay", () => {
               // bytes,uint32[] overload - over-reimburses this one by a larger,
               // still-safe margin. Its exact offset sensitivity is pinned by the
               // negative-control context below.
+              // The submitter is at least made whole: no under-reimbursement.
               expect(
                 measurement.netWei,
                 "submitter was under-reimbursed at the current offset"
               ).to.be.gte(0)
+
+              // The single _relayEntrySubmissionGasOffset is tuned for the
+              // heavier submitRelayEntry(bytes,uint32[]) overload, whose
+              // uint32[64] membersIDs calldata is charged as intrinsic gas
+              // before `gasStart = gasleft()` and is therefore never measured.
+              // This lighter bytes-only overload carries none of that calldata,
+              // so the same offset structurally over-reimburses it by that
+              // fixed slack (measured 9,563 gas under the pinned environment).
+              // Bound it so the over-reimbursement cannot silently grow, e.g.
+              // if the offset is inflated further.
+              expect(
+                measurement.netGas,
+                "bytes-only over-reimbursement exceeds the documented structural ceiling"
+              ).to.be.lte(BYTES_ONLY_OVER_REIMBURSEMENT_CEILING_GAS)
             })
           })
 
@@ -467,7 +499,7 @@ describe("RandomBeacon - Relay", () => {
                     gasPrice: RELAY_ENTRY_GAS_PRICE,
                   })
 
-              it("reimburses exactly the 2,200-gas fix adjustment more at the current offset than at the pre-fix offset", async () => {
+              it("is already fully reimbursed at the pre-fix offset and tracks the 2,200-gas fix adjustment", async () => {
                 const preFix = await measureRelayEntrySubmissionAtOffset(
                   RELAY_ENTRY_OFFSET_PRE_FIX,
                   submit
@@ -483,10 +515,21 @@ describe("RandomBeacon - Relay", () => {
                   "submitter was under-reimbursed at the current offset"
                 ).to.be.gte(0)
 
+                // Unlike the bytes,uint32[] overload - which under-reimburses at
+                // the pre-fix offset and is exactly the reason edb51da0 raised
+                // the offset - this lighter bytes-only overload is ALREADY fully
+                // reimbursed at the pre-fix 11,250 offset (measured +7,363 gas).
+                // The fix is therefore not required for this path and does not
+                // harm it; this is the meaningful, non-tautological control that
+                // pins the old offset as sufficient for bytes-only.
+                expect(
+                  preFix.netWei,
+                  "pre-fix offset should already fully reimburse the bytes-only overload"
+                ).to.be.gte(0)
+
                 // The current offset refunds exactly the 2,200-gas fix
-                // adjustment more than the pre-fix offset. This pins the
-                // reimbursement to the offset even though the bytes-only overload
-                // is over-reimbursed and so never dips below zero.
+                // adjustment more than the pre-fix offset, confirming the
+                // reimbursement tracks the offset for this overload too.
                 expect(
                   current.netGas.sub(preFix.netGas),
                   "reimbursement did not track the 2,200-gas offset change"

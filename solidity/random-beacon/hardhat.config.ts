@@ -110,6 +110,12 @@ const config: HardhatUserConfig = {
   },
   networks: {
     hardhat: {
+      // Pin the EVM hardfork so gas-refund tests (see the measurement note in
+      // test/RandomBeacon.Relay.test.ts) are reproducible and aligned with the
+      // solc EVM target (london). Hardhat 2.10.0 would otherwise default to
+      // "arrowGlacier", which is gas-identical to london, so this pin does not
+      // change any measured gas - it only makes the hardfork explicit.
+      hardfork: "london",
       forking: {
         // forking is enabled only if FORKING_URL env is provided
         enabled: !!process.env.FORKING_URL,

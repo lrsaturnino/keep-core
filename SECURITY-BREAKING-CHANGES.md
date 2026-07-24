@@ -157,7 +157,7 @@ monitoring updates.
 | **BC-7** | keep-core | `G1HashToPoint` reimplemented — **different G1 point** for the same input; see **F-02** above | Beacon / crypto paths using hash-to-curve |
 | **BC-8** | keep-core | `PrepareForSigning` returns `(wi, bigWs, err)` — **compile break** for callers | Go integrators (no in-tree keep-core callers found) |
 | **BC-9** | keep-core | Bootstrap removal (#3909): embedded well-known peers + **AllowList decoupling** — all peers pass `IsRecognized()` | Operators with custom bootstrap config |
-| **BC-10** | keep-core | RandomBeacon **new storage slot** for reentrancy guard (append-only, proxy-safe) | Contract deploy / upgrade path **only if** beacon proxy upgraded in same train |
+| **BC-10** | keep-core | RandomBeacon **new storage slot** for the reentrancy guard (append-only bytecode change). RandomBeacon is **directly deployed, not proxied**, so this activates **only** by deploying a new RandomBeacon and cutting over to its address — never by an in-place / proxy implementation swap | Only if this release **redeploys RandomBeacon**: perform the address cutover (see the BC-10 note below). If there is no beacon redeployment, BC-10 is **staged but not activated** on the existing deployment |
 
 ### Operator-visible (non-breaking wire)
 
@@ -166,6 +166,29 @@ monitoring updates.
 | **OV-1** | Metrics/diagnostics **opt-in**: `clientInfo.port` default is **0** (HTTP server off) | Set `clientInfo.port` explicitly (e.g. `9601`) if scraping `/metrics` or `/diagnostics` |
 | **OV-2** | Metric rename: `connected_bootstrap_count` → `connected_wellknown_peers_count` | Update Grafana/Prometheus dashboards and alerts |
 | **OV-3** | `--network.bootstrap=true` deprecated (warning only) | Remove from config when convenient |
+
+**BC-10 note — RandomBeacon is directly deployed, not a proxy.**
+`solidity/random-beacon/deploy/04_deploy_random_beacon.ts` calls
+`deployments.deploy("RandomBeacon", …)` with constructor arguments and linked
+libraries and **no `proxy` option**; there is no implementation-upgrade path.
+The reentrancy-guard storage slot is therefore compiled into the RandomBeacon
+bytecode and cannot be added to an already-deployed RandomBeacon by swapping a
+proxy implementation. It becomes active **only** when a new RandomBeacon is
+deployed and the network cuts over to the new address. Do **not** treat BC-10 as
+a "beacon proxy upgrade":
+
+- **If this release includes a RandomBeacon redeployment:** follow a separately
+  reviewed migration runbook covering the new address, dependency wiring
+  (sortition pool, staking, DKG validator, ReimbursementPool authorization and
+  funding), ownership/governance, consumer references, and post-deployment
+  validation. This is a fresh deployment + cutover, not an in-place upgrade.
+- **If RandomBeacon is not redeployed in this release:** BC-10 ships as a staged
+  bytecode change that is **not activated** on the existing deployment; no
+  operator action is required for it, and no existing reentrancy behavior
+  changes until a future beacon deployment.
+
+This distinguishes RandomBeacon from legitimately proxied components (e.g.
+`LightRelayMaintainerProxy`), which this row does not cover.
 
 **tss-lib pin (this release):** `github.com/threshold-network/tss-lib@v0.0.0-20260615180949-86bd1a375cc0` (`86bd1a3`).
 
