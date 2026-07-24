@@ -1,9 +1,15 @@
 package main
 
 import (
+	"context"
+	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/keep-network/keep-core/pkg/monitoring/cutoverroster"
 )
 
 // TestLoadInventory_ReadsTrustedReportTarget proves the inventory loader ingests
@@ -107,5 +113,91 @@ func TestChainIDMatches(t *testing.T) {
 				c.configured, c.rpcHex, got, c.want,
 			)
 		}
+	}
+}
+
+// TestParseHexUint64 proves the JSON-RPC hex parser fails closed: it rejects a
+// missing prefix, an empty body, an invalid digit, and — critically — a value
+// that overflows uint64. An oversized eth_blockNumber/eth_chainId result must
+// error rather than silently wrap and certify readiness from a bogus height.
+func TestParseHexUint64(t *testing.T) {
+	maxHex := "0x" + strings.Repeat("f", 16) // exactly math.MaxUint64
+
+	cases := []struct {
+		in      string
+		want    uint64
+		wantErr bool
+	}{
+		{"0x0", 0, false},
+		{"0x1", 1, false},
+		{"0xaa36a7", 0xaa36a7, false},
+		{maxHex, math.MaxUint64, false},
+		{"0x" + strings.Repeat("f", 17), 0, true},  // 17 nibbles overflows uint64
+		{"0x1" + strings.Repeat("0", 16), 0, true}, // 2^64 overflows uint64
+		{"", 0, true},                              // missing prefix
+		{"1", 0, true},                             // missing prefix
+		{"0x", 0, true},                            // empty body
+		{"0xzz", 0, true},                          // invalid digit
+	}
+	for _, c := range cases {
+		got, err := parseHexUint64(c.in)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("parseHexUint64(%q) = %d, want error", c.in, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseHexUint64(%q) unexpected error: %v", c.in, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("parseHexUint64(%q) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}
+
+// TestCollectOnce_InventoryUnavailableFailsClosed proves the collection loop
+// fails readiness closed when its authoritative inventory cannot be read: rather
+// than returning early and leaving a prior snapshot standing, it drives the
+// collector to an incomplete snapshot carrying a nonzero unreconciled signal.
+func TestCollectOnce_InventoryUnavailableFailsClosed(t *testing.T) {
+	store, err := cutoverroster.OpenStore(filepath.Join(t.TempDir(), "roster.db"))
+	if err != nil {
+		t.Fatalf("cannot open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	collector, err := cutoverroster.NewCollector(
+		cutoverroster.CollectorConfig{
+			ExpectedEpoch:      cutoverroster.ExpectedEpochSecurityV2Cutover,
+			CollectionInterval: time.Minute,
+			MissedThreshold:    2,
+			SuccessThreshold:   3,
+		},
+		store,
+		cutoverroster.NewPrometheusMetrics(),
+	)
+	if err != nil {
+		t.Fatalf("cannot construct collector: %v", err)
+	}
+
+	// A non-empty path to a file that does not exist forces the inventory load to
+	// fail (an empty path is a valid "no inventory" input and would not error).
+	opts := options{
+		inventoryFile: filepath.Join(t.TempDir(), "does-not-exist.json"),
+	}
+
+	collectOnce(context.Background(), opts, collector)
+
+	snap := collector.Snapshot()
+	if snap.Complete {
+		t.Errorf("an unreadable inventory must not leave readiness certified complete")
+	}
+	if snap.Inventory.Unreconciled < 1 {
+		t.Errorf(
+			"an unreadable inventory must drive a nonzero unreconciled signal, got %d",
+			snap.Inventory.Unreconciled,
+		)
 	}
 }

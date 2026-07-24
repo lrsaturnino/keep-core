@@ -407,6 +407,46 @@ func (c *Collector) Collect(
 	return snapshot, nil
 }
 
+// RecordInputUnavailable records a collection cycle in which an authoritative
+// input — the ceremony-eligible inventory or the legacy-sightings evidence —
+// could not be read. It fails readiness closed for the cycle: the published
+// snapshot is forced incomplete with a nonzero inventory-unreconciled signal, and
+// the fleet metrics are refreshed so the CutoverRosterIncomplete alert fires. A
+// stale "complete=true" snapshot from an earlier cycle must never keep certifying
+// readiness while the authoritative denominator is missing.
+//
+// Persisted operator/instance history is deliberately left untouched: a transient
+// input blip is not evidence that any operator converged, disappeared, or missed
+// a collection, so it must not advance a missed counter, purge a resolved record,
+// or otherwise mutate central state.
+func (c *Collector) RecordInputUnavailable(currentBlock uint64) FleetSnapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := c.clock()
+
+	snapshot := c.buildSnapshot(now, currentBlock)
+	snapshot.Complete = false
+
+	// The input failure is itself an inventory-reconciliation fault. Any persisted
+	// blocking operators stay visible via buildSnapshot; forcing unreconciled to at
+	// least one guarantees a nonzero watched gauge even when nothing was blocking.
+	const stale = 0
+	const unreconciled = 1
+	snapshot.Inventory = FleetInventoryCounts{
+		TotalInstances:    len(c.instances),
+		EligibleInstances: 0,
+		ReportersStale:    stale,
+		Unreconciled:      unreconciled,
+	}
+
+	c.lastSnapshot = snapshot
+	c.updateMetrics(snapshot, stale, unreconciled)
+	c.logCycle(snapshot)
+
+	return snapshot
+}
+
 // isComplete fails closed: readiness is "complete" only with a nonempty
 // reconciled authoritative inventory, a fresh current block, fully specified
 // expected artifact identity and chain ID, and zero blocking/stale/unreconciled.

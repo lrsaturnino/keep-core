@@ -435,3 +435,61 @@ func TestCollector_ContradictoryInstanceExpectationRejected(t *testing.T) {
 		t.Errorf("a contradictory per-instance expectation must not resolve the operator")
 	}
 }
+
+// TestCollector_RecordInputUnavailableFailsClosed proves that once an
+// authoritative input becomes unreadable, a previously-certified "complete=true"
+// readiness snapshot is superseded by an incomplete one carrying a nonzero
+// inventory-unreconciled signal, and that persisted operator history is left
+// intact so a transient input blip neither resolves nor ages any operator.
+func TestCollector_RecordInputUnavailableFailsClosed(t *testing.T) {
+	tc := newTestCollector(t)
+	inventory := []InventoryInstance{eligibleInstance("i1", "op1")}
+
+	// Drive the operator to resolved_current across three exact collections so the
+	// last published snapshot is genuinely complete with zero watched gauges.
+	var snap FleetSnapshot
+	for cycle := 1; cycle <= 3; cycle++ {
+		reports := map[string]InstanceReport{"i1": exactReport("i1", "op1", tc.now)}
+		var err error
+		snap, err = tc.collector.Collect(inventory, reports, nil, uint64(1000+cycle))
+		if err != nil {
+			t.Fatal(err)
+		}
+		tc.now = tc.now.Add(time.Minute)
+	}
+	if !snap.Complete {
+		t.Fatalf("precondition failed: expected a complete snapshot after three exact reports")
+	}
+	if tc.sink.gauge(MetricInventoryUnreconciled) != 0 {
+		t.Fatalf("precondition failed: expected zero unreconciled before the input failure")
+	}
+
+	// The next cycle cannot read its authoritative input.
+	failed := tc.collector.RecordInputUnavailable(1004)
+
+	if failed.Complete {
+		t.Errorf("an unavailable authoritative input must not certify readiness")
+	}
+	if failed.Inventory.Unreconciled == 0 {
+		t.Errorf("an unavailable authoritative input must surface as unreconciled")
+	}
+	if tc.sink.gauge(MetricInventoryUnreconciled) == 0 {
+		t.Errorf("expected a nonzero unreconciled gauge after the input failure")
+	}
+	if failed.CurrentBlock != 1004 {
+		t.Errorf("expected the failed snapshot to be stamped with the read block, got %d", failed.CurrentBlock)
+	}
+
+	// The most recently served snapshot must be the incomplete one, not the stale
+	// complete snapshot from the prior cycle.
+	served := tc.collector.Snapshot()
+	if served.Complete {
+		t.Errorf("the served snapshot must be incomplete while the input is unavailable")
+	}
+
+	// Persisted history is untouched: op1 is still recorded as resolved_current, it
+	// was neither aged out nor reopened by the transient input failure.
+	if status, ok := operatorStatus(served, "op1"); !ok || status != FleetResolvedCurrent {
+		t.Errorf("expected op1 to remain resolved_current after the input failure, got %s (present=%t)", status, ok)
+	}
+}

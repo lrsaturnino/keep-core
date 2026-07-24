@@ -193,20 +193,35 @@ func collectOnce(
 	opts options,
 	collector *cutoverroster.Collector,
 ) {
+	// Read the chain height first so it can stamp even a failed-closed snapshot;
+	// it is independent of the authoritative inputs read below.
+	currentBlock := readCurrentBlock(ctx, opts.ethereumRPC, opts.chainID)
+
+	// An unreadable authoritative input must fail readiness closed for this cycle
+	// rather than leave a previous "complete=true" snapshot standing. Returning
+	// early would keep certifying readiness while the inventory or sightings
+	// evidence is missing.
 	inventory, err := loadInventory(opts.inventoryFile)
 	if err != nil {
-		logger.Errorf("cannot load inventory: %v", err)
+		logger.Errorf(
+			"cannot load authoritative inventory; failing readiness closed "+
+				"for this cycle: %v", err,
+		)
+		collector.RecordInputUnavailable(currentBlock)
+		return
+	}
+
+	sightings, err := loadSightings(opts.sightingsFile)
+	if err != nil {
+		logger.Errorf(
+			"cannot load legacy sightings; failing readiness closed for this "+
+				"cycle: %v", err,
+		)
+		collector.RecordInputUnavailable(currentBlock)
 		return
 	}
 
 	reports := pollReports(ctx, inventory)
-
-	sightings, err := loadSightings(opts.sightingsFile)
-	if err != nil {
-		logger.Errorf("cannot load sightings: %v", err)
-	}
-
-	currentBlock := readCurrentBlock(ctx, opts.ethereumRPC, opts.chainID)
 
 	if _, err := collector.Collect(inventory, reports, sightings, currentBlock); err != nil {
 		logger.Errorf("collection cycle failed: %v", err)
@@ -431,20 +446,10 @@ func parseHexUint64(s string) (uint64, error) {
 	if len(s) < 2 || s[:2] != "0x" {
 		return 0, errors.New("missing 0x prefix")
 	}
-	var value uint64
-	for _, c := range s[2:] {
-		var digit uint64
-		switch {
-		case c >= '0' && c <= '9':
-			digit = uint64(c - '0')
-		case c >= 'a' && c <= 'f':
-			digit = uint64(c-'a') + 10
-		case c >= 'A' && c <= 'F':
-			digit = uint64(c-'A') + 10
-		default:
-			return 0, fmt.Errorf("invalid hex digit %q", c)
-		}
-		value = value*16 + digit
-	}
-	return value, nil
+	// Delegate digit parsing to strconv, which rejects an empty body, an invalid
+	// digit, and — critically — a value that overflows uint64. A hand-rolled
+	// value*16+digit loop wraps silently on an oversized eth_blockNumber or
+	// eth_chainId result, which would then certify readiness from a bogus height;
+	// ParseUint fails closed instead.
+	return strconv.ParseUint(s[2:], 16, 64)
 }
