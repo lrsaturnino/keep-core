@@ -205,26 +205,23 @@ func Initialize(
 	}
 	node.setCutoverPeerRoster(cutoverRoster)
 
-	// If initialization fails after the roster is constructed, stop and join its
-	// background sweep loop before returning. The sweep loop is bound to ctx, but
-	// a failed Initialize does not necessarily cancel ctx (the caller may keep the
-	// parent context alive), which would otherwise leak the loop and its periodic
-	// chain-clock reads. On the success path err is nil and the ctx-bound
-	// goroutine below closes the roster at process shutdown instead.
+	// Bind the roster's background sweep loop to the process lifecycle. On the
+	// success path the parent context's cancellation closes the roster at
+	// shutdown. On an initialization-error path the deferred close both closes
+	// the roster (a synchronous stop-and-join, so the sweep loop is reclaimed
+	// before Initialize returns) and releases the lifecycle goroutine through
+	// rosterStop — without which that goroutine would block on ctx.Done()
+	// indefinitely and leak whenever Initialize fails while the caller keeps the
+	// parent context alive. Close is idempotent (sync.Once), so the two closes
+	// are safe to overlap.
+	rosterStop := make(chan struct{})
 	defer func() {
 		if err != nil {
+			close(rosterStop)
 			cutoverRoster.Close()
 		}
 	}()
-
-	// Join the roster's background sweep loop to the process lifecycle. The
-	// sweep loop is already bound to ctx, but Close performs an explicit
-	// stop-and-join so the goroutine is reclaimed deterministically on
-	// shutdown.
-	go func() {
-		<-ctx.Done()
-		cutoverRoster.Close()
-	}()
+	go closeRosterOnShutdownOrInitError(ctx, rosterStop, cutoverRoster)
 
 	err = node.runCoordinationLayer(ctx)
 	if err != nil {
@@ -462,6 +459,32 @@ func Initialize(
 	})
 
 	return nil
+}
+
+// rosterLifecycleCloser is the subset of the cutover peer roster lifecycle used
+// by closeRosterOnShutdownOrInitError.
+type rosterLifecycleCloser interface {
+	Close()
+}
+
+// closeRosterOnShutdownOrInitError closes the cutover peer roster exactly once,
+// when either the parent context is cancelled (normal process shutdown — the
+// Initialize success path) or the stop channel is closed (Initialize failed
+// after the roster was constructed but before it was handed off to the process
+// lifecycle). Without the stop path this goroutine would block on ctx.Done()
+// indefinitely and leak whenever Initialize returns an error while the caller
+// keeps the parent context alive. Close is idempotent, so an overlapping
+// deferred close on the error path is safe.
+func closeRosterOnShutdownOrInitError(
+	ctx context.Context,
+	stop <-chan struct{},
+	roster rosterLifecycleCloser,
+) {
+	select {
+	case <-ctx.Done():
+	case <-stop:
+	}
+	roster.Close()
 }
 
 // enoughPreParamsInPoolPolicy is a policy that enforces the sufficient size
