@@ -163,7 +163,7 @@ monitoring updates.
 
 | ID | Change | Operator action |
 |----|--------|-----------------|
-| **OV-1** | Metrics/diagnostics **opt-in**: `clientInfo.port` default is **0** (HTTP server off) | Set `clientInfo.port` explicitly (e.g. `9601`) if scraping `/metrics` or `/diagnostics` |
+| **OV-1** | Metrics/diagnostics **temporary compatibility default**: `clientInfo.port` stays `9601` for this coordinated release (HTTP server on) so revision/epoch/mode and stranded-peer evidence stay visible through the cutover; explicit `clientInfo.port = 0` disables it. The follow-up R2 release flips the default back to `0` after the monitoring migration. | Commit an explicit `clientInfo.port` value now, expose it only over a trusted path, and migrate scrape targets before R2 |
 | **OV-2** | Metric rename: `connected_bootstrap_count` → `connected_wellknown_peers_count` | Update Grafana/Prometheus dashboards and alerts |
 | **OV-3** | `--network.bootstrap=true` deprecated (warning only) | Remove from config when convenient |
 
@@ -195,6 +195,37 @@ consensus-safety issue -- mismatched cryptography fails closed (shares do not
 decrypt, signatures do not verify) and never yields a valid-but-wrong result.
 Operators must upgrade the entire ceremony fleet atomically and must not run a
 mixed-version set through a live DKG or signing session.
+
+### Coordinated release-model context
+
+The mixed-version hazard above is why this ships as a single coordinated security
+release with one required operator update and one release-baked cutover block
+(`C`): before `C` participants speak the legacy wire formats, and canonically
+post-`C` work speaks security-v2. The block-height cutover gate and its
+per-ceremony mode strategies land in their own separately reviewable commits;
+the fail-closed property stated above holds regardless (mismatched cryptography
+does not decrypt or verify and never yields a valid-but-wrong result).
+
+Two supporting changes ship to keep the coordinated release observable and to
+identify who has not converged:
+
+- **Client-info compatibility (Part B).** The `clientInfo.port` default is
+  retained at `9601` for the release window (see OV-1). This keeps the
+  unauthenticated metrics/diagnostics channel — the primary source of exact
+  revision/epoch and stranded-peer evidence — alive through the cutover.
+  Expose it only over a trusted path. R2 flips the default back to `0` after the
+  monitoring migration is complete.
+- **Stranded/legacy-peer observability.** An announcer session-ID mismatch
+  observer classifies each membership-valid announcement as legacy or hardened
+  and a node-local, deduplicated cutover peer roster records post-cutover legacy
+  sightings by normalized operator address. A separate `cutover-roster`
+  aggregator joins those sightings to the authoritative eligible-instance
+  inventory so readiness is measured against exact revision/epoch/digest, not
+  merely a quiet mismatch counter.
+
+**Release epoch.** The coordinated cutover artifact reports the release epoch
+`security_v2_cutover` in `client_info` and diagnostics; a node's exact revision,
+epoch, and cutover block are the go/no-go evidence, not the container tag.
 
 ---
 

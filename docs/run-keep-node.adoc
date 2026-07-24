@@ -167,7 +167,7 @@ A *Network* Port has to be exposed publicly, so the peers can connect to your no
 // TODO: Add link to the Rewards Allocation documentation.
 A *Diagnostics* Port must be reachable from the Rewards Allocation prober via a
 trusted network path; do not expose it publicly. See <<clientInfo>> for the
-trusted-network requirement and the new opt-in default.
+trusted-network requirement and the temporary 9601 compatibility default.
 
 IMPORTANT: Please update your firewall rules if necessary.
 
@@ -189,7 +189,7 @@ IMPORTANT: Please update your firewall rules if necessary.
 |clientInfo.port
 |Egress
 |TCP
-|0
+|9601
 
 |===
 
@@ -311,14 +311,20 @@ startup log.  When sharing remember to substitute the `/ipv4/` address with the 
 [#clientInfo]
 == Client Info
 
-The client exposes metrics and diagnostics on a configurable port when
-explicitly enabled with `clientInfo.port` under `/metrics` and `/diagnostics`
-resources. Expose this endpoint only on a trusted network.
+The client exposes metrics and diagnostics on a configurable port under the
+`/metrics` and `/diagnostics` resources. Note that `clientInfo.port` (the
+non-public client-info port) is distinct from the public P2P `network.port`
+(default `3919`): the client-info endpoint is unauthenticated and MUST be
+reachable only over a trusted network path — a firewall/VPN or an authenticated
+proxy in front of it.
 
-IMPORTANT: The metrics server is *disabled by default* (port `0`). If you
-previously relied on the default port `9601`, you must now set
-`clientInfo.port = 9601` (or another port) in your configuration file
-to retain metrics collection.
+IMPORTANT: For the coordinated security release the client-info server listens
+on the compatibility default port `9601`. This is a temporary compatibility
+window: set `clientInfo.port = 0` to explicitly disable the server, or set an
+explicit port to keep it. Commit an explicit `clientInfo.port` value now and
+migrate every scrape target onto its trusted path; the follow-up R2 release
+will sunset this window and flip the default back to `0` (disabled) once the
+monitoring migration is complete.
 
 The data can be consumed by Prometheus to monitor the state of a node.
 

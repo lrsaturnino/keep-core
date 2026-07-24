@@ -174,7 +174,7 @@ var cmdFlagsTests = map[string]struct {
 		flagName:              "--clientInfo.port",
 		flagValue:             "9870",
 		expectedValueFromFlag: 9870,
-		defaultValue:          0,
+		defaultValue:          9601,
 	},
 	"clientInfo.networkMetricsTick": {
 		readValueFunc:         func(c *config.Config) interface{} { return c.ClientInfo.NetworkMetricsTick },
@@ -484,6 +484,55 @@ func TestFlags_Mixed(t *testing.T) {
 				t.Errorf("\nexpected: %s\nactual:   %s", expected, actual)
 			}
 		})
+	}
+}
+
+// TestFlags_ClientInfoPortExplicitZero proves that an explicit `--clientInfo.port 0`
+// on the command line resolves to zero even though the bound flag default is now
+// 9601. This is the CLI half of the two explicit-zero acceptance paths; it cannot
+// stand in for the TOML path because flag binding and Viper unmarshalling have
+// different precedence rules.
+func TestFlags_ClientInfoPortExplicitZero(t *testing.T) {
+	testCommand, testConfig, _ := initTestCommand()
+
+	args := []string{
+		cmdFlagsTests["ethereum.url"].flagName, cmdFlagsTests["ethereum.url"].flagValue,
+		cmdFlagsTests["ethereum.keyFile"].flagName, cmdFlagsTests["ethereum.keyFile"].flagValue,
+		cmdFlagsTests["bitcoin.electrum.url"].flagName, cmdFlagsTests["bitcoin.electrum.url"].flagValue,
+		cmdFlagsTests["storage.dir"].flagName, cmdFlagsTests["storage.dir"].flagValue,
+		"--clientInfo.port", "0",
+	}
+	testCommand.SetArgs(args)
+
+	testCommand.Execute()
+
+	if testConfig.ClientInfo.Port != 0 {
+		t.Errorf(
+			"expected clientInfo.port to be 0 when explicitly set on the CLI, got [%d]",
+			testConfig.ClientInfo.Port,
+		)
+	}
+}
+
+// TestFlags_ClientInfoPortZeroFromConfig proves that an explicit `[clientInfo] Port = 0`
+// in a TOML file resolves to zero despite the bound flag default of 9601. This is the
+// TOML half of the two explicit-zero acceptance paths; Viper must preserve a config-file
+// zero over the CLI-bound default.
+func TestFlags_ClientInfoPortZeroFromConfig(t *testing.T) {
+	testCommand, testConfig, _ := initTestCommand()
+
+	args := []string{
+		"--config", "../test/config_clientinfo_zero.toml",
+	}
+	testCommand.SetArgs(args)
+
+	testCommand.Execute()
+
+	if testConfig.ClientInfo.Port != 0 {
+		t.Errorf(
+			"expected clientInfo.port to be 0 when set to 0 in the config file, got [%d]",
+			testConfig.ClientInfo.Port,
+		)
 	}
 }
 

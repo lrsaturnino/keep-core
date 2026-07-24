@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/keep-network/keep-core/pkg/net"
 	"github.com/keep-network/keep-core/pkg/protocol/announcer/gen/pb"
@@ -63,12 +64,156 @@ func (am *announcementMessage) Type() string {
 	return "protocol_announcer/announcement_message"
 }
 
+// SessionIDFormat classifies the wire format of an announcement session ID
+// without exposing the raw identifier. It is used to distinguish legacy peers
+// from hardened (security-v2) peers during a coordinated cutover.
+type SessionIDFormat uint8
+
+const (
+	// SessionIDFormatUnknown denotes a session ID that matches neither the
+	// legacy nor a hardened format.
+	SessionIDFormatUnknown SessionIDFormat = iota
+	// SessionIDFormatLegacy denotes the pre-hardening form: one lowercase
+	// hexadecimal seed/message component and one unsigned decimal attempt
+	// component, separated by a single hyphen (e.g. "abc123-4").
+	SessionIDFormatLegacy
+	// SessionIDFormatHardenedDKG denotes the hardened tECDSA DKG form
+	// "dkg-<hex>-<16 hex digits>".
+	SessionIDFormatHardenedDKG
+	// SessionIDFormatHardenedSigning denotes the hardened tECDSA signing form
+	// "signing-<hex>-<16 hex digits>-<16 hex digits>".
+	SessionIDFormatHardenedSigning
+)
+
+// String returns a stable, log-safe label for the session ID format.
+func (f SessionIDFormat) String() string {
+	switch f {
+	case SessionIDFormatLegacy:
+		return "legacy"
+	case SessionIDFormatHardenedDKG:
+		return "hardened_dkg"
+	case SessionIDFormatHardenedSigning:
+		return "hardened_signing"
+	default:
+		return "unknown"
+	}
+}
+
+// IsHardened reports whether the format is one of the hardened (security-v2)
+// forms.
+func (f SessionIDFormat) IsHardened() bool {
+	return f == SessionIDFormatHardenedDKG || f == SessionIDFormatHardenedSigning
+}
+
+// ClassifySessionIDFormat classifies a session ID into one of the known formats
+// without retaining or exposing the raw identifier. The classification is
+// purely structural and mirrors the exact formats produced by the tBTC DKG and
+// signing loops:
+//
+//   - hardened DKG:     "dkg-<hex>-<16 hex digits>"
+//   - hardened signing: "signing-<hex>-<16 hex digits>-<16 hex digits>"
+//   - legacy:           "<lowercase hex>-<unsigned decimal>"
+//   - otherwise:        unknown
+func ClassifySessionIDFormat(sessionID string) SessionIDFormat {
+	parts := strings.Split(sessionID, "-")
+
+	switch {
+	case len(parts) == 3 &&
+		parts[0] == "dkg" &&
+		isLowerHex(parts[1]) &&
+		isFixedWidthLowerHex(parts[2], 16):
+		return SessionIDFormatHardenedDKG
+	case len(parts) == 4 &&
+		parts[0] == "signing" &&
+		isLowerHex(parts[1]) &&
+		isFixedWidthLowerHex(parts[2], 16) &&
+		isFixedWidthLowerHex(parts[3], 16):
+		return SessionIDFormatHardenedSigning
+	case len(parts) == 2 &&
+		isLowerHex(parts[0]) &&
+		isDecimal(parts[1]):
+		return SessionIDFormatLegacy
+	default:
+		return SessionIDFormatUnknown
+	}
+}
+
+// IsCrossFormatMismatch reports whether two session ID formats represent a
+// legacy-versus-hardened mismatch (as opposed to two differing formats on the
+// same side of the cutover). Only cross-format mismatches indicate a peer on
+// the opposite side of the cutover.
+func IsCrossFormatMismatch(a, b SessionIDFormat) bool {
+	return (a == SessionIDFormatLegacy && b.IsHardened()) ||
+		(b == SessionIDFormatLegacy && a.IsHardened())
+}
+
+// isLowerHex reports whether s is a non-empty string of lowercase hexadecimal
+// digits.
+func isLowerHex(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+// isFixedWidthLowerHex reports whether s is exactly width lowercase hexadecimal
+// digits.
+func isFixedWidthLowerHex(s string, width int) bool {
+	return len(s) == width && isLowerHex(s)
+}
+
+// isDecimal reports whether s is a non-empty string of decimal digits.
+func isDecimal(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// SessionMismatchObserver is invoked once per membership-valid, protocol-matched
+// sender per Announce call whose announced session ID differs from the local
+// session ID. It receives only the protocol ID, the sender's group member
+// index, and the classified expected/observed formats — never the raw session
+// IDs — so it is safe to log or aggregate. expectedFormat is the format of the
+// local node's own session ID; observedFormat is the sender's.
+type SessionMismatchObserver func(
+	protocolID string,
+	sender group.MemberIndex,
+	expectedFormat SessionIDFormat,
+	observedFormat SessionIDFormat,
+)
+
+// Option configures optional Announcer behavior. It is source-compatible: the
+// existing three-argument New calls continue to compile unchanged.
+type Option func(*Announcer)
+
+// WithSessionMismatchObserver installs an observer that is invoked when a
+// membership-valid, protocol-matched announcement carries a session ID that
+// differs from the local session ID. The observer is called at most once per
+// sender per Announce call. A nil observer is equivalent to not setting one.
+func WithSessionMismatchObserver(observer SessionMismatchObserver) Option {
+	return func(a *Announcer) {
+		a.sessionMismatchObserver = observer
+	}
+}
+
 // Announcer is an implementation of the protocol announcer that performs the
 // readiness announcement over the provided broadcast channel.
 type Announcer struct {
-	protocolID          string
-	broadcastChannel    net.BroadcastChannel
-	membershipValidator *group.MembershipValidator
+	protocolID              string
+	broadcastChannel        net.BroadcastChannel
+	membershipValidator     *group.MembershipValidator
+	sessionMismatchObserver SessionMismatchObserver
 }
 
 // RegisterUnmarshaller initializes the given broadcast channel to be able to
@@ -87,12 +232,19 @@ func New(
 	protocolID string,
 	broadcastChannel net.BroadcastChannel,
 	membershipValidator *group.MembershipValidator,
+	options ...Option,
 ) *Announcer {
-	return &Announcer{
+	announcer := &Announcer{
 		protocolID:          protocolID,
 		broadcastChannel:    broadcastChannel,
 		membershipValidator: membershipValidator,
 	}
+
+	for _, option := range options {
+		option(announcer)
+	}
+
+	return announcer
 }
 
 // Announce sends the member's readiness announcement for the given protocol
@@ -127,6 +279,10 @@ func (a *Announcer) Announce(
 	// Mark itself as ready.
 	readyMembersIndexesSet[memberIndex] = true
 
+	// Tracks senders already reported to the session mismatch observer during
+	// this Announce call so each mismatching sender is counted at most once.
+	mismatchObservedSenders := make(map[group.MemberIndex]bool)
+
 loop:
 	for {
 		select {
@@ -152,6 +308,23 @@ loop:
 			}
 
 			if announcement.sessionID != sessionID {
+				// The sender is a valid group member announcing for this
+				// protocol but with a different session ID. During a
+				// coordinated cutover this is how a peer on the opposite side
+				// of the boundary is observed. Report it to the optional
+				// observer, once per sender per call, before discarding the
+				// announcement. Only structural formats are exposed, never the
+				// raw session IDs.
+				if a.sessionMismatchObserver != nil &&
+					!mismatchObservedSenders[announcement.senderID] {
+					mismatchObservedSenders[announcement.senderID] = true
+					a.sessionMismatchObserver(
+						announcement.protocolID,
+						announcement.senderID,
+						ClassifySessionIDFormat(sessionID),
+						ClassifySessionIDFormat(announcement.sessionID),
+					)
+				}
 				continue
 			}
 

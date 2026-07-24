@@ -6,6 +6,12 @@ OPERATOR_KEY_FILE_PASSWORD="<Ethereum Key File Password>"
 CONFIG_DIR=$(pwd)/config
 STORAGE_DIR=$(pwd)/storage
 
+# Only the public P2P port (3919) is published to the host below. The
+# unauthenticated client-info server still listens inside the container on the
+# compatibility default port 9601 (metrics/diagnostics) unless you set
+# `--clientInfo.port 0`. Do NOT publish 9601 to 0.0.0.0; reach it only over a
+# trusted path (a private Docker network, a firewall/VPN, or an authenticated
+# mTLS reverse proxy).
 docker run --detach \
     --volume $CONFIG_DIR:/mnt/keep/config \
     --volume $STORAGE_DIR:/mnt/keep/storage \

@@ -20,6 +20,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/net"
 	"github.com/keep-network/keep-core/pkg/protocol/announcer"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/tecdsa/dkg"
 )
 
@@ -337,10 +338,36 @@ func (de *dkgExecutor) generateSigningGroup(
 				})
 			defer subscription.Unsubscribe()
 
+			// currentMode is the local node's protocol mode for this ceremony.
+			// It classifies our own announcement so the mismatch observer can
+			// tell legacy peers apart from hardened ones during a coordinated
+			// cutover.
+			// TODO: replace with permit.Mode() once the Part A cutover gate
+			// lands; for now it is the hardened mode unconditionally.
+			currentMode := participation.ModeSecurityV2
+			sessionMismatchObserver := func(
+				protocolID string,
+				sender group.MemberIndex,
+				expectedFormat announcer.SessionIDFormat,
+				observedFormat announcer.SessionIDFormat,
+			) {
+				dkgLogger.Infof(
+					"protocol announcement rejected: session ID mismatch "+
+						"[protocol=%s] [member=%d] [expectedFormat=%s] "+
+						"[observedFormat=%s] [permitMode=%s]",
+					protocolID,
+					sender,
+					expectedFormat,
+					observedFormat,
+					currentMode,
+				)
+			}
+
 			announcer := announcer.New(
 				fmt.Sprintf("%v-%v", ProtocolName, "dkg"),
 				broadcastChannel,
 				membershipValidator,
+				announcer.WithSessionMismatchObserver(sessionMismatchObserver),
 			)
 
 			retryLoop := newDkgRetryLoop(

@@ -105,10 +105,14 @@ Dir = "/my/secure/location"
 # - list of connected peers along with their network id and ethereum operator address
 # - information about the client's network id and ethereum operator address
 #
-# The metrics/diagnostics HTTP server is disabled by default. To enable it,
-# uncomment the section below and set Port to the listening port.
-# [clientInfo]
-# Port = 9601
+# The metrics/diagnostics HTTP server listens on the compatibility default port
+# 9601. This is a temporary compatibility default for the coordinated security
+# release; set Port = 0 to explicitly disable the server. The endpoint is
+# unauthenticated, so expose it only over a trusted network path (firewall/VPN
+# or an authenticated proxy). Operators MUST commit an explicit Port value before
+# the follow-up R2 release flips the default back to 0 (disabled).
+[clientInfo]
+Port = 9601
 # NetworkMetricsTick = 60
 # EthereumMetricsTick = 600
 

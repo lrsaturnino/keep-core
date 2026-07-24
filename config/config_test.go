@@ -255,6 +255,31 @@ func TestReadConfigFromFile(t *testing.T) {
 	}
 }
 
+// TestReadConfig_ClientInfoPortZero pins the lower-level configuration path: an
+// explicit `[clientInfo] Port = 0` in a TOML file must unmarshal to zero. This
+// supplements, and does not replace, the two command-path explicit-zero tests in
+// cmd/flags_test.go, because Viper unmarshalling and flag binding follow different
+// precedence rules.
+func TestReadConfig_ClientInfoPortZero(t *testing.T) {
+	t.Setenv(EthereumPasswordEnvVariable, "test-password")
+
+	cfg := &Config{}
+	if err := cfg.ReadConfig(
+		"../test/config_clientinfo_zero.toml",
+		nil,
+		AllCategories...,
+	); err != nil {
+		t.Fatalf("failed to read test config: [%v]", err)
+	}
+
+	if cfg.ClientInfo.Port != 0 {
+		t.Errorf(
+			"expected clientInfo.port to be 0, got [%d]",
+			cfg.ClientInfo.Port,
+		)
+	}
+}
+
 func TestReadConfig_ReadPassword(t *testing.T) {
 	expectToPrompt := "expect-to-prompt"
 

@@ -1,0 +1,62 @@
+# compose.yaml — Part B (section 14.2) private-network smoke scaffold.
+#
+# Demonstrates the intended topology for the client-info port matrix: a
+# keep-client node and a probe sit on a private Docker network, and the probe
+# reaches the client-info listener over that private network only. Port 9601 is
+# deliberately NOT published to the host (`ports:` is intentionally omitted) so
+# the unauthenticated endpoint is never exposed on a public interface.
+#
+# This is the "compatibility default" case (no client-info settings). Fill in the
+# chain endpoint, key file, and network flags for your environment, then:
+#   docker compose -f compose.yaml up -d node
+#   docker compose -f compose.yaml run --rm probe
+#
+# For the other matrix cases, override `command:` accordingly:
+#   explicit 9601 : add `--clientInfo.port 9601`
+#   custom        : add `--clientInfo.port 9137` (and probe that port)
+#   CLI disabled  : add `--clientInfo.port 0`    (probe must get connection refused)
+#   TOML variants : mount a config file with `[clientInfo] Port = 9601` or `= 0`
+
+services:
+  node:
+    image: ${IMAGE:-keep-client:candidate}
+    container_name: cutover-port-smoke-node
+    # No `ports:` mapping — 9601 stays internal to the private network.
+    networks:
+      - smoke
+    environment:
+      KEEP_ETHEREUM_PASSWORD: ${KEY_PASSWORD:?set KEY_PASSWORD}
+    volumes:
+      - ${KEY_FILE:?set KEY_FILE}:/mnt/keep/config/keyfile.json:ro
+      - ${STORAGE_DIR:-./storage}:/mnt/keep/storage
+    command:
+      - start
+      - --ethereum.url
+      - ${ETH_RPC:?set ETH_RPC}
+      - --ethereum.keyFile
+      - /mnt/keep/config/keyfile.json
+      - --storage.dir
+      - /mnt/keep/storage
+      # (compatibility default: no --clientInfo.port flag; 9601 is the default)
+
+  probe:
+    image: curlimages/curl:8.10.1
+    container_name: cutover-port-smoke-probe
+    depends_on:
+      - node
+    networks:
+      - smoke
+    # Succeeds only if the internal listener answers on 9601.
+    command:
+      - -fsS
+      - --retry
+      - "30"
+      - --retry-delay
+      - "2"
+      - --retry-connrefused
+      - http://cutover-port-smoke-node:9601/metrics
+
+networks:
+  smoke:
+    driver: bridge
+    internal: true

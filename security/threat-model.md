@@ -179,6 +179,18 @@ The following are explicitly excluded from the Threshold Network bug bounty:
 | Timing attack on hash-to-curve | `altbn128.go:120` | Try-and-increment leaks iteration count |
 | Observe P2P messages | Pubsub channel | Messages are signed but broadcast; payload visible to all subscribers |
 
+**Metrics endpoint (port 9601) — temporary compatibility acceptance.** The
+`clientInfo.port` default is retained at `9601` for the coordinated security
+release so revision/epoch, active-mode, and stranded-peer evidence stay visible
+through the cutover. There is still **no authentication** on the endpoint;
+mitigation is entirely by network posture. Required compensating controls: bind
+the endpoint to a trusted/private path only (firewall/VPN or an authenticated
+proxy), never publish it on a public interface, and set `clientInfo.port = 0`
+where monitoring is intentionally retired. This acceptance is time-bounded: the
+follow-up R2 release flips the default back to `0` (disabled) once the
+monitoring migration exit criteria are signed off, and the Security owner
+revalidates the exposure inventory before expiry.
+
 ### D -- Denial of Service
 
 | Attack | Component | Notes |
