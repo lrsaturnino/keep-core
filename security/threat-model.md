@@ -181,8 +181,10 @@ The following are explicitly excluded from the Threshold Network bug bounty:
 
 **Metrics endpoint (port 9601) — temporary compatibility acceptance.** The
 `clientInfo.port` default is retained at `9601` for the coordinated security
-release so revision/epoch, active-mode, and stranded-peer evidence stay visible
-through the cutover. There is still **no authentication** on the endpoint;
+release so a node's exact revision and stranded-peer evidence stay visible
+through the cutover (the compiled epoch and active-mode signals belong to the
+not-yet-landed cutover gate and are not exposed by this build). There is still
+**no authentication** on the endpoint;
 mitigation is entirely by network posture. Required compensating controls: bind
 the endpoint to a trusted/private path only (firewall/VPN or an authenticated
 proxy), never publish it on a public interface, and set `clientInfo.port = 0`

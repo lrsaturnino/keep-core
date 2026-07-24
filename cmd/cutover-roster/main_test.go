@@ -82,3 +82,30 @@ func TestLoadQuarantineEvidence_ReadsEntries(t *testing.T) {
 		t.Errorf("evidence ref not ingested: %q", entries[0].EvidenceRef)
 	}
 }
+
+// TestChainIDMatches proves the configured chain ID (decimal or 0x-hex) is
+// compared numerically against the RPC-returned hex eth_chainId, so a block
+// height read from the wrong chain is rejected rather than certifying readiness.
+func TestChainIDMatches(t *testing.T) {
+	cases := []struct {
+		configured, rpcHex string
+		want               bool
+	}{
+		{"1", "0x1", true},
+		{"0x1", "0x1", true},
+		{"11155111", "0xaa36a7", true}, // sepolia, decimal vs hex
+		{"1", "0x2", false},
+		{"", "0x1", false},
+		{"1", "", false},
+		{"abc", "0x1", false},
+		{"1", "0xzz", false},
+	}
+	for _, c := range cases {
+		if got := chainIDMatches(c.configured, c.rpcHex); got != c.want {
+			t.Errorf(
+				"chainIDMatches(%q, %q) = %v, want %v",
+				c.configured, c.rpcHex, got, c.want,
+			)
+		}
+	}
+}

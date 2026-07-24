@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/big"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,10 +15,12 @@ import (
 	"github.com/keep-network/keep-core/internal/testutils"
 	"github.com/keep-network/keep-core/pkg/bitcoin"
 	"github.com/keep-network/keep-core/pkg/chain"
+	"github.com/keep-network/keep-core/pkg/clientinfo"
 	"github.com/keep-network/keep-core/pkg/generator"
 	"github.com/keep-network/keep-core/pkg/internal/tecdsatest"
 	"github.com/keep-network/keep-core/pkg/net/local"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/tecdsa"
 )
 
@@ -1072,6 +1075,110 @@ func setupNodeForClosureTests(t *testing.T) (*node, *signer, *localChain) {
 	}
 
 	return n, signer, lc
+}
+
+// newTestCutoverRoster builds a node-local cutover peer roster backed by the
+// given chain's block counter and a no-op metrics sink, for wiring tests.
+func newTestCutoverRoster(
+	t *testing.T,
+	ctx context.Context,
+	lc *localChain,
+) *participation.CutoverPeerRoster {
+	t.Helper()
+
+	blockCounter, err := lc.BlockCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	roster, err := participation.NewCutoverPeerRoster(
+		ctx,
+		blockCounter,
+		1500,
+		&clientinfo.NoOpPerformanceMetrics{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return roster
+}
+
+// TestNode_SetCutoverPeerRoster_PropagatesToExistingSigningExecutor verifies
+// that installing the cutover peer roster reaches a signing executor that was
+// already created before the roster was installed. This guards the
+// initialization-ordering window in which a coordination round could create a
+// signing executor before the roster is wired: without propagation such an
+// executor would silently never record legacy-peer sightings.
+func TestNode_SetCutoverPeerRoster_PropagatesToExistingSigningExecutor(t *testing.T) {
+	n, signer, lc := setupNodeForClosureTests(t)
+
+	// Create the signing executor BEFORE the roster is installed, simulating an
+	// early coordination round that produced a signing executor.
+	executor, ok, err := n.getSigningExecutor(signer.wallet.publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("node is supposed to control wallet signers")
+	}
+	if executor.cutoverPeerRoster != nil {
+		t.Fatal("signing executor unexpectedly carries a roster before install")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	roster := newTestCutoverRoster(t, ctx, lc)
+	defer roster.Close()
+
+	n.setCutoverPeerRoster(roster)
+
+	if executor.cutoverPeerRoster != roster {
+		t.Error("pre-existing signing executor did not receive the roster")
+	}
+	if n.dkgExecutor.cutoverPeerRoster != roster {
+		t.Error("DKG executor did not receive the roster")
+	}
+}
+
+// TestNode_SetCutoverPeerRoster_ConcurrentInstall exercises concurrent roster
+// installation and signing-executor creation under -race. Both paths take
+// signingExecutorsMutex, so the field write and the executor cache read/write
+// are serialized; regardless of ordering the resulting executor must carry the
+// roster (created after install reads it from the node; created before install
+// is reached by the propagation loop).
+func TestNode_SetCutoverPeerRoster_ConcurrentInstall(t *testing.T) {
+	n, signer, lc := setupNodeForClosureTests(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	roster := newTestCutoverRoster(t, ctx, lc)
+	defer roster.Close()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		n.setCutoverPeerRoster(roster)
+	}()
+	go func() {
+		defer wg.Done()
+		_, _, _ = n.getSigningExecutor(signer.wallet.publicKey)
+	}()
+	wg.Wait()
+
+	executor, ok, err := n.getSigningExecutor(signer.wallet.publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("node is supposed to control wallet signers")
+	}
+	if executor.cutoverPeerRoster != roster {
+		t.Error(
+			"signing executor did not receive the roster after concurrent install",
+		)
+	}
 }
 
 // TestArchiveClosedWallets_ArchivesClosedWallet verifies that a wallet whose

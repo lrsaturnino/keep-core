@@ -59,4 +59,10 @@ services:
 networks:
   smoke:
     driver: bridge
+    # `internal: true` is the strictest isolation (no host publication AND no
+    # external egress) and proves 9601 is reachable only container-to-container.
+    # It requires the node's Ethereum/Electrum backends to also sit on this
+    # network; if you point the node at an EXTERNAL chain endpoint, drop this
+    # line (the runnable clientinfo-port-smoke.sh uses a plain bridge for exactly
+    # this reason) — 9601 still stays private because no `ports:` is published.
     internal: true

@@ -248,12 +248,24 @@ func (n *node) setPerformanceMetrics(metrics interface {
 }
 
 // setCutoverPeerRoster sets the node-local cutover peer roster and propagates it
-// into the components that observe announcer session-ID mismatches. Signing
-// executors are created lazily and read the roster from the node at creation
-// time, so this only needs to wire the already-created DKG executor.
+// into the components that observe announcer session-ID mismatches. It is called
+// once during initialization, before the coordination layer starts, so in
+// practice no signing executor exists yet; the propagation loop is a defensive
+// safeguard for any executor created by an early coordination round.
+//
+// The field write is guarded by signingExecutorsMutex because getSigningExecutor
+// reads n.cutoverPeerRoster under the same lock when wiring a freshly created
+// executor; without this the read/write pair would be an unsynchronized race.
 func (n *node) setCutoverPeerRoster(roster *participation.CutoverPeerRoster) {
+	n.signingExecutorsMutex.Lock()
 	n.cutoverPeerRoster = roster
+	for _, executor := range n.signingExecutors {
+		executor.setCutoverPeerRoster(roster)
+	}
+	n.signingExecutorsMutex.Unlock()
 
+	// The DKG executor is created once in newNode and never mutated
+	// concurrently, so it is wired directly.
 	if n.dkgExecutor != nil {
 		n.dkgExecutor.setCutoverPeerRoster(roster)
 	}

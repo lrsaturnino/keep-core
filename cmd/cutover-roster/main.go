@@ -21,6 +21,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -204,7 +206,7 @@ func collectOnce(
 		logger.Errorf("cannot load sightings: %v", err)
 	}
 
-	currentBlock := readCurrentBlock(ctx, opts.ethereumRPC)
+	currentBlock := readCurrentBlock(ctx, opts.ethereumRPC, opts.chainID)
 
 	if _, err := collector.Collect(inventory, reports, sightings, currentBlock); err != nil {
 		logger.Errorf("collection cycle failed: %v", err)
@@ -323,45 +325,106 @@ func fetchReport(
 	return report, nil
 }
 
-// readCurrentBlock reads the current block height via a single eth_blockNumber
-// JSON-RPC call. It returns 0 when no RPC URL is configured or on any error;
-// the collector treats the block as metadata only.
-func readCurrentBlock(ctx context.Context, rpcURL string) uint64 {
+// readCurrentBlock reads the current block height via eth_blockNumber. When a
+// chain ID is configured it first verifies, via eth_chainId, that the RPC
+// endpoint actually serves the expected chain. It returns 0 when no RPC URL is
+// configured, on any error, or on a chain-ID mismatch — a block height read from
+// the wrong chain must never be allowed to certify readiness.
+func readCurrentBlock(ctx context.Context, rpcURL, expectedChainID string) uint64 {
 	if rpcURL == "" {
 		return 0
 	}
 
-	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}`)
+	if expectedChainID != "" {
+		actual, err := ethRPCResult(ctx, rpcURL, "eth_chainId")
+		if err != nil {
+			logger.Errorf("cannot verify chain ID via RPC: %v", err)
+			return 0
+		}
+		if !chainIDMatches(expectedChainID, actual) {
+			logger.Errorf(
+				"configured chain ID %q does not match RPC eth_chainId %q; "+
+					"refusing to use a block height from the wrong chain",
+				expectedChainID, actual,
+			)
+			return 0
+		}
+	}
+
+	result, err := ethRPCResult(ctx, rpcURL, "eth_blockNumber")
+	if err != nil {
+		logger.Debugf("cannot read current block: %v", err)
+		return 0
+	}
+	block, err := parseHexUint64(result)
+	if err != nil {
+		logger.Debugf("cannot parse block number %q: %v", result, err)
+		return 0
+	}
+	return block
+}
+
+// ethRPCResult performs a single parameter-less JSON-RPC call and returns the
+// string "result" field, surfacing any transport, HTTP, or JSON-RPC error.
+func ethRPCResult(ctx context.Context, rpcURL, method string) (string, error) {
+	body := []byte(fmt.Sprintf(
+		`{"jsonrpc":"2.0","id":1,"method":%q,"params":[]}`, method,
+	))
 	// #nosec G107 -- the RPC URL is operator-supplied configuration.
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rpcURL, bytes.NewReader(body))
 	if err != nil {
-		logger.Debugf("cannot build block-number request: %v", err)
-		return 0
+		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		logger.Debugf("cannot read current block: %v", err)
-		return 0
+		return "", err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	var rpcResponse struct {
-		Result string `json:"result"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&rpcResponse); err != nil {
-		logger.Debugf("cannot decode block-number response: %v", err)
-		return 0
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("unexpected status %d", resp.StatusCode)
 	}
 
-	block, err := parseHexUint64(rpcResponse.Result)
-	if err != nil {
-		logger.Debugf("cannot parse block number %q: %v", rpcResponse.Result, err)
-		return 0
+	var rpcResponse struct {
+		Result string `json:"result"`
+		Error  *struct {
+			Message string `json:"message"`
+		} `json:"error"`
 	}
-	return block
+	if err := json.NewDecoder(resp.Body).Decode(&rpcResponse); err != nil {
+		return "", err
+	}
+	if rpcResponse.Error != nil {
+		return "", fmt.Errorf("rpc error: %s", rpcResponse.Error.Message)
+	}
+	return rpcResponse.Result, nil
+}
+
+// chainIDMatches reports whether the configured chain ID (decimal or 0x-hex)
+// numerically equals the RPC-returned eth_chainId (hex).
+func chainIDMatches(configured, rpcHex string) bool {
+	rpcVal, err := parseHexUint64(rpcHex)
+	if err != nil {
+		return false
+	}
+	cfgVal, err := parseUint64Flexible(configured)
+	if err != nil {
+		return false
+	}
+	return cfgVal == rpcVal
+}
+
+// parseUint64Flexible parses an unsigned integer that may be decimal or
+// 0x-prefixed hexadecimal.
+func parseUint64Flexible(s string) (uint64, error) {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
+		return strconv.ParseUint(s[2:], 16, 64)
+	}
+	return strconv.ParseUint(s, 10, 64)
 }
 
 func parseHexUint64(s string) (uint64, error) {

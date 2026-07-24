@@ -53,6 +53,11 @@ IMAGE="${IMAGE:-keep-client:candidate}"
 NETWORK="cutover-port-smoke-net"
 PROBE_IMAGE="curlimages/curl:8.10.1"
 READY_TIMEOUT="${READY_TIMEOUT:-180}"
+# The endpoint answering is the definitive readiness signal, so the positive
+# probe retries with a bounded backoff instead of assuming the listener is up
+# the instant a log line appears (which would race listener initialization).
+PROBE_RETRIES="${PROBE_RETRIES:-20}"
+PROBE_INTERVAL="${PROBE_INTERVAL:-3}"
 CUSTOM_PORT="${CUSTOM_PORT:-9137}"
 
 WORKDIR=""
@@ -161,10 +166,22 @@ wait_ready() {
 # assert_listens <container> <port> — probe /metrics and /diagnostics from a
 # sibling on the private network and require meaningful content on both.
 assert_listens() {
-  local container="$1" port="$2" body diag metric substr
-  body="$(docker run --rm --network "${NETWORK}" "${PROBE_IMAGE}" \
-    -fsS --max-time 10 "http://${container}:${port}/metrics")" \
-    || fail "case ${container}: expected a listener on ${port}, got none"
+  local container="$1" port="$2" body diag metric substr attempt=0
+  # Retry the /metrics probe with a bounded backoff: wait_ready only proves the
+  # process is up, so the listener may bind a moment later. The endpoint
+  # answering is the real readiness signal.
+  while :; do
+    if body="$(docker run --rm --network "${NETWORK}" "${PROBE_IMAGE}" \
+        -fsS --max-time 10 "http://${container}:${port}/metrics")"; then
+      break
+    fi
+    attempt=$(( attempt + 1 ))
+    if (( attempt >= PROBE_RETRIES )); then
+      docker logs "${container}" 2>&1 | tail -40 >&2
+      fail "case ${container}: expected a listener on ${port}, got none after ${attempt} attempts"
+    fi
+    sleep "${PROBE_INTERVAL}"
+  done
   for metric in "${REQUIRED_METRICS[@]}"; do
     grep -q "${metric}" <<<"${body}" \
       || fail "case ${container}: /metrics missing required metric ${metric}"

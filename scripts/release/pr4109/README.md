@@ -48,10 +48,15 @@ IMAGE=keep-client:candidate ETH_RPC=... KEY_FILE=... KEY_PASSWORD=... \
   ./clientinfo-port-smoke.sh listener-matrix
 ```
 
-The harness runs each case as a node container on an **internal** Docker network
-and probes the client-info port from a sibling `curl` container — never via a
-published host port. `compose.yaml` shows the same private-network topology for
-the compatibility-default case.
+The harness runs each case as a node container on a **private user-defined
+bridge network** and probes the client-info port from a sibling `curl` container
+— never via a published host port. The network is not made Docker `--internal`
+because the node must still reach its Ethereum/Electrum backends to start; the
+security property this harness proves is container-to-container reachability with
+**no host publication of 9601**. Proving that raw `9601`/`/diagnostics` are
+unreachable from a genuinely untrusted external network is a separate manual /
+ops follow-up (see the matrix above). `compose.yaml` shows the same
+private-network topology for the compatibility-default case.
 
 ## Guardrails
 

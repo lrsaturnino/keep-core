@@ -163,7 +163,7 @@ monitoring updates.
 
 | ID | Change | Operator action |
 |----|--------|-----------------|
-| **OV-1** | Metrics/diagnostics **temporary compatibility default**: `clientInfo.port` stays `9601` for this coordinated release (HTTP server on) so revision/epoch/mode and stranded-peer evidence stay visible through the cutover; explicit `clientInfo.port = 0` disables it. The follow-up R2 release flips the default back to `0` after the monitoring migration. | Commit an explicit `clientInfo.port` value now, expose it only over a trusted path, and migrate scrape targets before R2 |
+| **OV-1** | Metrics/diagnostics **temporary compatibility default**: `clientInfo.port` stays `9601` for this coordinated release (HTTP server on) so a node's exact revision and stranded-peer evidence stay visible through the cutover; explicit `clientInfo.port = 0` disables it. The follow-up R2 release flips the default back to `0` after the monitoring migration. | Commit an explicit `clientInfo.port` value now, expose it only over a trusted path, and migrate scrape targets before R2 |
 | **OV-2** | Metric rename: `connected_bootstrap_count` → `connected_wellknown_peers_count` | Update Grafana/Prometheus dashboards and alerts |
 | **OV-3** | `--network.bootstrap=true` deprecated (warning only) | Remove from config when convenient |
 
@@ -215,8 +215,8 @@ identify who has not converged:
 
 - **Client-info compatibility (Part B).** The `clientInfo.port` default is
   retained at `9601` for the release window (see OV-1). This keeps the
-  unauthenticated metrics/diagnostics channel — the primary source of exact
-  revision/epoch and stranded-peer evidence — alive through the cutover.
+  unauthenticated metrics/diagnostics channel — the primary source of a node's
+  exact revision and stranded-peer evidence — alive through the cutover.
   Expose it only over a trusted path. R2 flips the default back to `0` after the
   monitoring migration is complete.
 - **Stranded/legacy-peer observability.** An announcer session-ID mismatch

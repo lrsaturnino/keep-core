@@ -165,13 +165,6 @@ func Initialize(
 		return fmt.Errorf("cannot set up TBTC node: [%v]", err)
 	}
 
-	err = node.runCoordinationLayer(ctx)
-	if err != nil {
-		return fmt.Errorf("cannot run coordination layer: [%w]", err)
-	}
-
-	deduplicator := newDeduplicator()
-
 	// Construct one node-local cutover peer roster unconditionally, beside the
 	// (future) participation gate — including when client-info is disabled
 	// (port 0). It deduplicates post-cutover legacy peer sightings observed by
@@ -180,6 +173,10 @@ func Initialize(
 	// through the same performance registry that backs /metrics; with
 	// client-info disabled it records to a no-op sink so its logs and state
 	// still function.
+	//
+	// The roster is constructed and installed BEFORE the coordination layer
+	// starts, so a signing executor created by an early coordination round
+	// already carries it and no legacy sighting is missed.
 	var rosterMetrics participation.CutoverRosterMetricsRecorder
 	if clientInfo != nil {
 		if perfMetrics == nil {
@@ -207,6 +204,22 @@ func Initialize(
 		return fmt.Errorf("cannot create cutover peer roster: [%v]", err)
 	}
 	node.setCutoverPeerRoster(cutoverRoster)
+
+	// Join the roster's background sweep loop to the process lifecycle. The
+	// sweep loop is already bound to ctx, but Close performs an explicit
+	// stop-and-join so the goroutine is reclaimed deterministically on
+	// shutdown.
+	go func() {
+		<-ctx.Done()
+		cutoverRoster.Close()
+	}()
+
+	err = node.runCoordinationLayer(ctx)
+	if err != nil {
+		return fmt.Errorf("cannot run coordination layer: [%w]", err)
+	}
+
+	deduplicator := newDeduplicator()
 
 	if clientInfo != nil {
 		// only if client info endpoint is configured

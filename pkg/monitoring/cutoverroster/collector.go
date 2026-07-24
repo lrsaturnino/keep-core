@@ -98,6 +98,12 @@ func newCollectorWithClock(
 	if config.SuccessThreshold == 0 {
 		return nil, fmt.Errorf("success threshold must be non-zero")
 	}
+	// A nonpositive collection interval would panic time.NewTicker in the
+	// command's collection loop; reject it at construction so the invariant is
+	// enforced regardless of the consumer.
+	if config.CollectionInterval <= 0 {
+		return nil, fmt.Errorf("collection interval must be positive")
+	}
 
 	operators, err := store.LoadOperators()
 	if err != nil {
@@ -136,6 +142,11 @@ func (c *Collector) Collect(
 
 	eligibleByOperator := map[string][]InventoryInstance{}
 	stakingProviderByOperator := map[string]string{}
+	// seenInstanceIDs records which instances were present and eligible in the
+	// current inventory, so the reconciliation step can detect instances that
+	// have disappeared from service discovery since an earlier cycle.
+	seenInstanceIDs := map[string]bool{}
+	totalInstances := len(inventory)
 	unreconciled := 0
 	stale := 0
 	reconciledEligible := 0
@@ -148,6 +159,7 @@ func (c *Collector) Collect(
 			continue
 		}
 		reconciledEligible++
+		seenInstanceIDs[inv.InstanceID] = true
 		eligibleByOperator[inv.OperatorAddress] = append(
 			eligibleByOperator[inv.OperatorAddress], inv,
 		)
@@ -194,6 +206,10 @@ func (c *Collector) Collect(
 				reported, unreconciledFault = false, true
 			case report.AttestedAt.IsZero():
 				// Missing attestation time cannot prove freshness.
+				reported, unreconciledFault = false, true
+			case report.AttestedAt.After(now):
+				// A future attestation time is invalid evidence; accepting it
+				// would also poison the monotonic freshness guard below.
 				reported, unreconciledFault = false, true
 			case report.ReporterRevision == 0:
 				// Missing reporter revision.
@@ -251,7 +267,13 @@ func (c *Collector) Collect(
 		if sighting.Block > op.LastLegacyBlock {
 			op.LastLegacyBlock = sighting.Block
 		}
-		if sighting.ObservedAt.After(op.LastLegacyAt) {
+		// Advance the last-legacy timestamp only from a non-zero, non-future
+		// observation. The block bound above is the primary validity gate; a
+		// zero or future ObservedAt must not push LastLegacyAt (which would make
+		// resolution impossible) but does not invalidate the block evidence.
+		if !sighting.ObservedAt.IsZero() &&
+			!sighting.ObservedAt.After(now) &&
+			sighting.ObservedAt.After(op.LastLegacyAt) {
 			op.LastLegacyAt = sighting.ObservedAt
 		}
 	}
@@ -266,13 +288,26 @@ func (c *Collector) Collect(
 		toReconcile[op] = true
 	}
 
+	// Group every known instance record by operator so instances that were
+	// present in an earlier cycle but have since disappeared from the current
+	// inventory are still reconciled rather than silently dropped.
+	instancesByOperator := map[string][]*instanceRecord{}
+	for _, inst := range c.instances {
+		instancesByOperator[inst.OperatorAddress] = append(
+			instancesByOperator[inst.OperatorAddress], inst,
+		)
+	}
+
 	for operatorAddress := range toReconcile {
 		op := c.operatorForAddress(operatorAddress, stakingProviderByOperator)
 		if provider, ok := stakingProviderByOperator[operatorAddress]; ok {
 			op.StakingProvider = provider
 		}
 
-		instanceRecords := c.eligibleInstanceRecords(eligibleByOperator[operatorAddress])
+		instanceRecords := c.reconcileDisappearedInstances(
+			instancesByOperator[operatorAddress],
+			seenInstanceIDs,
+		)
 
 		previousStatus := op.Status
 		status, reason := c.reconcileOperatorStatus(
@@ -321,6 +356,23 @@ func (c *Collector) Collect(
 	snapshot.Complete = c.isComplete(
 		snapshot, reconciledEligible, stale, unreconciled, currentBlock,
 	)
+
+	// Guarantee that an incomplete readiness determination always surfaces as a
+	// nonzero blocking/stale/unreconciled signal, so the CutoverRosterIncomplete
+	// alert fires even when readiness cannot be established at all — an empty
+	// inventory, unset expected identity, a zero cutover block, or a stale chain
+	// clock would otherwise leave every watched gauge at zero and hide the fault.
+	if !snapshot.Complete &&
+		len(snapshot.Blocking) == 0 && stale == 0 && unreconciled == 0 {
+		unreconciled = 1
+	}
+
+	snapshot.Inventory = FleetInventoryCounts{
+		TotalInstances:    totalInstances,
+		EligibleInstances: reconciledEligible,
+		ReportersStale:    stale,
+		Unreconciled:      unreconciled,
+	}
 	c.lastSnapshot = snapshot
 
 	c.updateMetrics(snapshot, stale, unreconciled)
@@ -343,6 +395,11 @@ func (c *Collector) isComplete(
 		return false
 	}
 	if currentBlock == 0 {
+		return false
+	}
+	// A zero cutover block is placeholder metadata: readiness cannot be
+	// certified for a go/no-go until a real cutover block C is supplied.
+	if c.config.CutoverBlock == 0 {
 		return false
 	}
 	if c.config.ExpectedRevision == "" ||
@@ -499,14 +556,26 @@ func (c *Collector) operatorForAddress(
 	return record
 }
 
-func (c *Collector) eligibleInstanceRecords(
-	inventory []InventoryInstance,
+// reconcileDisappearedInstances returns every known instance record for an
+// operator, applying a missed-collection update to any instance absent from the
+// current inventory (disappeared from service discovery). A disappeared instance
+// loses its exact-confirmation streak and is re-checked for verified quarantine
+// using its last-known evidence reference, so removal never silently resolves
+// central state: the operator stays blocking until the instance either reappears
+// with fresh exact reports or is independently quarantined.
+func (c *Collector) reconcileDisappearedInstances(
+	records []*instanceRecord,
+	seenInstanceIDs map[string]bool,
 ) []*instanceRecord {
-	records := make([]*instanceRecord, 0, len(inventory))
-	for _, inv := range inventory {
-		if record, ok := c.instances[inv.InstanceID]; ok {
-			records = append(records, record)
+	for _, inst := range records {
+		if seenInstanceIDs[inst.InstanceID] {
+			continue
 		}
+		inst.ConsecutiveMissed++
+		inst.ConsecutiveExact = 0
+		inst.HasQuarantine = inst.QuarantineRef != "" &&
+			c.verifier != nil &&
+			c.verifier.Verify(inst.InstanceID, inst.OperatorAddress, inst.QuarantineRef)
 	}
 	return records
 }
@@ -570,35 +639,98 @@ func (c *Collector) buildSnapshot(now time.Time, currentBlock uint64) FleetSnaps
 }
 
 func (c *Collector) operatorEntry(op *operatorRecord) FleetOperatorEntry {
-	var instances []InstanceReport
+	var records []*instanceRecord
 	for _, inst := range c.instances {
-		if inst.OperatorAddress != op.OperatorAddress {
-			continue
+		if inst.OperatorAddress == op.OperatorAddress {
+			records = append(records, inst)
 		}
-		if inst.LatestReport != nil {
-			instances = append(instances, *inst.LatestReport)
-			continue
-		}
-		// Offline / never-reported authoritative instance: surface its identity
-		// so the audit trail lists every instance the operator owns, not only
-		// those that produced a report this window.
-		instances = append(instances, InstanceReport{
-			InstanceID:      inst.InstanceID,
-			OperatorAddress: inst.OperatorAddress,
-		})
 	}
-	sort.Slice(instances, func(i, j int) bool {
-		return instances[i].InstanceID < instances[j].InstanceID
+	sort.Slice(records, func(i, j int) bool {
+		return records[i].InstanceID < records[j].InstanceID
 	})
 
+	instances := make([]InstanceReport, 0, len(records))
+	statuses := make([]FleetInstanceStatus, 0, len(records))
+	for _, inst := range records {
+		if inst.LatestReport != nil {
+			instances = append(instances, *inst.LatestReport)
+		} else {
+			// Offline / never-reported authoritative instance: surface its
+			// identity so the audit trail lists every instance the operator
+			// owns, not only those that produced a report this window.
+			instances = append(instances, InstanceReport{
+				InstanceID:      inst.InstanceID,
+				OperatorAddress: inst.OperatorAddress,
+			})
+		}
+		statuses = append(statuses, c.instanceStatus(inst))
+	}
+
 	return FleetOperatorEntry{
-		OperatorAddress: op.OperatorAddress,
-		StakingProvider: op.StakingProvider,
-		Status:          op.Status,
-		Instances:       instances,
-		FirstSeenBlock:  op.FirstSeenBlock,
-		LastSeenBlock:   op.LastSeenBlock,
-		Reason:          op.Reason,
+		OperatorAddress:  op.OperatorAddress,
+		StakingProvider:  op.StakingProvider,
+		Status:           op.Status,
+		Instances:        instances,
+		InstanceStatuses: statuses,
+		FirstSeenBlock:   op.FirstSeenBlock,
+		LastSeenBlock:    op.LastSeenBlock,
+		Reason:           op.Reason,
+	}
+}
+
+// instanceStatus builds the per-instance reconciliation detail for the snapshot,
+// pairing the instance's observed identity with its reconciliation class and a
+// short human-readable reason.
+func (c *Collector) instanceStatus(inst *instanceRecord) FleetInstanceStatus {
+	class := c.classifyInstance(inst)
+	status := FleetInstanceStatus{
+		InstanceID:        inst.InstanceID,
+		OperatorAddress:   inst.OperatorAddress,
+		Class:             instanceClassString(class),
+		Reason:            c.instanceReason(inst, class),
+		Reported:          inst.LatestReport != nil,
+		ConsecutiveExact:  inst.ConsecutiveExact,
+		ConsecutiveMissed: inst.ConsecutiveMissed,
+		Quarantined:       inst.HasQuarantine,
+		QuarantineRef:     inst.QuarantineRef,
+	}
+	if inst.LatestReport != nil {
+		status.ObservedRevision = inst.LatestReport.Revision
+		status.ObservedEpoch = inst.LatestReport.Epoch
+		status.ObservedDigest = inst.LatestReport.ImageDigest
+		status.AttestedAt = inst.LatestReport.AttestedAt
+	}
+	return status
+}
+
+func instanceClassString(class instanceClass) string {
+	switch class {
+	case classExactConfirmed:
+		return "exact_confirmed"
+	case classNonCutoverRevision:
+		return "noncutover_revision"
+	default:
+		return "offline_unknown"
+	}
+}
+
+func (c *Collector) instanceReason(inst *instanceRecord, class instanceClass) string {
+	if inst.HasQuarantine {
+		return "independently verified quarantine/removal"
+	}
+	switch class {
+	case classExactConfirmed:
+		return "exact cutover release confirmed"
+	case classNonCutoverRevision:
+		return "reporting a non-cutover revision/epoch/digest"
+	default:
+		if inst.LatestReport == nil {
+			return "no accepted report"
+		}
+		if inst.ConsecutiveMissed >= c.config.MissedThreshold {
+			return "missed consecutive collections"
+		}
+		return "awaiting consecutive exact confirmations"
 	}
 }
 
@@ -676,6 +808,15 @@ func (c *Collector) logCycle(snapshot FleetSnapshot) {
 	)
 
 	for _, op := range snapshot.Blocking {
+		// reporters is the number of instances that produced an accepted report,
+		// which is distinct from the total instance count (the latter includes
+		// offline/never-reported and disappeared authoritative instances).
+		reporters := 0
+		for _, st := range op.InstanceStatuses {
+			if st.Reported {
+				reporters++
+			}
+		}
 		logger.Infof(
 			"cutover operator unresolved [operator=%s] [stakingProvider=%s] "+
 				"[status=%s] [firstSeenBlock=%d] [lastSeenBlock=%d] "+
@@ -685,7 +826,7 @@ func (c *Collector) logCycle(snapshot FleetSnapshot) {
 			op.Status,
 			op.FirstSeenBlock,
 			op.LastSeenBlock,
-			len(op.Instances),
+			reporters,
 			len(op.Instances),
 		)
 	}

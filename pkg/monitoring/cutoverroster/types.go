@@ -115,15 +115,53 @@ type LegacySighting struct {
 	ObservedAt      time.Time `json:"observed_at"`
 }
 
+// FleetInstanceStatus is the per-instance reconciliation detail exposed in a
+// snapshot for the dashboard's instance-level reasons and the audit trail. It
+// pairs each authoritative instance's observed identity with the expected
+// release identity, its reconciliation class/reason, and any independently
+// verified quarantine evidence, so a reader can see exactly why an operator is
+// blocking without joining separate inputs.
+type FleetInstanceStatus struct {
+	InstanceID        string    `json:"instance_id"`
+	OperatorAddress   string    `json:"operator_address"`
+	Class             string    `json:"class"`
+	Reason            string    `json:"reason"`
+	Reported          bool      `json:"reported"`
+	ObservedRevision  string    `json:"observed_revision,omitempty"`
+	ObservedEpoch     string    `json:"observed_epoch,omitempty"`
+	ObservedDigest    string    `json:"observed_image_digest,omitempty"`
+	AttestedAt        time.Time `json:"attested_at,omitempty"`
+	ConsecutiveExact  uint      `json:"consecutive_exact"`
+	ConsecutiveMissed uint      `json:"consecutive_missed"`
+	Quarantined       bool      `json:"quarantined"`
+	QuarantineRef     string    `json:"quarantine_ref,omitempty"`
+}
+
 // FleetOperatorEntry is the reconciled per-operator entry exposed in a snapshot.
+// Instances carries the raw attested reports (as specified); InstanceStatuses
+// adds the per-instance reconciliation detail (class, reason, expected-vs-
+// observed identity, and quarantine evidence) required for the dashboard's
+// instance-level reasons and the audit record.
 type FleetOperatorEntry struct {
-	OperatorAddress string           `json:"operator_address"`
-	StakingProvider string           `json:"staking_provider"`
-	Status          FleetStatus      `json:"status"`
-	Instances       []InstanceReport `json:"instances"`
-	FirstSeenBlock  uint64           `json:"first_seen_block"`
-	LastSeenBlock   uint64           `json:"last_seen_block"`
-	Reason          string           `json:"reason"`
+	OperatorAddress  string                `json:"operator_address"`
+	StakingProvider  string                `json:"staking_provider"`
+	Status           FleetStatus           `json:"status"`
+	Instances        []InstanceReport      `json:"instances"`
+	InstanceStatuses []FleetInstanceStatus `json:"instance_statuses"`
+	FirstSeenBlock   uint64                `json:"first_seen_block"`
+	LastSeenBlock    uint64                `json:"last_seen_block"`
+	Reason           string                `json:"reason"`
+}
+
+// FleetInventoryCounts summarizes the authoritative inventory reconciled this
+// cycle: how many instances were supplied in total, how many were ceremony
+// eligible, how many eligible instances lacked a fresh accepted report, and how
+// many identity/target/inventory reconciliation faults were seen.
+type FleetInventoryCounts struct {
+	TotalInstances    int `json:"total_instances"`
+	EligibleInstances int `json:"eligible_instances"`
+	ReportersStale    int `json:"reporters_stale"`
+	Unreconciled      int `json:"unreconciled"`
 }
 
 // FleetSnapshot is the deterministic authoritative fleet view.
@@ -136,6 +174,7 @@ type FleetSnapshot struct {
 	ExpectedRevision string               `json:"expected_revision"`
 	ExpectedEpoch    string               `json:"expected_epoch"`
 	ExpectedDigest   string               `json:"expected_image_digest"`
+	Inventory        FleetInventoryCounts `json:"inventory"`
 	Blocking         []FleetOperatorEntry `json:"blocking"`
 	Quarantined      []FleetOperatorEntry `json:"quarantined"`
 	RecentlyResolved []FleetOperatorEntry `json:"recently_resolved"`
