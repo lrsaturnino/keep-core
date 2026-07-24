@@ -50,4 +50,13 @@ contract RandomBeaconStub is RandomBeacon {
     function dkgLockState() external {
         dkg.lockState();
     }
+
+    /// @dev Test-only setter for the relay entry submission gas offset. Lets
+    ///      tests run a negative control at the pre-fix offset (11,250) to prove
+    ///      the reimbursement assertions are sensitive to the 2,200-gas
+    ///      adjustment made by the fix (13,450). Not gated by governance on
+    ///      purpose; this contract is only deployed in tests.
+    function setRelayEntrySubmissionGasOffset(uint256 offset) external {
+        _relayEntrySubmissionGasOffset = offset;
+    }
 }

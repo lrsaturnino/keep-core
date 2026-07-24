@@ -336,6 +336,33 @@ func TestMetricsInitialization(t *testing.T) {
 		}
 	}
 
+	// The SPV maintainer redemption-proof counters must be registered at zero
+	// and increment through IncrementCounter, so the maintainer's proof path is
+	// scrapeable at performance_redemption_proof_submissions_*.
+	redemptionProofCounters := []string{
+		MetricRedemptionProofSubmissionsTotal,
+		MetricRedemptionProofSubmissionsSuccessTotal,
+		MetricRedemptionProofSubmissionsFailedTotal,
+	}
+
+	for _, counterName := range redemptionProofCounters {
+		if value := pm.GetCounterValue(counterName); value != 0 {
+			t.Errorf(
+				"Counter %s should start at 0, got %v",
+				counterName,
+				value,
+			)
+		}
+		pm.IncrementCounter(counterName, 1)
+		if value := pm.GetCounterValue(counterName); value != 1 {
+			t.Errorf(
+				"Counter %s should be 1 after increment, got %v",
+				counterName,
+				value,
+			)
+		}
+	}
+
 	// Test gauges
 	gauges := []string{
 		MetricCPUUtilization,

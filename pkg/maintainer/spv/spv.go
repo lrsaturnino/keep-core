@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"math/big"
+	"runtime/debug"
 	"sync"
 	"time"
+
+	"github.com/btcsuite/btcd/blockchain"
 
 	"github.com/keep-network/keep-core/pkg/tbtc"
 
@@ -20,17 +22,13 @@ import (
 
 var logger = log.Logger("keep-maintainer-spv")
 
-// The maximum number of block headers allowed in a single SPV proof. Bounds
-// the forward walk over headers when computing required confirmations
-// (relevant on testnet4 where long runs of minimum-difficulty blocks occur).
-const maxProofHeaders = 144
-
-// errProofHeaderCapExceeded is returned when the forward header walk reaches
-// maxProofHeaders without accumulating enough difficulty. The transaction
-// cannot be proven and will not become provable without a reorg.
-var errProofHeaderCapExceeded = errors.New(
-	"SPV proof header cap exceeded without sufficient difficulty",
-)
+// minDifficultyTarget is the decoded Bitcoin minimum-difficulty (DIFF1) target.
+// It matches the Bridge's minimum-difficulty target (BTCUtils.DIFF1_TARGET)
+// used by BitcoinTx.determineRequestedDifficulty. Decoded targets, not integer
+// difficulties, must be compared: multiple compact-bits encodings round to
+// integer difficulty 1 while decoding to different targets, so only a header
+// whose decoded target equals this exact value is a skippable DIFF1 header.
+var minDifficultyTarget = blockchain.CompactToBig(0x1d00ffff)
 
 func Initialize(
 	ctx context.Context,
@@ -109,6 +107,19 @@ type spvMaintainer struct {
 }
 
 func (sm *spvMaintainer) startControlLoop(ctx context.Context) {
+	sm.runControlLoop(ctx, sm.maintainSpv)
+}
+
+// runControlLoop repeatedly runs the given maintainer iteration, backing off by
+// RestartBackoffTime between runs and exiting when the context is cancelled.
+// Each iteration runs under runMaintainSpv's panic-recovery boundary, so a
+// panic in one iteration is logged and converted into a restart rather than
+// crashing the dedicated maintainer process. The iteration function is a
+// parameter so the loop's restart behavior can be exercised in tests.
+func (sm *spvMaintainer) runControlLoop(
+	ctx context.Context,
+	iteration func(context.Context) error,
+) {
 	logger.Info("starting SPV maintainer")
 
 	defer func() {
@@ -116,7 +127,7 @@ func (sm *spvMaintainer) startControlLoop(ctx context.Context) {
 	}()
 
 	for {
-		err := sm.maintainSpv(ctx)
+		err := sm.runMaintainSpv(ctx, iteration)
 		if err != nil {
 			logger.Errorf(
 				"error while maintaining SPV: [%v]; restarting maintainer",
@@ -132,14 +143,51 @@ func (sm *spvMaintainer) startControlLoop(ctx context.Context) {
 	}
 }
 
+// runMaintainSpv runs a single maintainer iteration under a panic-recovery
+// boundary. A panic inside the iteration is recovered, its value and a full Go
+// stack trace are logged at error level, and it is converted into a non-nil
+// error so the caller can follow the ordinary error/restart path instead of
+// letting the panic terminate the dedicated maintainer process (which also runs
+// the co-resident Bitcoin-difficulty maintainer). This is residual containment
+// only; it does not replace the source-level bounds checks in the SPV
+// maintainer. Go runtime fatal errors are not recoverable and are intentionally
+// not handled here. The error return is named so the deferred recovery can set
+// it.
+func (sm *spvMaintainer) runMaintainSpv(
+	ctx context.Context,
+	iteration func(context.Context) error,
+) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Errorf(
+				"recovered from panic in SPV maintainer: [%v]\n%s",
+				r,
+				debug.Stack(),
+			)
+			err = fmt.Errorf("recovered from SPV maintainer panic: [%v]", r)
+		}
+	}()
+
+	return iteration(ctx)
+}
+
 func (sm *spvMaintainer) maintainSpv(ctx context.Context) error {
 	for {
+		// Create one header cache per proof-task pass. Transactions with
+		// overlapping proof windows - across all proof types processed in this
+		// pass - reuse the same cached headers instead of repeatedly fetching
+		// them from the Bitcoin backend. The cache is discarded before the idle
+		// backoff and rebuilt on the next pass, so height-keyed entries never
+		// survive a reorg between passes.
+		headerCache := newBlockHeaderCache(sm.btcChain.GetBlockHeader)
+
 		for action, v := range proofTypes {
 			logger.Infof("starting [%s] proof task execution...", action)
 
 			if err := sm.proveTransactions(
 				v.unprovenTransactionsGetter,
 				v.transactionProofSubmitter,
+				headerCache,
 			); err != nil {
 				return fmt.Errorf(
 					"error while proving [%s] transactions: [%v]",
@@ -191,6 +239,7 @@ type transactionProofSubmitter func(
 func (sm *spvMaintainer) proveTransactions(
 	unprovenTransactionsGetter unprovenTransactionsGetter,
 	transactionProofSubmitter transactionProofSubmitter,
+	headerCache *blockHeaderCache,
 ) error {
 	transactions, err := unprovenTransactionsGetter(
 		sm.config.HistoryDepth,
@@ -218,25 +267,9 @@ func (sm *spvMaintainer) proveTransactions(
 			sm.btcChain,
 			sm.spvChain,
 			sm.btcDiffChain,
+			headerCache,
 		)
 		if err != nil {
-			if errors.Is(err, errProofHeaderCapExceeded) {
-				logger.Errorf(
-					"permanently skipped proving transaction [%s]; "+
-						"the SPV proof requires more than [%d] block headers "+
-						"without accumulating sufficient difficulty",
-					transactionHashStr,
-					maxProofHeaders,
-				)
-				if metricsRecorder := getMetricsRecorder(); metricsRecorder != nil {
-					metricsRecorder.IncrementCounter(
-						"spv_proof_permanent_skip_total",
-						1,
-					)
-				}
-				continue
-			}
-
 			return fmt.Errorf("failed to get proof info: [%v]", err)
 		}
 
@@ -328,15 +361,68 @@ func isInputCurrentWalletsMainUTXO(
 	return bytes.Equal(mainUtxoHash[:], wallet.MainUtxoHash[:]), nil
 }
 
+// blockHeaderCache memoizes successful GetBlockHeader lookups by Bitcoin block
+// height for the lifetime of a single maintainSpv proof-task pass. Transactions
+// with overlapping proof windows - possibly across different proof types in the
+// same pass - otherwise re-walk and re-fetch the same headers from the Bitcoin
+// backend. Only successful results are cached, so a transient backend failure
+// is retried on a later call or pass. The cache is created fresh each pass and
+// discarded before the idle backoff, which bounds memory and keeps height-keyed
+// entries from surviving a reorg between passes. Access is currently
+// single-threaded (proof types are processed sequentially); the mutex makes the
+// at-most-one-fetch-per-height guarantee hold if that is ever parallelized.
+type blockHeaderCache struct {
+	getter  func(blockHeight uint) (*bitcoin.BlockHeader, error)
+	mutex   sync.Mutex
+	headers map[uint]*bitcoin.BlockHeader
+}
+
+// newBlockHeaderCache returns a blockHeaderCache backed by the given header
+// getter, typically bitcoin.Chain.GetBlockHeader.
+func newBlockHeaderCache(
+	getter func(blockHeight uint) (*bitcoin.BlockHeader, error),
+) *blockHeaderCache {
+	return &blockHeaderCache{
+		getter:  getter,
+		headers: make(map[uint]*bitcoin.BlockHeader),
+	}
+}
+
+// getBlockHeader returns the header at the given height, fetching it from the
+// backend on the first request and serving the cached value afterwards. Errors
+// are not cached.
+func (c *blockHeaderCache) getBlockHeader(blockHeight uint) (
+	*bitcoin.BlockHeader,
+	error,
+) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	if header, exists := c.headers[blockHeight]; exists {
+		return header, nil
+	}
+
+	header, err := c.getter(blockHeight)
+	if err != nil {
+		return nil, err
+	}
+
+	c.headers[blockHeight] = header
+	return header, nil
+}
+
 // getProofInfo returns information about the SPV proof. It includes the
 // information whether the transaction proof range is within the previous and
 // current difficulty epochs as seen by the relay, the accumulated number of
-// confirmations and the required number of confirmations.
+// confirmations and the required number of confirmations. Block headers are
+// read through the provided pass-scoped headerCache; tip, confirmation, and
+// difficulty data come directly from the chains.
 func getProofInfo(
 	transactionHash bitcoin.Hash,
 	btcChain bitcoin.Chain,
 	spvChain Chain,
 	btcDiffChain btcdiff.Chain,
+	headerCache *blockHeaderCache,
 ) (
 	bool, uint, uint, error,
 ) {
@@ -397,15 +483,6 @@ func getProofInfo(
 	headerCount := uint(0)
 
 	for {
-		if headerCount >= maxProofHeaders {
-			// Reached maxProofHeaders without finding a decisive header or
-			// accumulating enough difficulty. The forward walk is anchored at
-			// the transaction's confirming block, so growing the chain does not
-			// move this window; absent a reorg the outcome is fixed and the
-			// transaction is skipped permanently, not merely deferred.
-			return false, 0, 0, errProofHeaderCapExceeded
-		}
-
 		blockHeight := proofStartBlock + uint64(headerCount)
 		if blockHeight > uint64(latestBlockHeight) {
 			// Not enough mined blocks yet to assemble the proof. Report the
@@ -414,12 +491,25 @@ func getProofInfo(
 			return true, accumulatedConfirmations, headerCount + 1, nil
 		}
 
-		header, err := btcChain.GetBlockHeader(uint(blockHeight))
+		header, err := headerCache.getBlockHeader(uint(blockHeight))
 		if err != nil {
 			return false, 0, 0, fmt.Errorf(
 				"failed to get block header at height [%v]: [%v]",
 				blockHeight,
 				err,
+			)
+		}
+
+		// Compare decoded targets, not integer difficulties, when identifying a
+		// minimum-difficulty header (see minDifficultyTarget). Reject a
+		// non-positive target before calling Difficulty(), which would divide by
+		// a zero target.
+		headerTarget := header.Target()
+		if headerTarget.Sign() <= 0 {
+			return false, 0, 0, fmt.Errorf(
+				"invalid target [%v] for block header at height [%v]",
+				headerTarget,
+				blockHeight,
 			)
 		}
 
@@ -429,7 +519,7 @@ func getProofInfo(
 
 		if requestedDiff == nil {
 			// Still looking for the decisive header.
-			if skipMinDifficulty && headerDiff.Cmp(one) == 0 {
+			if skipMinDifficulty && headerTarget.Cmp(minDifficultyTarget) == 0 {
 				continue
 			}
 

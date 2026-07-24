@@ -250,3 +250,72 @@ func (lbc *localBitcoinChain) addTransactionConfirmations(
 
 	return nil
 }
+
+// countingHeaderGetter wraps a header getter (typically
+// localBitcoinChain.GetBlockHeader) with a per-height call counter and optional
+// per-height failure injection. Tests use it to assert how many times the
+// backend is hit and that the header cache does not cache failures.
+type countingHeaderGetter struct {
+	inner        func(uint) (*bitcoin.BlockHeader, error)
+	mutex        sync.Mutex
+	calls        map[uint]int
+	failuresLeft map[uint]int
+}
+
+func newCountingHeaderGetter(
+	inner func(uint) (*bitcoin.BlockHeader, error),
+) *countingHeaderGetter {
+	return &countingHeaderGetter{
+		inner:        inner,
+		calls:        make(map[uint]int),
+		failuresLeft: make(map[uint]int),
+	}
+}
+
+// get records the call and either injects a pending failure for the height or
+// delegates to the wrapped getter.
+func (c *countingHeaderGetter) get(blockHeight uint) (
+	*bitcoin.BlockHeader,
+	error,
+) {
+	c.mutex.Lock()
+	c.calls[blockHeight]++
+	if c.failuresLeft[blockHeight] > 0 {
+		c.failuresLeft[blockHeight]--
+		c.mutex.Unlock()
+		return nil, fmt.Errorf(
+			"injected header failure at height [%d]",
+			blockHeight,
+		)
+	}
+	c.mutex.Unlock()
+
+	return c.inner(blockHeight)
+}
+
+// failNext makes the next `times` calls for the given height return an error
+// before the wrapped getter is consulted.
+func (c *countingHeaderGetter) failNext(blockHeight uint, times int) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	c.failuresLeft[blockHeight] = times
+}
+
+// callsAt returns the number of get calls recorded for the given height.
+func (c *countingHeaderGetter) callsAt(blockHeight uint) int {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	return c.calls[blockHeight]
+}
+
+// totalCalls returns the total number of get calls across all heights.
+func (c *countingHeaderGetter) totalCalls() int {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	total := 0
+	for _, n := range c.calls {
+		total += n
+	}
+	return total
+}

@@ -46,9 +46,17 @@ func Initialize(
 		)
 	}
 
+	// The blast radius of a panic here is this dedicated `keep-client
+	// maintainer` process, which hosts the co-resident SPV and
+	// Bitcoin-difficulty maintainers - not the separate `keep-client start`
+	// beacon/tBTC operator. The SPV maintainer recovers panics per iteration
+	// and restarts after a backoff (see spvMaintainer.runMaintainSpv), so a
+	// panic in a single SPV iteration no longer terminates this process.
+	//
 	// TODO: Allow for launching multiple maintainers here. Every flag
 	//       indicating a maintainer task should launch a separate maintainer.
-	//       Notice that panic on one maintainer goroutine will crush the whole
-	//       program. Consider cancelling all maintainers if one maintainer
-	//       cannot ba launched due to a configuration error.
+	//       A panic in a maintainer without its own recovery boundary still
+	//       terminates this process; extend per-iteration recovery to the
+	//       other maintainers. Consider cancelling all maintainers if one
+	//       maintainer cannot be launched due to a configuration error.
 }

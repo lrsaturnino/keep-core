@@ -29,6 +29,7 @@ import type {
   TokenStaking,
   BLS,
   RandomBeaconGovernance,
+  ReimbursementPool,
 } from "../typechain"
 import type { Address } from "hardhat-deploy/types"
 import type { ContractTransaction, BigNumberish } from "ethers"
@@ -44,6 +45,11 @@ const { provider } = waffle
 // we declare a new type instead of using `RandomBeaconStub & RandomBeacon` intersection.
 type RandomBeaconTest = RandomBeacon & {
   dkgLockState: () => Promise<ContractTransaction>
+  // Test-only setter exposed by RandomBeaconStub, used by the reimbursement
+  // negative control to run the pre-fix gas offset.
+  setRelayEntrySubmissionGasOffset: (
+    offset: BigNumberish
+  ) => Promise<ContractTransaction>
 }
 
 async function fixture() {
@@ -72,9 +78,84 @@ async function fixture() {
       deployment.randomBeaconGovernance as RandomBeaconGovernance,
     sortitionPool: deployment.sortitionPool as SortitionPool,
     staking: deployment.staking as TokenStaking,
+    reimbursementPool: deployment.reimbursementPool as ReimbursementPool,
     relayStub,
     bls,
     operators,
+  }
+}
+
+// RELAY_ENTRY_GAS_PRICE is an explicit legacy gas price set on every measured
+// relay-entry submission. It is below ReimbursementPool.maxGasPrice (500 gwei),
+// so the reimbursement uses tx.gasprice and receipt.effectiveGasPrice equals it.
+// That makes all balance arithmetic below deterministic.
+//
+// Measurement environment (must stay in sync with hardhat.config.ts): solc
+// 0.8.17 with the optimizer enabled at its default 200 runs and the default EVM
+// version (london). These settings define the measured gas; changing any of
+// them can move the required offset and forces a re-measurement.
+const RELAY_ENTRY_GAS_PRICE = ethers.utils.parseUnits("100", "gwei")
+
+// RELAY_ENTRY_OFFSET_FIX is the current relay entry submission gas offset;
+// RELAY_ENTRY_OFFSET_PRE_FIX is the value before commit edb51da0 raised it. The
+// 2,200-gas difference is exactly the adjustment the reimbursement must track.
+const RELAY_ENTRY_OFFSET_FIX = 13_450
+const RELAY_ENTRY_OFFSET_PRE_FIX = 11_250
+const RELAY_ENTRY_OFFSET_ADJUSTMENT = BigNumber.from(
+  RELAY_ENTRY_OFFSET_FIX - RELAY_ENTRY_OFFSET_PRE_FIX
+)
+
+// TUNED_OVER_REIMBURSEMENT_GAS_TOLERANCE bounds how much more than its true cost
+// the submitter may be refunded at the current offset for the overload the
+// offset is tuned for: submitRelayEntry(bytes,uint32[]). The offset is set to
+// just cover that overload (measured ~82 gas of headroom), so this bound is
+// tight. The bytes-only overload carries far less calldata and is intentionally
+// over-reimbursed by a larger, still-safe margin; it is checked only for
+// no-under-reimbursement and exact offset sensitivity.
+const TUNED_OVER_REIMBURSEMENT_GAS_TOLERANCE = BigNumber.from(5_000)
+
+interface ReimbursementMeasurement {
+  netWei: BigNumber
+  gasPrice: BigNumber
+  // Signed net reimbursement in gas units: positive = over-reimbursed,
+  // negative = under-reimbursed.
+  netGas: BigNumber
+  refund: BigNumber
+  transactionCost: BigNumber
+}
+
+// measureRelayEntryReimbursement records the submitter and reimbursement-pool
+// balances around a relay-entry submission and derives the submitter's net
+// reimbursement. It asserts the exact conservation identity - the submitter's
+// balance change equals the pool refund it received minus the gas it paid - and
+// returns the net in wei and in gas units.
+async function measureRelayEntryReimbursement(
+  reimbursementPool: ReimbursementPool,
+  submitter: SignerWithAddress,
+  submitterBefore: BigNumber,
+  poolBefore: BigNumber,
+  tx: ContractTransaction
+): Promise<ReimbursementMeasurement> {
+  const receipt = await tx.wait()
+
+  const submitterAfter = await provider.getBalance(submitter.address)
+  const poolAfter = await provider.getBalance(reimbursementPool.address)
+
+  const transactionCost = receipt.gasUsed.mul(receipt.effectiveGasPrice)
+  const refund = poolBefore.sub(poolAfter)
+  const netWei = submitterAfter.sub(submitterBefore)
+
+  // Conservation of ETH: the submitter sends no value and receives only the
+  // pool refund, so its balance change must equal refund - gas paid. Exact.
+  expect(netWei).to.equal(refund.sub(transactionCost))
+
+  const gasPrice = receipt.effectiveGasPrice
+  return {
+    netWei,
+    gasPrice,
+    netGas: netWei.div(gasPrice),
+    refund,
+    transactionCost,
   }
 }
 
@@ -92,6 +173,7 @@ describe("RandomBeacon - Relay", () => {
   let randomBeaconGovernance: RandomBeaconGovernance
   let sortitionPool: SortitionPool
   let staking: TokenStaking
+  let reimbursementPool: ReimbursementPool
   let relayStub: RelayStub
   let bls: BLS
 
@@ -103,6 +185,7 @@ describe("RandomBeacon - Relay", () => {
       randomBeacon,
       sortitionPool,
       staking,
+      reimbursementPool,
       relayStub,
       bls,
       operators: members,
@@ -116,6 +199,36 @@ describe("RandomBeacon - Relay", () => {
       .connect(governance)
       .setRequesterAuthorization(requester.address, true)
   })
+
+  // measureRelayEntrySubmissionAtOffset sets the relay entry submission gas
+  // offset, runs `submit`, and returns the reimbursement measurement, all inside
+  // a snapshot so both the offset change and the submission are reverted. The
+  // caller must already have a relay request in progress.
+  async function measureRelayEntrySubmissionAtOffset(
+    offset: number,
+    submit: () => Promise<ContractTransaction>
+  ): Promise<ReimbursementMeasurement> {
+    await createSnapshot()
+
+    await randomBeacon.setRelayEntrySubmissionGasOffset(offset)
+
+    const submitterBefore = await provider.getBalance(submitter.address)
+    const poolBefore = await provider.getBalance(reimbursementPool.address)
+
+    const tx = await submit()
+
+    const measurement = await measureRelayEntryReimbursement(
+      reimbursementPool,
+      submitter,
+      submitterBefore,
+      poolBefore,
+      tx
+    )
+
+    await restoreSnapshot()
+
+    return measurement
+  }
 
   describe("requestRelayEntry", () => {
     context("when requester is not authorized", () => {
@@ -281,6 +394,7 @@ describe("RandomBeacon - Relay", () => {
           context("when result is submitted before the soft timeout", () => {
             let tx: ContractTransaction
             let initialSubmitterBalance: BigNumber
+            let initialReimbursementPoolBalance: BigNumber
 
             before(async () => {
               await createSnapshot()
@@ -288,10 +402,15 @@ describe("RandomBeacon - Relay", () => {
               initialSubmitterBalance = await provider.getBalance(
                 submitter.address
               )
+              initialReimbursementPoolBalance = await provider.getBalance(
+                reimbursementPool.address
+              )
 
               tx = await randomBeacon
                 .connect(submitter)
-                ["submitRelayEntry(bytes)"](blsData.groupSignature)
+                ["submitRelayEntry(bytes)"](blsData.groupSignature, {
+                  gasPrice: RELAY_ENTRY_GAS_PRICE,
+                })
             })
 
             after(async () => {
@@ -317,17 +436,64 @@ describe("RandomBeacon - Relay", () => {
               expect(await randomBeacon.isRelayRequestInProgress()).to.be.false
             })
 
-            it("should refund ETH", async () => {
-              const postNotifierBalance = await provider.getBalance(
-                submitter.address
+            it("should fully reimburse the submitter (no under-reimbursement)", async () => {
+              const measurement = await measureRelayEntryReimbursement(
+                reimbursementPool,
+                submitter,
+                initialSubmitterBalance,
+                initialReimbursementPoolBalance,
+                tx
               )
-              const diff = postNotifierBalance.sub(initialSubmitterBalance)
-              expect(diff).to.be.gt(0)
-              expect(diff).to.be.lt(
-                ethers.utils.parseUnits("2000000", "gwei") // 0,002 ETH
-              )
+
+              // The submitter is at least made whole. The bytes-only overload
+              // carries little calldata, so the offset - tuned for the
+              // bytes,uint32[] overload - over-reimburses this one by a larger,
+              // still-safe margin. Its exact offset sensitivity is pinned by the
+              // negative-control context below.
+              expect(
+                measurement.netWei,
+                "submitter was under-reimbursed at the current offset"
+              ).to.be.gte(0)
             })
           })
+
+          context(
+            "when the relay entry submission gas offset changes (negative control)",
+            () => {
+              const submit = () =>
+                randomBeacon
+                  .connect(submitter)
+                  ["submitRelayEntry(bytes)"](blsData.groupSignature, {
+                    gasPrice: RELAY_ENTRY_GAS_PRICE,
+                  })
+
+              it("reimburses exactly the 2,200-gas fix adjustment more at the current offset than at the pre-fix offset", async () => {
+                const preFix = await measureRelayEntrySubmissionAtOffset(
+                  RELAY_ENTRY_OFFSET_PRE_FIX,
+                  submit
+                )
+                const current = await measureRelayEntrySubmissionAtOffset(
+                  RELAY_ENTRY_OFFSET_FIX,
+                  submit
+                )
+
+                // Fully reimbursed at the current offset.
+                expect(
+                  current.netWei,
+                  "submitter was under-reimbursed at the current offset"
+                ).to.be.gte(0)
+
+                // The current offset refunds exactly the 2,200-gas fix
+                // adjustment more than the pre-fix offset. This pins the
+                // reimbursement to the offset even though the bytes-only overload
+                // is over-reimbursed and so never dips below zero.
+                expect(
+                  current.netGas.sub(preFix.netGas),
+                  "reimbursement did not track the 2,200-gas offset change"
+                ).to.equal(RELAY_ENTRY_OFFSET_ADJUSTMENT)
+              })
+            }
+          )
 
           context("when result is submitted after the soft timeout", () => {
             before(async () => {
@@ -413,6 +579,7 @@ describe("RandomBeacon - Relay", () => {
         context("when result is submitted before the soft timeout", () => {
           let tx: ContractTransaction
           let initialSubmitterBalance: BigNumber
+          let initialReimbursementPoolBalance: BigNumber
 
           before(async () => {
             await createSnapshot()
@@ -420,12 +587,16 @@ describe("RandomBeacon - Relay", () => {
             initialSubmitterBalance = await provider.getBalance(
               submitter.address
             )
+            initialReimbursementPoolBalance = await provider.getBalance(
+              reimbursementPool.address
+            )
 
             tx = await randomBeacon
               .connect(submitter)
               ["submitRelayEntry(bytes,uint32[])"](
                 blsData.groupSignature,
-                membersIDs
+                membersIDs,
+                { gasPrice: RELAY_ENTRY_GAS_PRICE }
               )
           })
 
@@ -454,18 +625,72 @@ describe("RandomBeacon - Relay", () => {
             expect(await randomBeacon.isRelayRequestInProgress()).to.be.false
           })
 
-          it("should refund ETH", async () => {
-            const postNotifierBalance = await provider.getBalance(
-              submitter.address
+          it("should fully reimburse the submitter within the tuned over-reimbursement tolerance", async () => {
+            const measurement = await measureRelayEntryReimbursement(
+              reimbursementPool,
+              submitter,
+              initialSubmitterBalance,
+              initialReimbursementPoolBalance,
+              tx
             )
-            const diff = postNotifierBalance.sub(initialSubmitterBalance)
 
-            expect(diff).to.be.gt(0)
-            expect(diff).to.be.lt(
-              ethers.utils.parseUnits("1000000", "gwei") // 0,001 ETH
-            )
+            // The offset is tuned for this overload, so the submitter is made
+            // whole with only a small over-reimbursement margin.
+            expect(
+              measurement.netWei,
+              "submitter was under-reimbursed at the current offset"
+            ).to.be.gte(0)
+            expect(
+              measurement.netGas,
+              "over-reimbursement exceeds the tuned tolerance"
+            ).to.be.lte(TUNED_OVER_REIMBURSEMENT_GAS_TOLERANCE)
           })
         })
+
+        context(
+          "when the relay entry submission gas offset changes (negative control)",
+          () => {
+            const submit = () =>
+              randomBeacon
+                .connect(submitter)
+                ["submitRelayEntry(bytes,uint32[])"](
+                  blsData.groupSignature,
+                  membersIDs,
+                  { gasPrice: RELAY_ENTRY_GAS_PRICE }
+                )
+
+            it("under-reimburses at the pre-fix offset and reimburses exactly the 2,200-gas fix adjustment more at the current offset", async () => {
+              const preFix = await measureRelayEntrySubmissionAtOffset(
+                RELAY_ENTRY_OFFSET_PRE_FIX,
+                submit
+              )
+              const current = await measureRelayEntrySubmissionAtOffset(
+                RELAY_ENTRY_OFFSET_FIX,
+                submit
+              )
+
+              // Fully reimbursed at the current offset...
+              expect(
+                current.netWei,
+                "submitter was under-reimbursed at the current offset"
+              ).to.be.gte(0)
+
+              // ...but under-reimbursed at the pre-fix offset. This overload is
+              // the one the offset is tuned for, so the fix is exactly what
+              // makes the submitter whole.
+              expect(
+                preFix.netWei,
+                "pre-fix offset did not under-reimburse the submitter"
+              ).to.be.lt(0)
+
+              // The difference is exactly the 2,200-gas fix adjustment.
+              expect(
+                current.netGas.sub(preFix.netGas),
+                "reimbursement did not track the 2,200-gas offset change"
+              ).to.equal(RELAY_ENTRY_OFFSET_ADJUSTMENT)
+            })
+          }
+        )
 
         context("when result is submitted after the soft timeout", () => {
           let initialSubmitterBalance: BigNumber

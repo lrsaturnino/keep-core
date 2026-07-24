@@ -251,3 +251,42 @@ func TestBlockHeaderDifficulty_ZeroTarget(t *testing.T) {
 		actualDifficulty,
 	)
 }
+
+// TestBlockHeaderDifficulty_NonDIFF1RoundsToOne documents that integer
+// difficulty is not a unique identifier of a header's target. The exact DIFF1
+// bits (0x1d00ffff) and a harder non-DIFF1 encoding (0x1d00aaaa) both round to
+// integer difficulty 1, yet decode to different targets. Callers that must
+// match the Bridge's exact minimum-difficulty target (BitcoinTx) therefore have
+// to compare decoded targets, not Difficulty() == 1.
+func TestBlockHeaderDifficulty_NonDIFF1RoundsToOne(t *testing.T) {
+	diff1Header := BlockHeader{Bits: 0x1d00ffff}
+	nonDiff1Header := BlockHeader{Bits: 0x1d00aaaa}
+
+	// Both integer difficulties round down to 1.
+	one := big.NewInt(1)
+	testutils.AssertBigIntsEqual(
+		t,
+		"exact DIFF1 difficulty",
+		one,
+		diff1Header.Difficulty(),
+	)
+	testutils.AssertBigIntsEqual(
+		t,
+		"non-DIFF1 difficulty",
+		one,
+		nonDiff1Header.Difficulty(),
+	)
+
+	// The decoded targets are not equal; the non-DIFF1 target is harder
+	// (numerically smaller) than the exact DIFF1 target.
+	diff1Target := diff1Header.Target()
+	nonDiff1Target := nonDiff1Header.Target()
+	if nonDiff1Target.Cmp(diff1Target) >= 0 {
+		t.Fatalf(
+			"expected non-DIFF1 target [%v] to be harder (smaller) than the "+
+				"exact DIFF1 target [%v]",
+			nonDiff1Target,
+			diff1Target,
+		)
+	}
+}
