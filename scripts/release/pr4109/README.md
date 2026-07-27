@@ -32,8 +32,12 @@ arithmetic, storage location, and decrypted membership. Namespace consistency
 alone is never rollback-ready: the audit exits nonzero until references to
 the chain reconciliation, Bitcoin reconciliation, quiescence outcome, and
 prior-reader compatibility evidence are supplied via its
-`--*-evidence`/`--quiescence-report` flags, and its output never authorizes
-activating quarantined material by itself.
+`--*-evidence`/`--quiescence-report` flags **and** the expected operational
+identities the evidence must bind to are supplied via its `--expected-*`
+flags — Ethereum chain ID, Bitcoin network, the exact prior and current
+release versions, revisions, and immutable image digests, the release epoch,
+the armed cutover block, and the evidence freshness bound. Its output never
+authorizes activating quarantined material by itself.
 
 The two **container** rehearsals are mandatory release gates that cannot run
 from this repository alone: they need the immutable prior-production and R1
