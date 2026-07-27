@@ -172,12 +172,17 @@ and beacon completion bounds with the beacon chain configuration they came
 from, the reviewed quiesce margin, the upper block interval, the
 RPC/processing allowance, and the resulting in-process backstop — plus the one
 reviewed input that is not compiled into the client: the forced-cancellation
-allowance between the backstop firing and SIGKILL. The authoritative external
-grace is the checked sum `in_process_backstop_seconds +
-forced_cancellation_allowance_seconds` (currently `19800 + 300 = 20100`
-seconds). The client never reads the manifest at runtime; its bounds are
-compiled in, and the manifest exists so the SIGKILL deadline is derived from
-those same bounds.
+allowance between the backstop firing and SIGKILL. The client consumes the
+same allowance from its compiled constant: after the forced cancellation the
+lifecycle controller keeps the run context alive until every canceled permit
+owner finishes its quarantine/audit cleanup and releases its permit, waiting
+at most this allowance, so the external grace always outlasts the writes it
+exists to protect (a `cmd` test pins the runtime wait to the manifest field).
+The authoritative external grace is the checked sum
+`in_process_backstop_seconds + forced_cancellation_allowance_seconds`
+(currently `19800 + 300 = 20100` seconds). The client never reads the
+manifest at runtime; its bounds are compiled in, and the manifest exists so
+the SIGKILL deadline is derived from those same bounds.
 
 The chain is enforced at three layers, each fail-closed:
 
