@@ -144,12 +144,21 @@ func (r *Registry) ObserveApplicationSource(
 	}
 }
 
-// RegisterMetricClientInfo registers static client information labels for metrics.
-func (r *Registry) RegisterMetricClientInfo(version string) {
+// RegisterMetricClientInfo registers the static artifact-identity labels of
+// the client_info metric: the release version, the exact source revision, and
+// the compiled protocol epoch. Fleet tooling reconciles these against the
+// expected release identity, so all three travel together.
+func (r *Registry) RegisterMetricClientInfo(
+	version string,
+	revision string,
+	protocolEpoch string,
+) {
 	_, err := r.NewMetricInfo(
 		ClientInfoMetricName,
 		[]clientinfo.Label{
 			clientinfo.NewLabel("version", version),
+			clientinfo.NewLabel("revision", revision),
+			clientinfo.NewLabel("protocol_epoch", protocolEpoch),
 		},
 	)
 	if err != nil {

@@ -196,6 +196,38 @@ func start(cmd *cobra.Command) error {
 				return string(bytes)
 			},
 		)
+
+		// Expose the gate's identity and live state so a diagnostics scrape
+		// answers the readiness questions directly: which epoch this artifact
+		// is, which cutover block it compiled or resolved, and what the gate
+		// is doing right now.
+		clientInfoRegistry.RegisterDiagnosticSource(
+			"protocol_participation",
+			func() string {
+				snapshot := participationGate.State()
+				bytes, err := json.Marshal(map[string]interface{}{
+					"protocol_epoch":                participation.CompiledEpoch.String(),
+					"cutover_block":                 snapshot.CutoverBlock,
+					"cutover_block_source":          cutoverBlockSource,
+					"gate_state":                    snapshot.State.String(),
+					"current_block":                 snapshot.CurrentBlock,
+					"clock_available":               snapshot.ClockAvailable,
+					"allowed":                       snapshot.Allowed,
+					"quiescing":                     snapshot.Quiescing,
+					"active_ceremonies":             snapshot.ActiveCeremonies,
+					"active_legacy_ceremonies":      snapshot.ActiveLegacyCeremonies,
+					"active_security_v2_ceremonies": snapshot.ActiveSecurityV2Ceremonies,
+				})
+				if err != nil {
+					logger.Errorf(
+						"error on serializing participation state to JSON: [%v]",
+						err,
+					)
+					return ""
+				}
+				return string(bytes)
+			},
+		)
 	}
 
 	beaconCompletionBound, err := beacon.MaximumLegacyCompletionBlocks(
@@ -468,7 +500,11 @@ func initializeClientInfo(
 		config.ClientInfo.EthereumMetricsTick,
 	)
 
-	registry.RegisterMetricClientInfo(build.Version)
+	registry.RegisterMetricClientInfo(
+		build.Version,
+		build.Revision,
+		participation.CompiledEpoch.String(),
+	)
 
 	registry.RegisterEthChainInfoSource(blockCounter)
 

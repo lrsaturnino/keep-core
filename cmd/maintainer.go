@@ -14,6 +14,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/clientinfo"
 	"github.com/keep-network/keep-core/pkg/maintainer"
 	"github.com/keep-network/keep-core/pkg/maintainer/spv"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 )
 
 // MaintainerCommand contains the definition of the maintainer command-line
@@ -116,7 +117,11 @@ func initializeMaintainerClientInfo(
 		return nil
 	}
 
-	registry.RegisterMetricClientInfo(build.Version)
+	registry.RegisterMetricClientInfo(
+		build.Version,
+		build.Revision,
+		participation.CompiledEpoch.String(),
+	)
 
 	registry.ObserveBtcConnectivity(
 		btcChain,
