@@ -24,7 +24,7 @@ on:
   workflow_dispatch:
     inputs:
       artifact_environment:
-        description: "npm dist-tag or exact version for the contract artifacts baked into the build image; the stamp records every resolved tarball's name, version, and sha256"
+        description: "npm dist-tag or exact version for the contract artifacts baked into the build image; forensic only — the proof stage restores every regenerated tracked file byte-exact from the dispatched SHA before testing, and the stamp records every resolved tarball's name, version, and sha256"
         required: false
         default: "development"
       run_container_stages:
@@ -86,9 +86,12 @@ jobs:
 
       # ENVIRONMENT names the artifact input identity explicitly instead of
       # riding the Makefile's implicit development default (client CI's
-      # empty build-arg resolves to the same tag). The tag itself can float
-      # on the registry, so the in-image verification binds the resolved
-      # tarballs — name, exact version, sha256 — into the archived stamp.
+      # empty build-arg resolves to the same tag). The tag can float on the
+      # registry, but nothing tested depends on it: the in-image
+      # verification restores every regenerated tracked file byte-exact
+      # from the dispatched commit before the proofs compile, and records
+      # the resolved tarballs — name, exact version, sha256 — in the
+      # archived stamp as the image build's own input identity.
       - name: Build Docker Build Image
         uses: docker/build-push-action@v5
         with:

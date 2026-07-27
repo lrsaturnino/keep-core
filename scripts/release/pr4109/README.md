@@ -106,23 +106,32 @@ gitignored build outputs (the `keep-client` binary, the `tmp/contracts`
 artifact trees) as untracked noise. Then every remaining status line must
 be explained: a deletion only for a path `.dockerignore` keeps out of the
 context (honoring the `.clusterfuzzlite` negations — those files must be
-present) or for a `gen/_address/` placeholder the generator does not
-recreate; a modification only for the families the image regenerates from
-published artifacts (`**/gen/**/*.go` and `**/gen/_address/*`, minus the
-negated `gen/pb/*.go`, `gen/gen.go`, and `gen/cmd/cmd.go`, which the final
-`COPY` overwrites with committed bytes — the committed protobuf code the
-tests compile can never differ). Every accepted regenerated file is bound
-into the stamp by committed-vs-image sha256 pair, and the resolved
-contract artifact tarballs under `tmp/contracts` — name, exact version,
-sha256 — are recorded as the artifact input identity behind them (the
-workflow pins the `ENVIRONMENT` build-arg from its `artifact_environment`
-input instead of riding the Makefile's implicit default). Untracked files
-and any other status are always fatal. The verifier is itself under test:
-`test-source-binding.sh` drives it through checkout- and image-shaped
-throwaway repositories — clean image, expected absences alone, tampered
-generated code, injected or deleted source, missing metadata, SHA
-mismatch — and runs both as an early workflow step on the runner and
-inside `local-proofs`, so its verdicts land in the archived evidence.
+present; no context-excluded path holds Go code the proof stages compile),
+and the families the image regenerates from published artifacts
+(`**/gen/**/*.go` and `**/gen/_address/*`, minus the negated `gen/pb/*.go`,
+`gen/gen.go`, and `gen/cmd/cmd.go`, which the final `COPY` overwrites with
+committed bytes — the committed protobuf code the tests compile can never
+differ) are never accepted as found: each one is restored byte-exact from
+the dispatched commit — `git show` against the read-only-mounted `.git`,
+whose `HEAD` was already proven equal to the dispatched SHA — before any
+test compiles it, with the pre-restore image hash recorded for forensics.
+Untracked files and any other status are always fatal, a path that cannot
+be restored is fatal, and the whole tree is re-checked after restoration:
+anything left beyond the context-excluded absences fails the stage. The
+resolved contract artifact tarballs under `tmp/contracts` — name, exact
+version, sha256 — are still recorded as the image build's input identity
+(the workflow pins the `ENVIRONMENT` build-arg from its
+`artifact_environment` input instead of riding the Makefile's implicit
+default), but they are forensic context only: whatever npm tag or version
+the image was built from, the bytes the proof stages compile are the
+dispatched commit's bytes by construction. The verifier is itself under
+test: `test-source-binding.sh` drives it through checkout- and
+image-shaped throwaway repositories — clean image, expected absences
+alone, arbitrary bytes in every regenerated family proven replaced on disk
+by the committed bytes, an unrestorable path, injected or deleted source,
+tampered committed generated code, missing metadata, SHA mismatch — and
+runs both as an early workflow step on the runner and inside
+`local-proofs`, so its verdicts land in the archived evidence.
 `./rehearse.sh verify-source-binding` runs the binding check alone and
 records it under `EVIDENCE_DIR`.
 
