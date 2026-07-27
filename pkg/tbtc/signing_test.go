@@ -195,6 +195,15 @@ func TestSigningExecutor_SignBatch_PartialFailure(t *testing.T) {
 // setupSigningExecutor sets up an instance of the signing executor ready
 // to perform test signing.
 func setupSigningExecutor(t *testing.T) *signingExecutor {
+	executor, _ := setupSigningExecutorWithChain(t)
+	return executor
+}
+
+// setupSigningExecutorWithChain sets up an instance of the signing executor
+// ready to perform test signing and returns it together with the local chain
+// it is connected to, so tests can drive gates and fences from the same chain
+// clock.
+func setupSigningExecutorWithChain(t *testing.T) (*signingExecutor, *localChain) {
 	groupParameters := &GroupParameters{
 		GroupSize:       5,
 		GroupQuorum:     4,
@@ -288,5 +297,5 @@ func setupSigningExecutor(t *testing.T) *signingExecutor {
 	// Set more attempts to give more time for computations.
 	executor.signingAttemptsLimit *= 8
 
-	return executor
+	return executor, localChain
 }
