@@ -26,6 +26,10 @@ type member struct {
 	membershipValidator *group.MembershipValidator
 	// Identifier of the particular DKG session this member is part of.
 	sessionID string
+	// Per-ceremony compatibility strategy bundle pinning the ECDH derivation
+	// and the TSS proof-transcript configuration to the ceremony's protocol
+	// mode for its entire lifetime.
+	strategies common.CompatibilityStrategies
 	// TSS pre-parameters getter.
 	preParamsFn func() (*PreParams, error)
 	// Concurrency level of TSS key-generation protocol.
@@ -43,6 +47,7 @@ func newMember(
 	dishonestThreshold int,
 	membershipValidator *group.MembershipValidator,
 	sessionID string,
+	strategies common.CompatibilityStrategies,
 	preParamsFn func() (*PreParams, error),
 	keyGenerationConcurrency int,
 ) *member {
@@ -52,6 +57,7 @@ func newMember(
 		group:                    group.NewGroup(dishonestThreshold, groupSize),
 		membershipValidator:      membershipValidator,
 		sessionID:                sessionID,
+		strategies:               strategies,
 		preParamsFn:              preParamsFn,
 		keyGenerationConcurrency: keyGenerationConcurrency,
 		identityConverter:        &identityConverter{seed: seed},
@@ -142,8 +148,18 @@ func (skgm *symmetricKeyGeneratingMember) initializeTssRoundOne() (
 		len(groupTssPartiesIDs),
 		skgm.group.HonestThreshold()-1,
 	)
-	// Bind GG20 proof challenges to the existing protocol session.
-	tssParameters.SetSessionNonceBytes([]byte(skgm.sessionID))
+	// Apply the ceremony's proof-transcript configuration; for security-v2
+	// this binds GG20 proof challenges to the existing protocol session.
+	err := skgm.strategies.ConfigureTSSParameters(
+		tssParameters,
+		skgm.sessionID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed configuring TSS parameters: [%w]",
+			err,
+		)
+	}
 	tssParameters.SetConcurrency(skgm.keyGenerationConcurrency)
 
 	tssOutgoingMessagesChan := make(chan tss.Message, len(groupTssPartiesIDs))

@@ -19,6 +19,7 @@ import (
 	"github.com/keep-network/keep-core/internal/testutils"
 	"github.com/keep-network/keep-core/pkg/crypto/ephemeral"
 	"github.com/keep-network/keep-core/pkg/crypto/secp256k1"
+	"github.com/keep-network/keep-core/pkg/protocol/compatibility"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 )
 
@@ -1526,6 +1527,7 @@ func initializeEphemeralKeyPairGeneratingMembersGroup(
 				id:                       id,
 				group:                    dkgGroup,
 				sessionID:                sessionID,
+				strategies:               compatibility.SecurityV2(),
 				preParamsFn:              preParamsFn,
 				keyGenerationConcurrency: 10,
 				identityConverter:        &identityConverter{seed: big.NewInt(200)},

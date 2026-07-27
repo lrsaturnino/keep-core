@@ -2,8 +2,12 @@ package compatibility
 
 import (
 	"bytes"
+	"errors"
 	"math/big"
 	"testing"
+
+	tsslibcommon "github.com/bnb-chain/tss-lib/common"
+	"github.com/bnb-chain/tss-lib/tss"
 
 	"github.com/keep-network/keep-core/pkg/altbn128"
 	"github.com/keep-network/keep-core/pkg/crypto/ephemeral"
@@ -212,5 +216,86 @@ func TestG1HashToPointSelection(t *testing.T) {
 				message,
 			)
 		}
+	}
+}
+
+// newTestTSSParameters builds a minimal valid TSS parameters value: two
+// parties with distinct keys and threshold one, the smallest setup the pinned
+// tss-lib constructor accepts.
+func newTestTSSParameters() *tss.Parameters {
+	parties := tss.SortPartyIDs([]*tss.PartyID{
+		tss.NewPartyID("1", "member-1", big.NewInt(1)),
+		tss.NewPartyID("2", "member-2", big.NewInt(2)),
+	})
+
+	return tss.NewParameters(
+		tss.S256(),
+		tss.NewPeerContext(parties),
+		parties[0],
+		2,
+		1,
+	)
+}
+
+func TestConfigureTSSParametersSelection(t *testing.T) {
+	legacy, _ := StrategiesFor(participation.ModeLegacy)
+	securityV2, _ := StrategiesFor(participation.ModeSecurityV2)
+
+	sessionID := "dkg-64757a1f-0000000000000001"
+
+	// The security-v2 bundle binds the GG20 proof challenges to the ceremony
+	// session exactly as the hardened release does: the session ID hashed
+	// into the parameters' session nonce.
+	parameters := newTestTSSParameters()
+	if err := securityV2.ConfigureTSSParameters(
+		parameters,
+		sessionID,
+	); err != nil {
+		t.Fatalf("unexpected error: [%v]", err)
+	}
+
+	expectedNonce := new(big.Int).SetBytes(
+		tsslibcommon.SHA512_256([]byte(sessionID)),
+	)
+	if parameters.SessionNonce() == nil ||
+		expectedNonce.Cmp(parameters.SessionNonce()) != 0 {
+		t.Errorf(
+			"security-v2 session nonce disagrees with the hardened "+
+				"session-ID binding: [%v]",
+			parameters.SessionNonce(),
+		)
+	}
+
+	// The legacy bundle fails closed: the pinned tss-lib revision has no
+	// reviewed legacy transcript, and running the hardened one under a
+	// legacy permit would interoperate with neither release.
+	err := legacy.ConfigureTSSParameters(newTestTSSParameters(), sessionID)
+	if !errors.Is(err, ErrLegacyTSSTranscriptUnavailable) {
+		t.Errorf(
+			"legacy TSS configuration must fail closed with the "+
+				"unavailability sentinel, got: [%v]",
+			err,
+		)
+	}
+}
+
+func TestConfigureTSSParametersValidation(t *testing.T) {
+	securityV2, _ := StrategiesFor(participation.ModeSecurityV2)
+
+	if err := securityV2.ConfigureTSSParameters(
+		nil,
+		"dkg-64757a1f-0000000000000001",
+	); err == nil {
+		t.Error("expected an error for nil parameters")
+	}
+
+	// A session ID below the fork's 16-byte proof-binding floor must surface
+	// as an error from the bundle, not as a panic inside the party.
+	parameters := newTestTSSParameters()
+	if err := securityV2.ConfigureTSSParameters(parameters, "1-1"); err == nil {
+		t.Error("expected an error for a session ID below 16 bytes")
+	}
+	if parameters.SessionNonce() != nil {
+		t.Error("session nonce must remain unset after a rejected session ID")
 	}
 }

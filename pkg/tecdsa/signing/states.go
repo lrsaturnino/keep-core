@@ -99,10 +99,15 @@ func (skgs *symmetricKeyGenerationState) CanTransition() bool {
 }
 
 func (skgs *symmetricKeyGenerationState) Next() (state.AsyncState, error) {
+	member, err := skgs.member.initializeTssRoundOne()
+	if err != nil {
+		return nil, err
+	}
+
 	return &tssRoundOneState{
 		BaseAsyncState: skgs.BaseAsyncState,
 		channel:        skgs.channel,
-		member:         skgs.member.initializeTssRoundOne(),
+		member:         member,
 	}, nil
 }
 

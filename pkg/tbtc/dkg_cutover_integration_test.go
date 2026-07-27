@@ -436,6 +436,12 @@ func runRealDKGCutoverMember(
 		announcerOptions...,
 	)
 
+	strategies, err := compatibility.StrategiesFor(permit.Mode())
+	if err != nil {
+		outcome.err = err
+		return
+	}
+
 	retryLoop := newDkgRetryLoop(
 		logger,
 		seed,
@@ -474,6 +480,7 @@ func runRealDKGCutoverMember(
 				attempt.excludedMembersIndexes,
 				channel,
 				cutoverGroup.validator,
+				strategies,
 			)
 		},
 	)

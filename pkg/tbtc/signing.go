@@ -12,6 +12,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/generator"
 	"github.com/keep-network/keep-core/pkg/net"
 	"github.com/keep-network/keep-core/pkg/protocol/announcer"
+	"github.com/keep-network/keep-core/pkg/protocol/compatibility"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/tecdsa"
@@ -226,6 +227,17 @@ func (se *signingExecutor) sign(
 		)
 	}
 
+	// The compatibility strategy bundle carries the wallet action's mode into
+	// every tECDSA party this operation constructs; each retry attempt reuses
+	// it unchanged.
+	strategies, err := compatibility.StrategiesFor(mode)
+	if err != nil {
+		return nil, nil, 0, fmt.Errorf(
+			"cannot select compatibility strategies: [%v]",
+			err,
+		)
+	}
+
 	if lockAcquired := se.lock.TryAcquire(1); !lockAcquired {
 		// Record failure metrics for lock acquisition failure
 		if se.metricsRecorder != nil {
@@ -400,6 +412,7 @@ func (se *signingExecutor) sign(
 						attempt.excludedMembersIndexes,
 						se.broadcastChannel,
 						se.membershipValidator,
+						strategies,
 					)
 					if err != nil {
 						return nil, 0, err

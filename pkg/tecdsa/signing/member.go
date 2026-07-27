@@ -29,6 +29,10 @@ type member struct {
 	membershipValidator *group.MembershipValidator
 	// Identifier of the particular signing session this member is part of.
 	sessionID string
+	// Per-ceremony compatibility strategy bundle pinning the ECDH derivation
+	// and the TSS proof-transcript configuration to the ceremony's protocol
+	// mode for its entire lifetime.
+	strategies common.CompatibilityStrategies
 	// Message that is the subject of the signing process.
 	message *big.Int
 	// tECDSA private key share of the member.
@@ -45,6 +49,7 @@ func newMember(
 	dishonestThreshold int,
 	membershipValidator *group.MembershipValidator,
 	sessionID string,
+	strategies common.CompatibilityStrategies,
 	message *big.Int,
 	privateKeyShare *tecdsa.PrivateKeyShare,
 ) *member {
@@ -54,6 +59,7 @@ func newMember(
 		group:               group.NewGroup(dishonestThreshold, groupSize),
 		membershipValidator: membershipValidator,
 		sessionID:           sessionID,
+		strategies:          strategies,
 		message:             message,
 		privateKeyShare:     privateKeyShare,
 		identityConverter:   &identityConverter{keys: privateKeyShare.Data().Ks},
@@ -124,7 +130,10 @@ type symmetricKeyGeneratingMember struct {
 }
 
 // initializeTssRoundOne returns a member to perform next protocol operations.
-func (skgm *symmetricKeyGeneratingMember) initializeTssRoundOne() *tssRoundOneMember {
+func (skgm *symmetricKeyGeneratingMember) initializeTssRoundOne() (
+	*tssRoundOneMember,
+	error,
+) {
 	// Set up the local TSS party using only operating members. This effectively
 	// removes all excluded members who were marked as disqualified at the
 	// beginning of the protocol.
@@ -141,8 +150,18 @@ func (skgm *symmetricKeyGeneratingMember) initializeTssRoundOne() *tssRoundOneMe
 		len(groupTssPartiesIDs),
 		skgm.group.HonestThreshold()-1,
 	)
-	// Bind GG20 proof challenges to the existing protocol session.
-	tssParameters.SetSessionNonceBytes([]byte(skgm.sessionID))
+	// Apply the ceremony's proof-transcript configuration; for security-v2
+	// this binds GG20 proof challenges to the existing protocol session.
+	err := skgm.strategies.ConfigureTSSParameters(
+		tssParameters,
+		skgm.sessionID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed configuring TSS parameters: [%w]",
+			err,
+		)
+	}
 
 	tssOutgoingMessagesChan := make(chan tss.Message, len(groupTssPartiesIDs))
 	tssResultChan := make(chan tsslibcommon.SignatureData, 1)
@@ -163,7 +182,7 @@ func (skgm *symmetricKeyGeneratingMember) initializeTssRoundOne() *tssRoundOneMe
 		tssParameters:                tssParameters,
 		tssOutgoingMessagesChan:      tssOutgoingMessagesChan,
 		tssResultChan:                tssResultChan,
-	}
+	}, nil
 }
 
 // tssRoundOneMember represents one member in a signing group performing the

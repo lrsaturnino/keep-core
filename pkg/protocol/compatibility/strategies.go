@@ -3,10 +3,11 @@
 // with exactly one bundle — legacy or security-v2 — selected from its
 // participation permit's pinned protocol mode, and every wire- and
 // transcript-sensitive decision travels together inside that bundle: the
-// announcement session-ID formats, the ECDH symmetric-key derivation, and the
-// G1 hash-to-point mapping. Selecting these decisions individually is
-// forbidden: switching only one of them would produce a partially legacy
-// ceremony that interoperates with neither release.
+// announcement session-ID formats, the ECDH symmetric-key derivation, the
+// G1 hash-to-point mapping, and the tECDSA proof-transcript configuration.
+// Selecting these decisions individually is forbidden: switching only one of
+// them would produce a partially legacy ceremony that interoperates with
+// neither release.
 //
 // The bundles are stateless values and therefore immutable: nothing can
 // mutate a bundle after selection, and nothing in this package reads the
@@ -14,26 +15,49 @@
 // reproduce, byte for byte, the behavior of the pre-hardening production
 // releases; security-v2 strategies reproduce the hardened behavior.
 //
-// The tECDSA proof-transcript strategy (the session-bound tss-lib behavior)
-// is deliberately not part of this bundle yet: the pinned tss-lib fork does
-// not expose a per-party protocol mode, and extending that fork is reviewed
-// work outside this repository. Until the extended fork is pinned, tECDSA
-// ceremonies cannot run in legacy mode, and no production path may hand a
-// legacy bundle to a tECDSA ceremony. The hard-dependency record — what the
-// reviewed fork must provide and which acceptance evidence is blocked on it —
-// lives in scripts/release/pr4109/README.md.
+// The legacy tECDSA proof transcript is the one decision whose implementation
+// is still missing: the pinned tss-lib fork exposes no per-party protocol
+// mode, and extending that fork is reviewed cryptographic work outside this
+// repository. The legacy bundle therefore fails closed — its TSS
+// configuration returns ErrLegacyTSSTranscriptUnavailable — so a tECDSA
+// ceremony cannot run in legacy mode until the reviewed fork is pinned and
+// that single method is replaced with the fork's legacy-mode configuration.
+// The hard-dependency record — what the reviewed fork must provide and which
+// acceptance evidence is blocked on it — lives in
+// scripts/release/pr4109/README.md.
 package compatibility
 
 import (
+	"errors"
 	"fmt"
 	"math/big"
 
+	"github.com/bnb-chain/tss-lib/tss"
 	bn256 "github.com/ethereum/go-ethereum/crypto/bn256/cloudflare"
 
 	"github.com/keep-network/keep-core/pkg/altbn128"
 	"github.com/keep-network/keep-core/pkg/crypto/ephemeral"
 	"github.com/keep-network/keep-core/pkg/protocol/participation"
 )
+
+// ErrLegacyTSSTranscriptUnavailable reports that the legacy tECDSA proof
+// transcript cannot be produced because the pinned tss-lib fork exposes no
+// per-party legacy mode. Running the hardened transcript under a legacy
+// permit would emit wire traffic incompatible with both releases, so the
+// legacy bundle refuses TSS configuration outright. The refusal disappears
+// only when a reviewed fork revision with an immutable per-party mode is
+// pinned in go.mod.
+var ErrLegacyTSSTranscriptUnavailable = errors.New(
+	"legacy tECDSA proof transcript unavailable: the pinned tss-lib " +
+		"revision has no reviewed legacy mode",
+)
+
+// minTSSSessionIDBytes mirrors the pinned tss-lib fork's minimum session-ID
+// length: the fork hashes the session ID into the GG20 proof-binding nonce
+// and panics below 16 bytes (128 bits), the birthday-bound minimum for
+// collision resistance. The bundle validates the length up front so a
+// malformed session ID surfaces as an error, not a panic inside the party.
+const minTSSSessionIDBytes = 16
 
 // Strategies is the immutable per-ceremony compatibility strategy bundle. All
 // methods are pure functions of their inputs and the bundle's mode; a bundle
@@ -67,6 +91,15 @@ type Strategies interface {
 
 	// G1HashToPoint maps the given message onto a G1 point.
 	G1HashToPoint(message []byte) *bn256.G1
+
+	// ConfigureTSSParameters applies this bundle's tECDSA proof-transcript
+	// decision to the given TSS parameters before any local party is
+	// constructed from them. The security-v2 configuration binds the GG20
+	// proof challenges to the ceremony's session ID; the legacy configuration
+	// fails closed with ErrLegacyTSSTranscriptUnavailable until the reviewed
+	// dual-mode tss-lib fork is pinned. The applied setting is immutable for
+	// the party's lifetime.
+	ConfigureTSSParameters(parameters *tss.Parameters, sessionID string) error
 }
 
 // StrategiesFor returns the immutable strategy bundle for the given protocol
@@ -135,6 +168,16 @@ func (legacyStrategies) G1HashToPoint(message []byte) *bn256.G1 {
 	return altbn128.G1HashToPointLegacy(message)
 }
 
+func (legacyStrategies) ConfigureTSSParameters(
+	_ *tss.Parameters,
+	_ string,
+) error {
+	return fmt.Errorf(
+		"cannot configure TSS parameters for a legacy ceremony: %w",
+		ErrLegacyTSSTranscriptUnavailable,
+	)
+}
+
 // securityV2Strategies reproduces the hardened behavior of the security
 // release.
 type securityV2Strategies struct{}
@@ -173,4 +216,26 @@ func (securityV2Strategies) ECDH(
 
 func (securityV2Strategies) G1HashToPoint(message []byte) *bn256.G1 {
 	return altbn128.G1HashToPoint(message)
+}
+
+func (securityV2Strategies) ConfigureTSSParameters(
+	parameters *tss.Parameters,
+	sessionID string,
+) error {
+	if parameters == nil {
+		return fmt.Errorf(
+			"cannot configure TSS parameters: no parameters provided",
+		)
+	}
+	if len(sessionID) < minTSSSessionIDBytes {
+		return fmt.Errorf(
+			"cannot bind GG20 proof challenges to session ID of [%d] bytes: "+
+				"at least [%d] bytes are required",
+			len(sessionID),
+			minTSSSessionIDBytes,
+		)
+	}
+	// Bind GG20 proof challenges to the existing protocol session.
+	parameters.SetSessionNonceBytes([]byte(sessionID))
+	return nil
 }

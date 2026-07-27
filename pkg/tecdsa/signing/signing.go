@@ -11,12 +11,18 @@ import (
 	"github.com/keep-network/keep-core/pkg/net"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/tecdsa"
+	"github.com/keep-network/keep-core/pkg/tecdsa/common"
 )
 
 // Execute runs the tECDSA signing protocol, given a message to sign,
 // broadcast channel to mediate with, a block counter used for time tracking,
 // a member index to use in the group, private key share, dishonest threshold,
 // and block height when signing protocol should start.
+//
+// The strategies bundle pins the ceremony's compatibility decisions — the
+// ECDH derivation and the TSS proof-transcript configuration — and must be
+// selected explicitly from the ceremony's participation permit; there is no
+// default.
 //
 // This function also supports signing execution with a subset of the signing
 // group by passing a non-empty excludedMembers slice holding the members that
@@ -33,6 +39,7 @@ func Execute(
 	excludedMembersIndexes []group.MemberIndex,
 	channel net.BroadcastChannel,
 	membershipValidator *group.MembershipValidator,
+	strategies common.CompatibilityStrategies,
 ) (*Result, error) {
 	logger.Debugf("[member:%v] initializing member", memberIndex)
 
@@ -43,6 +50,7 @@ func Execute(
 		dishonestThreshold,
 		membershipValidator,
 		sessionID,
+		strategies,
 		message,
 		privateKeyShare,
 	)

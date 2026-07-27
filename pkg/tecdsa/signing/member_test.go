@@ -1,6 +1,7 @@
 package signing
 
 import (
+	"errors"
 	"fmt"
 	"math/big"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/chain/local_v1"
 	"github.com/keep-network/keep-core/pkg/internal/tecdsatest"
 	"github.com/keep-network/keep-core/pkg/operator"
+	"github.com/keep-network/keep-core/pkg/protocol/compatibility"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/tecdsa"
 )
@@ -95,6 +97,7 @@ func TestShouldAcceptMessage(t *testing.T) {
 				groupSize-honestThreshold,
 				membershipValdator,
 				"1",
+				compatibility.SecurityV2(),
 				big.NewInt(100),
 				tecdsa.NewPrivateKeyShare(testData[0]),
 			)
@@ -203,4 +206,40 @@ func TestIdentityConverter_TssPartyIDToMemberIndex_Corrupted(t *testing.T) {
 	memberIndex := converter.TssPartyIDToMemberIndex(partyID)
 
 	testutils.AssertIntsEqual(t, "member ID", 0, int(memberIndex))
+}
+
+// TestInitializeTssRoundOneRefusesLegacyTranscript proves the crypto-boundary
+// fence: a member carrying the legacy strategy bundle cannot construct a TSS
+// party, because the pinned tss-lib revision has no reviewed legacy proof
+// transcript. The refusal must surface the unavailability sentinel before any
+// party state exists.
+func TestInitializeTssRoundOneRefusesLegacyTranscript(t *testing.T) {
+	testData, err := tecdsatest.LoadPrivateKeyShareTestFixtures(1)
+	if err != nil {
+		t.Fatalf("failed to load test data: [%v]", err)
+	}
+
+	member := newMember(
+		&testutils.MockLogger{},
+		group.MemberIndex(1),
+		2,
+		0,
+		nil,
+		"64757a1f-1",
+		compatibility.Legacy(),
+		big.NewInt(100),
+		tecdsa.NewPrivateKeyShare(testData[0]),
+	)
+
+	_, err = member.
+		initializeEphemeralKeysGeneration().
+		initializeSymmetricKeyGeneration().
+		initializeTssRoundOne()
+	if !errors.Is(err, compatibility.ErrLegacyTSSTranscriptUnavailable) {
+		t.Errorf(
+			"legacy TSS round one must fail closed with the unavailability "+
+				"sentinel, got: [%v]",
+			err,
+		)
+	}
 }

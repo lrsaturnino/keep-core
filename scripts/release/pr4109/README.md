@@ -88,27 +88,38 @@ the key files' password.
 
 ### Reviewed tss-lib fork with an immutable per-party legacy mode
 
-R1's per-ceremony compatibility bundles cover the announcement session-ID
-formats, the ECDH symmetric-key derivation, and the G1 hash-to-point mapping
-(`pkg/protocol/compatibility`). The fourth wire-sensitive decision — the
-tECDSA proof transcript — cannot be bundled yet: a Go build resolves exactly
-one `github.com/bnb-chain/tss-lib` replacement (currently the hardened
-`threshold-network/tss-lib` revision `86bd1a375cc0` in `go.mod`), and that
-revision exposes no per-party protocol mode. Reproducing the legacy
-transcript requires extending that fork so each local party is constructed
-with an immutable legacy/security-v2 setting: legacy reproduces the
-prior-production proof transcript byte for byte, security-v2 requires the
-session nonce, and every mode-independent memory-safety fix stays active in
-both modes.
+R1's per-ceremony compatibility bundle covers all four wire- and
+transcript-sensitive decisions (`pkg/protocol/compatibility`): the
+announcement session-ID formats, the ECDH symmetric-key derivation, the G1
+hash-to-point mapping, and the tECDSA proof-transcript configuration. The
+bundle travels from the participation permit into every tECDSA DKG and
+signing party (`pkg/tecdsa/dkg`, `pkg/tecdsa/signing` take the bundle
+explicitly — there is no default), and a repository check
+(`pkg/protocol/compatibility/transcript_ownership_test.go`) fails the build
+tests if a call site bypasses it.
+
+The legacy arm of the transcript decision has no implementation to select: a
+Go build resolves exactly one `github.com/bnb-chain/tss-lib` replacement
+(currently the hardened `threshold-network/tss-lib` revision `86bd1a375cc0`
+in `go.mod`), and that revision exposes no per-party protocol mode.
+Reproducing the legacy transcript requires extending that fork so each local
+party is constructed with an immutable legacy/security-v2 setting: legacy
+reproduces the prior-production proof transcript byte for byte — including
+the prior wire message formats, whose protobuf schema the hardened revision
+changed — security-v2 requires the session nonce, and every mode-independent
+memory-safety fix stays active in both modes.
 
 That extension is reviewed cryptographic work outside this repository, and an
 unreviewed in-tree fork is not an accepted substitute. Until the reviewed
 fork commit is pinned in `go.mod`:
 
-- tBTC ceremonies **fail closed on legacy permits** — deliberately. The
-  tECDSA executors refuse any mode other than security-v2 (`pkg/tbtc/dkg.go`,
-  `pkg/tbtc/signing.go`) rather than emit a partially hardened transcript
-  that would interoperate with neither release.
+- tBTC ceremonies **fail closed on legacy permits** — deliberately, at two
+  layers. The authoritative fence is the legacy bundle itself: its TSS
+  configuration returns `ErrLegacyTSSTranscriptUnavailable`
+  (`pkg/protocol/compatibility`), so no tECDSA party can be constructed in
+  legacy mode anywhere in the tree. The tECDSA executors additionally refuse
+  legacy permits up front (`pkg/tbtc/dkg.go`, `pkg/tbtc/signing.go`,
+  `pkg/tbtc/node.go`) so a refused ceremony never announces itself to peers.
 - The pre-cutover interop acceptance cases of smoke gates 1 and 2 — mixed
   prior/R1 legacy signing and DKG succeeding before the cutover block, and a
   legacy-anchored ceremony completing with legacy peers — cannot produce
@@ -121,8 +132,11 @@ fork commit is pinned in `go.mod`:
 
 Unblocking requires the reviewed fork commit, its review record, transcript
 fixtures proving both modes reproduce their exact expected bytes, and the
-`go.mod` pin. The tECDSA refusals are then replaced by permit-scoped mode
-configuration and the skip-marked cases become runnable acceptance tests.
+`go.mod` pin. The keep-core changes are then confined to: pinning the fork,
+replacing the legacy bundle's `ConfigureTSSParameters` refusal with the
+fork's legacy-mode configuration, deleting the three executor-level early
+refusals, and turning the skip-marked cases into runnable acceptance tests.
+Every other integration point already receives its mode from the permit.
 
 ## clientInfo.port 9601 compatibility smoke matrix
 

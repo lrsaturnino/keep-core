@@ -27,6 +27,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/internal/tecdsatest"
 	netLocal "github.com/keep-network/keep-core/pkg/net/local"
 	"github.com/keep-network/keep-core/pkg/operator"
+	"github.com/keep-network/keep-core/pkg/protocol/compatibility"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/tecdsa"
 	"github.com/keep-network/keep-core/pkg/tecdsa/signing"
@@ -173,6 +174,7 @@ func RunTestWithTimeout(
 				[]group.MemberIndex{}, // no statically-excluded members
 				broadcastChannel,
 				membershipValidator,
+				compatibility.SecurityV2(),
 			)
 
 			mutex.Lock()

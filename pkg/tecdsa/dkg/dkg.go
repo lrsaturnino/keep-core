@@ -13,6 +13,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/net"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/protocol/state"
+	"github.com/keep-network/keep-core/pkg/tecdsa/common"
 )
 
 // Executor represents an ECDSA distributed key generation process executor.
@@ -55,6 +56,11 @@ func NewExecutor(
 // a member index to use in the group, dishonest threshold, and block height
 // when DKG protocol should start.
 //
+// The strategies bundle pins the ceremony's compatibility decisions — the
+// ECDH derivation and the TSS proof-transcript configuration — and must be
+// selected explicitly from the ceremony's participation permit; there is no
+// default.
+//
 // This function also supports DKG execution with a subset of the selected
 // group by passing a non-empty excludedMembers slice holding the members that
 // should be excluded.
@@ -69,6 +75,7 @@ func (e *Executor) Execute(
 	excludedMembersIndexes []group.MemberIndex,
 	channel net.BroadcastChannel,
 	membershipValidator *group.MembershipValidator,
+	strategies common.CompatibilityStrategies,
 ) (*Result, error) {
 	logger.Debugf("[member:%v] initializing member", memberIndex)
 
@@ -80,6 +87,7 @@ func (e *Executor) Execute(
 		dishonestThreshold,
 		membershipValidator,
 		sessionID,
+		strategies,
 		e.tssPreParamsPool.GetNow,
 		e.keyGenerationConcurrency,
 	)

@@ -17,6 +17,7 @@ import (
 	"github.com/keep-network/keep-core/internal/testutils"
 	"github.com/keep-network/keep-core/pkg/crypto/ephemeral"
 	"github.com/keep-network/keep-core/pkg/internal/tecdsatest"
+	"github.com/keep-network/keep-core/pkg/protocol/compatibility"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/tecdsa"
 )
@@ -284,7 +285,10 @@ func TestInitializeTssRoundOneSetsSessionNonce(t *testing.T) {
 	otherSessionSource := members[0].symmetricKeyGeneratingMember
 	originalSessionID := otherSessionSource.sessionID
 	otherSessionSource.sessionID = "other-session-with-128-bits"
-	otherSessionMember := otherSessionSource.initializeTssRoundOne()
+	otherSessionMember, err := otherSessionSource.initializeTssRoundOne()
+	if err != nil {
+		t.Fatal(err)
+	}
 	otherSessionSource.sessionID = originalSessionID
 
 	if expectedNonce.Cmp(otherSessionMember.tssParameters.SessionNonce()) == 0 {
@@ -2467,6 +2471,7 @@ func initializeEphemeralKeyPairGeneratingMembersGroup(
 				id:                id,
 				group:             signingGroup,
 				sessionID:         sessionID,
+				strategies:        compatibility.SecurityV2(),
 				message:           big.NewInt(100),
 				privateKeyShare:   tecdsa.NewPrivateKeyShare(testData[i-1]),
 				identityConverter: &identityConverter{keys: testData[i-1].Ks},
@@ -2559,10 +2564,16 @@ func initializeTssRoundOneMembersGroup(
 			)
 		}
 
-		tssRoundOneMembers = append(
-			tssRoundOneMembers,
-			member.initializeTssRoundOne(),
-		)
+		tssRoundOneMember, err := member.initializeTssRoundOne()
+		if err != nil {
+			return nil, fmt.Errorf(
+				"cannot initialize TSS round one for member [%v]: [%v]",
+				member.id,
+				err,
+			)
+		}
+
+		tssRoundOneMembers = append(tssRoundOneMembers, tssRoundOneMember)
 	}
 
 	return tssRoundOneMembers, nil

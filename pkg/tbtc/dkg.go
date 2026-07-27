@@ -23,6 +23,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/generator"
 	"github.com/keep-network/keep-core/pkg/net"
 	"github.com/keep-network/keep-core/pkg/protocol/announcer"
+	"github.com/keep-network/keep-core/pkg/protocol/compatibility"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/tecdsa/dkg"
@@ -434,6 +435,18 @@ func (de *dkgExecutor) generateSigningGroup(
 			// announcement so the mismatch observer can tell legacy peers
 			// apart from hardened ones during a coordinated cutover.
 			currentMode := permit.Mode()
+			// The compatibility strategy bundle carries the permit's mode
+			// into every tECDSA party this ceremony constructs; each retry
+			// attempt reuses it unchanged.
+			strategies, err := compatibility.StrategiesFor(currentMode)
+			if err != nil {
+				dkgLogger.Errorf(
+					"[member:%v] cannot select compatibility strategies: [%v]",
+					memberIndex,
+					err,
+				)
+				return
+			}
 			// operatorAddresses maps a sender's group member index (1-based) to
 			// its operator address so a mismatch can be attributed to an
 			// operator in the node-local cutover roster.
@@ -513,6 +526,7 @@ func (de *dkgExecutor) generateSigningGroup(
 						attempt.excludedMembersIndexes,
 						broadcastChannel,
 						membershipValidator,
+						strategies,
 					)
 					if err != nil {
 						dkgAttemptLogger.Errorf(

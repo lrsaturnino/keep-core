@@ -83,8 +83,10 @@ func (skgm *symmetricKeyGeneratingMember) generateSymmetricKeys(
 			ephemeralPubKeyMessage.ephemeralPublicKeys[skgm.id]
 
 		// Create symmetric key for the current group member and the other
-		// group member by ECDH'ing the public and private key.
-		symmetricKey := thisMemberEphemeralPrivateKey.Ecdh(
+		// group member by ECDH'ing the public and private key, using the
+		// ceremony's pinned key-derivation strategy.
+		symmetricKey := skgm.strategies.ECDH(
+			thisMemberEphemeralPrivateKey,
 			otherMemberEphemeralPublicKey,
 			dkgEcdhInfo(skgm.id, otherMember),
 		)
