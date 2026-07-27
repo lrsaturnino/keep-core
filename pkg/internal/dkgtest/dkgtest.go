@@ -85,17 +85,60 @@ func RunTest(
 	)
 }
 
+// RunTestWithModes executes the full DKG roundtrip test like RunTest, but
+// selects each member's compatibility strategy bundle through the given
+// selector instead of pinning security-v2 for every member. Homogeneous
+// legacy and mixed-mode cutover scenarios use it to prove per-mode protocol
+// behavior on the production execution path.
+func RunTestWithModes(
+	groupSize int,
+	honestThreshold int,
+	seed *big.Int,
+	rules interception.Rules,
+	strategiesForMember func(group.MemberIndex) compatibility.Strategies,
+) (*Result, error) {
+	return runTest(
+		groupSize,
+		honestThreshold,
+		seed,
+		interception.FromRules(rules),
+		strategiesForMember,
+	)
+}
+
 // RunTestWithStrategy executes the full DKG roundtrip test like RunTest, but
 // applies an interception.Strategy instead of the legacy modify-or-drop Rules.
 // A Strategy can additionally attribute each message to its sender, duplicate
 // it, or inject new messages - the building blocks for Byzantine-operator
 // simulation scenarios. RunTest is the special case
 // RunTestWithStrategy(..., interception.FromRules(rules)).
+//
+// The harness pins security-v2 strategies for every member: it exercises the
+// hardened protocol behavior end to end. Per-mode cutover coverage selects
+// explicit bundles through RunTestWithModes instead.
 func RunTestWithStrategy(
 	groupSize int,
 	honestThreshold int,
 	seed *big.Int,
 	strategy interception.Strategy,
+) (*Result, error) {
+	return runTest(
+		groupSize,
+		honestThreshold,
+		seed,
+		strategy,
+		func(group.MemberIndex) compatibility.Strategies {
+			return compatibility.SecurityV2()
+		},
+	)
+}
+
+func runTest(
+	groupSize int,
+	honestThreshold int,
+	seed *big.Int,
+	strategy interception.Strategy,
+	strategiesForMember func(group.MemberIndex) compatibility.Strategies,
 ) (*Result, error) {
 	operatorPrivateKey, operatorPublicKey, err := operator.GenerateKeyPair(local_v1.DefaultCurve)
 	if err != nil {
@@ -132,6 +175,7 @@ func RunTestWithStrategy(
 		localChain.GetLastDKGResult,
 		network,
 		selectedOperators,
+		strategiesForMember,
 	)
 }
 
@@ -144,6 +188,7 @@ func executeDKG(
 	),
 	network interception.Network,
 	selectedOperators []chain.Address,
+	strategiesForMember func(group.MemberIndex) compatibility.Strategies,
 ) (*Result, error) {
 	beaconConfig := beaconChain.GetConfig()
 
@@ -199,10 +244,6 @@ func executeDKG(
 	for i := 0; i < beaconConfig.GroupSize; i++ {
 		memberIndex := group.MemberIndex(i + 1) // capture for goroutine
 		go func() {
-			// The harness pins security-v2 strategies: it exercises the
-			// hardened protocol behavior end to end. Per-mode cutover
-			// coverage constructs its members with an explicit bundle
-			// instead of going through this harness.
 			signer, err := dkg.ExecuteDKG(
 				memberLogger,
 				seed,
@@ -212,7 +253,7 @@ func executeDKG(
 				broadcastChannel,
 				membershipValidator,
 				selectedOperators,
-				compatibility.SecurityV2(),
+				strategiesForMember(memberIndex),
 			)
 			if signer != nil {
 				signersMutex.Lock()

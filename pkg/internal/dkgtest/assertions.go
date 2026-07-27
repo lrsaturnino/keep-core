@@ -17,6 +17,14 @@ func AssertDkgResultPublished(t *testing.T, testResult *Result) {
 	}
 }
 
+// AssertNoDkgResultPublished checks that no DKG result reached the chain: the
+// fail-closed outcome of a ceremony that must not complete.
+func AssertNoDkgResultPublished(t *testing.T, testResult *Result) {
+	if testResult.dkgResult != nil {
+		t.Fatal("expected no dkg result to be published")
+	}
+}
+
 // reconstructionGuardMarker is a stable substring of the F-008 defensive guard's
 // Error message (gjkr/protocol.go ComputeGroupPublicKeyShares). Its appearance
 // means the reconstructed-share branch found peerSharesS missing an entry for an

@@ -131,6 +131,15 @@ func (n *node) JoinDKGIfEligible(
 			len(indexes),
 		)
 
+		if n.participationGate == nil {
+			// The gate is mandatory in production; participating without it
+			// would select a protocol mode implicitly. Fail closed.
+			dkgLogger.Errorf(
+				"no participation gate; refusing to join DKG",
+			)
+			return
+		}
+
 		broadcastChannel, err := n.netProvider.BroadcastChannelFor(channelName)
 		if err != nil {
 			dkgLogger.Errorf("failed to get broadcast channel: [%v]", err)
@@ -157,17 +166,55 @@ func (n *node) JoinDKGIfEligible(
 			// index should be in range [1, groupSize] so we need to add 1.
 			memberIndex := index + 1
 
+			// One participation permit per locally controlled member, issued
+			// immediately before the member goroutine. The permit pins the
+			// protocol mode from the ceremony's canonical chain anchor — the
+			// DKG started event block — for the ceremony's entire lifetime,
+			// and every wire-sensitive choice derives from the bundle it
+			// selects. A refusal is a gate decision, not an ordinary DKG
+			// failure.
+			permit, err := n.participationGate.Begin(
+				participation.BeaconDKG,
+				dkgStartBlockNumber,
+			)
+			if err != nil {
+				dkgLogger.Warnf(
+					"[member:%v] refused by the participation gate: [%v]",
+					memberIndex,
+					err,
+				)
+				continue
+			}
+
+			strategies, err := compatibility.StrategiesFor(permit.Mode())
+			if err != nil {
+				// Unreachable with a well-formed permit; refusing to
+				// participate is the only safe response to a mode without an
+				// explicit bundle.
+				permit.Close()
+				dkgLogger.Errorf(
+					"[member:%v] no compatibility strategies for the "+
+						"permitted mode: [%v]",
+					memberIndex,
+					err,
+				)
+				continue
+			}
+
 			go func() {
+				defer permit.Close()
+
 				n.protocolLatch.Lock()
 				defer n.protocolLatch.Unlock()
 
-				// TODO: The strategy bundle must come from the ceremony's
-				// participation permit once the gate is constructed and
-				// passed into the beacon node; until then the node
-				// participates in security-v2 mode unconditionally, which
-				// preserves the current behavior of this branch. This is a
-				// release blocker for the chain-clocked cutover: a node
-				// below the cutover block must run legacy strategies here.
+				dkgLogger.Infof(
+					"[member:%v] joining DKG with protocol mode [%s] "+
+						"[canonicalStartBlock=%v]",
+					memberIndex,
+					permit.Mode(),
+					permit.CanonicalStartBlock(),
+				)
+
 				signer, err := dkg.ExecuteDKG(
 					dkgLogger,
 					dkgSeed,
@@ -177,7 +224,7 @@ func (n *node) JoinDKGIfEligible(
 					broadcastChannel,
 					membershipValidator,
 					selectedOperators,
-					compatibility.SecurityV2(),
+					strategies,
 				)
 				if err != nil {
 					dkgLogger.Errorf("failed to execute dkg: [%v]", err)
