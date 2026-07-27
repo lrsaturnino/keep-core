@@ -144,11 +144,26 @@ func (pm *PerformanceMetrics) registerAllMetrics() {
 		MetricAnnouncerCrossFormatPeerTotal,
 		MetricAnnouncerLegacyPeerAdditionsTotal,
 		MetricAnnouncerLegacyPeerEvictionsTotal,
+		MetricParticipationModeLegacyTotal,
+		MetricParticipationModeSecurityV2Total,
+		MetricParticipationLegacyCompletionsAfterCutoverTotal,
+		MetricParticipationRefusalsTotal,
+		MetricParticipationCommitRefusalsTotal,
+		MetricParticipationClockErrorsTotal,
+		MetricParticipationClockAbortsTotal,
+		MetricParticipationQuiesceTotal,
+		MetricParticipationQuiesceForcedAbortsTotal,
+		MetricHeartbeatPenaltySuppressedTotal,
 	}
 
 	// Register per-reason network join failure counters
 	for _, reason := range GetAllNetworkJoinFailureReasons() {
 		counters = append(counters, NetworkJoinFailureMetricName(reason))
+	}
+
+	// Register per-ceremony participation refusal counters
+	for _, ceremony := range GetAllParticipationCeremonies() {
+		counters = append(counters, ParticipationRefusalMetricName(ceremony))
 	}
 
 	// First, initialize all counters in the map
@@ -314,6 +329,13 @@ func (pm *PerformanceMetrics) registerAllMetrics() {
 		MetricAnnouncerLegacyPeersCurrent,
 		MetricAnnouncerLegacyPeerOldestAgeBlocks,
 		MetricAnnouncerLegacyPeerRosterRevision,
+		MetricParticipationGateState,
+		MetricParticipationCurrentBlock,
+		MetricParticipationCutoverBlock,
+		MetricParticipationAllowed,
+		MetricParticipationActiveCeremonies,
+		MetricParticipationActiveLegacyCeremonies,
+		MetricParticipationActiveSecurityV2Ceremonies,
 	}
 
 	// First, initialize all gauges in the map
@@ -714,6 +736,31 @@ const (
 	MetricAnnouncerLegacyPeerRosterRevision  = "announcer_legacy_peer_roster_revision"
 	MetricAnnouncerLegacyPeerAdditionsTotal  = "announcer_legacy_peer_additions_total"
 	MetricAnnouncerLegacyPeerEvictionsTotal  = "announcer_legacy_peer_evictions_total"
+
+	// Protocol participation gate Metrics
+	//
+	// These back the chain-clocked cutover gate: the process participation
+	// state, the resolved cutover block, per-mode permit activity, and the
+	// refusal/abort/suppression evidence required for the cutover go/no-go
+	// and rollback decisions. Per-ceremony refusal counters are generated
+	// with ParticipationRefusalMetricName.
+	MetricParticipationGateState                          = "participation_gate_state"
+	MetricParticipationCurrentBlock                       = "participation_current_block"
+	MetricParticipationCutoverBlock                       = "participation_cutover_block"
+	MetricParticipationAllowed                            = "participation_allowed"
+	MetricParticipationActiveCeremonies                   = "participation_active_ceremonies"
+	MetricParticipationActiveLegacyCeremonies             = "participation_active_legacy_ceremonies"
+	MetricParticipationActiveSecurityV2Ceremonies         = "participation_active_security_v2_ceremonies"
+	MetricParticipationModeLegacyTotal                    = "participation_mode_legacy_total"
+	MetricParticipationModeSecurityV2Total                = "participation_mode_security_v2_total"
+	MetricParticipationLegacyCompletionsAfterCutoverTotal = "participation_legacy_completions_after_cutover_total"
+	MetricParticipationRefusalsTotal                      = "participation_refusals_total"
+	MetricParticipationCommitRefusalsTotal                = "participation_commit_refusals_total"
+	MetricParticipationClockErrorsTotal                   = "participation_clock_errors_total"
+	MetricParticipationClockAbortsTotal                   = "participation_clock_aborts_total"
+	MetricParticipationQuiesceTotal                       = "participation_quiesce_total"
+	MetricParticipationQuiesceForcedAbortsTotal           = "participation_quiesce_forced_aborts_total"
+	MetricHeartbeatPenaltySuppressedTotal                 = "heartbeat_penalty_suppressed_total"
 )
 
 // Network join request failure reasons. These are the low-cardinality
@@ -773,5 +820,32 @@ func GetAllWalletActionTypes() []string {
 		"redemption",
 		"moving_funds",
 		"moved_funds_sweep",
+	}
+}
+
+// ParticipationRefusalMetricName generates the per-ceremony refusal counter
+// name for the protocol participation gate. ceremony should be one of the
+// GetAllParticipationCeremonies values.
+// Format: participation_refusals_{ceremony}_total
+// Example: participation_refusals_tbtc_dkg_total
+func ParticipationRefusalMetricName(ceremony string) string {
+	return fmt.Sprintf("participation_refusals_%s_total", ceremony)
+}
+
+// GetAllParticipationCeremonies returns the fixed set of gated protocol
+// ceremonies whose per-ceremony refusal counters should be tracked. It must
+// stay in lockstep with the participation package's ceremony constants; a
+// drift test there asserts the two lists are identical.
+func GetAllParticipationCeremonies() []string {
+	return []string{
+		"tbtc_dkg",
+		"tbtc_wallet_coordination",
+		"tbtc_signing",
+		"tbtc_heartbeat",
+		"tbtc_inactivity_claim",
+		"beacon_dkg",
+		"beacon_relay_signing",
+		"beacon_relay_forwarding",
+		"beacon_timeout_report",
 	}
 }
