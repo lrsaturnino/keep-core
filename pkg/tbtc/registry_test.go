@@ -588,7 +588,15 @@ func (mph *mockPersistenceHandle) Archive(directory string) error {
 }
 
 func (mph *mockPersistenceHandle) Delete(directory string, name string) error {
-	panic("not implemented")
+	for i, descriptor := range mph.saved {
+		if descriptor.Directory() == directory && descriptor.Name() == name {
+			mph.saved = append(mph.saved[:i], mph.saved[i+1:]...)
+			return nil
+		}
+	}
+
+	// Deleting an absent entry is a no-op, matching the disk implementation.
+	return nil
 }
 
 type mockDescriptor struct {

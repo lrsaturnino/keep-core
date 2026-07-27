@@ -2,32 +2,42 @@ package tbtc
 
 // This file carries the in-repository part of the tBTC DKG cutover acceptance
 // evidence: the production DKG retry loop and announcer over real local
-// network providers, and real participation gates clocked by a local chain.
+// network providers, real participation gates clocked by a local chain, and —
+// for the security-v2 mode — complete tECDSA key-generation transcripts with
+// fixture pre-parameters, including generated key material, misbehavior
+// evidence, and signer persistence across a registry restart.
 //
-// The cases that require completing an actual tECDSA key-generation
-// transcript are out of unit-suite reach: the legacy transcript is blocked on
-// the reviewed tss-lib fork with an immutable per-party legacy mode, and the
-// homogeneous full-crypto controls (and the on-chain 90-active/10-misbehaved
-// consequence with reward ineligibility) belong to the exact-image rehearsal
-// in scripts/release/pr4109 and the Solidity suite. What is proven here is
+// The legacy-transcript cases remain out of unit-suite reach: they are
+// blocked on the reviewed tss-lib fork with an immutable per-party legacy
+// mode. The on-chain 90-active/10-misbehaved consequence with reward
+// ineligibility belongs to the Solidity suite, and the exact-image
+// mixed-release rehearsals to scripts/release/pr4109. What is proven here is
 // the anchor-derived mode selection, its immutability across the cutover
-// block, the quorum discipline of the retry loop, and the conversion of
+// block, the quorum discipline of the retry loop, the conversion of
 // post-cutover legacy peers into exclusion, mismatch metrics, and roster
-// evidence.
+// evidence, and the homogeneous security-v2 key-generation control.
 
 import (
+	"bytes"
 	"context"
+	"crypto/ecdsa"
 	"fmt"
 	"math/big"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/bnb-chain/tss-lib/ecdsa/keygen"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
+	"github.com/keep-network/keep-common/pkg/persistence"
 	"github.com/keep-network/keep-core/internal/testutils"
 	"github.com/keep-network/keep-core/pkg/chain"
 	"github.com/keep-network/keep-core/pkg/chain/local_v1"
 	"github.com/keep-network/keep-core/pkg/clientinfo"
 	"github.com/keep-network/keep-core/pkg/generator"
+	"github.com/keep-network/keep-core/pkg/internal/tecdsatest"
 	"github.com/keep-network/keep-core/pkg/net"
 	"github.com/keep-network/keep-core/pkg/net/local"
 	"github.com/keep-network/keep-core/pkg/operator"
@@ -36,6 +46,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/tecdsa/dkg"
+	"github.com/keep-network/keep-core/pkg/tecdsa/dkg/gen/pb"
 )
 
 // dkgCutoverGroup is a local test group whose seats have distinct wire
@@ -277,6 +288,546 @@ func TestDKGCutover_SecurityV2AnchorUsesHardenedSessionIDs(t *testing.T) {
 		0,
 		len(attemptExclusions[0]),
 	)
+}
+
+// marshaledTestPreParams converts the given tss-lib local pre-parameters into
+// the exact bytes the tECDSA pre-parameters storage persists, so a test
+// executor can restore them through the pool's ordinary restart path instead
+// of running the CPU-intensive generation. The layout mirrors the production
+// PreParams marshaling.
+func marshaledTestPreParams(
+	t *testing.T,
+	localPreParams keygen.LocalPreParams,
+) []byte {
+	t.Helper()
+
+	pbPreParams := &pb.PreParams{
+		Data: &pb.PreParams_LocalPreParams{
+			PaillierSK: &pb.PreParams_PrivateKey{
+				PublicKey: &pb.PreParams_PublicKey{
+					N: localPreParams.PaillierSK.N.Bytes(),
+				},
+				LambdaN: localPreParams.PaillierSK.LambdaN.Bytes(),
+				PhiN:    localPreParams.PaillierSK.PhiN.Bytes(),
+			},
+			NTilde: localPreParams.NTildei.Bytes(),
+			H1I:    localPreParams.H1i.Bytes(),
+			H2I:    localPreParams.H2i.Bytes(),
+			Alpha:  localPreParams.Alpha.Bytes(),
+			Beta:   localPreParams.Beta.Bytes(),
+			P:      localPreParams.P.Bytes(),
+			Q:      localPreParams.Q.Bytes(),
+		},
+		CreationTimestamp: timestamppb.Now(),
+	}
+
+	preParamsBytes, err := proto.Marshal(pbPreParams)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return preParamsBytes
+}
+
+// newSeededTecdsaExecutor builds a real tECDSA DKG executor whose
+// pre-parameters pool restores the given member's fixture pre-parameters from
+// persistence — the executor's ordinary restart path — so an attempt can run
+// the complete key-generation transcript without the CPU-intensive
+// pre-parameters generation. The scheduler's permanently locked latch stops
+// the pool's background generation within one scheduler tick.
+func newSeededTecdsaExecutor(
+	t *testing.T,
+	localPreParams keygen.LocalPreParams,
+) *dkg.Executor {
+	t.Helper()
+
+	workPersistence := &mockPersistenceHandle{
+		saved: []persistence.DataDescriptor{
+			&mockDescriptor{
+				name:      "pp_seeded",
+				directory: "preparams",
+				content:   marshaledTestPreParams(t, localPreParams),
+			},
+		},
+	}
+
+	return dkg.NewExecutor(
+		&testutils.MockLogger{},
+		newTestScheduler(t),
+		workPersistence,
+		1,             // pool size: exactly the seeded entry
+		2*time.Minute, // pre-params generation timeout
+		time.Hour,     // pre-params generation delay
+		1,             // pre-params generation concurrency
+		10,            // key-generation concurrency, as in the protocol tests
+	)
+}
+
+// dkgCutoverMemberOutcome carries one member's DKG retry-loop outcome across
+// the per-member goroutine boundary.
+type dkgCutoverMemberOutcome struct {
+	memberIndex group.MemberIndex
+	result      *dkg.Result
+	sessionIDs  []string
+	err         error
+}
+
+// runRealDKGCutoverMember mirrors the production per-member DKG pipeline over
+// the given cutover group: one participation permit issued from the canonical
+// anchor, the production broadcast-channel setup, announcer, and retry loop,
+// and a real tECDSA key-generation execution per attempt. The outcome is
+// always delivered to the outcomes channel, exactly once.
+func runRealDKGCutoverMember(
+	ctx context.Context,
+	cutoverGroup *dkgCutoverGroup,
+	gate participation.Gate,
+	groupParameters *GroupParameters,
+	seed *big.Int,
+	anchor uint64,
+	memberIndex group.MemberIndex,
+	tecdsaExecutor *dkg.Executor,
+	outcomes chan<- *dkgCutoverMemberOutcome,
+) {
+	outcome := &dkgCutoverMemberOutcome{memberIndex: memberIndex}
+	defer func() { outcomes <- outcome }()
+
+	permit, err := gate.Begin(participation.TBTCDKG, anchor)
+	if err != nil {
+		outcome.err = fmt.Errorf("gate refused the permit: [%w]", err)
+		return
+	}
+	defer permit.Close()
+
+	if permit.Mode() != participation.ModeSecurityV2 {
+		outcome.err = fmt.Errorf(
+			"unexpected permit mode [%s] for anchor [%v]",
+			permit.Mode(),
+			anchor,
+		)
+		return
+	}
+
+	channelName := fmt.Sprintf("%s-%s", ProtocolName, seed.Text(16))
+	channel, err := cutoverGroup.provider(memberIndex).BroadcastChannelFor(
+		channelName,
+	)
+	if err != nil {
+		outcome.err = err
+		return
+	}
+
+	dkg.RegisterUnmarshallers(channel)
+	announcer.RegisterUnmarshaller(channel)
+	if err := channel.SetFilter(cutoverGroup.validator.IsInGroup); err != nil {
+		outcome.err = err
+		return
+	}
+
+	memberAnnouncer := announcer.New(
+		fmt.Sprintf("%v-%v", ProtocolName, "dkg"),
+		channel,
+		cutoverGroup.validator,
+	)
+
+	retryLoop := newDkgRetryLoop(
+		logger,
+		seed,
+		permit.Mode(),
+		anchor,
+		memberIndex,
+		cutoverGroup.operators,
+		groupParameters,
+		memberAnnouncer,
+		3,
+	)
+
+	waitFn := newChainWaitForBlockFn(cutoverGroup.blockCounter)
+
+	outcome.result, outcome.err = retryLoop.start(
+		ctx,
+		waitFn,
+		func(attempt *dkgAttemptParams) (*dkg.Result, error) {
+			outcome.sessionIDs = append(outcome.sessionIDs, attempt.sessionID)
+
+			attemptCtx, cancelAttemptCtx := withCancelOnBlock(
+				ctx,
+				attempt.timeoutBlock,
+				waitFn,
+			)
+			defer cancelAttemptCtx()
+
+			return tecdsaExecutor.Execute(
+				attemptCtx,
+				&testutils.MockLogger{},
+				seed,
+				attempt.sessionID,
+				memberIndex,
+				groupParameters.GroupSize,
+				groupParameters.DishonestThreshold(),
+				attempt.excludedMembersIndexes,
+				channel,
+				cutoverGroup.validator,
+			)
+		},
+	)
+}
+
+// TestDKGCutover_HomogeneousSecurityV2RealKeyGeneration proves the smoke-gate-2
+// homogeneous security-v2 control with a complete key-generation transcript: a
+// full cohort whose ceremony is canonically anchored at the cutover block runs
+// the production retry loop and announcer over real local network providers,
+// executes the real tECDSA key-generation protocol under the hardened session
+// ID, and every member derives the same wallet public key with no misbehavior
+// evidence. The generated signers then pass through the production
+// result-to-signer transformation and registry persistence, and a registry
+// restart — a fresh registry over the same persistence — restores the wallet
+// and all memberships. Result-publication fencing is covered separately by the
+// completion-fence tests.
+func TestDKGCutover_HomogeneousSecurityV2RealKeyGeneration(t *testing.T) {
+	groupParameters := &GroupParameters{
+		GroupSize:       3,
+		GroupQuorum:     2,
+		HonestThreshold: 2,
+	}
+
+	// A block time roomy enough for the real key-generation transcript to
+	// complete within one attempt's protocol window, race detector included.
+	cutoverGroup := setupDKGCutoverGroup(
+		t,
+		groupParameters.GroupSize,
+		100*time.Millisecond,
+	)
+
+	testData, err := tecdsatest.LoadPrivateKeyShareTestFixtures(
+		groupParameters.GroupSize,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Cross the cutover block before the ceremony starts: the canonical
+	// anchor is the cutover block itself while the current height is already
+	// past it.
+	cutoverBlock := uint64(2)
+	if err := cutoverGroup.blockCounter.WaitForBlockHeight(
+		cutoverBlock + 1,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	gate := newTestGateWithCutover(t, cutoverGroup.blockCounter, cutoverBlock)
+
+	seed := big.NewInt(0x2C0DE)
+
+	loopCtx, cancelLoopCtx := context.WithTimeout(
+		context.Background(),
+		120*time.Second,
+	)
+	defer cancelLoopCtx()
+
+	outcomes := make(
+		chan *dkgCutoverMemberOutcome,
+		groupParameters.GroupSize,
+	)
+	for i := 1; i <= groupParameters.GroupSize; i++ {
+		memberIndex := group.MemberIndex(i)
+		tecdsaExecutor := newSeededTecdsaExecutor(
+			t,
+			testData[i-1].LocalPreParams,
+		)
+
+		go runRealDKGCutoverMember(
+			loopCtx,
+			cutoverGroup,
+			gate,
+			groupParameters,
+			seed,
+			cutoverBlock,
+			memberIndex,
+			tecdsaExecutor,
+			outcomes,
+		)
+	}
+
+	results := make(map[group.MemberIndex]*dkg.Result)
+	for i := 0; i < groupParameters.GroupSize; i++ {
+		outcome := <-outcomes
+		if outcome.err != nil {
+			t.Fatalf(
+				"member [%v] failed: [%v]",
+				outcome.memberIndex,
+				outcome.err,
+			)
+		}
+
+		testutils.AssertIntsEqual(
+			t,
+			fmt.Sprintf("attempts of member [%v]", outcome.memberIndex),
+			1,
+			len(outcome.sessionIDs),
+		)
+		testutils.AssertStringsEqual(
+			t,
+			fmt.Sprintf("attempt session ID of member [%v]", outcome.memberIndex),
+			compatibility.SecurityV2().DKGSessionID(seed, 1),
+			outcome.sessionIDs[0],
+		)
+
+		results[outcome.memberIndex] = outcome.result
+	}
+
+	referencePublicKeyBytes, err := results[1].GroupPublicKeyBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for memberIndex, result := range results {
+		testutils.AssertIntsEqual(
+			t,
+			fmt.Sprintf("misbehaved members of member [%v]", memberIndex),
+			0,
+			len(result.MisbehavedMembersIndexes()),
+		)
+
+		publicKeyBytes, err := result.GroupPublicKeyBytes()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(referencePublicKeyBytes, publicKeyBytes) {
+			t.Errorf(
+				"member [%v] derived group public key [0x%x] "+
+					"instead of [0x%x]",
+				memberIndex,
+				publicKeyBytes,
+				referencePublicKeyBytes,
+			)
+		}
+	}
+
+	// The production result-to-signer transformation and persistence: all
+	// three memberships register against one registry, as a single node
+	// controlling three seats would.
+	walletPersistence := &mockPersistenceHandle{}
+	walletRegistry, err := newWalletRegistry(
+		walletPersistence,
+		cutoverGroup.localChain.CalculateWalletID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	registrar := &dkgExecutor{
+		groupParameters: groupParameters,
+		walletRegistry:  walletRegistry,
+	}
+
+	var walletPublicKey *ecdsa.PublicKey
+	for memberIndex, result := range results {
+		registeredSigner, err := registrar.registerSigner(
+			result,
+			memberIndex,
+			cutoverGroup.operators,
+		)
+		if err != nil {
+			t.Fatalf(
+				"failed to register the signer of member [%v]: [%v]",
+				memberIndex,
+				err,
+			)
+		}
+		walletPublicKey = registeredSigner.wallet.publicKey
+	}
+
+	testutils.AssertIntsEqual(
+		t,
+		"active signers after registration",
+		groupParameters.GroupSize,
+		len(walletRegistry.getSigners(walletPublicKey)),
+	)
+
+	// A registry restart: a fresh registry over the same persistence must
+	// restore the wallet and all generated memberships.
+	restartedRegistry, err := newWalletRegistry(
+		walletPersistence,
+		cutoverGroup.localChain.CalculateWalletID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	testutils.AssertIntsEqual(
+		t,
+		"active signers after the registry restart",
+		groupParameters.GroupSize,
+		len(restartedRegistry.getSigners(walletPublicKey)),
+	)
+}
+
+// TestDKGCutover_RealKeyGenerationExcludesSilentPeer proves that the
+// production retry loop and the real tECDSA key-generation protocol convert a
+// silent post-cutover peer into misbehavior evidence: the two live members
+// exclude the never-announcing seat at quorum, complete the real transcript
+// without it, report it in the result's misbehaved members, and the
+// production result-to-signer transformation resolves the reduced final
+// signing group with remapped member indexes. This is the off-chain half of
+// the 90-active/10-misbehaved consequence; the on-chain acceptance and reward
+// ineligibility belong to the Solidity suite.
+func TestDKGCutover_RealKeyGenerationExcludesSilentPeer(t *testing.T) {
+	groupParameters := &GroupParameters{
+		GroupSize:       3,
+		GroupQuorum:     2,
+		HonestThreshold: 2,
+	}
+
+	cutoverGroup := setupDKGCutoverGroup(
+		t,
+		groupParameters.GroupSize,
+		100*time.Millisecond,
+	)
+
+	testData, err := tecdsatest.LoadPrivateKeyShareTestFixtures(
+		groupParameters.GroupSize,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cutoverBlock := uint64(2)
+	if err := cutoverGroup.blockCounter.WaitForBlockHeight(
+		cutoverBlock + 1,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	gate := newTestGateWithCutover(t, cutoverGroup.blockCounter, cutoverBlock)
+
+	seed := big.NewInt(0x51137)
+	silentMemberIndex := group.MemberIndex(2)
+	liveMembersIndexes := []group.MemberIndex{1, 3}
+
+	loopCtx, cancelLoopCtx := context.WithTimeout(
+		context.Background(),
+		120*time.Second,
+	)
+	defer cancelLoopCtx()
+
+	outcomes := make(
+		chan *dkgCutoverMemberOutcome,
+		len(liveMembersIndexes),
+	)
+	for _, memberIndex := range liveMembersIndexes {
+		tecdsaExecutor := newSeededTecdsaExecutor(
+			t,
+			testData[memberIndex-1].LocalPreParams,
+		)
+
+		go runRealDKGCutoverMember(
+			loopCtx,
+			cutoverGroup,
+			gate,
+			groupParameters,
+			seed,
+			cutoverBlock,
+			memberIndex,
+			tecdsaExecutor,
+			outcomes,
+		)
+	}
+
+	results := make(map[group.MemberIndex]*dkg.Result)
+	for i := 0; i < len(liveMembersIndexes); i++ {
+		outcome := <-outcomes
+		if outcome.err != nil {
+			t.Fatalf(
+				"member [%v] failed: [%v]",
+				outcome.memberIndex,
+				outcome.err,
+			)
+		}
+		results[outcome.memberIndex] = outcome.result
+	}
+
+	referencePublicKeyBytes, err := results[1].GroupPublicKeyBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, memberIndex := range liveMembersIndexes {
+		result := results[memberIndex]
+
+		misbehaved := result.MisbehavedMembersIndexes()
+		testutils.AssertIntsEqual(
+			t,
+			fmt.Sprintf("misbehaved members of member [%v]", memberIndex),
+			1,
+			len(misbehaved),
+		)
+		testutils.AssertIntsEqual(
+			t,
+			fmt.Sprintf("misbehaved member index of member [%v]", memberIndex),
+			int(silentMemberIndex),
+			int(misbehaved[0]),
+		)
+
+		publicKeyBytes, err := result.GroupPublicKeyBytes()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(referencePublicKeyBytes, publicKeyBytes) {
+			t.Errorf(
+				"member [%v] derived group public key [0x%x] "+
+					"instead of [0x%x]",
+				memberIndex,
+				publicKeyBytes,
+				referencePublicKeyBytes,
+			)
+		}
+	}
+
+	// The reduced final signing group: the silent seat is dropped and the
+	// remaining member indexes are remapped to consecutive positions.
+	walletRegistry, err := newWalletRegistry(
+		&mockPersistenceHandle{},
+		cutoverGroup.localChain.CalculateWalletID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	registrar := &dkgExecutor{
+		groupParameters: groupParameters,
+		walletRegistry:  walletRegistry,
+	}
+
+	expectedFinalIndexes := map[group.MemberIndex]group.MemberIndex{
+		1: 1,
+		3: 2,
+	}
+	for _, memberIndex := range liveMembersIndexes {
+		registeredSigner, err := registrar.registerSigner(
+			results[memberIndex],
+			memberIndex,
+			cutoverGroup.operators,
+		)
+		if err != nil {
+			t.Fatalf(
+				"failed to register the signer of member [%v]: [%v]",
+				memberIndex,
+				err,
+			)
+		}
+
+		testutils.AssertIntsEqual(
+			t,
+			fmt.Sprintf("final signing group size of member [%v]", memberIndex),
+			len(liveMembersIndexes),
+			len(registeredSigner.wallet.signingGroupOperators),
+		)
+		testutils.AssertIntsEqual(
+			t,
+			fmt.Sprintf("final member index of member [%v]", memberIndex),
+			int(expectedFinalIndexes[memberIndex]),
+			int(registeredSigner.signingGroupMemberIndex),
+		)
+	}
 }
 
 // TestDKGCutover_LegacyAnchorPinnedThroughRetriesAcrossCutover proves the
