@@ -1,8 +1,8 @@
 /* eslint-disable @typescript-eslint/no-unused-expressions */
 import { deployments, ethers, getUnnamedAccounts, helpers } from "hardhat"
-import { smock } from "@defi-wonderland/smock"
 import { expect } from "chai"
 
+import { createMock } from "./helpers/mock"
 import {
   constants,
   params,
@@ -14,7 +14,7 @@ import {
 
 import type { IWalletOwner } from "../typechain/IWalletOwner"
 import type { IRandomBeacon } from "../typechain/IRandomBeacon"
-import type { FakeContract } from "@defi-wonderland/smock"
+import type { Mock } from "./helpers/mock"
 import type { SignerWithAddress } from "@nomiclabs/hardhat-ethers/signers"
 import type {
   WalletRegistry,
@@ -74,8 +74,8 @@ describe("WalletRegistry - Custom Errors", () => {
   let operator: SignerWithAddress
   let authorizer: SignerWithAddress
   let beneficiary: SignerWithAddress
-  let walletOwner: FakeContract<IWalletOwner>
-  let randomBeacon: FakeContract<IRandomBeacon>
+  let walletOwner: Mock<IWalletOwner>
+  let randomBeacon: Mock<IRandomBeacon>
 
   const stakedAmount = to1e18(1000000) // 1M T
   let minimumAuthorization
@@ -123,7 +123,7 @@ describe("WalletRegistry - Custom Errors", () => {
       .registerOperator(operator.address)
 
     // Mock random beacon
-    randomBeacon = await smock.fake<IRandomBeacon>("IRandomBeacon")
+    randomBeacon = await createMock<IRandomBeacon>("IRandomBeacon")
   })
 
   describe("Authorization Errors", () => {
