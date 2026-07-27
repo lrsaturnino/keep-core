@@ -42,7 +42,10 @@ stages:
                       boundary modes, pre-C permit surviving C, quiescence and
                       the signal lifecycle, forced shutdown and clock-failure
                       quarantine, penalty suppression, forwarding lifecycle,
-                      held-wait cancellation, and the offline state audit
+                      held-wait cancellation, the offline state audit, and the
+                      tBTC cutover ceremony suites — real security-v2
+                      transcripts, the production-scale 90/10 split, heartbeat
+                      bands, and roster wiring — under the race detector
                       (runs today, no Docker)
   preflight           validate the container-rehearsal inputs and image digests
   single-release      exact-image cutover rehearsal: prior+R1 mixed fleet
@@ -102,6 +105,9 @@ stage_local_proofs() {
       ./cmd/
     go test -count=1 -race ./cmd/participation-state-audit/
     go test -count=1 -run 'TestDecodeSignerAuditRecord' ./pkg/tbtc/
+    go test -count=1 -race -timeout 900s \
+      -run 'Cutover|HandleAnnouncerSessionMismatch' \
+      ./pkg/tbtc/
   ) 2>&1 | tee "${log}"
 
   note "local proofs recorded in ${log}"

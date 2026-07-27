@@ -96,3 +96,6 @@ target/
 dist/
 .DS_Store
 build/
+
+# Locally produced cutover rehearsal evidence (rehearse.sh)
+scripts/release/pr4109/rehearsal-evidence/

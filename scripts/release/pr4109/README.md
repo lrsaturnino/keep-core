@@ -14,8 +14,11 @@ This directory holds two harnesses for the coordinated security release:
 The chain-clocked cutover machinery — the participation gate, per-ceremony
 permits, commit fences, quiescence and the signal lifecycle controller, and
 the signer quarantine namespace — is implemented in this tree and proven by
-repository-local Go tests. Run those proofs, which need no Docker or chain,
-with:
+repository-local Go tests, together with the tBTC cutover ceremony
+acceptance suites under the race detector: real security-v2 key-generation
+transcripts, the production-scale 90/10 split exclusion, heartbeat
+inactivity bands, and cutover roster wiring. Run those proofs, which need no
+Docker or chain, with:
 
 ```
 ./rehearse.sh local-proofs
