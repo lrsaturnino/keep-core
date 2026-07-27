@@ -1540,9 +1540,11 @@ func TestDKGCutover_RealKeyGenerationExcludesLegacyPeerAtQuorum(t *testing.T) {
 // hundred-member equivalent the Solidity suite accepts at the ninety-active
 // boundary and punishes with the reward ban. The group size is the largest
 // this repository can drive with distinct real pre-parameters per live
-// member; the same arithmetic at the production hundred-member parameters is
-// proven by TestDKGCutover_PostCutoverSplitExcludesLegacyPeersAtProductionScale
-// and the exact-image rehearsals. All ten stragglers become mismatch metrics
+// member; TestDKGCutover_PostCutoverSplitExcludesLegacyPeersAtProductionScale
+// pins the same exclusion arithmetic at the production hundred-member
+// parameters with a stubbed protocol execution, and a real transcript at
+// that scale remains outstanding with the not-yet-executed exact-image
+// rehearsals. All ten stragglers become mismatch metrics
 // and deduplicated roster evidence, and the production result-to-signer
 // transformation remaps the four survivors to consecutive final indexes.
 func TestDKGCutover_RealKeyGenerationExcludesTenLegacyPeers(t *testing.T) {
