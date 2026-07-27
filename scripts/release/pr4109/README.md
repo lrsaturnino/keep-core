@@ -1,13 +1,17 @@
 # Release rehearsal and smoke harnesses
 
-This directory holds two harnesses for the coordinated security release:
+This directory holds the release-engineering scaffolding for the coordinated
+security release:
 
 1. the container smoke matrix for the temporary `clientInfo.port` **9601
    compatibility default** — `clientinfo-port-smoke.sh` and `compose.yaml`;
-   and
 2. the single-release **cutover rehearsal** scaffold — `rehearse.sh`,
    `compose.rehearsal.yaml`, and `rehearsal-evidence.schema.json`, driven
-   manually or through the `cutover-rehearsal` workflow.
+   manually or through the `cutover-rehearsal` workflow; and
+3. the **release manifest** binding the service-manager termination grace to
+   the client's compiled protocol bounds — `release-manifest.json`,
+   `release-manifest.schema.json`, and the deployment scaffold under
+   `deploy/`.
 
 ## Cutover rehearsal scaffold
 
@@ -144,6 +148,60 @@ bundle MUST contain throwaway rehearsal keys only — never production
 operator keys — and the dispatch reports `BLOCKED` when the secret is not
 provisioned. The companion `REHEARSAL_KEEP_ETHEREUM_PASSWORD` secret carries
 the key files' password.
+
+## Release manifest: service-manager termination grace
+
+A terminating node drains instead of dying: the first SIGTERM quiesces the
+participation gate, already-started ceremonies run to natural completion, and
+only the in-process backstop — `(maximum legacy completion bound + reviewed
+margin) × upper block interval + RPC/processing allowance`, armed by
+`quiesceBackstopDeadline` in `cmd/start.go` — forces the remainder through the
+audited forced-cancellation path. All of that is useless if the external
+service manager SIGKILLs the process first: the Kubernetes default grace is
+30 s and systemd's is typically 90 s, both hours short of the drain a node may
+legitimately need. The release manifest exists to close that gap fail-closed
+rather than by hand-tuned deployment values.
+
+`release-manifest.json` records every input of the external grace — the tBTC
+and beacon completion bounds with the beacon chain configuration they came
+from, the reviewed quiesce margin, the upper block interval, the
+RPC/processing allowance, and the resulting in-process backstop — plus the one
+reviewed input that is not compiled into the client: the forced-cancellation
+allowance between the backstop firing and SIGKILL. The authoritative external
+grace is the checked sum `in_process_backstop_seconds +
+forced_cancellation_allowance_seconds` (currently `19800 + 300 = 20100`
+seconds). The client never reads the manifest at runtime; its bounds are
+compiled in, and the manifest exists so the SIGKILL deadline is derived from
+those same bounds.
+
+The chain is enforced at three layers, each fail-closed:
+
+- `keep-client release-manifest derive` prints the manifest derived from the
+  binary's compiled bounds, and `keep-client release-manifest validate
+  --manifest <path>` re-derives every number and rejects the manifest on any
+  mismatch, reporting every violation at once. Because the subcommand ships in
+  the client binary, the exact-image rehearsal can validate the manifest with
+  the very artifact under test.
+- `go test ./cmd/ -run TestReleaseManifest` pins the checked-in manifest to
+  the compiled bounds and the deployment scaffold to the manifest, so a
+  changed protocol constant, a stale manifest, and a drifted scaffold value
+  all fail the ordinary test suite; the strict loader additionally rejects
+  unknown fields, trailing content, and non-integer numbers. The
+  `local-proofs` stage runs these checks under the race detector.
+- `release-manifest.schema.json` describes the document shape for external
+  tooling; schema validity alone is never authority — only the compiled-bound
+  validation is.
+
+`deploy/` carries the two scaffold fragments operators apply, each holding
+exactly the manifest's grace: `keep-client-termination-grace.k8s-patch.yaml`
+(`spec.template.spec.terminationGracePeriodSeconds`, applied with `kubectl
+patch --patch-file`) and `keep-client-termination-grace.systemd-dropin.conf`
+(`TimeoutStopSec` plus an explicit `KillSignal=SIGTERM`, installed as a
+`<unit>.service.d/` drop-in). The grace is a ceiling, not a wait — a node
+whose drain completes exits immediately. Changing any compiled bound or the
+reviewed allowance requires regenerating the manifest with `derive`,
+re-reviewing it, and updating both scaffold fragments; the `cmd` tests refuse
+any shortcut through that sequence.
 
 ## Hard external dependencies
 

@@ -1,0 +1,29 @@
+# Kubernetes strategic-merge patch configuring the service-manager
+# termination grace for a keep-client pod running the cutover release.
+#
+# The value is termination_grace_period_seconds from
+# ../release-manifest.json: the client's in-process quiesce backstop
+# (19800 s — the compiled maximum legacy completion bound plus the reviewed
+# margin, converted at the reviewed upper block interval, plus the
+# RPC/processing allowance) plus the reviewed forced-cancellation allowance
+# (300 s). Without this patch the Kubernetes default of 30 s SIGKILLs a
+# draining node hours before already-started protocol work can complete and
+# before the audited forced-cancellation path runs.
+#
+# The grace is a ceiling, not a wait: a node whose drain completes exits
+# immediately. Kubernetes delivers SIGTERM to the container's PID 1 at
+# deletion, which is what starts the drain, so the container MUST run
+# keep-client as PID 1 (exec-form entrypoint, no wrapping shell).
+#
+# Apply to each keep-client workload, for example:
+#   kubectl patch statefulset <keep-client-name> \
+#     --patch-file keep-client-termination-grace.k8s-patch.yaml
+#
+# `go test ./cmd/ -run TestReleaseManifest` rejects this file whenever its
+# value stops matching the validated release manifest; regenerate the
+# manifest with `keep-client release-manifest derive` and re-review both
+# together.
+spec:
+  template:
+    spec:
+      terminationGracePeriodSeconds: 20100

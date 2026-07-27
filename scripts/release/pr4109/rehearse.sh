@@ -446,7 +446,7 @@ stage_local_proofs() {
       -run 'TestSubmitDKGResult|TestSyncExecute' \
       ./pkg/beacon/dkg/result/ ./pkg/protocol/state/
     go test -count=1 -race \
-      -run 'TestAwaitQuiesce|TestQuiesceBackstop|TestSignalLifecycle' \
+      -run 'TestAwaitQuiesce|TestQuiesceBackstop|TestSignalLifecycle|TestMaximumLegacyCompletionBlocks|TestReleaseManifest' \
       ./cmd/
     go test -count=1 -race ./cmd/participation-state-audit/
     go test -count=1 -run 'TestDecodeSignerAuditRecord' ./pkg/tbtc/

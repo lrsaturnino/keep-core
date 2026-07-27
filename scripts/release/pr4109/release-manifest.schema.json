@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Release manifest: service-manager termination grace",
+  "description": "Reviewed record binding the external service-manager termination grace to the client's compiled protocol bounds. Schema validation alone is never sufficient: the numbers must also pass `keep-client release-manifest validate`, which re-derives every field from the compiled bounds of the exact release binary.",
+  "type": "object",
+  "required": ["schema_version", "generated_at", "protocol_epoch", "termination_grace"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "protocol_epoch": { "const": "security_v2_cutover" },
+    "termination_grace": {
+      "type": "object",
+      "required": [
+        "tbtc_completion_blocks",
+        "beacon_completion_blocks",
+        "beacon_inputs",
+        "maximum_legacy_completion_blocks",
+        "reviewed_margin_blocks",
+        "upper_block_interval_seconds",
+        "rpc_processing_allowance_seconds",
+        "in_process_backstop_seconds",
+        "forced_cancellation_allowance_seconds",
+        "termination_grace_period_seconds"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "tbtc_completion_blocks": {
+          "description": "tbtc.MaximumLegacyCompletionBlocks(): the longest already-started tBTC work may legitimately run, in blocks.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "beacon_completion_blocks": {
+          "description": "beacon.MaximumLegacyCompletionBlocks(config): the longest already-started beacon work may legitimately run, in blocks.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "beacon_inputs": {
+          "description": "The beacon chain configuration the beacon bound was derived from, for reviewer retracing.",
+          "type": "object",
+          "required": ["group_size", "result_publication_block_step", "relay_entry_timeout_blocks"],
+          "additionalProperties": false,
+          "properties": {
+            "group_size": { "type": "integer", "minimum": 1 },
+            "result_publication_block_step": { "type": "integer", "minimum": 0 },
+            "relay_entry_timeout_blocks": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "maximum_legacy_completion_blocks": {
+          "description": "max(tbtc, beacon) completion bound: the starting input of both the in-process backstop and the external grace.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "reviewed_margin_blocks": {
+          "description": "Reviewed block margin absorbing chain-clock jitter around the completion bound (quiesceReviewedMarginBlocks).",
+          "type": "integer",
+          "minimum": 0
+        },
+        "upper_block_interval_seconds": {
+          "description": "Conservative upper bound on the Ethereum block interval used for the block-to-wall-clock conversion (quiesceUpperBlockIntervalSeconds).",
+          "type": "integer",
+          "minimum": 1
+        },
+        "rpc_processing_allowance_seconds": {
+          "description": "RPC and processing skew allowance inside the in-process backstop (quiesceBackstopMargin).",
+          "type": "integer",
+          "minimum": 0
+        },
+        "in_process_backstop_seconds": {
+          "description": "(maximum_legacy_completion_blocks + reviewed_margin_blocks) * upper_block_interval_seconds + rpc_processing_allowance_seconds — the deadline quiesceBackstopDeadline() arms in the client.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "forced_cancellation_allowance_seconds": {
+          "description": "Reviewed allowance for the audited forced-cancellation path after the backstop fires and before SIGKILL. Must be positive: the external grace must end strictly after the in-process backstop.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "termination_grace_period_seconds": {
+          "description": "in_process_backstop_seconds + forced_cancellation_allowance_seconds — the exact value deployment scaffolds must configure (Kubernetes terminationGracePeriodSeconds, systemd TimeoutStopSec).",
+          "type": "integer",
+          "minimum": 2
+        },
+        "notes": { "type": "string" }
+      }
+    }
+  }
+}
