@@ -1381,6 +1381,148 @@ func TestGate_UnprojectableHeightIsClockFailure(t *testing.T) {
 	}
 }
 
+// TestGate_StaleUnprojectableHeightStillFailsItsOperation pins that an
+// unprojectable height belongs to its own read's result: a Begin whose read
+// snapshots a height above the metric projection limit fails closed even when
+// a newer valid sample applies first, discards the stale sample, and keeps the
+// gate available. The discarded sample must not fail the gate or cancel
+// permits, exactly like a superseded RPC error.
+func TestGate_StaleUnprojectableHeightStillFailsItsOperation(t *testing.T) {
+	// Constructing at the cutover height fires the construction-armed cutover
+	// waiter immediately, so its one-shot telemetry poll is the only background
+	// read; wait it out so nothing races the held-read choreography below.
+	gate, blockCounter, metrics := newTestGate(
+		t, Schedule{CutoverBlock: 1000}, 1000, inertPollInterval,
+	)
+	eventually(t, func() bool { return blockCounter.readCount() >= 2 })
+
+	existing, err := gate.Begin(TBTCSigning, 1000)
+	if err != nil {
+		t.Fatalf("unexpected error: [%v]", err)
+	}
+	defer existing.Close()
+
+	// The held read snapshots an unprojectable height, then stalls in flight.
+	blockCounter.set(maxSafeMetricInteger+1, nil)
+	started, release := blockCounter.holdNextRead()
+
+	staleResult := make(chan error, 1)
+	go func() {
+		p, err := gate.Begin(TBTCDKG, 1000)
+		if err == nil {
+			p.Close()
+		}
+		staleResult <- err
+	}()
+	<-started
+
+	// The chain recovers and a newer read succeeds before the stale
+	// unprojectable sample lands.
+	blockCounter.set(1005, nil)
+	fresh, err := gate.Begin(BeaconDKG, 1005)
+	if err != nil {
+		t.Fatalf("unexpected error after recovery: [%v]", err)
+	}
+	defer fresh.Close()
+
+	release()
+	// The operation whose own read was unprojectable still fails closed.
+	if err := <-staleResult; !errors.Is(err, ErrClockUnavailable) {
+		t.Errorf("expected the stale Begin to fail closed, got: [%v]", err)
+	}
+	// But the discarded stale sample must not have transitioned the gate or
+	// canceled anything.
+	snapshot := gate.State()
+	if snapshot.State != StateOpenSecurityV2 {
+		t.Errorf("expected open_security_v2 state, got [%s]", snapshot.State)
+	}
+	if !snapshot.ClockAvailable {
+		t.Error("expected the clock to stay available")
+	}
+	if snapshot.CurrentBlock != 1005 {
+		t.Errorf(
+			"expected the newer valid height [1005] to remain, got [%d]",
+			snapshot.CurrentBlock,
+		)
+	}
+	select {
+	case <-existing.Context().Done():
+		t.Error("a stale unprojectable sample must not cancel permits")
+	default:
+	}
+	if got := metrics.counter(
+		clientinfo.MetricParticipationClockAbortsTotal,
+	); got != 0 {
+		t.Errorf("expected zero clock aborts, got [%f]", got)
+	}
+}
+
+// TestGate_StaleUnprojectableHeightStillFailsItsFence pins the same guarantee
+// for the commit fence path: a fence whose own read snapshots an unprojectable
+// height refuses even when a newer valid sample applied first and kept the
+// gate available for everyone else.
+func TestGate_StaleUnprojectableHeightStillFailsItsFence(t *testing.T) {
+	gate, blockCounter, metrics := newTestGate(
+		t, Schedule{CutoverBlock: 1000}, 1000, inertPollInterval,
+	)
+	eventually(t, func() bool { return blockCounter.readCount() >= 2 })
+
+	permit, err := gate.Begin(TBTCSigning, 1000)
+	if err != nil {
+		t.Fatalf("unexpected error: [%v]", err)
+	}
+	defer permit.Close()
+	other, err := gate.Begin(TBTCHeartbeat, 1000)
+	if err != nil {
+		t.Fatalf("unexpected error: [%v]", err)
+	}
+	defer other.Close()
+
+	blockCounter.set(maxSafeMetricInteger+1, nil)
+	started, release := blockCounter.holdNextRead()
+
+	staleResult := make(chan error, 1)
+	go func() {
+		staleResult <- permit.CheckCommit(
+			"result_submission", CompletionCommit,
+		)
+	}()
+	<-started
+
+	blockCounter.set(1005, nil)
+	if err := other.CheckCommit(
+		"heartbeat_signature", CompletionCommit,
+	); err != nil {
+		t.Fatalf("unexpected fence error after recovery: [%v]", err)
+	}
+
+	release()
+	// The fence whose own read was unprojectable still fails closed.
+	if err := <-staleResult; !errors.Is(err, ErrClockUnavailable) {
+		t.Errorf("expected the stale fence to fail closed, got: [%v]", err)
+	}
+	// The discarded stale sample left the gate available on the newer height.
+	snapshot := gate.State()
+	if snapshot.State != StateOpenSecurityV2 {
+		t.Errorf("expected open_security_v2 state, got [%s]", snapshot.State)
+	}
+	if !snapshot.ClockAvailable {
+		t.Error("expected the clock to stay available")
+	}
+	for _, p := range []Permit{permit, other} {
+		select {
+		case <-p.Context().Done():
+			t.Error("a stale unprojectable sample must not cancel permits")
+		default:
+		}
+	}
+	if got := metrics.counter(
+		clientinfo.MetricParticipationClockAbortsTotal,
+	); got != 0 {
+		t.Errorf("expected zero clock aborts, got [%f]", got)
+	}
+}
+
 // TestGate_ConcurrentBeginAcrossCutover races permit issuance, commit fences,
 // state reads, and permit closes against the chain crossing the cutover block,
 // a mid-flight Quiesce, and the terminal gate Close, all genuinely

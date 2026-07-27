@@ -455,8 +455,7 @@ func (g *chainGate) run(
 // failure cancels all permits; a newest success recomputes the current state,
 // but previously canceled permits do not revive. A stale outcome is discarded.
 func (g *chainGate) poll(operation string) {
-	ticket := g.clockReadTicket()
-	height, err := g.blockCounter.CurrentBlock()
+	ticket, height, err := g.readClock()
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -464,18 +463,28 @@ func (g *chainGate) poll(operation string) {
 	g.applyClockSampleLocked(ticket, height, operation, err)
 }
 
-// clockReadTicket reserves the ordering slot for a synchronous clock read. It
-// must be taken immediately before the read starts.
-func (g *chainGate) clockReadTicket() uint64 {
-	return g.clockSeq.Add(1)
+// readClock performs one ordered synchronous read of the chain clock. The
+// ordering ticket is taken immediately before the read starts, so concurrently
+// completing reads apply in initiation order regardless of the order their
+// responses arrive in. A height the float64 metrics projection cannot
+// represent exactly is folded into the read's own error here, at read time:
+// the owning operation then fails closed on it exactly like on an RPC error,
+// even when a newer concurrent sample supersedes this one.
+func (g *chainGate) readClock() (ticket uint64, height uint64, err error) {
+	ticket = g.clockSeq.Add(1)
+	height, err = g.blockCounter.CurrentBlock()
+	if err == nil {
+		err = validateMetricProjectable(height)
+	}
+	return ticket, height, err
 }
 
 // applyClockSampleLocked applies the outcome of one ordered synchronous clock
-// read. A sample older than the newest applied one is discarded entirely: a
-// stale success arriving after a newer failure can never reopen the gate, and
-// a stale failure arriving after a newer success cannot spuriously cancel
-// permits. A height the float64 metrics projection cannot represent exactly is
-// a clock failure, not a valid sample. The caller must hold g.mu.
+// read taken through readClock. A sample older than the newest applied one is
+// discarded entirely: a stale success arriving after a newer failure can never
+// reopen the gate, and a stale failure — an RPC error or an unprojectable
+// height — arriving after a newer success cannot spuriously cancel permits.
+// The caller must hold g.mu.
 func (g *chainGate) applyClockSampleLocked(
 	ticket uint64,
 	height uint64,
@@ -487,9 +496,6 @@ func (g *chainGate) applyClockSampleLocked(
 	}
 	g.lastClockTicket = ticket
 
-	if readErr == nil {
-		readErr = validateMetricProjectable(height)
-	}
 	if readErr != nil {
 		g.clockFailureLocked(operation, readErr)
 		return
@@ -672,8 +678,7 @@ func (g *chainGate) issue(
 	// The synchronous, authoritative chain read happens outside the lock so a
 	// slow chain call never blocks fences, closes, or the supervisor. The
 	// ticket taken before the read orders this sample against concurrent ones.
-	ticket := g.clockReadTicket()
-	height, clockErr := g.blockCounter.CurrentBlock()
+	ticket, height, clockErr := g.readClock()
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -689,9 +694,10 @@ func (g *chainGate) issue(
 		)
 	}
 
-	// This operation fails closed on its own read error even when a newer
-	// concurrent sample kept the gate available, and equally when its own read
-	// succeeded but lost the race to a newer applied failure.
+	// This operation fails closed on its own read error — an RPC failure or an
+	// unprojectable height — even when a newer concurrent sample kept the gate
+	// available, and equally when its own read succeeded but lost the race to
+	// a newer applied failure.
 	if clockErr != nil || !g.clockAvailable {
 		return nil, g.refuseLocked(
 			ceremony,
@@ -779,17 +785,17 @@ func (p *permit) CheckCommit(operation string, class CommitClass) error {
 
 	// The fence always uses its own fresh synchronous height, read outside
 	// the lock and ordered against concurrent reads by its ticket.
-	ticket := g.clockReadTicket()
-	height, clockErr := g.blockCounter.CurrentBlock()
+	ticket, height, clockErr := g.readClock()
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
 	g.applyClockSampleLocked(ticket, height, "commit_fence", clockErr)
 
-	// The fence fails closed on its own read error even when a newer
-	// concurrent sample kept the gate available, and equally when its own read
-	// succeeded but lost the race to a newer applied failure.
+	// The fence fails closed on its own read error — an RPC failure or an
+	// unprojectable height — even when a newer concurrent sample kept the gate
+	// available, and equally when its own read succeeded but lost the race to
+	// a newer applied failure.
 	if clockErr != nil || !g.clockAvailable {
 		return g.refuseCommitLocked(
 			p,
