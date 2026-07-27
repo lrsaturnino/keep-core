@@ -87,7 +87,9 @@ func (sm *SubmittingMember) SubmitDKGResult(
 		)
 	}
 
-	onSubmittedResultChan := make(chan uint64)
+	// The buffer lets an in-flight event callback complete after the consumer
+	// returned on cancellation, instead of blocking forever.
+	onSubmittedResultChan := make(chan uint64, 1)
 
 	subscription := chainRelay.OnDKGResultSubmitted(
 		func(event *event.DKGResultSubmission) {

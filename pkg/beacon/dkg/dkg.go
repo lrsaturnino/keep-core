@@ -124,7 +124,9 @@ func ExecuteDKG(
 
 	operatingMemberIndexes := gjkrResult.Group.OperatingMemberIndexes()
 
-	dkgResultChannel := make(chan *event.DKGResultSubmission)
+	// The buffer lets an in-flight event callback complete after the consumer
+	// returned on cancellation or timeout, instead of blocking forever.
+	dkgResultChannel := make(chan *event.DKGResultSubmission, 1)
 	dkgResultSubscription := beaconChain.OnDKGResultSubmitted(
 		func(event *event.DKGResultSubmission) {
 			dkgResultChannel <- event

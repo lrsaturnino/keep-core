@@ -56,7 +56,9 @@ func SignAndSubmit(
 	ctx, cancelCtx := context.WithCancel(ctx)
 	defer cancelCtx()
 
-	relayEntrySubmittedChannel := make(chan uint64)
+	// The buffer lets an in-flight event callback complete after the consumer
+	// returned on cancellation or timeout, instead of blocking forever.
+	relayEntrySubmittedChannel := make(chan uint64, 1)
 	subscription := beaconChain.OnRelayEntrySubmitted(
 		func(event *event.RelayEntrySubmitted) {
 			relayEntrySubmittedChannel <- event.BlockNumber

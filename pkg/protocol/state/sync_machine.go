@@ -41,9 +41,11 @@ type SyncMachine struct {
 // NewSyncMachine returns a new protocol state machine.
 //
 // The context passed to NewSyncMachine must be active for the entire lifetime
-// of the execution. Canceling it aborts the machine between state-internal
-// block waits: per-state work receives a context derived from it, and the
-// message loop returns the cancellation cause as its error.
+// of the execution. Canceling it aborts the machine even while it is parked on
+// a block wait — the start-block wait and the between-state delay waits are
+// interruptible, so a stalled chain cannot hold a canceled execution hostage.
+// Per-state work receives a context derived from it, and the machine returns
+// the cancellation cause as its error.
 func NewSyncMachine(
 	logger log.StandardLogger,
 	ctx context.Context,
@@ -77,10 +79,13 @@ func (sm *SyncMachine) Execute(startBlockHeight uint64) (SyncState, uint64, erro
 		currentState.MemberIndex(),
 		startBlockHeight,
 	)
-	err := sm.blockCounter.WaitForBlockHeight(startBlockHeight)
+	err := waitForBlockHeight(ctx, sm.blockCounter, startBlockHeight)
 	if err != nil {
 		cancelCtx()
-		return nil, 0, fmt.Errorf("failed to wait for the execution start block")
+		return nil, 0, fmt.Errorf(
+			"failed to wait for the execution start block: [%w]",
+			err,
+		)
 	}
 
 	lastStateEndBlockHeight := startBlockHeight
@@ -179,10 +184,10 @@ func stateTransition(
 	// In that case, if the message is sent too early, it is lost given that the
 	// syncReceiveBuffer has the retransmissions filtered out.
 	initiateDelay := lastStateEndBlockHeight + currentState.DelayBlocks()
-	err := blockCounter.WaitForBlockHeight(initiateDelay)
+	err := waitForBlockHeight(ctx, blockCounter, initiateDelay)
 	if err != nil {
 		return nil, fmt.Errorf(
-			"failed to wait [%v] blocks entering state [%T]: [%v]",
+			"failed to wait [%v] blocks entering state [%T]: [%w]",
 			currentState.DelayBlocks(),
 			currentState,
 			err,
@@ -212,4 +217,27 @@ func stateTransition(
 	)
 
 	return blockWaiter, nil
+}
+
+// waitForBlockHeight blocks until the given height is reached or the context
+// ends, whichever happens first. A synchronous WaitForBlockHeight call would
+// hold the machine hostage to a stalled chain even after its ceremony was
+// canceled; interrupting the wait lets the caller observe the cancellation
+// cause and run its recovery path instead.
+func waitForBlockHeight(
+	ctx context.Context,
+	blockCounter chain.BlockCounter,
+	blockHeight uint64,
+) error {
+	waiter, err := blockCounter.BlockHeightWaiter(blockHeight)
+	if err != nil {
+		return err
+	}
+
+	select {
+	case <-waiter:
+		return nil
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
 }
