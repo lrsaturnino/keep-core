@@ -18,7 +18,7 @@ func TestMaximumLegacyCompletionBlocks(t *testing.T) {
 // means the retention review must be redone deliberately, not that this test
 // should be updated casually.
 func TestCutoverPeerRosterRetentionBlocks(t *testing.T) {
-	retention, err := cutoverPeerRosterRetentionBlocks()
+	retention, err := CutoverPeerRosterRetentionBlocks()
 	if err != nil {
 		t.Fatalf("unexpected retention derivation error: [%v]", err)
 	}

@@ -126,11 +126,24 @@ type node struct {
 	windowMetricsTracker *coordinationWindowMetrics
 
 	// cutoverPeerRoster is the node-local, deduplicated record of post-cutover
-	// legacy peer sightings. It is constructed unconditionally beside the
-	// (future) participation gate, including when client-info is disabled, and
-	// is shared by the DKG and signing executors. It may be nil in tests that
-	// do not exercise the cutover observability path.
+	// legacy peer sightings. It is constructed unconditionally at process
+	// startup beside the participation gate, including when client-info is
+	// disabled, and is shared by the DKG and signing executors. It may be nil
+	// in tests that do not exercise the cutover observability path.
 	cutoverPeerRoster *participation.CutoverPeerRoster
+
+	// participationGate issues the per-ceremony participation permits that pin
+	// each ceremony's protocol mode from its canonical chain anchor. It is
+	// constructed once at process startup beside the cutover peer roster and
+	// shared with the beacon application. It may be nil in tests that do not
+	// exercise the cutover path.
+	//
+	// TODO: Derive every tBTC ceremony's protocol mode from a permit issued by
+	// this gate at the canonical-anchor choke points (DKG, wallet coordination,
+	// wallet actions/signing, heartbeat/inactivity); until that wiring lands
+	// the protocol layers select security-v2 unconditionally at their mode
+	// call sites. That gap is a release blocker for the chain-clocked cutover.
+	participationGate participation.Gate
 }
 
 func newNode(

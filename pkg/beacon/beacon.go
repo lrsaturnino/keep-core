@@ -16,6 +16,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/beacon/event"
 	"github.com/keep-network/keep-core/pkg/beacon/registry"
 	"github.com/keep-network/keep-core/pkg/net"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 )
 
 var logger = log.Logger("keep-beacon")
@@ -27,13 +28,24 @@ const ProtocolName = "beacon"
 // ensuring preconditions like staking are met, and then kicking off the
 // internal random beacon implementation. Returns an error if this failed,
 // otherwise enters a blocked loop.
+//
+// The participation gate is constructed once at process startup, immediately
+// after the Ethereum connection, and shared with the tBTC application; this
+// function receives that exact instance. A nil gate is forbidden: every
+// beacon ceremony's protocol mode must derive from a permit issued by the
+// shared gate.
 func Initialize(
 	ctx context.Context,
 	beaconChain beaconchain.Interface,
 	netProvider net.Provider,
 	persistence persistence.ProtectedHandle,
 	scheduler *generator.Scheduler,
+	participationGate participation.Gate,
 ) error {
+	if participationGate == nil {
+		return fmt.Errorf("the participation gate is required")
+	}
+
 	groupRegistry := registry.NewGroupRegistry(logger, beaconChain, persistence)
 	groupRegistry.LoadExistingGroups()
 
@@ -42,6 +54,7 @@ func Initialize(
 		netProvider,
 		groupRegistry,
 		scheduler,
+		participationGate,
 	)
 
 	err := sortition.MonitorPool(

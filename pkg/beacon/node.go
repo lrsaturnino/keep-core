@@ -18,6 +18,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/net"
 	"github.com/keep-network/keep-core/pkg/protocol/compatibility"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 )
 
 // node represents the current state of a beacon node.
@@ -26,6 +27,12 @@ type node struct {
 	netProvider   net.Provider
 	groupRegistry *registry.Groups
 	protocolLatch *generator.ProtocolLatch
+
+	// participationGate issues the per-ceremony participation permits that pin
+	// each ceremony's protocol mode from its canonical chain anchor. It is
+	// constructed once at process startup and shared with the tBTC
+	// application.
+	participationGate participation.Gate
 }
 
 // newNode returns an empty node with no group, zero group count, and a nil last
@@ -35,15 +42,17 @@ func newNode(
 	netProvider net.Provider,
 	groupRegistry *registry.Groups,
 	scheduler *generator.Scheduler,
+	participationGate participation.Gate,
 ) *node {
 	latch := generator.NewProtocolLatch()
 	scheduler.RegisterProtocol(latch)
 
 	return &node{
-		beaconChain:   beaconChain,
-		netProvider:   netProvider,
-		groupRegistry: groupRegistry,
-		protocolLatch: latch,
+		beaconChain:       beaconChain,
+		netProvider:       netProvider,
+		groupRegistry:     groupRegistry,
+		protocolLatch:     latch,
+		participationGate: participationGate,
 	}
 }
 

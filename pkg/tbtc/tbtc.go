@@ -2,7 +2,6 @@ package tbtc
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"runtime"
 	"time"
@@ -103,6 +102,14 @@ type Config struct {
 // Initialize kicks off the TBTC by initializing internal state, ensuring
 // preconditions like staking are met, and then kicking off the internal TBTC
 // implementation. Returns an error if this failed.
+//
+// The participation gate and the cutover peer roster are constructed once at
+// process startup, immediately after the Ethereum connection, and shared with
+// the beacon application; this function receives those exact instances and
+// must not construct its own. A nil gate or roster is forbidden: every tBTC
+// ceremony's protocol mode must ultimately derive from a permit issued by the
+// shared gate, and legacy peer sightings from the DKG and signing announcers
+// feed the shared roster.
 func Initialize(
 	ctx context.Context,
 	chain Chain,
@@ -116,7 +123,16 @@ func Initialize(
 	clientInfo *clientinfo.Registry,
 	perfMetrics *clientinfo.PerformanceMetrics,
 	ethereumNetwork ethereum.Network,
-) (err error) {
+	participationGate participation.Gate,
+	cutoverRoster *participation.CutoverPeerRoster,
+) error {
+	if participationGate == nil {
+		return fmt.Errorf("the participation gate is required")
+	}
+	if cutoverRoster == nil {
+		return fmt.Errorf("the cutover peer roster is required")
+	}
+
 	groupParameters := defaultGroupParameters(ethereumNetwork)
 
 	if ethChain, ok := chain.(interface {
@@ -157,70 +173,13 @@ func Initialize(
 		return fmt.Errorf("cannot set up TBTC node: [%v]", err)
 	}
 
-	// Construct one node-local cutover peer roster unconditionally, beside the
-	// (future) participation gate — including when client-info is disabled
-	// (port 0). It deduplicates post-cutover legacy peer sightings observed by
-	// the DKG and signing announcers so operators that have not adopted the
-	// security-v2 release can be identified. With client-info enabled it records
-	// through the same performance registry that backs /metrics; with
-	// client-info disabled it records to a no-op sink so its logs and state
-	// still function.
-	//
-	// The roster is constructed and installed BEFORE the coordination layer
-	// starts, so a signing executor created by an early coordination round
-	// already carries it and no legacy sighting is missed.
-	var rosterMetrics participation.CutoverRosterMetricsRecorder
-	if clientInfo != nil {
-		if perfMetrics == nil {
-			perfMetrics = clientinfo.NewPerformanceMetrics(ctx, clientInfo)
-		}
-		rosterMetrics = perfMetrics
-	} else {
-		rosterMetrics = &clientinfo.NoOpPerformanceMetrics{}
-	}
-
-	blockCounter, err := chain.BlockCounter()
-	if err != nil {
-		return fmt.Errorf(
-			"cannot get block counter for cutover peer roster: [%v]",
-			err,
-		)
-	}
-	rosterRetentionBlocks, err := cutoverPeerRosterRetentionBlocks()
-	if err != nil {
-		return fmt.Errorf(
-			"cannot derive cutover peer roster retention: [%v]",
-			err,
-		)
-	}
-	cutoverRoster, err := participation.NewCutoverPeerRoster(
-		ctx,
-		blockCounter,
-		rosterRetentionBlocks,
-		rosterMetrics,
-	)
-	if err != nil {
-		return fmt.Errorf("cannot create cutover peer roster: [%v]", err)
-	}
+	// The gate and roster are installed BEFORE the coordination layer starts,
+	// so a signing executor created by an early coordination round already
+	// carries the roster and no legacy sighting is missed. The gate is stored
+	// for the ceremony choke points; their lifecycles are owned by the process
+	// startup that constructed them.
+	node.participationGate = participationGate
 	node.setCutoverPeerRoster(cutoverRoster)
-
-	// Bind the roster's background sweep loop to the process lifecycle. On the
-	// success path the parent context's cancellation closes the roster at
-	// shutdown. On an initialization-error path the deferred close both closes
-	// the roster (a synchronous stop-and-join, so the sweep loop is reclaimed
-	// before Initialize returns) and releases the lifecycle goroutine through
-	// rosterStop — without which that goroutine would block on ctx.Done()
-	// indefinitely and leak whenever Initialize fails while the caller keeps the
-	// parent context alive. Close is idempotent (sync.Once), so the two closes
-	// are safe to overlap.
-	rosterStop := make(chan struct{})
-	defer func() {
-		if err != nil {
-			close(rosterStop)
-			cutoverRoster.Close()
-		}
-	}()
-	go closeRosterOnShutdownOrInitError(ctx, rosterStop, cutoverRoster)
 
 	err = node.runCoordinationLayer(ctx)
 	if err != nil {
@@ -240,26 +199,10 @@ func Initialize(
 			},
 		)
 
+		if perfMetrics == nil {
+			perfMetrics = clientinfo.NewPerformanceMetrics(ctx, clientInfo)
+		}
 		node.setPerformanceMetrics(perfMetrics)
-
-		// Expose the node-local cutover peer roster snapshot as a top-level
-		// diagnostics object so port-enabled nodes surface which operators are
-		// observed on the legacy release across the cutover.
-		clientInfo.RegisterDiagnosticSource(
-			"cutover_legacy_peers",
-			func() string {
-				snapshot := cutoverRoster.Snapshot()
-				bytes, err := json.Marshal(snapshot)
-				if err != nil {
-					logger.Errorf(
-						"error on serializing cutover peer roster to JSON: [%v]",
-						err,
-					)
-					return ""
-				}
-				return string(bytes)
-			},
-		)
 
 		// Register coordination windows as a diagnostic source
 		clientInfo.RegisterApplicationSource(
@@ -458,32 +401,6 @@ func Initialize(
 	})
 
 	return nil
-}
-
-// rosterLifecycleCloser is the subset of the cutover peer roster lifecycle used
-// by closeRosterOnShutdownOrInitError.
-type rosterLifecycleCloser interface {
-	Close()
-}
-
-// closeRosterOnShutdownOrInitError closes the cutover peer roster exactly once,
-// when either the parent context is cancelled (normal process shutdown — the
-// Initialize success path) or the stop channel is closed (Initialize failed
-// after the roster was constructed but before it was handed off to the process
-// lifecycle). Without the stop path this goroutine would block on ctx.Done()
-// indefinitely and leak whenever Initialize returns an error while the caller
-// keeps the parent context alive. Close is idempotent, so an overlapping
-// deferred close on the error path is safe.
-func closeRosterOnShutdownOrInitError(
-	ctx context.Context,
-	stop <-chan struct{},
-	roster rosterLifecycleCloser,
-) {
-	select {
-	case <-ctx.Done():
-	case <-stop:
-	}
-	roster.Close()
 }
 
 // enoughPreParamsInPoolPolicy is a policy that enforces the sufficient size

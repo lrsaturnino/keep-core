@@ -42,14 +42,16 @@ func MaximumLegacyCompletionBlocks() uint64 {
 // work bound.
 const cutoverPeerRosterRetentionMarginBlocks = uint64(300)
 
-// cutoverPeerRosterRetentionBlocks derives how long a legacy peer sighting is
+// CutoverPeerRosterRetentionBlocks derives how long a legacy peer sighting is
 // retained without a fresh observation before it is evicted as "not recently
 // observed": the maximum number of blocks any already-started tBTC work may
-// legitimately still be running, plus the reviewed margin. Deriving from the
-// completion bound keeps retention in lockstep with the protocol validity
-// windows; the addition is overflow-checked because the retention feeds the
-// roster's gauge projection and eviction arithmetic.
-func cutoverPeerRosterRetentionBlocks() (uint64, error) {
+// legitimately still be running, plus the reviewed margin. The roster records
+// sightings from the tBTC DKG and signing announcers, so the tBTC completion
+// bound governs the retention. Deriving from the completion bound keeps
+// retention in lockstep with the protocol validity windows; the addition is
+// overflow-checked because the retention feeds the roster's gauge projection
+// and eviction arithmetic.
+func CutoverPeerRosterRetentionBlocks() (uint64, error) {
 	bound := MaximumLegacyCompletionBlocks()
 	if bound > math.MaxUint64-cutoverPeerRosterRetentionMarginBlocks {
 		return 0, fmt.Errorf(

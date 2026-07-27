@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -102,57 +103,29 @@ func start(cmd *cobra.Command) error {
 		return fmt.Errorf("error connecting to Ethereum node: [%v]", err)
 	}
 
-	netProvider, err := initializeNetwork(
-		ctx,
-		[]firewall.Application{beaconChain, tbtcChain},
-		operatorPrivateKey,
-		blockCounter,
-	)
-	if err != nil {
-		return fmt.Errorf("cannot initialize network: [%v]", err)
-	}
+	// The client-info registry and its chain-bound observers start first: the
+	// participation gate and cutover roster constructed below need a real
+	// metrics sink before the network provider exists. The network-bound
+	// observers attach right after the network initializes.
+	clientInfoRegistry := initializeClientInfo(ctx, clientConfig, blockCounter)
 
-	clientInfoRegistry := initializeClientInfo(
-		ctx,
-		clientConfig,
-		netProvider,
-		signing,
-		blockCounter,
-	)
-
-	// Wire performance metrics into network provider if available
 	var perfMetrics *clientinfo.PerformanceMetrics
 	if clientInfoRegistry != nil {
 		perfMetrics = clientinfo.NewPerformanceMetrics(ctx, clientInfoRegistry)
-		// Type assert to libp2p provider to set metrics recorder
-		// The provider struct is not exported, so we use interface assertion
-		if setter, ok := netProvider.(interface {
-			SetMetricsRecorder(recorder interface {
-				IncrementCounter(name string, value float64)
-				SetGauge(name string, value float64)
-				RecordDuration(name string, duration time.Duration)
-			})
-		}); ok {
-			setter.SetMetricsRecorder(perfMetrics)
-		}
 
-		// Wire performance metrics into firewall validation so live
-		// on-chain IsRecognized calls are counted.
+		// Wire performance metrics into firewall validation so live on-chain
+		// IsRecognized calls are counted. The recorder is a package-level sink
+		// read at validation time, so setting it before the network provider
+		// is constructed loses no events.
 		firewall.SetMetricsRecorder(perfMetrics)
 	}
 
-	// Construct the production participation gate from the shared block
-	// counter before any protocol component starts: the gate performs its
-	// first synchronous chain-clock read here and a clock error refuses
-	// startup. With client-info disabled the gate records to a no-op sink so
-	// its logs and state machine still function.
-	//
-	// TODO: Pass this gate into beacon.Initialize and tbtc.Initialize and
-	// derive every ceremony's protocol mode from its permit. Until that
-	// wiring lands the protocol layers run security-v2 unconditionally
-	// (tracked at their mode call sites) and this gate provides the
-	// authoritative cutover state machine, metrics, and transition logs only.
-	// That gap is a release blocker for the chain-clocked cutover.
+	// Construct the production participation gate and the cutover peer roster
+	// from the shared block counter immediately after the Ethereum connection
+	// and before the network provider, beacon, or tBTC can send protocol
+	// traffic. The gate performs its first synchronous chain-clock read here
+	// and a clock error refuses startup. With client-info disabled both record
+	// to a no-op sink so their logs and state machines still function.
 	var gateMetrics participation.GateMetricsRecorder
 	if perfMetrics != nil {
 		gateMetrics = perfMetrics
@@ -169,6 +142,51 @@ func start(cmd *cobra.Command) error {
 		return fmt.Errorf("cannot construct the participation gate: [%v]", err)
 	}
 	defer participationGate.Close()
+
+	rosterRetentionBlocks, err := tbtc.CutoverPeerRosterRetentionBlocks()
+	if err != nil {
+		return fmt.Errorf(
+			"cannot derive cutover peer roster retention: [%v]",
+			err,
+		)
+	}
+	var rosterMetrics participation.CutoverRosterMetricsRecorder
+	if perfMetrics != nil {
+		rosterMetrics = perfMetrics
+	} else {
+		rosterMetrics = &clientinfo.NoOpPerformanceMetrics{}
+	}
+	cutoverRoster, err := participation.NewCutoverPeerRoster(
+		ctx,
+		blockCounter,
+		rosterRetentionBlocks,
+		rosterMetrics,
+	)
+	if err != nil {
+		return fmt.Errorf("cannot create cutover peer roster: [%v]", err)
+	}
+	defer cutoverRoster.Close()
+
+	if clientInfoRegistry != nil {
+		// Expose the node-local cutover peer roster snapshot as a top-level
+		// diagnostics object so port-enabled nodes surface which operators
+		// are observed on the legacy release across the cutover.
+		clientInfoRegistry.RegisterDiagnosticSource(
+			"cutover_legacy_peers",
+			func() string {
+				snapshot := cutoverRoster.Snapshot()
+				bytes, err := json.Marshal(snapshot)
+				if err != nil {
+					logger.Errorf(
+						"error on serializing cutover peer roster to JSON: [%v]",
+						err,
+					)
+					return ""
+				}
+				return string(bytes)
+			},
+		)
+	}
 
 	beaconCompletionBound, err := beacon.MaximumLegacyCompletionBlocks(
 		beaconChain.GetConfig(),
@@ -194,6 +212,32 @@ func start(cmd *cobra.Command) error {
 		maximumCompletionBound,
 		cutoverBlockSource,
 	)
+
+	netProvider, err := initializeNetwork(
+		ctx,
+		[]firewall.Application{beaconChain, tbtcChain},
+		operatorPrivateKey,
+		blockCounter,
+	)
+	if err != nil {
+		return fmt.Errorf("cannot initialize network: [%v]", err)
+	}
+
+	registerNetworkClientInfo(clientConfig, clientInfoRegistry, netProvider, signing)
+
+	if perfMetrics != nil {
+		// Type assert to libp2p provider to set metrics recorder
+		// The provider struct is not exported, so we use interface assertion
+		if setter, ok := netProvider.(interface {
+			SetMetricsRecorder(recorder interface {
+				IncrementCounter(name string, value float64)
+				SetGauge(name string, value float64)
+				RecordDuration(name string, duration time.Duration)
+			})
+		}); ok {
+			setter.SetMetricsRecorder(perfMetrics)
+		}
+	}
 
 	// Initialize beacon and tbtc only for non-bootstrap nodes.
 	// Skip initialization for bootstrap nodes as they are only used for network
@@ -237,6 +281,7 @@ func start(cmd *cobra.Command) error {
 			netProvider,
 			beaconKeyStorePersistence,
 			scheduler,
+			participationGate,
 		)
 		if err != nil {
 			return fmt.Errorf("error initializing beacon: [%v]", err)
@@ -260,6 +305,8 @@ func start(cmd *cobra.Command) error {
 			clientInfoRegistry,
 			perfMetrics, // Pass the existing performance metrics instance to avoid duplicate registrations
 			clientConfig.Ethereum.Network,
+			participationGate,
+			cutoverRoster,
 		)
 		if err != nil {
 			return fmt.Errorf("error initializing TBTC: [%v]", err)
@@ -309,17 +356,50 @@ func initializeNetwork(
 	return netProvider, nil
 }
 
+// initializeClientInfo starts the client-info registry and attaches the
+// chain-bound observers. It runs before the network provider exists because
+// the participation gate and cutover roster need its metrics sink from the
+// first chain-clock read; the network-bound observers attach later through
+// registerNetworkClientInfo.
 func initializeClientInfo(
 	ctx context.Context,
 	config *config.Config,
-	netProvider net.Provider,
-	signing chain.Signing,
 	blockCounter chain.BlockCounter,
 ) *clientinfo.Registry {
 	registry, isConfigured := clientinfo.Initialize(ctx, config.ClientInfo.Port)
 	if !isConfigured {
 		logger.Infof("client info endpoint not configured")
 		return nil
+	}
+
+	registry.ObserveEthConnectivity(
+		blockCounter,
+		config.ClientInfo.EthereumMetricsTick,
+	)
+
+	registry.RegisterMetricClientInfo(build.Version)
+
+	registry.RegisterEthChainInfoSource(blockCounter)
+
+	logger.Infof(
+		"enabled client info endpoint on port [%v]",
+		config.ClientInfo.Port,
+	)
+
+	return registry
+}
+
+// registerNetworkClientInfo attaches the network-bound client-info observers
+// once the network provider exists. It is a no-op when the client-info
+// endpoint is not configured.
+func registerNetworkClientInfo(
+	config *config.Config,
+	registry *clientinfo.Registry,
+	netProvider net.Provider,
+	signing chain.Signing,
+) {
+	if registry == nil {
+		return
 	}
 
 	registry.ObserveConnectedPeersCount(
@@ -333,13 +413,6 @@ func initializeClientInfo(
 		config.ClientInfo.NetworkMetricsTick,
 	)
 
-	registry.ObserveEthConnectivity(
-		blockCounter,
-		config.ClientInfo.EthereumMetricsTick,
-	)
-
-	registry.RegisterMetricClientInfo(build.Version)
-
 	registry.RegisterConnectedPeersSource(netProvider, signing)
 
 	registry.RegisterClientInfoSource(
@@ -348,15 +421,6 @@ func initializeClientInfo(
 		build.Version,
 		build.Revision,
 	)
-
-	registry.RegisterEthChainInfoSource(blockCounter)
-
-	logger.Infof(
-		"enabled client info endpoint on port [%v]",
-		config.ClientInfo.Port,
-	)
-
-	return registry
 }
 
 func initializePersistence() (

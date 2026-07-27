@@ -566,3 +566,45 @@ func TestCutoverPeerRoster_CloseIdempotent(t *testing.T) {
 	roster.Close()
 	roster.Close() // must not panic or block
 }
+
+// TestCutoverPeerRoster_ConcurrentCloseSafe races two Close calls on a real
+// roster with a live background sweep loop. Each Close joins the sweep loop
+// under sync.Once, so both concurrent callers must return without panicking,
+// double-closing the join channel, or blocking forever on the join; a later
+// Close after shutdown must remain a safe no-op.
+func TestCutoverPeerRoster_ConcurrentCloseSafe(t *testing.T) {
+	roster, _, _ := newTestRoster(t, 500, 1000)
+
+	firstDone := make(chan struct{})
+	secondDone := make(chan struct{})
+	go func() {
+		roster.Close()
+		close(firstDone)
+	}()
+	go func() {
+		roster.Close()
+		close(secondDone)
+	}()
+
+	for _, done := range []<-chan struct{}{firstDone, secondDone} {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal(
+				"a concurrent Close did not return; Close did not safely " +
+					"join the sweep loop under the double-close overlap",
+			)
+		}
+	}
+
+	thirdDone := make(chan struct{})
+	go func() {
+		roster.Close()
+		close(thirdDone)
+	}()
+	select {
+	case <-thirdDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a Close after shutdown blocked; Close is not idempotent")
+	}
+}
