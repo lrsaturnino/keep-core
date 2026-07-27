@@ -3,6 +3,7 @@ package bitcoin
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 
 	"github.com/btcsuite/btcd/wire"
 )
@@ -22,6 +23,19 @@ const (
 	// https://github.com/bitcoin/bips/blob/master/bip-0141.mediawiki#specification
 	Witness
 )
+
+// MaxTransactionByteLength is the maximum byte length of a serialized
+// transaction accepted by the deserialization routines. A consensus-valid
+// transaction can never reach it: a transaction's weight is
+// `3*base_size + total_size` and cannot exceed the maximum block weight of
+// 4,000,000 weight units, so its serialized length is always strictly below
+// that number.
+//
+// Rejecting longer input keeps deserialization defensive against untrusted
+// sources. The underlying btcd decoder slices all scripts of a single
+// transaction out of one fixed-size 4 MiB buffer and panics, rather than
+// returning an error, once their cumulative length exceeds it.
+const MaxTransactionByteLength = 4_000_000
 
 // Transaction represents a Bitcoin transaction. For reference, see:
 // https://developer.bitcoin.org/reference/transactions.html#raw-transaction-format
@@ -150,6 +164,14 @@ func (t *Transaction) SerializeLocktime() [4]byte {
 
 // Deserialize deserializes the given byte array to a Transaction.
 func (t *Transaction) Deserialize(data []byte) error {
+	if len(data) > MaxTransactionByteLength {
+		return fmt.Errorf(
+			"transaction byte length [%v] exceeds the maximum of [%v]",
+			len(data),
+			MaxTransactionByteLength,
+		)
+	}
+
 	internal := newInternalTransaction()
 	err := internal.Deserialize(bytes.NewReader(data))
 	if err != nil {

@@ -21,6 +21,10 @@ type TransactionBuilder struct {
 	internal    *internalTransaction
 	sigHashArgs []*inputSigHashArgs
 	sigHashes   []*big.Int
+	// prevOuts holds the locking script and value of the UTXO pointed by
+	// each added input. The txscript sighash pre-computation consults it
+	// to determine the witness version of the spent outputs.
+	prevOuts *txscript.MultiPrevOutFetcher
 }
 
 // NewTransactionBuilder constructs a new TransactionBuilder instance.
@@ -29,6 +33,7 @@ func NewTransactionBuilder(chain Chain) *TransactionBuilder {
 		chain:       chain,
 		internal:    newInternalTransaction(),
 		sigHashArgs: make([]*inputSigHashArgs, 0),
+		prevOuts:    txscript.NewMultiPrevOutFetcher(nil),
 	}
 }
 
@@ -69,6 +74,7 @@ func (tb *TransactionBuilder) AddPublicKeyHashInput(
 
 	hash := chainhash.Hash(utxo.Outpoint.TransactionHash)
 	outpoint := wire.NewOutPoint(&hash, utxo.Outpoint.OutputIndex)
+	tb.prevOuts.AddPrevOut(*outpoint, wire.NewTxOut(utxo.Value, utxoScript))
 
 	// Deliberately set both `signatureScript` and `witness` arguments to nil
 	// because at this point, the input does not contain any signature data.
@@ -115,6 +121,7 @@ func (tb *TransactionBuilder) AddScriptHashInput(
 
 	hash := chainhash.Hash(utxo.Outpoint.TransactionHash)
 	outpoint := wire.NewOutPoint(&hash, utxo.Outpoint.OutputIndex)
+	tb.prevOuts.AddPrevOut(*outpoint, wire.NewTxOut(utxo.Value, utxoScript))
 
 	// Signature data required to unlock a P2SH/P2WSH UTXO needs the plain-text
 	// redeem script to be placed as the last item of the `witness` field for
@@ -176,8 +183,24 @@ func (tb *TransactionBuilder) ComputeSignatureHashes() ([]*big.Int, error) {
 	sigHashes := make([]*big.Int, len(tb.internal.TxIn))
 
 	// Calculation of sighashes for witness inputs can be faster as common
-	// sighash fragments can be pre-computed upfront and reused.
-	witnessSigHashFragments := txscript.NewTxSigHashes(tb.internal.MsgTx)
+	// sighash fragments can be pre-computed upfront and reused. The previous
+	// outputs of all added inputs must be provided so the pre-computation can
+	// determine the witness version of the spent outputs. A missing entry
+	// makes the pre-computation panic, so make sure the builder's state is
+	// consistent before handing it over.
+	for i, input := range tb.internal.TxIn {
+		if tb.prevOuts.FetchPrevOutput(input.PreviousOutPoint) == nil {
+			return nil, fmt.Errorf(
+				"missing previous output for input [%v]",
+				i,
+			)
+		}
+	}
+
+	witnessSigHashFragments := txscript.NewTxSigHashes(
+		tb.internal.MsgTx,
+		tb.prevOuts,
+	)
 
 	for i := range tb.internal.TxIn {
 		sigHashArgs := tb.sigHashArgs[i]

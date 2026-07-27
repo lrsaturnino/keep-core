@@ -2,7 +2,9 @@ package bitcoin
 
 import (
 	"crypto/ecdsa"
+	"encoding/binary"
 	"encoding/hex"
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -275,6 +277,78 @@ func transactionFrom(t *testing.T, hex string) *Transaction {
 		t.Fatalf("error while converting [%v]: [%v]", hex, err)
 	}
 	return tx
+}
+
+// TestTransaction_DeserializeOversized makes sure an oversized transaction is
+// rejected with an error. The underlying btcd decoder slices all scripts of a
+// single transaction out of one fixed-size 4 MiB buffer and panics once their
+// cumulative length exceeds it, so the deserializer must reject such input
+// before handing it over. No consensus-valid transaction gets anywhere near
+// this length.
+func TestTransaction_DeserializeOversized(t *testing.T) {
+	// A well-formed transaction with a single input and outputs whose scripts
+	// jointly exceed the decoder's script buffer.
+	var data []byte
+
+	appendVarInt := func(value uint64) {
+		switch {
+		case value < 0xfd:
+			data = append(data, byte(value))
+		case value <= 0xffff:
+			data = append(data, 0xfd)
+			data = binary.LittleEndian.AppendUint16(data, uint16(value))
+		case value <= 0xffffffff:
+			data = append(data, 0xfe)
+			data = binary.LittleEndian.AppendUint32(data, uint32(value))
+		default:
+			data = append(data, 0xff)
+			data = binary.LittleEndian.AppendUint64(data, value)
+		}
+	}
+
+	const (
+		outputCount      = 5
+		outputScriptSize = 900000
+	)
+
+	data = binary.LittleEndian.AppendUint32(data, 1) // version
+	appendVarInt(1)                                  // input count
+	data = append(data, make([]byte, 32)...)         // previous transaction hash
+	data = binary.LittleEndian.AppendUint32(data, 0) // previous output index
+	appendVarInt(0)                                  // empty signature script
+	data = binary.LittleEndian.AppendUint32(data, 0xffffffff)
+	appendVarInt(outputCount)
+	for i := 0; i < outputCount; i++ {
+		data = binary.LittleEndian.AppendUint64(data, 1000) // value
+		appendVarInt(outputScriptSize)
+		data = append(data, make([]byte, outputScriptSize)...)
+	}
+	data = binary.LittleEndian.AppendUint32(data, 0) // locktime
+
+	if len(data) <= MaxTransactionByteLength {
+		t.Fatalf(
+			"test transaction of [%v] bytes does not exceed the maximum "+
+				"of [%v] bytes",
+			len(data),
+			MaxTransactionByteLength,
+		)
+	}
+
+	transaction := new(Transaction)
+	err := transaction.Deserialize(data)
+
+	expectedError := fmt.Errorf(
+		"transaction byte length [%v] exceeds the maximum of [%v]",
+		len(data),
+		MaxTransactionByteLength,
+	)
+	if !reflect.DeepEqual(expectedError, err) {
+		t.Errorf(
+			"unexpected error\nexpected: %v\nactual:   %v",
+			expectedError,
+			err,
+		)
+	}
 }
 
 func hexToSlice(t *testing.T, hexString string) []byte {

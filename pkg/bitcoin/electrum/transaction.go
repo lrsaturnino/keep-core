@@ -5,7 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 
-	"github.com/btcsuite/btcd/v2/wire"
+	"github.com/btcsuite/btcd/wire"
 	"github.com/checksum0/go-electrum/electrum"
 	"github.com/keep-network/keep-core/pkg/bitcoin"
 )
@@ -16,6 +16,17 @@ func decodeTransaction(rawTx string) (*wire.MsgTx, error) {
 	headerBytes, err := hex.DecodeString(rawTx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode a hex string: [%w]", err)
+	}
+
+	// The Electrum server is untrusted and the deserialization below panics
+	// on transactions holding more script data than any consensus-valid
+	// transaction can carry.
+	if len(headerBytes) > bitcoin.MaxTransactionByteLength {
+		return nil, fmt.Errorf(
+			"transaction byte length [%v] exceeds the maximum of [%v]",
+			len(headerBytes),
+			bitcoin.MaxTransactionByteLength,
+		)
 	}
 
 	buf := bytes.NewBuffer(headerBytes)
