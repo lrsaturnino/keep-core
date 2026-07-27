@@ -13,6 +13,7 @@ import (
 
 	"github.com/ipfs/go-log/v2"
 	"github.com/keep-network/keep-core/pkg/chain"
+	"github.com/keep-network/keep-core/pkg/protocol/compatibility"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/tecdsa/retry"
@@ -151,9 +152,10 @@ type signingAttemptParams struct {
 }
 
 // signingAttemptSessionID derives the announcer/protocol session ID of a
-// single signing attempt for the given protocol compatibility mode. The
-// legacy form is byte-for-byte the pre-hardening production form — it carries
-// no attempt start block — so a legacy-mode ceremony interoperates with
+// single signing attempt for the given protocol compatibility mode. The exact
+// per-mode formats are owned by the compatibility strategy bundle: the legacy
+// form is byte-for-byte the pre-hardening production form — it carries no
+// attempt start block — so a legacy-mode ceremony interoperates with
 // prior-release peers; the security-v2 form carries the protocol name and
 // fixed-width start block and attempt so it cannot collide or be replayed
 // across protocols or windows. The mode always comes from the ceremony's
@@ -164,26 +166,14 @@ func signingAttemptSessionID(
 	attemptStartBlock uint64,
 	attemptNumber uint,
 ) string {
-	switch mode {
-	case participation.ModeLegacy:
-		return fmt.Sprintf(
-			"%v-%v",
-			message.Text(16),
-			attemptNumber,
-		)
-	case participation.ModeSecurityV2:
-		return fmt.Sprintf(
-			"signing-%v-%016x-%016x",
-			message.Text(16),
-			attemptStartBlock,
-			attemptNumber,
-		)
-	default:
+	strategies, err := compatibility.StrategiesFor(mode)
+	if err != nil {
 		panic(fmt.Sprintf(
 			"signingAttemptSessionID: protocol mode not set explicitly: [%v]",
-			mode,
+			err,
 		))
 	}
+	return strategies.SigningSessionID(message, attemptStartBlock, attemptNumber)
 }
 
 // signingAttemptFn represents a function performing a signing attempt.

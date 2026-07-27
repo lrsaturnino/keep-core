@@ -10,6 +10,7 @@ import (
 	"github.com/ipfs/go-log/v2"
 	"github.com/keep-network/keep-core/pkg/chain"
 	"github.com/keep-network/keep-core/pkg/protocol/announcer"
+	"github.com/keep-network/keep-core/pkg/protocol/compatibility"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/tecdsa/dkg"
@@ -131,7 +132,8 @@ type dkgAttemptParams struct {
 }
 
 // dkgAttemptSessionID derives the announcer/protocol session ID of a single
-// DKG attempt for the given protocol compatibility mode. The legacy form is
+// DKG attempt for the given protocol compatibility mode. The exact per-mode
+// formats are owned by the compatibility strategy bundle: the legacy form is
 // byte-for-byte the pre-hardening production form so a legacy-mode ceremony
 // interoperates with prior-release peers; the security-v2 form carries the
 // protocol name and a fixed-width attempt so it cannot collide or be replayed
@@ -142,25 +144,14 @@ func dkgAttemptSessionID(
 	seed *big.Int,
 	attemptNumber uint,
 ) string {
-	switch mode {
-	case participation.ModeLegacy:
-		return fmt.Sprintf(
-			"%v-%v",
-			seed.Text(16),
-			attemptNumber,
-		)
-	case participation.ModeSecurityV2:
-		return fmt.Sprintf(
-			"dkg-%v-%016x",
-			seed.Text(16),
-			attemptNumber,
-		)
-	default:
+	strategies, err := compatibility.StrategiesFor(mode)
+	if err != nil {
 		panic(fmt.Sprintf(
 			"dkgAttemptSessionID: protocol mode not set explicitly: [%v]",
-			mode,
+			err,
 		))
 	}
+	return strategies.DKGSessionID(seed, attemptNumber)
 }
 
 // dkgAttemptFn represents a function performing a DKG attempt.

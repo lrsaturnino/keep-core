@@ -157,6 +157,88 @@ func TestG1HashToPointWireFormat(t *testing.T) {
 	}
 }
 
+// TestG1HashToPointLegacyWireFormat pins the marshalled output of the legacy
+// try-and-increment mapping for a small set of known inputs. The legacy
+// mapping exists solely so a ceremony pinned to the legacy protocol mode
+// remains wire-compatible with peers running a pre-hardening production
+// release: its output must stay byte-for-byte what those releases derive. If
+// this test fails, the legacy compatibility path is broken — do NOT update
+// the expected values; restore the mapping.
+func TestG1HashToPointLegacyWireFormat(t *testing.T) {
+	vectors := []struct {
+		input       []byte
+		expectedHex string
+	}{
+		{
+			input:       []byte(""),
+			expectedHex: "221f8a7714359b6db9baddee936a57adc9a8979ec2d46917b41368c0165ec33a2a05536f2b20da52c6ae18e4a02e2aec0a7f35497cfd27b9084ef5c0147b1442",
+		},
+		{
+			input:       []byte("keep-core G1 pin"),
+			expectedHex: "089fea656fe4bbf194be17dadca92032084f10647fd6f2233028e80d18f025832143081e571616093f5a1f6e352902a438f60cc7f8a75a3fe5bc8783ef2ecd28",
+		},
+		{
+			input:       []byte("relay entry v2"),
+			expectedHex: "1401d7e9e769a82e1f824e2402f66b7ac1621ede4f02160df4d96ec8000de7b713c2979faf9a76ee254e4c6a0c1c9f5fdd35fdc0533efbe85580074ebd65cf05",
+		},
+		{
+			input:       []byte("beacon group seed"),
+			expectedHex: "081822c14fff3b1aa5a665ffd7cb7a62a440c7985c931a180fe8bfcc436d7aa416614a46f32a09e169df3f78b678ba5be3ccd3bebce3423bbe1c43b01b06913d",
+		},
+	}
+
+	for _, v := range vectors {
+		got := hex.EncodeToString(G1HashToPointLegacy(v.input).Marshal())
+		if got != v.expectedHex {
+			t.Errorf(
+				"G1HashToPointLegacy(%q) output drifted -- the legacy "+
+					"compatibility path no longer matches pre-hardening "+
+					"releases; restore the mapping instead of updating the "+
+					"expected value.\n"+
+					"  expected: %s\n"+
+					"  got:      %s",
+				v.input, v.expectedHex, got,
+			)
+		}
+	}
+}
+
+// TestG1HashToPointLegacyProperties proves the legacy mapping is
+// deterministic, produces valid on-curve points, and diverges from the
+// hardened counter-based mapping: the two mappings must never be conflated
+// for the same ceremony.
+func TestG1HashToPointLegacyProperties(t *testing.T) {
+	for _, msg := range [][]byte{
+		[]byte(""),
+		[]byte("a"),
+		[]byte("hello world"),
+		make([]byte, 32),
+	} {
+		p1 := G1HashToPointLegacy(msg)
+		p2 := G1HashToPointLegacy(msg)
+		testutils.AssertBytesEqual(t, p1.Marshal(), p2.Marshal())
+
+		recovered := new(bn256.G1)
+		if _, err := recovered.Unmarshal(p1.Marshal()); err != nil {
+			t.Errorf(
+				"G1HashToPointLegacy produced an invalid G1 point for "+
+					"input %q: %v",
+				msg,
+				err,
+			)
+		}
+
+		hardened := G1HashToPoint(msg)
+		if string(p1.Marshal()) == string(hardened.Marshal()) {
+			t.Errorf(
+				"legacy and hardened mappings coincided for input %q; the "+
+					"modes would be indistinguishable on the wire",
+				msg,
+			)
+		}
+	}
+}
+
 // TestSqrtGfP2Exponent asserts the hardcoded exponent in sqrtGfP2 equals (p^2+15)/32.
 func TestSqrtGfP2Exponent(t *testing.T) {
 	p2 := new(big.Int).Mul(bn256.P, bn256.P)

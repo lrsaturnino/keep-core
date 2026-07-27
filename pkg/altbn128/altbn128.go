@@ -161,6 +161,38 @@ func G1HashToPoint(m []byte) *bn256.G1 {
 	panic("G1HashToPoint: no valid curve point found for input")
 }
 
+// G1HashToPointLegacy hashes the provided byte slice and maps it into a G1
+// point using the pre-hardening try-and-increment approach: the digest is the
+// first candidate x-coordinate and is incremented until a quadratic residue
+// is found.
+//
+// It reproduces, byte for byte, the mapping of the production releases that
+// precede the counter-based G1HashToPoint, and exists solely so a ceremony
+// pinned to the legacy protocol mode by the participation gate remains
+// wire-compatible with peers running such a release. A ceremony uses exactly
+// one of the two mappings for its entire lifetime, selected from its permit
+// mode. The legacy variant's data-dependent iteration count — the timing side
+// channel the counter-based design bounds — is the price of that
+// compatibility; new code must use G1HashToPoint.
+func G1HashToPointLegacy(m []byte) *bn256.G1 {
+
+	one := big.NewInt(1)
+
+	h := sha256.Sum256(m)
+
+	x := mod(new(big.Int).SetBytes(h[:]), bn256.P)
+
+	for {
+		y := yFromX(x)
+		if y != nil {
+			g1, _ := G1FromInts(x, y)
+			return g1
+		}
+
+		x.Add(x, one)
+	}
+}
+
 // yParity calculates whether the provided Y coordinate is an even or odd
 // number. Returns 0x01 if Y is an even number and 0x00 if it's odd.
 func yParity(y *big.Int) byte {
