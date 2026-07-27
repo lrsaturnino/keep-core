@@ -1,0 +1,307 @@
+#!/usr/bin/env bash
+#
+# Self-test for rehearse.sh's fail-closed source binding.
+#
+# Builds throwaway repositories shaped like the dispatched checkout and like
+# the CI build image's tree — context-excluded paths absent, the gen/
+# binding and _address families regenerated from artifacts, gitignored build
+# outputs present, the committed ignore rules dropped — and proves the
+# verifier accepts exactly the image's documented construction and nothing
+# else. Runs anywhere bash and git exist; everything lives under mktemp and
+# this repository is never touched.
+
+set -euo pipefail
+
+TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# shellcheck source=/dev/null
+source "${TEST_DIR}/rehearse.sh"
+
+# The verifier reads these from the environment; the container running the
+# proof stages exports them, and they must never leak into the cases.
+unset PR4109_EXPECTED_SOURCE_COMMIT PR4109_SOURCE_BINDING_MODE
+
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/pr4109-source-binding.XXXXXX")"
+trap 'rm -rf "${WORK}"' EXIT
+
+PASS=0
+FAILED=0
+ORIGIN_SHA=""
+CASE_RC=0
+CASE_OUT=""
+
+# Every git invocation pins its identity and disables signing so the cases
+# behave identically on a workstation and inside the CI build image.
+git_q() {
+  git -c user.name=rehearsal -c user.email=rehearsal@invalid \
+    -c commit.gpgsign=false -c init.defaultBranch=main "$@"
+}
+
+# A miniature of the real tree holding one representative of every family
+# the classifier distinguishes: context-excluded paths, the protected
+# committed generated code (gen/pb, gen/gen.go, gen/cmd/cmd.go), the
+# regenerated binding and _address families, plain source, and ignore rules
+# covering the image's build outputs.
+make_origin() {
+  local repo="${WORK}/origin"
+  mkdir -p "${repo}"
+  (
+    cd "${repo}"
+    git_q init -q
+    printf '/keep-client\ntmp/\n/pkg/chain/**/gen/_contracts/\n/pkg/chain/**/gen/abi/*.abi\n' \
+      >.gitignore
+    mkdir -p .github/workflows .clusterfuzzlite docs scripts config \
+      pkg/tbtc/gen/pb \
+      pkg/chain/ethereum/beacon/gen/abi \
+      pkg/chain/ethereum/beacon/gen/cmd \
+      pkg/chain/ethereum/beacon/gen/contract \
+      pkg/chain/ethereum/beacon/gen/_address \
+      solidity/ecdsa
+    echo 'jobs:' >.github/workflows/ci.yml
+    echo 'fuzz build' >.clusterfuzzlite/build.sh
+    echo 'FROM scratch' >Dockerfile
+    echo '* @keep-network/core' >CODEOWNERS
+    echo '= README' >README.adoc
+    echo 'docs' >docs/index.adoc
+    echo '#!/bin/sh' >scripts/helper.sh
+    echo 'toml' >config/config.toml
+    echo 'module example.com/m' >go.mod
+    echo 'package main' >main.go
+    echo 'package pb // committed protobuf bytes' \
+      >pkg/tbtc/gen/pb/message.pb.go
+    echo 'package gen // committed generator directives' \
+      >pkg/chain/ethereum/beacon/gen/gen.go
+    echo 'package cmd // committed root command' \
+      >pkg/chain/ethereum/beacon/gen/cmd/cmd.go
+    echo 'package cmd // committed binding command' \
+      >pkg/chain/ethereum/beacon/gen/cmd/RandomBeacon.go
+    echo 'package abi // committed binding abi' \
+      >pkg/chain/ethereum/beacon/gen/abi/RandomBeacon.go
+    echo 'package contract // committed binding' \
+      >pkg/chain/ethereum/beacon/gen/contract/RandomBeacon.go
+    touch pkg/chain/ethereum/beacon/gen/_address/.keep
+    : >pkg/chain/ethereum/beacon/gen/_address/RandomBeacon
+    echo 'contract A {}' >solidity/ecdsa/WalletRegistry.sol
+    git_q add -A
+    git_q commit -q -m 'fixture'
+  )
+  ORIGIN_SHA="$(git -C "${repo}" rev-parse HEAD)"
+}
+
+# A pristine clone of the origin: the dispatched checkout as CI sees it.
+make_checkout() {
+  local tree="$1"
+  git_q clone -q --no-hardlinks "${WORK}/origin" "${tree}"
+}
+
+# Reshape a clone the way the Dockerfile builds the image: context-excluded
+# paths never copied (ignore rules included), the binding and _address
+# families rewritten from downloaded artifacts, the _address placeholder not
+# recreated, and the gitignored build outputs present.
+make_image_tree() {
+  local tree="$1"
+  make_checkout "${tree}"
+  (
+    cd "${tree}"
+    rm -rf .gitignore .github Dockerfile CODEOWNERS README.adoc docs \
+      scripts solidity
+    rm -f pkg/chain/ethereum/beacon/gen/_address/.keep
+    printf '0x1111111111111111111111111111111111111111' \
+      >pkg/chain/ethereum/beacon/gen/_address/RandomBeacon
+    echo 'package contract // regenerated from published artifacts' \
+      >pkg/chain/ethereum/beacon/gen/contract/RandomBeacon.go
+    echo 'package abi // regenerated from published artifacts' \
+      >pkg/chain/ethereum/beacon/gen/abi/RandomBeacon.go
+    echo 'binary bytes' >keep-client
+    mkdir -p 'tmp/contracts/development/@keep-network/random-beacon'
+    echo 'tarball bytes' \
+      >'tmp/contracts/development/@keep-network/random-beacon/keep-network-random-beacon-2.1.0-dev.24.tgz'
+    echo 'abi json' >pkg/chain/ethereum/beacon/gen/abi/RandomBeacon.abi
+    mkdir -p pkg/chain/ethereum/beacon/gen/_contracts
+    echo 'artifact json' \
+      >pkg/chain/ethereum/beacon/gen/_contracts/RandomBeacon.json
+  )
+}
+
+# Run verify_source_binding against a tree in an isolated subshell so a
+# fail/exit inside the verifier never kills the test run; capture rc and
+# combined output. Arguments: repo root, expected commit, binding mode.
+run_verifier() {
+  local root="$1" expected="$2" mode="$3"
+  set +e
+  CASE_OUT="$(
+    (
+      # The sourced verifier reads these three; shellcheck cannot see
+      # across the source boundary.
+      # shellcheck disable=SC2034
+      REPO_ROOT="${root}"
+      # shellcheck disable=SC2034
+      PR4109_EXPECTED_SOURCE_COMMIT="${expected}"
+      # shellcheck disable=SC2034
+      PR4109_SOURCE_BINDING_MODE="${mode}"
+      verify_source_binding
+    ) 2>&1
+  )"
+  CASE_RC=$?
+  set -e
+}
+
+# Assert the captured rc and that the output matches every given pattern.
+check() {
+  local desc="$1" want_rc="$2"
+  shift 2
+  if [[ "${CASE_RC}" -ne "${want_rc}" ]]; then
+    printf 'FAIL %s: rc %s, want %s\n--- output ---\n%s\n--------------\n' \
+      "${desc}" "${CASE_RC}" "${want_rc}" "${CASE_OUT}"
+    FAILED=$((FAILED + 1))
+    return
+  fi
+  local pattern
+  for pattern in "$@"; do
+    if ! printf '%s\n' "${CASE_OUT}" | grep -Eq -- "${pattern}"; then
+      printf 'FAIL %s: output missing /%s/\n--- output ---\n%s\n--------------\n' \
+        "${desc}" "${pattern}" "${CASE_OUT}"
+      FAILED=$((FAILED + 1))
+      return
+    fi
+  done
+  printf 'ok   %s\n' "${desc}"
+  PASS=$((PASS + 1))
+}
+
+make_origin
+
+# --- exact mode -------------------------------------------------------------
+
+T="${WORK}/exact-clean"
+make_checkout "${T}"
+run_verifier "${T}" "${ORIGIN_SHA}" ""
+check "exact: pristine dispatched checkout passes" 0 \
+  "verified against the dispatched SHA"
+
+T="${WORK}/exact-dirty"
+make_checkout "${T}"
+echo tampered >>"${T}/main.go"
+run_verifier "${T}" "${ORIGIN_SHA}" ""
+check "exact: any divergence fails" 1 "tree diverges"
+
+run_verifier "${T}" "" ""
+check "unbound: dirty tree stamps -dirty instead of failing" 0 "dirty"
+
+T="${WORK}/exact-mismatch"
+make_checkout "${T}"
+run_verifier "${T}" "0000000000000000000000000000000000000000" ""
+check "exact: dispatched-SHA mismatch fails" 1 "source binding mismatch"
+
+T="${WORK}/exact-badmode"
+make_checkout "${T}"
+run_verifier "${T}" "${ORIGIN_SHA}" "trust-me"
+check "unknown binding mode fails" 1 "unknown PR4109_SOURCE_BINDING_MODE"
+
+# --- build-image mode -------------------------------------------------------
+
+T="${WORK}/img-clean"
+make_image_tree "${T}"
+run_verifier "${T}" "${ORIGIN_SHA}" build-image
+check "build-image: the image's designed divergence passes, hash-bound" 0 \
+  "verified against the dispatched SHA inside the build image" \
+  "8 context-excluded absence\(s\) and 3 regenerated tracked file\(s\)" \
+  "gen/contract/RandomBeacon\.go committed sha256 [0-9a-f]{64} image sha256 [0-9a-f]{64}" \
+  "gen/_address/RandomBeacon committed sha256 [0-9a-f]{64} image sha256 [0-9a-f]{64}" \
+  "resolved contract artifact tarballs" \
+  "keep-network-random-beacon-2\.1\.0-dev\.24\.tgz sha256 [0-9a-f]{64}"
+
+T="${WORK}/img-deletions-only"
+make_checkout "${T}"
+(cd "${T}" && rm -rf .gitignore .github Dockerfile CODEOWNERS README.adoc \
+  docs scripts solidity)
+run_verifier "${T}" "${ORIGIN_SHA}" build-image
+check "build-image: expected context-excluded absences alone pass" 0 \
+  "7 context-excluded absence\(s\) and 0 regenerated tracked file\(s\)"
+
+T="${WORK}/img-outputs-only"
+make_image_tree "${T}"
+run_verifier "${T}" "${ORIGIN_SHA}" build-image
+check "build-image: gitignored build outputs are classified by the restored \
+committed ignore rules" 0 \
+  "verified against the dispatched SHA inside the build image"
+
+T="${WORK}/img-mismatch"
+make_image_tree "${T}"
+run_verifier "${T}" "1111111111111111111111111111111111111111" build-image
+check "build-image: dispatched-SHA mismatch fails" 1 "source binding mismatch"
+
+T="${WORK}/img-nogit"
+make_image_tree "${T}"
+rm -rf "${T}/.git"
+run_verifier "${T}" "${ORIGIN_SHA}" build-image
+check "build-image: unreadable git metadata fails" 1 \
+  "no readable git metadata"
+
+T="${WORK}/img-untracked"
+make_image_tree "${T}"
+echo 'package tbtc' >"${T}/pkg/tbtc/injected.go"
+run_verifier "${T}" "${ORIGIN_SHA}" build-image
+check "build-image: an untracked source file fails" 1 \
+  "\?\? pkg/tbtc/injected\.go" "beyond what the image build produces"
+
+T="${WORK}/img-pb"
+make_image_tree "${T}"
+echo '// tampered' >>"${T}/pkg/tbtc/gen/pb/message.pb.go"
+run_verifier "${T}" "${ORIGIN_SHA}" build-image
+check "build-image: modified committed gen/pb code fails" 1 \
+  "M pkg/tbtc/gen/pb/message\.pb\.go"
+
+T="${WORK}/img-gengo"
+make_image_tree "${T}"
+echo '// tampered' >>"${T}/pkg/chain/ethereum/beacon/gen/gen.go"
+run_verifier "${T}" "${ORIGIN_SHA}" build-image
+check "build-image: modified committed gen/gen.go fails" 1 \
+  "M pkg/chain/ethereum/beacon/gen/gen\.go"
+
+T="${WORK}/img-cmdgo"
+make_image_tree "${T}"
+echo '// tampered' >>"${T}/pkg/chain/ethereum/beacon/gen/cmd/cmd.go"
+run_verifier "${T}" "${ORIGIN_SHA}" build-image
+check "build-image: modified committed gen/cmd/cmd.go fails" 1 \
+  "M pkg/chain/ethereum/beacon/gen/cmd/cmd\.go"
+
+T="${WORK}/img-source"
+make_image_tree "${T}"
+echo '// tampered' >>"${T}/main.go"
+run_verifier "${T}" "${ORIGIN_SHA}" build-image
+check "build-image: modified plain source fails" 1 "M main\.go"
+
+T="${WORK}/img-deleted-source"
+make_image_tree "${T}"
+rm "${T}/main.go"
+run_verifier "${T}" "${ORIGIN_SHA}" build-image
+check "build-image: deleted plain source fails" 1 "D main\.go"
+
+T="${WORK}/img-missing-binding"
+make_image_tree "${T}"
+rm "${T}/pkg/chain/ethereum/beacon/gen/contract/RandomBeacon.go"
+run_verifier "${T}" "${ORIGIN_SHA}" build-image
+check "build-image: a binding the image failed to regenerate fails" 1 \
+  "D pkg/chain/ethereum/beacon/gen/contract/RandomBeacon\.go"
+
+T="${WORK}/img-badignore"
+make_image_tree "${T}"
+printf '*\n' >"${T}/.gitignore"
+run_verifier "${T}" "${ORIGIN_SHA}" build-image
+check "build-image: a present-but-tampered .gitignore is never restored \
+over and fails" 1 "M \.gitignore"
+
+T="${WORK}/img-cfl"
+make_image_tree "${T}"
+rm -rf "${T}/.clusterfuzzlite"
+run_verifier "${T}" "${ORIGIN_SHA}" build-image
+check "build-image: .clusterfuzzlite absence is never explained away" 1 \
+  "D \.clusterfuzzlite/build\.sh"
+
+# ----------------------------------------------------------------------------
+
+printf '%d passed, %d failed\n' "${PASS}" "${FAILED}"
+if [[ "${FAILED}" -ne 0 ]]; then
+  exit 1
+fi

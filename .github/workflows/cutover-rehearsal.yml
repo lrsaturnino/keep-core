@@ -23,6 +23,10 @@ name: Cutover Rehearsal
 on:
   workflow_dispatch:
     inputs:
+      artifact_environment:
+        description: "npm dist-tag or exact version for the contract artifacts baked into the build image; the stamp records every resolved tarball's name, version, and sha256"
+        required: false
+        default: "development"
       run_container_stages:
         description: "Run the container rehearsal stages (needs all inputs below)"
         type: boolean
@@ -61,6 +65,14 @@ jobs:
           echo "version=$(git describe --tags --match "v[0-9]*" HEAD)" >> "$GITHUB_ENV"
           echo "revision=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
 
+      # The binding verifier gates every piece of evidence this workflow
+      # archives, so it proves itself before the expensive image build: the
+      # self-test drives it through checkout- and image-shaped trees and
+      # fails the dispatch if the verifier accepts anything beyond the
+      # image's documented construction.
+      - name: Self-test the source binding verifier
+        run: ./scripts/release/pr4109/test-source-binding.sh
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -72,6 +84,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-buildx-
 
+      # ENVIRONMENT names the artifact input identity explicitly instead of
+      # riding the Makefile's implicit development default (client CI's
+      # empty build-arg resolves to the same tag). The tag itself can float
+      # on the registry, so the in-image verification binds the resolved
+      # tarballs — name, exact version, sha256 — into the archived stamp.
       - name: Build Docker Build Image
         uses: docker/build-push-action@v5
         with:
@@ -80,6 +97,7 @@ jobs:
           build-args: |
             VERSION=${{ env.version }}
             REVISION=${{ env.revision }}
+            ENVIRONMENT=${{ inputs.artifact_environment }}
           load: true # load image to local registry to use it in next steps
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache-new

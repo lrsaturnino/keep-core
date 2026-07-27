@@ -32,10 +32,14 @@
 #                        divergence — untracked files included
 #   PR4109_SOURCE_BINDING_MODE
 #                        exact (default) tolerates no divergence at all;
-#                        build-image additionally accepts only what the CI
-#                        build image produces by design — .dockerignore'd
-#                        paths absent from the image and the gen/ trees the
-#                        image regenerates from published artifacts
+#                        build-image accepts only what the CI build image
+#                        produces by design: context-excluded paths absent
+#                        from the image and the regenerated gen/ binding and
+#                        _address families — never the committed protobuf
+#                        code — with every accepted regeneration bound into
+#                        the stamp by committed-vs-image content hash and
+#                        untracked files classified under the commit's own
+#                        restored .gitignore rules
 #
 # Evidence is written under EVIDENCE_DIR (default: ./rehearsal-evidence).
 # Every accepted rehearsal run must produce a record conforming to
@@ -86,6 +90,10 @@ stages:
                       all-candidate-down barrier, offline state audit, staged
                       prior redeploy, forbidden partial-rollback attempt
                       [BLOCKED until preflight passes]
+  verify-source-binding
+                      run only the fail-closed source binding check on this
+                      tree and record it; inside the CI build image set
+                      PR4109_SOURCE_BINDING_MODE=build-image
   validate-evidence   validate every evidence record under EVIDENCE_DIR
                       against rehearsal-evidence.schema.json
 
@@ -95,7 +103,8 @@ environment (every proof stage):
                       is exactly this commit (clean, untracked included)
   PR4109_SOURCE_BINDING_MODE
                       exact (default) | build-image (accept only the CI
-                      build image's .dockerignore/gen-rebuild divergence)
+                      build image's designed divergence: context-excluded
+                      absences and hash-recorded regenerated gen/ families)
 EOF
 }
 
@@ -136,31 +145,162 @@ source_commit() {
   printf '%s' "${commit}"
 }
 
-# Divergence the CI build image creates by design, and nothing else:
-# .dockerignore keeps these paths out of the build context entirely, so
-# against the mounted checkout metadata they surface as worktree deletions,
-# and `make get_artifacts`/`make generate` rebuild the gen/ trees from the
-# published contract artifacts, surfacing as modified, deleted, or
-# untracked gen/ and node_modules/ paths. Reads porcelain lines on stdin
-# and passes through every line neither family explains.
-unexplained_build_image_divergence() {
-  local regenerated='(^|/)(gen|node_modules)/'
-  local dockerignored='^(\..+|docs[^/]*/.+|infrastructure/.+|scripts/.+'
-  dockerignored+='|tmp/.+|CODEOWNERS|Dockerfile|[^/]+\.adoc|solidity/.+'
-  dockerignored+='|token-stakedrop/.+|token-tracker/.+)$'
+# sha256 of stdin, portable across the CI build image (busybox sha256sum)
+# and a macOS workstation (shasum).
+hash_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  else
+    shasum -a 256 | awk '{print $1}'
+  fi
+}
+
+# The CI build image drops every root dotfile from its build context (the
+# .dockerignore `.*` rule), so inside the image git sees a tree without the
+# repository's own ignore rules and every gitignored build output — the
+# keep-client binary, the tmp/contracts artifact trees — as untracked
+# divergence. Restore the committed .gitignore files, and only where they
+# are absent: the restored bytes come from the commit under verification
+# itself, so restoration cannot mask anything, while a present-but-modified
+# .gitignore keeps its modified status and still fails the stamp.
+restore_committed_gitignores() {
+  local path
+  git -C "${REPO_ROOT}" ls-tree -r --name-only HEAD |
+    { grep -E '(^|/)\.gitignore$' || true; } |
+    while IFS= read -r path; do
+      if [[ ! -e "${REPO_ROOT}/${path}" ]]; then
+        mkdir -p "${REPO_ROOT}/$(dirname "${path}")"
+        git -C "${REPO_ROOT}" show "HEAD:${path}" >"${REPO_ROOT}/${path}"
+      fi
+    done
+}
+
+# True when .dockerignore keeps this committed path out of the build context
+# entirely, so its absence inside the image is the image's construction and
+# not divergence. Mirrors .dockerignore rule by rule, negations included:
+# .clusterfuzzlite MUST reach the context, so its absence is never explained
+# away, and the regenerated gen/ families are deliberately not listed here —
+# the image is supposed to recreate them, so their absence is drift.
+dockerignore_excluded_path() {
+  local path="$1"
+  if [[ "${path}" =~ ^\.clusterfuzzlite(/|$) ]]; then
+    return 1
+  fi
+  [[ "${path}" =~ ^\.[^/]*(/|$) ]] && return 0
+  [[ "${path}" =~ ^docs[^/]*/ ]] && return 0
+  [[ "${path}" =~ ^(infrastructure|scripts|tmp|solidity|token-stakedrop|token-tracker)/ ]] &&
+    return 0
+  [[ "${path}" =~ ^(CODEOWNERS|Dockerfile)$ ]] && return 0
+  [[ "${path}" =~ ^[^/]+\.adoc$ ]] && return 0
+  [[ "${path}" =~ (^|/)node_modules/ ]] && return 0
+  [[ "${path}" =~ (^|/)gen/_contracts(/|$) ]] && return 0
+  return 1
+}
+
+# True for the tracked files the image legitimately rewrites: .dockerignore
+# keeps **/gen/**/*.go and **/gen/_address/* out of the context, and
+# `make get_artifacts` + `make generate` recreate them from the published
+# contract artifacts before the final COPY. The negated families —
+# gen/pb/*.go, gen/gen.go, gen/cmd/cmd.go — DO reach the context and are
+# overwritten with committed bytes by that COPY, so a difference there is
+# tampering, never regeneration: the committed protobuf message code the
+# tests compile stays byte-bound to the dispatched commit.
+regenerated_by_design_path() {
+  local path="$1"
+  if [[ "${path}" =~ (^|/)gen/pb/[^/]+\.go$ ]] ||
+    [[ "${path}" =~ (^|/)gen/gen\.go$ ]] ||
+    [[ "${path}" =~ (^|/)gen/cmd/cmd\.go$ ]]; then
+    return 1
+  fi
+  [[ "${path}" =~ (^|/)gen/.+\.go$ ]] && return 0
+  [[ "${path}" =~ (^|/)gen/_address/[^/]+$ ]] && return 0
+  return 1
+}
+
+# The artifact input identity behind the regenerated files: get_artifacts
+# leaves each resolved npm tarball — name and exact version — under
+# tmp/contracts. Binding their digests into the stamp turns "regenerated
+# from published artifacts" from a label into something an evidence consumer
+# can verify against the registry.
+record_artifact_identity() {
+  local tarball
+  if [[ ! -d "${REPO_ROOT}/tmp/contracts" ]]; then
+    note "artifact identity: no tmp/contracts artifact tree in this image"
+    return
+  fi
+  note "artifact identity: resolved contract artifact tarballs:"
+  find "${REPO_ROOT}/tmp/contracts" -name '*.tgz' -type f |
+    LC_ALL=C sort |
+    while IFS= read -r tarball; do
+      printf '>>   %s sha256 %s\n' "${tarball#"${REPO_ROOT}"/}" \
+        "$(hash_stdin <"${tarball}")"
+    done
+}
+
+# Build-image verification: every porcelain line must be explained by the
+# image's documented construction, and everything the image is allowed to
+# rewrite is bound into the stamp by content hash. Deletions are accepted
+# only for context-excluded paths plus the gen/_address placeholders the
+# generator does not recreate; modifications only for the regenerated
+# families, each recorded committed-vs-image; untracked files are always
+# fatal once the committed ignore rules are restored; every other status —
+# index-side changes, renames, typechanges, an unreadable tree — is fatal.
+verify_build_image_tree() {
+  local expected="$1"
+  restore_committed_gitignores
+
+  local divergence unexplained="" regenerated="" absences=0 regens=0
   local line status path
+  divergence="$(source_divergence)"
   while IFS= read -r line; do
     [[ -n "${line}" ]] || continue
     status="${line:0:2}"
     path="${line:3}"
-    if [[ "${path}" =~ ${regenerated} ]]; then
-      continue
-    fi
-    if [[ "${status}" == " D" && "${path}" =~ ${dockerignored} ]]; then
-      continue
-    fi
-    printf '%s\n' "${line}"
-  done
+    case "${status}" in
+    " D")
+      if dockerignore_excluded_path "${path}" ||
+        [[ "${path}" =~ (^|/)gen/_address/[^/]+$ ]]; then
+        absences=$((absences + 1))
+      else
+        unexplained+="${line}"$'\n'
+      fi
+      ;;
+    " M")
+      if regenerated_by_design_path "${path}"; then
+        regenerated+="${path}"$'\n'
+        regens=$((regens + 1))
+      else
+        unexplained+="${line}"$'\n'
+      fi
+      ;;
+    *)
+      unexplained+="${line}"$'\n'
+      ;;
+    esac
+  done <<<"${divergence}"
+
+  if [[ -n "${unexplained}" ]]; then
+    printf '%s' "${unexplained}" >&2
+    fail "source binding to ${expected} requested, but the build-image tree \
+diverges from that commit beyond what the image build produces by design \
+(listing above); refusing to produce evidence"
+  fi
+
+  if [[ -n "${regenerated}" ]]; then
+    note "regenerated tracked files accepted by design, bytes bound into \
+this stamp:"
+    while IFS= read -r path; do
+      [[ -n "${path}" ]] || continue
+      printf '>>   %s committed sha256 %s image sha256 %s\n' "${path}" \
+        "$(git -C "${REPO_ROOT}" show "HEAD:${path}" | hash_stdin)" \
+        "$(hash_stdin <"${REPO_ROOT}/${path}")"
+    done <<<"${regenerated}"
+  fi
+  record_artifact_identity
+
+  note "source commit: ${expected} (verified against the dispatched SHA \
+inside the build image; ${absences} context-excluded absence(s) and \
+${regens} regenerated tracked file(s) accepted by design)"
 }
 
 # Fail-closed source binding. When PR4109_EXPECTED_SOURCE_COMMIT is set —
@@ -191,9 +331,9 @@ dispatch expects ${expected}"
   fi
 
   local mode="${PR4109_SOURCE_BINDING_MODE:-exact}" divergence
-  divergence="$(source_divergence)"
   case "${mode}" in
   exact)
+    divergence="$(source_divergence)"
     if [[ -n "${divergence}" ]]; then
       printf '%s\n' "${divergence}" >&2
       fail "source binding to ${expected} requested, but the tree diverges \
@@ -203,21 +343,7 @@ produce evidence for bytes that are not the dispatched commit"
     note "source commit: ${expected} (verified against the dispatched SHA)"
     ;;
   build-image)
-    local unexplained accepted=0
-    unexplained="$(printf '%s\n' "${divergence}" |
-      unexplained_build_image_divergence)"
-    if [[ -n "${unexplained}" ]]; then
-      printf '%s\n' "${unexplained}" >&2
-      fail "source binding to ${expected} requested, but the build-image \
-tree diverges from that commit beyond the .dockerignore'd and regenerated \
-gen/ families (listing above); refusing to produce evidence"
-    fi
-    if [[ -n "${divergence}" ]]; then
-      accepted="$(printf '%s\n' "${divergence}" | grep -c .)"
-    fi
-    note "source commit: ${expected} (verified against the dispatched SHA \
-inside the build image; ${accepted} .dockerignore'd or regenerated path \
-divergence(s) accepted by design)"
+    verify_build_image_tree "${expected}"
     ;;
   *)
     fail "unknown PR4109_SOURCE_BINDING_MODE [${mode}]; use exact or \
@@ -250,6 +376,11 @@ stage_local_proofs() {
 
   (
     cd "${REPO_ROOT}"
+    # The verifier gates every piece of evidence below, so it proves itself
+    # first: the self-test builds throwaway repositories shaped like the
+    # dispatched checkout and like the build image's tree and checks the
+    # verifier accepts exactly the image's documented construction.
+    "${SCRIPT_DIR}/test-source-binding.sh"
     verify_source_binding
     go test -count=1 -v \
       -run 'TestJoinDKGIfEligible|TestMonitorRelayEntry|TestForwardSignatureShares' \
@@ -427,6 +558,19 @@ storage snapshots and an independent network probe; supply them and extend \
 this stage before relying on it as release evidence"
 }
 
+stage_verify_source_binding() {
+  note "running the fail-closed source binding check"
+  mkdir -p "${EVIDENCE_DIR}"
+  local log="${EVIDENCE_DIR}/source-binding.log"
+
+  (
+    cd "${REPO_ROOT}"
+    verify_source_binding
+  ) 2>&1 | tee "${log}"
+
+  note "source binding recorded in ${log}"
+}
+
 stage_validate_evidence() {
   local schema="${SCRIPT_DIR}/rehearsal-evidence.schema.json"
 
@@ -451,16 +595,20 @@ run that produced no record cannot be accepted"
   note "all evidence records conform to the schema"
 }
 
-case "${1:-}" in
-local-proofs) stage_local_proofs ;;
-static-analysis) stage_static_analysis ;;
-solidity-proofs) stage_solidity_proofs ;;
-preflight) stage_preflight ;;
-single-release) stage_single_release ;;
-rollback) stage_rollback ;;
-validate-evidence) stage_validate_evidence ;;
-*)
-  usage
-  exit 2
-  ;;
-esac
+# Sourceable for the source-binding self-test: dispatch only when executed.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  case "${1:-}" in
+  local-proofs) stage_local_proofs ;;
+  static-analysis) stage_static_analysis ;;
+  solidity-proofs) stage_solidity_proofs ;;
+  preflight) stage_preflight ;;
+  single-release) stage_single_release ;;
+  rollback) stage_rollback ;;
+  verify-source-binding) stage_verify_source_binding ;;
+  validate-evidence) stage_validate_evidence ;;
+  *)
+    usage
+    exit 2
+    ;;
+  esac
+fi

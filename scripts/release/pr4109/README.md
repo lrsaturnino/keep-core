@@ -96,11 +96,35 @@ just labeling: the workflow hands every proof stage the dispatched SHA via
 `PR4109_EXPECTED_SOURCE_COMMIT`, and for the build-image stage it mounts
 the checkout's `.git` and `scripts/` read-only into the container
 (`.dockerignore` keeps both out of the build context) and sets
-`PR4109_SOURCE_BINDING_MODE=build-image`, under which `rehearse.sh`
-accepts only the divergence the image produces by design —
-`.dockerignore`'d paths absent from the image and the `gen/` trees the
-image regenerates from published artifacts — and refuses to produce
-evidence on anything else.
+`PR4109_SOURCE_BINDING_MODE=build-image`. Under that mode `rehearse.sh`
+accepts exactly the image's documented construction and nothing else.
+First it restores the commit's own `.gitignore` files — only where absent,
+byte-exact from the commit under verification, so restoration can mask
+nothing while a tampered ignore file keeps its modified status — because
+the image drops every root dotfile and would otherwise report its own
+gitignored build outputs (the `keep-client` binary, the `tmp/contracts`
+artifact trees) as untracked noise. Then every remaining status line must
+be explained: a deletion only for a path `.dockerignore` keeps out of the
+context (honoring the `.clusterfuzzlite` negations — those files must be
+present) or for a `gen/_address/` placeholder the generator does not
+recreate; a modification only for the families the image regenerates from
+published artifacts (`**/gen/**/*.go` and `**/gen/_address/*`, minus the
+negated `gen/pb/*.go`, `gen/gen.go`, and `gen/cmd/cmd.go`, which the final
+`COPY` overwrites with committed bytes — the committed protobuf code the
+tests compile can never differ). Every accepted regenerated file is bound
+into the stamp by committed-vs-image sha256 pair, and the resolved
+contract artifact tarballs under `tmp/contracts` — name, exact version,
+sha256 — are recorded as the artifact input identity behind them (the
+workflow pins the `ENVIRONMENT` build-arg from its `artifact_environment`
+input instead of riding the Makefile's implicit default). Untracked files
+and any other status are always fatal. The verifier is itself under test:
+`test-source-binding.sh` drives it through checkout- and image-shaped
+throwaway repositories — clean image, expected absences alone, tampered
+generated code, injected or deleted source, missing metadata, SHA
+mismatch — and runs both as an early workflow step on the runner and
+inside `local-proofs`, so its verdicts land in the archived evidence.
+`./rehearse.sh verify-source-binding` runs the binding check alone and
+records it under `EVIDENCE_DIR`.
 
 On a hosted runner the per-node keystore comes from the
 `REHEARSAL_KEYSTORE_BUNDLE_B64` repository secret: a base64-encoded tar.gz
