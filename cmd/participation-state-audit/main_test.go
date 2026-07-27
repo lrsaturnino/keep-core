@@ -184,6 +184,19 @@ func newValidEvidence(t *testing.T, auditManifest *manifest) evidenceInputs {
 			DKGSettlement:    "approved",
 		})
 	}
+	for _, quarantined := range auditManifest.TBTCQuarantinedOutputs {
+		chainRecord.Wallets = append(chainRecord.Wallets, struct {
+			WalletStorageKey string `json:"wallet_storage_key"`
+			WalletID         string `json:"wallet_id"`
+			Registered       bool   `json:"registered"`
+			DKGSettlement    string `json:"dkg_settlement"`
+		}{
+			WalletStorageKey: quarantined.WalletStorageKey,
+			WalletID:         "0x" + strings.Repeat("22", 32),
+			Registered:       false,
+			DKGSettlement:    "none",
+		})
+	}
 	for _, membership := range auditManifest.BeaconActiveMemberships {
 		chainRecord.BeaconGroups = append(chainRecord.BeaconGroups, struct {
 			GroupPublicKey string `json:"group_public_key"`
@@ -191,6 +204,15 @@ func newValidEvidence(t *testing.T, auditManifest *manifest) evidenceInputs {
 		}{
 			GroupPublicKey: membership.GroupPublicKey,
 			Registered:     true,
+		})
+	}
+	for _, quarantined := range auditManifest.BeaconQuarantinedOutputs {
+		chainRecord.BeaconGroups = append(chainRecord.BeaconGroups, struct {
+			GroupPublicKey string `json:"group_public_key"`
+			Registered     bool   `json:"registered"`
+		}{
+			GroupPublicKey: quarantined.GroupPublicKey,
+			Registered:     false,
 		})
 	}
 
@@ -231,6 +253,19 @@ func newValidEvidence(t *testing.T, auditManifest *manifest) evidenceInputs {
 	}
 }
 
+// testExpectedIdentity returns the expected-identity inputs matching the
+// values newValidEvidence writes, so identity binding passes unless a test
+// deliberately mismatches it.
+func testExpectedIdentity() expectedIdentityInputs {
+	return expectedIdentityInputs{
+		ethereumChainID: "1",
+		bitcoinNetwork:  "mainnet",
+		priorVersion:    "v2.0.0",
+		priorRevision:   strings.Repeat("ab", 20),
+		maxEvidenceAge:  24 * time.Hour,
+	}
+}
+
 func hasBlocker(auditManifest *manifest, fragment string) bool {
 	for _, blocker := range auditManifest.RollbackBlockers {
 		if strings.Contains(blocker, fragment) {
@@ -252,7 +287,7 @@ func hasFinding(auditManifest *manifest, fragment string) bool {
 func TestRunAudit_ConsistentSnapshot(t *testing.T) {
 	storageDir := newTestStorage(t)
 
-	auditManifest, err := runAudit(storageDir, testPassword, evidenceInputs{})
+	auditManifest, err := runAudit(storageDir, testPassword, evidenceInputs{}, testExpectedIdentity())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -349,7 +384,7 @@ func TestRunAudit_ValidEvidenceSatisfiesBarrier(t *testing.T) {
 	// The two-phase workflow: the first audit produces the snapshot identity
 	// and interpreted inventory the external evidence must bind to and cover;
 	// the second audit validates the produced evidence.
-	firstPass, err := runAudit(storageDir, testPassword, evidenceInputs{})
+	firstPass, err := runAudit(storageDir, testPassword, evidenceInputs{}, testExpectedIdentity())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -358,6 +393,7 @@ func TestRunAudit_ValidEvidenceSatisfiesBarrier(t *testing.T) {
 		storageDir,
 		testPassword,
 		newValidEvidence(t, firstPass),
+		testExpectedIdentity(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -394,6 +430,7 @@ func TestRunAudit_PlaceholderEvidenceIsBlocking(t *testing.T) {
 		storageDir,
 		testPassword,
 		newPlaceholderEvidence(t),
+		testExpectedIdentity(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -421,7 +458,7 @@ func TestRunAudit_PlaceholderEvidenceIsBlocking(t *testing.T) {
 func TestRunAudit_EvidenceBoundToDifferentSnapshotIsBlocking(t *testing.T) {
 	storageDir := newTestStorage(t)
 
-	firstPass, err := runAudit(storageDir, testPassword, evidenceInputs{})
+	firstPass, err := runAudit(storageDir, testPassword, evidenceInputs{}, testExpectedIdentity())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -434,6 +471,7 @@ func TestRunAudit_EvidenceBoundToDifferentSnapshotIsBlocking(t *testing.T) {
 		storageDir,
 		testPassword,
 		newValidEvidence(t, &foreign),
+		testExpectedIdentity(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -453,7 +491,7 @@ func TestRunAudit_EvidenceBoundToDifferentSnapshotIsBlocking(t *testing.T) {
 func TestRunAudit_UncoveredPersistedGroupIsBlocking(t *testing.T) {
 	storageDir := newTestStorage(t)
 
-	firstPass, err := runAudit(storageDir, testPassword, evidenceInputs{})
+	firstPass, err := runAudit(storageDir, testPassword, evidenceInputs{}, testExpectedIdentity())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -466,6 +504,7 @@ func TestRunAudit_UncoveredPersistedGroupIsBlocking(t *testing.T) {
 		storageDir,
 		testPassword,
 		newValidEvidence(t, &uncovered),
+		testExpectedIdentity(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -485,7 +524,7 @@ func TestRunAudit_UncoveredPersistedGroupIsBlocking(t *testing.T) {
 func TestRunAudit_IncompatiblePriorReaderIsBlocking(t *testing.T) {
 	storageDir := newTestStorage(t)
 
-	firstPass, err := runAudit(storageDir, testPassword, evidenceInputs{})
+	firstPass, err := runAudit(storageDir, testPassword, evidenceInputs{}, testExpectedIdentity())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -521,7 +560,7 @@ func TestRunAudit_IncompatiblePriorReaderIsBlocking(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	auditManifest, err := runAudit(storageDir, testPassword, evidence)
+	auditManifest, err := runAudit(storageDir, testPassword, evidence, testExpectedIdentity())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -542,7 +581,7 @@ func TestRunAudit_QuarantinedClaimWithoutQuarantineStateIsBlocking(
 ) {
 	storageDir := newTestStorage(t)
 
-	firstPass, err := runAudit(storageDir, testPassword, evidenceInputs{})
+	firstPass, err := runAudit(storageDir, testPassword, evidenceInputs{}, testExpectedIdentity())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -586,7 +625,7 @@ func TestRunAudit_QuarantinedClaimWithoutQuarantineStateIsBlocking(
 		t.Fatal(err)
 	}
 
-	auditManifest, err := runAudit(storageDir, testPassword, evidence)
+	auditManifest, err := runAudit(storageDir, testPassword, evidence, testExpectedIdentity())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -647,7 +686,7 @@ func TestRunAudit_TBTCQuarantineMetadataWithoutMembershipIsAFinding(
 		t.Fatal(err)
 	}
 
-	auditManifest, err := runAudit(storageDir, testPassword, evidenceInputs{})
+	auditManifest, err := runAudit(storageDir, testPassword, evidenceInputs{}, testExpectedIdentity())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -700,7 +739,7 @@ func TestRunAudit_UndecodableTBTCQuarantineMembershipIsAFinding(
 		t.Fatal(err)
 	}
 
-	auditManifest, err := runAudit(storageDir, testPassword, evidenceInputs{})
+	auditManifest, err := runAudit(storageDir, testPassword, evidenceInputs{}, testExpectedIdentity())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -723,9 +762,14 @@ func TestRunAudit_UndecodableTBTCQuarantineMembershipIsAFinding(
 func TestRunAudit_UnreadableEvidenceIsAnError(t *testing.T) {
 	storageDir := newTestStorage(t)
 
-	_, err := runAudit(storageDir, testPassword, evidenceInputs{
-		chainReconciliation: filepath.Join(t.TempDir(), "does-not-exist"),
-	})
+	_, err := runAudit(
+		storageDir,
+		testPassword,
+		evidenceInputs{
+			chainReconciliation: filepath.Join(t.TempDir(), "does-not-exist"),
+		},
+		testExpectedIdentity(),
+	)
 	if err == nil {
 		t.Error("expected an error for an unreadable evidence reference")
 	}
@@ -755,7 +799,7 @@ func TestRunAudit_MetadataWithoutMembershipIsAFinding(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	auditManifest, err := runAudit(storageDir, testPassword, evidenceInputs{})
+	auditManifest, err := runAudit(storageDir, testPassword, evidenceInputs{}, testExpectedIdentity())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -813,7 +857,7 @@ func TestRunAudit_QuarantineMetadataCrossChecks(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	auditManifest, err := runAudit(storageDir, testPassword, evidenceInputs{})
+	auditManifest, err := runAudit(storageDir, testPassword, evidenceInputs{}, testExpectedIdentity())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -877,7 +921,7 @@ func TestRunAudit_QuarantinedGroupAlsoActiveIsAFinding(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	auditManifest, err := runAudit(storageDir, testPassword, evidenceInputs{})
+	auditManifest, err := runAudit(storageDir, testPassword, evidenceInputs{}, testExpectedIdentity())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -924,7 +968,7 @@ func TestRunAudit_MisplacedActiveMembershipIsAFinding(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	auditManifest, err := runAudit(storageDir, testPassword, evidenceInputs{})
+	auditManifest, err := runAudit(storageDir, testPassword, evidenceInputs{}, testExpectedIdentity())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -968,7 +1012,7 @@ func TestRunAudit_UndecodableTBTCRecordIsAFinding(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	auditManifest, err := runAudit(storageDir, testPassword, evidenceInputs{})
+	auditManifest, err := runAudit(storageDir, testPassword, evidenceInputs{}, testExpectedIdentity())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -994,7 +1038,7 @@ func TestRunAudit_UnexpectedNamespaceIsAFinding(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	auditManifest, err := runAudit(storageDir, testPassword, evidenceInputs{})
+	auditManifest, err := runAudit(storageDir, testPassword, evidenceInputs{}, testExpectedIdentity())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1013,7 +1057,7 @@ func TestRunAudit_UnexpectedNamespaceIsAFinding(t *testing.T) {
 func TestRunAudit_WithoutPasswordInventoriesOnly(t *testing.T) {
 	storageDir := newTestStorage(t)
 
-	auditManifest, err := runAudit(storageDir, "", evidenceInputs{})
+	auditManifest, err := runAudit(storageDir, "", evidenceInputs{}, testExpectedIdentity())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1045,5 +1089,381 @@ func TestRunAudit_WithoutPasswordInventoriesOnly(t *testing.T) {
 	}
 	if quarantineFiles == 0 {
 		t.Error("expected the quarantine namespace inventory to list files")
+	}
+}
+
+func TestRunAudit_MissingExpectedIdentityIsBlocking(t *testing.T) {
+	storageDir := newTestStorage(t)
+
+	firstPass, err := runAudit(
+		storageDir,
+		testPassword,
+		evidenceInputs{},
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	auditManifest, err := runAudit(
+		storageDir,
+		testPassword,
+		newValidEvidence(t, firstPass),
+		expectedIdentityInputs{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if auditManifest.RollbackBarrierReady {
+		t.Error("missing expected identities must not authorize the barrier")
+	}
+	for _, fragment := range []string{
+		"expected Ethereum chain ID is not supplied",
+		"expected Bitcoin network is not supplied",
+		"expected prior version is not supplied",
+		"expected prior revision is not supplied",
+		"no evidence freshness bound is supplied",
+	} {
+		if !hasBlocker(auditManifest, fragment) {
+			t.Errorf(
+				"expected the [%s] blocker, blockers: %v",
+				fragment,
+				auditManifest.RollbackBlockers,
+			)
+		}
+	}
+}
+
+func TestRunAudit_MismatchedExpectedIdentityIsBlocking(t *testing.T) {
+	storageDir := newTestStorage(t)
+
+	firstPass, err := runAudit(
+		storageDir,
+		testPassword,
+		evidenceInputs{},
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The evidence itself is schema-valid and records chain [1], network
+	// [mainnet], version [v2.0.0]; the audit expects a different operational
+	// target for each.
+	mismatched := expectedIdentityInputs{
+		ethereumChainID: "11155111",
+		bitcoinNetwork:  "testnet",
+		priorVersion:    "v1.9.9",
+		priorRevision:   strings.Repeat("cd", 20),
+		maxEvidenceAge:  24 * time.Hour,
+	}
+
+	auditManifest, err := runAudit(
+		storageDir,
+		testPassword,
+		newValidEvidence(t, firstPass),
+		mismatched,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if auditManifest.RollbackBarrierReady {
+		t.Error("mismatched identities must not authorize the barrier")
+	}
+	for _, fragment := range []string{
+		"reconciled against Ethereum chain [1], expected [11155111]",
+		"reconciled against Bitcoin network [mainnet], expected [testnet]",
+		"tested prior version [v2.0.0], expected [v1.9.9]",
+		"tested prior revision",
+	} {
+		if !hasBlocker(auditManifest, fragment) {
+			t.Errorf(
+				"expected the [%s] blocker, blockers: %v",
+				fragment,
+				auditManifest.RollbackBlockers,
+			)
+		}
+	}
+}
+
+func TestRunAudit_StaleEvidenceIsBlocking(t *testing.T) {
+	storageDir := newTestStorage(t)
+
+	firstPass, err := runAudit(
+		storageDir,
+		testPassword,
+		evidenceInputs{},
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The evidence was generated a moment ago; a one-nanosecond freshness
+	// bound makes every record stale.
+	stale := testExpectedIdentity()
+	stale.maxEvidenceAge = time.Nanosecond
+
+	auditManifest, err := runAudit(
+		storageDir,
+		testPassword,
+		newValidEvidence(t, firstPass),
+		stale,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if auditManifest.RollbackBarrierReady {
+		t.Error("stale evidence must not authorize the barrier")
+	}
+	if !hasBlocker(auditManifest, "evidence freshness bound") {
+		t.Errorf(
+			"expected a freshness blocker, blockers: %v",
+			auditManifest.RollbackBlockers,
+		)
+	}
+}
+
+func TestRunAudit_UncoveredQuarantinedOutputIsBlocking(t *testing.T) {
+	storageDir := newTestStorage(t)
+
+	firstPass, err := runAudit(
+		storageDir,
+		testPassword,
+		evidenceInputs{},
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Evidence generated from a manifest stripped of the quarantined output
+	// reconciles the active state only.
+	uncovered := *firstPass
+	uncovered.BeaconQuarantinedOutputs = nil
+
+	auditManifest, err := runAudit(
+		storageDir,
+		testPassword,
+		newValidEvidence(t, &uncovered),
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if auditManifest.RollbackBarrierReady {
+		t.Error("an unreconciled quarantined output must not authorize the barrier")
+	}
+	if !hasBlocker(auditManifest, "quarantined beacon group") ||
+		!hasBlocker(auditManifest, "is not reconciled") {
+		t.Errorf(
+			"expected a quarantined-coverage blocker, blockers: %v",
+			auditManifest.RollbackBlockers,
+		)
+	}
+}
+
+func TestRunAudit_EvidenceForStateTheSnapshotDoesNotHoldIsBlocking(
+	t *testing.T,
+) {
+	storageDir := newTestStorage(t)
+
+	firstPass, err := runAudit(
+		storageDir,
+		testPassword,
+		evidenceInputs{},
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Evidence generated from a manifest holding one extra beacon group
+	// reconciles state this snapshot does not hold.
+	padded := *firstPass
+	padded.BeaconActiveMemberships = append(
+		append(
+			[]beaconMembershipRecord{},
+			firstPass.BeaconActiveMemberships...,
+		),
+		beaconMembershipRecord{
+			GroupPublicKey: strings.Repeat("ee", 64),
+			MemberIndex:    9,
+			ChannelName:    "foreign-channel",
+		},
+	)
+
+	auditManifest, err := runAudit(
+		storageDir,
+		testPassword,
+		newValidEvidence(t, &padded),
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if auditManifest.RollbackBarrierReady {
+		t.Error("evidence for foreign state must not authorize the barrier")
+	}
+	if !hasBlocker(auditManifest, "that the snapshot does not hold") {
+		t.Errorf(
+			"expected a foreign-state blocker, blockers: %v",
+			auditManifest.RollbackBlockers,
+		)
+	}
+}
+
+func TestRunAudit_RegisteredQuarantinedOnlyShareIsBlocking(t *testing.T) {
+	storageDir := newTestStorage(t)
+
+	firstPass, err := runAudit(
+		storageDir,
+		testPassword,
+		evidenceInputs{},
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	evidence := newValidEvidence(t, firstPass)
+
+	// Flip the quarantined group's chain state to registered: the share
+	// exists only in quarantine, so a prior binary would run the group
+	// without it.
+	content, err := os.ReadFile(evidence.chainReconciliation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := &chainReconciliationEvidence{}
+	if err := json.Unmarshal(content, record); err != nil {
+		t.Fatal(err)
+	}
+	quarantinedGroup := firstPass.BeaconQuarantinedOutputs[0].GroupPublicKey
+	for i := range record.BeaconGroups {
+		if record.BeaconGroups[i].GroupPublicKey == quarantinedGroup {
+			record.BeaconGroups[i].Registered = true
+		}
+	}
+	content, err = json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		evidence.chainReconciliation,
+		content,
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	auditManifest, err := runAudit(
+		storageDir,
+		testPassword,
+		evidence,
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if auditManifest.RollbackBarrierReady {
+		t.Error(
+			"a registered group with a quarantine-only share must not " +
+				"authorize the barrier",
+		)
+	}
+	if !hasBlocker(auditManifest, "preserved only in quarantine") {
+		t.Errorf(
+			"expected a quarantine-only-share blocker, blockers: %v",
+			auditManifest.RollbackBlockers,
+		)
+	}
+}
+
+func TestRunAudit_QuarantinedClaimWithMismatchedTripleIsBlocking(
+	t *testing.T,
+) {
+	storageDir := newTestStorage(t)
+
+	firstPass, err := runAudit(
+		storageDir,
+		testPassword,
+		evidenceInputs{},
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	evidence := newValidEvidence(t, firstPass)
+
+	// The snapshot's only quarantined beacon output is a legacy ceremony
+	// anchored at block 900; the report claims a security-v2 one at the same
+	// anchor. Ceremony-level presence alone must not vouch for it.
+	record := &quiescenceReportEvidence{
+		evidenceEnvelope: evidenceEnvelope{
+			SchemaVersion:           evidenceSchemaVersion,
+			EvidenceType:            "quiescence_report",
+			GeneratedAt:             time.Now().UTC(),
+			SnapshotAggregateSHA256: firstPass.Snapshot.AggregateSHA256,
+		},
+		QuiesceCause: "rollback drill",
+	}
+	record.ActivePermitsAtQuiescence = append(
+		record.ActivePermitsAtQuiescence,
+		struct {
+			Ceremony            string `json:"ceremony"`
+			Mode                string `json:"mode"`
+			CanonicalStartBlock uint64 `json:"canonical_start_block"`
+			Outcome             string `json:"outcome"`
+		}{
+			Ceremony:            "beacon_dkg",
+			Mode:                "security_v2",
+			CanonicalStartBlock: 900,
+			Outcome:             "quarantined",
+		},
+	)
+	content, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		evidence.quiescenceReport,
+		content,
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	auditManifest, err := runAudit(
+		storageDir,
+		testPassword,
+		evidence,
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if auditManifest.RollbackBarrierReady {
+		t.Error(
+			"a triple-mismatched quarantined-output claim must not " +
+				"authorize the barrier",
+		)
+	}
+	if !hasBlocker(
+		auditManifest,
+		"the beacon quarantine namespace holds none matching",
+	) {
+		t.Errorf(
+			"expected a triple-matching blocker, blockers: %v",
+			auditManifest.RollbackBlockers,
+		)
 	}
 }

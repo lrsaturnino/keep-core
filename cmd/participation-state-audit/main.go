@@ -20,12 +20,17 @@
 //
 // Namespace consistency alone is deliberately insufficient for the rollback
 // barrier. Chain reconciliation (wallet/group registration and DKG
-// settlement), Bitcoin transaction reconciliation, the quiescence outcome
-// report, and prior-reader compatibility evidence are produced outside this
-// offline tool; until a reference to each is supplied and recorded, the
-// manifest reports the missing pieces as rollback blockers and the process
-// exits nonzero. This tool's output never authorizes activating quarantined
-// material by itself.
+// settlement, for active and quarantined state alike), Bitcoin transaction
+// reconciliation, the quiescence outcome report, and prior-reader
+// compatibility evidence are produced outside this offline tool; until a
+// reference to each is supplied and recorded, the manifest reports the
+// missing pieces as rollback blockers and the process exits nonzero. Every
+// evidence record must additionally bind to the operator-supplied expected
+// operational identities — Ethereum chain ID, Bitcoin network, exact prior
+// version and revision — and fall within the evidence freshness bound:
+// schema-valid evidence for the wrong target or from long before the
+// rollback decision blocks the barrier exactly like missing evidence. This
+// tool's output never authorizes activating quarantined material by itself.
 package main
 
 import (
@@ -51,7 +56,7 @@ import (
 )
 
 // manifestSchemaVersion versions the audit manifest document.
-const manifestSchemaVersion = uint32(2)
+const manifestSchemaVersion = uint32(3)
 
 // The audited namespaces, relative to the storage root. The beacon quarantine
 // namespace is a sibling of the active beacon keystore precisely so the
@@ -126,6 +131,12 @@ type evidenceRecord struct {
 // evidenceSchemaVersion versions the external rollback-evidence record
 // schemas this audit accepts.
 const evidenceSchemaVersion uint32 = 1
+
+// evidenceFutureSkewAllowance bounds how far in the future an evidence
+// record's generation time may lie relative to this audit before it is a
+// violation; it absorbs ordinary clock skew between the evidence generator
+// and the audit host.
+const evidenceFutureSkewAllowance = 5 * time.Minute
 
 // evidenceEnvelope is the common header of every external rollback-evidence
 // record. The snapshot binding makes a record usable for exactly one audited
@@ -250,6 +261,11 @@ type tbtcWalletRecord struct {
 type tbtcQuarantineRecord struct {
 	tbtc.QuarantinedSignerMetadata
 
+	// WalletStorageKey is the quarantine directory the output was preserved
+	// under — the same public-key-derived key the active namespace uses — so
+	// chain reconciliation can match quarantined and active state of the
+	// same wallet one-to-one.
+	WalletStorageKey string `json:"wallet_storage_key"`
 	// HasMembershipRecord reports whether the preserved signer bytes
 	// accompany the metadata; metadata without the signer means the key
 	// material was lost and the record is evidence only.
@@ -282,12 +298,27 @@ type manifest struct {
 	// by itself.
 	Consistent bool `json:"consistent"`
 
+	// ExpectedIdentity records the operator-supplied operational identities
+	// the external evidence was bound to; a missing input is a rollback
+	// blocker, never a silently skipped check.
+	ExpectedIdentity expectedIdentityRecord `json:"expected_identity"`
+
 	// ExternalEvidence records the externally produced rollback inputs this
 	// offline tool cannot derive; RollbackBlockers names every one still
 	// missing, plus any finding that blocks the barrier.
 	ExternalEvidence     []evidenceRecord `json:"external_evidence"`
 	RollbackBlockers     []string         `json:"rollback_blockers"`
 	RollbackBarrierReady bool             `json:"rollback_barrier_ready"`
+}
+
+// expectedIdentityRecord is the manifest's evidence trail of the expected
+// operational identities the audit ran with.
+type expectedIdentityRecord struct {
+	EthereumChainID string `json:"ethereum_chain_id,omitempty"`
+	BitcoinNetwork  string `json:"bitcoin_network,omitempty"`
+	PriorVersion    string `json:"prior_version,omitempty"`
+	PriorRevision   string `json:"prior_revision,omitempty"`
+	MaxEvidenceAge  string `json:"max_evidence_age,omitempty"`
 }
 
 // evidenceInputs carries the externally produced rollback-evidence references
@@ -299,10 +330,25 @@ type evidenceInputs struct {
 	priorReaderCompatibility string
 }
 
+// expectedIdentityInputs carries the operator-supplied expected operational
+// identities the audit binds the external evidence to. Every rollback-grade
+// run must supply all of them: without an expected chain, network, prior
+// artifact identity, and freshness bound, schema-valid evidence generated
+// against the wrong target — or long before the rollback decision — would
+// pass. A missing input is a rollback blocker, not a skipped check.
+type expectedIdentityInputs struct {
+	ethereumChainID string
+	bitcoinNetwork  string
+	priorVersion    string
+	priorRevision   string
+	maxEvidenceAge  time.Duration
+}
+
 func main() {
 	var storageDir string
 	var outputPath string
 	var evidence evidenceInputs
+	var expected expectedIdentityInputs
 
 	flag.StringVar(
 		&storageDir,
@@ -346,6 +392,43 @@ func main() {
 			"prior version and its result against every schema this release "+
 			"writes",
 	)
+	flag.StringVar(
+		&expected.ethereumChainID,
+		"expected-ethereum-chain-id",
+		"",
+		"the Ethereum chain ID the rollback targets; the chain "+
+			"reconciliation evidence must record exactly this chain",
+	)
+	flag.StringVar(
+		&expected.bitcoinNetwork,
+		"expected-bitcoin-network",
+		"",
+		"the Bitcoin network the rollback targets; the Bitcoin "+
+			"reconciliation evidence must record exactly this network",
+	)
+	flag.StringVar(
+		&expected.priorVersion,
+		"expected-prior-version",
+		"",
+		"the exact prior release version the rollback restores; the "+
+			"prior-reader compatibility evidence must record exactly this "+
+			"version",
+	)
+	flag.StringVar(
+		&expected.priorRevision,
+		"expected-prior-revision",
+		"",
+		"the exact prior release revision the rollback restores; the "+
+			"prior-reader compatibility evidence must record exactly this "+
+			"revision",
+	)
+	flag.DurationVar(
+		&expected.maxEvidenceAge,
+		"max-evidence-age",
+		24*time.Hour,
+		"the maximum age of every supplied evidence record; older evidence "+
+			"reflects a state the rollback decision cannot rely on",
+	)
 	flag.Parse()
 
 	if storageDir == "" {
@@ -356,7 +439,7 @@ func main() {
 
 	password := os.Getenv(config.EthereumPasswordEnvVariable)
 
-	auditManifest, err := runAudit(storageDir, password, evidence)
+	auditManifest, err := runAudit(storageDir, password, evidence, expected)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "audit failed: [%v]\n", err)
 		os.Exit(1)
@@ -389,6 +472,7 @@ func main() {
 type auditRun struct {
 	mu       sync.Mutex
 	manifest *manifest
+	expected expectedIdentityInputs
 }
 
 func (r *auditRun) finding(format string, args ...interface{}) {
@@ -403,11 +487,13 @@ func (r *auditRun) finding(format string, args ...interface{}) {
 
 // runAudit produces the audit manifest for the given storage snapshot. An
 // empty password skips interpretation and produces a raw inventory whose
-// missing interpretation is itself a rollback blocker.
+// missing interpretation is itself a rollback blocker, exactly like a
+// missing expected-identity input.
 func runAudit(
 	storageDir string,
 	password string,
 	evidence evidenceInputs,
+	expected expectedIdentityInputs,
 ) (*manifest, error) {
 	info, err := os.Stat(storageDir)
 	if err != nil {
@@ -428,7 +514,15 @@ func runAudit(
 				Path:     storageDir,
 				RootMode: info.Mode().String(),
 			},
+			ExpectedIdentity: expectedIdentityRecord{
+				EthereumChainID: expected.ethereumChainID,
+				BitcoinNetwork:  expected.bitcoinNetwork,
+				PriorVersion:    expected.priorVersion,
+				PriorRevision:   expected.priorRevision,
+				MaxEvidenceAge:  expected.maxEvidenceAge.String(),
+			},
 		},
+		expected: expected,
 	}
 	auditManifest := run.manifest
 
@@ -473,6 +567,7 @@ func runAudit(
 	auditManifest.Consistent = auditManifest.Interpreted &&
 		len(auditManifest.Findings) == 0
 
+	recordMissingExpectedIdentity(run)
 	if err := recordExternalEvidence(run, evidence); err != nil {
 		return nil, err
 	}
@@ -653,6 +748,56 @@ func classifyTBTCWork(r *auditRun) {
 // snapshot, and turns each missing or invalid one into a rollback blocker. A
 // supplied reference that cannot be read is an input error: fail fast instead
 // of recording evidence that does not exist.
+// recordMissingExpectedIdentity turns every unsupplied expected-identity
+// input into a rollback blocker: evidence that is not bound to an explicit
+// operational target can approve a rollback of the wrong chain, network, or
+// prior artifact.
+func recordMissingExpectedIdentity(r *auditRun) {
+	missing := []struct {
+		absent  bool
+		blocker string
+	}{
+		{
+			absent: r.expected.ethereumChainID == "",
+			blocker: "the expected Ethereum chain ID is not supplied: the " +
+				"chain reconciliation evidence cannot be bound to the " +
+				"rollback's operational target",
+		},
+		{
+			absent: r.expected.bitcoinNetwork == "",
+			blocker: "the expected Bitcoin network is not supplied: the " +
+				"Bitcoin reconciliation evidence cannot be bound to the " +
+				"rollback's operational target",
+		},
+		{
+			absent: r.expected.priorVersion == "",
+			blocker: "the expected prior version is not supplied: the " +
+				"prior-reader compatibility evidence cannot be bound to the " +
+				"exact restored artifact",
+		},
+		{
+			absent: r.expected.priorRevision == "",
+			blocker: "the expected prior revision is not supplied: the " +
+				"prior-reader compatibility evidence cannot be bound to the " +
+				"exact restored artifact",
+		},
+		{
+			absent: r.expected.maxEvidenceAge <= 0,
+			blocker: "no evidence freshness bound is supplied: arbitrarily " +
+				"old evidence cannot support a rollback decision",
+		},
+	}
+
+	for _, input := range missing {
+		if input.absent {
+			r.manifest.RollbackBlockers = append(
+				r.manifest.RollbackBlockers,
+				input.blocker,
+			)
+		}
+	}
+}
+
 func recordExternalEvidence(r *auditRun, evidence evidenceInputs) error {
 	inputs := []struct {
 		name     string
@@ -766,6 +911,28 @@ func (r *auditRun) validateEnvelope(
 	}
 	if envelope.GeneratedAt.IsZero() {
 		violations = append(violations, "the generation time is missing")
+	} else if r.expected.maxEvidenceAge > 0 {
+		// Freshness is measured against this audit's own generation time so
+		// the manifest and its verdict stay reproducible from the recorded
+		// inputs. Evidence from the future signals a clock problem in the
+		// generator and cannot be trusted either.
+		age := r.manifest.GeneratedAt.Sub(envelope.GeneratedAt)
+		if age > r.expected.maxEvidenceAge {
+			violations = append(violations, fmt.Sprintf(
+				"generated [%s] before this audit, exceeding the [%s] "+
+					"evidence freshness bound",
+				age.Round(time.Second),
+				r.expected.maxEvidenceAge,
+			))
+		}
+		if age < -evidenceFutureSkewAllowance {
+			violations = append(violations, fmt.Sprintf(
+				"generated [%s] after this audit, beyond the [%s] clock "+
+					"skew allowance",
+				(-age).Round(time.Second),
+				evidenceFutureSkewAllowance,
+			))
+		}
 	}
 	if envelope.SnapshotAggregateSHA256 !=
 		r.manifest.Snapshot.AggregateSHA256 {
@@ -780,9 +947,12 @@ func (r *auditRun) validateEnvelope(
 }
 
 // validateChainReconciliationEvidence checks the Ethereum reconciliation
-// record: schema, snapshot binding, chain identity, full coverage of every
-// persisted tBTC wallet and beacon group, and a settled, registered on-chain
-// state for each of them.
+// record: schema, snapshot binding, the expected chain identity, one-to-one
+// coverage of every persisted tBTC wallet and beacon group — active and
+// quarantined — and a settled, registered on-chain state for each active
+// one. A quarantined output whose wallet or group is registered on chain is
+// a blocker of its own: the prior binary would run that wallet without the
+// preserved share.
 func (r *auditRun) validateChainReconciliationEvidence(
 	content []byte,
 ) []string {
@@ -801,6 +971,13 @@ func (r *auditRun) validateChainReconciliationEvidence(
 
 	if record.EthereumChainID == "" {
 		violations = append(violations, "the Ethereum chain ID is missing")
+	} else if r.expected.ethereumChainID != "" &&
+		record.EthereumChainID != r.expected.ethereumChainID {
+		violations = append(violations, fmt.Sprintf(
+			"reconciled against Ethereum chain [%s], expected [%s]",
+			record.EthereumChainID,
+			r.expected.ethereumChainID,
+		))
 	}
 
 	wallets := make(map[string]int)
@@ -826,7 +1003,10 @@ func (r *auditRun) validateChainReconciliationEvidence(
 		beaconGroups[beaconGroup.GroupPublicKey] = i
 	}
 
+	activeWalletKeys := make(map[string]struct{})
 	for _, wallet := range r.manifest.TBTCActiveWallets {
+		activeWalletKeys[wallet.WalletStorageKey] = struct{}{}
+
 		i, covered := wallets[wallet.WalletStorageKey]
 		if !covered {
 			violations = append(violations, fmt.Sprintf(
@@ -850,7 +1030,37 @@ func (r *auditRun) validateChainReconciliationEvidence(
 			))
 		}
 	}
+	quarantinedWalletKeys := make(map[string]struct{})
+	for _, quarantined := range r.manifest.TBTCQuarantinedOutputs {
+		quarantinedWalletKeys[quarantined.WalletStorageKey] = struct{}{}
+
+		i, covered := wallets[quarantined.WalletStorageKey]
+		if !covered {
+			violations = append(violations, fmt.Sprintf(
+				"quarantined tbtc wallet [%s] is not reconciled",
+				quarantined.WalletStorageKey,
+			))
+			continue
+		}
+		if _, active := activeWalletKeys[quarantined.WalletStorageKey]; active {
+			// Both namespaces holding the same wallet is already an
+			// interpretation finding; the registered state is judged there.
+			continue
+		}
+		if record.Wallets[i].Registered {
+			violations = append(violations, fmt.Sprintf(
+				"quarantined tbtc wallet [%s] is registered on chain but "+
+					"its share is preserved only in quarantine; the prior "+
+					"binary would run it without the share",
+				quarantined.WalletStorageKey,
+			))
+		}
+	}
+
+	activeBeaconGroups := make(map[string]struct{})
 	for _, membership := range r.manifest.BeaconActiveMemberships {
+		activeBeaconGroups[membership.GroupPublicKey] = struct{}{}
+
 		i, covered := beaconGroups[membership.GroupPublicKey]
 		if !covered {
 			violations = append(violations, fmt.Sprintf(
@@ -863,6 +1073,60 @@ func (r *auditRun) validateChainReconciliationEvidence(
 			violations = append(violations, fmt.Sprintf(
 				"persisted beacon group [%s] is not registered on chain",
 				membership.GroupPublicKey,
+			))
+		}
+	}
+	quarantinedBeaconGroups := make(map[string]struct{})
+	for _, quarantined := range r.manifest.BeaconQuarantinedOutputs {
+		quarantinedBeaconGroups[quarantined.GroupPublicKey] = struct{}{}
+
+		i, covered := beaconGroups[quarantined.GroupPublicKey]
+		if !covered {
+			violations = append(violations, fmt.Sprintf(
+				"quarantined beacon group [%s] is not reconciled",
+				quarantined.GroupPublicKey,
+			))
+			continue
+		}
+		if _, active := activeBeaconGroups[quarantined.GroupPublicKey]; active {
+			continue
+		}
+		if record.BeaconGroups[i].Registered {
+			violations = append(violations, fmt.Sprintf(
+				"quarantined beacon group [%s] is registered on chain but "+
+					"its share is preserved only in quarantine; the prior "+
+					"binary would run it without the share",
+				quarantined.GroupPublicKey,
+			))
+		}
+	}
+
+	// One-to-one the other way: evidence reconciling state the snapshot does
+	// not hold audits a different node — or fabricates coverage — and cannot
+	// bind to this rollback.
+	for _, wallet := range record.Wallets {
+		if wallet.WalletStorageKey == "" {
+			continue
+		}
+		_, active := activeWalletKeys[wallet.WalletStorageKey]
+		_, quarantined := quarantinedWalletKeys[wallet.WalletStorageKey]
+		if !active && !quarantined {
+			violations = append(violations, fmt.Sprintf(
+				"reconciles tbtc wallet [%s] that the snapshot does not hold",
+				wallet.WalletStorageKey,
+			))
+		}
+	}
+	for _, beaconGroup := range record.BeaconGroups {
+		if beaconGroup.GroupPublicKey == "" {
+			continue
+		}
+		_, active := activeBeaconGroups[beaconGroup.GroupPublicKey]
+		_, quarantined := quarantinedBeaconGroups[beaconGroup.GroupPublicKey]
+		if !active && !quarantined {
+			violations = append(violations, fmt.Sprintf(
+				"reconciles beacon group [%s] that the snapshot does not hold",
+				beaconGroup.GroupPublicKey,
 			))
 		}
 	}
@@ -891,6 +1155,13 @@ func (r *auditRun) validateBitcoinReconciliationEvidence(
 
 	if record.BitcoinNetwork == "" {
 		violations = append(violations, "the Bitcoin network is missing")
+	} else if r.expected.bitcoinNetwork != "" &&
+		record.BitcoinNetwork != r.expected.bitcoinNetwork {
+		violations = append(violations, fmt.Sprintf(
+			"reconciled against Bitcoin network [%s], expected [%s]",
+			record.BitcoinNetwork,
+			r.expected.bitcoinNetwork,
+		))
 	}
 	if !record.Complete {
 		violations = append(
@@ -917,10 +1188,21 @@ func (r *auditRun) validateBitcoinReconciliationEvidence(
 	return violations
 }
 
+// quarantineTriple identifies quarantined state by the immutable permit
+// identity it was preserved under: the ceremony, the pinned protocol mode,
+// and the canonical chain anchor.
+type quarantineTriple struct {
+	ceremony            string
+	mode                string
+	canonicalStartBlock uint64
+}
+
 // validateQuiescenceReportEvidence checks the quiescence outcome record:
 // schema, snapshot binding, a stated cause, and a known ceremony, mode, and
-// terminal outcome for every permit active at quiescence. A quarantined DKG
-// outcome must be matched by preserved quarantine state in the snapshot.
+// terminal outcome for every permit active at quiescence. Every quarantined
+// DKG outcome must be matched by preserved quarantine state carrying the
+// same ceremony, protocol mode, and canonical anchor — one preserved output
+// per claiming permit, so one real output cannot vouch for several claims.
 func (r *auditRun) validateQuiescenceReportEvidence(content []byte) []string {
 	record := &quiescenceReportEvidence{}
 	if err := strictUnmarshal(content, record); err != nil {
@@ -942,6 +1224,23 @@ func (r *auditRun) validateQuiescenceReportEvidence(content []byte) []string {
 	knownCeremonies := make(map[string]struct{})
 	for _, ceremony := range participation.AllCeremonies() {
 		knownCeremonies[string(ceremony)] = struct{}{}
+	}
+
+	beaconQuarantined := make(map[quarantineTriple]int)
+	for _, quarantined := range r.manifest.BeaconQuarantinedOutputs {
+		beaconQuarantined[quarantineTriple{
+			ceremony:            quarantined.Ceremony,
+			mode:                quarantined.ProtocolMode,
+			canonicalStartBlock: quarantined.CanonicalStartBlock,
+		}]++
+	}
+	tbtcQuarantined := make(map[quarantineTriple]int)
+	for _, quarantined := range r.manifest.TBTCQuarantinedOutputs {
+		tbtcQuarantined[quarantineTriple{
+			ceremony:            quarantined.Ceremony,
+			mode:                quarantined.ProtocolMode,
+			canonicalStartBlock: quarantined.CanonicalStartBlock,
+		}]++
 	}
 
 	for i, permit := range record.ActivePermitsAtQuiescence {
@@ -972,25 +1271,42 @@ func (r *auditRun) validateQuiescenceReportEvidence(content []byte) []string {
 		if permit.Outcome != "quarantined" || !r.manifest.Interpreted {
 			continue
 		}
+		triple := quarantineTriple{
+			ceremony:            permit.Ceremony,
+			mode:                permit.Mode,
+			canonicalStartBlock: permit.CanonicalStartBlock,
+		}
 		switch permit.Ceremony {
 		case string(participation.BeaconDKG):
-			if len(r.manifest.BeaconQuarantinedOutputs) == 0 {
+			if beaconQuarantined[triple] == 0 {
 				violations = append(violations, fmt.Sprintf(
-					"permit entry [%d] claims a quarantined [%s] output but "+
-						"the beacon quarantine namespace holds none",
+					"permit entry [%d] claims a quarantined [%s] output "+
+						"[mode=%s] [canonicalStartBlock=%d] but the beacon "+
+						"quarantine namespace holds none matching that "+
+						"ceremony, mode, and anchor",
 					i,
 					permit.Ceremony,
+					permit.Mode,
+					permit.CanonicalStartBlock,
 				))
+				continue
 			}
+			beaconQuarantined[triple]--
 		case string(participation.TBTCDKG):
-			if len(r.manifest.TBTCQuarantinedOutputs) == 0 {
+			if tbtcQuarantined[triple] == 0 {
 				violations = append(violations, fmt.Sprintf(
-					"permit entry [%d] claims a quarantined [%s] output but "+
-						"the tbtc quarantine namespace holds none",
+					"permit entry [%d] claims a quarantined [%s] output "+
+						"[mode=%s] [canonicalStartBlock=%d] but the tbtc "+
+						"quarantine namespace holds none matching that "+
+						"ceremony, mode, and anchor",
 					i,
 					permit.Ceremony,
+					permit.Mode,
+					permit.CanonicalStartBlock,
 				))
+				continue
 			}
+			tbtcQuarantined[triple]--
 		}
 	}
 
@@ -1020,9 +1336,23 @@ func (r *auditRun) validatePriorReaderCompatibilityEvidence(
 
 	if record.PriorVersion == "" {
 		violations = append(violations, "the tested prior version is missing")
+	} else if r.expected.priorVersion != "" &&
+		record.PriorVersion != r.expected.priorVersion {
+		violations = append(violations, fmt.Sprintf(
+			"tested prior version [%s], expected [%s]",
+			record.PriorVersion,
+			r.expected.priorVersion,
+		))
 	}
 	if record.PriorRevision == "" {
 		violations = append(violations, "the tested prior revision is missing")
+	} else if r.expected.priorRevision != "" &&
+		record.PriorRevision != r.expected.priorRevision {
+		violations = append(violations, fmt.Sprintf(
+			"tested prior revision [%s], expected [%s]",
+			record.PriorRevision,
+			r.expected.priorRevision,
+		))
 	}
 
 	results := make(map[string]bool)
@@ -1797,6 +2127,7 @@ func interpretTBTCQuarantineNamespace(
 			run.manifest.TBTCQuarantinedOutputs,
 			tbtcQuarantineRecord{
 				QuarantinedSignerMetadata: *entry.metadata,
+				WalletStorageKey:          entry.directory,
 				HasMembershipRecord:       entry.signer != nil,
 			},
 		)
