@@ -186,16 +186,17 @@ func resolveAndValidate(
 	}
 }
 
-// validateMetricProjectable rejects a cutover block that cannot be represented
-// exactly by the float64 metrics projection. Decisions always use uint64; this
-// only guards the observability contract, under which the exported cutover
-// block gauge must equal the decision value exactly.
-func validateMetricProjectable(cutoverBlock uint64) error {
-	if cutoverBlock > maxSafeMetricInteger {
+// validateMetricProjectable rejects an Ethereum block height that cannot be
+// represented exactly by the float64 metrics projection. Decisions always use
+// uint64; this only guards the observability contract, under which every
+// exported height gauge — the cutover block and the current block — must equal
+// the decision value exactly.
+func validateMetricProjectable(blockHeight uint64) error {
+	if blockHeight > maxSafeMetricInteger {
 		return fmt.Errorf(
-			"cutover block [%d] exceeds the maximum precisely projectable "+
+			"block height [%d] exceeds the maximum precisely projectable "+
 				"metric value [%d]",
-			cutoverBlock,
+			blockHeight,
 			maxSafeMetricInteger,
 		)
 	}

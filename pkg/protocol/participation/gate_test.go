@@ -13,13 +13,18 @@ import (
 
 // gateBlockCounter is a controllable chain.BlockCounter with real height
 // waiter semantics: a waiter channel emits the reached height and closes, or
-// can be force-closed without a value to simulate a waiter failure.
+// can be force-closed without a value to simulate a waiter failure. A one-shot
+// read hold lets tests model a slow RPC response, computed from an older chain
+// view, arriving after newer reads have completed.
 type gateBlockCounter struct {
-	mu        sync.Mutex
-	block     uint64
-	err       error
-	waiterErr error
-	waiters   map[uint64][]chan uint64
+	mu          sync.Mutex
+	block       uint64
+	err         error
+	waiterErr   error
+	waiters     map[uint64][]chan uint64
+	reads       uint64
+	holdStarted chan struct{}
+	holdRelease chan struct{}
 }
 
 func newGateBlockCounter(block uint64) *gateBlockCounter {
@@ -64,10 +69,63 @@ func (f *gateBlockCounter) failWaiters() {
 	}
 }
 
-func (f *gateBlockCounter) CurrentBlock() (uint64, error) {
+// deliverWaiters fires every waiter armed at or below the given height without
+// changing the current block or error, so a test can make the cutover waiter
+// report its target while the synchronous read path stays independently
+// controlled.
+func (f *gateBlockCounter) deliverWaiters(height uint64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.block, f.err
+
+	for target, channels := range f.waiters {
+		if height >= target {
+			for _, ch := range channels {
+				ch <- height
+				close(ch)
+			}
+			delete(f.waiters, target)
+		}
+	}
+}
+
+// holdNextRead arms a one-shot hold: the next CurrentBlock call snapshots its
+// result immediately but does not return until release is called. The started
+// channel closes once the held read has taken its snapshot; release is
+// idempotent.
+func (f *gateBlockCounter) holdNextRead() (<-chan struct{}, func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	started := make(chan struct{})
+	releaseCh := make(chan struct{})
+	f.holdStarted = started
+	f.holdRelease = releaseCh
+
+	var once sync.Once
+	return started, func() { once.Do(func() { close(releaseCh) }) }
+}
+
+// readCount returns how many CurrentBlock reads have been served, letting a
+// test wait deterministically for a background read to have happened.
+func (f *gateBlockCounter) readCount() uint64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.reads
+}
+
+func (f *gateBlockCounter) CurrentBlock() (uint64, error) {
+	f.mu.Lock()
+	f.reads++
+	block, err := f.block, f.err
+	started, releaseCh := f.holdStarted, f.holdRelease
+	f.holdStarted, f.holdRelease = nil, nil
+	f.mu.Unlock()
+
+	if started != nil {
+		close(started)
+		<-releaseCh
+	}
+	return block, err
 }
 
 func (f *gateBlockCounter) WaitForBlockHeight(uint64) error { return nil }
@@ -183,6 +241,13 @@ func TestNewGate_Validation(t *testing.T) {
 		context.Background(), Schedule{}, failing, metrics, time.Second,
 	); err == nil {
 		t.Error("expected a chain-clock error at startup to be rejected")
+	}
+
+	unprojectable := newGateBlockCounter(maxSafeMetricInteger + 1)
+	if _, err := newGate(
+		context.Background(), Schedule{}, unprojectable, metrics, time.Second,
+	); err == nil {
+		t.Error("expected an unprojectable chain height rejection")
 	}
 
 	noWaiter := newGateBlockCounter(100)
@@ -1017,10 +1082,313 @@ func TestGate_ClosedPermitCommitRefused(t *testing.T) {
 	}
 }
 
+// TestGate_StaleClockSuccessCannotReopenGate pins the clock-sample ordering
+// for permit issuance: a successful read initiated before a newer failing read
+// but applied after it must be discarded. The issuing operation fails closed
+// and the gate stays clock-unavailable instead of silently reopening.
+func TestGate_StaleClockSuccessCannotReopenGate(t *testing.T) {
+	gate, blockCounter, _ := newTestGate(
+		t, Schedule{CutoverBlock: 1000}, 999, inertPollInterval,
+	)
+
+	existing, err := gate.Begin(TBTCSigning, 999)
+	if err != nil {
+		t.Fatalf("unexpected error: [%v]", err)
+	}
+	defer existing.Close()
+
+	started, release := blockCounter.holdNextRead()
+
+	// This Begin's read snapshots a healthy chain view, then stalls in flight.
+	staleResult := make(chan error, 1)
+	go func() {
+		_, err := gate.Begin(TBTCDKG, 999)
+		staleResult <- err
+	}()
+	<-started
+
+	// A read initiated after the held one fails and must win permanently.
+	blockCounter.set(999, fmt.Errorf("rpc down"))
+	if _, err := gate.Begin(
+		TBTCHeartbeat, 999,
+	); !errors.Is(err, ErrClockUnavailable) {
+		t.Fatalf("expected a clock-unavailable refusal, got: [%v]", err)
+	}
+	if state := gate.State().State; state != StateClockUnavailable {
+		t.Fatalf("expected clock_unavailable state, got [%s]", state)
+	}
+
+	// The stale success lands last: it must not reopen the gate, must not
+	// issue a permit, and must not revive the canceled permit.
+	release()
+	if err := <-staleResult; !errors.Is(err, ErrClockUnavailable) {
+		t.Errorf("expected the stale Begin to fail closed, got: [%v]", err)
+	}
+	snapshot := gate.State()
+	if snapshot.State != StateClockUnavailable {
+		t.Errorf(
+			"expected the gate to stay clock_unavailable, got [%s]",
+			snapshot.State,
+		)
+	}
+	if snapshot.ClockAvailable {
+		t.Error("expected the clock to stay unavailable")
+	}
+	if snapshot.Allowed {
+		t.Error("expected the gate to keep refusing new permits")
+	}
+	if cause := context.Cause(
+		existing.Context(),
+	); !errors.Is(cause, ErrClockUnavailable) {
+		t.Errorf("expected the canceled permit to stay canceled, got: [%v]", cause)
+	}
+}
+
+// TestGate_StaleClockSuccessCannotReopenGateViaFence pins the same ordering
+// for the commit fence path: a stalled successful fence read applied after a
+// newer failure is discarded, the fence refuses, and the gate stays failed.
+func TestGate_StaleClockSuccessCannotReopenGateViaFence(t *testing.T) {
+	gate, blockCounter, _ := newTestGate(
+		t, Schedule{CutoverBlock: 1000}, 999, inertPollInterval,
+	)
+
+	permit, err := gate.Begin(TBTCSigning, 999)
+	if err != nil {
+		t.Fatalf("unexpected error: [%v]", err)
+	}
+	defer permit.Close()
+	other, err := gate.Begin(TBTCHeartbeat, 999)
+	if err != nil {
+		t.Fatalf("unexpected error: [%v]", err)
+	}
+	defer other.Close()
+
+	started, release := blockCounter.holdNextRead()
+
+	staleResult := make(chan error, 1)
+	go func() {
+		staleResult <- permit.CheckCommit(
+			"result_submission", CompletionCommit,
+		)
+	}()
+	<-started
+
+	blockCounter.set(999, fmt.Errorf("rpc down"))
+	if err := other.CheckCommit(
+		"heartbeat_signature", CompletionCommit,
+	); !errors.Is(err, ErrClockUnavailable) {
+		t.Fatalf("expected a clock-unavailable fence refusal, got: [%v]", err)
+	}
+	if state := gate.State().State; state != StateClockUnavailable {
+		t.Fatalf("expected clock_unavailable state, got [%s]", state)
+	}
+
+	release()
+	if err := <-staleResult; !errors.Is(err, ErrClockUnavailable) {
+		t.Errorf("expected the stale fence to fail closed, got: [%v]", err)
+	}
+	snapshot := gate.State()
+	if snapshot.State != StateClockUnavailable {
+		t.Errorf(
+			"expected the gate to stay clock_unavailable, got [%s]",
+			snapshot.State,
+		)
+	}
+	if snapshot.ClockAvailable {
+		t.Error("expected the clock to stay unavailable")
+	}
+}
+
+// TestGate_StaleClockFailureCannotCancelAfterNewerSuccess pins the symmetric
+// ordering guarantee: a failing read initiated before a newer successful read
+// but applied after it refuses only its own operation. It must not transition
+// the gate to clock-unavailable or cancel permits on stale information.
+func TestGate_StaleClockFailureCannotCancelAfterNewerSuccess(t *testing.T) {
+	gate, blockCounter, metrics := newTestGate(
+		t, Schedule{CutoverBlock: 1000}, 999, inertPollInterval,
+	)
+
+	permit, err := gate.Begin(TBTCSigning, 999)
+	if err != nil {
+		t.Fatalf("unexpected error: [%v]", err)
+	}
+	defer permit.Close()
+
+	// The held read snapshots a transient failure, then stalls in flight.
+	blockCounter.set(999, fmt.Errorf("transient rpc error"))
+	started, release := blockCounter.holdNextRead()
+
+	staleResult := make(chan error, 1)
+	go func() {
+		_, err := gate.Begin(TBTCDKG, 999)
+		staleResult <- err
+	}()
+	<-started
+
+	// The chain recovers and a newer read succeeds before the stale failure
+	// lands.
+	blockCounter.set(1000, nil)
+	fresh, err := gate.Begin(BeaconDKG, 1000)
+	if err != nil {
+		t.Fatalf("unexpected error after recovery: [%v]", err)
+	}
+	defer fresh.Close()
+
+	release()
+	// The operation whose own read failed still fails closed.
+	if err := <-staleResult; !errors.Is(err, ErrClockUnavailable) {
+		t.Errorf("expected the stale Begin to fail closed, got: [%v]", err)
+	}
+	// But the stale failure must not have transitioned the gate or canceled
+	// anything.
+	snapshot := gate.State()
+	if snapshot.State != StateOpenSecurityV2 {
+		t.Errorf("expected open_security_v2 state, got [%s]", snapshot.State)
+	}
+	if !snapshot.ClockAvailable {
+		t.Error("expected the clock to stay available")
+	}
+	select {
+	case <-permit.Context().Done():
+		t.Error("a stale clock failure must not cancel permits")
+	default:
+	}
+	if got := metrics.counter(
+		clientinfo.MetricParticipationClockAbortsTotal,
+	); got != 0 {
+		t.Errorf("expected zero clock aborts, got [%f]", got)
+	}
+}
+
+// TestGate_WaiterFireWithFailingReadIsClockFailure pins that the cutover
+// waiter is telemetry-only: recovery and state advancement require a
+// successful synchronous read. A waiter that reports its target while the
+// synchronous clock fails must produce clock-unavailable, not a transition,
+// and must not project the waiter's height.
+func TestGate_WaiterFireWithFailingReadIsClockFailure(t *testing.T) {
+	gate, blockCounter, _ := newTestGate(
+		t, Schedule{CutoverBlock: 1000}, 999, inertPollInterval,
+	)
+
+	permit, err := gate.Begin(TBTCSigning, 999)
+	if err != nil {
+		t.Fatalf("unexpected error: [%v]", err)
+	}
+	defer permit.Close()
+
+	// Reads fail from here on; the armed cutover waiter stays deliverable.
+	blockCounter.set(999, fmt.Errorf("rpc down"))
+	blockCounter.deliverWaiters(1000)
+
+	eventually(t, func() bool {
+		return gate.State().State == StateClockUnavailable
+	})
+	snapshot := gate.State()
+	if snapshot.CurrentBlock != 999 {
+		t.Errorf(
+			"expected the waiter height to be discarded and the current "+
+				"block to stay [999], got [%d]",
+			snapshot.CurrentBlock,
+		)
+	}
+	if cause := context.Cause(
+		permit.Context(),
+	); !errors.Is(cause, ErrClockUnavailable) {
+		t.Errorf("expected a clock-unavailable cancellation, got: [%v]", cause)
+	}
+}
+
+// TestGate_WaiterFireWithLaggingReadStaysAuthoritative pins that a waiter
+// firing at the cutover target cannot advance the state past what the
+// authoritative synchronous read reports: a healthy read still below the
+// cutover block keeps the gate open in legacy state.
+func TestGate_WaiterFireWithLaggingReadStaysAuthoritative(t *testing.T) {
+	gate, blockCounter, _ := newTestGate(
+		t, Schedule{CutoverBlock: 1000}, 999, inertPollInterval,
+	)
+
+	reads := blockCounter.readCount()
+	blockCounter.deliverWaiters(1000)
+
+	// Wait for the waiter-triggered authoritative poll to have read the
+	// (still lagging) clock.
+	eventually(t, func() bool {
+		return blockCounter.readCount() > reads
+	})
+
+	snapshot := gate.State()
+	if snapshot.State != StateOpenLegacy {
+		t.Errorf(
+			"expected the lagging read to keep open_legacy, got [%s]",
+			snapshot.State,
+		)
+	}
+	if snapshot.CurrentBlock != 999 {
+		t.Errorf(
+			"expected current block [999] from the authoritative read, "+
+				"got [%d]",
+			snapshot.CurrentBlock,
+		)
+	}
+
+	// Once the synchronous clock itself reports the cutover height, new work
+	// selects security-v2: the gate stayed live throughout.
+	blockCounter.set(1000, nil)
+	permit, err := gate.Begin(TBTCDKG, 1000)
+	if err != nil {
+		t.Fatalf("unexpected error: [%v]", err)
+	}
+	if permit.Mode() != ModeSecurityV2 {
+		t.Errorf("expected security_v2 mode, got [%s]", permit.Mode())
+	}
+	permit.Close()
+}
+
+// TestGate_UnprojectableHeightIsClockFailure pins that a chain height the
+// float64 metrics projection cannot represent exactly is handled as a clock
+// failure at runtime instead of being exported imprecisely.
+func TestGate_UnprojectableHeightIsClockFailure(t *testing.T) {
+	gate, blockCounter, _ := newTestGate(
+		t, Schedule{CutoverBlock: 1000}, 999, inertPollInterval,
+	)
+
+	permit, err := gate.Begin(TBTCSigning, 999)
+	if err != nil {
+		t.Fatalf("unexpected error: [%v]", err)
+	}
+	defer permit.Close()
+
+	blockCounter.set(maxSafeMetricInteger+1, nil)
+	if _, err := gate.Begin(
+		TBTCDKG, 999,
+	); !errors.Is(err, ErrClockUnavailable) {
+		t.Fatalf("expected a clock-unavailable refusal, got: [%v]", err)
+	}
+	if state := gate.State().State; state != StateClockUnavailable {
+		t.Errorf("expected clock_unavailable state, got [%s]", state)
+	}
+	if cause := context.Cause(
+		permit.Context(),
+	); !errors.Is(cause, ErrClockUnavailable) {
+		t.Errorf("expected a clock-unavailable cancellation, got: [%v]", cause)
+	}
+	if current := gate.State().CurrentBlock; current != 999 {
+		t.Errorf(
+			"expected the unprojectable height to be discarded and the "+
+				"current block to stay [999], got [%d]",
+			current,
+		)
+	}
+}
+
 // TestGate_ConcurrentBeginAcrossCutover races permit issuance, commit fences,
-// state reads, and permit closes against the chain crossing the cutover block.
-// The only valid outcomes for any permit are: anchored below C and permanently
-// legacy, or anchored at/above C and permanently security-v2.
+// state reads, and permit closes against the chain crossing the cutover block,
+// a mid-flight Quiesce, and the terminal gate Close, all genuinely
+// overlapping. The invariants: a permit is pinned legacy for an anchor below C
+// and security-v2 at/above C regardless of which goroutine observed C first;
+// every fence outcome is one of the exactly allowed sentinels for its commit
+// class (the clock never fails here, so a clock sentinel is a bug); and the
+// active-permit accounting balances to zero once every owner closed.
 func TestGate_ConcurrentBeginAcrossCutover(t *testing.T) {
 	const cutover = uint64(1000)
 
@@ -1029,69 +1397,162 @@ func TestGate_ConcurrentBeginAcrossCutover(t *testing.T) {
 	)
 
 	var wg sync.WaitGroup
+	lifecycleDone := make(chan struct{})
 
-	// Advance the chain across the cutover block while workers race.
+	// Advance the chain across the cutover block while workers race, and keep
+	// stepping until the lifecycle goroutine has closed the gate so crossing,
+	// quiescence, and close all overlap live traffic.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		for height := cutover - 10; height <= cutover+10; height++ {
+		height := cutover - 10
+		for {
 			blockCounter.set(height, nil)
-			time.Sleep(time.Millisecond)
+			height++
+			select {
+			case <-lifecycleDone:
+				return
+			case <-time.After(500 * time.Microsecond):
+			}
 		}
 	}()
+
+	// Quiesce once the gate has observably crossed the cutover block, then
+	// close shortly after, while workers still hammer the gate.
+	var quiesceDone <-chan struct{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(lifecycleDone)
+		for gate.State().CurrentBlock < cutover+2 {
+			time.Sleep(200 * time.Microsecond)
+		}
+		quiesceDone = gate.Quiesce(fmt.Errorf("test quiesce"))
+		time.Sleep(2 * time.Millisecond)
+		gate.Close()
+	}()
+
+	// The exact allowed fence outcomes. Completion commits stay allowed
+	// through crossing and quiescence and refuse only after the forced
+	// close; penalty commits are additionally suppressed for legacy permits
+	// at/after C and for every permit once quiescence begins.
+	completionAllowed := func(err error) bool {
+		return err == nil || errors.Is(err, ErrQuiesceDeadline)
+	}
+	penaltyAllowed := func(err error) bool {
+		return err == nil ||
+			errors.Is(err, ErrPenaltySuppressed) ||
+			errors.Is(err, ErrQuiesceDeadline)
+	}
 
 	for worker := 0; worker < 8; worker++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for i := 0; i < 200; i++ {
+
+			var held []Permit
+			defer func() {
+				for _, p := range held {
+					p.Close()
+				}
+			}()
+
+			// Run until the lifecycle finished, then a few bonus iterations
+			// so the closed-gate paths are exercised too.
+			bonus := 0
+			for bonus <= 10 {
+				select {
+				case <-lifecycleDone:
+					bonus++
+				default:
+				}
+
 				anchor, err := blockCounter.CurrentBlock()
-				if err != nil || anchor == 0 {
+				if err != nil {
 					continue
 				}
 
-				permit, err := gate.Begin(TBTCSigning, anchor)
+				permit, err := gate.Begin(TBTCHeartbeat, anchor)
 				if err != nil {
-					// The chain may have been read one step behind another
-					// goroutine's Begin; the only acceptable refusals here
-					// are anchor/ordering ones.
-					if !errors.Is(err, ErrInvalidAnchor) {
+					// The gate may have quiesced or closed, and an anchor can
+					// race one step ahead of a concurrent reader's applied
+					// height. Nothing else is acceptable.
+					if !errors.Is(err, ErrQuiescing) &&
+						!errors.Is(err, ErrInvalidAnchor) {
 						t.Errorf("unexpected Begin error: [%v]", err)
 					}
-					continue
+				} else {
+					expected := ModeLegacy
+					if anchor >= cutover {
+						expected = ModeSecurityV2
+					}
+					if permit.Mode() != expected {
+						t.Errorf(
+							"anchor [%d]: expected mode [%s], got [%s]",
+							anchor,
+							expected,
+							permit.Mode(),
+						)
+					}
+					held = append(held, permit)
 				}
 
-				expected := ModeLegacy
-				if anchor >= cutover {
-					expected = ModeSecurityV2
+				// Fence every held permit and assert every outcome; permits
+				// held across the crossing, the quiescence, and the close are
+				// exactly the ones the fences must keep classifying.
+				for _, p := range held {
+					if err := p.CheckCommit(
+						"race_completion", CompletionCommit,
+					); !completionAllowed(err) {
+						t.Errorf(
+							"unexpected completion fence outcome for "+
+								"mode [%s]: [%v]",
+							p.Mode(),
+							err,
+						)
+					}
+					if err := p.CheckCommit(
+						"race_penalty", PenaltyCommit,
+					); !penaltyAllowed(err) {
+						t.Errorf(
+							"unexpected penalty fence outcome for "+
+								"mode [%s]: [%v]",
+							p.Mode(),
+							err,
+						)
+					}
 				}
-				if permit.Mode() != expected {
-					t.Errorf(
-						"anchor [%d]: expected mode [%s], got [%s]",
-						anchor,
-						expected,
-						permit.Mode(),
-					)
-				}
-
-				_ = permit.CheckCommit("race_commit", CompletionCommit)
 				_ = gate.State()
-				permit.Close()
+
+				// Close the oldest permit so ownership churns while newer
+				// permits keep spanning the lifecycle transitions.
+				if len(held) > 3 {
+					held[0].Close()
+					held = held[1:]
+				}
 			}
 		}()
 	}
 
 	wg.Wait()
 
+	if quiesceDone == nil {
+		t.Fatal("the lifecycle goroutine did not quiesce the gate")
+	}
+	select {
+	case <-quiesceDone:
+	default:
+		t.Error("expected the quiesce channel to be closed after gate close")
+	}
+
+	// Every worker closed all its permits, including force-canceled ones, so
+	// the accounting must balance exactly.
 	if active := gate.State().ActiveCeremonies; active != 0 {
 		t.Errorf("expected zero active ceremonies, got [%d]", active)
 	}
-
-	done := gate.Quiesce(fmt.Errorf("test quiesce"))
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("quiesce channel did not close")
+	if _, err := gate.Begin(
+		TBTCSigning, cutover,
+	); !errors.Is(err, ErrQuiescing) {
+		t.Errorf("expected a quiescing refusal after close, got: [%v]", err)
 	}
-	gate.Close()
 }

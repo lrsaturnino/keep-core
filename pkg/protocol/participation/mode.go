@@ -1,22 +1,24 @@
-// Package participation contains observability primitives used to track a
-// coordinated protocol cutover from the legacy cryptographic behavior to the
-// hardened security-v2 behavior.
+// Package participation implements the chain-clocked protocol cutover from
+// the legacy cryptographic behavior to the hardened security-v2 behavior: the
+// compiled release epoch, the one-value cutover schedule and its per-network
+// resolver, the participation gate that issues per-ceremony permits with the
+// protocol mode pinned from each ceremony's canonical chain anchor, and the
+// node-local roster of post-cutover legacy peer sightings.
 //
-// This package deliberately contains only the decoupled, self-contained pieces
-// of the cutover observability contract: the process-scoped protocol mode and
-// the node-local roster of post-cutover legacy peer sightings. The block-height
-// cutover gate that would select the mode from a canonical chain anchor is
-// intentionally NOT part of this package yet; it can adopt the ProtocolMode
-// type below unchanged when it lands.
+// The gate is the only component that derives protocol modes from the chain
+// clock. There is no process-wide mutable mode: a pre-cutover legacy ceremony
+// may still be completing while a post-cutover security-v2 ceremony begins,
+// and each carries its own immutable permit.
 package participation
 
 // ProtocolMode identifies which cryptographic compatibility mode a ceremony
 // participates in.
 //
-// It is a small, self-contained, inert type. Nothing in this package selects a
-// mode from a block height, configuration, or gate; callers supply the mode
-// explicitly. The future cutover gate is expected to derive the mode from a
-// ceremony's canonical chain anchor and pin it for the ceremony lifetime.
+// A mode is selected by the gate from a ceremony's canonical chain anchor at
+// permit issuance — legacy below the cutover block, security-v2 at or above
+// it — and is pinned in that ceremony's permit for its entire lifetime.
+// Components that receive a mode directly (test fixtures, strategy bundles)
+// must treat it as immutable for the ceremony it was issued for.
 type ProtocolMode uint8
 
 const (

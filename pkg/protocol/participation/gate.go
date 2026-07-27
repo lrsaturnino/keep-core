@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ipfs/go-log/v2"
@@ -248,7 +249,14 @@ type chainGate struct {
 
 	closeOnce sync.Once
 
+	// clockSeq issues the ordering tickets for synchronous clock reads. A
+	// ticket is taken immediately before a read starts, so concurrently
+	// completing reads apply in initiation order regardless of the order their
+	// responses arrive in.
+	clockSeq atomic.Uint64
+
 	mu                sync.Mutex
+	lastClockTicket   uint64
 	currentBlock      uint64
 	clockAvailable    bool
 	quiescing         bool
@@ -307,6 +315,15 @@ func newGate(
 	if err != nil {
 		return nil, fmt.Errorf(
 			"could not read the chain clock at gate construction: [%w]",
+			err,
+		)
+	}
+	// Every height the gate exports must project exactly onto the float64
+	// metric surface; a chain reporting an unprojectable height is as unusable
+	// as one reporting an error.
+	if err := validateMetricProjectable(currentBlock); err != nil {
+		return nil, fmt.Errorf(
+			"could not accept the chain height at gate construction: [%w]",
 			err,
 		)
 	}
@@ -409,47 +426,89 @@ func (g *chainGate) run(
 		select {
 		case <-g.ctx.Done():
 			return
-		case height, ok := <-cutoverWaiter:
+		case _, ok := <-cutoverWaiter:
 			// A nil channel (disabled schedule, or already handled) blocks
 			// forever, which is the intended disarm.
 			cutoverWaiter = nil
-			g.mu.Lock()
 			if !ok {
 				// The waiter closed before its target: a clock failure.
-				g.clockFailureLocked(
+				g.mu.Lock()
+				g.signalClockFailureLocked(
 					"cutover_waiter",
 					fmt.Errorf("cutover block waiter closed before target"),
 				)
-			} else {
-				g.clockAvailable = true
-				if height > g.currentBlock {
-					g.currentBlock = height
-				}
-				g.refreshMetricsLocked()
+				g.mu.Unlock()
+				continue
 			}
-			g.mu.Unlock()
+			// The waiter exists only to make transition telemetry eager: it
+			// requests an authoritative synchronous poll and never recovers or
+			// advances gate state itself. A failing poll here is a clock
+			// failure even though the waiter reported the target height.
+			g.poll("cutover_waiter_poll")
 		case <-ticker.C:
-			g.poll()
+			g.poll("supervisor_poll")
 		}
 	}
 }
 
-// poll performs one supervisor read of the chain clock. A failure cancels all
-// permits; a success recomputes the current state, but previously canceled
-// permits do not revive.
-func (g *chainGate) poll() {
+// poll performs one ordered synchronous read of the chain clock. A newest
+// failure cancels all permits; a newest success recomputes the current state,
+// but previously canceled permits do not revive. A stale outcome is discarded.
+func (g *chainGate) poll(operation string) {
+	ticket := g.clockReadTicket()
 	height, err := g.blockCounter.CurrentBlock()
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	if err != nil {
-		g.clockFailureLocked("supervisor_poll", err)
+	g.applyClockSampleLocked(ticket, height, operation, err)
+}
+
+// clockReadTicket reserves the ordering slot for a synchronous clock read. It
+// must be taken immediately before the read starts.
+func (g *chainGate) clockReadTicket() uint64 {
+	return g.clockSeq.Add(1)
+}
+
+// applyClockSampleLocked applies the outcome of one ordered synchronous clock
+// read. A sample older than the newest applied one is discarded entirely: a
+// stale success arriving after a newer failure can never reopen the gate, and
+// a stale failure arriving after a newer success cannot spuriously cancel
+// permits. A height the float64 metrics projection cannot represent exactly is
+// a clock failure, not a valid sample. The caller must hold g.mu.
+func (g *chainGate) applyClockSampleLocked(
+	ticket uint64,
+	height uint64,
+	operation string,
+	readErr error,
+) {
+	if ticket <= g.lastClockTicket {
 		return
 	}
+	g.lastClockTicket = ticket
+
+	if readErr == nil {
+		readErr = validateMetricProjectable(height)
+	}
+	if readErr != nil {
+		g.clockFailureLocked(operation, readErr)
+		return
+	}
+
 	g.clockAvailable = true
 	g.currentBlock = height
 	g.refreshMetricsLocked()
+}
+
+// signalClockFailureLocked records a clock failure that arrived as a lifecycle
+// signal — the cutover waiter closing before its target — rather than as an
+// ordered read outcome. It takes a fresh ticket at application time, so any
+// read still in flight was initiated earlier, is stale on arrival, and cannot
+// mask this failure; recovery requires a read initiated afterwards. The caller
+// must hold g.mu.
+func (g *chainGate) signalClockFailureLocked(operation string, err error) {
+	g.lastClockTicket = g.clockSeq.Add(1)
+	g.clockFailureLocked(operation, err)
 }
 
 // clockFailureLocked is the atomic clock-unavailable transition: it marks the
@@ -611,11 +670,15 @@ func (g *chainGate) issue(
 	}
 
 	// The synchronous, authoritative chain read happens outside the lock so a
-	// slow chain call never blocks fences, closes, or the supervisor.
+	// slow chain call never blocks fences, closes, or the supervisor. The
+	// ticket taken before the read orders this sample against concurrent ones.
+	ticket := g.clockReadTicket()
 	height, clockErr := g.blockCounter.CurrentBlock()
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
+
+	g.applyClockSampleLocked(ticket, height, "issue_permit", clockErr)
 
 	if g.closed || g.quiescing {
 		return nil, g.refuseLocked(
@@ -626,8 +689,10 @@ func (g *chainGate) issue(
 		)
 	}
 
-	if clockErr != nil {
-		g.clockFailureLocked("issue_permit", clockErr)
+	// This operation fails closed on its own read error even when a newer
+	// concurrent sample kept the gate available, and equally when its own read
+	// succeeded but lost the race to a newer applied failure.
+	if clockErr != nil || !g.clockAvailable {
 		return nil, g.refuseLocked(
 			ceremony,
 			canonicalStartBlock,
@@ -635,8 +700,10 @@ func (g *chainGate) issue(
 			ErrClockUnavailable,
 		)
 	}
-	g.clockAvailable = true
-	g.currentBlock = height
+
+	// From here on, decisions use the newest applied height, which is this
+	// read's own height unless a newer concurrent sample applied first.
+	height = g.currentBlock
 
 	if resume && ceremony != BeaconRelaySigning {
 		return nil, g.refuseLocked(
@@ -711,14 +778,19 @@ func (p *permit) CheckCommit(operation string, class CommitClass) error {
 	g := p.gate
 
 	// The fence always uses its own fresh synchronous height, read outside
-	// the lock.
+	// the lock and ordered against concurrent reads by its ticket.
+	ticket := g.clockReadTicket()
 	height, clockErr := g.blockCounter.CurrentBlock()
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	if clockErr != nil {
-		g.clockFailureLocked("commit_fence", clockErr)
+	g.applyClockSampleLocked(ticket, height, "commit_fence", clockErr)
+
+	// The fence fails closed on its own read error even when a newer
+	// concurrent sample kept the gate available, and equally when its own read
+	// succeeded but lost the race to a newer applied failure.
+	if clockErr != nil || !g.clockAvailable {
 		return g.refuseCommitLocked(
 			p,
 			operation,
@@ -727,8 +799,10 @@ func (p *permit) CheckCommit(operation string, class CommitClass) error {
 			ErrClockUnavailable,
 		)
 	}
-	g.clockAvailable = true
-	g.currentBlock = height
+
+	// Fence decisions use the newest applied height, which is this read's own
+	// height unless a newer concurrent sample applied first.
+	height = g.currentBlock
 
 	if cause := context.Cause(p.ctx); cause != nil {
 		return g.refuseCommitLocked(p, operation, class, height, cause)
