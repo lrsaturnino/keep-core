@@ -141,6 +141,60 @@ func start(cmd *cobra.Command) error {
 		firewall.SetMetricsRecorder(perfMetrics)
 	}
 
+	// Construct the production participation gate from the shared block
+	// counter before any protocol component starts: the gate performs its
+	// first synchronous chain-clock read here and a clock error refuses
+	// startup. With client-info disabled the gate records to a no-op sink so
+	// its logs and state machine still function.
+	//
+	// TODO: Pass this gate into beacon.Initialize and tbtc.Initialize and
+	// derive every ceremony's protocol mode from its permit. Until that
+	// wiring lands the protocol layers run security-v2 unconditionally
+	// (tracked at their mode call sites) and this gate provides the
+	// authoritative cutover state machine, metrics, and transition logs only.
+	// That gap is a release blocker for the chain-clocked cutover.
+	var gateMetrics participation.GateMetricsRecorder
+	if perfMetrics != nil {
+		gateMetrics = perfMetrics
+	} else {
+		gateMetrics = &clientinfo.NoOpPerformanceMetrics{}
+	}
+	participationGate, err := participation.NewGate(
+		ctx,
+		participationSchedule,
+		blockCounter,
+		gateMetrics,
+	)
+	if err != nil {
+		return fmt.Errorf("cannot construct the participation gate: [%v]", err)
+	}
+	defer participationGate.Close()
+
+	beaconCompletionBound, err := beacon.MaximumLegacyCompletionBlocks(
+		beaconChain.GetConfig(),
+	)
+	if err != nil {
+		return fmt.Errorf("cannot derive the beacon completion bound: [%v]", err)
+	}
+	maximumCompletionBound := tbtc.MaximumLegacyCompletionBlocks()
+	if beaconCompletionBound > maximumCompletionBound {
+		maximumCompletionBound = beaconCompletionBound
+	}
+
+	gateSnapshot := participationGate.State()
+	logger.Infof(
+		"protocol participation gate started [state=%s] [currentBlock=%d] "+
+			"[cutoverBlock=%d] [revision=%s] [epoch=%s] "+
+			"[maximumLegacyCompletionBlocks=%d] [source=%s]",
+		gateSnapshot.State,
+		gateSnapshot.CurrentBlock,
+		gateSnapshot.CutoverBlock,
+		build.Revision,
+		participation.CompiledEpoch,
+		maximumCompletionBound,
+		cutoverBlockSource,
+	)
+
 	// Initialize beacon and tbtc only for non-bootstrap nodes.
 	// Skip initialization for bootstrap nodes as they are only used for network
 	// discovery.
