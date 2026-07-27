@@ -304,6 +304,7 @@ func (se *signingExecutor) sign(
 			retryLoop := newSigningRetryLoop(
 				signingLogger,
 				message,
+				participation.ModeSecurityV2,
 				startBlock,
 				signer.signingGroupMemberIndex,
 				wallet.signingGroupOperators,

@@ -396,6 +396,7 @@ func (de *dkgExecutor) generateSigningGroup(
 			retryLoop := newDkgRetryLoop(
 				dkgLogger,
 				seed,
+				participation.ModeSecurityV2,
 				startBlock+delayBlocks,
 				memberIndex,
 				groupSelectionResult.OperatorsAddresses,

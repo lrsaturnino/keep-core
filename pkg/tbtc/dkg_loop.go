@@ -11,6 +11,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/chain"
 	"github.com/keep-network/keep-core/pkg/protocol/announcer"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/tecdsa/dkg"
 	"github.com/keep-network/keep-core/pkg/tecdsa/retry"
 	"golang.org/x/exp/slices"
@@ -60,6 +61,12 @@ type dkgRetryLoop struct {
 	// Used for the announcement. It never changes.
 	seed *big.Int
 
+	// protocolMode is the ceremony's pinned protocol compatibility mode. A
+	// retry is a phase of its outer ceremony, so every attempt of this loop —
+	// including attempts starting at or after the cutover block — derives its
+	// session ID from this one immutable mode.
+	protocolMode participation.ProtocolMode
+
 	memberIndex       group.MemberIndex
 	selectedOperators chain.Addresses
 
@@ -80,6 +87,7 @@ type dkgRetryLoop struct {
 func newDkgRetryLoop(
 	logger log.StandardLogger,
 	seed *big.Int,
+	protocolMode participation.ProtocolMode,
 	initialStartBlock uint64,
 	memberIndex group.MemberIndex,
 	selectedOperators chain.Addresses,
@@ -97,6 +105,7 @@ func newDkgRetryLoop(
 	return &dkgRetryLoop{
 		logger:             logger,
 		seed:               seed,
+		protocolMode:       protocolMode,
 		memberIndex:        memberIndex,
 		selectedOperators:  selectedOperators,
 		groupParameters:    groupParameters,
@@ -121,12 +130,37 @@ type dkgAttemptParams struct {
 	sessionID string
 }
 
-func dkgAttemptSessionID(seed *big.Int, attemptNumber uint) string {
-	return fmt.Sprintf(
-		"dkg-%v-%016x",
-		seed.Text(16),
-		attemptNumber,
-	)
+// dkgAttemptSessionID derives the announcer/protocol session ID of a single
+// DKG attempt for the given protocol compatibility mode. The legacy form is
+// byte-for-byte the pre-hardening production form so a legacy-mode ceremony
+// interoperates with prior-release peers; the security-v2 form carries the
+// protocol name and a fixed-width attempt so it cannot collide or be replayed
+// across protocols. The mode always comes from the ceremony's pinned permit
+// mode; there is no implicit default.
+func dkgAttemptSessionID(
+	mode participation.ProtocolMode,
+	seed *big.Int,
+	attemptNumber uint,
+) string {
+	switch mode {
+	case participation.ModeLegacy:
+		return fmt.Sprintf(
+			"%v-%v",
+			seed.Text(16),
+			attemptNumber,
+		)
+	case participation.ModeSecurityV2:
+		return fmt.Sprintf(
+			"dkg-%v-%016x",
+			seed.Text(16),
+			attemptNumber,
+		)
+	default:
+		panic(fmt.Sprintf(
+			"dkgAttemptSessionID: protocol mode not set explicitly: [%v]",
+			mode,
+		))
+	}
 }
 
 // dkgAttemptFn represents a function performing a DKG attempt.
@@ -208,7 +242,11 @@ func (drl *dkgRetryLoop) start(
 
 		// Derive the session ID once per attempt so the announcer and the DKG
 		// protocol cannot drift apart.
-		sessionID := dkgAttemptSessionID(drl.seed, drl.attemptCounter)
+		sessionID := dkgAttemptSessionID(
+			drl.protocolMode,
+			drl.seed,
+			drl.attemptCounter,
+		)
 
 		readyMembersIndexes, err := drl.announcer.Announce(
 			announceCtx,

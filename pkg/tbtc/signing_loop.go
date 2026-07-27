@@ -14,6 +14,7 @@ import (
 	"github.com/ipfs/go-log/v2"
 	"github.com/keep-network/keep-core/pkg/chain"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/tecdsa/retry"
 	"github.com/keep-network/keep-core/pkg/tecdsa/signing"
 	"golang.org/x/exp/slices"
@@ -84,6 +85,12 @@ type signingRetryLoop struct {
 
 	message *big.Int
 
+	// protocolMode is the ceremony's pinned protocol compatibility mode. A
+	// retry is a phase of its outer ceremony, so every attempt of this loop —
+	// including attempts starting at or after the cutover block — derives its
+	// session ID from this one immutable mode.
+	protocolMode participation.ProtocolMode
+
 	signingGroupMemberIndex group.MemberIndex
 	signingGroupOperators   chain.Addresses
 
@@ -101,6 +108,7 @@ type signingRetryLoop struct {
 func newSigningRetryLoop(
 	logger log.StandardLogger,
 	message *big.Int,
+	protocolMode participation.ProtocolMode,
 	initialStartBlock uint64,
 	signingGroupMemberIndex group.MemberIndex,
 	signingGroupOperators chain.Addresses,
@@ -118,6 +126,7 @@ func newSigningRetryLoop(
 	return &signingRetryLoop{
 		logger:                  logger,
 		message:                 message,
+		protocolMode:            protocolMode,
 		signingGroupMemberIndex: signingGroupMemberIndex,
 		signingGroupOperators:   signingGroupOperators,
 		groupParameters:         groupParameters,
@@ -141,17 +150,40 @@ type signingAttemptParams struct {
 	sessionID string
 }
 
+// signingAttemptSessionID derives the announcer/protocol session ID of a
+// single signing attempt for the given protocol compatibility mode. The
+// legacy form is byte-for-byte the pre-hardening production form — it carries
+// no attempt start block — so a legacy-mode ceremony interoperates with
+// prior-release peers; the security-v2 form carries the protocol name and
+// fixed-width start block and attempt so it cannot collide or be replayed
+// across protocols or windows. The mode always comes from the ceremony's
+// pinned permit mode; there is no implicit default.
 func signingAttemptSessionID(
+	mode participation.ProtocolMode,
 	message *big.Int,
 	attemptStartBlock uint64,
 	attemptNumber uint,
 ) string {
-	return fmt.Sprintf(
-		"signing-%v-%016x-%016x",
-		message.Text(16),
-		attemptStartBlock,
-		attemptNumber,
-	)
+	switch mode {
+	case participation.ModeLegacy:
+		return fmt.Sprintf(
+			"%v-%v",
+			message.Text(16),
+			attemptNumber,
+		)
+	case participation.ModeSecurityV2:
+		return fmt.Sprintf(
+			"signing-%v-%016x-%016x",
+			message.Text(16),
+			attemptStartBlock,
+			attemptNumber,
+		)
+	default:
+		panic(fmt.Sprintf(
+			"signingAttemptSessionID: protocol mode not set explicitly: [%v]",
+			mode,
+		))
+	}
 }
 
 // signingAttemptFn represents a function performing a signing attempt.
@@ -277,6 +309,7 @@ func (srl *signingRetryLoop) start(
 		// Derive the session ID once per attempt so the announcer and the
 		// signing protocol cannot drift apart.
 		sessionID := signingAttemptSessionID(
+			srl.protocolMode,
 			srl.message,
 			announcementEndBlock,
 			srl.attemptCounter,
