@@ -80,8 +80,9 @@ func start(cmd *cobra.Command) error {
 
 	// Signal capture is installed before anything else so that no window of
 	// the startup sequence is left to the default signal action: a signal
-	// arriving while components are still initializing is held in the buffered
-	// channel and handled by the lifecycle controller once startup completes.
+	// arriving before the participation gate exists is held in the buffered
+	// channel and acted on the moment the lifecycle controller starts,
+	// immediately after the gate is constructed.
 	signalChan := make(chan os.Signal, 2)
 	signal.Notify(signalChan, syscall.SIGTERM, syscall.SIGINT)
 	defer signal.Stop(signalChan)
@@ -258,6 +259,18 @@ func start(cmd *cobra.Command) error {
 		return fmt.Errorf("cannot derive the quiesce backstop: [%v]", err)
 	}
 
+	// The lifecycle controller arms while only the gate and roster exist —
+	// before the network provider, beacon, or tBTC can begin protocol work —
+	// so a termination signal received at any later point of startup quiesces
+	// the gate immediately instead of waiting for initialization to finish.
+	shutdownChan := startSignalLifecycleController(
+		runCtx,
+		cancelRunCtx,
+		participationGate,
+		signalChan,
+		quiesceBackstop,
+	)
+
 	gateSnapshot := participationGate.State()
 	logger.Infof(
 		"protocol participation gate started [state=%s] [currentBlock=%d] "+
@@ -386,42 +399,77 @@ func start(cmd *cobra.Command) error {
 		clientConfig.Ethereum,
 	)
 
-	// The signal controller: on the first SIGTERM/SIGINT the gate refuses new
-	// permits and existing ceremonies run to natural completion; the run
-	// context is canceled only afterwards, so in-flight protocol work keeps
-	// its network, chain, and persistence access for the whole drain. A
-	// second signal or the in-process backstop deadline forces the remainder
-	// through the gate's audited forced-cancellation path. The signal channel
-	// itself was armed before any component initialized.
+	// The lifecycle controller has been driving signals since right after the
+	// gate was constructed; from here the main goroutine only waits for its
+	// shutdown report or for the run context to end for another reason.
 	select {
-	case receivedSignal := <-signalChan:
-		quiesceCause := fmt.Errorf("received signal [%v]", receivedSignal)
-		quiesceDone := participationGate.Quiesce(quiesceCause)
-
-		reason := awaitQuiesce(
-			quiesceDone,
-			signalChan,
-			quiesceBackstop,
-		)
-		logger.Infof(
-			"protocol participation quiescence ended [reason=%s] "+
-				"[signal=%v]",
-			reason,
-			receivedSignal,
-		)
-
-		// Close force-cancels any permit that outlived the drain and stops
-		// the clock supervisor; only then may the run context be canceled.
-		participationGate.Close()
-		cancelRunCtx()
-
-		return fmt.Errorf(
-			"shutting down the node after signal [%v]",
-			receivedSignal,
-		)
+	case err := <-shutdownChan:
+		return err
 	case <-runCtx.Done():
+		// The controller sends its shutdown report before it cancels the run
+		// context, so a pending report is always preferred over the bare
+		// context end.
+		select {
+		case err := <-shutdownChan:
+			return err
+		default:
+		}
 		return fmt.Errorf("shutting down the node because its context has ended")
 	}
+}
+
+// startSignalLifecycleController launches the signal-driven shutdown
+// controller. It must be started as soon as the participation gate exists,
+// before the network provider or either application can begin protocol work:
+// the first SIGTERM/SIGINT — including one that arrives while startup is
+// still initializing components — immediately quiesces the gate, so no new
+// permit is issued from that moment on, while existing ceremonies run to
+// natural completion. A second signal or the in-process backstop deadline
+// forces the remainder through the gate's audited forced-cancellation path.
+// The run context is canceled only after the drain resolves, so in-flight
+// protocol work keeps its network, chain, and persistence access for the
+// whole drain. The returned channel reports the shutdown cause once the
+// drive completes.
+func startSignalLifecycleController(
+	runCtx context.Context,
+	cancelRunCtx context.CancelFunc,
+	gate participation.Gate,
+	signals <-chan os.Signal,
+	backstop time.Duration,
+) <-chan error {
+	shutdown := make(chan error, 1)
+
+	go func() {
+		select {
+		case receivedSignal := <-signals:
+			quiesceCause := fmt.Errorf("received signal [%v]", receivedSignal)
+			quiesceDone := gate.Quiesce(quiesceCause)
+
+			reason := awaitQuiesce(quiesceDone, signals, backstop)
+			logger.Infof(
+				"protocol participation quiescence ended [reason=%s] "+
+					"[signal=%v]",
+				reason,
+				receivedSignal,
+			)
+
+			// Close force-cancels any permit that outlived the drain and
+			// stops the clock supervisor. The shutdown report is sent before
+			// the run context is canceled so the report is already pending
+			// whenever the main goroutine observes the context end.
+			gate.Close()
+			shutdown <- fmt.Errorf(
+				"shutting down the node after signal [%v]",
+				receivedSignal,
+			)
+			cancelRunCtx()
+		case <-runCtx.Done():
+			// The process is ending for another reason; there is no drain to
+			// drive.
+		}
+	}()
+
+	return shutdown
 }
 
 // quiesceUpperBlockIntervalSeconds is the conservative upper bound on the

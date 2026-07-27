@@ -1,11 +1,18 @@
 package cmd
 
 import (
+	"context"
+	"errors"
 	"math"
 	"os"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/keep-network/keep-core/pkg/chain/local_v1"
+	"github.com/keep-network/keep-core/pkg/clientinfo"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 )
 
 func TestAwaitQuiesce_NaturalCompletion(t *testing.T) {
@@ -36,6 +43,103 @@ func TestAwaitQuiesce_BackstopDeadline(t *testing.T) {
 	)
 	if reason != "backstop_deadline" {
 		t.Errorf("expected reason [backstop_deadline], got [%s]", reason)
+	}
+}
+
+// TestSignalLifecycleController_FirstSignalPreventsNewPermits proves the
+// controller acts on the first termination signal the moment it arrives —
+// the model of a signal received while startup is still initializing
+// components: the gate refuses every subsequent Begin, the in-flight permit
+// keeps draining, and only after it completes does the controller report
+// shutdown and cancel the run context.
+func TestSignalLifecycleController_FirstSignalPreventsNewPermits(t *testing.T) {
+	localChain := local_v1.Connect(10, 5)
+	blockCounter, err := localChain.BlockCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := blockCounter.WaitForBlockHeight(1); err != nil {
+		t.Fatal(err)
+	}
+
+	gate, err := participation.NewGate(
+		context.Background(),
+		participation.Schedule{CutoverBlock: 1_000_000},
+		blockCounter,
+		&clientinfo.NoOpPerformanceMetrics{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gate.Close()
+
+	// The in-flight ceremony that must survive the first signal and keep the
+	// drain open until it completes.
+	permit, err := gate.Begin(participation.BeaconDKG, 1)
+	if err != nil {
+		t.Fatalf("cannot begin the in-flight ceremony: [%v]", err)
+	}
+
+	runCtx, cancelRunCtx := context.WithCancel(context.Background())
+	defer cancelRunCtx()
+
+	signals := make(chan os.Signal, 2)
+	shutdownChan := startSignalLifecycleController(
+		runCtx,
+		cancelRunCtx,
+		gate,
+		signals,
+		time.Hour,
+	)
+
+	signals <- syscall.SIGTERM
+
+	// The controller quiesces asynchronously; a Begin that still succeeds
+	// lost the race with the quiesce transition and its permit is returned
+	// before retrying. Once the refusal appears it must be the quiesce
+	// sentinel.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		extraPermit, err := gate.Begin(participation.BeaconDKG, 1)
+		if err != nil {
+			if !errors.Is(err, participation.ErrQuiescing) {
+				t.Fatalf("expected the quiesce refusal, got [%v]", err)
+			}
+			break
+		}
+		extraPermit.Close()
+
+		if time.Now().After(deadline) {
+			t.Fatal("the gate never started refusing new permits")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// The drain must wait for the in-flight permit: no shutdown report and no
+	// run-context cancellation may occur while it is open.
+	select {
+	case err := <-shutdownChan:
+		t.Fatalf("shutdown reported while a permit was active: [%v]", err)
+	case <-runCtx.Done():
+		t.Fatal("run context canceled while a permit was active")
+	default:
+	}
+
+	permit.Close()
+
+	select {
+	case err := <-shutdownChan:
+		if err == nil || !strings.Contains(err.Error(), "signal") {
+			t.Errorf("expected a signal shutdown report, got [%v]", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("no shutdown report after the drain completed")
+	}
+
+	select {
+	case <-runCtx.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("the run context was not canceled after the shutdown report")
 	}
 }
 
