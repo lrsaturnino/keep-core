@@ -26,11 +26,15 @@ Run those proofs, which need no Docker or chain, with:
 ```
 
 Two sibling stages cover the rest of the changed risk surface locally:
-`./rehearse.sh static-analysis` runs the CI-enforced Go analyzers at their
-CI-pinned versions and flags (gofmt, go vet, staticcheck, gosec,
-golangci-lint), and `./rehearse.sh solidity-proofs` builds and tests the
-ECDSA contracts exactly as the contracts workflow does (Node 18 and yarn
-required).
+`./rehearse.sh static-analysis` runs the CI-enforced Go analyzers with
+every tool at an immutable version — gofmt, `go vet ./...` (strictly wider
+than CI's root-only vet), staticcheck 2025.1.1, gosec v2.28.0 (CI's own
+gosec action floats on `master`; the pin keeps the evidence reproducible),
+and golangci-lint v2.12.2 — and `./rehearse.sh solidity-proofs` builds and
+tests the ECDSA contracts exactly as the contracts workflow does: Node
+18.15.0, the Corepack-managed yarn from `packageManager`, and a
+never-skipped `yarn install --immutable` before `yarn build` and
+`yarn test`. Every stage stamps the exact source commit into its log.
 
 The offline state classification the rollback barrier requires runs with
 `go run ./cmd/participation-state-audit --storage-snapshot <copy>`: it
@@ -78,9 +82,10 @@ gauge snapshots, transaction hashes, and non-secret state checksums.
 Screenshots alone are insufficient. `./rehearse.sh validate-evidence` checks
 every record under `EVIDENCE_DIR` against the schema, and the
 `cutover-rehearsal` workflow (manually dispatched, in
-`.github/workflows/cutover-rehearsal.yml`) runs the local proofs on every
-dispatch and the container preflight when the image digests and chain inputs
-are supplied.
+`.github/workflows/cutover-rehearsal.yml`) runs the local proofs, the
+static analyzers, and the contracts build/test on every dispatch —
+archiving each stage's log in a per-SHA artifact — and the container
+preflight when the image digests and chain inputs are supplied.
 
 On a hosted runner the per-node keystore comes from the
 `REHEARSAL_KEYSTORE_BUNDLE_B64` repository secret: a base64-encoded tar.gz
@@ -118,8 +123,13 @@ changed — security-v2 requires the session nonce, and every mode-independent
 memory-safety fix stays active in both modes.
 
 That extension is reviewed cryptographic work outside this repository, and an
-unreviewed in-tree fork is not an accepted substitute. Until the reviewed
-fork commit is pinned in `go.mod`:
+unreviewed in-tree fork is not an accepted substitute. The dependency was
+re-verified empirically on 2026-07-27: `git ls-remote --heads --tags
+https://github.com/threshold-network/tss-lib` showed `master` at exactly the
+pinned `86bd1a375cc0` revision, no tags, and no branch carrying a per-party
+legacy mode — the reviewed dual-mode revision does not exist anywhere on the
+fork remote yet, so the dependency is outstanding upstream, not merely
+unpinned here. Until the reviewed fork commit is pinned in `go.mod`:
 
 - tBTC ceremonies **fail closed on legacy permits** — deliberately, at two
   layers. The authoritative fence is the legacy bundle itself: its TSS
