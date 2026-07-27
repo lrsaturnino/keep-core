@@ -484,6 +484,17 @@ func (se *signingExecutor) sign(
 		}
 		return outcome.signature, outcome.activityReport, outcome.endBlock, nil
 	default:
+		// A gate decision — clock failure, forced quiescence, or a closed
+		// permit — canceled the signing; it is not an ordinary protocol
+		// failure or timeout and must not increment the ordinary failure
+		// metrics. The gate records the abort in its own metrics; the wrapped
+		// cause lets every caller layer classify the outcome the same way.
+		if cause := context.Cause(ctx); participation.IsGateRefusal(cause) {
+			return nil, nil, 0, fmt.Errorf(
+				"signing canceled by the participation gate: %w",
+				cause,
+			)
+		}
 		if se.metricsRecorder != nil {
 			// All signers failed to produce a signature within the timeout period.
 			// This is counted as both a failure and a timeout.

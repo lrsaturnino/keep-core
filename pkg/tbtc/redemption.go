@@ -283,10 +283,13 @@ func (ra *redemptionAction) execute() error {
 		ra.proposalExpiryBlock-ra.signingTimeoutSafetyMarginBlocks,
 	)
 	if err != nil {
-		if ra.metricsRecorder != nil {
+		// A gate-caused abort is not an ordinary failure of this action and
+		// stays out of its failure metrics; the wrapped cause lets the
+		// dispatcher classify it the same way.
+		if ra.metricsRecorder != nil && !participation.IsGateRefusal(err) {
 			ra.metricsRecorder.IncrementCounter(clientinfo.MetricRedemptionExecutionsFailedTotal, 1)
 		}
-		return fmt.Errorf("sign transaction step failed: [%v]", err)
+		return fmt.Errorf("sign transaction step failed: [%w]", err)
 	}
 
 	broadcastTxLogger := ra.logger.With(
@@ -301,10 +304,13 @@ func (ra *redemptionAction) execute() error {
 		ra.broadcastCheckDelay,
 	)
 	if err != nil {
-		if ra.metricsRecorder != nil {
+		// A gate-caused abort is not an ordinary failure of this action and
+		// stays out of its failure metrics; the wrapped cause lets the
+		// dispatcher classify it the same way.
+		if ra.metricsRecorder != nil && !participation.IsGateRefusal(err) {
 			ra.metricsRecorder.IncrementCounter(clientinfo.MetricRedemptionExecutionsFailedTotal, 1)
 		}
-		return fmt.Errorf("broadcast transaction step failed: [%v]", err)
+		return fmt.Errorf("broadcast transaction step failed: [%w]", err)
 	}
 
 	// Record successful redemption execution

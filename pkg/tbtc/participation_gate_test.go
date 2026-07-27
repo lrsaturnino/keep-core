@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/bitcoin"
 	"github.com/keep-network/keep-core/pkg/chain"
 	"github.com/keep-network/keep-core/pkg/chain/local_v1"
+	"github.com/keep-network/keep-core/pkg/clientinfo"
 	"github.com/keep-network/keep-core/pkg/internal/tecdsatest"
 	"github.com/keep-network/keep-core/pkg/net/local"
 	"github.com/keep-network/keep-core/pkg/operator"
@@ -237,6 +239,7 @@ func TestDkgExecutor_PreserveInterruptedSigner_Quarantines(t *testing.T) {
 		result,
 		group.MemberIndex(1),
 		gsr,
+		"tbtc_dkg_signer_activation",
 		fmt.Errorf("activation refused"),
 	)
 
@@ -356,6 +359,7 @@ func TestDkgExecutor_PreserveInterruptedSigner_SavesRegisteredWithoutActivation(
 		result,
 		group.MemberIndex(1),
 		gsr,
+		"tbtc_dkg_signer_activation",
 		fmt.Errorf("activation refused"),
 	)
 
@@ -644,4 +648,644 @@ func TestWalletTransactionExecutor_BroadcastRefusedByGate(t *testing.T) {
 		"tbtc_deposit_sweep_bitcoin_broadcast",
 		operations[0],
 	)
+}
+
+// quarantinedFailedOperation decodes the single quarantine metadata record in
+// the given handle and returns its failed-operation name.
+func quarantinedFailedOperation(
+	t *testing.T,
+	quarantineHandle *mockPersistenceHandle,
+) string {
+	t.Helper()
+
+	var metadataContent []byte
+	for _, descriptor := range quarantineHandle.saved {
+		if strings.HasPrefix(descriptor.Name(), "/metadata_") {
+			metadataContent, _ = descriptor.Content()
+		}
+	}
+	if metadataContent == nil {
+		t.Fatal("expected a quarantine metadata record")
+	}
+
+	var metadata QuarantinedSignerMetadata
+	if err := json.Unmarshal(metadataContent, &metadata); err != nil {
+		t.Fatal(err)
+	}
+
+	return metadata.FailedOperation
+}
+
+// TestDkgExecutor_CompleteDkgCeremony_ActivatesAfterPublication proves the
+// completion order of a DKG ceremony: the result publication concludes first,
+// the activation fence is consulted only afterwards, and only then is the
+// signer persisted in the active namespace and activated in the wallet cache.
+func TestDkgExecutor_CompleteDkgCeremony_ActivatesAfterPublication(t *testing.T) {
+	de, result, gsr, registryHandle, quarantineHandle := setupPreserveScenario(t)
+
+	permit := newTestPermit(participation.TBTCDKG)
+
+	published := false
+	activated := de.completeDkgCeremony(
+		permit.Context(),
+		logger.With(),
+		permit,
+		big.NewInt(1),
+		result,
+		group.MemberIndex(1),
+		gsr,
+		func() bool { return false },
+		func(context.Context) error {
+			// The activation fence must not have been consulted before the
+			// publication concluded.
+			testutils.AssertIntsEqual(
+				t,
+				"fence consultations during publication",
+				0,
+				len(permit.commitOperations()),
+			)
+			published = true
+			return nil
+		},
+	)
+
+	if !published {
+		t.Fatal("expected the result publication to run")
+	}
+	if !activated {
+		t.Fatal("expected the signer to be activated")
+	}
+
+	operations := permit.commitOperations()
+	testutils.AssertIntsEqual(t, "fence consultations", 1, len(operations))
+	testutils.AssertStringsEqual(
+		t,
+		"fence operation",
+		"tbtc_dkg_signer_activation",
+		operations[0],
+	)
+
+	testutils.AssertIntsEqual(
+		t,
+		"active-namespace saves",
+		1,
+		len(registryHandle.saved),
+	)
+	testutils.AssertIntsEqual(
+		t,
+		"activated signers",
+		1,
+		len(de.walletRegistry.getSigners(result.PrivateKeyShare.PublicKey())),
+	)
+	testutils.AssertIntsEqual(
+		t,
+		"quarantined records",
+		0,
+		len(quarantineHandle.saved),
+	)
+}
+
+// TestDkgExecutor_CompleteDkgCeremony_PublicationGateRefusalQuarantines
+// proves a submission fence refusal during result publication preserves the
+// generated share only in the protected quarantine namespace: the activation
+// fence is never consulted and the signer is neither saved to the active
+// namespace nor activated in the wallet cache.
+func TestDkgExecutor_CompleteDkgCeremony_PublicationGateRefusalQuarantines(
+	t *testing.T,
+) {
+	de, result, gsr, registryHandle, quarantineHandle := setupPreserveScenario(t)
+
+	permit := newTestPermit(participation.TBTCDKG)
+
+	activated := de.completeDkgCeremony(
+		permit.Context(),
+		logger.With(),
+		permit,
+		big.NewInt(1),
+		result,
+		group.MemberIndex(1),
+		gsr,
+		func() bool { return false },
+		func(context.Context) error {
+			return fmt.Errorf(
+				"completion commit refused: %w",
+				participation.ErrClockUnavailable,
+			)
+		},
+	)
+
+	if activated {
+		t.Fatal("expected no signer activation")
+	}
+	testutils.AssertIntsEqual(
+		t,
+		"fence consultations",
+		0,
+		len(permit.commitOperations()),
+	)
+	testutils.AssertIntsEqual(
+		t,
+		"active-namespace saves",
+		0,
+		len(registryHandle.saved),
+	)
+	testutils.AssertIntsEqual(
+		t,
+		"activated signers",
+		0,
+		len(de.walletRegistry.getSigners(result.PrivateKeyShare.PublicKey())),
+	)
+	testutils.AssertIntsEqual(
+		t,
+		"quarantined records",
+		2,
+		len(quarantineHandle.saved),
+	)
+	testutils.AssertStringsEqual(
+		t,
+		"quarantined failed operation",
+		"tbtc_dkg_result_publication",
+		quarantinedFailedOperation(t, quarantineHandle),
+	)
+}
+
+// TestDkgExecutor_CompleteDkgCeremony_ClockLossDuringPublicationQuarantines
+// proves a clock-failure permit cancellation racing the result publication —
+// the publication itself surfaces only a plain context cancellation, the gate
+// cause lives in the permit context — preserves the share only in quarantine
+// and never activates it.
+func TestDkgExecutor_CompleteDkgCeremony_ClockLossDuringPublicationQuarantines(
+	t *testing.T,
+) {
+	de, result, gsr, registryHandle, quarantineHandle := setupPreserveScenario(t)
+
+	permit := newTestPermit(participation.TBTCDKG)
+
+	activated := de.completeDkgCeremony(
+		permit.Context(),
+		logger.With(),
+		permit,
+		big.NewInt(1),
+		result,
+		group.MemberIndex(1),
+		gsr,
+		func() bool { return false },
+		func(publishCtx context.Context) error {
+			// The gate loses the chain clock while the publication is in
+			// flight: the permit is canceled with the gate cause and the
+			// publication ends with a plain context cancellation.
+			permit.cancel(participation.ErrClockUnavailable)
+			<-publishCtx.Done()
+			return publishCtx.Err()
+		},
+	)
+
+	if activated {
+		t.Fatal("expected no signer activation")
+	}
+	testutils.AssertIntsEqual(
+		t,
+		"fence consultations",
+		0,
+		len(permit.commitOperations()),
+	)
+	testutils.AssertIntsEqual(
+		t,
+		"active-namespace saves",
+		0,
+		len(registryHandle.saved),
+	)
+	testutils.AssertIntsEqual(
+		t,
+		"activated signers",
+		0,
+		len(de.walletRegistry.getSigners(result.PrivateKeyShare.PublicKey())),
+	)
+	testutils.AssertIntsEqual(
+		t,
+		"quarantined records",
+		2,
+		len(quarantineHandle.saved),
+	)
+	testutils.AssertStringsEqual(
+		t,
+		"quarantined failed operation",
+		"tbtc_dkg_result_publication",
+		quarantinedFailedOperation(t, quarantineHandle),
+	)
+}
+
+// TestDkgExecutor_CompleteDkgCeremony_ActivatesWhenAnotherMemberSubmitted
+// proves a publication ended by the on-chain submission event — another
+// member submitted the result first — still activates the signer through the
+// activation fence: the ceremony completed and the share is needed.
+func TestDkgExecutor_CompleteDkgCeremony_ActivatesWhenAnotherMemberSubmitted(
+	t *testing.T,
+) {
+	de, result, gsr, registryHandle, quarantineHandle := setupPreserveScenario(t)
+
+	permit := newTestPermit(participation.TBTCDKG)
+
+	activated := de.completeDkgCeremony(
+		permit.Context(),
+		logger.With(),
+		permit,
+		big.NewInt(1),
+		result,
+		group.MemberIndex(1),
+		gsr,
+		func() bool { return true },
+		func(context.Context) error {
+			return context.Canceled
+		},
+	)
+
+	if !activated {
+		t.Fatal("expected the signer to be activated")
+	}
+	operations := permit.commitOperations()
+	testutils.AssertIntsEqual(t, "fence consultations", 1, len(operations))
+	testutils.AssertIntsEqual(
+		t,
+		"active-namespace saves",
+		1,
+		len(registryHandle.saved),
+	)
+	testutils.AssertIntsEqual(
+		t,
+		"activated signers",
+		1,
+		len(de.walletRegistry.getSigners(result.PrivateKeyShare.PublicKey())),
+	)
+	testutils.AssertIntsEqual(
+		t,
+		"quarantined records",
+		0,
+		len(quarantineHandle.saved),
+	)
+}
+
+// TestDkgExecutor_CompleteDkgCeremony_TimeoutWithoutSubmissionQuarantines
+// proves a publication window that closes without any observed submitted
+// result preserves the share only in quarantine: the wallet may never appear
+// on chain, so activating the signer would leave an active signer for an
+// unpublished result.
+func TestDkgExecutor_CompleteDkgCeremony_TimeoutWithoutSubmissionQuarantines(
+	t *testing.T,
+) {
+	de, result, gsr, registryHandle, quarantineHandle := setupPreserveScenario(t)
+
+	permit := newTestPermit(participation.TBTCDKG)
+
+	activated := de.completeDkgCeremony(
+		permit.Context(),
+		logger.With(),
+		permit,
+		big.NewInt(1),
+		result,
+		group.MemberIndex(1),
+		gsr,
+		func() bool { return false },
+		func(context.Context) error {
+			return context.Canceled
+		},
+	)
+
+	if activated {
+		t.Fatal("expected no signer activation")
+	}
+	testutils.AssertIntsEqual(
+		t,
+		"fence consultations",
+		0,
+		len(permit.commitOperations()),
+	)
+	testutils.AssertIntsEqual(
+		t,
+		"active-namespace saves",
+		0,
+		len(registryHandle.saved),
+	)
+	testutils.AssertIntsEqual(
+		t,
+		"quarantined records",
+		2,
+		len(quarantineHandle.saved),
+	)
+	testutils.AssertStringsEqual(
+		t,
+		"quarantined failed operation",
+		"tbtc_dkg_result_publication",
+		quarantinedFailedOperation(t, quarantineHandle),
+	)
+}
+
+// TestDkgExecutor_CompleteDkgCeremony_ActivationFenceRefusalQuarantines
+// proves a refused activation fence after a successful publication preserves
+// the share only in quarantine when the wallet is not yet registered on
+// chain, and never activates it in this process.
+func TestDkgExecutor_CompleteDkgCeremony_ActivationFenceRefusalQuarantines(
+	t *testing.T,
+) {
+	de, result, gsr, registryHandle, quarantineHandle := setupPreserveScenario(t)
+
+	permit := newTestPermit(participation.TBTCDKG)
+	permit.commitErr = participation.ErrQuiesceDeadline
+
+	activated := de.completeDkgCeremony(
+		permit.Context(),
+		logger.With(),
+		permit,
+		big.NewInt(1),
+		result,
+		group.MemberIndex(1),
+		gsr,
+		func() bool { return false },
+		func(context.Context) error {
+			return nil
+		},
+	)
+
+	if activated {
+		t.Fatal("expected no signer activation")
+	}
+	operations := permit.commitOperations()
+	testutils.AssertIntsEqual(t, "fence consultations", 1, len(operations))
+	testutils.AssertStringsEqual(
+		t,
+		"fence operation",
+		"tbtc_dkg_signer_activation",
+		operations[0],
+	)
+	testutils.AssertIntsEqual(
+		t,
+		"active-namespace saves",
+		0,
+		len(registryHandle.saved),
+	)
+	testutils.AssertIntsEqual(
+		t,
+		"quarantined records",
+		2,
+		len(quarantineHandle.saved),
+	)
+	testutils.AssertStringsEqual(
+		t,
+		"quarantined failed operation",
+		"tbtc_dkg_signer_activation",
+		quarantinedFailedOperation(t, quarantineHandle),
+	)
+}
+
+// TestDkgExecutor_CompleteDkgCeremony_QuiesceDeadlineRaceWithRealGate proves
+// the deterministic forced-quiescence race against a real gate: the process
+// shutdown deadline arrives while the result publication is in flight, the
+// permit is force-canceled with the gate cause, and the generated share ends
+// up only in quarantine — never active, never dropped.
+func TestDkgExecutor_CompleteDkgCeremony_QuiesceDeadlineRaceWithRealGate(
+	t *testing.T,
+) {
+	de, result, gsr, registryHandle, quarantineHandle := setupPreserveScenario(t)
+
+	blockCounter, err := de.chain.BlockCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := blockCounter.WaitForBlockHeight(1); err != nil {
+		t.Fatal(err)
+	}
+
+	gate := newTestGate(t, blockCounter)
+	de.participationGate = gate
+
+	permit, err := gate.Begin(participation.TBTCDKG, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	activated := de.completeDkgCeremony(
+		permit.Context(),
+		logger.With(),
+		permit,
+		big.NewInt(1),
+		result,
+		group.MemberIndex(1),
+		gsr,
+		func() bool { return false },
+		func(publishCtx context.Context) error {
+			// The shutdown deadline arrives mid-publication: Close
+			// force-cancels the permit with the gate cause and the
+			// publication ends with a plain context cancellation.
+			gate.Close()
+			<-publishCtx.Done()
+			return publishCtx.Err()
+		},
+	)
+
+	if activated {
+		t.Fatal("expected no signer activation")
+	}
+	testutils.AssertIntsEqual(
+		t,
+		"active-namespace saves",
+		0,
+		len(registryHandle.saved),
+	)
+	testutils.AssertIntsEqual(
+		t,
+		"activated signers",
+		0,
+		len(de.walletRegistry.getSigners(result.PrivateKeyShare.PublicKey())),
+	)
+	testutils.AssertIntsEqual(
+		t,
+		"quarantined records",
+		2,
+		len(quarantineHandle.saved),
+	)
+	testutils.AssertStringsEqual(
+		t,
+		"quarantined failed operation",
+		"tbtc_dkg_result_publication",
+		quarantinedFailedOperation(t, quarantineHandle),
+	)
+}
+
+// TestSigningExecutor_Sign_GateCancellationSkipsFailureMetrics proves a
+// gate-caused signing cancellation — clock failure carried as the context
+// cause — leaves the ordinary signing failure and timeout counters unchanged
+// and surfaces the gate sentinel, while an ordinary cancellation still counts
+// as a failure and a timeout.
+func TestSigningExecutor_Sign_GateCancellationSkipsFailureMetrics(t *testing.T) {
+	executor := setupSigningExecutor(t)
+
+	recorder := newDispatcherMetricsRecorder()
+	executor.setMetricsRecorder(recorder)
+
+	gateCtx, cancelGateCtx := context.WithCancelCause(context.Background())
+	cancelGateCtx(participation.ErrClockUnavailable)
+
+	_, _, _, err := executor.sign(
+		gateCtx,
+		big.NewInt(100),
+		0,
+		participation.ModeSecurityV2,
+	)
+	if !errors.Is(err, participation.ErrClockUnavailable) {
+		t.Fatalf("expected the gate sentinel, got [%v]", err)
+	}
+
+	if failed := recorder.counter(clientinfo.MetricSigningFailedTotal); failed != 0 {
+		t.Errorf("expected no ordinary signing failures, got [%v]", failed)
+	}
+	if timeouts := recorder.counter(clientinfo.MetricSigningTimeoutsTotal); timeouts != 0 {
+		t.Errorf("expected no ordinary signing timeouts, got [%v]", timeouts)
+	}
+
+	// An ordinary cancellation without a gate cause still counts as an
+	// ordinary failure and timeout.
+	plainCtx, cancelPlainCtx := context.WithCancel(context.Background())
+	cancelPlainCtx()
+
+	_, _, _, err = executor.sign(
+		plainCtx,
+		big.NewInt(101),
+		0,
+		participation.ModeSecurityV2,
+	)
+	if err == nil {
+		t.Fatal("expected an error from the canceled signing")
+	}
+	if errors.Is(err, participation.ErrClockUnavailable) {
+		t.Fatalf("expected no gate sentinel, got [%v]", err)
+	}
+
+	if failed := recorder.counter(clientinfo.MetricSigningFailedTotal); failed != 1 {
+		t.Errorf("expected one ordinary signing failure, got [%v]", failed)
+	}
+	if timeouts := recorder.counter(clientinfo.MetricSigningTimeoutsTotal); timeouts != 1 {
+		t.Errorf("expected one ordinary signing timeout, got [%v]", timeouts)
+	}
+}
+
+// dispatchGaugeRecorder extends the counting recorder with gauge capture so
+// tests can wait for the dispatcher's active-actions gauge to return to zero
+// — the gauge is reset only after an action's goroutine finished all its
+// metric accounting.
+type dispatchGaugeRecorder struct {
+	*dispatcherMetricsRecorder
+
+	gaugeMu sync.Mutex
+	gauges  map[string]float64
+}
+
+func newDispatchGaugeRecorder() *dispatchGaugeRecorder {
+	return &dispatchGaugeRecorder{
+		dispatcherMetricsRecorder: newDispatcherMetricsRecorder(),
+		gauges:                    make(map[string]float64),
+	}
+}
+
+func (r *dispatchGaugeRecorder) SetGauge(name string, value float64) {
+	r.gaugeMu.Lock()
+	defer r.gaugeMu.Unlock()
+	r.gauges[name] = value
+}
+
+func (r *dispatchGaugeRecorder) gauge(name string) float64 {
+	r.gaugeMu.Lock()
+	defer r.gaugeMu.Unlock()
+	return r.gauges[name]
+}
+
+// TestWalletDispatcher_Dispatch_GateRefusalSkipsFailureMetrics proves a
+// wallet action ended by a gate refusal is counted neither as an ordinary
+// action failure nor as a success, on both the aggregate and the per-action
+// counters, while an ordinary action error still counts as a failure.
+func TestWalletDispatcher_Dispatch_GateRefusalSkipsFailureMetrics(t *testing.T) {
+	walletDispatcher := newWalletDispatcher()
+	recorder := newDispatchGaugeRecorder()
+	walletDispatcher.setMetricsRecorder(recorder)
+
+	actionWallet := generateWallet(big.NewInt(100))
+
+	dispatchAndWait := func(action *mockWalletAction) {
+		t.Helper()
+
+		if err := walletDispatcher.dispatch(action); err != nil {
+			t.Fatal(err)
+		}
+		// The active-actions gauge returns to zero only in the action
+		// goroutine's final cleanup, after every counter update.
+		deadline := time.Now().Add(10 * time.Second)
+		for recorder.gauge(clientinfo.MetricWalletDispatcherActiveActions) != 0 {
+			if time.Now().After(deadline) {
+				t.Fatal("the dispatched action never completed")
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	dispatchAndWait(&mockWalletAction{
+		executeFn: func() error {
+			return fmt.Errorf(
+				"broadcast refused: %w",
+				participation.ErrQuiesceDeadline,
+			)
+		},
+		actionWallet: actionWallet,
+	})
+
+	failedName := clientinfo.WalletActionMetricName("noop", "failed_total")
+	successName := clientinfo.WalletActionMetricName("noop", "success_total")
+
+	if failed := recorder.counter(clientinfo.MetricWalletActionFailedTotal); failed != 0 {
+		t.Errorf("expected no aggregate action failures, got [%v]", failed)
+	}
+	if failed := recorder.counter(failedName); failed != 0 {
+		t.Errorf("expected no per-action failures, got [%v]", failed)
+	}
+	if success := recorder.counter(successName); success != 0 {
+		t.Errorf("expected no action successes, got [%v]", success)
+	}
+
+	dispatchAndWait(&mockWalletAction{
+		executeFn: func() error {
+			return fmt.Errorf("ordinary failure")
+		},
+		actionWallet: actionWallet,
+	})
+
+	if failed := recorder.counter(clientinfo.MetricWalletActionFailedTotal); failed != 1 {
+		t.Errorf("expected one aggregate action failure, got [%v]", failed)
+	}
+	if failed := recorder.counter(failedName); failed != 1 {
+		t.Errorf("expected one per-action failure, got [%v]", failed)
+	}
+	if success := recorder.counter(successName); success != 0 {
+		t.Errorf("expected no action successes, got [%v]", success)
+	}
+}
+
+// TestWalletTransactionExecutor_BroadcastAbortSurfacesGateCause proves an
+// ended broadcast window caused by a gate permit cancellation surfaces the
+// gate sentinel instead of the ordinary broadcast timeout.
+func TestWalletTransactionExecutor_BroadcastAbortSurfacesGateCause(t *testing.T) {
+	permit := newTestPermit(participation.TBTCSigning)
+	permit.cancel(participation.ErrClockUnavailable)
+
+	wte := &walletTransactionExecutor{
+		btcChain: newLocalBitcoinChain(),
+		permit:   permit,
+	}
+
+	err := wte.broadcastTransaction(
+		logger.With(),
+		&bitcoin.Transaction{Version: 1},
+		10*time.Second,
+		time.Millisecond,
+	)
+	if !errors.Is(err, participation.ErrClockUnavailable) {
+		t.Fatalf("expected the gate sentinel, got [%v]", err)
+	}
 }

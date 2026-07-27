@@ -246,11 +246,14 @@ func (dsa *depositSweepAction) execute() error {
 		dsa.proposalExpiryBlock-dsa.signingTimeoutSafetyMarginBlocks,
 	)
 	if err != nil {
-		if dsa.metricsRecorder != nil {
+		// A gate-caused abort is not an ordinary failure of this action and
+		// stays out of its failure metrics; the wrapped cause lets the
+		// dispatcher classify it the same way.
+		if dsa.metricsRecorder != nil && !participation.IsGateRefusal(err) {
 			dsa.metricsRecorder.IncrementCounter("deposit_sweep_executions_failed_total", 1)
 			dsa.metricsRecorder.RecordDuration("deposit_sweep_execution_duration_seconds", time.Since(executionStartTime))
 		}
-		return fmt.Errorf("sign transaction step failed: [%v]", err)
+		return fmt.Errorf("sign transaction step failed: [%w]", err)
 	}
 
 	// Record deposit sweep transaction signing duration
@@ -270,11 +273,14 @@ func (dsa *depositSweepAction) execute() error {
 		dsa.broadcastCheckDelay,
 	)
 	if err != nil {
-		if dsa.metricsRecorder != nil {
+		// A gate-caused abort is not an ordinary failure of this action and
+		// stays out of its failure metrics; the wrapped cause lets the
+		// dispatcher classify it the same way.
+		if dsa.metricsRecorder != nil && !participation.IsGateRefusal(err) {
 			dsa.metricsRecorder.IncrementCounter("deposit_sweep_executions_failed_total", 1)
 			dsa.metricsRecorder.RecordDuration("deposit_sweep_execution_duration_seconds", time.Since(executionStartTime))
 		}
-		return fmt.Errorf("broadcast transaction step failed: [%v]", err)
+		return fmt.Errorf("broadcast transaction step failed: [%w]", err)
 	}
 
 	// Record successful deposit sweep execution

@@ -245,7 +245,7 @@ func (mfa *movingFundsAction) execute() error {
 		mfa.proposalExpiryBlock-mfa.signingTimeoutSafetyMarginBlocks,
 	)
 	if err != nil {
-		return fmt.Errorf("sign transaction step failed: [%v]", err)
+		return fmt.Errorf("sign transaction step failed: [%w]", err)
 	}
 
 	broadcastTxLogger := mfa.logger.With(
@@ -263,7 +263,7 @@ func (mfa *movingFundsAction) execute() error {
 		mfa.broadcastCheckDelay,
 	)
 	if err != nil {
-		return fmt.Errorf("broadcast transaction step failed: [%v]", err)
+		return fmt.Errorf("broadcast transaction step failed: [%w]", err)
 	}
 
 	return nil

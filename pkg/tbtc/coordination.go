@@ -20,6 +20,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/generator"
 	"github.com/keep-network/keep-core/pkg/net"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -436,7 +437,10 @@ func (ce *coordinationExecutor) coordinate(
 			// occur anyway.
 			cancelCtx()
 			coordinationFailed = true
-			if ce.metricsRecorder != nil {
+			// A gate-canceled permit ended the routine; that is not an
+			// ordinary coordination failure of this node.
+			if ce.metricsRecorder != nil &&
+				!participation.IsGateRefusal(context.Cause(ctx)) {
 				ce.metricsRecorder.IncrementCounter(clientinfo.MetricCoordinationFailedTotal, 1)
 			}
 			return nil, fmt.Errorf(
@@ -461,8 +465,11 @@ func (ce *coordinationExecutor) coordinate(
 		if err != nil {
 			coordinationFailed = true
 			// Record as leader timeout observation, not as a failure of this node.
-			// The actual failure is on the leader's side.
-			if ce.metricsRecorder != nil {
+			// The actual failure is on the leader's side. A gate-canceled
+			// permit ended the routine locally, so it is no observation about
+			// the leader either.
+			if ce.metricsRecorder != nil &&
+				!participation.IsGateRefusal(context.Cause(ctx)) {
 				ce.metricsRecorder.IncrementCounter(clientinfo.MetricCoordinationLeaderTimeoutTotal, 1)
 			}
 			// Return a partial result with leader and faults information

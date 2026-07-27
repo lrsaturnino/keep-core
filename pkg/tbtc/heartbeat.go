@@ -198,8 +198,9 @@ func (ha *heartbeatAction) execute() error {
 		// process returned an error here, that likely means the group signing
 		// threshold was not met. In such a case, the inactivity claim does not
 		// have a chance for success anyway (it needs the group threshold to
-		// be met as well).
-		return fmt.Errorf("heartbeat signing process errored out: [%v]", err)
+		// be met as well). The wrapped cause lets the dispatcher tell a
+		// gate-caused abort apart from an ordinary failure.
+		return fmt.Errorf("heartbeat signing process errored out: [%w]", err)
 	}
 
 	// If the number of active members during signing was enough, we can

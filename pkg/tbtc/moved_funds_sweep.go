@@ -231,7 +231,7 @@ func (mfsa *movedFundsSweepAction) execute() error {
 		mfsa.proposalExpiryBlock-mfsa.signingTimeoutSafetyMarginBlocks,
 	)
 	if err != nil {
-		return fmt.Errorf("sign transaction step failed: [%v]", err)
+		return fmt.Errorf("sign transaction step failed: [%w]", err)
 	}
 
 	broadcastTxLogger := mfsa.logger.With(
@@ -249,7 +249,7 @@ func (mfsa *movedFundsSweepAction) execute() error {
 		mfsa.broadcastCheckDelay,
 	)
 	if err != nil {
-		return fmt.Errorf("broadcast transaction step failed: [%v]", err)
+		return fmt.Errorf("broadcast transaction step failed: [%w]", err)
 	}
 
 	return nil

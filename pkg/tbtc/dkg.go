@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math/big"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/exp/maps"
@@ -399,11 +400,20 @@ func (de *dkgExecutor) generateSigningGroup(
 			)
 			defer cancelCtx()
 
+			// resultSubmitted records that a DKG result for this ceremony
+			// reached the chain — submitted by this member or any other —
+			// before the subscription canceled the publication context.
+			// Activating the generated signer is conditioned on it: a
+			// publication context that ends without a submitted result must
+			// not leave an active signer behind.
+			var resultSubmitted atomic.Bool
+
 			// TODO: This subscription has to be updated once we implement
 			//       re-submitting DKG result to the chain after a challenge.
 			//       See https://github.com/keep-network/keep-core/issues/3450
 			subscription := de.chain.OnDKGResultSubmitted(
 				func(event *DKGResultSubmittedEvent) {
+					resultSubmitted.Store(true)
 					defer cancelCtx()
 
 					dkgLogger.Infof(
@@ -552,87 +562,176 @@ func (de *dkgExecutor) generateSigningGroup(
 				return
 			}
 
-			// The last-moment fence before activating the newly generated key
-			// material. A refusal — clock failure or process quiescence —
-			// preserves the share without activating it: in the protected
-			// quarantine namespace normally, or as a durable non-activated
-			// save when the wallet is already registered on chain.
-			if fenceErr := permit.CheckCommit(
-				"tbtc_dkg_signer_activation",
-				participation.CompletionCommit,
-			); fenceErr != nil {
-				de.preserveInterruptedSigner(
-					dkgLogger,
-					permit,
-					seed,
-					result,
-					memberIndex,
-					groupSelectionResult,
-					fenceErr,
-				)
-				return
-			}
-
-			signer, err := de.registerSigner(
-				result,
-				memberIndex,
-				groupSelectionResult.OperatorsAddresses,
-			)
-			if err != nil {
-				dkgLogger.Errorf(
-					"[member:%v] failed to register signing group member: [%v]",
-					memberIndex,
-					err,
-				)
-			}
-
-			dkgLogger.Infof("registered %s", signer)
-
-			// Record successful DKG completion
-			if de.metricsRecorder != nil {
-				de.metricsRecorder.RecordDuration(clientinfo.MetricDKGDurationSeconds, time.Since(dkgStartTime))
-			}
-
-			err = de.publishDkgResult(
+			activated := de.completeDkgCeremony(
 				ctx,
 				dkgLogger,
-				seed,
-				memberIndex,
-				broadcastChannel,
-				membershipValidator,
-				result,
-				groupSelectionResult,
-				startBlock,
 				permit,
+				seed,
+				result,
+				memberIndex,
+				groupSelectionResult,
+				resultSubmitted.Load,
+				func(publishCtx context.Context) error {
+					return de.publishDkgResult(
+						publishCtx,
+						dkgLogger,
+						seed,
+						memberIndex,
+						broadcastChannel,
+						membershipValidator,
+						result,
+						groupSelectionResult,
+						startBlock,
+						permit,
+					)
+				},
 			)
-			if err != nil {
-				if participation.IsGateRefusal(err) {
-					dkgLogger.Warnf(
-						"[member:%v] DKG result publication refused by the "+
-							"release gate: [%v]",
-						memberIndex,
-						err,
-					)
-					return
-				}
-				if errors.Is(err, context.Canceled) {
-					dkgLogger.Infof(
-						"[member:%v] DKG is no longer awaiting the result; "+
-							"aborting DKG result publication",
-						memberIndex,
-					)
-					return
-				}
-
-				dkgLogger.Errorf(
-					"[member:%v] DKG result publication failed [%v]",
-					memberIndex,
-					err,
-				)
-				return
+			if activated && de.metricsRecorder != nil {
+				// The ceremony completed end to end: result published,
+				// activation fenced, signer active.
+				de.metricsRecorder.RecordDuration(clientinfo.MetricDKGDurationSeconds, time.Since(dkgStartTime))
 			}
 		}()
 	}
+}
+
+// completeDkgCeremony finalizes one member's DKG after key generation.
+// Publication precedes activation: the generated share stays out of the
+// active namespace and the wallet cache until the DKG result demonstrably
+// reached the chain and the activation fence passed. A clock failure, forced
+// quiescence, or a publication window that closes without a submitted result
+// therefore never leaves an active signer for an unpublished result; every
+// such outcome preserves the share through the interrupted-signer path
+// instead of dropping or activating it. publishResultFn performs the result
+// publication bound to the given context; resultSubmittedFn reports whether a
+// submitted DKG result was observed on chain for this ceremony. It returns
+// true only when the signer was activated.
+func (de *dkgExecutor) completeDkgCeremony(
+	ctx context.Context,
+	dkgLogger log.StandardLogger,
+	permit participation.Permit,
+	seed *big.Int,
+	result *dkg.Result,
+	memberIndex group.MemberIndex,
+	groupSelectionResult *GroupSelectionResult,
+	resultSubmittedFn func() bool,
+	publishResultFn func(context.Context) error,
+) bool {
+	err := publishResultFn(ctx)
+	if err != nil {
+		// The submission fence returns its sentinel as an ordinary error; a
+		// permit cancellation surfaces as a plain context cancellation whose
+		// gate cause is only in the context.
+		refusal := err
+		if !participation.IsGateRefusal(refusal) {
+			refusal = context.Cause(ctx)
+		}
+		switch {
+		case participation.IsGateRefusal(refusal):
+			dkgLogger.Warnf(
+				"[member:%v] DKG result publication refused by the release "+
+					"gate; preserving the generated signer without "+
+					"activation: [%v]",
+				memberIndex,
+				err,
+			)
+			de.preserveInterruptedSigner(
+				dkgLogger,
+				permit,
+				seed,
+				result,
+				memberIndex,
+				groupSelectionResult,
+				"tbtc_dkg_result_publication",
+				refusal,
+			)
+			return false
+		case errors.Is(err, context.Canceled) && resultSubmittedFn():
+			// The submission subscription observed the result on chain and
+			// ended the publication; the ceremony completed and the signer
+			// proceeds to activation.
+			dkgLogger.Infof(
+				"[member:%v] DKG result submitted by another member; "+
+					"proceeding to signer activation",
+				memberIndex,
+			)
+		default:
+			// The publication window closed without an observed submitted
+			// result, or publication failed outright. The wallet may never
+			// appear on chain, so the share is preserved without activation
+			// for the offline state audit to reconcile.
+			dkgLogger.Errorf(
+				"[member:%v] DKG result publication ended without a "+
+					"submitted result; preserving the generated signer "+
+					"without activation: [%v]",
+				memberIndex,
+				err,
+			)
+			de.preserveInterruptedSigner(
+				dkgLogger,
+				permit,
+				seed,
+				result,
+				memberIndex,
+				groupSelectionResult,
+				"tbtc_dkg_result_publication",
+				err,
+			)
+			return false
+		}
+	}
+
+	// The last-moment fence before activating the newly generated key
+	// material, consulted only after the result publication concluded. A
+	// refusal — clock failure or process quiescence — preserves the share
+	// without activating it: in the protected quarantine namespace normally,
+	// or as a durable non-activated save when the wallet is already
+	// registered on chain.
+	if fenceErr := permit.CheckCommit(
+		"tbtc_dkg_signer_activation",
+		participation.CompletionCommit,
+	); fenceErr != nil {
+		de.preserveInterruptedSigner(
+			dkgLogger,
+			permit,
+			seed,
+			result,
+			memberIndex,
+			groupSelectionResult,
+			"tbtc_dkg_signer_activation",
+			fenceErr,
+		)
+		return false
+	}
+
+	signer, err := de.registerSigner(
+		result,
+		memberIndex,
+		groupSelectionResult.OperatorsAddresses,
+	)
+	if err != nil {
+		dkgLogger.Errorf(
+			"[member:%v] failed to register signing group member; "+
+				"preserving the generated signer without activation: [%v]",
+			memberIndex,
+			err,
+		)
+		de.preserveInterruptedSigner(
+			dkgLogger,
+			permit,
+			seed,
+			result,
+			memberIndex,
+			groupSelectionResult,
+			"tbtc_dkg_signer_registration",
+			err,
+		)
+		return false
+	}
+
+	dkgLogger.Infof("registered %s", signer)
+
+	return true
 }
 
 // buildFinalSigner determines the final signing group shape and constructs
@@ -708,14 +807,16 @@ func (de *dkgExecutor) registerSigner(
 	return signer, nil
 }
 
-// preserveInterruptedSigner durably preserves generated key material whose
-// activation the release gate refused — a clock failure or process quiescence
-// raced with the completing DKG. The share is never dropped and never
-// activated by this process: when the wallet is already registered on chain
-// the signer is saved to the active namespace without cache activation, so a
-// restart's reconciliation can pick it up; otherwise it goes to the protected
-// quarantine namespace that no release's active-wallet scan reads, for the
-// offline state audit to reconcile.
+// preserveInterruptedSigner durably preserves generated key material the
+// release gate or a failed ceremony step kept from activating — a clock
+// failure, process quiescence, or a publication that ended without a
+// submitted result raced with the completing DKG. The share is never dropped
+// and never activated by this process: when the wallet is already registered
+// on chain the signer is saved to the active namespace without cache
+// activation, so a restart's reconciliation can pick it up; otherwise it goes
+// to the protected quarantine namespace that no release's active-wallet scan
+// reads, for the offline state audit to reconcile. The operation names the
+// ceremony step that was refused in the quarantine metadata.
 func (de *dkgExecutor) preserveInterruptedSigner(
 	dkgLogger log.StandardLogger,
 	permit participation.Permit,
@@ -723,6 +824,7 @@ func (de *dkgExecutor) preserveInterruptedSigner(
 	result *dkg.Result,
 	memberIndex group.MemberIndex,
 	groupSelectionResult *GroupSelectionResult,
+	operation string,
 	fenceErr error,
 ) {
 	signer, err := de.buildFinalSigner(
@@ -754,10 +856,11 @@ func (de *dkgExecutor) preserveInterruptedSigner(
 
 	if walletRegistered {
 		dkgLogger.Warnf(
-			"[member:%v] activation refused by the release gate but the "+
-				"wallet is registered on chain; saving the signer without "+
+			"[member:%v] signer activation withheld at [%s] but the wallet "+
+				"is registered on chain; saving the signer without "+
 				"activation: [%v]",
 			memberIndex,
+			operation,
 			fenceErr,
 		)
 		if saveErr := de.walletRegistry.saveSigner(signer); saveErr != nil {
@@ -780,9 +883,10 @@ func (de *dkgExecutor) preserveInterruptedSigner(
 	}
 
 	dkgLogger.Warnf(
-		"[member:%v] activation refused by the release gate; quarantining "+
-			"the generated signer: [%v]",
+		"[member:%v] signer activation withheld at [%s]; quarantining the "+
+			"generated signer: [%v]",
 		memberIndex,
+		operation,
 		fenceErr,
 	)
 
@@ -796,7 +900,7 @@ func (de *dkgExecutor) preserveInterruptedSigner(
 			Ceremony:            string(permit.Ceremony()),
 			SeedHash:            hex.EncodeToString(seedHash[:]),
 			WalletID:            walletIDHex,
-			FailedOperation:     "tbtc_dkg_signer_activation",
+			FailedOperation:     operation,
 			LastObservedBlock:   snapshot.CurrentBlock,
 		},
 	); quarantineErr != nil {

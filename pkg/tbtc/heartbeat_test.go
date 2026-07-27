@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/big"
-	"reflect"
 	"testing"
 
 	"github.com/keep-network/keep-core/internal/testutils"
@@ -223,8 +222,8 @@ func TestHeartbeatAction_Failure_SigningError(t *testing.T) {
 	// mean the procedure failure.
 	err = action.execute()
 
-	expectedError := fmt.Errorf("heartbeat signing process errored out: [oofta]")
-	if !reflect.DeepEqual(expectedError, err) {
+	expectedError := "heartbeat signing process errored out: [oofta]"
+	if err == nil || err.Error() != expectedError {
 		t.Errorf(
 			"unexpected error\n"+
 				"expected: %v\n"+

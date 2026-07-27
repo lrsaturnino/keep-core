@@ -1287,7 +1287,18 @@ func executeCoordinationProcedure(
 	duration := time.Since(startTime)
 
 	if err != nil {
-		procedureLogger.Errorf("coordination procedure failed: [%v]", err)
+		// A gate-canceled permit — clock failure, forced quiescence — ended
+		// the procedure; that is a release-gate decision, not an ordinary
+		// coordination failure.
+		if participation.IsGateRefusal(context.Cause(permit.Context())) {
+			procedureLogger.Warnf(
+				"coordination procedure canceled by the participation "+
+					"gate: [%v]",
+				err,
+			)
+		} else {
+			procedureLogger.Errorf("coordination procedure failed: [%v]", err)
+		}
 		// Metrics are already recorded in executor.coordinate() for failures
 
 		// Record window metrics for failed coordination

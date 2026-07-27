@@ -171,6 +171,19 @@ func (ice *inactivityClaimExecutor) claimInactivity(
 				claim,
 			)
 			if err != nil {
+				// A refused penalty fence or a gate-canceled permit is a
+				// deliberate release-gate suppression, not an ordinary
+				// publishing failure.
+				if participation.IsGateRefusal(err) ||
+					participation.IsGateRefusal(context.Cause(signerCtx)) {
+					execLogger.Warnf(
+						"[member:%v] inactivity claim suppressed by the "+
+							"release gate: [%v]",
+						signer.signingGroupMemberIndex,
+						err,
+					)
+					return
+				}
 				if errors.Is(err, context.Canceled) {
 					execLogger.Infof(
 						"[member:%v] inactivity claim is no longer awaiting "+

@@ -245,6 +245,18 @@ func (wd *walletDispatcher) dispatch(action walletAction) error {
 
 		err := action.execute()
 		if err != nil {
+			// A gate decision — clock failure, forced quiescence, or a refused
+			// commit fence — ended the action; it is not an ordinary action
+			// failure and must not increment the ordinary failure metrics.
+			// The gate records the abort in its own metrics.
+			if participation.IsGateRefusal(err) {
+				walletActionLogger.Warnf(
+					"action execution canceled by the participation "+
+						"gate: [%v]",
+					err,
+				)
+				return
+			}
 			walletActionLogger.Errorf(
 				"action execution terminated with error: [%v]",
 				err,
@@ -362,7 +374,7 @@ func (wte *walletTransactionExecutor) signTransaction(
 	)
 	if err != nil {
 		return nil, fmt.Errorf(
-			"error while signing transaction's sig hashes: [%v]",
+			"error while signing transaction's sig hashes: [%w]",
 			err,
 		)
 	}
@@ -416,7 +428,7 @@ func (wte *walletTransactionExecutor) broadcastTransaction(
 	for {
 		select {
 		case <-broadcastCtx.Done():
-			return fmt.Errorf("broadcast timeout exceeded")
+			return broadcastAbortError(broadcastCtx)
 		default:
 			broadcastAttempt++
 
@@ -455,7 +467,7 @@ func (wte *walletTransactionExecutor) broadcastTransaction(
 			select {
 			case <-time.After(checkDelay):
 			case <-broadcastCtx.Done():
-				return fmt.Errorf("broadcast timeout exceeded")
+				return broadcastAbortError(broadcastCtx)
 			}
 
 			broadcastTxLogger.Infof(
@@ -476,6 +488,17 @@ func (wte *walletTransactionExecutor) broadcastTransaction(
 			return nil
 		}
 	}
+}
+
+// broadcastAbortError classifies an ended broadcast window: a gate-caused
+// permit cancellation surfaces its sentinel so upper layers keep it out of
+// ordinary failure accounting; everything else is the ordinary broadcast
+// timeout.
+func broadcastAbortError(ctx context.Context) error {
+	if cause := context.Cause(ctx); participation.IsGateRefusal(cause) {
+		return fmt.Errorf("bitcoin broadcast aborted: %w", cause)
+	}
+	return fmt.Errorf("broadcast timeout exceeded")
 }
 
 // wallet represents a tBTC wallet. A wallet is one of the basic building
