@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "keep-core/scripts/release/pr4109/rehearsal-evidence.schema.json",
+  "title": "PR #4109 Part A rehearsal evidence record",
+  "description": "One record per rehearsal run of smoke gate 6 (single-release) or smoke gate 7 (rollback). Screenshots alone are insufficient: every assertion must reference recorded values in this document.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "gate",
+    "generated_at",
+    "source_sha",
+    "artifacts",
+    "chain",
+    "stages",
+    "assertions"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "gate": {
+      "description": "Which mandatory smoke gate this record evidences.",
+      "enum": ["single_release", "rollback"]
+    },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "source_sha": {
+      "description": "Exact keep-core commit the R1 image was built from.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "artifacts": {
+      "type": "object",
+      "required": ["r1_image_digests", "prior_image_digests", "version", "revision", "protocol_epoch"],
+      "properties": {
+        "r1_image_digests": {
+          "description": "Immutable R1 digests by architecture.",
+          "type": "object",
+          "additionalProperties": { "type": "string", "pattern": "@sha256:[0-9a-f]{64}$" }
+        },
+        "prior_image_digests": {
+          "type": "object",
+          "additionalProperties": { "type": "string", "pattern": "@sha256:[0-9a-f]{64}$" }
+        },
+        "version": { "type": "string" },
+        "revision": { "type": "string" },
+        "protocol_epoch": { "const": "security_v2_cutover" }
+      }
+    },
+    "chain": {
+      "type": "object",
+      "required": ["chain_id", "cutover_block"],
+      "properties": {
+        "chain_id": { "type": "string" },
+        "cutover_block": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "stages": {
+      "description": "One entry per executed rehearsal step, in execution order, with the canonical and callback blocks, permit modes, and gauge snapshots observed at that step.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "outcome"],
+        "properties": {
+          "name": { "type": "string" },
+          "outcome": { "enum": ["pass", "fail", "blocked"] },
+          "canonical_blocks": { "type": "array", "items": { "type": "integer" } },
+          "callback_blocks": { "type": "array", "items": { "type": "integer" } },
+          "permit_modes": {
+            "type": "array",
+            "items": { "enum": ["legacy", "security_v2"] }
+          },
+          "gauges": {
+            "description": "participation gate gauge snapshot at the step.",
+            "type": "object",
+            "additionalProperties": { "type": "number" }
+          },
+          "transaction_hashes": {
+            "type": "array",
+            "items": { "type": "string", "pattern": "^0x[0-9a-f]{64}$" }
+          },
+          "state_checksums": {
+            "description": "Non-secret checksums of persisted state snapshots (active and quarantine namespaces).",
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+          },
+          "notes": { "type": "string" }
+        }
+      }
+    },
+    "assertions": {
+      "description": "The gate's acceptance assertions with their observed values; every one must reference stage evidence above.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["assertion", "holds"],
+        "properties": {
+          "assertion": { "type": "string" },
+          "holds": { "type": "boolean" },
+          "evidence_stage": { "type": "string" }
+        }
+      }
+    }
+  }
+}

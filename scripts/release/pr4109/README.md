@@ -1,9 +1,44 @@
-# PR #4109 — clientInfo.port 9601 compatibility smoke matrix (Part B, section 14.2)
+# PR #4109 — release rehearsal and smoke harnesses
 
-This directory holds the container smoke harness for the temporary
-`clientInfo.port` **9601 compatibility default** restored for the coordinated
-security release. It is scoped to Part B; it does **not** exercise the Part A
-cutover gate (which is intentionally not implemented in this pass).
+This directory holds two harnesses for the coordinated security release:
+
+1. the **Part B** container smoke matrix for the temporary `clientInfo.port`
+   **9601 compatibility default** (section 14.2) — `clientinfo-port-smoke.sh`
+   and `compose.yaml`; and
+2. the **Part A** single-release cutover rehearsal scaffold (sections 9.7 and
+   9.8) — `rehearse.sh`, `compose.rehearsal.yaml`, and
+   `rehearsal-evidence.schema.json`.
+
+## Part A — cutover rehearsal scaffold (smoke gates 6 and 7)
+
+The chain-clocked cutover machinery — the participation gate, per-ceremony
+permits, commit fences, quiescence, and the signer quarantine namespace — is
+implemented in this tree and proven by repository-local Go tests. Run those
+proofs, which need no Docker or chain, with:
+
+```
+./rehearse.sh local-proofs
+```
+
+The two **container** rehearsals are mandatory release gates that cannot run
+from this repository alone: they need the immutable prior-production and R1
+runtime image digests, a rehearsal chain with deployed beacon/tBTC contracts,
+per-node operator keys, and (for rollback) storage snapshots plus an
+independent network vantage point. `rehearse.sh preflight` validates those
+inputs; `single-release` and `rollback` refuse to run — reporting `BLOCKED`
+with the exact missing input — until they are supplied and the stages are
+extended against the real fleet. `compose.rehearsal.yaml` is the fleet shell:
+one prior node (no gate — the deliberate straggler) and two R1 nodes with the
+non-mainnet `--protocolParticipation.cutoverBlock` override and persistent
+volumes.
+
+Every accepted rehearsal run must produce an evidence record conforming to
+`rehearsal-evidence.schema.json`: exact source SHA, per-architecture image
+digests, chain ID and C, per-stage canonical/callback blocks, permit modes,
+gauge snapshots, transaction hashes, and non-secret state checksums.
+Screenshots alone are insufficient.
+
+## Part B — clientInfo.port 9601 compatibility smoke matrix (section 14.2)
 
 ## What is proven where
 

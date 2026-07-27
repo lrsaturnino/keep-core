@@ -1,0 +1,71 @@
+# PR #4109 Part A — exact-image rehearsal fleet shell (sections 9.7, 9.8).
+#
+# This compose file is the container shell for the single-release and rollback
+# rehearsals: an immutable prior-production node and two immutable R1 nodes
+# sharing one rehearsal chain, each with a persistent keystore/work volume so
+# restarts and rollback state audits are meaningful. It deliberately contains
+# no chain service: the rehearsals run against a dedicated rehearsal chain
+# with deployed beacon/tBTC contracts, supplied via ETH_WS_URL, because a
+# throwaway in-compose chain without those contracts cannot produce release
+# evidence.
+#
+# Required environment (validated by rehearse.sh preflight):
+#   PRIOR_IMAGE_DIGEST  immutable prior-production runtime digest
+#   R1_IMAGE_DIGEST     immutable R1 candidate runtime digest
+#   ETH_WS_URL          rehearsal chain websocket endpoint
+#   CUTOVER_BLOCK       rehearsed cutover block C (non-mainnet override)
+#   KEYSTORE_DIR        per-node operator key material, one subdirectory per
+#                       service name
+#
+# The prior node receives no cutover configuration: the prior binary has no
+# gate, which is exactly the straggler behavior the rehearsal must observe.
+
+services:
+  prior-node:
+    image: "${PRIOR_IMAGE_DIGEST}"
+    command:
+      - "start"
+      - "--ethereum.url"
+      - "${ETH_WS_URL}"
+    volumes:
+      - "${KEYSTORE_DIR}/prior-node:/mnt/keystore"
+      - "prior-node-storage:/mnt/storage"
+    networks:
+      - rehearsal
+
+  r1-node-1:
+    image: "${R1_IMAGE_DIGEST}"
+    command:
+      - "start"
+      - "--ethereum.url"
+      - "${ETH_WS_URL}"
+      - "--protocolParticipation.cutoverBlock"
+      - "${CUTOVER_BLOCK}"
+    volumes:
+      - "${KEYSTORE_DIR}/r1-node-1:/mnt/keystore"
+      - "r1-node-1-storage:/mnt/storage"
+    networks:
+      - rehearsal
+
+  r1-node-2:
+    image: "${R1_IMAGE_DIGEST}"
+    command:
+      - "start"
+      - "--ethereum.url"
+      - "${ETH_WS_URL}"
+      - "--protocolParticipation.cutoverBlock"
+      - "${CUTOVER_BLOCK}"
+    volumes:
+      - "${KEYSTORE_DIR}/r1-node-2:/mnt/keystore"
+      - "r1-node-2-storage:/mnt/storage"
+    networks:
+      - rehearsal
+
+volumes:
+  prior-node-storage:
+  r1-node-1-storage:
+  r1-node-2-storage:
+
+networks:
+  rehearsal:
+    internal: true
