@@ -20,6 +20,14 @@ proofs, which need no Docker or chain, with:
 ./rehearse.sh local-proofs
 ```
 
+The offline state classification the rollback barrier requires runs with
+`go run ./cmd/participation-state-audit --storage-snapshot <copy>`: it
+inventories the keystore/work namespaces with at-rest checksums, interprets
+the beacon active and quarantine namespaces when the storage password is
+supplied, and fails on any inconsistency. It never performs chain
+reconciliation and its output never authorizes activating quarantined
+material by itself.
+
 The two **container** rehearsals are mandatory release gates that cannot run
 from this repository alone: they need the immutable prior-production and R1
 runtime image digests, a rehearsal chain with deployed beacon/tBTC contracts,
