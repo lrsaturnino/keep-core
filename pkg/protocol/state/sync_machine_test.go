@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/keep-network/keep-core/internal/testutils"
 	"github.com/keep-network/keep-core/pkg/chain/local_v1"
@@ -261,6 +263,203 @@ func TestSyncExecute_CancellationDuringTransitionDelayWait(t *testing.T) {
 			"expected the cancellation cause in the error chain, got [%v]",
 			err,
 		)
+	}
+}
+
+// TestWaitForBlockHeight_CancellationReleasesEventualSender proves the
+// canceled wait does not strand the block counter's delivery goroutine: after
+// the wait is canceled and the requested height is later reached, the
+// counter's blocking send completes instead of parking forever on the
+// abandoned channel.
+func TestWaitForBlockHeight_CancellationReleasesEventualSender(t *testing.T) {
+	counter := newManualBlockCounter(0)
+
+	cause := fmt.Errorf("wait cancellation cause")
+	ctx, cancel := context.WithCancelCause(context.Background())
+
+	waitResult := make(chan error, 1)
+	go func() {
+		waitResult <- waitForBlockHeight(ctx, counter, 5)
+	}()
+
+	// The waiter registers before the wait parks; canceling only afterwards
+	// deterministically hits a parked wait.
+	<-counter.waiterRegistered
+	cancel(cause)
+
+	if err := <-waitResult; !errors.Is(err, cause) {
+		t.Fatalf(
+			"expected the cancellation cause in the error chain, got [%v]",
+			err,
+		)
+	}
+
+	// Reaching the height after the cancellation launches the counter's
+	// blocking send; it completes only if the abandoned waiter was drained.
+	counter.advanceTo(5)
+
+	select {
+	case <-counter.sendCompleted:
+	case <-time.After(10 * time.Second):
+		t.Fatal(
+			"the block counter's sender remained blocked after the " +
+				"cancellation; the abandoned waiter was not drained",
+		)
+	}
+}
+
+// TestSyncExecute_CancellationReleasesStateEndWaiterSender proves aborting the
+// machine while it is parked on a state's end-block waiter does not strand the
+// block counter's delivery goroutine: once the end block is later reached,
+// every launched sender completes.
+func TestSyncExecute_CancellationReleasesStateEndWaiterSender(t *testing.T) {
+	counter := newManualBlockCounter(1)
+
+	provider := netLocal.Connect()
+	channel, err := provider.BroadcastChannelFor("drained_end_waiter_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel.SetUnmarshaler(func() net.TaggedUnmarshaler {
+		return &TestMessage{}
+	})
+
+	initialState := &testHeldWaitSyncState{
+		memberIndex:  group.MemberIndex(1),
+		activeBlocks: 4,
+	}
+
+	cause := fmt.Errorf("end waiter cancellation cause")
+	ctx, cancel := context.WithCancelCause(context.Background())
+
+	stateMachine := NewSyncMachine(
+		&testutils.MockLogger{},
+		ctx,
+		channel,
+		counter,
+		initialState,
+	)
+
+	execResult := make(chan error, 1)
+	go func() {
+		_, _, err := stateMachine.Execute(1)
+		execResult <- err
+	}()
+
+	// Execution registers three waiters in order: the start wait, the
+	// zero-delay transition wait, and the state end-block waiter at block 5.
+	// The first two are satisfied immediately at height 1; only the third
+	// keeps the machine parked, so the cancellation abandons exactly it.
+	for i := 0; i < 3; i++ {
+		<-counter.waiterRegistered
+	}
+	cancel(cause)
+
+	if err := <-execResult; !errors.Is(err, cause) {
+		t.Fatalf(
+			"expected the cancellation cause in the error chain, got [%v]",
+			err,
+		)
+	}
+
+	// The first two senders completed into the consumed waits; reaching block
+	// 5 launches the third. All three complete only if the machine drained
+	// the end-block waiter it abandoned on the cancellation.
+	counter.advanceTo(5)
+
+	for i := 0; i < 3; i++ {
+		select {
+		case <-counter.sendCompleted:
+		case <-time.After(10 * time.Second):
+			t.Fatalf(
+				"sender [%d] remained blocked after the cancellation; the "+
+					"abandoned end-block waiter was not drained",
+				i+1,
+			)
+		}
+	}
+}
+
+// manualBlockCounter is a deterministic chain.BlockCounter test double: its
+// height moves only when the test advances it, and it reproduces the
+// production waiter contract — exactly one blocking send on an unbuffered
+// channel per registered waiter once the height is reached. Registration and
+// send completion are observable so tests can order their steps and prove the
+// eventual sender terminated, instead of relying on timing.
+type manualBlockCounter struct {
+	mu      sync.Mutex
+	height  uint64
+	waiters map[uint64][]chan uint64
+
+	waiterRegistered chan struct{}
+	sendCompleted    chan struct{}
+}
+
+func newManualBlockCounter(height uint64) *manualBlockCounter {
+	return &manualBlockCounter{
+		height:           height,
+		waiters:          make(map[uint64][]chan uint64),
+		waiterRegistered: make(chan struct{}, 128),
+		sendCompleted:    make(chan struct{}, 128),
+	}
+}
+
+func (mbc *manualBlockCounter) WaitForBlockHeight(blockNumber uint64) error {
+	waiter, err := mbc.BlockHeightWaiter(blockNumber)
+	if err != nil {
+		return err
+	}
+	<-waiter
+	return nil
+}
+
+func (mbc *manualBlockCounter) BlockHeightWaiter(
+	blockNumber uint64,
+) (<-chan uint64, error) {
+	newWaiter := make(chan uint64)
+
+	mbc.mu.Lock()
+	if blockNumber <= mbc.height {
+		go mbc.deliver(newWaiter, blockNumber)
+	} else {
+		mbc.waiters[blockNumber] = append(mbc.waiters[blockNumber], newWaiter)
+	}
+	mbc.mu.Unlock()
+
+	mbc.waiterRegistered <- struct{}{}
+
+	return newWaiter, nil
+}
+
+func (mbc *manualBlockCounter) CurrentBlock() (uint64, error) {
+	mbc.mu.Lock()
+	defer mbc.mu.Unlock()
+	return mbc.height, nil
+}
+
+func (mbc *manualBlockCounter) WatchBlocks(ctx context.Context) <-chan uint64 {
+	return make(chan uint64)
+}
+
+// deliver performs the production-style blocking send and then records that
+// the sender terminated.
+func (mbc *manualBlockCounter) deliver(waiter chan uint64, height uint64) {
+	waiter <- height
+	mbc.sendCompleted <- struct{}{}
+}
+
+// advanceTo moves the height forward and launches the production-style
+// delivery goroutine for every waiter whose height was reached.
+func (mbc *manualBlockCounter) advanceTo(height uint64) {
+	mbc.mu.Lock()
+	defer mbc.mu.Unlock()
+
+	for h := mbc.height + 1; h <= height; h++ {
+		mbc.height = h
+		for _, waiter := range mbc.waiters[h] {
+			go mbc.deliver(waiter, h)
+		}
+		delete(mbc.waiters, h)
 	}
 }
 

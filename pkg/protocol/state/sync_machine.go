@@ -155,6 +155,7 @@ func (sm *SyncMachine) Execute(startBlockHeight uint64) (SyncState, uint64, erro
 
 		case <-sm.ctx.Done():
 			cancelCtx()
+			drainAbandonedWaiter(blockWaiter)
 			return nil, 0, fmt.Errorf(
 				"execution of state [%T] canceled: [%w]",
 				currentState,
@@ -238,6 +239,17 @@ func waitForBlockHeight(
 	case <-waiter:
 		return nil
 	case <-ctx.Done():
+		drainAbandonedWaiter(waiter)
 		return context.Cause(ctx)
 	}
+}
+
+// drainAbandonedWaiter takes ownership of a block-height waiter whose consumer
+// is walking away before the notification arrived. The block counter delivers
+// exactly one notification per waiter with a blocking send on an unbuffered
+// channel once the height is reached; simply abandoning the channel would park
+// that sender goroutine forever. The drain goroutine performs the single
+// receive so the eventual sender can terminate, and itself exits then.
+func drainAbandonedWaiter(waiter <-chan uint64) {
+	go func() { <-waiter }()
 }
