@@ -174,10 +174,13 @@ That extension is reviewed cryptographic work outside this repository, and an
 unreviewed in-tree fork is not an accepted substitute. The dependency was
 re-verified empirically on 2026-07-27: `git ls-remote --heads --tags
 https://github.com/threshold-network/tss-lib` showed `master` at exactly the
-pinned `86bd1a375cc0` revision, no tags, and no branch carrying a per-party
-legacy mode — the reviewed dual-mode revision does not exist anywhere on the
-fork remote yet, so the dependency is outstanding upstream, not merely
-unpinned here. Until the reviewed fork commit is pinned in `go.mod`:
+pinned `86bd1a375cc0` revision and no tags; the remote carries development
+branches (`advisory-fix`, `codex/*`, `constant-time-hardening`,
+`integrate-bnb-hardening`, `resharing-fix-upstream`), and a shallow clone of
+every branch tip grepped for any per-party legacy/transcript-mode API surface
+found zero hits on all of them — the reviewed dual-mode revision does not
+exist anywhere on the fork remote yet, so the dependency is outstanding
+upstream, not merely unpinned here. Until the reviewed fork commit is pinned in `go.mod`:
 
 - tBTC ceremonies **fail closed on legacy permits** — deliberately, at two
   layers. The authoritative fence is the legacy bundle itself: its TSS
