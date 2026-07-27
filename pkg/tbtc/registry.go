@@ -136,33 +136,41 @@ func (wr *walletRegistry) saveSigner(signer *signer) error {
 
 // registerSigner registers the given signer using in the walletRegistry: it
 // durably persists the signer and activates it in the in-memory wallet cache.
+// Every fallible step runs before the durable save and the cache activation
+// follows a successful save unconditionally, so an error return guarantees
+// this call left no record in the active storage namespace: an interrupted
+// ceremony can then preserve the signer in quarantine without a second,
+// active copy surfacing in a restart's — or any release's — active scan.
 func (wr *walletRegistry) registerSigner(signer *signer) error {
 	wr.mutex.Lock()
 	defer wr.mutex.Unlock()
 
-	err := wr.walletStorage.saveSigner(signer)
-	if err != nil {
-		return fmt.Errorf("cannot save signer in the storage: [%w]", err)
-	}
-
 	walletStorageKey := getWalletStorageKey(signer.wallet.publicKey)
 
-	// If the wallet cache does not have the given entry yet, initialize
-	// the value and compute the wallet ID and wallet public key hash. This way,
-	// the hashes are computed only once. No need to initialize signers slice as
-	// appending works with nil values.
+	// If the wallet cache does not have the given entry yet, prepare the value
+	// with the wallet ID and wallet public key hash. This way, the hashes are
+	// computed only once. No need to initialize signers slice as appending
+	// works with nil values.
+	var newCacheValue *walletCacheValue
 	if _, ok := wr.walletCache[walletStorageKey]; !ok {
 		walletID, err := wr.calculateWalletIdFunc(signer.wallet.publicKey)
 		if err != nil {
 			return fmt.Errorf("cannot calculate wallet ID: [%v]", err)
 		}
 
-		wr.walletCache[walletStorageKey] = &walletCacheValue{
+		newCacheValue = &walletCacheValue{
 			walletPublicKeyHash: bitcoin.PublicKeyHash(signer.wallet.publicKey),
 			walletID:            walletID,
 		}
 	}
 
+	if err := wr.walletStorage.saveSigner(signer); err != nil {
+		return fmt.Errorf("cannot save signer in the storage: [%w]", err)
+	}
+
+	if newCacheValue != nil {
+		wr.walletCache[walletStorageKey] = newCacheValue
+	}
 	wr.walletCache[walletStorageKey].signers = append(
 		wr.walletCache[walletStorageKey].signers,
 		signer,

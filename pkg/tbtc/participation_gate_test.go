@@ -2,6 +2,7 @@ package tbtc
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -742,6 +743,86 @@ func TestDkgExecutor_CompleteDkgCeremony_ActivatesAfterPublication(t *testing.T)
 		"quarantined records",
 		0,
 		len(quarantineHandle.saved),
+	)
+}
+
+// TestDkgExecutor_CompleteDkgCeremony_RegistrationFailureQuarantinesOnly
+// proves a registration failure between the concluded result publication and
+// the wallet-cache activation preserves the generated share only in the
+// protected quarantine namespace. The wallet ID calculation is the last
+// fallible registration step, and its failure must not leave a partial record
+// in the active namespace that a restart's — or any release's — active scan
+// would load beside the quarantined copy.
+func TestDkgExecutor_CompleteDkgCeremony_RegistrationFailureQuarantinesOnly(
+	t *testing.T,
+) {
+	de, result, gsr, registryHandle, quarantineHandle := setupPreserveScenario(t)
+
+	// The registry's wallet ID calculation fails while the chain's own
+	// calculation keeps succeeding, so the preservation path can still check
+	// the wallet's on-chain registration and choose quarantine.
+	failingRegistry, err := newWalletRegistry(
+		registryHandle,
+		func(*ecdsa.PublicKey) ([32]byte, error) {
+			return [32]byte{}, fmt.Errorf("wallet ID calculation failed")
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	de.walletRegistry = failingRegistry
+
+	permit := newTestPermit(participation.TBTCDKG)
+
+	published := false
+	activated := de.completeDkgCeremony(
+		permit.Context(),
+		logger.With(),
+		permit,
+		big.NewInt(1),
+		result,
+		group.MemberIndex(1),
+		gsr,
+		func() bool { return false },
+		func(context.Context) error {
+			published = true
+			return nil
+		},
+	)
+
+	if !published {
+		t.Fatal("expected the result publication to run")
+	}
+	if activated {
+		t.Fatal("expected no signer activation")
+	}
+
+	operations := permit.commitOperations()
+	testutils.AssertIntsEqual(t, "fence consultations", 1, len(operations))
+
+	testutils.AssertIntsEqual(
+		t,
+		"active-namespace saves",
+		0,
+		len(registryHandle.saved),
+	)
+	testutils.AssertIntsEqual(
+		t,
+		"activated signers",
+		0,
+		len(de.walletRegistry.getSigners(result.PrivateKeyShare.PublicKey())),
+	)
+	testutils.AssertIntsEqual(
+		t,
+		"quarantined records",
+		2,
+		len(quarantineHandle.saved),
+	)
+	testutils.AssertStringsEqual(
+		t,
+		"quarantined failed operation",
+		"tbtc_dkg_signer_registration",
+		quarantinedFailedOperation(t, quarantineHandle),
 	)
 }
 

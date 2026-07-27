@@ -68,6 +68,46 @@ func TestWalletRegistry_RegisterSigner(t *testing.T) {
 	)
 }
 
+// TestWalletRegistry_RegisterSigner_WalletIdFailureLeavesNoActiveRecord
+// proves a wallet ID calculation failure aborts the registration before the
+// durable save: the active storage namespace and the wallet cache both stay
+// untouched, so the caller can preserve the signer elsewhere without leaving
+// a second, active copy behind.
+func TestWalletRegistry_RegisterSigner_WalletIdFailureLeavesNoActiveRecord(
+	t *testing.T,
+) {
+	persistenceHandle := &mockPersistenceHandle{}
+
+	walletRegistry, err := newWalletRegistry(
+		persistenceHandle,
+		func(*ecdsa.PublicKey) ([32]byte, error) {
+			return [32]byte{}, fmt.Errorf("wallet ID calculation failed")
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	signer := createMockSigner(t)
+
+	if err := walletRegistry.registerSigner(signer); err == nil {
+		t.Fatal("expected the registration to fail")
+	}
+
+	testutils.AssertIntsEqual(
+		t,
+		"active-namespace saves",
+		0,
+		len(persistenceHandle.saved),
+	)
+	testutils.AssertIntsEqual(
+		t,
+		"cached wallets",
+		0,
+		len(walletRegistry.walletCache),
+	)
+}
+
 func TestWalletRegistry_GetSigners(t *testing.T) {
 	persistenceHandle := &mockPersistenceHandle{}
 	chain := Connect()
