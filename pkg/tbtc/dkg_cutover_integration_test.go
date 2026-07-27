@@ -11,11 +11,15 @@ package tbtc
 // blocked on the reviewed tss-lib fork with an immutable per-party legacy
 // mode. The on-chain 90-active/10-misbehaved consequence with reward
 // ineligibility belongs to the Solidity suite, and the exact-image
-// mixed-release rehearsals to scripts/release/pr4109. What is proven here is
+// mixed-release rehearsals — including transcript realness at the full
+// hundred-member scale — to scripts/release/pr4109. What is proven here is
 // the anchor-derived mode selection, its immutability across the cutover
-// block, the quorum discipline of the retry loop, the conversion of
-// post-cutover legacy peers into exclusion, mismatch metrics, and roster
-// evidence, and the homogeneous security-v2 key-generation control.
+// block, the quorum discipline of the retry loop, the real-transcript
+// conversion of post-cutover legacy and silent peers into misbehaved-members
+// evidence, mismatch metrics, and roster attribution, the exact
+// production-scale first-attempt exclusion of the ten legacy seats at the
+// ninety-member quorum, and the homogeneous security-v2 key-generation
+// control.
 
 import (
 	"bytes"
@@ -375,7 +379,8 @@ type dkgCutoverMemberOutcome struct {
 // runRealDKGCutoverMember mirrors the production per-member DKG pipeline over
 // the given cutover group: one participation permit issued from the canonical
 // anchor, the production broadcast-channel setup, announcer, and retry loop,
-// and a real tECDSA key-generation execution per attempt. The outcome is
+// and a real tECDSA key-generation execution per attempt. Announcer options
+// let a member wire the production session-mismatch observer. The outcome is
 // always delivered to the outcomes channel, exactly once.
 func runRealDKGCutoverMember(
 	ctx context.Context,
@@ -387,6 +392,7 @@ func runRealDKGCutoverMember(
 	memberIndex group.MemberIndex,
 	tecdsaExecutor *dkg.Executor,
 	outcomes chan<- *dkgCutoverMemberOutcome,
+	announcerOptions ...announcer.Option,
 ) {
 	outcome := &dkgCutoverMemberOutcome{memberIndex: memberIndex}
 	defer func() { outcomes <- outcome }()
@@ -427,6 +433,7 @@ func runRealDKGCutoverMember(
 		fmt.Sprintf("%v-%v", ProtocolName, "dkg"),
 		channel,
 		cutoverGroup.validator,
+		announcerOptions...,
 	)
 
 	retryLoop := newDkgRetryLoop(
@@ -1008,23 +1015,27 @@ func TestDKGCutover_LegacyAnchorPinnedThroughRetriesAcrossCutover(t *testing.T) 
 	)
 }
 
-// TestDKGCutover_PostCutoverSplitExcludesLegacyPeersAtQuorum proves the
-// off-chain half of the smoke-gate-2 90/10 consequence, scaled to 5/4: a
-// post-cutover DKG selection containing one prior-release peer proceeds once
-// the security-v2 cohort alone reaches the group quorum, excludes exactly the
-// legacy seat from the attempt — the exclusion that the tECDSA executor turns
-// into the result's misbehaved-members output — and reports the straggler
-// into mismatch metrics and the node-local roster under its operator. The
-// on-chain acceptance of the 90-active boundary and the reward-ineligibility
-// consequence live in the Solidity suite and the exact-image rehearsal.
-func TestDKGCutover_PostCutoverSplitExcludesLegacyPeersAtQuorum(t *testing.T) {
+// TestDKGCutover_PostCutoverSplitExcludesLegacyPeersAtProductionScale proves
+// the exact smoke-gate-2 90/10 exclusion arithmetic at the production group
+// parameters: a post-cutover DKG selection over a hundred-member group whose
+// ten prior-release seats keep announcing legacy session IDs proceeds in the
+// first attempt — the security-v2 cohort alone is exactly the group quorum
+// of ninety — and excludes exactly the ten legacy seats, the exclusion that
+// the tECDSA executor turns into the result's ten misbehaved-members
+// indexes, as proven with a real transcript at fixture scale by
+// TestDKGCutover_RealKeyGenerationExcludesLegacyPeerAtQuorum. Every legacy
+// straggler is attributed to its operator in the node-local roster. The
+// on-chain acceptance of the ninety-active boundary and the
+// reward-ineligibility consequence live in the Solidity suite; transcript
+// realness at this scale stays with the exact-image rehearsals.
+func TestDKGCutover_PostCutoverSplitExcludesLegacyPeersAtProductionScale(t *testing.T) {
 	groupParameters := &GroupParameters{
-		GroupSize:       5,
-		GroupQuorum:     4,
-		HonestThreshold: 3,
+		GroupSize:       100,
+		GroupQuorum:     90,
+		HonestThreshold: 51,
 	}
 
-	cutoverGroup := setupDKGCutoverGroup(t, groupParameters.GroupSize, 20*time.Millisecond)
+	cutoverGroup := setupDKGCutoverGroup(t, groupParameters.GroupSize, 100*time.Millisecond)
 	blockCounter := cutoverGroup.blockCounter
 
 	gate := newTestGate(t, blockCounter)
@@ -1040,9 +1051,9 @@ func TestDKGCutover_PostCutoverSplitExcludesLegacyPeersAtQuorum(t *testing.T) {
 	}
 	defer permit.Close()
 
-	seed := big.NewInt(0x5544)
+	seed := big.NewInt(0x9010)
 	protocolID := fmt.Sprintf("%v-%v", ProtocolName, "dkg")
-	channelName := "dkg-cutover-split-quorum-test"
+	channelName := "dkg-cutover-split-production-scale-test"
 
 	channel, err := cutoverGroup.provider(1).BroadcastChannelFor(channelName)
 	if err != nil {
@@ -1092,13 +1103,17 @@ func TestDKGCutover_PostCutoverSplitExcludesLegacyPeersAtQuorum(t *testing.T) {
 	peersCtx, cancelPeers := context.WithCancel(context.Background())
 	defer cancelPeers()
 
-	// Members 2-4 are current security-v2 peers; member 5 is a prior-release
-	// binary that keeps announcing the legacy session ID after the cutover.
+	// Members 2-90 are current security-v2 peers — together with the local
+	// member that is exactly the group quorum of ninety. Members 91-100 are
+	// prior-release binaries that keep announcing the legacy session ID
+	// after the cutover.
+	firstLegacySeat := groupParameters.GroupQuorum + 1
 	hardenedSessionIDs := []string{
 		compatibility.SecurityV2().DKGSessionID(seed, 1),
 		compatibility.SecurityV2().DKGSessionID(seed, 2),
 	}
-	for _, memberIndex := range []group.MemberIndex{2, 3, 4} {
+	for seat := 2; seat < firstLegacySeat; seat++ {
+		memberIndex := group.MemberIndex(seat)
 		startPeerAnnouncer(
 			peersCtx,
 			t,
@@ -1114,16 +1129,19 @@ func TestDKGCutover_PostCutoverSplitExcludesLegacyPeersAtQuorum(t *testing.T) {
 		compatibility.Legacy().DKGSessionID(seed, 1),
 		compatibility.Legacy().DKGSessionID(seed, 2),
 	}
-	startPeerAnnouncer(
-		peersCtx,
-		t,
-		cutoverGroup.provider(5),
-		channelName,
-		cutoverGroup.validator,
-		protocolID,
-		group.MemberIndex(5),
-		legacySessionIDs,
-	)
+	for seat := firstLegacySeat; seat <= groupParameters.GroupSize; seat++ {
+		memberIndex := group.MemberIndex(seat)
+		startPeerAnnouncer(
+			peersCtx,
+			t,
+			cutoverGroup.provider(memberIndex),
+			channelName,
+			cutoverGroup.validator,
+			protocolID,
+			memberIndex,
+			legacySessionIDs,
+		)
+	}
 
 	retryLoop := newDkgRetryLoop(
 		logger,
@@ -1165,21 +1183,316 @@ func TestDKGCutover_PostCutoverSplitExcludesLegacyPeersAtQuorum(t *testing.T) {
 		t.Error("expected the attempt's result")
 	}
 
-	// The security-v2 cohort proceeded at quorum and excluded exactly the
-	// legacy straggler's seat.
+	// The security-v2 cohort proceeded at exactly the ninety-member quorum
+	// in the first attempt and excluded exactly the ten legacy seats.
 	testutils.AssertIntsEqual(t, "attempts", 1, len(attemptExclusions))
+	excludedMembersIndexes := attemptExclusions[0]
+	legacySeatCount := groupParameters.GroupSize - groupParameters.GroupQuorum
 	testutils.AssertIntsEqual(
 		t,
 		"excluded members",
-		1,
-		len(attemptExclusions[0]),
+		legacySeatCount,
+		len(excludedMembersIndexes),
 	)
+	for i, excludedMemberIndex := range excludedMembersIndexes {
+		testutils.AssertIntsEqual(
+			t,
+			fmt.Sprintf("excluded member at position [%v]", i),
+			firstLegacySeat+i,
+			int(excludedMemberIndex),
+		)
+	}
+
+	// Every straggler became mismatch and cross-format evidence attributed
+	// to its operator in the node-local roster.
+	if mismatches := recorder.counter(
+		clientinfo.MetricAnnouncerSessionIDMismatchTotal,
+	); mismatches < float64(legacySeatCount) {
+		t.Errorf(
+			"expected at least [%v] mismatches, got [%v]",
+			legacySeatCount,
+			mismatches,
+		)
+	}
+	if crossFormat := recorder.counter(
+		clientinfo.MetricAnnouncerCrossFormatPeerTotal,
+	); crossFormat < float64(legacySeatCount) {
+		t.Errorf(
+			"expected at least [%v] cross-format peers, got [%v]",
+			legacySeatCount,
+			crossFormat,
+		)
+	}
+
+	rosterSnapshot := roster.Snapshot()
 	testutils.AssertIntsEqual(
 		t,
-		"excluded member index",
-		5,
-		int(attemptExclusions[0][0]),
+		"cutover roster operators",
+		legacySeatCount,
+		len(rosterSnapshot.Peers),
 	)
+	rosterOperatorAddresses := make(map[string]bool)
+	for _, peer := range rosterSnapshot.Peers {
+		rosterOperatorAddresses[peer.OperatorAddress] = true
+	}
+	for seat := firstLegacySeat; seat <= groupParameters.GroupSize; seat++ {
+		operatorAddress := string(cutoverGroup.rosterOperators[seat-1])
+		if !rosterOperatorAddresses[operatorAddress] {
+			t.Errorf(
+				"legacy seat [%v] operator [%s] missing from the roster",
+				seat,
+				operatorAddress,
+			)
+		}
+	}
+}
+
+// TestDKGCutover_RealKeyGenerationExcludesLegacyPeerAtQuorum proves the
+// off-chain half of the smoke-gate-2 90/10 consequence with a real
+// transcript: a post-cutover DKG selection contains a live prior-release
+// peer that keeps announcing the legacy session ID, the security-v2 cohort
+// proceeds once it alone reaches the group quorum, completes the real tECDSA
+// key-generation protocol without the legacy seat, and reports that seat in
+// the result's misbehaved members — the exact output the submitted result
+// carries into the Solidity suite's boundary acceptance and reward-ban
+// proof. The straggler also becomes mismatch metrics and roster evidence
+// attributed to its operator, and the production result-to-signer
+// transformation resolves the reduced final signing group with remapped
+// member indexes.
+func TestDKGCutover_RealKeyGenerationExcludesLegacyPeerAtQuorum(t *testing.T) {
+	groupParameters := &GroupParameters{
+		GroupSize:       3,
+		GroupQuorum:     2,
+		HonestThreshold: 2,
+	}
+
+	cutoverGroup := setupDKGCutoverGroup(
+		t,
+		groupParameters.GroupSize,
+		100*time.Millisecond,
+	)
+
+	testData, err := tecdsatest.LoadPrivateKeyShareTestFixtures(
+		groupParameters.GroupSize,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cutoverBlock := uint64(2)
+	if err := cutoverGroup.blockCounter.WaitForBlockHeight(
+		cutoverBlock + 1,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	gate := newTestGateWithCutover(t, cutoverGroup.blockCounter, cutoverBlock)
+
+	seed := big.NewInt(0x1E6AC1)
+	legacyMemberIndex := group.MemberIndex(3)
+	liveMembersIndexes := []group.MemberIndex{1, 2}
+
+	recorder := newDispatcherMetricsRecorder()
+	roster, err := participation.NewCutoverPeerRoster(
+		context.Background(),
+		cutoverGroup.blockCounter,
+		1500,
+		newCutoverFakeMetrics(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(roster.Close)
+
+	// The first live member observes announcement mismatches exactly like
+	// the production DKG executor wires them: stragglers become metrics and
+	// roster evidence. The permit mode is pinned to security-v2 by the
+	// member pipeline itself.
+	mismatchObserver := announcer.WithSessionMismatchObserver(func(
+		observedProtocolID string,
+		sender group.MemberIndex,
+		expectedFormat announcer.SessionIDFormat,
+		observedFormat announcer.SessionIDFormat,
+	) {
+		handleAnnouncerSessionMismatch(
+			logger,
+			nil,
+			recorder,
+			roster,
+			participation.ModeSecurityV2,
+			cutoverGroup.rosterOperators,
+			observedProtocolID,
+			sender,
+			expectedFormat,
+			observedFormat,
+		)
+	})
+
+	peersCtx, cancelPeers := context.WithCancel(context.Background())
+	defer cancelPeers()
+
+	// Seat 3 is a prior-release binary that keeps announcing the legacy
+	// session IDs after the cutover, on the same channel the live members
+	// use for the ceremony.
+	startPeerAnnouncer(
+		peersCtx,
+		t,
+		cutoverGroup.provider(legacyMemberIndex),
+		fmt.Sprintf("%s-%s", ProtocolName, seed.Text(16)),
+		cutoverGroup.validator,
+		fmt.Sprintf("%v-%v", ProtocolName, "dkg"),
+		legacyMemberIndex,
+		[]string{
+			compatibility.Legacy().DKGSessionID(seed, 1),
+			compatibility.Legacy().DKGSessionID(seed, 2),
+		},
+	)
+
+	loopCtx, cancelLoopCtx := context.WithTimeout(
+		context.Background(),
+		120*time.Second,
+	)
+	defer cancelLoopCtx()
+
+	outcomes := make(
+		chan *dkgCutoverMemberOutcome,
+		len(liveMembersIndexes),
+	)
+	for _, memberIndex := range liveMembersIndexes {
+		tecdsaExecutor := newSeededTecdsaExecutor(
+			t,
+			testData[memberIndex-1].LocalPreParams,
+		)
+
+		var announcerOptions []announcer.Option
+		if memberIndex == liveMembersIndexes[0] {
+			announcerOptions = append(announcerOptions, mismatchObserver)
+		}
+
+		go runRealDKGCutoverMember(
+			loopCtx,
+			cutoverGroup,
+			gate,
+			groupParameters,
+			seed,
+			cutoverBlock,
+			memberIndex,
+			tecdsaExecutor,
+			outcomes,
+			announcerOptions...,
+		)
+	}
+
+	results := make(map[group.MemberIndex]*dkg.Result)
+	for i := 0; i < len(liveMembersIndexes); i++ {
+		outcome := <-outcomes
+		if outcome.err != nil {
+			t.Fatalf(
+				"member [%v] failed: [%v]",
+				outcome.memberIndex,
+				outcome.err,
+			)
+		}
+
+		testutils.AssertIntsEqual(
+			t,
+			fmt.Sprintf("attempts of member [%v]", outcome.memberIndex),
+			1,
+			len(outcome.sessionIDs),
+		)
+		testutils.AssertStringsEqual(
+			t,
+			fmt.Sprintf("attempt session ID of member [%v]", outcome.memberIndex),
+			compatibility.SecurityV2().DKGSessionID(seed, 1),
+			outcome.sessionIDs[0],
+		)
+
+		results[outcome.memberIndex] = outcome.result
+	}
+	cancelPeers()
+
+	referencePublicKeyBytes, err := results[1].GroupPublicKeyBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, memberIndex := range liveMembersIndexes {
+		result := results[memberIndex]
+
+		misbehaved := result.MisbehavedMembersIndexes()
+		testutils.AssertIntsEqual(
+			t,
+			fmt.Sprintf("misbehaved members of member [%v]", memberIndex),
+			1,
+			len(misbehaved),
+		)
+		testutils.AssertIntsEqual(
+			t,
+			fmt.Sprintf("misbehaved member index of member [%v]", memberIndex),
+			int(legacyMemberIndex),
+			int(misbehaved[0]),
+		)
+
+		publicKeyBytes, err := result.GroupPublicKeyBytes()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(referencePublicKeyBytes, publicKeyBytes) {
+			t.Errorf(
+				"member [%v] derived group public key [0x%x] "+
+					"instead of [0x%x]",
+				memberIndex,
+				publicKeyBytes,
+				referencePublicKeyBytes,
+			)
+		}
+	}
+
+	// The reduced final signing group: the legacy seat is dropped and the
+	// remaining member indexes are remapped to consecutive positions.
+	walletRegistry, err := newWalletRegistry(
+		&mockPersistenceHandle{},
+		cutoverGroup.localChain.CalculateWalletID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	registrar := &dkgExecutor{
+		groupParameters: groupParameters,
+		walletRegistry:  walletRegistry,
+	}
+
+	expectedFinalIndexes := map[group.MemberIndex]group.MemberIndex{
+		1: 1,
+		2: 2,
+	}
+	for _, memberIndex := range liveMembersIndexes {
+		registeredSigner, err := registrar.registerSigner(
+			results[memberIndex],
+			memberIndex,
+			cutoverGroup.operators,
+		)
+		if err != nil {
+			t.Fatalf(
+				"failed to register the signer of member [%v]: [%v]",
+				memberIndex,
+				err,
+			)
+		}
+
+		testutils.AssertIntsEqual(
+			t,
+			fmt.Sprintf("final signing group size of member [%v]", memberIndex),
+			len(liveMembersIndexes),
+			len(registeredSigner.wallet.signingGroupOperators),
+		)
+		testutils.AssertIntsEqual(
+			t,
+			fmt.Sprintf("final member index of member [%v]", memberIndex),
+			int(expectedFinalIndexes[memberIndex]),
+			int(registeredSigner.signingGroupMemberIndex),
+		)
+	}
 
 	// The straggler became mismatch and cross-format evidence attributed to
 	// its operator in the node-local roster.
@@ -1204,7 +1517,7 @@ func TestDKGCutover_PostCutoverSplitExcludesLegacyPeersAtQuorum(t *testing.T) {
 	testutils.AssertStringsEqual(
 		t,
 		"roster operator address",
-		string(cutoverGroup.rosterOperators[4]),
+		string(cutoverGroup.rosterOperators[legacyMemberIndex-1]),
 		rosterSnapshot.Peers[0].OperatorAddress,
 	)
 }
