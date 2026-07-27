@@ -25,9 +25,22 @@ func newTestGate(
 ) participation.Gate {
 	t.Helper()
 
+	return newTestGateWithCutover(t, blockCounter, 1)
+}
+
+// newTestGateWithCutover constructs a real participation gate over the given
+// block counter with the given cutover block, letting boundary tests choose
+// the protocol mode a permit anchor resolves to.
+func newTestGateWithCutover(
+	t *testing.T,
+	blockCounter chain.BlockCounter,
+	cutoverBlock uint64,
+) participation.Gate {
+	t.Helper()
+
 	gate, err := participation.NewGate(
 		context.Background(),
-		participation.Schedule{CutoverBlock: 1},
+		participation.Schedule{CutoverBlock: cutoverBlock},
 		blockCounter,
 		testGateMetrics{},
 	)

@@ -382,6 +382,7 @@ func TestNode_RunCoordinationLayer(t *testing.T) {
 	// Simply pass processed results to the channel.
 	processedResultsChan := make(chan *coordinationResult, 5)
 	processCoordinationResultFn := func(
+		_ context.Context,
 		_ *node,
 		result *coordinationResult,
 	) {
@@ -862,176 +863,182 @@ func TestProcessCoordinationResult_NoopActionReturnsEarly(t *testing.T) {
 		},
 	}
 
-	processCoordinationResult(n, result)
+	processCoordinationResult(context.Background(), n, result)
 
 	if count := dispatchedActionsCount(n); count != 0 {
 		t.Errorf("expected no dispatched actions for Noop result, got %d", count)
 	}
 }
 
-// TestProcessCoordinationResult_HeartbeatRoutesToHandler verifies that
-// processCoordinationResult dispatches a heartbeat action when the proposal is
-// a HeartbeatProposal and the wallet is controlled by this node.
-func TestProcessCoordinationResult_HeartbeatRoutesToHandler(t *testing.T) {
-	n, signer := setupNodeForHandlerTests(t)
-
-	result := &coordinationResult{
-		wallet: signer.wallet,
-		window: newCoordinationWindow(100),
-		proposal: &HeartbeatProposal{
-			Message: [16]byte{0x04},
-		},
-	}
-
-	processCoordinationResult(n, result)
-
-	waitForDispatcherIdle(t, n)
-
-	// Dispatcher should be idle; a panicking handler would have made this fail.
-	if count := dispatchedActionsCount(n); count != 0 {
-		t.Errorf(
-			"expected dispatcher to be idle after heartbeat action, got %d active",
-			count,
-		)
+// routingTestProposals returns one well-formed proposal per dispatchable
+// wallet action, keyed by the action type it must route to.
+func routingTestProposals() map[WalletActionType]CoordinationProposal {
+	return map[WalletActionType]CoordinationProposal{
+		ActionHeartbeat:       &HeartbeatProposal{Message: [16]byte{0x04}},
+		ActionDepositSweep:    &DepositSweepProposal{},
+		ActionRedemption:      &RedemptionProposal{RedemptionTxFee: big.NewInt(0)},
+		ActionMovingFunds:     &MovingFundsProposal{},
+		ActionMovedFundsSweep: &MovedFundsSweepProposal{SweepTxFee: big.NewInt(0)},
 	}
 }
 
-// TestProcessCoordinationResult_DepositSweepRoutesToHandler verifies that
-// processCoordinationResult attempts to dispatch a deposit sweep action when
-// the proposal is a DepositSweepProposal. The wallet is pre-marked busy so
-// dispatch returns errWalletBusy immediately, proving the routing path was
-// exercised without running the action's execute() method.
-func TestProcessCoordinationResult_DepositSweepRoutesToHandler(t *testing.T) {
-	n, signer := setupNodeForHandlerTests(t)
-	walletKey := walletKeyFor(t, signer)
+// TestProcessCoordinationResult_RoutesToHandler verifies that every
+// dispatchable proposal type reaches its handler and the wallet dispatcher
+// under a real participation gate. Coordination results arrive before the
+// window's end block, so processCoordinationResult must first wait for that
+// block and only then acquire the permit anchored at it. The wallet is
+// pre-marked busy so dispatch is rejected before the action's execute() method
+// runs; the rejected-actions counter increment is positive proof the routed
+// handler reached the dispatcher.
+func TestProcessCoordinationResult_RoutesToHandler(t *testing.T) {
+	for action, proposal := range routingTestProposals() {
+		t.Run(action.String(), func(t *testing.T) {
+			n, signer, recorder := setupNodeForRoutingTests(t)
+			walletKey := markWalletBusy(t, n, signer)
 
-	// Mark the wallet busy so dispatch is rejected before execute() runs.
-	func() {
-		n.walletDispatcher.actionsMutex.Lock()
-		defer n.walletDispatcher.actionsMutex.Unlock()
-		n.walletDispatcher.actions[walletKey] = ActionNoop
-	}()
+			result := &coordinationResult{
+				wallet:   signer.wallet,
+				window:   newCoordinationWindow(100),
+				proposal: proposal,
+			}
 
-	result := &coordinationResult{
-		wallet:   signer.wallet,
-		window:   newCoordinationWindow(100),
-		proposal: &DepositSweepProposal{},
-	}
+			processCoordinationResult(context.Background(), n, result)
 
-	processCoordinationResult(n, result)
+			rejected := recorder.counter(
+				clientinfo.MetricWalletDispatcherRejectedTotal,
+			)
+			if rejected != 1 {
+				t.Errorf(
+					"expected exactly one rejected dispatch proving the "+
+						"handler was invoked, got %v",
+					rejected,
+				)
+			}
 
-	// Busy sentinel must still be there: dispatch was attempted (routing worked)
-	// but returned errWalletBusy without touching the map entry.
-	_, ok := func() (WalletActionType, bool) {
-		n.walletDispatcher.actionsMutex.Lock()
-		defer n.walletDispatcher.actionsMutex.Unlock()
-		v, exists := n.walletDispatcher.actions[walletKey]
-		return v, exists
-	}()
-	if !ok {
-		t.Error("expected walletDispatcher to retain the busy sentinel after DepositSweep routing")
-	}
-}
-
-// TestProcessCoordinationResult_RedemptionRoutesToHandler verifies that
-// processCoordinationResult dispatches a redemption action when the proposal is
-// a RedemptionProposal and the wallet is controlled by this node. The wallet is
-// pre-marked busy so dispatch returns errWalletBusy immediately, proving the
-// routing path was exercised without running the action's execute() method.
-func TestProcessCoordinationResult_RedemptionRoutesToHandler(t *testing.T) {
-	n, signer := setupNodeForHandlerTests(t)
-	walletKey := walletKeyFor(t, signer)
-
-	// Mark the wallet busy so dispatch is rejected before execute() runs.
-	func() {
-		n.walletDispatcher.actionsMutex.Lock()
-		defer n.walletDispatcher.actionsMutex.Unlock()
-		n.walletDispatcher.actions[walletKey] = ActionNoop
-	}()
-
-	result := &coordinationResult{
-		wallet:   signer.wallet,
-		window:   newCoordinationWindow(100),
-		proposal: &RedemptionProposal{RedemptionTxFee: big.NewInt(0)},
-	}
-
-	processCoordinationResult(n, result)
-
-	// Busy sentinel must still be there: dispatch was attempted (routing worked)
-	// but returned errWalletBusy without touching the map entry.
-	_, ok := func() (WalletActionType, bool) {
-		n.walletDispatcher.actionsMutex.Lock()
-		defer n.walletDispatcher.actionsMutex.Unlock()
-		v, exists := n.walletDispatcher.actions[walletKey]
-		return v, exists
-	}()
-	if !ok {
-		t.Error("expected walletDispatcher to retain the busy sentinel after Redemption routing")
+			// The busy sentinel must be untouched: dispatch was attempted but
+			// returned errWalletBusy without modifying the map entry.
+			_, ok := func() (WalletActionType, bool) {
+				n.walletDispatcher.actionsMutex.Lock()
+				defer n.walletDispatcher.actionsMutex.Unlock()
+				v, exists := n.walletDispatcher.actions[walletKey]
+				return v, exists
+			}()
+			if !ok {
+				t.Error(
+					"expected walletDispatcher to retain the busy sentinel " +
+						"after routing",
+				)
+			}
+		})
 	}
 }
 
-// TestProcessCoordinationResult_MovingFundsRoutesToHandler verifies that
-// processCoordinationResult dispatches a moving funds action when the proposal
-// is a MovingFundsProposal and the wallet is controlled by this node.
-func TestProcessCoordinationResult_MovingFundsRoutesToHandler(t *testing.T) {
-	n, signer := setupNodeForHandlerTests(t)
-	walletKey := walletKeyFor(t, signer)
+// TestProcessCoordinationResult_AtCutoverAnchorDispatches verifies the exact
+// cutover boundary: a wallet action whose canonical anchor equals the cutover
+// block resolves to the security-v2 mode and reaches the dispatcher for every
+// dispatchable proposal type.
+func TestProcessCoordinationResult_AtCutoverAnchorDispatches(t *testing.T) {
+	for action, proposal := range routingTestProposals() {
+		t.Run(action.String(), func(t *testing.T) {
+			n, signer, lc := setupNodeWithChain(t, 1*time.Millisecond)
 
-	func() {
-		n.walletDispatcher.actionsMutex.Lock()
-		defer n.walletDispatcher.actionsMutex.Unlock()
-		n.walletDispatcher.actions[walletKey] = ActionNoop
-	}()
+			blockCounter, err := lc.BlockCounter()
+			if err != nil {
+				t.Fatal(err)
+			}
 
-	result := &coordinationResult{
-		wallet:   signer.wallet,
-		window:   newCoordinationWindow(100),
-		proposal: &MovingFundsProposal{},
-	}
+			window := newCoordinationWindow(100)
+			// The permit anchor is the window's end block; make it the exact
+			// cutover block so the anchor sits right at C.
+			n.participationGate = newTestGateWithCutover(
+				t,
+				blockCounter,
+				window.endBlock(),
+			)
 
-	processCoordinationResult(n, result)
+			recorder := newDispatcherMetricsRecorder()
+			n.walletDispatcher.setMetricsRecorder(recorder)
 
-	_, ok := func() (WalletActionType, bool) {
-		n.walletDispatcher.actionsMutex.Lock()
-		defer n.walletDispatcher.actionsMutex.Unlock()
-		v, exists := n.walletDispatcher.actions[walletKey]
-		return v, exists
-	}()
-	if !ok {
-		t.Error("expected walletDispatcher to retain the busy sentinel after MovingFunds routing")
+			markWalletBusy(t, n, signer)
+
+			result := &coordinationResult{
+				wallet:   signer.wallet,
+				window:   window,
+				proposal: proposal,
+			}
+
+			processCoordinationResult(context.Background(), n, result)
+
+			rejected := recorder.counter(
+				clientinfo.MetricWalletDispatcherRejectedTotal,
+			)
+			if rejected != 1 {
+				t.Errorf(
+					"expected the anchor at the exact cutover block to "+
+						"dispatch, got %v rejected-dispatch increments",
+					rejected,
+				)
+			}
+		})
 	}
 }
 
-// TestProcessCoordinationResult_MovedFundsSweepRoutesToHandler verifies that
-// processCoordinationResult dispatches a moved funds sweep action when the
-// proposal is a MovedFundsSweepProposal and the wallet is controlled by this
-// node.
-func TestProcessCoordinationResult_MovedFundsSweepRoutesToHandler(t *testing.T) {
-	n, signer := setupNodeForHandlerTests(t)
-	walletKey := walletKeyFor(t, signer)
+// TestProcessCoordinationResult_BeforeCutoverAnchorRefuses verifies the other
+// side of the cutover boundary: a wallet action whose canonical anchor is one
+// block below the cutover block resolves to the legacy mode, which the tECDSA
+// stack cannot run, so no proposal type may reach the dispatcher.
+func TestProcessCoordinationResult_BeforeCutoverAnchorRefuses(t *testing.T) {
+	for action, proposal := range routingTestProposals() {
+		t.Run(action.String(), func(t *testing.T) {
+			n, signer, lc := setupNodeWithChain(t, 1*time.Millisecond)
 
-	func() {
-		n.walletDispatcher.actionsMutex.Lock()
-		defer n.walletDispatcher.actionsMutex.Unlock()
-		n.walletDispatcher.actions[walletKey] = ActionNoop
-	}()
+			blockCounter, err := lc.BlockCounter()
+			if err != nil {
+				t.Fatal(err)
+			}
 
-	result := &coordinationResult{
-		wallet:   signer.wallet,
-		window:   newCoordinationWindow(100),
-		proposal: &MovedFundsSweepProposal{SweepTxFee: big.NewInt(0)},
-	}
+			window := newCoordinationWindow(100)
+			// The permit anchor is the window's end block; put the cutover one
+			// block above it so the anchor sits at C-1 and pins legacy mode.
+			n.participationGate = newTestGateWithCutover(
+				t,
+				blockCounter,
+				window.endBlock()+1,
+			)
 
-	processCoordinationResult(n, result)
+			recorder := newDispatcherMetricsRecorder()
+			n.walletDispatcher.setMetricsRecorder(recorder)
 
-	_, ok := func() (WalletActionType, bool) {
-		n.walletDispatcher.actionsMutex.Lock()
-		defer n.walletDispatcher.actionsMutex.Unlock()
-		v, exists := n.walletDispatcher.actions[walletKey]
-		return v, exists
-	}()
-	if !ok {
-		t.Error("expected walletDispatcher to retain the busy sentinel after MovedFundsSweep routing")
+			result := &coordinationResult{
+				wallet:   signer.wallet,
+				window:   window,
+				proposal: proposal,
+			}
+
+			processCoordinationResult(context.Background(), n, result)
+
+			if total := recorder.counter(clientinfo.MetricWalletActionsTotal); total != 0 {
+				t.Errorf(
+					"expected no dispatched actions for a legacy-mode anchor, "+
+						"got %v",
+					total,
+				)
+			}
+			if rejected := recorder.counter(clientinfo.MetricWalletDispatcherRejectedTotal); rejected != 0 {
+				t.Errorf(
+					"expected no dispatch attempts for a legacy-mode anchor, "+
+						"got %v rejected-dispatch increments",
+					rejected,
+				)
+			}
+			if count := dispatchedActionsCount(n); count != 0 {
+				t.Errorf(
+					"expected walletDispatcher to stay idle for a legacy-mode "+
+						"anchor, got %d active actions",
+					count,
+				)
+			}
+		})
 	}
 }
 
@@ -1321,7 +1328,10 @@ func TestHandleWalletClosure_ReturnsErrorWhenNotConfirmed(t *testing.T) {
 // setupNodeWithChain creates a fully-initialised node and returns the node,
 // the signer, and the underlying *localChain so callers can manipulate chain
 // state (e.g. close/terminate a wallet) after creation.
-func setupNodeWithChain(t *testing.T) (*node, *signer, *localChain) {
+func setupNodeWithChain(
+	t *testing.T,
+	blockTime ...time.Duration,
+) (*node, *signer, *localChain) {
 	t.Helper()
 
 	groupParameters := &GroupParameters{
@@ -1330,7 +1340,7 @@ func setupNodeWithChain(t *testing.T) (*node, *signer, *localChain) {
 		HonestThreshold: 3,
 	}
 
-	lc := Connect()
+	lc := Connect(blockTime...)
 	localProvider := local.Connect()
 
 	signer := createMockSigner(t)
@@ -1368,6 +1378,73 @@ func setupNodeForHandlerTests(t *testing.T) (*node, *signer) {
 	t.Helper()
 	n, signer, _ := setupNodeWithChain(t)
 	return n, signer
+}
+
+// dispatcherMetricsRecorder counts walletDispatcher counter increments so
+// tests can positively observe that a dispatch was attempted.
+type dispatcherMetricsRecorder struct {
+	mu       sync.Mutex
+	counters map[string]float64
+}
+
+func newDispatcherMetricsRecorder() *dispatcherMetricsRecorder {
+	return &dispatcherMetricsRecorder{counters: make(map[string]float64)}
+}
+
+func (r *dispatcherMetricsRecorder) IncrementCounter(name string, value float64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.counters[name] += value
+}
+
+func (r *dispatcherMetricsRecorder) SetGauge(string, float64) {}
+
+func (r *dispatcherMetricsRecorder) RecordDuration(string, time.Duration) {}
+
+func (r *dispatcherMetricsRecorder) counter(name string) float64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.counters[name]
+}
+
+// setupNodeForRoutingTests builds a node on a fast-block chain with a real
+// participation gate whose cutover is already crossed, so that
+// processCoordinationResult can wait for the coordination window's end block
+// and acquire a security-v2 permit against it. The returned recorder counts
+// walletDispatcher metrics and proves dispatch attempts.
+func setupNodeForRoutingTests(
+	t *testing.T,
+) (*node, *signer, *dispatcherMetricsRecorder) {
+	t.Helper()
+
+	n, signer, lc := setupNodeWithChain(t, 1*time.Millisecond)
+
+	blockCounter, err := lc.BlockCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.participationGate = newTestGate(t, blockCounter)
+
+	recorder := newDispatcherMetricsRecorder()
+	n.walletDispatcher.setMetricsRecorder(recorder)
+
+	return n, signer, recorder
+}
+
+// markWalletBusy plants a busy sentinel for the signer's wallet in the
+// dispatcher so a routed action is rejected with errWalletBusy before its
+// execute() method runs; the rejection is observable through the dispatcher
+// rejected-actions counter.
+func markWalletBusy(t *testing.T, n *node, s *signer) string {
+	t.Helper()
+
+	walletKey := walletKeyFor(t, s)
+
+	n.walletDispatcher.actionsMutex.Lock()
+	defer n.walletDispatcher.actionsMutex.Unlock()
+	n.walletDispatcher.actions[walletKey] = ActionNoop
+
+	return walletKey
 }
 
 // uncontrolledWalletFor returns a wallet whose public key is NOT registered in

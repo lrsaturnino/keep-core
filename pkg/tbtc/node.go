@@ -1099,8 +1099,10 @@ type coordinationLayerSettings struct {
 	) (*coordinationResult, bool)
 
 	// processCoordinationResultFn is a function processing the given
-	// coordination result.
+	// coordination result. The context bounds the processing lifetime and
+	// is done when the coordination layer shuts down.
 	processCoordinationResultFn func(
+		ctx context.Context,
 		node *node,
 		result *coordinationResult,
 	)
@@ -1196,7 +1198,7 @@ func (n *node) runCoordinationLayer(
 		for {
 			select {
 			case result := <-coordinationResultChan:
-				go cls.processCoordinationResultFn(n, result)
+				go cls.processCoordinationResultFn(ctx, n, result)
 			case <-ctx.Done():
 				return
 			}
@@ -1342,8 +1344,14 @@ func executeCoordinationProcedure(
 	return result, true
 }
 
-// processCoordinationResult processes the given coordination result.
-func processCoordinationResult(node *node, result *coordinationResult) {
+// processCoordinationResult processes the given coordination result. The
+// context bounds the pre-dispatch wait for the action's start block and is
+// done when the coordination layer shuts down.
+func processCoordinationResult(
+	ctx context.Context,
+	node *node,
+	result *coordinationResult,
+) {
 	logger.Infof("processing coordination result [%s]", result)
 
 	// TODO: In the future, create coordination faults cache and
@@ -1359,6 +1367,28 @@ func processCoordinationResult(node *node, result *coordinationResult) {
 
 	startBlock := result.window.endBlock()
 	expiryBlock := startBlock + result.proposal.ValidityBlocks()
+
+	// Coordination normally concludes during the window's active phase, so
+	// at this point the chain has not reached the window's end block that
+	// anchors the action. The gate accepts only anchors at or below the
+	// current height, hence the permit is acquired once the chain reaches
+	// the anchor; the anchor itself stays the same for the whole action,
+	// including all its retries.
+	if err := node.waitForBlockHeight(ctx, startBlock); err != nil {
+		logger.Errorf(
+			"failed to wait for the [%s] wallet action start block [%v]: [%v]",
+			proposedAction,
+			startBlock,
+			err,
+		)
+		return
+	}
+	if ctx.Err() != nil {
+		// waitForBlockHeight returns nil when the context ends before the
+		// height is reached; the coordination layer is shutting down, so
+		// the action is dropped without touching the gate.
+		return
+	}
 
 	// One action permit, acquired before the handler and the dispatcher are
 	// set up and anchored at the proposal-processing start block. Every
