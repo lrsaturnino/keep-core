@@ -13,6 +13,27 @@ func TestMaximumLegacyCompletionBlocks(t *testing.T) {
 	}
 }
 
+// TestCutoverPeerRosterRetentionBlocks pins the derived roster retention: the
+// maximum legacy completion bound plus the reviewed margin. A different value
+// means the retention review must be redone deliberately, not that this test
+// should be updated casually.
+func TestCutoverPeerRosterRetentionBlocks(t *testing.T) {
+	retention, err := cutoverPeerRosterRetentionBlocks()
+	if err != nil {
+		t.Fatalf("unexpected retention derivation error: [%v]", err)
+	}
+	if retention != 1500 {
+		t.Errorf("expected roster retention [1500], got [%d]", retention)
+	}
+	if cutoverPeerRosterRetentionMarginBlocks != 300 {
+		t.Errorf(
+			"reviewed retention margin changed: expected [300], got [%d]; "+
+				"re-review the roster retention derivation",
+			cutoverPeerRosterRetentionMarginBlocks,
+		)
+	}
+}
+
 // TestMaximumLegacyCompletionBlocksConstituents is a drift test: it fails when
 // any constituent protocol constant changes without the completion bound —
 // and everything derived from it, such as roster retention and rollback

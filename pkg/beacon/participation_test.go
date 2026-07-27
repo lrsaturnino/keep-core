@@ -1,25 +1,28 @@
 package beacon
 
 import (
+	"math"
 	"testing"
 
 	beaconchain "github.com/keep-network/keep-core/pkg/beacon/chain"
 	dkgResult "github.com/keep-network/keep-core/pkg/beacon/dkg/result"
 	"github.com/keep-network/keep-core/pkg/beacon/gjkr"
+	"github.com/keep-network/keep-core/pkg/chain/ethereum"
 )
 
 // TestMaximumLegacyCompletionBlocks pins the derived in-flight completion
-// bound for the current Ethereum beacon configuration (group size 64,
-// publication step 1, relay entry timeout 64): the full DKG duration
-// dominates the relay entry timeout.
+// bound against the configuration the production Ethereum beacon adapter
+// actually supplies, so adapter drift fails this test, not only a changed
+// literal. GetConfig reads no receiver state today; if that ever changes,
+// this test fails loudly and the bound must be re-anchored deliberately.
 func TestMaximumLegacyCompletionBlocks(t *testing.T) {
-	config := &beaconchain.Config{
-		GroupSize:                  64,
-		ResultPublicationBlockStep: 1,
-		RelayEntryTimeout:          64,
-	}
+	config := (&ethereum.BeaconChain{}).GetConfig()
 
-	if maximum := MaximumLegacyCompletionBlocks(config); maximum != 136 {
+	maximum, err := MaximumLegacyCompletionBlocks(config)
+	if err != nil {
+		t.Fatalf("unexpected completion bound error: [%v]", err)
+	}
+	if maximum != 136 {
 		t.Errorf(
 			"expected maximum legacy completion bound [136], got [%d]",
 			maximum,
@@ -32,11 +35,52 @@ func TestMaximumLegacyCompletionBlocks(t *testing.T) {
 		ResultPublicationBlockStep: 1,
 		RelayEntryTimeout:          500,
 	}
-	if maximum := MaximumLegacyCompletionBlocks(timeoutDominant); maximum != 500 {
+	maximum, err = MaximumLegacyCompletionBlocks(timeoutDominant)
+	if err != nil {
+		t.Fatalf("unexpected completion bound error: [%v]", err)
+	}
+	if maximum != 500 {
 		t.Errorf(
 			"expected the relay entry timeout [500] to dominate, got [%d]",
 			maximum,
 		)
+	}
+}
+
+// TestMaximumLegacyCompletionBlocks_Validation proves the bound rejects a nil
+// config, a non-positive group size, and arithmetic overflow instead of
+// deriving a wrapped-around retention or quiescence deadline from them.
+func TestMaximumLegacyCompletionBlocks_Validation(t *testing.T) {
+	if _, err := MaximumLegacyCompletionBlocks(nil); err == nil {
+		t.Error("expected a nil config rejection")
+	}
+
+	invalid := map[string]*beaconchain.Config{
+		"zero group size": {
+			GroupSize:                  0,
+			ResultPublicationBlockStep: 1,
+			RelayEntryTimeout:          64,
+		},
+		"negative group size": {
+			GroupSize:                  -1,
+			ResultPublicationBlockStep: 1,
+			RelayEntryTimeout:          64,
+		},
+		"publication loop multiplication overflow": {
+			GroupSize:                  2,
+			ResultPublicationBlockStep: math.MaxUint64/2 + 1,
+			RelayEntryTimeout:          64,
+		},
+		"completion bound addition overflow": {
+			GroupSize:                  1,
+			ResultPublicationBlockStep: math.MaxUint64 - 10,
+			RelayEntryTimeout:          64,
+		},
+	}
+	for name, config := range invalid {
+		if _, err := MaximumLegacyCompletionBlocks(config); err == nil {
+			t.Errorf("expected a rejection for %s", name)
+		}
 	}
 }
 
@@ -57,6 +101,23 @@ func TestMaximumLegacyCompletionBlocksConstituents(t *testing.T) {
 			"result pre-publication duration changed: expected [6] blocks, "+
 				"got [%d]; re-review the maximum legacy completion bound",
 			blocks,
+		)
+	}
+
+	// The production adapter inputs themselves are constituents: a changed
+	// adapter configuration must re-trip the bound review even if the formula
+	// is untouched.
+	config := (&ethereum.BeaconChain{}).GetConfig()
+	if config.GroupSize != 64 ||
+		config.ResultPublicationBlockStep != 1 ||
+		config.RelayEntryTimeout != 64 {
+		t.Errorf(
+			"Ethereum beacon adapter configuration changed: got group size "+
+				"[%d], publication step [%d], relay entry timeout [%d]; "+
+				"re-review the maximum legacy completion bound",
+			config.GroupSize,
+			config.ResultPublicationBlockStep,
+			config.RelayEntryTimeout,
 		)
 	}
 }

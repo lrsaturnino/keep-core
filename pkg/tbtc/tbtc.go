@@ -84,14 +84,6 @@ const (
 	DefaultPreParamsGenerationConcurrency = 1
 )
 
-// cutoverPeerRosterRetentionBlocks bounds how long a legacy peer sighting is
-// retained without a fresh observation before it is evicted as "not recently
-// observed". It is a placeholder for the Part A cutover gate's
-// tbtc.MaximumLegacyCompletionBlocks() + reviewed margin: the longest tBTC
-// wallet-action validity is 1200 blocks (deposit sweep), and a 300-block margin
-// covers RPC and processing skew.
-const cutoverPeerRosterRetentionBlocks = uint64(1200 + 300)
-
 var DefaultKeyGenerationConcurrency = runtime.GOMAXPROCS(0)
 
 // Config carries the config for tBTC protocol.
@@ -194,10 +186,17 @@ func Initialize(
 			err,
 		)
 	}
+	rosterRetentionBlocks, err := cutoverPeerRosterRetentionBlocks()
+	if err != nil {
+		return fmt.Errorf(
+			"cannot derive cutover peer roster retention: [%v]",
+			err,
+		)
+	}
 	cutoverRoster, err := participation.NewCutoverPeerRoster(
 		ctx,
 		blockCounter,
-		cutoverPeerRosterRetentionBlocks,
+		rosterRetentionBlocks,
 		rosterMetrics,
 	)
 	if err != nil {
