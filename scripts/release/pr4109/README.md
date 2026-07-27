@@ -81,6 +81,46 @@ operator keys — and the dispatch reports `BLOCKED` when the secret is not
 provisioned. The companion `REHEARSAL_KEEP_ETHEREUM_PASSWORD` secret carries
 the key files' password.
 
+## Hard external dependencies
+
+### Reviewed tss-lib fork with an immutable per-party legacy mode
+
+R1's per-ceremony compatibility bundles cover the announcement session-ID
+formats, the ECDH symmetric-key derivation, and the G1 hash-to-point mapping
+(`pkg/protocol/compatibility`). The fourth wire-sensitive decision — the
+tECDSA proof transcript — cannot be bundled yet: a Go build resolves exactly
+one `github.com/bnb-chain/tss-lib` replacement (currently the hardened
+`threshold-network/tss-lib` revision `86bd1a375cc0` in `go.mod`), and that
+revision exposes no per-party protocol mode. Reproducing the legacy
+transcript requires extending that fork so each local party is constructed
+with an immutable legacy/security-v2 setting: legacy reproduces the
+prior-production proof transcript byte for byte, security-v2 requires the
+session nonce, and every mode-independent memory-safety fix stays active in
+both modes.
+
+That extension is reviewed cryptographic work outside this repository, and an
+unreviewed in-tree fork is not an accepted substitute. Until the reviewed
+fork commit is pinned in `go.mod`:
+
+- tBTC ceremonies **fail closed on legacy permits** — deliberately. The
+  tECDSA executors refuse any mode other than security-v2 (`pkg/tbtc/dkg.go`,
+  `pkg/tbtc/signing.go`) rather than emit a partially hardened transcript
+  that would interoperate with neither release.
+- The pre-cutover interop acceptance cases of smoke gates 1 and 2 — mixed
+  prior/R1 legacy signing and DKG succeeding before the cutover block, and a
+  legacy-anchored ceremony completing with legacy peers — cannot produce
+  evidence. They are recorded as explicit skips in
+  `pkg/tbtc/signing_cutover_integration_test.go` and
+  `pkg/tbtc/dkg_cutover_integration_test.go`.
+- The `single-release` container rehearsal stays `BLOCKED` even with all
+  image/chain inputs supplied, because a mixed prior/R1 fleet cannot pass its
+  pre-cutover compatibility stages.
+
+Unblocking requires the reviewed fork commit, its review record, transcript
+fixtures proving both modes reproduce their exact expected bytes, and the
+`go.mod` pin. The tECDSA refusals are then replaced by permit-scoped mode
+configuration and the skip-marked cases become runnable acceptance tests.
+
 ## clientInfo.port 9601 compatibility smoke matrix
 
 ### What is proven where

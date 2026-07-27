@@ -19,7 +19,9 @@
 // not expose a per-party protocol mode, and extending that fork is reviewed
 // work outside this repository. Until the extended fork is pinned, tECDSA
 // ceremonies cannot run in legacy mode, and no production path may hand a
-// legacy bundle to a tECDSA ceremony.
+// legacy bundle to a tECDSA ceremony. The hard-dependency record — what the
+// reviewed fork must provide and which acceptance evidence is blocked on it —
+// lives in scripts/release/pr4109/README.md.
 package compatibility
 
 import (
