@@ -116,6 +116,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The per-node keys and configurations come from one repository secret
+      # holding a base64-encoded tar.gz with a <service>/config.toml plus key
+      # material per rehearsal node — rehearsal-only throwaway keys, never
+      # production material. Without it the stage reports BLOCKED with the
+      # exact missing input instead of failing preflight opaquely.
+      - name: Provision the rehearsal keystore bundle
+        env:
+          REHEARSAL_KEYSTORE_BUNDLE_B64: ${{ secrets.REHEARSAL_KEYSTORE_BUNDLE_B64 }}
+        run: |
+          if [ -z "$REHEARSAL_KEYSTORE_BUNDLE_B64" ]; then
+            echo "BLOCKED: the REHEARSAL_KEYSTORE_BUNDLE_B64 secret is not" >&2
+            echo "provisioned; store a base64-encoded tar.gz holding one" >&2
+            echo "<service>/config.toml and rehearsal-only key material per" >&2
+            echo "node, then re-dispatch" >&2
+            exit 3
+          fi
+          mkdir -p "$KEYSTORE_DIR"
+          printf '%s' "$REHEARSAL_KEYSTORE_BUNDLE_B64" \
+            | base64 -d \
+            | tar -xz -C "$KEYSTORE_DIR"
+          chmod -R go-rwx "$KEYSTORE_DIR"
+          echo "provisioned $(find "$KEYSTORE_DIR" -mindepth 1 -maxdepth 1 \
+            -type d | wc -l | tr -d ' ') rehearsal node directories"
+
       - name: Preflight the rehearsal inputs
         run: ./scripts/release/pr4109/rehearse.sh preflight
 

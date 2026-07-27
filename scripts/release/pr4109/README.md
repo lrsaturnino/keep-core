@@ -67,6 +67,16 @@ every record under `EVIDENCE_DIR` against the schema, and the
 dispatch and the container preflight when the image digests and chain inputs
 are supplied.
 
+On a hosted runner the per-node keystore comes from the
+`REHEARSAL_KEYSTORE_BUNDLE_B64` repository secret: a base64-encoded tar.gz
+whose top level holds one `<service>/` directory per rehearsal node, each
+with its `config.toml` and rehearsal-only key material. Generate it from a
+prepared `KEYSTORE_DIR` with `tar -cz -C "$KEYSTORE_DIR" . | base64`. The
+bundle MUST contain throwaway rehearsal keys only — never production
+operator keys — and the dispatch reports `BLOCKED` when the secret is not
+provisioned. The companion `REHEARSAL_KEEP_ETHEREUM_PASSWORD` secret carries
+the key files' password.
+
 ## clientInfo.port 9601 compatibility smoke matrix
 
 ### What is proven where
