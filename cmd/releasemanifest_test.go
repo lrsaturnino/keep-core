@@ -149,10 +149,11 @@ func TestReleaseManifestFileMatchesCompiledDerivation(t *testing.T) {
 }
 
 // TestReleaseManifestDeploymentScaffoldMatchesManifest closes the chain from
-// the compiled bounds through the manifest into the deployment scaffold: both
-// scaffold files must carry exactly the manifest's termination grace, once,
-// and the systemd drop-in must keep SIGTERM as the stop signal because that
-// is the signal the lifecycle controller quiesces on.
+// the compiled bounds through the manifest into the deployment scaffold:
+// every scaffold file must carry exactly the manifest's termination grace at
+// its expected number of sites — once per service-manager fragment, once per
+// R1 rehearsal node — and the systemd drop-in must keep SIGTERM as the stop
+// signal because that is the signal the lifecycle controller quiesces on.
 func TestReleaseManifestDeploymentScaffoldMatchesManifest(t *testing.T) {
 	manifest, err := loadReleaseManifest(releaseManifestRepositoryPath)
 	if err != nil {
@@ -161,54 +162,70 @@ func TestReleaseManifestDeploymentScaffoldMatchesManifest(t *testing.T) {
 	expected := manifest.TerminationGrace.TerminationGracePeriodSeconds
 
 	scaffolds := []struct {
-		file    string
-		pattern *regexp.Regexp
+		path        string
+		pattern     *regexp.Regexp
+		occurrences int
 	}{
 		{
-			"keep-client-termination-grace.k8s-patch.yaml",
+			filepath.Join(
+				releaseManifestDeployDirectory,
+				"keep-client-termination-grace.k8s-patch.yaml",
+			),
 			regexp.MustCompile(`(?m)^\s*terminationGracePeriodSeconds:\s*(\d+)\s*$`),
+			1,
 		},
 		{
-			"keep-client-termination-grace.systemd-dropin.conf",
+			filepath.Join(
+				releaseManifestDeployDirectory,
+				"keep-client-termination-grace.systemd-dropin.conf",
+			),
 			regexp.MustCompile(`(?m)^TimeoutStopSec=(\d+)$`),
+			1,
+		},
+		{
+			"../scripts/release/pr4109/compose.rehearsal.yaml",
+			regexp.MustCompile(`(?m)^\s*stop_grace_period:\s*(\d+)s\s*$`),
+			2,
 		},
 	}
 
 	for _, scaffold := range scaffolds {
-		path := filepath.Join(releaseManifestDeployDirectory, scaffold.file)
-		content, err := os.ReadFile(path)
+		content, err := os.ReadFile(scaffold.path)
 		if err != nil {
 			t.Fatalf("cannot read the deployment scaffold: [%v]", err)
 		}
 
 		matches := scaffold.pattern.FindAllStringSubmatch(string(content), -1)
-		if len(matches) != 1 {
+		if len(matches) != scaffold.occurrences {
 			t.Errorf(
-				"[%s] must configure the grace exactly once, found [%d] "+
-					"occurrences",
-				scaffold.file,
+				"[%s] must configure the grace at exactly [%d] site(s), "+
+					"found [%d]",
+				scaffold.path,
+				scaffold.occurrences,
 				len(matches),
 			)
 			continue
 		}
 
-		configured, err := strconv.ParseUint(matches[0][1], 10, 64)
-		if err != nil {
-			t.Errorf(
-				"[%s] carries a non-integer grace [%s]",
-				scaffold.file,
-				matches[0][1],
-			)
-			continue
-		}
-		if configured != expected {
-			t.Errorf(
-				"[%s] configures a grace of [%d]s, the validated manifest "+
-					"requires [%d]s",
-				scaffold.file,
-				configured,
-				expected,
-			)
+		for _, match := range matches {
+			configured, err := strconv.ParseUint(match[1], 10, 64)
+			if err != nil {
+				t.Errorf(
+					"[%s] carries a non-integer grace [%s]",
+					scaffold.path,
+					match[1],
+				)
+				continue
+			}
+			if configured != expected {
+				t.Errorf(
+					"[%s] configures a grace of [%d]s, the validated "+
+						"manifest requires [%d]s",
+					scaffold.path,
+					configured,
+					expected,
+				)
+			}
 		}
 	}
 

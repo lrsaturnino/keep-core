@@ -197,11 +197,16 @@ exactly the manifest's grace: `keep-client-termination-grace.k8s-patch.yaml`
 (`spec.template.spec.terminationGracePeriodSeconds`, applied with `kubectl
 patch --patch-file`) and `keep-client-termination-grace.systemd-dropin.conf`
 (`TimeoutStopSec` plus an explicit `KillSignal=SIGTERM`, installed as a
-`<unit>.service.d/` drop-in). The grace is a ceiling, not a wait — a node
-whose drain completes exits immediately. Changing any compiled bound or the
-reviewed allowance requires regenerating the manifest with `derive`,
-re-reviewing it, and updating both scaffold fragments; the `cmd` tests refuse
-any shortcut through that sequence.
+`<unit>.service.d/` drop-in). The rehearsal fleet carries the same contract:
+both R1 services in `compose.rehearsal.yaml` set the manifest's grace as
+their `stop_grace_period`, because Docker's 10-second default would SIGKILL
+a draining node long before its backstop and no rollback rehearsal could
+ever evidence natural completion — the prior node deliberately keeps the
+default, having no drain semantics to protect. The grace is a ceiling, not a
+wait — a node whose drain completes exits immediately. Changing any compiled
+bound or the reviewed allowance requires regenerating the manifest with
+`derive`, re-reviewing it, and updating every scaffold site; the `cmd` tests
+refuse any shortcut through that sequence.
 
 ## Hard external dependencies
 

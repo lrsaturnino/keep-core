@@ -28,6 +28,16 @@
 #
 # The prior node receives no cutover configuration: the prior binary has no
 # gate, which is exactly the straggler behavior the rehearsal must observe.
+# It also keeps the default stop grace: without a lifecycle controller it
+# exits on the first SIGTERM, so a long grace would only imply drain
+# semantics the prior binary does not have.
+#
+# Both R1 nodes carry the release manifest's service-manager termination
+# grace as their stop_grace_period: the rollback rehearsal stops R1 nodes
+# mid-protocol, and Docker's 10-second default would SIGKILL a draining node
+# long before its in-process backstop, so no rehearsal could ever evidence
+# natural completion or the audited forced-cancellation path. The value is
+# pinned to release-manifest.json by `go test ./cmd/ -run TestReleaseManifest`.
 
 services:
   prior-node:
@@ -49,6 +59,7 @@ services:
 
   r1-node-1:
     image: "${R1_IMAGE_DIGEST}"
+    stop_grace_period: 20100s
     command:
       - "start"
       - "--config"
@@ -68,6 +79,7 @@ services:
 
   r1-node-2:
     image: "${R1_IMAGE_DIGEST}"
+    stop_grace_period: 20100s
     command:
       - "start"
       - "--config"
