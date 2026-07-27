@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	bn256 "github.com/ethereum/go-ethereum/crypto/bn256/cloudflare"
 	"github.com/keep-network/keep-common/pkg/persistence"
 
 	beaconchain "github.com/keep-network/keep-core/pkg/beacon/chain"
@@ -23,6 +24,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/chain/local_v1"
 	"github.com/keep-network/keep-core/pkg/clientinfo"
 	"github.com/keep-network/keep-core/pkg/generator"
+	"github.com/keep-network/keep-core/pkg/net"
 	netLocal "github.com/keep-network/keep-core/pkg/net/local"
 	"github.com/keep-network/keep-core/pkg/operator"
 	"github.com/keep-network/keep-core/pkg/protocol/compatibility"
@@ -872,5 +874,307 @@ func TestJoinDKGIfEligible_GateCancellationDuringKeyGenerationAbortsCleanly(t *t
 			harness.groupSize,
 			forcedAborts,
 		)
+	}
+}
+
+// TestMonitorRelayEntry_LegacyTimeoutReportSuppressedAfterCutover proves the
+// timeout-report penalty fence: a monitor holding a legacy permit whose
+// timeout block falls at or after the cutover block must not report the
+// timeout. The technical grace for pre-cutover work must never create new
+// penalty state after the cutover.
+func TestMonitorRelayEntry_LegacyTimeoutReportSuppressedAfterCutover(t *testing.T) {
+	localChain := local_v1.Connect(5, 3)
+
+	blockCounter, err := localChain.BlockCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := blockCounter.WaitForBlockHeight(1); err != nil {
+		t.Fatal(err)
+	}
+	currentBlock, err := blockCounter.CurrentBlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The relay request anchors below the cutover block, but its timeout
+	// block — request plus the relay entry timeout — falls after it.
+	gateMetrics := newCutoverGateMetrics()
+	gate, err := participation.NewGate(
+		context.Background(),
+		participation.Schedule{CutoverBlock: currentBlock + 5},
+		blockCounter,
+		gateMetrics,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(gate.Close)
+
+	node := &node{
+		beaconChain:       localChain,
+		participationGate: gate,
+	}
+
+	monitorDone := make(chan struct{})
+	go func() {
+		defer close(monitorDone)
+		node.MonitorRelayEntry(currentBlock)
+	}()
+
+	timeoutBlock := currentBlock +
+		localChain.GetConfig().RelayEntryTimeout
+	if err := blockCounter.WaitForBlockHeight(timeoutBlock + 2); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-monitorDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the monitor did not return after the timeout block")
+	}
+
+	if reports := localChain.GetRelayEntryTimeoutReports(); len(reports) != 0 {
+		t.Errorf(
+			"expected no timeout reports after the cutover, got [%v]",
+			reports,
+		)
+	}
+	refusals := gateMetrics.counter(
+		clientinfo.MetricParticipationCommitRefusalsTotal,
+	)
+	if refusals != 1 {
+		t.Errorf("expected [1] commit refusal, got [%f]", refusals)
+	}
+}
+
+// TestMonitorRelayEntry_TimeoutReportedBelowCutover proves the monitor still
+// files the timeout report while both the anchor and the timeout block stay
+// below the cutover block: the penalty fence suppresses only post-cutover
+// legacy penalties, not normal pre-cutover operation.
+func TestMonitorRelayEntry_TimeoutReportedBelowCutover(t *testing.T) {
+	localChain := local_v1.Connect(5, 3)
+
+	blockCounter, err := localChain.BlockCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := blockCounter.WaitForBlockHeight(1); err != nil {
+		t.Fatal(err)
+	}
+	currentBlock, err := blockCounter.CurrentBlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gateMetrics := newCutoverGateMetrics()
+	gate, err := participation.NewGate(
+		context.Background(),
+		participation.Schedule{CutoverBlock: currentBlock + 100_000},
+		blockCounter,
+		gateMetrics,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(gate.Close)
+
+	node := &node{
+		beaconChain:       localChain,
+		participationGate: gate,
+	}
+
+	monitorDone := make(chan struct{})
+	go func() {
+		defer close(monitorDone)
+		node.MonitorRelayEntry(currentBlock)
+	}()
+
+	timeoutBlock := currentBlock +
+		localChain.GetConfig().RelayEntryTimeout
+	if err := blockCounter.WaitForBlockHeight(timeoutBlock + 2); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-monitorDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the monitor did not return after the timeout block")
+	}
+
+	if reports := localChain.GetRelayEntryTimeoutReports(); len(reports) != 1 {
+		t.Errorf(
+			"expected exactly one timeout report below the cutover, got [%v]",
+			reports,
+		)
+	}
+}
+
+// cutoverStubForwarder is a controllable net.Forwarder for forwarding
+// lifecycle tests.
+type cutoverStubForwarder struct {
+	closeOnce sync.Once
+	done      chan struct{}
+}
+
+func newCutoverStubForwarder() *cutoverStubForwarder {
+	return &cutoverStubForwarder{done: make(chan struct{})}
+}
+
+func (f *cutoverStubForwarder) Close() {
+	f.closeOnce.Do(func() { close(f.done) })
+}
+
+func (f *cutoverStubForwarder) Done() <-chan struct{} { return f.done }
+
+func (f *cutoverStubForwarder) closed() bool {
+	select {
+	case <-f.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// cutoverForwardingProvider delegates everything to the wrapped provider but
+// hands out a controllable forwarder handle.
+type cutoverForwardingProvider struct {
+	net.Provider
+
+	forwarder *cutoverStubForwarder
+}
+
+func (p *cutoverForwardingProvider) BroadcastChannelForwarderFor(string) (
+	net.Forwarder,
+	error,
+) {
+	return p.forwarder, nil
+}
+
+// TestForwardSignatureShares_GateCancellationClosesForwarder proves the
+// forwarding permit owns the relay's lifecycle: the forwarding runs under a
+// permit, and when the gate force-cancels it the forwarder handle is closed
+// and the permit released.
+func TestForwardSignatureShares_GateCancellationClosesForwarder(t *testing.T) {
+	localChain := local_v1.Connect(5, 3)
+
+	blockCounter, err := localChain.BlockCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := blockCounter.WaitForBlockHeight(1); err != nil {
+		t.Fatal(err)
+	}
+	currentBlock, err := blockCounter.CurrentBlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gateMetrics := newCutoverGateMetrics()
+	gate, err := participation.NewGate(
+		context.Background(),
+		participation.Schedule{CutoverBlock: currentBlock + 100_000},
+		blockCounter,
+		gateMetrics,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(gate.Close)
+
+	stubForwarder := newCutoverStubForwarder()
+	node := &node{
+		beaconChain: localChain,
+		netProvider: &cutoverForwardingProvider{
+			Provider:  netLocal.Connect(),
+			forwarder: stubForwarder,
+		},
+		participationGate: gate,
+	}
+
+	groupPublicKeyBytes := new(bn256.G2).ScalarBaseMult(big.NewInt(1)).Marshal()
+	node.ForwardSignatureShares(groupPublicKeyBytes, currentBlock)
+
+	if active := gate.State().ActiveCeremonies; active != 1 {
+		t.Fatalf("expected one active forwarding permit, got [%d]", active)
+	}
+
+	gate.Quiesce(fmt.Errorf("test shutdown"))
+	gate.Close()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if stubForwarder.closed() && gate.State().ActiveCeremonies == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !stubForwarder.closed() {
+		t.Error("expected the forwarder to be closed on gate cancellation")
+	}
+	if active := gate.State().ActiveCeremonies; active != 0 {
+		t.Errorf("expected the forwarding permit released, got [%d]", active)
+	}
+}
+
+// TestForwardSignatureShares_ForwarderEndClosesPermit proves the reverse
+// lifecycle direction: when the relay ends on its own — TTL expiry or
+// provider shutdown — the forwarding permit is released without gate action.
+func TestForwardSignatureShares_ForwarderEndClosesPermit(t *testing.T) {
+	localChain := local_v1.Connect(5, 3)
+
+	blockCounter, err := localChain.BlockCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := blockCounter.WaitForBlockHeight(1); err != nil {
+		t.Fatal(err)
+	}
+	currentBlock, err := blockCounter.CurrentBlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gateMetrics := newCutoverGateMetrics()
+	gate, err := participation.NewGate(
+		context.Background(),
+		participation.Schedule{CutoverBlock: currentBlock + 100_000},
+		blockCounter,
+		gateMetrics,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(gate.Close)
+
+	stubForwarder := newCutoverStubForwarder()
+	node := &node{
+		beaconChain: localChain,
+		netProvider: &cutoverForwardingProvider{
+			Provider:  netLocal.Connect(),
+			forwarder: stubForwarder,
+		},
+		participationGate: gate,
+	}
+
+	groupPublicKeyBytes := new(bn256.G2).ScalarBaseMult(big.NewInt(1)).Marshal()
+	node.ForwardSignatureShares(groupPublicKeyBytes, currentBlock)
+
+	if active := gate.State().ActiveCeremonies; active != 1 {
+		t.Fatalf("expected one active forwarding permit, got [%d]", active)
+	}
+
+	// The relay ends naturally.
+	stubForwarder.Close()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if gate.State().ActiveCeremonies == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if active := gate.State().ActiveCeremonies; active != 0 {
+		t.Errorf("expected the forwarding permit released, got [%d]", active)
 	}
 }

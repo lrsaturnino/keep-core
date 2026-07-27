@@ -131,21 +131,24 @@ func (p *provider) CreateTransportIdentifier(operatorPublicKey *operator.PublicK
 	return peer.IDFromPublicKey(networkPublicKey)
 }
 
-func (p *provider) BroadcastChannelForwarderFor(name string) {
+func (p *provider) BroadcastChannelForwarderFor(name string) (net.Forwarder, error) {
 	if p.disseminationTime == 0 {
-		return
+		return net.NoopForwarder(), nil
 	}
 
 	logger.Infof("starting message forwarder for channel [%v]", name)
 	timeout := time.Duration(p.disseminationTime) * time.Second
 
-	if err := p.broadcastChannelManager.newForwarder(name, timeout); err != nil {
-		logger.Warnf(
-			"could not create message forwarder for channel [%v]: [%v]",
+	forwarder, err := p.broadcastChannelManager.newForwarder(name, timeout)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"could not create message forwarder for channel [%v]: [%w]",
 			name,
 			err,
 		)
 	}
+
+	return forwarder, nil
 }
 
 type connectionManager struct {

@@ -881,4 +881,9 @@ func (p *errNetProvider) ConnectionManager() net.ConnectionManager { return nil 
 func (p *errNetProvider) CreateTransportIdentifier(_ *operator.PublicKey) (net.TransportIdentifier, error) {
 	return nil, nil
 }
-func (p *errNetProvider) BroadcastChannelForwarderFor(_ string) {}
+func (p *errNetProvider) BroadcastChannelForwarderFor(_ string) (
+	net.Forwarder,
+	error,
+) {
+	return net.NoopForwarder(), nil
+}

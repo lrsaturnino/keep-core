@@ -1,21 +1,53 @@
 package beacon
 
 import (
+	"context"
 	"fmt"
 	"math/big"
 	"testing"
 
+	beaconchain "github.com/keep-network/keep-core/pkg/beacon/chain"
 	"github.com/keep-network/keep-core/pkg/chain/local_v1"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 )
 
 var relayEntryTimeout = uint64(15)
 
+// newMonitorTestNode builds the minimal node a relay entry monitoring test
+// needs: the local chain plus a real participation gate with the
+// developer-only disabled schedule, in which timeout reports stay allowed.
+func newMonitorTestNode(
+	t *testing.T,
+	localChain beaconchain.Interface,
+) *node {
+	t.Helper()
+
+	blockCounter, err := localChain.BlockCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gate, err := participation.NewGate(
+		context.Background(),
+		participation.Schedule{},
+		blockCounter,
+		newCutoverGateMetrics(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(gate.Close)
+
+	return &node{
+		beaconChain:       localChain,
+		participationGate: gate,
+	}
+}
+
 func TestMonitorRelayEntryOnChain_EntrySubmitted(t *testing.T) {
 	localChain := local_v1.Connect(5, 3)
 
-	node := &node{
-		beaconChain: localChain,
-	}
+	node := newMonitorTestNode(t, localChain)
 
 	blockCounter, err := node.beaconChain.BlockCounter()
 	if err != nil {
@@ -65,9 +97,7 @@ func TestMonitorRelayEntryOnChain_EntrySubmitted(t *testing.T) {
 func TestMonitorRelayEntryOnChain_EntryNotSubmitted(t *testing.T) {
 	localChain := local_v1.Connect(5, 3)
 
-	node := &node{
-		beaconChain: localChain,
-	}
+	node := newMonitorTestNode(t, localChain)
 
 	blockCounter, err := node.beaconChain.BlockCounter()
 	if err != nil {

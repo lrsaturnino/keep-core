@@ -1,6 +1,7 @@
 package beacon
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -387,15 +388,63 @@ func (n *node) quarantineSigner(
 
 // ForwardSignatureShares enables the ability to forward signature shares
 // messages to other nodes even if this node is not a part of the group which
-// signs the relay entry.
-func (n *node) ForwardSignatureShares(groupPublicKeyBytes []byte) {
+// signs the relay entry. The forwarding runs under a participation permit
+// anchored at the relay request block, so quiescence and clock failure close
+// the relay; the permit's mode is telemetry only because forwarding does not
+// reinterpret payloads.
+func (n *node) ForwardSignatureShares(
+	groupPublicKeyBytes []byte,
+	relayRequestBlockNumber uint64,
+) {
 	name, err := channelNameForPublicKeyBytes(groupPublicKeyBytes)
 	if err != nil {
 		logger.Warnf("could not forward signature shares: [%v]", err)
 		return
 	}
 
-	n.netProvider.BroadcastChannelForwarderFor(name)
+	if n.participationGate == nil {
+		logger.Warnf(
+			"no participation gate; not forwarding signature shares",
+		)
+		return
+	}
+
+	permit, err := n.participationGate.Begin(
+		participation.BeaconRelayForwarding,
+		relayRequestBlockNumber,
+	)
+	if err != nil {
+		logger.Warnf(
+			"signature share forwarding refused by the participation "+
+				"gate: [%v]",
+			err,
+		)
+		return
+	}
+
+	forwarder, err := n.netProvider.BroadcastChannelForwarderFor(name)
+	if err != nil {
+		permit.Close()
+		logger.Warnf(
+			"could not start the message forwarder for channel [%v]: [%v]",
+			name,
+			err,
+		)
+		return
+	}
+
+	go func() {
+		defer permit.Close()
+
+		select {
+		case <-forwarder.Done():
+			// TTL expiry, provider shutdown, or an explicit close ended the
+			// relay naturally.
+		case <-permit.Context().Done():
+			// Clock failure or forced quiescence closes the relay.
+			forwarder.Close()
+		}
+	}()
 }
 
 // ResumeSigningIfEligible enables a client to rejoin the ongoing signing process
@@ -440,10 +489,15 @@ func (n *node) ResumeSigningIfEligible() {
 			"attempting to rejoin the current signing process [0x%x]",
 			groupPublicKey,
 		)
-		n.GenerateRelayEntry(
+		// The on-chain liveness of the request was verified just above:
+		// IsEntryInProgress reported an entry in progress and the canonical
+		// anchor is the on-chain current request start block. That is the
+		// verification the gate's Resume path requires from its caller.
+		n.generateRelayEntry(
 			previousEntry,
 			groupPublicKey,
 			entryStartBlock.Uint64(),
+			true,
 		)
 	}
 }
@@ -452,10 +506,37 @@ func (n *node) ResumeSigningIfEligible() {
 // When a processing group which is supposed to deliver a relay entry does not
 // fulfill its work, then this node notifies the chain about it. In the case of
 // delivering a relay entry by a processing group, this node does nothing.
+//
+// The monitoring runs under a participation permit anchored at the relay
+// request block: a timeout report is a penalty commit, so a legacy permit
+// cannot report at or after the cutover block and no permit can report once
+// quiescence begins.
 func (n *node) MonitorRelayEntry(
 	relayRequestBlockNumber uint64,
 ) {
 	logger.Infof("monitoring chain for a new relay entry")
+
+	if n.participationGate == nil {
+		// The monitor exists only to file the penalty report; without a gate
+		// there is no fenced way to do that. Fail closed.
+		logger.Errorf(
+			"no participation gate; refusing to monitor the relay entry",
+		)
+		return
+	}
+
+	permit, err := n.participationGate.Begin(
+		participation.BeaconTimeoutReport,
+		relayRequestBlockNumber,
+	)
+	if err != nil {
+		logger.Warnf(
+			"relay entry monitoring refused by the participation gate: [%v]",
+			err,
+		)
+		return
+	}
+	defer permit.Close()
 
 	blockCounter, err := n.beaconChain.BlockCounter()
 	if err != nil {
@@ -473,7 +554,9 @@ func (n *node) MonitorRelayEntry(
 		return
 	}
 
-	onEntrySubmittedChannel := make(chan *event.RelayEntrySubmitted)
+	// The buffer lets an in-flight event callback complete after this
+	// function returned on cancellation, instead of blocking forever.
+	onEntrySubmittedChannel := make(chan *event.RelayEntrySubmitted, 1)
 
 	subscription := n.beaconChain.OnRelayEntrySubmitted(
 		func(event *event.RelayEntrySubmitted) {
@@ -485,7 +568,22 @@ func (n *node) MonitorRelayEntry(
 		select {
 		case blockNumber := <-timeoutWaiterChannel:
 			subscription.Unsubscribe()
-			close(onEntrySubmittedChannel)
+
+			// The last-moment penalty fence: a late legacy timeout at or
+			// after the cutover block, or any timeout during quiescence,
+			// must not create new penalty state.
+			if err := permit.CheckCommit(
+				"beacon_relay_timeout_report",
+				participation.PenaltyCommit,
+			); err != nil {
+				logger.Warnf(
+					"relay entry timeout report refused by the release "+
+						"gate: [%v]",
+					err,
+				)
+				return
+			}
+
 			logger.Warnf(
 				"relay entry was not submitted on time, reporting timeout at block [%v]",
 				blockNumber,
@@ -499,6 +597,14 @@ func (n *node) MonitorRelayEntry(
 			logger.Infof(
 				"relay entry was submitted by the selected group on time at block [%v]",
 				entry.BlockNumber,
+			)
+			return
+		case <-permit.Context().Done():
+			subscription.Unsubscribe()
+			logger.Warnf(
+				"relay entry monitoring canceled by the participation "+
+					"gate: [%v]",
+				context.Cause(permit.Context()),
 			)
 			return
 		}
@@ -517,6 +623,20 @@ func (n *node) GenerateRelayEntry(
 	groupPublicKey []byte,
 	startBlockHeight uint64,
 ) {
+	n.generateRelayEntry(previousEntry, groupPublicKey, startBlockHeight, false)
+}
+
+// generateRelayEntry runs the relay entry signing for every local membership,
+// each under its own participation permit anchored at the on-chain relay
+// request start block. The resume flag selects the gate's restart path, which
+// requires the caller to have verified on chain that the request is still
+// live.
+func (n *node) generateRelayEntry(
+	previousEntry []byte,
+	groupPublicKey []byte,
+	startBlockHeight uint64,
+	resume bool,
+) {
 	relayLogger := logger.With(
 		zap.String("groupPublicKey", fmt.Sprintf("0x%x", groupPublicKey)),
 		zap.String("previousEntry", fmt.Sprintf("0x%x", previousEntry)),
@@ -525,6 +645,15 @@ func (n *node) GenerateRelayEntry(
 	memberships := n.groupRegistry.GetGroup(groupPublicKey)
 
 	if len(memberships) < 1 {
+		return
+	}
+
+	if n.participationGate == nil {
+		// The gate is mandatory in production; signing without it would select
+		// a protocol mode implicitly. Fail closed.
+		relayLogger.Errorf(
+			"no participation gate; refusing to sign the relay entry",
+		)
 		return
 	}
 
@@ -566,12 +695,38 @@ func (n *node) GenerateRelayEntry(
 
 	chainConfig := n.beaconChain.GetConfig()
 
+	issuePermit := n.participationGate.Begin
+	if resume {
+		issuePermit = n.participationGate.Resume
+	}
+
 	for _, member := range memberships {
-		go func(member *registry.Membership) {
+		// One participation permit per local membership, anchored at the
+		// on-chain relay request start block: all share exchange and
+		// submission run under it and a refusal is a gate decision, not an
+		// ordinary signing failure.
+		permit, err := issuePermit(
+			participation.BeaconRelaySigning,
+			startBlockHeight,
+		)
+		if err != nil {
+			relayLogger.Warnf(
+				"[member:%v] relay entry signing refused by the "+
+					"participation gate: [%v]",
+				member.Signer.MemberID(),
+				err,
+			)
+			continue
+		}
+
+		go func(member *registry.Membership, permit participation.Permit) {
+			defer permit.Close()
+
 			n.protocolLatch.Lock()
 			defer n.protocolLatch.Unlock()
 
-			err = entry.SignAndSubmit(
+			err := entry.SignAndSubmit(
+				permit.Context(),
 				relayLogger,
 				blockCounter,
 				channel,
@@ -580,15 +735,24 @@ func (n *node) GenerateRelayEntry(
 				chainConfig.HonestThreshold,
 				member.Signer,
 				startBlockHeight,
+				permit,
 			)
 			if err != nil {
+				if participation.IsGateRefusal(err) {
+					relayLogger.Warnf(
+						"relay entry signing canceled by the participation "+
+							"gate: [%v]",
+						err,
+					)
+					return
+				}
 				relayLogger.Errorf(
 					"error creating threshold signature: [%v]",
 					err,
 				)
 				return
 			}
-		}(member)
+		}(member, permit)
 	}
 }
 

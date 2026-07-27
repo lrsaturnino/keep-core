@@ -1,13 +1,16 @@
 package entry
 
 import (
+	"context"
 	"fmt"
-	"github.com/ipfs/go-log/v2"
 	"math/big"
+
+	"github.com/ipfs/go-log/v2"
 
 	beaconchain "github.com/keep-network/keep-core/pkg/beacon/chain"
 	"github.com/keep-network/keep-core/pkg/chain"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 )
 
 type relayEntrySubmitter struct {
@@ -24,12 +27,18 @@ type relayEntrySubmitter struct {
 // tries to submit after a few blocks if member 1 did not submit and so on.
 // Relay entry submit process starts at block height defined by startBlockheight
 // parameter.
+//
+// The context bounds the submission loop and the commit guard is consulted
+// immediately before every terminal chain submission attempt; a guard refusal
+// is a release-gate decision, not an ordinary submission failure.
 func (res *relayEntrySubmitter) submitRelayEntry(
+	ctx context.Context,
 	newEntry []byte,
 	groupPublicKey []byte,
 	startBlockHeight uint64,
 	relayEntrySubmittedChannel <-chan uint64,
 	relayEntryTimeoutChannel <-chan uint64,
+	commitGuard participation.CommitGuard,
 ) error {
 	config := res.chain.GetConfig()
 
@@ -50,6 +59,19 @@ func (res *relayEntrySubmitter) submitRelayEntry(
 	for {
 		select {
 		case blockNumber := <-eligibleToSubmitWaiter:
+			// The last-moment completion fence, immediately before the
+			// terminal chain call: a ceremony that lost its permit to clock
+			// failure, quiescence, or the shutdown deadline must not submit.
+			if err := commitGuard.CheckCommit(
+				"beacon_relay_entry_submission",
+				participation.CompletionCommit,
+			); err != nil {
+				return fmt.Errorf(
+					"relay entry submission refused by the release gate: [%w]",
+					err,
+				)
+			}
+
 			res.logger.Infof(
 				"[member:%v] submitting relay entry [0x%x] on "+
 					"behalf of group [0x%x] at block [%v]",
@@ -115,6 +137,11 @@ func (res *relayEntrySubmitter) submitRelayEntry(
 			return fmt.Errorf(
 				"relay entry timed out at block [%v]",
 				blockNumber,
+			)
+		case <-ctx.Done():
+			return fmt.Errorf(
+				"relay entry submission canceled: [%w]",
+				context.Cause(ctx),
 			)
 		}
 	}

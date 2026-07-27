@@ -54,7 +54,9 @@ func (m *mockProvider) CreateTransportIdentifier(
 ) (net.TransportIdentifier, error) {
 	return nil, nil
 }
-func (m *mockProvider) BroadcastChannelForwarderFor(string) {}
+func (m *mockProvider) BroadcastChannelForwarderFor(string) (net.Forwarder, error) {
+	return net.NoopForwarder(), nil
+}
 
 // TestObserveConnectedWellknownPeersCount_Callable verifies that the renamed
 // function exists on the Registry type and can be called without panicking.

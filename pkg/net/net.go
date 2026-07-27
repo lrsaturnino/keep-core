@@ -71,8 +71,40 @@ type Provider interface {
 		operatorPublicKey *operator.PublicKey,
 	) (TransportIdentifier, error)
 
-	// BroadcastChannelForwarderFor creates a message relay for given channel name.
-	BroadcastChannelForwarderFor(name string)
+	// BroadcastChannelForwarderFor creates a message relay for given channel
+	// name and returns its lifecycle handle. Implementations that run no
+	// relay — a disabled dissemination time or a provider with no relaying —
+	// return an already-done no-op handle and no error.
+	BroadcastChannelForwarderFor(name string) (Forwarder, error)
+}
+
+// Forwarder is the lifecycle handle of a broadcast channel message relay. The
+// relay stops on its TTL, on provider shutdown, or on an explicit Close;
+// whichever comes first closes the Done channel.
+type Forwarder interface {
+	// Close stops the forwarder. It is idempotent.
+	Close()
+	// Done returns a channel that is closed when the forwarder stopped.
+	Done() <-chan struct{}
+}
+
+// noopForwarderDone is the shared already-closed Done channel of every no-op
+// forwarder.
+var noopForwarderDone = func() chan struct{} {
+	done := make(chan struct{})
+	close(done)
+	return done
+}()
+
+type noopForwarder struct{}
+
+func (noopForwarder) Close()                {}
+func (noopForwarder) Done() <-chan struct{} { return noopForwarderDone }
+
+// NoopForwarder returns an already-done Forwarder for providers and
+// configurations that run no message relay.
+func NoopForwarder() Forwarder {
+	return noopForwarder{}
 }
 
 // ConnectionManager is an interface which exposes peers a client is connected

@@ -44,7 +44,7 @@ type channelManager struct {
 	retransmissionTicker *retransmission.Ticker
 
 	forwardersMutex sync.Mutex
-	forwarders      map[string]pubsub.RelayCancelFunc
+	forwarders      map[string]*forwarder
 
 	topicsMutex sync.Mutex
 	topics      map[string]*pubsub.Topic
@@ -83,7 +83,7 @@ func newChannelManager(
 		identity:             identity,
 		ctx:                  ctx,
 		retransmissionTicker: retransmissionTicker,
-		forwarders:           make(map[string]pubsub.RelayCancelFunc),
+		forwarders:           make(map[string]*forwarder),
 		topics:               make(map[string]*pubsub.Topic),
 	}, nil
 }
@@ -178,57 +178,106 @@ func (cm *channelManager) newChannel(name string) (*channel, error) {
 	return channel, nil
 }
 
-func (cm *channelManager) newForwarder(name string, ttl time.Duration) error {
-	cm.forwardersMutex.Lock()
-	defer cm.forwardersMutex.Unlock()
+// forwarder is the lifecycle handle of one channel message relay. There is at
+// most one live forwarder per channel name; requesting a forwarder for a name
+// that already has one returns the existing handle.
+type forwarder struct {
+	name        string
+	relayCancel pubsub.RelayCancelFunc
+	manager     *channelManager
 
-	if _, ok := cm.forwarders[name]; !ok {
-		topic, err := cm.getTopic(name)
-		if err != nil {
-			return fmt.Errorf(
-				"could not get topic [%v] handle: [%v]",
-				name,
-				err,
-			)
-		}
-
-		cancelFn, err := topic.Relay()
-		if err != nil {
-			return fmt.Errorf(
-				"could not enable relay for topic [%v]: [%v]",
-				name,
-				err,
-			)
-		}
-
-		go func() {
-			ctx, cancelCtx := context.WithTimeout(cm.ctx, ttl)
-			defer cancelCtx()
-
-			<-ctx.Done()
-			cm.shutdownForwarder(name)
-		}()
-
-		cm.forwarders[name] = cancelFn
-	}
-
-	return nil
+	stopOnce sync.Once
+	done     chan struct{}
 }
 
-func (cm *channelManager) shutdownForwarder(name string) {
+// Close implements net.Forwarder. It is idempotent.
+func (f *forwarder) Close() {
+	f.stop()
+}
+
+// Done implements net.Forwarder.
+func (f *forwarder) Done() <-chan struct{} {
+	return f.done
+}
+
+// stop cancels the pubsub relay, closes the done channel, and removes the
+// forwarder from the manager exactly once.
+func (f *forwarder) stop() {
+	f.stopOnce.Do(func() {
+		logger.Infof(
+			"shutting down message forwarder for channel: [%v]",
+			f.name,
+		)
+
+		f.relayCancel()
+		close(f.done)
+		f.manager.removeForwarder(f.name, f)
+	})
+}
+
+func (cm *channelManager) newForwarder(
+	name string,
+	ttl time.Duration,
+) (*forwarder, error) {
 	cm.forwardersMutex.Lock()
 	defer cm.forwardersMutex.Unlock()
 
-	logger.Infof("shutting down message forwarder for channel: [%v]", name)
-
-	cancelFn, ok := cm.forwarders[name]
-
-	if !ok {
-		return
+	if existing, ok := cm.forwarders[name]; ok {
+		return existing, nil
 	}
 
-	cancelFn()
-	delete(cm.forwarders, name)
+	topic, err := cm.getTopic(name)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"could not get topic [%v] handle: [%v]",
+			name,
+			err,
+		)
+	}
+
+	relayCancel, err := topic.Relay()
+	if err != nil {
+		return nil, fmt.Errorf(
+			"could not enable relay for topic [%v]: [%v]",
+			name,
+			err,
+		)
+	}
+
+	newForwarder := &forwarder{
+		name:        name,
+		relayCancel: relayCancel,
+		manager:     cm,
+		done:        make(chan struct{}),
+	}
+
+	// The relay stops on its TTL, on provider shutdown through cm.ctx, or on
+	// an explicit Close, whichever comes first.
+	go func() {
+		ctx, cancelCtx := context.WithTimeout(cm.ctx, ttl)
+		defer cancelCtx()
+
+		select {
+		case <-ctx.Done():
+			newForwarder.stop()
+		case <-newForwarder.done:
+		}
+	}()
+
+	cm.forwarders[name] = newForwarder
+
+	return newForwarder, nil
+}
+
+// removeForwarder drops the forwarder from the manager if it is still the one
+// registered under its name.
+func (cm *channelManager) removeForwarder(name string, f *forwarder) {
+	cm.forwardersMutex.Lock()
+	defer cm.forwardersMutex.Unlock()
+
+	if cm.forwarders[name] == f {
+		delete(cm.forwarders, name)
+	}
 }
 
 func (cm *channelManager) getTopic(name string) (*pubsub.Topic, error) {

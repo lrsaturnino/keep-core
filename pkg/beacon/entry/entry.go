@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+
 	"github.com/keep-network/keep-core/pkg/beacon/event"
 
 	bn256 "github.com/ethereum/go-ethereum/crypto/bn256/cloudflare"
@@ -14,6 +15,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/chain"
 	"github.com/keep-network/keep-core/pkg/net"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 )
 
 // RegisterUnmarshallers initializes the given broadcast channel to be able to
@@ -29,7 +31,12 @@ func RegisterUnmarshallers(channel net.BroadcastChannel) {
 // SignAndSubmit triggers the threshold signature process for the
 // previous relay entry and publishes the signature to the chain as
 // a new relay entry.
+//
+// The context bounds the execution and must be the ceremony permit's context:
+// canceling it aborts the share exchange and the submission. The commit guard
+// is consulted immediately before the terminal on-chain entry submission.
 func SignAndSubmit(
+	ctx context.Context,
 	logger log.StandardLogger,
 	blockCounter chain.BlockCounter,
 	channel net.BroadcastChannel,
@@ -38,8 +45,15 @@ func SignAndSubmit(
 	honestThreshold int,
 	signer *dkg.ThresholdSigner,
 	startBlockHeight uint64,
+	commitGuard participation.CommitGuard,
 ) error {
-	ctx, cancelCtx := context.WithCancel(context.Background())
+	if commitGuard == nil {
+		// Submitting without a fence would publish an entry the release gate
+		// never authorized; there is no implicit default.
+		return fmt.Errorf("a commit guard is required to sign a relay entry")
+	}
+
+	ctx, cancelCtx := context.WithCancel(ctx)
 	defer cancelCtx()
 
 	relayEntrySubmittedChannel := make(chan uint64)
@@ -141,6 +155,11 @@ func SignAndSubmit(
 				blockNumber,
 				len(receivedValidShares),
 			)
+		case <-ctx.Done():
+			return fmt.Errorf(
+				"relay entry signing canceled: [%w]",
+				context.Cause(ctx),
+			)
 		}
 	}
 
@@ -162,11 +181,13 @@ func SignAndSubmit(
 	// still a possibility those signals appear in the future so the submitter
 	// must be aware of them and break the execution if they occur.
 	return submitter.submitRelayEntry(
+		ctx,
 		signature.Marshal(),
 		signer.GroupPublicKeyBytes(),
 		startBlockHeight,
 		relayEntrySubmittedChannel,
 		relayEntryTimeoutChannel,
+		commitGuard,
 	)
 }
 

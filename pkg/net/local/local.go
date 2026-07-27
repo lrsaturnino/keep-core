@@ -55,8 +55,12 @@ func (lp *localProvider) CreateTransportIdentifier(
 	return createLocalIdentifier(operatorPublicKey)
 }
 
-func (lp *localProvider) BroadcastChannelForwarderFor(name string) {
-	//no-op
+func (lp *localProvider) BroadcastChannelForwarderFor(name string) (
+	net.Forwarder,
+	error,
+) {
+	// The local provider does no relaying; the handle is already done.
+	return net.NoopForwarder(), nil
 }
 
 // Connect returns a local instance of a net provider that does not go over the

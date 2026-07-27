@@ -18,8 +18,10 @@ import (
 
 	bn256 "github.com/ethereum/go-ethereum/crypto/bn256/cloudflare"
 
+	"github.com/keep-network/keep-core/pkg/clientinfo"
 	"github.com/keep-network/keep-core/pkg/internal/interception"
 	"github.com/keep-network/keep-core/pkg/operator"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 
 	"github.com/keep-network/keep-core/pkg/beacon/dkg"
 	"github.com/keep-network/keep-core/pkg/beacon/entry"
@@ -138,11 +140,42 @@ func executeSigning(
 	// make sure all signers are ready
 	startBlockHeight := currentBlockHeight + 3
 
+	// The harness runs every signer through a real participation gate with the
+	// developer-only disabled schedule: each signer holds a permit whose
+	// context and commit fence follow the production execution path. The
+	// anchor is the current height because the deliberately future execution
+	// start block is not a canonical chain anchor.
+	gate, err := participation.NewGate(
+		context.Background(),
+		participation.Schedule{},
+		blockCounter,
+		&clientinfo.NoOpPerformanceMetrics{},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("cannot construct the test gate: [%v]", err)
+	}
+	defer gate.Close()
+
 	entry.RegisterUnmarshallers(broadcastChannel)
 
 	for _, signer := range signers {
-		go func(signer *dkg.ThresholdSigner) {
+		permit, err := gate.Begin(
+			participation.BeaconRelaySigning,
+			currentBlockHeight,
+		)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"cannot begin the ceremony for signer [%v]: [%v]",
+				signer.MemberID(),
+				err,
+			)
+		}
+
+		go func(signer *dkg.ThresholdSigner, permit participation.Permit) {
+			defer permit.Close()
+
 			err := entry.SignAndSubmit(
+				permit.Context(),
 				&testutils.MockLogger{},
 				blockCounter,
 				broadcastChannel,
@@ -151,6 +184,7 @@ func executeSigning(
 				threshold,
 				signer,
 				startBlockHeight,
+				permit,
 			)
 			if err != nil {
 				fmt.Printf("[signer:%v %v] failed with: [%v]\n", signer.MemberID(), previousEntry, err)
@@ -159,7 +193,7 @@ func executeSigning(
 				signerFailuresMutex.Unlock()
 			}
 			wg.Done()
-		}(signer)
+		}(signer, permit)
 	}
 	wg.Wait()
 
