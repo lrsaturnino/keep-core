@@ -56,7 +56,8 @@ export async function signAndSubmitCorrectDkgResult(
   startBlock: number,
   misbehavedIndices = noMisbehaved,
   submitterIndex = 1,
-  numberOfSignatures = 51
+  numberOfSignatures = 51,
+  excludedSigningMembersIndices: number[] = []
 ): Promise<{
   signers: Operator[]
   dkgResult: DkgResult
@@ -81,7 +82,8 @@ export async function signAndSubmitCorrectDkgResult(
       startBlock,
       misbehavedIndices,
       submitterIndex,
-      numberOfSignatures
+      numberOfSignatures,
+      excludedSigningMembersIndices
     )),
   }
 }
@@ -99,7 +101,8 @@ export async function signAndSubmitArbitraryDkgResult(
   startBlock: number,
   misbehavedIndices: number[],
   submitterIndex = 1,
-  numberOfSignatures = 51
+  numberOfSignatures = 51,
+  excludedSigningMembersIndices: number[] = []
 ): Promise<{
   dkgResult: DkgResult
   dkgResultHash: string
@@ -113,7 +116,8 @@ export async function signAndSubmitArbitraryDkgResult(
     misbehavedIndices,
     startBlock,
     submitterIndex,
-    numberOfSignatures
+    numberOfSignatures,
+    excludedSigningMembersIndices
   )
 
   const dkgResultHash = ethers.utils.keccak256(
@@ -193,7 +197,8 @@ export async function signDkgResult(
   misbehavedMembersIndices: number[],
   startBlock: number,
   submitterIndex = 1,
-  numberOfSignatures = 51
+  numberOfSignatures = 51,
+  excludedSigningMembersIndices: number[] = []
 ): Promise<{
   dkgResult: DkgResult
   signingMembersIndices: number[]
@@ -219,6 +224,11 @@ export async function signDkgResult(
     }
 
     const signerIndex: number = i + 1
+
+    if (excludedSigningMembersIndices.includes(signerIndex)) {
+      // eslint-disable-next-line no-continue
+      continue
+    }
 
     signingMembersIndices.push(signerIndex)
 

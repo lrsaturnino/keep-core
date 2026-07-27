@@ -1,7 +1,7 @@
 import { ethers, helpers } from "hardhat"
 import { expect } from "chai"
 
-import { params, walletRegistryFixture } from "./fixtures"
+import { constants, params, walletRegistryFixture } from "./fixtures"
 import ecdsaData from "./data/ecdsa"
 import { hashDKGMembers, signAndSubmitCorrectDkgResult } from "./utils/dkg"
 import { submitRelayEntry } from "./utils/randomBeacon"
@@ -313,6 +313,13 @@ describe("WalletRegistry - Rewards", () => {
         boundaryWalletPublicKey,
         dkgSeed,
         startBlock,
+        misbehavedIndices,
+        // The ninety-member active cohort produces this result, so the
+        // submitting seat and every signing seat must come from it: seat 2
+        // is the first seat outside the misbehaved set, and the misbehaved
+        // seats contribute no signatures.
+        2,
+        constants.groupThreshold,
         misbehavedIndices
       ))
 
@@ -353,6 +360,25 @@ describe("WalletRegistry - Rewards", () => {
 
     after(async () => {
       await restoreSnapshot()
+    })
+
+    it("should carry submission and signatures only from active seats", async () => {
+      // The result claims the ten seats misbehaved, so none of them can have
+      // taken part in producing it: the fixture must be a result the ninety
+      // active members could actually have submitted.
+      expect(misbehavedIndices).to.not.include(
+        boundaryDkgResult.submitterMemberIndex
+      )
+
+      expect(boundaryDkgResult.signingMembersIndices.length).to.equal(
+        constants.groupThreshold
+      )
+      const signingSeats = boundaryDkgResult.signingMembersIndices.map(
+        (index) => ethers.BigNumber.from(index).toNumber()
+      )
+      misbehavedIndices.forEach((misbehavedIndex) => {
+        expect(signingSeats).to.not.include(misbehavedIndex)
+      })
     })
 
     it("should withstand a challenge of the boundary result", async () => {
