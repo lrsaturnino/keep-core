@@ -17,6 +17,8 @@ const releaseManifestRepositoryPath = "../scripts/release/pr4109/release-manifes
 
 const releaseManifestDeployDirectory = "../scripts/release/pr4109/deploy"
 
+const rehearsalEvidenceSchemaPath = "../scripts/release/pr4109/rehearsal-evidence.schema.json"
+
 
 // validReleaseManifestForTests builds a manifest that must pass validation:
 // the derived termination grace under the reviewed default allowance,
@@ -246,6 +248,56 @@ func TestReleaseManifestDeploymentScaffoldMatchesManifest(t *testing.T) {
 				"got [%v]",
 			killSignal,
 		)
+	}
+}
+
+// TestRehearsalEvidenceSchemaRequiresManifestBinding pins the evidence
+// schema's release-manifest binding: every accepted rehearsal record must
+// name the hash of the reviewed manifest and the grace it ran under.
+// Dropping the requirement from the schema would silently sever the link
+// between the termination-grace record and the source SHA, image digests,
+// and chain identity the record carries.
+func TestRehearsalEvidenceSchemaRequiresManifestBinding(t *testing.T) {
+	content, err := os.ReadFile(rehearsalEvidenceSchemaPath)
+	if err != nil {
+		t.Fatalf("cannot read the evidence schema: [%v]", err)
+	}
+
+	var schema struct {
+		Required   []string `json:"required"`
+		Properties struct {
+			ReleaseManifest struct {
+				Required   []string                   `json:"required"`
+				Properties map[string]json.RawMessage `json:"properties"`
+			} `json:"release_manifest"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(content, &schema); err != nil {
+		t.Fatalf("cannot decode the evidence schema: [%v]", err)
+	}
+
+	contains := func(list []string, want string) bool {
+		for _, entry := range list {
+			if entry == want {
+				return true
+			}
+		}
+		return false
+	}
+
+	if !contains(schema.Required, "release_manifest") {
+		t.Error("the evidence schema must require the release_manifest binding")
+	}
+	for _, field := range []string{
+		"sha256",
+		"termination_grace_period_seconds",
+	} {
+		if !contains(schema.Properties.ReleaseManifest.Required, field) {
+			t.Errorf("the release_manifest binding must require [%s]", field)
+		}
+		if _, present := schema.Properties.ReleaseManifest.Properties[field]; !present {
+			t.Errorf("the release_manifest binding must define [%s]", field)
+		}
 	}
 }
 

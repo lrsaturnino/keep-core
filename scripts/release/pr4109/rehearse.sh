@@ -627,6 +627,7 @@ stage_verify_source_binding() {
 
 stage_validate_evidence() {
   local schema="${SCRIPT_DIR}/rehearsal-evidence.schema.json"
+  local manifest="${SCRIPT_DIR}/release-manifest.json"
 
   shopt -s nullglob
   local records=("${EVIDENCE_DIR}"/*.json)
@@ -638,15 +639,40 @@ run that produced no record cannot be accepted"
 
   command -v npx >/dev/null 2>&1 ||
     blocked "npx (Node.js) is required to validate evidence records"
+  command -v node >/dev/null 2>&1 ||
+    blocked "node (Node.js) is required to validate evidence records"
+
+  # Schema conformance requires the record to name a manifest hash; this
+  # cross-check requires it to be the hash of the checked-in manifest, whose
+  # numbers the Go drift tests pin to the compiled bounds. Together they bind
+  # the termination grace the fleet ran under to the source SHA, image
+  # digests, and chain identity the record carries.
+  local manifest_sha
+  manifest_sha="$(hash_stdin <"${manifest}")"
 
   for record in "${records[@]}"; do
     note "validating ${record}"
-    npx --yes ajv-cli@5 validate --spec=draft2020 \
-      -s "${schema}" -d "${record}" ||
+    # ajv needs the formats plugin loaded explicitly or it rejects the
+    # schema's own date-time format annotation before ever reading a record.
+    npx --yes -p ajv-cli@5 -p ajv-formats@2 ajv validate --spec=draft2020 \
+      -c ajv-formats -s "${schema}" -d "${record}" ||
       blocked "evidence record ${record} does not conform to ${schema}"
+
+    local recorded_sha
+    recorded_sha="$(node -e '
+      const fs = require("fs");
+      const record = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      process.stdout.write(String((record.release_manifest || {}).sha256 || ""));
+    ' "${record}")"
+    if [[ "${recorded_sha}" != "${manifest_sha}" ]]; then
+      blocked "evidence record ${record} binds release manifest sha256 \
+[${recorded_sha:-absent}], but the checked-in manifest hashes to \
+[${manifest_sha}]; regenerate the record against the reviewed manifest"
+    fi
   done
 
-  note "all evidence records conform to the schema"
+  note "all evidence records conform to the schema and bind the reviewed \
+release manifest"
 }
 
 # Sourceable for the source-binding self-test: dispatch only when executed.

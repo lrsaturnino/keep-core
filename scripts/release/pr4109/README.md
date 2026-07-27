@@ -86,10 +86,15 @@ the external `ETH_WS_URL` endpoint.
 
 Every accepted rehearsal run must produce an evidence record conforming to
 `rehearsal-evidence.schema.json`: exact source SHA, per-architecture image
-digests, chain ID and C, per-stage canonical/callback blocks, permit modes,
-gauge snapshots, transaction hashes, and non-secret state checksums.
-Screenshots alone are insufficient. `./rehearse.sh validate-evidence` checks
-every record under `EVIDENCE_DIR` against the schema, and the
+digests, chain ID and C, the sha256 of the reviewed `release-manifest.json`
+the fleet's termination grace was taken from, per-stage canonical/callback
+blocks, permit modes, gauge snapshots, transaction hashes, and non-secret
+state checksums. Screenshots alone are insufficient.
+`./rehearse.sh validate-evidence` checks every record under `EVIDENCE_DIR`
+against the schema and requires the recorded manifest hash to equal the
+checked-in manifest's — the Go drift tests pin that manifest's numbers to
+the compiled bounds, so an accepted record links the termination-grace
+record to the exact artifact and chain identity it carries — and the
 `cutover-rehearsal` workflow (manually dispatched, in
 `.github/workflows/cutover-rehearsal.yml`) runs the local proofs, the
 static analyzers, and the contracts build/test on every dispatch — and the

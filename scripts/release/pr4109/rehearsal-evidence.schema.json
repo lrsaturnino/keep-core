@@ -10,6 +10,7 @@
     "source_sha",
     "artifacts",
     "chain",
+    "release_manifest",
     "stages",
     "assertions"
   ],
@@ -49,6 +50,15 @@
       "properties": {
         "chain_id": { "type": "string" },
         "cutover_block": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "release_manifest": {
+      "description": "Content binding to the reviewed release manifest whose termination grace the rehearsal fleet ran under. The sha256 is over the exact release-manifest.json bytes; validate-evidence cross-checks it against the checked-in manifest, so a record links the grace record to the source SHA, image digests, and chain identity recorded above.",
+      "type": "object",
+      "required": ["sha256", "termination_grace_period_seconds"],
+      "properties": {
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "termination_grace_period_seconds": { "type": "integer", "minimum": 1 }
       }
     },
     "stages": {
