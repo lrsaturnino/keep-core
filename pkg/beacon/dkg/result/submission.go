@@ -1,13 +1,16 @@
 package result
 
 import (
+	"context"
 	"fmt"
+
 	"github.com/ipfs/go-log/v2"
 
 	beaconchain "github.com/keep-network/keep-core/pkg/beacon/chain"
 	"github.com/keep-network/keep-core/pkg/beacon/event"
 	"github.com/keep-network/keep-core/pkg/chain"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 )
 
 // SubmittingMember represents a member submitting a DKG result to the
@@ -50,14 +53,26 @@ func NewSubmittingMember(
 // successfully submitted on chain by the member. In case of failure or result
 // already submitted by another member it returns `0`.
 //
+// The context bounds the eligibility wait: canceling it aborts the submission
+// before the chain call. The commit guard is consulted immediately before the
+// terminal on-chain submission; a guard refusal is a release-gate decision,
+// not an ordinary submission failure.
+//
 // See Phase 14 of the protocol specification.
 func (sm *SubmittingMember) SubmitDKGResult(
+	ctx context.Context,
 	result *beaconchain.DKGResult,
 	signatures map[group.MemberIndex][]byte,
 	chainRelay beaconchain.Interface,
 	blockCounter chain.BlockCounter,
 	startBlockHeight uint64,
+	commitGuard participation.CommitGuard,
 ) error {
+	if commitGuard == nil {
+		// Submitting without a fence would publish a result the release gate
+		// never authorized; there is no implicit default.
+		return fmt.Errorf("a commit guard is required to submit a DKG result")
+	}
 	config := chainRelay.GetConfig()
 
 	// Chain rejects the result if it has less than 25% safety margin.
@@ -117,6 +132,19 @@ func (sm *SubmittingMember) SubmitDKGResult(
 			// submitting the result.
 			subscription.Unsubscribe()
 
+			// The last-moment completion fence, immediately before the
+			// terminal chain call: a ceremony that lost its permit to clock
+			// failure, quiescence, or the shutdown deadline must not submit.
+			if err := commitGuard.CheckCommit(
+				"beacon_dkg_result_submission",
+				participation.CompletionCommit,
+			); err != nil {
+				return fmt.Errorf(
+					"DKG result submission refused by the release gate: [%w]",
+					err,
+				)
+			}
+
 			sm.logger.Infof(
 				"[member:%v] submitting DKG result with public key [0x%x] and "+
 					"[%v] supporting member signatures at block [%v]",
@@ -140,6 +168,11 @@ func (sm *SubmittingMember) SubmitDKGResult(
 			// A result has been submitted by other member. Leave without
 			// publishing the result.
 			return nil
+		case <-ctx.Done():
+			return fmt.Errorf(
+				"DKG result submission canceled: [%w]",
+				context.Cause(ctx),
+			)
 		}
 	}
 }

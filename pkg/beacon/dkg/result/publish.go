@@ -1,6 +1,7 @@
 package result
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/ipfs/go-log/v2"
@@ -10,6 +11,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/chain"
 	"github.com/keep-network/keep-core/pkg/net"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/protocol/state"
 )
 
@@ -28,7 +30,13 @@ func RegisterUnmarshallers(channel net.BroadcastChannel) {
 // other signatures and results are received and accounted for. Those that match
 // our own result and added to the list of votes. Finally, we submit the result
 // along with everyone's votes.
+//
+// The context bounds the execution: canceling it aborts the publication
+// between block waits. The commit guard is consulted immediately before the
+// terminal on-chain submission; it must be the permit of the ceremony this
+// publication concludes.
 func Publish(
+	ctx context.Context,
 	logger log.StandardLogger,
 	sessionID string,
 	memberIndex group.MemberIndex,
@@ -39,7 +47,14 @@ func Publish(
 	beaconChain beaconchain.Interface,
 	blockCounter chain.BlockCounter,
 	startBlockHeight uint64,
+	commitGuard participation.CommitGuard,
 ) error {
+	if commitGuard == nil {
+		// Publishing without a fence would submit a result the release gate
+		// never authorized; there is no implicit default.
+		return fmt.Errorf("a commit guard is required to publish a DKG result")
+	}
+
 	initialState := &resultSigningState{
 		channel:                 channel,
 		beaconChain:             beaconChain,
@@ -48,9 +63,10 @@ func Publish(
 		result:                  convertGjkrResult(result),
 		signatureMessages:       make([]*DKGResultHashSignatureMessage, 0),
 		signingStartBlockHeight: startBlockHeight,
+		commitGuard:             commitGuard,
 	}
 
-	stateMachine := state.NewSyncMachine(logger, channel, blockCounter, initialState)
+	stateMachine := state.NewSyncMachine(logger, ctx, channel, blockCounter, initialState)
 
 	lastState, _, err := stateMachine.Execute(startBlockHeight)
 	if err != nil {

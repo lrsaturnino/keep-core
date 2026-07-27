@@ -22,11 +22,13 @@ import (
 	dkgResult "github.com/keep-network/keep-core/pkg/beacon/dkg/result"
 	"github.com/keep-network/keep-core/pkg/beacon/event"
 	"github.com/keep-network/keep-core/pkg/beacon/gjkr"
+	"github.com/keep-network/keep-core/pkg/clientinfo"
 	"github.com/keep-network/keep-core/pkg/internal/interception"
 	netLocal "github.com/keep-network/keep-core/pkg/net/local"
 	"github.com/keep-network/keep-core/pkg/operator"
 	"github.com/keep-network/keep-core/pkg/protocol/compatibility"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 )
 
 // Result of a DKG test execution.
@@ -227,6 +229,23 @@ func executeDKG(
 	// make sure all members are up.
 	startBlockHeight := currentBlockHeight + 3
 
+	// The harness runs every member through a real participation gate with the
+	// developer-only disabled schedule: each member holds a permit whose
+	// context and commit fence follow the production execution path, while the
+	// cryptographic behavior stays selected by the explicit per-member strategy
+	// bundle. The anchor is the current height because the deliberately future
+	// execution start block is not a canonical chain anchor.
+	gate, err := participation.NewGate(
+		context.Background(),
+		participation.Schedule{},
+		blockCounter,
+		&clientinfo.NoOpPerformanceMetrics{},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("cannot construct the test gate: [%v]", err)
+	}
+	defer gate.Close()
+
 	gjkr.RegisterUnmarshallers(broadcastChannel)
 	dkgResult.RegisterUnmarshallers(broadcastChannel)
 
@@ -243,8 +262,21 @@ func executeDKG(
 
 	for i := 0; i < beaconConfig.GroupSize; i++ {
 		memberIndex := group.MemberIndex(i + 1) // capture for goroutine
+
+		permit, err := gate.Begin(participation.BeaconDKG, currentBlockHeight)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"cannot begin the ceremony for member [%v]: [%v]",
+				memberIndex,
+				err,
+			)
+		}
+
 		go func() {
+			defer permit.Close()
+
 			signer, err := dkg.ExecuteDKG(
+				permit.Context(),
 				memberLogger,
 				seed,
 				memberIndex,
@@ -254,6 +286,7 @@ func executeDKG(
 				membershipValidator,
 				selectedOperators,
 				strategiesForMember(memberIndex),
+				permit,
 			)
 			if signer != nil {
 				signersMutex.Lock()

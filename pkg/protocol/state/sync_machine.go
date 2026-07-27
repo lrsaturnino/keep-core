@@ -32,20 +32,28 @@ const syncReceiveBuffer = 128
 // if some members expected to participate in the execution are inactive.
 type SyncMachine struct {
 	logger       log.StandardLogger
+	ctx          context.Context
 	channel      net.BroadcastChannel
 	blockCounter chain.BlockCounter
 	initialState SyncState // first state from which execution starts
 }
 
 // NewSyncMachine returns a new protocol state machine.
+//
+// The context passed to NewSyncMachine must be active for the entire lifetime
+// of the execution. Canceling it aborts the machine between state-internal
+// block waits: per-state work receives a context derived from it, and the
+// message loop returns the cancellation cause as its error.
 func NewSyncMachine(
 	logger log.StandardLogger,
+	ctx context.Context,
 	channel net.BroadcastChannel,
 	blockCounter chain.BlockCounter,
 	initialState SyncState,
 ) *SyncMachine {
 	return &SyncMachine{
 		logger:       logger,
+		ctx:          ctx,
 		channel:      channel,
 		blockCounter: blockCounter,
 		initialState: initialState,
@@ -61,7 +69,7 @@ func (sm *SyncMachine) Execute(startBlockHeight uint64) (SyncState, uint64, erro
 	}
 
 	currentState := sm.initialState
-	ctx, cancelCtx := context.WithCancel(context.Background())
+	ctx, cancelCtx := context.WithCancel(sm.ctx)
 	sm.channel.Recv(ctx, handler)
 
 	sm.logger.Infof(
@@ -125,7 +133,7 @@ func (sm *SyncMachine) Execute(startBlockHeight uint64) (SyncState, uint64, erro
 			}
 
 			currentState = nextState
-			ctx, cancelCtx = context.WithCancel(context.Background())
+			ctx, cancelCtx = context.WithCancel(sm.ctx)
 			sm.channel.Recv(ctx, handler)
 
 			blockWaiter, err = stateTransition(
@@ -139,6 +147,14 @@ func (sm *SyncMachine) Execute(startBlockHeight uint64) (SyncState, uint64, erro
 				cancelCtx()
 				return nil, 0, err
 			}
+
+		case <-sm.ctx.Done():
+			cancelCtx()
+			return nil, 0, fmt.Errorf(
+				"execution of state [%T] canceled: [%w]",
+				currentState,
+				context.Cause(sm.ctx),
+			)
 		}
 	}
 }

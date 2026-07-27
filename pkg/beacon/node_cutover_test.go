@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 	beaconchain "github.com/keep-network/keep-core/pkg/beacon/chain"
 	"github.com/keep-network/keep-core/pkg/beacon/dkg"
 	"github.com/keep-network/keep-core/pkg/beacon/event"
+	"github.com/keep-network/keep-core/pkg/beacon/gjkr"
 	"github.com/keep-network/keep-core/pkg/beacon/registry"
 	"github.com/keep-network/keep-core/pkg/chain"
 	"github.com/keep-network/keep-core/pkg/chain/local_v1"
@@ -43,6 +46,55 @@ func (cutoverFakePersistence) ReadAll() (
 	close(data)
 	close(errs)
 	return data, errs
+}
+
+// cutoverRecordingPersistence records every saved file name so tests can
+// assert exactly which namespace received signer material.
+type cutoverRecordingPersistence struct {
+	cutoverFakePersistence
+
+	mu    sync.Mutex
+	saves []string
+}
+
+func (p *cutoverRecordingPersistence) Save(
+	data []byte,
+	directory string,
+	name string,
+) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.saves = append(p.saves, directory+name)
+	return nil
+}
+
+// savesContaining counts recorded saves whose path contains the given marker.
+func (p *cutoverRecordingPersistence) savesContaining(marker string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	count := 0
+	for _, save := range p.saves {
+		if strings.Contains(save, marker) {
+			count++
+		}
+	}
+	return count
+}
+
+// cutoverFailableBlockCounter delegates to the real local chain clock until a
+// test induces a synchronous read failure; waiters keep working, matching a
+// failing RPC current-height call.
+type cutoverFailableBlockCounter struct {
+	chain.BlockCounter
+
+	failing atomic.Bool
+}
+
+func (c *cutoverFailableBlockCounter) CurrentBlock() (uint64, error) {
+	if c.failing.Load() {
+		return 0, fmt.Errorf("induced clock failure")
+	}
+	return c.BlockCounter.CurrentBlock()
 }
 
 // cutoverTestChain delegates to the local chain but returns a fixed group
@@ -92,12 +144,15 @@ type cutoverLocalChain interface {
 
 // cutoverNodeHarness bundles everything a node-level cutover test drives.
 type cutoverNodeHarness struct {
-	node        *node
-	localChain  cutoverLocalChain
-	gate        participation.Gate
-	gateMetrics *cutoverGateMetrics
-	anchorBlock uint64
-	groupSize   int
+	node                  *node
+	localChain            cutoverLocalChain
+	gate                  participation.Gate
+	gateMetrics           *cutoverGateMetrics
+	gateClock             *cutoverFailableBlockCounter
+	registryPersistence   *cutoverRecordingPersistence
+	quarantinePersistence *cutoverRecordingPersistence
+	anchorBlock           uint64
+	groupSize             int
 }
 
 // newCutoverNodeHarness builds a beacon node over the local chain and network
@@ -141,10 +196,11 @@ func newCutoverNodeHarness(
 	}
 
 	gateMetrics := newCutoverGateMetrics()
+	gateClock := &cutoverFailableBlockCounter{BlockCounter: blockCounter}
 	gate, err := participation.NewGate(
 		context.Background(),
 		participation.Schedule{CutoverBlock: cutoverBlockFor(currentBlock)},
-		blockCounter,
+		gateClock,
 		gateMetrics,
 	)
 	if err != nil {
@@ -178,11 +234,15 @@ func newCutoverNodeHarness(
 		selectedOperators: selectedOperators,
 	}
 
+	registryPersistence := &cutoverRecordingPersistence{}
 	groupRegistry := registry.NewGroupRegistry(
 		logger,
 		testChain,
-		cutoverFakePersistence{},
+		registryPersistence,
 	)
+
+	quarantinePersistence := &cutoverRecordingPersistence{}
+	signerQuarantine := registry.NewQuarantine(logger, quarantinePersistence)
 
 	node := newNode(
 		testChain,
@@ -190,15 +250,19 @@ func newCutoverNodeHarness(
 		groupRegistry,
 		generator.StartScheduler(),
 		gate,
+		signerQuarantine,
 	)
 
 	return &cutoverNodeHarness{
-		node:        node,
-		localChain:  localChain,
-		gate:        gate,
-		gateMetrics: gateMetrics,
-		anchorBlock: currentBlock,
-		groupSize:   groupSize,
+		node:                  node,
+		localChain:            localChain,
+		gate:                  gate,
+		gateMetrics:           gateMetrics,
+		gateClock:             gateClock,
+		registryPersistence:   registryPersistence,
+		quarantinePersistence: quarantinePersistence,
+		anchorBlock:           currentBlock,
+		groupSize:             groupSize,
 	}
 }
 
@@ -236,14 +300,23 @@ func (h *cutoverNodeHarness) runCeremonyToCompletion(
 
 	// Members close their permits after signer registration; wait for the
 	// gate to drain so the assertion sees final accounting.
-	deadline := time.Now().Add(30 * time.Second)
+	h.waitForPermitRelease(t)
+}
+
+// waitForPermitRelease waits until every member goroutine released its permit,
+// so assertions see the final gate accounting and every quarantine or
+// registration write has happened.
+func (h *cutoverNodeHarness) waitForPermitRelease(t *testing.T) {
+	t.Helper()
+
+	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		if h.gate.State().ActiveCeremonies == 0 {
 			return
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatal("permits were not released after the ceremony completed")
+	t.Fatal("permits were not released")
 }
 
 // TestJoinDKGIfEligible_AnchorBelowCutoverRunsLegacyCeremony proves the node
@@ -458,13 +531,42 @@ func TestJoinDKGIfEligible_LegacyAnchorInteroperatesWithLegacyPeers(t *testing.T
 		externalSigner,
 	)
 
+	// The standalone legacy peers run through their own always-legacy gate —
+	// the pre-cutover peer behavior — so their execution path carries a permit
+	// context and commit guard exactly like a production member.
+	externalBlockCounter, err := harness.localChain.BlockCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	externalMetrics := newCutoverGateMetrics()
+	externalGate, err := participation.NewGate(
+		context.Background(),
+		participation.Schedule{},
+		externalBlockCounter,
+		externalMetrics,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(externalGate.Close)
+
 	externalErrors := make(chan error, 3)
 	var externalWait sync.WaitGroup
 	for _, memberIndex := range []group.MemberIndex{3, 4, 5} {
+		externalPermit, err := externalGate.Begin(
+			participation.BeaconDKG,
+			harness.anchorBlock,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
 		externalWait.Add(1)
 		go func(memberIndex group.MemberIndex) {
 			defer externalWait.Done()
+			defer externalPermit.Close()
 			_, err := dkg.ExecuteDKG(
+				externalPermit.Context(),
 				logger,
 				seed,
 				memberIndex,
@@ -474,6 +576,7 @@ func TestJoinDKGIfEligible_LegacyAnchorInteroperatesWithLegacyPeers(t *testing.T
 				membershipValidator,
 				selectedOperators,
 				compatibility.Legacy(),
+				externalPermit,
 			)
 			if err != nil {
 				externalErrors <- fmt.Errorf(
@@ -504,5 +607,270 @@ func TestJoinDKGIfEligible_LegacyAnchorInteroperatesWithLegacyPeers(t *testing.T
 	}
 	if securityV2 != 0 {
 		t.Errorf("expected no security-v2 permits, got [%f]", securityV2)
+	}
+}
+
+// TestJoinDKGIfEligible_LegacyPermitCompletesAfterCutover proves a permit
+// pinned from a pre-cutover anchor survives the cutover block and completes in
+// legacy mode: the cutover falls in the middle of the ceremony, the process
+// state transitions to open_security_v2, yet every member finishes with its
+// legacy permit and the completion commits are accepted and counted as
+// legacy completions after the cutover.
+func TestJoinDKGIfEligible_LegacyPermitCompletesAfterCutover(t *testing.T) {
+	harness := newCutoverNodeHarness(
+		t,
+		5,
+		3,
+		// The cutover block falls inside the ceremony: the DKG protocol takes
+		// tens of blocks beyond the GJKR phase alone, so block anchor+30 is
+		// crossed while the ceremony is still running.
+		func(currentBlock uint64) uint64 { return currentBlock + 30 },
+		nil,
+	)
+
+	harness.runCeremonyToCompletion(t, cutoverRandomSeed(t))
+
+	legacy := harness.gateMetrics.counter(
+		clientinfo.MetricParticipationModeLegacyTotal,
+	)
+	securityV2 := harness.gateMetrics.counter(
+		clientinfo.MetricParticipationModeSecurityV2Total,
+	)
+	if legacy != float64(harness.groupSize) {
+		t.Errorf(
+			"expected [%d] legacy permits, got [%f]",
+			harness.groupSize,
+			legacy,
+		)
+	}
+	if securityV2 != 0 {
+		t.Errorf("expected no security-v2 permits, got [%f]", securityV2)
+	}
+
+	// The ceremony must genuinely have completed at or after the cutover
+	// block: the process state already derives open_security_v2 while every
+	// signer activation still committed under its legacy permit.
+	if state := harness.gate.State(); state.State != participation.StateOpenSecurityV2 {
+		t.Errorf(
+			"expected the process state [%s] after the cutover, got [%s]",
+			participation.StateOpenSecurityV2,
+			state.State,
+		)
+	}
+	completions := harness.gateMetrics.counter(
+		clientinfo.MetricParticipationLegacyCompletionsAfterCutoverTotal,
+	)
+	if completions < float64(harness.groupSize) {
+		t.Errorf(
+			"expected at least [%d] legacy completions after the cutover "+
+				"(one signer activation per member), got [%f]",
+			harness.groupSize,
+			completions,
+		)
+	}
+
+	// Every member's accepted signer was activated normally.
+	if got := harness.registryPersistence.savesContaining("/membership_"); got != harness.groupSize {
+		t.Errorf(
+			"expected [%d] active membership saves, got [%d]",
+			harness.groupSize,
+			got,
+		)
+	}
+	if got := harness.quarantinePersistence.savesContaining("/membership_"); got != 0 {
+		t.Errorf("expected no quarantined memberships, got [%d]", got)
+	}
+}
+
+// TestJoinDKGIfEligible_ForcedShutdownAfterKeyGenerationQuarantinesSigner
+// proves the forced-quiescence path after share generation: the gate is
+// force-closed inside the result publication window, when the group key
+// material already exists but no on-chain publication was observed. Every
+// member's orphaned signer must be preserved in the quarantine namespace, no
+// active membership may be written, and nothing may reach the chain.
+func TestJoinDKGIfEligible_ForcedShutdownAfterKeyGenerationQuarantinesSigner(t *testing.T) {
+	harness := newCutoverNodeHarness(
+		t,
+		2,
+		2,
+		func(currentBlock uint64) uint64 { return currentBlock + 100_000 },
+		nil,
+	)
+
+	blockCounter, err := harness.localChain.BlockCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The trigger fires inside the result publication signing window: after
+	// the last GJKR protocol block, before the earliest possible submission.
+	trigger, err := blockCounter.BlockHeightWaiter(
+		harness.anchorBlock + gjkr.ProtocolBlocks() + 2,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
+		<-trigger
+		harness.gate.Quiesce(fmt.Errorf("test shutdown"))
+		harness.gate.Close()
+	}()
+
+	harness.node.JoinDKGIfEligible(cutoverRandomSeed(t), harness.anchorBlock)
+
+	<-shutdownDone
+	harness.waitForPermitRelease(t)
+
+	if result, _ := harness.localChain.GetLastDKGResult(); result != nil {
+		t.Error("expected no DKG result after the forced shutdown")
+	}
+	if got := harness.quarantinePersistence.savesContaining("/membership_"); got != harness.groupSize {
+		t.Errorf(
+			"expected [%d] quarantined memberships, got [%d]",
+			harness.groupSize,
+			got,
+		)
+	}
+	if got := harness.quarantinePersistence.savesContaining("/metadata_"); got != harness.groupSize {
+		t.Errorf(
+			"expected [%d] quarantine metadata records, got [%d]",
+			harness.groupSize,
+			got,
+		)
+	}
+	if got := harness.registryPersistence.savesContaining("/membership_"); got != 0 {
+		t.Errorf(
+			"expected no active membership saves, got [%d]",
+			got,
+		)
+	}
+	forcedAborts := harness.gateMetrics.counter(
+		clientinfo.MetricParticipationQuiesceForcedAbortsTotal,
+	)
+	if forcedAborts != float64(harness.groupSize) {
+		t.Errorf(
+			"expected [%d] forced aborts, got [%f]",
+			harness.groupSize,
+			forcedAborts,
+		)
+	}
+}
+
+// TestJoinDKGIfEligible_ClockFailureAfterKeyGenerationQuarantinesSigner proves
+// the chain-clock-failure path after share generation: the gate's synchronous
+// clock reads start failing inside the result publication window. The commit
+// fence and the clock supervisor fail closed, the permits are canceled with
+// the clock sentinel, and every member's orphaned signer is preserved in the
+// quarantine namespace without any on-chain submission.
+func TestJoinDKGIfEligible_ClockFailureAfterKeyGenerationQuarantinesSigner(t *testing.T) {
+	harness := newCutoverNodeHarness(
+		t,
+		2,
+		2,
+		func(currentBlock uint64) uint64 { return currentBlock + 100_000 },
+		nil,
+	)
+
+	blockCounter, err := harness.localChain.BlockCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The trigger fires inside the result publication signing window: after
+	// the last GJKR protocol block, before the earliest possible submission.
+	trigger, err := blockCounter.BlockHeightWaiter(
+		harness.anchorBlock + gjkr.ProtocolBlocks() + 2,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clockFailed := make(chan struct{})
+	go func() {
+		defer close(clockFailed)
+		<-trigger
+		harness.gateClock.failing.Store(true)
+	}()
+
+	harness.node.JoinDKGIfEligible(cutoverRandomSeed(t), harness.anchorBlock)
+
+	<-clockFailed
+	harness.waitForPermitRelease(t)
+
+	if result, _ := harness.localChain.GetLastDKGResult(); result != nil {
+		t.Error("expected no DKG result after the clock failure")
+	}
+	if got := harness.quarantinePersistence.savesContaining("/membership_"); got != harness.groupSize {
+		t.Errorf(
+			"expected [%d] quarantined memberships, got [%d]",
+			harness.groupSize,
+			got,
+		)
+	}
+	if got := harness.registryPersistence.savesContaining("/membership_"); got != 0 {
+		t.Errorf(
+			"expected no active membership saves, got [%d]",
+			got,
+		)
+	}
+	clockAborts := harness.gateMetrics.counter(
+		clientinfo.MetricParticipationClockAbortsTotal,
+	)
+	if clockAborts != float64(harness.groupSize) {
+		t.Errorf(
+			"expected [%d] clock aborts, got [%f]",
+			harness.groupSize,
+			clockAborts,
+		)
+	}
+}
+
+// TestJoinDKGIfEligible_GateCancellationDuringKeyGenerationAbortsCleanly
+// proves cancellation reaches a running ceremony before key material exists:
+// the gate is force-closed right after the members start, every member aborts
+// as a gate decision — not an ordinary DKG failure — and nothing is
+// quarantined, registered, or submitted.
+func TestJoinDKGIfEligible_GateCancellationDuringKeyGenerationAbortsCleanly(t *testing.T) {
+	harness := newCutoverNodeHarness(
+		t,
+		2,
+		2,
+		func(currentBlock uint64) uint64 { return currentBlock + 100_000 },
+		nil,
+	)
+
+	harness.node.JoinDKGIfEligible(cutoverRandomSeed(t), harness.anchorBlock)
+
+	// The members are inside GJKR now: no group key material exists yet.
+	harness.gate.Quiesce(fmt.Errorf("test shutdown"))
+	harness.gate.Close()
+
+	harness.waitForPermitRelease(t)
+
+	if result, _ := harness.localChain.GetLastDKGResult(); result != nil {
+		t.Error("expected no DKG result after the cancellation")
+	}
+	if got := harness.quarantinePersistence.savesContaining("/membership_"); got != 0 {
+		t.Errorf(
+			"expected no quarantined memberships before key generation, "+
+				"got [%d]",
+			got,
+		)
+	}
+	if got := harness.registryPersistence.savesContaining("/membership_"); got != 0 {
+		t.Errorf("expected no active membership saves, got [%d]", got)
+	}
+	forcedAborts := harness.gateMetrics.counter(
+		clientinfo.MetricParticipationQuiesceForcedAbortsTotal,
+	)
+	if forcedAborts != float64(harness.groupSize) {
+		t.Errorf(
+			"expected [%d] forced aborts, got [%f]",
+			harness.groupSize,
+			forcedAborts,
+		)
 	}
 }

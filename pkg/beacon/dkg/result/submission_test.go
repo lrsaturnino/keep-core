@@ -1,6 +1,8 @@
 package result
 
 import (
+	"context"
+	"errors"
 	"testing"
 
 	"github.com/keep-network/keep-core/internal/testutils"
@@ -8,8 +10,39 @@ import (
 
 	beaconchain "github.com/keep-network/keep-core/pkg/beacon/chain"
 	"github.com/keep-network/keep-core/pkg/chain"
+	"github.com/keep-network/keep-core/pkg/clientinfo"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 )
+
+// testCommitPermit issues a real gate permit over the given block counter with
+// the developer-only disabled schedule, so submissions exercise the production
+// commit fence. The returned permit doubles as the commit guard.
+func testCommitPermit(
+	t *testing.T,
+	blockCounter chain.BlockCounter,
+) participation.Permit {
+	t.Helper()
+
+	gate, err := participation.NewGate(
+		context.Background(),
+		participation.Schedule{},
+		blockCounter,
+		&clientinfo.NoOpPerformanceMetrics{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(gate.Close)
+
+	permit, err := gate.Begin(participation.BeaconDKG, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(permit.Close)
+
+	return permit
+}
 
 func TestSubmitDKGResult(t *testing.T) {
 	honestThreshold := 3
@@ -77,11 +110,13 @@ func TestSubmitDKGResult(t *testing.T) {
 			}
 
 			err = member.SubmitDKGResult(
+				context.Background(),
 				result,
 				signatures,
 				beaconChain,
 				blockCounter,
 				initialBlockHeight,
+				testCommitPermit(t, blockCounter),
 			)
 			if err != nil {
 				t.Fatalf("\nexpected: %s\nactual:   %s\n", "", err)
@@ -197,13 +232,16 @@ func TestConcurrentPublishResult(t *testing.T) {
 			result2Chan := make(chan uint64)
 			defer close(result2Chan)
 
+			member2Permit := testCommitPermit(t, blockCounter)
 			go func() {
 				err := member2.SubmitDKGResult(
+					context.Background(),
 					test.resultToPublish2,
 					signatures,
 					chainHandle,
 					blockCounter,
 					initialBlock,
+					member2Permit,
 				)
 				if err != nil {
 					t.Error(err)
@@ -218,13 +256,16 @@ func TestConcurrentPublishResult(t *testing.T) {
 			// before member1 can submit.
 			<-subscriptionRegistered
 
+			member1Permit := testCommitPermit(t, blockCounter)
 			go func() {
 				err := member1.SubmitDKGResult(
+					context.Background(),
 					test.resultToPublish1,
 					signatures,
 					chainHandle,
 					blockCounter,
 					initialBlock,
+					member1Permit,
 				)
 				if err != nil {
 					t.Error(err)
@@ -241,6 +282,193 @@ func TestConcurrentPublishResult(t *testing.T) {
 				t.Errorf("\nexpected: %v\nactual:   %v\n", expectedBlockEnd2, result2)
 			}
 		})
+	}
+}
+
+// TestSubmitDKGResult_RefusedByGateFence proves the commit fence guards the
+// terminal chain call: a permit force-canceled at the gate's shutdown deadline
+// refuses the submission with the gate sentinel and nothing reaches the chain.
+func TestSubmitDKGResult_RefusedByGateFence(t *testing.T) {
+	honestThreshold := 3
+	groupSize := 5
+
+	beaconChain, blockCounter, initialBlockHeight, err := initChainHandle(
+		honestThreshold,
+		groupSize,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gate, err := participation.NewGate(
+		context.Background(),
+		participation.Schedule{},
+		blockCounter,
+		&clientinfo.NoOpPerformanceMetrics{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(gate.Close)
+
+	permit, err := gate.Begin(participation.BeaconDKG, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer permit.Close()
+
+	// The terminal shutdown force-cancels the permit: the fence must refuse
+	// from here on.
+	gate.Quiesce(errors.New("test shutdown"))
+	gate.Close()
+
+	result := &beaconchain.DKGResult{
+		GroupPublicKey: []byte{124, 46},
+	}
+	signatures := map[group.MemberIndex][]byte{
+		1: {101},
+		2: {102},
+		3: {103},
+		4: {104},
+	}
+
+	member := &SubmittingMember{
+		logger: &testutils.MockLogger{},
+		index:  group.MemberIndex(1),
+	}
+
+	err = member.SubmitDKGResult(
+		context.Background(),
+		result,
+		signatures,
+		beaconChain,
+		blockCounter,
+		initialBlockHeight,
+		permit,
+	)
+	if !participation.IsGateRefusal(err) {
+		t.Fatalf("expected a gate refusal, got [%v]", err)
+	}
+
+	isSubmitted, err := beaconChain.IsGroupRegistered(result.GroupPublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if isSubmitted {
+		t.Error("expected no result submission after a fence refusal")
+	}
+}
+
+// TestSubmitDKGResult_NilGuardFailsClosed proves a submission without a commit
+// guard is refused before any chain interaction: there is no implicit default
+// fence.
+func TestSubmitDKGResult_NilGuardFailsClosed(t *testing.T) {
+	honestThreshold := 3
+	groupSize := 5
+
+	beaconChain, blockCounter, initialBlockHeight, err := initChainHandle(
+		honestThreshold,
+		groupSize,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := &beaconchain.DKGResult{
+		GroupPublicKey: []byte{125, 47},
+	}
+	signatures := map[group.MemberIndex][]byte{
+		1: {101},
+		2: {102},
+		3: {103},
+		4: {104},
+	}
+
+	member := &SubmittingMember{
+		logger: &testutils.MockLogger{},
+		index:  group.MemberIndex(1),
+	}
+
+	err = member.SubmitDKGResult(
+		context.Background(),
+		result,
+		signatures,
+		beaconChain,
+		blockCounter,
+		initialBlockHeight,
+		nil,
+	)
+	if err == nil {
+		t.Fatal("expected an error for a nil commit guard")
+	}
+
+	isSubmitted, err := beaconChain.IsGroupRegistered(result.GroupPublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if isSubmitted {
+		t.Error("expected no result submission without a commit guard")
+	}
+}
+
+// TestSubmitDKGResult_CanceledContext proves a canceled execution context
+// aborts the eligibility wait with the cancellation cause before the chain
+// call.
+func TestSubmitDKGResult_CanceledContext(t *testing.T) {
+	honestThreshold := 3
+	groupSize := 5
+
+	beaconChain, blockCounter, initialBlockHeight, err := initChainHandle(
+		honestThreshold,
+		groupSize,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := &beaconchain.DKGResult{
+		GroupPublicKey: []byte{126, 48},
+	}
+	signatures := map[group.MemberIndex][]byte{
+		1: {101},
+		2: {102},
+		3: {103},
+		4: {104},
+	}
+
+	// A later member index keeps the eligibility waiter pending long enough
+	// for the canceled context to win the select deterministically.
+	member := &SubmittingMember{
+		logger: &testutils.MockLogger{},
+		index:  group.MemberIndex(5),
+	}
+
+	cause := errors.New("cancellation cause")
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(cause)
+
+	err = member.SubmitDKGResult(
+		ctx,
+		result,
+		signatures,
+		beaconChain,
+		blockCounter,
+		initialBlockHeight,
+		testCommitPermit(t, blockCounter),
+	)
+	if !errors.Is(err, cause) {
+		t.Fatalf(
+			"expected the cancellation cause in the error chain, got [%v]",
+			err,
+		)
+	}
+
+	isSubmitted, err := beaconChain.IsGroupRegistered(result.GroupPublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if isSubmitted {
+		t.Error("expected no result submission after cancellation")
 	}
 }
 

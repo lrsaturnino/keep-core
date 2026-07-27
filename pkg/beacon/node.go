@@ -2,10 +2,12 @@ package beacon
 
 import (
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math/big"
 
 	bn256 "github.com/ethereum/go-ethereum/crypto/bn256/cloudflare"
+	"github.com/ipfs/go-log/v2"
 	"go.uber.org/zap"
 
 	"github.com/keep-network/keep-core/pkg/altbn128"
@@ -33,6 +35,11 @@ type node struct {
 	// constructed once at process startup and shared with the tBTC
 	// application.
 	participationGate participation.Gate
+
+	// signerQuarantine preserves signer outputs whose completion the gate
+	// interrupted before an accepted on-chain publication was observed. It
+	// writes to a dedicated protected namespace outside the active-group scan.
+	signerQuarantine *registry.Quarantine
 }
 
 // newNode returns an empty node with no group, zero group count, and a nil last
@@ -43,6 +50,7 @@ func newNode(
 	groupRegistry *registry.Groups,
 	scheduler *generator.Scheduler,
 	participationGate participation.Gate,
+	signerQuarantine *registry.Quarantine,
 ) *node {
 	latch := generator.NewProtocolLatch()
 	scheduler.RegisterProtocol(latch)
@@ -53,6 +61,7 @@ func newNode(
 		groupRegistry:     groupRegistry,
 		protocolLatch:     latch,
 		participationGate: participationGate,
+		signerQuarantine:  signerQuarantine,
 	}
 }
 
@@ -140,6 +149,15 @@ func (n *node) JoinDKGIfEligible(
 			return
 		}
 
+		if n.signerQuarantine == nil {
+			// Without a quarantine store a gate interruption after key
+			// generation would have to drop the generated share. Fail closed.
+			dkgLogger.Errorf(
+				"no signer quarantine store; refusing to join DKG",
+			)
+			return
+		}
+
 		broadcastChannel, err := n.netProvider.BroadcastChannelFor(channelName)
 		if err != nil {
 			dkgLogger.Errorf("failed to get broadcast channel: [%v]", err)
@@ -216,6 +234,7 @@ func (n *node) JoinDKGIfEligible(
 				)
 
 				signer, err := dkg.ExecuteDKG(
+					permit.Context(),
 					dkgLogger,
 					dkgSeed,
 					memberIndex,
@@ -225,9 +244,33 @@ func (n *node) JoinDKGIfEligible(
 					membershipValidator,
 					selectedOperators,
 					strategies,
+					permit,
 				)
 				if err != nil {
-					dkgLogger.Errorf("failed to execute dkg: [%v]", err)
+					var interrupted *dkg.PublicationInterruptedError
+					switch {
+					case errors.As(err, &interrupted):
+						// The gate stopped the ceremony after key generation
+						// but before an accepted publication was observed:
+						// preserve the orphaned share for the offline audit.
+						n.quarantineSigner(
+							dkgLogger,
+							memberIndex,
+							interrupted,
+							permit,
+						)
+					case participation.IsGateRefusal(err):
+						// A gate decision before key generation is not an
+						// ordinary DKG failure.
+						dkgLogger.Warnf(
+							"[member:%v] DKG canceled by the participation "+
+								"gate: [%v]",
+							memberIndex,
+							err,
+						)
+					default:
+						dkgLogger.Errorf("failed to execute dkg: [%v]", err)
+					}
 					return
 				}
 
@@ -235,7 +278,40 @@ func (n *node) JoinDKGIfEligible(
 					signer.GroupPublicKeyBytesCompressed(),
 				)
 
-				// TODO: Consider snapshotting the key material just in case.
+				// The result reached the chain, so the share must be preserved
+				// durably in every outcome. The fence decides only whether this
+				// process may also activate it now: during quiescence or after
+				// a clock failure the accepted share is saved without
+				// activation and loads as active on the next start.
+				err = permit.CheckCommit(
+					"beacon_dkg_signer_activation",
+					participation.CompletionCommit,
+				)
+				if err != nil {
+					dkgLogger.Warnf(
+						"[member:%v] activation of group [0x%v] refused by "+
+							"the release gate; preserving the accepted signer "+
+							"without activation: [%v]",
+						signer.MemberID(),
+						groupPublicKey,
+						err,
+					)
+					if saveErr := n.groupRegistry.SaveAcceptedGroup(
+						signer,
+						groupPublicKey,
+					); saveErr != nil {
+						dkgLogger.Errorf(
+							"[member:%v] failed to preserve the accepted "+
+								"signer of group [0x%v]; the share is only "+
+								"in memory: [%v]",
+							signer.MemberID(),
+							groupPublicKey,
+							saveErr,
+						)
+					}
+					return
+				}
+
 				err = n.groupRegistry.RegisterGroup(signer, groupPublicKey)
 				if err != nil {
 					dkgLogger.Errorf(
@@ -256,6 +332,56 @@ func (n *node) JoinDKGIfEligible(
 		}
 	} else {
 		dkgLogger.Infof("not eligible for DKG")
+	}
+}
+
+// quarantineSigner preserves a signer output whose publication the release
+// gate interrupted. The share may still be part of a result other members
+// published, so it cannot be dropped, and no acceptance was observed locally,
+// so it must not be activated; the offline state audit reconciles it against
+// the chain. A preservation failure is a WARN-level protocol violation and is
+// never suppressed.
+func (n *node) quarantineSigner(
+	dkgLogger log.StandardLogger,
+	memberIndex group.MemberIndex,
+	interrupted *dkg.PublicationInterruptedError,
+	permit participation.Permit,
+) {
+	dkgLogger.Warnf(
+		"[member:%v] DKG interrupted by the participation gate after key "+
+			"generation; quarantining the signer output: [%v]",
+		memberIndex,
+		interrupted.Cause,
+	)
+
+	gateSnapshot := n.participationGate.State()
+
+	channelName := hex.EncodeToString(
+		interrupted.Signer.GroupPublicKeyBytesCompressed(),
+	)
+
+	err := n.signerQuarantine.Preserve(
+		&registry.Membership{
+			Signer:      interrupted.Signer,
+			ChannelName: channelName,
+		},
+		registry.QuarantinedSignerMetadata{
+			ReleaseEpoch:        participation.CompiledEpoch.String(),
+			ProtocolMode:        permit.Mode().String(),
+			CutoverBlock:        gateSnapshot.CutoverBlock,
+			CanonicalStartBlock: permit.CanonicalStartBlock(),
+			Ceremony:            string(permit.Ceremony()),
+			FailedOperation:     "beacon_dkg_result_publication",
+			LastObservedBlock:   gateSnapshot.CurrentBlock,
+		},
+	)
+	if err != nil {
+		dkgLogger.Errorf(
+			"[member:%v] failed to quarantine the interrupted signer "+
+				"output; the share is only in memory: [%v]",
+			memberIndex,
+			err,
+		)
 	}
 }
 

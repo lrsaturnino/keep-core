@@ -1,6 +1,7 @@
 package gjkr
 
 import (
+	"context"
 	"fmt"
 	"math/big"
 
@@ -59,7 +60,11 @@ func RegisterUnmarshallers(channel net.BroadcastChannel) {
 // transcript-sensitive cryptographic decision of the ceremony — the ECDH
 // derivation and the hash-to-point mapping behind the Pedersen generator H —
 // and must be supplied explicitly; there is no implicit default mode.
+//
+// The context bounds the execution: canceling it aborts the protocol between
+// block waits and the error carries the cancellation cause.
 func Execute(
+	ctx context.Context,
 	logger log.StandardLogger,
 	seed *big.Int,
 	sessionID string,
@@ -93,7 +98,7 @@ func Execute(
 		member:  member.InitializeEphemeralKeysGeneration(),
 	}
 
-	stateMachine := state.NewSyncMachine(logger, channel, blockCounter, initialState)
+	stateMachine := state.NewSyncMachine(logger, ctx, channel, blockCounter, initialState)
 
 	lastState, endBlockHeight, err := stateMachine.Execute(startBlockHeight)
 	if err != nil {

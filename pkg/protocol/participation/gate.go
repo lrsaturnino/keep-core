@@ -109,11 +109,49 @@ var (
 	ErrPermitClosed = errors.New("participation permit is closed")
 )
 
+// IsGateRefusal reports whether the error is, or wraps, one of the gate's
+// sentinel errors: the work was refused, canceled, or fenced off by the
+// release gate rather than failing on its own protocol terms. Callers use it
+// to keep gate decisions out of ordinary failure logs and metrics; it also
+// matches a permit context's cancellation cause propagated through an error
+// chain.
+func IsGateRefusal(err error) bool {
+	for _, sentinel := range []error{
+		ErrInvalidAnchor,
+		ErrClockUnavailable,
+		ErrQuiescing,
+		ErrQuiesceDeadline,
+		ErrResumeUnsupported,
+		ErrPenaltySuppressed,
+		ErrCommitBeforeCutover,
+		ErrPermitClosed,
+	} {
+		if errors.Is(err, sentinel) {
+			return true
+		}
+	}
+	return false
+}
+
+// CommitGuard is the narrow view of a Permit handed to terminal submission
+// code: it can consult the commit fence immediately before an irreversible
+// chain or broadcast call, but it cannot close or otherwise manage the permit.
+type CommitGuard interface {
+	// CheckCommit is the last-moment commit fence, called immediately before
+	// activating newly generated key material, submitting results or claims,
+	// or broadcasting Bitcoin transactions. It reads a fresh chain height and
+	// enforces the per-mode fence rules; a returned error is a gate sentinel,
+	// not a normal protocol timeout.
+	CheckCommit(operation string, class CommitClass) error
+}
+
 // Permit authorizes local participation in one ceremony. Its ceremony,
 // canonical start block, and protocol mode are immutable for its entire
 // lifetime: crossing the cutover block never cancels a permit or mutates its
 // mode. A permit is counted as active until its idempotent Close.
 type Permit interface {
+	CommitGuard
+
 	// Context is canceled when the gate cancels the permit: on chain-clock
 	// failure, at the quiesce deadline, or at Close. Ceremony work must stop
 	// when it is done; the cancellation cause carries the gate sentinel.
@@ -125,12 +163,6 @@ type Permit interface {
 	CanonicalStartBlock() uint64
 	// Mode returns the immutable protocol mode of the ceremony.
 	Mode() ProtocolMode
-	// CheckCommit is the last-moment commit fence, called immediately before
-	// activating newly generated key material, submitting results or claims,
-	// or broadcasting Bitcoin transactions. It reads a fresh chain height and
-	// enforces the per-mode fence rules; a returned error is a gate sentinel,
-	// not a normal protocol timeout.
-	CheckCommit(operation string, class CommitClass) error
 	// Close releases the permit. It is idempotent.
 	Close()
 }

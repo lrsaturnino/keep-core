@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"testing"
@@ -55,7 +56,13 @@ func TestSyncExecute(t *testing.T) {
 		channel:     channel,
 	}
 
-	stateMachine := NewSyncMachine(&testutils.MockLogger{}, channel, blockCounter, initialState)
+	stateMachine := NewSyncMachine(
+		&testutils.MockLogger{},
+		context.Background(),
+		channel,
+		blockCounter,
+		initialState,
+	)
 
 	finalState, endBlockHeight, err := stateMachine.Execute(1)
 	if err != nil {
@@ -91,6 +98,57 @@ func TestSyncExecute(t *testing.T) {
 
 	if !reflect.DeepEqual(expectedTestLog, testLog) {
 		t.Errorf("\nexpected: %v\nactual:   %v\n", expectedTestLog, testLog)
+	}
+}
+
+// TestSyncExecute_ContextCancellation proves canceling the machine's parent
+// context aborts the execution between states and surfaces the cancellation
+// cause instead of running the protocol to its final state.
+func TestSyncExecute_ContextCancellation(t *testing.T) {
+	testLog = make(map[uint64][]string)
+
+	localChain := local_v1.Connect(10, 5)
+	blockCounter, _ = localChain.BlockCounter()
+	provider := netLocal.Connect()
+	channel, err := provider.BroadcastChannelFor("cancellation_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	channel.SetUnmarshaler(func() net.TaggedUnmarshaler {
+		return &TestMessage{}
+	})
+
+	initialState := testSyncState1{
+		memberIndex: group.MemberIndex(1),
+		channel:     channel,
+	}
+
+	cause := fmt.Errorf("cancellation cause")
+	ctx, cancel := context.WithCancelCause(context.Background())
+
+	stateMachine := NewSyncMachine(
+		&testutils.MockLogger{},
+		ctx,
+		channel,
+		blockCounter,
+		initialState,
+	)
+
+	go func() {
+		blockCounter.WaitForBlockHeight(2)
+		cancel(cause)
+	}()
+
+	finalState, _, err := stateMachine.Execute(1)
+	if finalState != nil {
+		t.Errorf("expected no final state, got [%v]", finalState)
+	}
+	if !errors.Is(err, cause) {
+		t.Errorf(
+			"expected the cancellation cause in the error chain, got [%v]",
+			err,
+		)
 	}
 }
 

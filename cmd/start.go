@@ -291,6 +291,7 @@ func start(cmd *cobra.Command) error {
 		}
 
 		beaconKeyStorePersistence,
+			beaconQuarantinePersistence,
 			tbtcKeyStorePersistence,
 			tbtcDataPersistence,
 			err := initializePersistence()
@@ -322,6 +323,7 @@ func start(cmd *cobra.Command) error {
 			beaconChain,
 			netProvider,
 			beaconKeyStorePersistence,
+			beaconQuarantinePersistence,
 			scheduler,
 			participationGate,
 		)
@@ -552,6 +554,7 @@ func registerNetworkClientInfo(
 
 func initializePersistence() (
 	beaconKeyStorePersistence persistence.ProtectedHandle,
+	beaconQuarantinePersistence persistence.ProtectedHandle,
 	tbtcKeyStorePersistence persistence.ProtectedHandle,
 	tbtcDataPersistence persistence.BasicHandle,
 	err error,
@@ -561,15 +564,31 @@ func initializePersistence() (
 		clientConfig.Ethereum.KeyFilePassword,
 	)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("cannot initialize storage: [%w]", err)
+		return nil, nil, nil, nil, fmt.Errorf(
+			"cannot initialize storage: [%w]",
+			err,
+		)
 	}
 
 	beaconKeyStorePersistence, err = storage.InitializeKeyStorePersistence(
 		"beacon",
 	)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf(
+		return nil, nil, nil, nil, fmt.Errorf(
 			"cannot initialize beacon keystore persistence: [%w]",
+			err,
+		)
+	}
+
+	// The quarantine namespace is a sibling of the active beacon keystore, so
+	// no release's active-group scan — which reads only the "beacon" directory
+	// — can load a quarantined signer output as an active signer.
+	beaconQuarantinePersistence, err = storage.InitializeKeyStorePersistence(
+		"beacon-quarantine",
+	)
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf(
+			"cannot initialize beacon quarantine persistence: [%w]",
 			err,
 		)
 	}
@@ -578,7 +597,7 @@ func initializePersistence() (
 		"tbtc",
 	)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf(
+		return nil, nil, nil, nil, fmt.Errorf(
 			"cannot initialize tbtc keystore persistence: [%w]",
 			err,
 		)
@@ -586,7 +605,7 @@ func initializePersistence() (
 
 	tbtcDataPersistence, err = storage.InitializeWorkPersistence("tbtc")
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf(
+		return nil, nil, nil, nil, fmt.Errorf(
 			"cannot initialize tbtc data persistence: [%w]",
 			err,
 		)

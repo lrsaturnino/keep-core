@@ -2,6 +2,7 @@ package dkg
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"math/big"
 	"sort"
@@ -16,12 +17,48 @@ import (
 	"github.com/keep-network/keep-core/pkg/net"
 	"github.com/keep-network/keep-core/pkg/protocol/compatibility"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 )
+
+// PublicationInterruptedError reports that the release gate stopped the
+// ceremony after the group key material was generated but before an accepted
+// on-chain publication of the result was observed. The orphaned signer must be
+// preserved through the quarantine path: the result may still have been
+// accepted on chain by other members, so the share cannot be dropped, and no
+// acceptance was observed locally, so the share must not be activated.
+type PublicationInterruptedError struct {
+	// Cause is the gate error that interrupted the publication.
+	Cause error
+	// Signer carries the generated key material. Its group operators are the
+	// full pre-acceptance selection: the accepted result, if any, may exclude
+	// members, and only the offline state audit may resolve the final roster.
+	Signer *ThresholdSigner
+}
+
+func (e *PublicationInterruptedError) Error() string {
+	return fmt.Sprintf(
+		"DKG result publication interrupted by the release gate "+
+			"after key generation: [%v]",
+		e.Cause,
+	)
+}
+
+func (e *PublicationInterruptedError) Unwrap() error {
+	return e.Cause
+}
 
 // ExecuteDKG runs the full distributed key generation lifecycle. The
 // compatibility strategy bundle selects the ceremony's wire-sensitive
 // cryptographic behavior and must be supplied explicitly.
+//
+// The context bounds the execution and must be the ceremony permit's context:
+// canceling it aborts the protocol between block waits. The commit guard is
+// consulted immediately before the terminal on-chain result submission. A
+// successful return means an on-chain publication of the result was observed;
+// a *PublicationInterruptedError return carries generated key material whose
+// publication the gate interrupted.
 func ExecuteDKG(
+	ctx context.Context,
 	logger log.StandardLogger,
 	seed *big.Int,
 	memberIndex group.MemberIndex,
@@ -31,6 +68,7 @@ func ExecuteDKG(
 	membershipValidator *group.MembershipValidator,
 	selectedOperators []chain.Address,
 	strategies compatibility.Strategies,
+	commitGuard participation.CommitGuard,
 ) (*ThresholdSigner, error) {
 	beaconConfig := beaconChain.GetConfig()
 
@@ -45,6 +83,7 @@ func ExecuteDKG(
 	sessionID := seed.Text(16)
 
 	gjkrResult, gjkrEndBlockHeight, err := gjkr.Execute(
+		ctx,
 		logger,
 		seed,
 		sessionID,
@@ -59,10 +98,26 @@ func ExecuteDKG(
 	)
 	if err != nil {
 		return nil, fmt.Errorf(
-			"[member:%v] GJKR execution failed [%v]",
+			"[member:%v] GJKR execution failed [%w]",
 			memberIndex,
 			err,
 		)
+	}
+
+	// From this point on the group key material exists. A gate interruption —
+	// the permit canceled or a commit fence refused — must surface the signer
+	// for quarantine instead of dropping it.
+	interruptedSigner := func(cause error) error {
+		return &PublicationInterruptedError{
+			Cause: cause,
+			Signer: &ThresholdSigner{
+				memberIndex:          memberIndex,
+				groupPublicKey:       gjkrResult.GroupPublicKey,
+				groupPrivateKeyShare: gjkrResult.GroupPrivateKeyShare,
+				groupPublicKeyShares: gjkrResult.GroupPublicKeyShares(),
+				groupOperators:       selectedOperators,
+			},
+		}
 	}
 
 	startPublicationBlockHeight := gjkrEndBlockHeight
@@ -78,6 +133,7 @@ func ExecuteDKG(
 	defer dkgResultSubscription.Unsubscribe()
 
 	err = dkgResult.Publish(
+		ctx,
 		logger,
 		sessionID,
 		memberIndex,
@@ -88,8 +144,13 @@ func ExecuteDKG(
 		beaconChain,
 		blockCounter,
 		startPublicationBlockHeight,
+		commitGuard,
 	)
 	if err != nil {
+		if isGateInterruption(ctx, err) {
+			return nil, interruptedSigner(err)
+		}
+
 		// Result publication failed. It means that either the result this
 		// member proposed is not supported by the majority of group members or
 		// that the chain interaction failed. In either case, we observe the
@@ -103,6 +164,7 @@ func ExecuteDKG(
 		)
 
 		if operatingMemberIndexes, err = decideMemberFate(
+			ctx,
 			memberIndex,
 			gjkrResult,
 			dkgResultChannel,
@@ -110,6 +172,9 @@ func ExecuteDKG(
 			beaconChain,
 			blockCounter,
 		); err != nil {
+			if isGateInterruption(ctx, err) {
+				return nil, interruptedSigner(err)
+			}
 			return nil, err
 		}
 	}
@@ -132,11 +197,19 @@ func ExecuteDKG(
 	}, nil
 }
 
+// isGateInterruption distinguishes a release-gate decision from an ordinary
+// protocol failure: the ceremony context was canceled by the gate, or the
+// error chain carries a gate sentinel from a refused commit fence.
+func isGateInterruption(ctx context.Context, err error) bool {
+	return ctx.Err() != nil || participation.IsGateRefusal(err)
+}
+
 // decideMemberFate decides what the member will do in case it failed
 // publishing its DKG result. Member can stay in the group if it
 // supports the same group public key as the one registered on-chain and
 // the member is not considered as misbehaving by the group.
 func decideMemberFate(
+	ctx context.Context,
 	playerIndex group.MemberIndex,
 	gjkrResult *gjkr.Result,
 	dkgResultChannel chan *event.DKGResultSubmission,
@@ -145,6 +218,7 @@ func decideMemberFate(
 	blockCounter chain.BlockCounter,
 ) ([]group.MemberIndex, error) {
 	dkgResultEvent, err := waitForDkgResultEvent(
+		ctx,
 		dkgResultChannel,
 		startPublicationBlockHeight,
 		beaconChain,
@@ -196,6 +270,7 @@ func decideMemberFate(
 }
 
 func waitForDkgResultEvent(
+	ctx context.Context,
 	dkgResultChannel chan *event.DKGResultSubmission,
 	startPublicationBlockHeight uint64,
 	beaconChain beaconchain.Interface,
@@ -217,6 +292,11 @@ func waitForDkgResultEvent(
 		return dkgResultEvent, nil
 	case <-timeoutBlockChannel:
 		return nil, fmt.Errorf("DKG result publication timed out")
+	case <-ctx.Done():
+		return nil, fmt.Errorf(
+			"waiting for the DKG result event canceled: [%w]",
+			context.Cause(ctx),
+		)
 	}
 }
 

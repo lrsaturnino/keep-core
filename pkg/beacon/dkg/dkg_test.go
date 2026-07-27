@@ -1,6 +1,7 @@
 package dkg
 
 import (
+	"context"
 	"fmt"
 	"math/big"
 	"reflect"
@@ -50,6 +51,7 @@ func TestDecideMemberFate_HappyPath(t *testing.T) {
 	}
 
 	operatingMemberIndexes, err := decideMemberFate(
+		context.Background(),
 		playerIndex,
 		gjkrResult,
 		dkgResultChannel,
@@ -85,6 +87,7 @@ func TestDecideMemberFate_NotSameGroupPublicKey(t *testing.T) {
 	}
 
 	_, err := decideMemberFate(
+		context.Background(),
 		playerIndex,
 		gjkrResult,
 		dkgResultChannel,
@@ -116,6 +119,7 @@ func TestDecideMemberFate_MemberIsMisbehaved(t *testing.T) {
 	}
 
 	_, err := decideMemberFate(
+		context.Background(),
 		playerIndex,
 		gjkrResult,
 		dkgResultChannel,
@@ -142,6 +146,7 @@ func TestDecideMemberFate_Timeout(t *testing.T) {
 	setup()
 
 	_, err := decideMemberFate(
+		context.Background(),
 		playerIndex,
 		gjkrResult,
 		dkgResultChannel,

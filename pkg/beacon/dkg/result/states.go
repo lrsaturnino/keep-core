@@ -8,6 +8,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/chain"
 	"github.com/keep-network/keep-core/pkg/net"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/protocol/state"
 )
 
@@ -39,6 +40,8 @@ type resultSigningState struct {
 	signatureMessages []*DKGResultHashSignatureMessage
 
 	signingStartBlockHeight uint64
+
+	commitGuard participation.CommitGuard
 }
 
 func (rss *resultSigningState) DelayBlocks() uint64 {
@@ -107,6 +110,7 @@ func (rss *resultSigningState) Next() (state.SyncState, error) {
 		verificationStartBlockHeight: rss.signingStartBlockHeight +
 			rss.DelayBlocks() +
 			rss.ActiveBlocks(),
+		commitGuard: rss.commitGuard,
 	}, nil
 
 }
@@ -133,6 +137,8 @@ type signaturesVerificationState struct {
 	validSignatures   map[group.MemberIndex][]byte
 
 	verificationStartBlockHeight uint64
+
+	commitGuard participation.CommitGuard
 }
 
 func (svs *signaturesVerificationState) DelayBlocks() uint64 {
@@ -171,6 +177,7 @@ func (svs *signaturesVerificationState) Next() (state.SyncState, error) {
 		submissionStartBlockHeight: svs.verificationStartBlockHeight +
 			svs.DelayBlocks() +
 			svs.ActiveBlocks(),
+		commitGuard: svs.commitGuard,
 	}, nil
 
 }
@@ -194,6 +201,8 @@ type resultSubmissionState struct {
 	signatures map[group.MemberIndex][]byte
 
 	submissionStartBlockHeight uint64
+
+	commitGuard participation.CommitGuard
 }
 
 func (rss *resultSubmissionState) DelayBlocks() uint64 {
@@ -210,11 +219,13 @@ func (rss *resultSubmissionState) ActiveBlocks() uint64 {
 
 func (rss *resultSubmissionState) Initiate(ctx context.Context) error {
 	return rss.member.SubmitDKGResult(
+		ctx,
 		rss.result,
 		rss.signatures,
 		rss.beaconChain,
 		rss.blockCounter,
 		rss.submissionStartBlockHeight,
+		rss.commitGuard,
 	)
 }
 

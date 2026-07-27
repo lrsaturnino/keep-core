@@ -76,6 +76,33 @@ func (g *Groups) RegisterGroup(
 	return nil
 }
 
+// SaveAcceptedGroup persists the membership durably without activating it in
+// the in-memory group cache. It preserves a signer whose result was accepted
+// on chain but whose local activation the participation gate refused — during
+// quiescence or after a clock failure: dropping an accepted share would
+// permanently reduce its group, while activating it would start participation
+// the gate no longer allows. The membership loads as active on the next
+// process start, when the gate re-derives the process state.
+func (g *Groups) SaveAcceptedGroup(
+	signer *dkg.ThresholdSigner,
+	channelName string,
+) error {
+	g.mutex.Lock()
+	defer g.mutex.Unlock()
+
+	membership := &Membership{
+		Signer:      signer,
+		ChannelName: channelName,
+	}
+
+	err := g.storage.save(membership)
+	if err != nil {
+		return fmt.Errorf("could not persist membership to the storage: [%v]", err)
+	}
+
+	return nil
+}
+
 // GetGroup gets a group by a groupPublicKey
 func (g *Groups) GetGroup(groupPublicKey []byte) []*Membership {
 	g.mutex.Lock()
