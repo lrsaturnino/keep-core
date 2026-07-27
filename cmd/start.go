@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/keep-network/keep-core/pkg/tbtcpg"
@@ -65,7 +68,14 @@ Environment variables:
 
 // start starts a node
 func start(cmd *cobra.Command) error {
+	// Two-context lifecycle: the gate and the cutover roster live on the root
+	// context and are closed explicitly, while every protocol component
+	// receives runCtx, which the signal controller cancels only after
+	// quiescence has run its course. Handing protocol code an
+	// already-canceled signal context would defeat graceful completion.
 	ctx := context.Background()
+	runCtx, cancelRunCtx := context.WithCancel(ctx)
+	defer cancelRunCtx()
 
 	// Resolve the protocol participation schedule before connecting anywhere:
 	// these are configuration-only checks, and a misconfigured cutover block
@@ -107,11 +117,11 @@ func start(cmd *cobra.Command) error {
 	// participation gate and cutover roster constructed below need a real
 	// metrics sink before the network provider exists. The network-bound
 	// observers attach right after the network initializes.
-	clientInfoRegistry := initializeClientInfo(ctx, clientConfig, blockCounter)
+	clientInfoRegistry := initializeClientInfo(runCtx, clientConfig, blockCounter)
 
 	var perfMetrics *clientinfo.PerformanceMetrics
 	if clientInfoRegistry != nil {
-		perfMetrics = clientinfo.NewPerformanceMetrics(ctx, clientInfoRegistry)
+		perfMetrics = clientinfo.NewPerformanceMetrics(runCtx, clientInfoRegistry)
 
 		// Wire performance metrics into firewall validation so live on-chain
 		// IsRecognized calls are counted. The recorder is a package-level sink
@@ -214,7 +224,7 @@ func start(cmd *cobra.Command) error {
 	)
 
 	netProvider, err := initializeNetwork(
-		ctx,
+		runCtx,
 		[]firewall.Application{beaconChain, tbtcChain},
 		operatorPrivateKey,
 		blockCounter,
@@ -243,7 +253,7 @@ func start(cmd *cobra.Command) error {
 	// Skip initialization for bootstrap nodes as they are only used for network
 	// discovery.
 	if !isBootstrap() {
-		btcChain, err := electrum.Connect(ctx, clientConfig.Bitcoin.Electrum)
+		btcChain, err := electrum.Connect(runCtx, clientConfig.Bitcoin.Electrum)
 		if err != nil {
 			return fmt.Errorf("could not connect to Electrum chain: [%v]", err)
 		}
@@ -272,11 +282,11 @@ func start(cmd *cobra.Command) error {
 				btcChain,
 				clientConfig.ClientInfo.RPCHealthCheckInterval,
 			)
-			rpcHealthChecker.Start(ctx)
+			rpcHealthChecker.Start(runCtx)
 		}
 
 		err = beacon.Initialize(
-			ctx,
+			runCtx,
 			beaconChain,
 			netProvider,
 			beaconKeyStorePersistence,
@@ -293,7 +303,7 @@ func start(cmd *cobra.Command) error {
 		)
 
 		err = tbtc.Initialize(
-			ctx,
+			runCtx,
 			tbtcChain,
 			btcChain,
 			netProvider,
@@ -320,8 +330,89 @@ func start(cmd *cobra.Command) error {
 		clientConfig.Ethereum,
 	)
 
-	<-ctx.Done()
-	return fmt.Errorf("shutting down the node because its context has ended")
+	// The signal controller: on the first SIGTERM/SIGINT the gate refuses new
+	// permits and existing ceremonies run to natural completion; the run
+	// context is canceled only afterwards, so in-flight protocol work keeps
+	// its network, chain, and persistence access for the whole drain. A
+	// second signal or the in-process backstop deadline forces the remainder
+	// through the gate's audited forced-cancellation path.
+	signalChan := make(chan os.Signal, 2)
+	signal.Notify(signalChan, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(signalChan)
+
+	select {
+	case receivedSignal := <-signalChan:
+		quiesceCause := fmt.Errorf("received signal [%v]", receivedSignal)
+		quiesceDone := participationGate.Quiesce(quiesceCause)
+
+		reason := awaitQuiesce(
+			quiesceDone,
+			signalChan,
+			quiesceBackstopDeadline(maximumCompletionBound),
+		)
+		logger.Infof(
+			"protocol participation quiescence ended [reason=%s] "+
+				"[signal=%v]",
+			reason,
+			receivedSignal,
+		)
+
+		// Close force-cancels any permit that outlived the drain and stops
+		// the clock supervisor; only then may the run context be canceled.
+		participationGate.Close()
+		cancelRunCtx()
+
+		return fmt.Errorf(
+			"shutting down the node after signal [%v]",
+			receivedSignal,
+		)
+	case <-runCtx.Done():
+		return fmt.Errorf("shutting down the node because its context has ended")
+	}
+}
+
+// quiesceUpperBlockIntervalSeconds is the conservative upper bound on the
+// Ethereum block interval used to convert the block-clock completion bound
+// into the in-process wall-clock backstop. The release manifest derives the
+// authoritative external termination grace from reviewed production evidence;
+// this value only sizes the last-resort in-process deadline.
+const quiesceUpperBlockIntervalSeconds = 15
+
+// quiesceBackstopMargin absorbs RPC and processing skew on top of the
+// block-derived backstop.
+const quiesceBackstopMargin = 5 * time.Minute
+
+// quiesceBackstopDeadline converts the maximum legacy completion bound into
+// the in-process wall-clock backstop for the quiesce drain. The service
+// manager's configured termination grace, derived in the release manifest,
+// remains the authoritative external deadline; this backstop only guarantees
+// the audited forced-cancellation path runs even if no second signal ever
+// arrives.
+func quiesceBackstopDeadline(completionBoundBlocks uint64) time.Duration {
+	return time.Duration(completionBoundBlocks)*
+		quiesceUpperBlockIntervalSeconds*time.Second +
+		quiesceBackstopMargin
+}
+
+// awaitQuiesce waits for the quiesce drain to end and reports why: natural
+// completion of every active permit, a second operator signal forcing
+// shutdown, or the in-process backstop deadline.
+func awaitQuiesce(
+	quiesceDone <-chan struct{},
+	signals <-chan os.Signal,
+	backstop time.Duration,
+) string {
+	backstopTimer := time.NewTimer(backstop)
+	defer backstopTimer.Stop()
+
+	select {
+	case <-quiesceDone:
+		return "completed"
+	case <-signals:
+		return "forced_by_signal"
+	case <-backstopTimer.C:
+		return "backstop_deadline"
+	}
 }
 
 func isBootstrap() bool {
