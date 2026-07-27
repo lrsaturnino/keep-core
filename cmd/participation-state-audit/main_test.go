@@ -17,6 +17,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/beacon/registry"
 	"github.com/keep-network/keep-core/pkg/chain"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/storage"
 )
 
@@ -179,12 +180,16 @@ func newValidEvidence(t *testing.T, auditManifest *manifest) evidenceInputs {
 			DKGSettlement    string `json:"dkg_settlement"`
 		}{
 			WalletStorageKey: wallet.WalletStorageKey,
-			WalletID:         "0x" + strings.Repeat("11", 32),
+			WalletID:         wallet.WalletID,
 			Registered:       true,
 			DKGSettlement:    "approved",
 		})
 	}
 	for _, quarantined := range auditManifest.TBTCQuarantinedOutputs {
+		walletID := quarantined.SignerWalletID
+		if walletID == "" {
+			walletID = quarantined.WalletID
+		}
 		chainRecord.Wallets = append(chainRecord.Wallets, struct {
 			WalletStorageKey string `json:"wallet_storage_key"`
 			WalletID         string `json:"wallet_id"`
@@ -192,7 +197,7 @@ func newValidEvidence(t *testing.T, auditManifest *manifest) evidenceInputs {
 			DKGSettlement    string `json:"dkg_settlement"`
 		}{
 			WalletStorageKey: quarantined.WalletStorageKey,
-			WalletID:         "0x" + strings.Repeat("22", 32),
+			WalletID:         walletID,
 			Registered:       false,
 			DKGSettlement:    "none",
 		})
@@ -224,13 +229,21 @@ func newValidEvidence(t *testing.T, auditManifest *manifest) evidenceInputs {
 
 	quiescenceRecord := &quiescenceReportEvidence{
 		evidenceEnvelope: envelope("quiescence_report"),
+		ReleaseVersion:   "v2.1.0",
+		ReleaseRevision:  strings.Repeat("ef", 20),
+		ReleaseEpoch:     participation.CompiledEpoch.String(),
+		CutoverBlock:     1_000,
 		QuiesceCause:     "rollback drill",
 	}
 
 	priorReaderRecord := &priorReaderCompatibilityEvidence{
-		evidenceEnvelope: envelope("prior_reader_compatibility"),
-		PriorVersion:     "v2.0.0",
-		PriorRevision:    strings.Repeat("ab", 20),
+		evidenceEnvelope:   envelope("prior_reader_compatibility"),
+		PriorVersion:       "v2.0.0",
+		PriorRevision:      strings.Repeat("ab", 20),
+		PriorImageDigest:   "sha256:" + strings.Repeat("11", 32),
+		ReleaseVersion:     "v2.1.0",
+		ReleaseRevision:    strings.Repeat("ef", 20),
+		ReleaseImageDigest: "sha256:" + strings.Repeat("22", 32),
 	}
 	for _, schema := range requiredPriorReaderSchemas {
 		priorReaderRecord.SchemaResults = append(
@@ -254,15 +267,21 @@ func newValidEvidence(t *testing.T, auditManifest *manifest) evidenceInputs {
 }
 
 // testExpectedIdentity returns the expected-identity inputs matching the
-// values newValidEvidence writes, so identity binding passes unless a test
-// deliberately mismatches it.
+// values newValidEvidence and newTestStorage write, so identity binding
+// passes unless a test deliberately mismatches it.
 func testExpectedIdentity() expectedIdentityInputs {
 	return expectedIdentityInputs{
-		ethereumChainID: "1",
-		bitcoinNetwork:  "mainnet",
-		priorVersion:    "v2.0.0",
-		priorRevision:   strings.Repeat("ab", 20),
-		maxEvidenceAge:  24 * time.Hour,
+		ethereumChainID:    "1",
+		bitcoinNetwork:     "mainnet",
+		priorVersion:       "v2.0.0",
+		priorRevision:      strings.Repeat("ab", 20),
+		priorImageDigest:   "sha256:" + strings.Repeat("11", 32),
+		releaseVersion:     "v2.1.0",
+		releaseRevision:    strings.Repeat("ef", 20),
+		releaseImageDigest: "sha256:" + strings.Repeat("22", 32),
+		releaseEpoch:       participation.CompiledEpoch.String(),
+		cutoverBlock:       1_000,
+		maxEvidenceAge:     24 * time.Hour,
 	}
 }
 
@@ -1123,6 +1142,12 @@ func TestRunAudit_MissingExpectedIdentityIsBlocking(t *testing.T) {
 		"expected Bitcoin network is not supplied",
 		"expected prior version is not supplied",
 		"expected prior revision is not supplied",
+		"expected prior image digest is not supplied",
+		"expected release version is not supplied",
+		"expected release revision is not supplied",
+		"expected release image digest is not supplied",
+		"expected release epoch is not supplied",
+		"expected cutover block is not supplied",
 		"no evidence freshness bound is supplied",
 	} {
 		if !hasBlocker(auditManifest, fragment) {
@@ -1463,6 +1488,398 @@ func TestRunAudit_QuarantinedClaimWithMismatchedTripleIsBlocking(
 	) {
 		t.Errorf(
 			"expected a triple-matching blocker, blockers: %v",
+			auditManifest.RollbackBlockers,
+		)
+	}
+}
+
+// TestRunAudit_WrongExpectedReleaseEpochIsBlocking proves an expected release
+// epoch differing from the audit build's own compiled epoch is a rollback
+// blocker: the wrong audit tool cannot judge the audited state.
+func TestRunAudit_WrongExpectedReleaseEpochIsBlocking(t *testing.T) {
+	storageDir := newTestStorage(t)
+
+	expected := testExpectedIdentity()
+	expected.releaseEpoch = "some_other_epoch"
+
+	auditManifest, err := runAudit(
+		storageDir,
+		testPassword,
+		evidenceInputs{},
+		expected,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if auditManifest.RollbackBarrierReady {
+		t.Error("a wrong expected epoch must not authorize the barrier")
+	}
+	if !hasBlocker(
+		auditManifest,
+		"does not match this audit build's compiled epoch",
+	) {
+		t.Errorf(
+			"expected a compiled-epoch blocker, blockers: %v",
+			auditManifest.RollbackBlockers,
+		)
+	}
+}
+
+// TestRunAudit_MutableExpectedImageDigestIsBlocking proves an expected image
+// reference that is not an immutable sha256 digest — a tag, a malformed
+// digest — is a rollback blocker: a mutable reference cannot pin the
+// artifact the rollback restores or leaves.
+func TestRunAudit_MutableExpectedImageDigestIsBlocking(t *testing.T) {
+	storageDir := newTestStorage(t)
+
+	expected := testExpectedIdentity()
+	expected.priorImageDigest = "keep-client:latest"
+	expected.releaseImageDigest = "sha256:not-a-hex-digest"
+
+	auditManifest, err := runAudit(
+		storageDir,
+		testPassword,
+		evidenceInputs{},
+		expected,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if auditManifest.RollbackBarrierReady {
+		t.Error("a mutable image reference must not authorize the barrier")
+	}
+	if !hasBlocker(
+		auditManifest,
+		"the expected prior image digest [keep-client:latest] is not an "+
+			"immutable sha256 image digest",
+	) {
+		t.Errorf(
+			"expected a prior-digest blocker, blockers: %v",
+			auditManifest.RollbackBlockers,
+		)
+	}
+	if !hasBlocker(
+		auditManifest,
+		"the expected release image digest [sha256:not-a-hex-digest] is "+
+			"not an immutable sha256 image digest",
+	) {
+		t.Errorf(
+			"expected a release-digest blocker, blockers: %v",
+			auditManifest.RollbackBlockers,
+		)
+	}
+}
+
+// TestRunAudit_MismatchedArtifactIdentityIsBlocking proves schema-valid
+// evidence recording a different release artifact, prior image, or cutover
+// block than the expected one blocks the barrier, and that quarantine
+// metadata preserved under a different cutover block is a finding of its
+// own.
+func TestRunAudit_MismatchedArtifactIdentityIsBlocking(t *testing.T) {
+	storageDir := newTestStorage(t)
+
+	firstPass, err := runAudit(
+		storageDir,
+		testPassword,
+		evidenceInputs{},
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The evidence records the artifact identities newValidEvidence writes;
+	// the audit expects a different candidate build and cutover schedule.
+	mismatched := testExpectedIdentity()
+	mismatched.priorImageDigest = "sha256:" + strings.Repeat("44", 32)
+	mismatched.releaseVersion = "v9.9.9"
+	mismatched.releaseRevision = strings.Repeat("00", 20)
+	mismatched.releaseImageDigest = "sha256:" + strings.Repeat("33", 32)
+	mismatched.cutoverBlock = 2_000
+
+	auditManifest, err := runAudit(
+		storageDir,
+		testPassword,
+		newValidEvidence(t, firstPass),
+		mismatched,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if auditManifest.RollbackBarrierReady {
+		t.Error("mismatched artifact identities must not authorize the barrier")
+	}
+	for _, fragment := range []string{
+		"quiescing release version [v2.1.0], expected [v9.9.9]",
+		"quiescing release revision",
+		"quiesced under cutover block [1000], expected [2000]",
+		"tested prior image digest",
+		"writing release version [v2.1.0], expected [v9.9.9]",
+		"writing release revision",
+		"writing release image digest",
+	} {
+		if !hasBlocker(auditManifest, fragment) {
+			t.Errorf(
+				"expected the [%s] blocker, blockers: %v",
+				fragment,
+				auditManifest.RollbackBlockers,
+			)
+		}
+	}
+	if !hasFinding(
+		auditManifest,
+		"was preserved under cutover block [1000], not the expected "+
+			"cutover block [2000]",
+	) {
+		t.Errorf(
+			"expected a quarantine cutover-binding finding, findings: %v",
+			auditManifest.Findings,
+		)
+	}
+}
+
+// TestRunAudit_DuplicateReconciliationEntriesAreBlocking proves duplicate
+// wallet, wallet-ID, beacon-group, and schema-result entries in otherwise
+// valid evidence are violations: duplicates cannot prove one-to-one coverage
+// and can shadow a contradicting result.
+func TestRunAudit_DuplicateReconciliationEntriesAreBlocking(t *testing.T) {
+	storageDir := newTestStorage(t)
+
+	firstPass, err := runAudit(
+		storageDir,
+		testPassword,
+		evidenceInputs{},
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	evidence := newValidEvidence(t, firstPass)
+
+	content, err := os.ReadFile(evidence.chainReconciliation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chainRecord := &chainReconciliationEvidence{}
+	if err := json.Unmarshal(content, chainRecord); err != nil {
+		t.Fatal(err)
+	}
+	// Duplicate the persisted beacon group's entry, reconcile one fabricated
+	// wallet twice, and claim its wallet ID from a second fabricated wallet.
+	chainRecord.BeaconGroups = append(
+		chainRecord.BeaconGroups,
+		chainRecord.BeaconGroups[0],
+	)
+	walletEntry := struct {
+		WalletStorageKey string `json:"wallet_storage_key"`
+		WalletID         string `json:"wallet_id"`
+		Registered       bool   `json:"registered"`
+		DKGSettlement    string `json:"dkg_settlement"`
+	}{
+		WalletStorageKey: "duplicated-wallet",
+		WalletID:         strings.Repeat("aa", 32),
+		Registered:       false,
+		DKGSettlement:    "none",
+	}
+	chainRecord.Wallets = append(chainRecord.Wallets, walletEntry, walletEntry)
+	walletEntry.WalletStorageKey = "identity-thief-wallet"
+	chainRecord.Wallets = append(chainRecord.Wallets, walletEntry)
+	content, err = json.MarshalIndent(chainRecord, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		evidence.chainReconciliation,
+		content,
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	content, err = os.ReadFile(evidence.priorReaderCompatibility)
+	if err != nil {
+		t.Fatal(err)
+	}
+	priorReaderRecord := &priorReaderCompatibilityEvidence{}
+	if err := json.Unmarshal(content, priorReaderRecord); err != nil {
+		t.Fatal(err)
+	}
+	// The duplicate contradicts the authoritative first result; it must be
+	// rejected, not silently shadow it.
+	priorReaderRecord.SchemaResults = append(
+		priorReaderRecord.SchemaResults,
+		struct {
+			Schema     string `json:"schema"`
+			Compatible bool   `json:"compatible"`
+		}{Schema: requiredPriorReaderSchemas[0], Compatible: false},
+	)
+	content, err = json.MarshalIndent(priorReaderRecord, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		evidence.priorReaderCompatibility,
+		content,
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	auditManifest, err := runAudit(
+		storageDir,
+		testPassword,
+		evidence,
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if auditManifest.RollbackBarrierReady {
+		t.Error("duplicate reconciliation entries must not authorize the barrier")
+	}
+	for _, fragment := range []string{
+		"beacon group [" +
+			firstPass.BeaconActiveMemberships[0].GroupPublicKey +
+			"] is reconciled more than once",
+		"tbtc wallet [duplicated-wallet] is reconciled more than once",
+		"is claimed by both tbtc wallet [duplicated-wallet] and tbtc " +
+			"wallet [identity-thief-wallet]",
+		"schema [" + requiredPriorReaderSchemas[0] + "] is covered more " +
+			"than once",
+	} {
+		if !hasBlocker(auditManifest, fragment) {
+			t.Errorf(
+				"expected the [%s] blocker, blockers: %v",
+				fragment,
+				auditManifest.RollbackBlockers,
+			)
+		}
+	}
+}
+
+// TestRunAudit_QuarantinedUnsettledOrMisidentifiedWalletIsBlocking proves a
+// quarantined-only tBTC wallet whose reconciled DKG settlement is anything
+// but an explicit no-result state — or whose reconciled wallet ID differs
+// from the preserved output's identity — blocks the barrier: an unsettled
+// result may still hand the prior binary a wallet whose share exists only in
+// quarantine, and evidence for a different wallet proves nothing about this
+// one.
+func TestRunAudit_QuarantinedUnsettledOrMisidentifiedWalletIsBlocking(
+	t *testing.T,
+) {
+	storageDir := newTestStorage(t)
+
+	diskStorage, err := storage.Initialize(
+		storage.Config{Dir: storageDir},
+		testPassword,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quarantineHandle, err := diskStorage.InitializeKeyStorePersistence(
+		"tbtc-quarantine",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := quarantineHandle.Save(
+		[]byte(`{`+
+			`"schema_version":1,`+
+			`"release_epoch":"security_v2_cutover",`+
+			`"protocol_mode":"legacy",`+
+			`"cutover_block":1000,`+
+			`"canonical_start_block":900,`+
+			`"ceremony":"tbtc_dkg",`+
+			`"seed_hash":"aa",`+
+			`"member_index":3,`+
+			`"wallet_id":"bb",`+
+			`"wallet_public_key_hash":"cc",`+
+			`"failed_operation":"tbtc_dkg_signer_activation",`+
+			`"last_observed_block":950,`+
+			`"preserved_at":"2026-01-01T00:00:00Z"}`),
+		"interrupted-wallet-directory",
+		"/metadata_3",
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	firstPass, err := runAudit(
+		storageDir,
+		testPassword,
+		evidenceInputs{},
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	evidence := newValidEvidence(t, firstPass)
+
+	content, err := os.ReadFile(evidence.chainReconciliation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chainRecord := &chainReconciliationEvidence{}
+	if err := json.Unmarshal(content, chainRecord); err != nil {
+		t.Fatal(err)
+	}
+	// The quarantined wallet's result is reported as still pending, under a
+	// wallet ID that is not the preserved output's identity.
+	for i := range chainRecord.Wallets {
+		if chainRecord.Wallets[i].WalletStorageKey ==
+			"interrupted-wallet-directory" {
+			chainRecord.Wallets[i].DKGSettlement = "pending"
+			chainRecord.Wallets[i].WalletID = "ff"
+		}
+	}
+	content, err = json.MarshalIndent(chainRecord, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		evidence.chainReconciliation,
+		content,
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	auditManifest, err := runAudit(
+		storageDir,
+		testPassword,
+		evidence,
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if auditManifest.RollbackBarrierReady {
+		t.Error("an unsettled quarantined wallet must not authorize the barrier")
+	}
+	if !hasBlocker(
+		auditManifest,
+		"quarantined tbtc wallet [interrupted-wallet-directory] has DKG "+
+			"settlement [pending], expected [none]",
+	) {
+		t.Errorf(
+			"expected a settlement blocker, blockers: %v",
+			auditManifest.RollbackBlockers,
+		)
+	}
+	if !hasBlocker(
+		auditManifest,
+		"quarantined tbtc wallet [interrupted-wallet-directory] is "+
+			"reconciled under wallet ID [ff], but its preserved output "+
+			"carries wallet ID [bb]",
+	) {
+		t.Errorf(
+			"expected a wallet-identity blocker, blockers: %v",
 			auditManifest.RollbackBlockers,
 		)
 	}

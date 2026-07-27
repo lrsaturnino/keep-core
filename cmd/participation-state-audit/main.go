@@ -26,11 +26,14 @@
 // reference to each is supplied and recorded, the manifest reports the
 // missing pieces as rollback blockers and the process exits nonzero. Every
 // evidence record must additionally bind to the operator-supplied expected
-// operational identities — Ethereum chain ID, Bitcoin network, exact prior
-// version and revision — and fall within the evidence freshness bound:
-// schema-valid evidence for the wrong target or from long before the
-// rollback decision blocks the barrier exactly like missing evidence. This
-// tool's output never authorizes activating quarantined material by itself.
+// operational identities — Ethereum chain ID, Bitcoin network, the exact
+// prior and current release versions and revisions, both immutable image
+// digests, the compiled release epoch, and the cutover block — and fall
+// within the evidence freshness bound: schema-valid evidence for the wrong
+// target, the wrong artifact, the wrong cutover schedule, or from long
+// before the rollback decision blocks the barrier exactly like missing
+// evidence. This tool's output never authorizes activating quarantined
+// material by itself.
 package main
 
 import (
@@ -56,7 +59,7 @@ import (
 )
 
 // manifestSchemaVersion versions the audit manifest document.
-const manifestSchemaVersion = uint32(3)
+const manifestSchemaVersion = uint32(4)
 
 // The audited namespaces, relative to the storage root. The beacon quarantine
 // namespace is a sibling of the active beacon keystore precisely so the
@@ -130,7 +133,7 @@ type evidenceRecord struct {
 
 // evidenceSchemaVersion versions the external rollback-evidence record
 // schemas this audit accepts.
-const evidenceSchemaVersion uint32 = 1
+const evidenceSchemaVersion uint32 = 2
 
 // evidenceFutureSkewAllowance bounds how far in the future an evidence
 // record's generation time may lie relative to this audit before it is a
@@ -186,10 +189,17 @@ type bitcoinReconciliationEvidence struct {
 }
 
 // quiescenceReportEvidence records the permits active at process quiescence
-// and each one's terminal outcome.
+// and each one's terminal outcome. The quiescing node also attests its own
+// exact artifact identity — release version and revision — and the compiled
+// epoch and armed cutover block it quiesced under, so the report cannot vouch
+// for the state of a different candidate build or cutover schedule.
 type quiescenceReportEvidence struct {
 	evidenceEnvelope
 
+	ReleaseVersion            string `json:"release_version"`
+	ReleaseRevision           string `json:"release_revision"`
+	ReleaseEpoch              string `json:"release_epoch"`
+	CutoverBlock              uint64 `json:"cutover_block"`
 	QuiesceCause              string `json:"quiesce_cause"`
 	ActivePermitsAtQuiescence []struct {
 		Ceremony            string `json:"ceremony"`
@@ -201,13 +211,20 @@ type quiescenceReportEvidence struct {
 
 // priorReaderCompatibilityEvidence records the tested prior release and its
 // result against every schema this release writes, including loading and
-// signing with a wallet created after the cutover block.
+// signing with a wallet created after the cutover block. Both sides of the
+// test are pinned exactly: the prior artifact that performed the reads and
+// the current release artifact that wrote the tested schemas, each with its
+// version, revision, and immutable image digest.
 type priorReaderCompatibilityEvidence struct {
 	evidenceEnvelope
 
-	PriorVersion  string `json:"prior_version"`
-	PriorRevision string `json:"prior_revision"`
-	SchemaResults []struct {
+	PriorVersion       string `json:"prior_version"`
+	PriorRevision      string `json:"prior_revision"`
+	PriorImageDigest   string `json:"prior_image_digest"`
+	ReleaseVersion     string `json:"release_version"`
+	ReleaseRevision    string `json:"release_revision"`
+	ReleaseImageDigest string `json:"release_image_digest"`
+	SchemaResults      []struct {
 		Schema     string `json:"schema"`
 		Compatible bool   `json:"compatible"`
 	} `json:"schema_results"`
@@ -219,6 +236,18 @@ var requiredPriorReaderSchemas = []string{
 	"beacon_membership",
 	"tbtc_membership",
 	"post_cutover_wallet_load_and_sign",
+}
+
+// Valid DKG settlement states of a reconciled tBTC wallet. "approved" is the
+// only state that permits persisted active signers; "none" — no DKG result
+// on chain references the wallet — is the only state that permits a
+// quarantined-only share, because a pending or challenged result may still
+// settle into an on-chain wallet whose share the prior binary cannot load.
+var validDKGSettlementStates = map[string]struct{}{
+	"approved":   {},
+	"pending":    {},
+	"challenged": {},
+	"none":       {},
 }
 
 // Valid terminal states of a reconciled pending Bitcoin transaction.
@@ -253,7 +282,10 @@ type beaconQuarantineRecord struct {
 // tbtcWalletRecord summarizes the decoded signer records of one wallet in the
 // tBTC active namespace.
 type tbtcWalletRecord struct {
-	WalletStorageKey string  `json:"wallet_storage_key"`
+	WalletStorageKey string `json:"wallet_storage_key"`
+	// WalletID is the ECDSA wallet ID derived from the decoded wallet public
+	// key — the identity chain reconciliation evidence must match exactly.
+	WalletID         string  `json:"wallet_id"`
 	MemberIndexes    []uint8 `json:"member_indexes"`
 	SigningGroupSize int     `json:"signing_group_size"`
 }
@@ -266,6 +298,12 @@ type tbtcQuarantineRecord struct {
 	// chain reconciliation can match quarantined and active state of the
 	// same wallet one-to-one.
 	WalletStorageKey string `json:"wallet_storage_key"`
+	// SignerWalletID is the ECDSA wallet ID derived from the preserved
+	// signer's decoded public key. Unlike the metadata's wallet ID — recorded
+	// best-effort at preservation time — it is derived from the key material
+	// itself, so it stays the authoritative identity for chain
+	// reconciliation when the metadata half is incomplete.
+	SignerWalletID string `json:"signer_wallet_id,omitempty"`
 	// HasMembershipRecord reports whether the preserved signer bytes
 	// accompany the metadata; metadata without the signer means the key
 	// material was lost and the record is evidence only.
@@ -314,11 +352,17 @@ type manifest struct {
 // expectedIdentityRecord is the manifest's evidence trail of the expected
 // operational identities the audit ran with.
 type expectedIdentityRecord struct {
-	EthereumChainID string `json:"ethereum_chain_id,omitempty"`
-	BitcoinNetwork  string `json:"bitcoin_network,omitempty"`
-	PriorVersion    string `json:"prior_version,omitempty"`
-	PriorRevision   string `json:"prior_revision,omitempty"`
-	MaxEvidenceAge  string `json:"max_evidence_age,omitempty"`
+	EthereumChainID    string `json:"ethereum_chain_id,omitempty"`
+	BitcoinNetwork     string `json:"bitcoin_network,omitempty"`
+	PriorVersion       string `json:"prior_version,omitempty"`
+	PriorRevision      string `json:"prior_revision,omitempty"`
+	PriorImageDigest   string `json:"prior_image_digest,omitempty"`
+	ReleaseVersion     string `json:"release_version,omitempty"`
+	ReleaseRevision    string `json:"release_revision,omitempty"`
+	ReleaseImageDigest string `json:"release_image_digest,omitempty"`
+	ReleaseEpoch       string `json:"release_epoch,omitempty"`
+	CutoverBlock       uint64 `json:"cutover_block,omitempty"`
+	MaxEvidenceAge     string `json:"max_evidence_age,omitempty"`
 }
 
 // evidenceInputs carries the externally produced rollback-evidence references
@@ -332,16 +376,23 @@ type evidenceInputs struct {
 
 // expectedIdentityInputs carries the operator-supplied expected operational
 // identities the audit binds the external evidence to. Every rollback-grade
-// run must supply all of them: without an expected chain, network, prior
-// artifact identity, and freshness bound, schema-valid evidence generated
+// run must supply all of them: without an expected chain, network, exact
+// prior and current artifact identities, immutable image digests, compiled
+// epoch, cutover block, and freshness bound, schema-valid evidence generated
 // against the wrong target — or long before the rollback decision — would
 // pass. A missing input is a rollback blocker, not a skipped check.
 type expectedIdentityInputs struct {
-	ethereumChainID string
-	bitcoinNetwork  string
-	priorVersion    string
-	priorRevision   string
-	maxEvidenceAge  time.Duration
+	ethereumChainID    string
+	bitcoinNetwork     string
+	priorVersion       string
+	priorRevision      string
+	priorImageDigest   string
+	releaseVersion     string
+	releaseRevision    string
+	releaseImageDigest string
+	releaseEpoch       string
+	cutoverBlock       uint64
+	maxEvidenceAge     time.Duration
 }
 
 func main() {
@@ -421,6 +472,54 @@ func main() {
 		"the exact prior release revision the rollback restores; the "+
 			"prior-reader compatibility evidence must record exactly this "+
 			"revision",
+	)
+	flag.StringVar(
+		&expected.priorImageDigest,
+		"expected-prior-image-digest",
+		"",
+		"the immutable sha256 image digest of the prior release artifact the "+
+			"rollback restores; the prior-reader compatibility evidence must "+
+			"record exactly this digest",
+	)
+	flag.StringVar(
+		&expected.releaseVersion,
+		"expected-release-version",
+		"",
+		"the exact version of the release being rolled back; the quiescence "+
+			"report and prior-reader compatibility evidence must record "+
+			"exactly this version",
+	)
+	flag.StringVar(
+		&expected.releaseRevision,
+		"expected-release-revision",
+		"",
+		"the exact revision of the release being rolled back; the quiescence "+
+			"report and prior-reader compatibility evidence must record "+
+			"exactly this revision",
+	)
+	flag.StringVar(
+		&expected.releaseImageDigest,
+		"expected-release-image-digest",
+		"",
+		"the immutable sha256 image digest of the release artifact being "+
+			"rolled back; the prior-reader compatibility evidence must record "+
+			"exactly this digest",
+	)
+	flag.StringVar(
+		&expected.releaseEpoch,
+		"expected-release-epoch",
+		"",
+		"the release epoch the audited state was written under; it must "+
+			"match this audit build's compiled epoch and the quiescence "+
+			"report's recorded epoch",
+	)
+	flag.Uint64Var(
+		&expected.cutoverBlock,
+		"expected-cutover-block",
+		0,
+		"the cutover block the audited deployment was armed with; the "+
+			"quiescence report and every quarantined output must record "+
+			"exactly this block",
 	)
 	flag.DurationVar(
 		&expected.maxEvidenceAge,
@@ -515,11 +614,17 @@ func runAudit(
 				RootMode: info.Mode().String(),
 			},
 			ExpectedIdentity: expectedIdentityRecord{
-				EthereumChainID: expected.ethereumChainID,
-				BitcoinNetwork:  expected.bitcoinNetwork,
-				PriorVersion:    expected.priorVersion,
-				PriorRevision:   expected.priorRevision,
-				MaxEvidenceAge:  expected.maxEvidenceAge.String(),
+				EthereumChainID:    expected.ethereumChainID,
+				BitcoinNetwork:     expected.bitcoinNetwork,
+				PriorVersion:       expected.priorVersion,
+				PriorRevision:      expected.priorRevision,
+				PriorImageDigest:   expected.priorImageDigest,
+				ReleaseVersion:     expected.releaseVersion,
+				ReleaseRevision:    expected.releaseRevision,
+				ReleaseImageDigest: expected.releaseImageDigest,
+				ReleaseEpoch:       expected.releaseEpoch,
+				CutoverBlock:       expected.cutoverBlock,
+				MaxEvidenceAge:     expected.maxEvidenceAge.String(),
 			},
 		},
 		expected: expected,
@@ -743,53 +848,125 @@ func classifyTBTCWork(r *auditRun) {
 	}
 }
 
-// recordExternalEvidence records every externally produced rollback input,
-// validates each supplied record against its mandatory schema and this exact
-// snapshot, and turns each missing or invalid one into a rollback blocker. A
-// supplied reference that cannot be read is an input error: fail fast instead
-// of recording evidence that does not exist.
+// isImmutableImageDigest reports whether the reference is an immutable
+// sha256 image digest — "sha256:" followed by 64 hex characters. Tags and
+// other mutable references cannot pin a rollback artifact.
+func isImmutableImageDigest(reference string) bool {
+	digest, ok := strings.CutPrefix(reference, "sha256:")
+	if !ok || len(digest) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(digest)
+	return err == nil
+}
+
 // recordMissingExpectedIdentity turns every unsupplied expected-identity
-// input into a rollback blocker: evidence that is not bound to an explicit
-// operational target can approve a rollback of the wrong chain, network, or
-// prior artifact.
+// input into a rollback blocker — evidence that is not bound to an explicit
+// operational target can approve a rollback of the wrong chain, network,
+// artifact, or cutover schedule — and every unusable one likewise: a mutable
+// image reference cannot pin an artifact, and an expected epoch differing
+// from this audit build's compiled epoch means the wrong audit tool is
+// examining the state.
 func recordMissingExpectedIdentity(r *auditRun) {
-	missing := []struct {
-		absent  bool
+	blocked := []struct {
+		when    bool
 		blocker string
 	}{
 		{
-			absent: r.expected.ethereumChainID == "",
+			when: r.expected.ethereumChainID == "",
 			blocker: "the expected Ethereum chain ID is not supplied: the " +
 				"chain reconciliation evidence cannot be bound to the " +
 				"rollback's operational target",
 		},
 		{
-			absent: r.expected.bitcoinNetwork == "",
+			when: r.expected.bitcoinNetwork == "",
 			blocker: "the expected Bitcoin network is not supplied: the " +
 				"Bitcoin reconciliation evidence cannot be bound to the " +
 				"rollback's operational target",
 		},
 		{
-			absent: r.expected.priorVersion == "",
+			when: r.expected.priorVersion == "",
 			blocker: "the expected prior version is not supplied: the " +
 				"prior-reader compatibility evidence cannot be bound to the " +
 				"exact restored artifact",
 		},
 		{
-			absent: r.expected.priorRevision == "",
+			when: r.expected.priorRevision == "",
 			blocker: "the expected prior revision is not supplied: the " +
 				"prior-reader compatibility evidence cannot be bound to the " +
 				"exact restored artifact",
 		},
 		{
-			absent: r.expected.maxEvidenceAge <= 0,
+			when: r.expected.priorImageDigest == "",
+			blocker: "the expected prior image digest is not supplied: the " +
+				"prior-reader compatibility evidence cannot be bound to the " +
+				"exact restored image",
+		},
+		{
+			when: r.expected.priorImageDigest != "" &&
+				!isImmutableImageDigest(r.expected.priorImageDigest),
+			blocker: fmt.Sprintf(
+				"the expected prior image digest [%s] is not an immutable "+
+					"sha256 image digest: a mutable reference cannot pin the "+
+					"restored artifact",
+				r.expected.priorImageDigest,
+			),
+		},
+		{
+			when: r.expected.releaseVersion == "",
+			blocker: "the expected release version is not supplied: the " +
+				"evidence cannot be bound to the exact rolled-back artifact",
+		},
+		{
+			when: r.expected.releaseRevision == "",
+			blocker: "the expected release revision is not supplied: the " +
+				"evidence cannot be bound to the exact rolled-back artifact",
+		},
+		{
+			when: r.expected.releaseImageDigest == "",
+			blocker: "the expected release image digest is not supplied: the " +
+				"evidence cannot be bound to the exact rolled-back image",
+		},
+		{
+			when: r.expected.releaseImageDigest != "" &&
+				!isImmutableImageDigest(r.expected.releaseImageDigest),
+			blocker: fmt.Sprintf(
+				"the expected release image digest [%s] is not an immutable "+
+					"sha256 image digest: a mutable reference cannot pin the "+
+					"rolled-back artifact",
+				r.expected.releaseImageDigest,
+			),
+		},
+		{
+			when: r.expected.releaseEpoch == "",
+			blocker: "the expected release epoch is not supplied: the " +
+				"audited state cannot be bound to the release that wrote it",
+		},
+		{
+			when: r.expected.releaseEpoch != "" &&
+				r.expected.releaseEpoch != participation.CompiledEpoch.String(),
+			blocker: fmt.Sprintf(
+				"the expected release epoch [%s] does not match this audit "+
+					"build's compiled epoch [%s]: the audit must be built from "+
+					"the audited release",
+				r.expected.releaseEpoch,
+				participation.CompiledEpoch,
+			),
+		},
+		{
+			when: r.expected.cutoverBlock == 0,
+			blocker: "the expected cutover block is not supplied: the " +
+				"audited state cannot be bound to the armed cutover schedule",
+		},
+		{
+			when: r.expected.maxEvidenceAge <= 0,
 			blocker: "no evidence freshness bound is supplied: arbitrarily " +
 				"old evidence cannot support a rollback decision",
 		},
 	}
 
-	for _, input := range missing {
-		if input.absent {
+	for _, input := range blocked {
+		if input.when {
 			r.manifest.RollbackBlockers = append(
 				r.manifest.RollbackBlockers,
 				input.blocker,
@@ -798,6 +975,11 @@ func recordMissingExpectedIdentity(r *auditRun) {
 	}
 }
 
+// recordExternalEvidence records every externally produced rollback input,
+// validates each supplied record against its mandatory schema and this exact
+// snapshot, and turns each missing or invalid one into a rollback blocker. A
+// supplied reference that cannot be read is an input error: fail fast instead
+// of recording evidence that does not exist.
 func recordExternalEvidence(r *auditRun, evidence evidenceInputs) error {
 	inputs := []struct {
 		name     string
@@ -946,13 +1128,67 @@ func (r *auditRun) validateEnvelope(
 	return violations
 }
 
+// exactIdentityViolations checks one identity field of an evidence record:
+// it must be present, and it must be exactly the expected value when an
+// expectation is supplied.
+func exactIdentityViolations(
+	description string,
+	value string,
+	expected string,
+) []string {
+	if value == "" {
+		return []string{fmt.Sprintf("the %s is missing", description)}
+	}
+	if expected != "" && value != expected {
+		return []string{fmt.Sprintf(
+			"%s [%s], expected [%s]",
+			description,
+			value,
+			expected,
+		)}
+	}
+	return nil
+}
+
+// digestViolations checks one image-digest field of an evidence record: it
+// must be present, immutable — a sha256 digest, never a tag — and exactly
+// the expected digest when an expectation is supplied.
+func digestViolations(
+	description string,
+	value string,
+	expected string,
+) []string {
+	if value == "" {
+		return []string{fmt.Sprintf("the %s is missing", description)}
+	}
+	var violations []string
+	if !isImmutableImageDigest(value) {
+		violations = append(violations, fmt.Sprintf(
+			"the %s [%s] is not an immutable sha256 image digest",
+			description,
+			value,
+		))
+	}
+	if expected != "" && value != expected {
+		violations = append(violations, fmt.Sprintf(
+			"%s [%s], expected [%s]",
+			description,
+			value,
+			expected,
+		))
+	}
+	return violations
+}
+
 // validateChainReconciliationEvidence checks the Ethereum reconciliation
 // record: schema, snapshot binding, the expected chain identity, one-to-one
 // coverage of every persisted tBTC wallet and beacon group — active and
-// quarantined — and a settled, registered on-chain state for each active
-// one. A quarantined output whose wallet or group is registered on chain is
-// a blocker of its own: the prior binary would run that wallet without the
-// preserved share.
+// quarantined — with no duplicate entries and wallet IDs matching the
+// decoded snapshot identities, a settled, registered on-chain state for each
+// active wallet, and an explicit no-result settlement for each
+// quarantined-only one. A quarantined output whose wallet or group is
+// registered on chain is a blocker of its own: the prior binary would run
+// that wallet without the preserved share.
 func (r *auditRun) validateChainReconciliationEvidence(
 	content []byte,
 ) []string {
@@ -981,6 +1217,7 @@ func (r *auditRun) validateChainReconciliationEvidence(
 	}
 
 	wallets := make(map[string]int)
+	walletIDs := make(map[string]string)
 	for i, wallet := range record.Wallets {
 		if wallet.WalletStorageKey == "" || wallet.WalletID == "" {
 			violations = append(violations, fmt.Sprintf(
@@ -989,7 +1226,33 @@ func (r *auditRun) validateChainReconciliationEvidence(
 			))
 			continue
 		}
+		if _, duplicate := wallets[wallet.WalletStorageKey]; duplicate {
+			violations = append(violations, fmt.Sprintf(
+				"tbtc wallet [%s] is reconciled more than once; duplicate "+
+					"entries cannot prove one-to-one coverage",
+				wallet.WalletStorageKey,
+			))
+			continue
+		}
+		if previous, duplicate := walletIDs[wallet.WalletID]; duplicate {
+			violations = append(violations, fmt.Sprintf(
+				"wallet ID [%s] is claimed by both tbtc wallet [%s] and "+
+					"tbtc wallet [%s]",
+				wallet.WalletID,
+				previous,
+				wallet.WalletStorageKey,
+			))
+			continue
+		}
+		if _, known := validDKGSettlementStates[wallet.DKGSettlement]; !known {
+			violations = append(violations, fmt.Sprintf(
+				"tbtc wallet [%s] has unknown DKG settlement state [%s]",
+				wallet.WalletStorageKey,
+				wallet.DKGSettlement,
+			))
+		}
 		wallets[wallet.WalletStorageKey] = i
+		walletIDs[wallet.WalletID] = wallet.WalletStorageKey
 	}
 	beaconGroups := make(map[string]int)
 	for i, beaconGroup := range record.BeaconGroups {
@@ -997,6 +1260,14 @@ func (r *auditRun) validateChainReconciliationEvidence(
 			violations = append(violations, fmt.Sprintf(
 				"beacon group entry [%d] is missing its group public key",
 				i,
+			))
+			continue
+		}
+		if _, duplicate := beaconGroups[beaconGroup.GroupPublicKey]; duplicate {
+			violations = append(violations, fmt.Sprintf(
+				"beacon group [%s] is reconciled more than once; duplicate "+
+					"entries cannot prove one-to-one coverage",
+				beaconGroup.GroupPublicKey,
 			))
 			continue
 		}
@@ -1029,6 +1300,16 @@ func (r *auditRun) validateChainReconciliationEvidence(
 				record.Wallets[i].DKGSettlement,
 			))
 		}
+		if wallet.WalletID != "" &&
+			record.Wallets[i].WalletID != wallet.WalletID {
+			violations = append(violations, fmt.Sprintf(
+				"persisted tbtc wallet [%s] is reconciled under wallet ID "+
+					"[%s], but its decoded records carry wallet ID [%s]",
+				wallet.WalletStorageKey,
+				record.Wallets[i].WalletID,
+				wallet.WalletID,
+			))
+		}
 	}
 	quarantinedWalletKeys := make(map[string]struct{})
 	for _, quarantined := range r.manifest.TBTCQuarantinedOutputs {
@@ -1053,6 +1334,32 @@ func (r *auditRun) validateChainReconciliationEvidence(
 					"its share is preserved only in quarantine; the prior "+
 					"binary would run it without the share",
 				quarantined.WalletStorageKey,
+			))
+		}
+		// A quarantined-only share tolerates no DKG result on chain at all:
+		// a pending or challenged result may still settle into a wallet the
+		// prior binary would run without the share, and an approved one
+		// contradicts the quarantine itself.
+		if record.Wallets[i].DKGSettlement != "none" {
+			violations = append(violations, fmt.Sprintf(
+				"quarantined tbtc wallet [%s] has DKG settlement [%s], "+
+					"expected [none]",
+				quarantined.WalletStorageKey,
+				record.Wallets[i].DKGSettlement,
+			))
+		}
+		expectedWalletID := quarantined.SignerWalletID
+		if expectedWalletID == "" {
+			expectedWalletID = quarantined.WalletID
+		}
+		if expectedWalletID != "" &&
+			record.Wallets[i].WalletID != expectedWalletID {
+			violations = append(violations, fmt.Sprintf(
+				"quarantined tbtc wallet [%s] is reconciled under wallet ID "+
+					"[%s], but its preserved output carries wallet ID [%s]",
+				quarantined.WalletStorageKey,
+				record.Wallets[i].WalletID,
+				expectedWalletID,
 			))
 		}
 	}
@@ -1198,11 +1505,12 @@ type quarantineTriple struct {
 }
 
 // validateQuiescenceReportEvidence checks the quiescence outcome record:
-// schema, snapshot binding, a stated cause, and a known ceremony, mode, and
-// terminal outcome for every permit active at quiescence. Every quarantined
-// DKG outcome must be matched by preserved quarantine state carrying the
-// same ceremony, protocol mode, and canonical anchor — one preserved output
-// per claiming permit, so one real output cannot vouch for several claims.
+// schema, snapshot binding, the quiescing node's exact artifact identity and
+// cutover schedule, a stated cause, and a known ceremony, mode, and terminal
+// outcome for every permit active at quiescence. Every quarantined DKG
+// outcome must be matched by preserved quarantine state carrying the same
+// ceremony, protocol mode, and canonical anchor — one preserved output per
+// claiming permit, so one real output cannot vouch for several claims.
 func (r *auditRun) validateQuiescenceReportEvidence(content []byte) []string {
 	record := &quiescenceReportEvidence{}
 	if err := strictUnmarshal(content, record); err != nil {
@@ -1216,6 +1524,35 @@ func (r *auditRun) validateQuiescenceReportEvidence(content []byte) []string {
 		record.evidenceEnvelope,
 		"quiescence_report",
 	)
+
+	violations = append(violations, exactIdentityViolations(
+		"quiescing release version",
+		record.ReleaseVersion,
+		r.expected.releaseVersion,
+	)...)
+	violations = append(violations, exactIdentityViolations(
+		"quiescing release revision",
+		record.ReleaseRevision,
+		r.expected.releaseRevision,
+	)...)
+	violations = append(violations, exactIdentityViolations(
+		"quiescing release epoch",
+		record.ReleaseEpoch,
+		r.expected.releaseEpoch,
+	)...)
+	if record.CutoverBlock == 0 {
+		violations = append(
+			violations,
+			"the armed cutover block is missing",
+		)
+	} else if r.expected.cutoverBlock > 0 &&
+		record.CutoverBlock != r.expected.cutoverBlock {
+		violations = append(violations, fmt.Sprintf(
+			"quiesced under cutover block [%d], expected [%d]",
+			record.CutoverBlock,
+			r.expected.cutoverBlock,
+		))
+	}
 
 	if record.QuiesceCause == "" {
 		violations = append(violations, "the quiescence cause is missing")
@@ -1314,8 +1651,10 @@ func (r *auditRun) validateQuiescenceReportEvidence(content []byte) []string {
 }
 
 // validatePriorReaderCompatibilityEvidence checks the prior-reader record:
-// schema, snapshot binding, an identified prior release, and an explicit
-// compatible result for every schema this release writes. Any missing or
+// schema, snapshot binding, the exactly pinned prior and current release
+// artifacts on both sides of the test, and an explicit compatible result for
+// every schema this release writes — each schema at most once, so one result
+// cannot be shadowed by a contradicting duplicate. Any missing or
 // incompatible schema means the prior-binary rollback is not an accepted
 // mechanism.
 func (r *auditRun) validatePriorReaderCompatibilityEvidence(
@@ -1334,29 +1673,54 @@ func (r *auditRun) validatePriorReaderCompatibilityEvidence(
 		"prior_reader_compatibility",
 	)
 
-	if record.PriorVersion == "" {
-		violations = append(violations, "the tested prior version is missing")
-	} else if r.expected.priorVersion != "" &&
-		record.PriorVersion != r.expected.priorVersion {
-		violations = append(violations, fmt.Sprintf(
-			"tested prior version [%s], expected [%s]",
-			record.PriorVersion,
-			r.expected.priorVersion,
-		))
-	}
-	if record.PriorRevision == "" {
-		violations = append(violations, "the tested prior revision is missing")
-	} else if r.expected.priorRevision != "" &&
-		record.PriorRevision != r.expected.priorRevision {
-		violations = append(violations, fmt.Sprintf(
-			"tested prior revision [%s], expected [%s]",
-			record.PriorRevision,
-			r.expected.priorRevision,
-		))
-	}
+	violations = append(violations, exactIdentityViolations(
+		"tested prior version",
+		record.PriorVersion,
+		r.expected.priorVersion,
+	)...)
+	violations = append(violations, exactIdentityViolations(
+		"tested prior revision",
+		record.PriorRevision,
+		r.expected.priorRevision,
+	)...)
+	violations = append(violations, digestViolations(
+		"tested prior image digest",
+		record.PriorImageDigest,
+		r.expected.priorImageDigest,
+	)...)
+	violations = append(violations, exactIdentityViolations(
+		"writing release version",
+		record.ReleaseVersion,
+		r.expected.releaseVersion,
+	)...)
+	violations = append(violations, exactIdentityViolations(
+		"writing release revision",
+		record.ReleaseRevision,
+		r.expected.releaseRevision,
+	)...)
+	violations = append(violations, digestViolations(
+		"writing release image digest",
+		record.ReleaseImageDigest,
+		r.expected.releaseImageDigest,
+	)...)
 
 	results := make(map[string]bool)
-	for _, result := range record.SchemaResults {
+	for i, result := range record.SchemaResults {
+		if result.Schema == "" {
+			violations = append(violations, fmt.Sprintf(
+				"schema result entry [%d] is missing its schema name",
+				i,
+			))
+			continue
+		}
+		if _, duplicate := results[result.Schema]; duplicate {
+			violations = append(violations, fmt.Sprintf(
+				"schema [%s] is covered more than once; duplicate results "+
+					"cannot prove compatibility",
+				result.Schema,
+			))
+			continue
+		}
 		results[result.Schema] = result.Compatible
 	}
 	for _, schema := range requiredPriorReaderSchemas {
@@ -1805,14 +2169,27 @@ func validateQuarantineEntry(
 }
 
 // validateQuarantineMode checks the recorded protocol mode against the
-// recorded cutover arithmetic: the mode is pinned from the canonical anchor,
-// so a record that contradicts that rule was not produced by the release
-// gate.
+// recorded cutover arithmetic — the mode is pinned from the canonical
+// anchor, so a record that contradicts that rule was not produced by the
+// release gate — and the recorded cutover block against the expected armed
+// schedule: a record preserved under a different cutover block belongs to a
+// different deployment than the one being rolled back.
 func validateQuarantineMode(
 	run *auditRun,
 	key string,
 	metadata *registry.QuarantinedSignerMetadata,
 ) {
+	if run.expected.cutoverBlock > 0 &&
+		metadata.CutoverBlock != run.expected.cutoverBlock {
+		run.finding(
+			"beacon quarantine metadata [%s] was preserved under cutover "+
+				"block [%d], not the expected cutover block [%d]",
+			key,
+			metadata.CutoverBlock,
+			run.expected.cutoverBlock,
+		)
+	}
+
 	legacy := participation.ModeLegacy.String()
 	securityV2 := participation.ModeSecurityV2.String()
 
@@ -1952,6 +2329,7 @@ func interpretTBTCActiveNamespace(
 		if !ok {
 			wallet = &tbtcWalletRecord{
 				WalletStorageKey: record.WalletStorageKey,
+				WalletID:         record.WalletID,
 				SigningGroupSize: record.SigningGroupSize,
 			}
 			wallets[record.WalletStorageKey] = wallet
@@ -2123,11 +2501,16 @@ func interpretTBTCQuarantineNamespace(
 		if entry.metadata == nil {
 			continue
 		}
+		signerWalletID := ""
+		if entry.signer != nil {
+			signerWalletID = entry.signer.WalletID
+		}
 		run.manifest.TBTCQuarantinedOutputs = append(
 			run.manifest.TBTCQuarantinedOutputs,
 			tbtcQuarantineRecord{
 				QuarantinedSignerMetadata: *entry.metadata,
 				WalletStorageKey:          entry.directory,
+				SignerWalletID:            signerWalletID,
 				HasMembershipRecord:       entry.signer != nil,
 			},
 		)
@@ -2249,8 +2632,11 @@ func validateTBTCQuarantineEntry(
 
 	validateTBTCQuarantineMode(run, key, metadata)
 
-	if entry.signer != nil &&
-		uint8(entry.signer.MemberIndex) != metadata.MemberIndex {
+	if entry.signer == nil {
+		return
+	}
+
+	if uint8(entry.signer.MemberIndex) != metadata.MemberIndex {
 		run.finding(
 			"tbtc quarantine output [%s] pairs metadata for member [%d] "+
 				"with a membership of member [%d]",
@@ -2259,17 +2645,50 @@ func validateTBTCQuarantineEntry(
 			entry.signer.MemberIndex,
 		)
 	}
+	if metadata.WalletID != "" &&
+		metadata.WalletID != entry.signer.WalletID {
+		run.finding(
+			"tbtc quarantine metadata [%s] names wallet ID [%s], but its "+
+				"membership decodes to wallet ID [%s]",
+			key,
+			metadata.WalletID,
+			entry.signer.WalletID,
+		)
+	}
+	if metadata.WalletPublicKeyHash != "" &&
+		metadata.WalletPublicKeyHash != entry.signer.WalletPublicKeyHash {
+		run.finding(
+			"tbtc quarantine metadata [%s] names wallet public key hash "+
+				"[%s], but its membership decodes to [%s]",
+			key,
+			metadata.WalletPublicKeyHash,
+			entry.signer.WalletPublicKeyHash,
+		)
+	}
 }
 
 // validateTBTCQuarantineMode checks the recorded protocol mode against the
-// recorded cutover arithmetic: the mode is pinned from the canonical anchor,
-// so a record that contradicts that rule was not produced by the release
-// gate.
+// recorded cutover arithmetic — the mode is pinned from the canonical
+// anchor, so a record that contradicts that rule was not produced by the
+// release gate — and the recorded cutover block against the expected armed
+// schedule: a record preserved under a different cutover block belongs to a
+// different deployment than the one being rolled back.
 func validateTBTCQuarantineMode(
 	run *auditRun,
 	key string,
 	metadata *tbtc.QuarantinedSignerMetadata,
 ) {
+	if run.expected.cutoverBlock > 0 &&
+		metadata.CutoverBlock != run.expected.cutoverBlock {
+		run.finding(
+			"tbtc quarantine metadata [%s] was preserved under cutover "+
+				"block [%d], not the expected cutover block [%d]",
+			key,
+			metadata.CutoverBlock,
+			run.expected.cutoverBlock,
+		)
+	}
+
 	legacy := participation.ModeLegacy.String()
 	securityV2 := participation.ModeSecurityV2.String()
 
