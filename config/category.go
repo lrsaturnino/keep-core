@@ -12,6 +12,7 @@ const (
 	Tbtc
 	Maintainer
 	Developer
+	ProtocolParticipation
 )
 
 // StartCmdCategories are categories needed for the start command.
@@ -23,6 +24,7 @@ var StartCmdCategories = []Category{
 	Storage,
 	ClientInfo,
 	Tbtc,
+	ProtocolParticipation,
 	Developer,
 }
 
@@ -44,5 +46,6 @@ var AllCategories = []Category{
 	ClientInfo,
 	Tbtc,
 	Maintainer,
+	ProtocolParticipation,
 	Developer,
 }

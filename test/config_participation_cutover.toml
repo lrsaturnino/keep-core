@@ -1,0 +1,21 @@
+# Config fixture proving that a `[protocolParticipation] CutoverBlock` config
+# file key is decoded and detected as explicitly present. It carries the
+# minimum valid Ethereum, Bitcoin Electrum, network, and storage values
+# required by config validation so the only property under test is the
+# protocol participation section.
+
+[ethereum]
+URL = "ws://192.168.0.158:8546"
+KeyFile = "/tmp/UTC--2018-03-11T01-37-33.202765887Z--c2a56884538778bacd91aa5bf343bf882c5fb18b"
+
+[bitcoin.electrum]
+URL = "tcp://url.to.electrum:18332"
+
+[network]
+Port = 3919
+
+[storage]
+Dir = "/my/secure/location"
+
+[protocolParticipation]
+CutoverBlock = 124000

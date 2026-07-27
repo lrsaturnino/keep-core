@@ -1,0 +1,22 @@
+# Config fixture proving that an explicit `[protocolParticipation]
+# CutoverBlock = 0` config file key is detected as explicitly present even
+# though its decoded value equals the flag default. Mainnet rejection is keyed
+# on this presence, so an explicit zero must be distinguishable from an absent
+# key. It carries the minimum valid Ethereum, Bitcoin Electrum, network, and
+# storage values required by config validation.
+
+[ethereum]
+URL = "ws://192.168.0.158:8546"
+KeyFile = "/tmp/UTC--2018-03-11T01-37-33.202765887Z--c2a56884538778bacd91aa5bf343bf882c5fb18b"
+
+[bitcoin.electrum]
+URL = "tcp://url.to.electrum:18332"
+
+[network]
+Port = 3919
+
+[storage]
+Dir = "/my/secure/location"
+
+[protocolParticipation]
+CutoverBlock = 0

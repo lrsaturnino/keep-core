@@ -25,6 +25,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/net"
 	"github.com/keep-network/keep-core/pkg/net/libp2p"
 	"github.com/keep-network/keep-core/pkg/net/retransmission"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/tbtc"
 )
 
@@ -64,6 +65,36 @@ Environment variables:
 // start starts a node
 func start(cmd *cobra.Command) error {
 	ctx := context.Background()
+
+	// Resolve the protocol participation schedule before connecting anywhere:
+	// these are configuration-only checks, and a misconfigured cutover block
+	// must terminate startup before any component can send protocol traffic.
+	participationSchedule, err := participation.ResolveAndValidate(
+		clientConfig.Ethereum.Network,
+		clientConfig.ProtocolParticipation,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"protocol participation schedule rejected: [%v]",
+			err,
+		)
+	}
+
+	cutoverBlockSource := "release_baked"
+	if clientConfig.ProtocolParticipation.CutoverBlockSet {
+		cutoverBlockSource = "non_mainnet_override"
+	}
+	logger.Infof(
+		"protocol participation schedule resolved [version=%s] "+
+			"[revision=%s] [epoch=%s] [cutoverBlock=%d] [source=%s] "+
+			"[disabled=%t]",
+		build.Version,
+		build.Revision,
+		participation.CompiledEpoch,
+		participationSchedule.CutoverBlock,
+		cutoverBlockSource,
+		participationSchedule.Disabled(),
+	)
 
 	beaconChain, tbtcChain, blockCounter, signing, operatorPrivateKey, err :=
 		ethereum.Connect(ctx, clientConfig.Ethereum)

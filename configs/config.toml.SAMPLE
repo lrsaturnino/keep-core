@@ -125,6 +125,14 @@ Port = 9601
 # PreParamsGenerationConcurrency = 1
 # KeyGenerationConcurrency = 1
 
+# Protocol cutover block override for NON-MAINNET networks only. Mainnet always
+# uses the compiled release constant and refuses to start when this setting is
+# present, including with an explicit zero. Testnet release rehearsals must set
+# a nonzero value; developer mode may use 0 to disable the cutover schedule.
+#
+# [protocolParticipation]
+# CutoverBlock = 124000
+
 # Developer options to work with locally deployed contracts
 #
 # [developer]

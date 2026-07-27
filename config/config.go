@@ -23,6 +23,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/clientinfo"
 	"github.com/keep-network/keep-core/pkg/maintainer"
 	"github.com/keep-network/keep-core/pkg/net/libp2p"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/storage"
 	"github.com/keep-network/keep-core/pkg/tbtc"
 )
@@ -45,13 +46,14 @@ const (
 
 // Config is the top level config structure.
 type Config struct {
-	Ethereum   commonEthereum.Config
-	Bitcoin    BitcoinConfig
-	LibP2P     libp2p.Config `mapstructure:"network"`
-	Storage    storage.Config
-	ClientInfo clientinfo.Config
-	Maintainer maintainer.Config
-	Tbtc       tbtc.Config
+	Ethereum              commonEthereum.Config
+	Bitcoin               BitcoinConfig
+	LibP2P                libp2p.Config `mapstructure:"network"`
+	Storage               storage.Config
+	ClientInfo            clientinfo.Config
+	Maintainer            maintainer.Config
+	Tbtc                  tbtc.Config
+	ProtocolParticipation participation.Config `mapstructure:"protocolParticipation"`
 }
 
 // BitcoinConfig defines the configuration for Bitcoin.
@@ -140,6 +142,17 @@ func (c *Config) ReadConfig(configFilePath string, flagSet *pflag.FlagSet, categ
 	if err := unmarshalConfig(c); err != nil {
 		return fmt.Errorf("unable to unmarshal config: %w", err)
 	}
+
+	// Record whether the protocol participation cutover block was explicitly
+	// supplied at all: mainnet rejection is keyed on this presence — an
+	// explicit zero must be rejected too — so the decoded numeric value alone
+	// is not enough. Viper's IsSet deliberately ignores unchanged flag
+	// defaults, so this is true only for a config-file key or an explicitly
+	// changed flag.
+	c.ProtocolParticipation.CutoverBlockSet =
+		viper.IsSet("protocolParticipation.cutoverBlock") ||
+			(flagSet != nil &&
+				flagSet.Changed("protocolParticipation.cutoverBlock"))
 
 	// Resolve contracts addresses.
 	c.resolveContractsAddresses()

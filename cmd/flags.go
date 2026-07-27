@@ -50,6 +50,8 @@ func initFlags(
 			initTbtcFlags(cmd, cfg)
 		case config.Maintainer:
 			initMaintainerFlags(cmd, cfg)
+		case config.ProtocolParticipation:
+			initProtocolParticipationFlags(cmd, cfg)
 		case config.Developer:
 			initDeveloperFlags(cmd)
 		}
@@ -372,6 +374,19 @@ func initMaintainerFlags(command *cobra.Command, cfg *config.Config) {
 		spv.DefaultIdleBackOffTime,
 		"The wait time which should be applied when there are no more "+
 			"transaction proofs to submit.",
+	)
+}
+
+// Initialize flags for Protocol Participation configuration.
+func initProtocolParticipationFlags(cmd *cobra.Command, cfg *config.Config) {
+	cmd.Flags().Uint64Var(
+		&cfg.ProtocolParticipation.CutoverBlock,
+		"protocolParticipation.cutoverBlock",
+		0,
+		"Protocol cutover block override for non-mainnet networks. Mainnet "+
+			"always uses the compiled release constant and rejects this "+
+			"setting; testnet requires a nonzero value; developer mode may "+
+			"use 0 to disable the cutover schedule.",
 	)
 }
 

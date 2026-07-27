@@ -22,6 +22,7 @@ import (
 	ethereumEcdsa "github.com/keep-network/keep-core/pkg/chain/ethereum/ecdsa/gen"
 	ethereumTbtc "github.com/keep-network/keep-core/pkg/chain/ethereum/tbtc/gen"
 	ethereumThreshold "github.com/keep-network/keep-core/pkg/chain/ethereum/threshold/gen"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 )
 
 var cmdFlagsTests = map[string]struct {
@@ -363,6 +364,15 @@ var cmdFlagsTests = map[string]struct {
 		expectedValueFromFlag: common.HexToAddress("0xE7d33d8AA55B73a93059a24b900366894684a497"),
 		defaultValue:          common.HexToAddress(ethereumTbtc.WalletProposalValidatorAddress),
 	},
+	"protocolParticipation.cutoverBlock": {
+		readValueFunc: func(c *config.Config) interface{} {
+			return c.ProtocolParticipation.CutoverBlock
+		},
+		flagName:              "--protocolParticipation.cutoverBlock",
+		flagValue:             "124000",
+		expectedValueFromFlag: uint64(124000),
+		defaultValue:          uint64(0),
+	},
 }
 
 func TestFlags_ReadConfigFromFlags(t *testing.T) {
@@ -630,4 +640,228 @@ func readPeers(network commonEthereum.Network) []string {
 	}
 
 	return result
+}
+
+// TestFlags_ProtocolParticipationAbsentByDefault proves that with no flag and
+// no config key the cutover block resolves to the zero default and, more
+// importantly, is detected as not explicitly supplied. Mainnet rejects the
+// override by presence, so absence must be reliably distinguishable.
+func TestFlags_ProtocolParticipationAbsentByDefault(t *testing.T) {
+	testCommand, testConfig, _ := initTestCommand()
+
+	args := []string{
+		cmdFlagsTests["ethereum.url"].flagName, cmdFlagsTests["ethereum.url"].flagValue,
+		cmdFlagsTests["ethereum.keyFile"].flagName, cmdFlagsTests["ethereum.keyFile"].flagValue,
+		cmdFlagsTests["bitcoin.electrum.url"].flagName, cmdFlagsTests["bitcoin.electrum.url"].flagValue,
+		cmdFlagsTests["storage.dir"].flagName, cmdFlagsTests["storage.dir"].flagValue,
+	}
+	testCommand.SetArgs(args)
+
+	testCommand.Execute()
+
+	if testConfig.ProtocolParticipation.CutoverBlock != 0 {
+		t.Errorf(
+			"expected the cutover block default 0, got [%d]",
+			testConfig.ProtocolParticipation.CutoverBlock,
+		)
+	}
+	if testConfig.ProtocolParticipation.CutoverBlockSet {
+		t.Error("expected the cutover block to be detected as not supplied")
+	}
+}
+
+// TestFlags_ProtocolParticipationPresenceFromFlag proves that an explicitly
+// changed flag is detected as supplied even when its value equals the bound
+// default, which is what lets mainnet reject an explicit zero override.
+func TestFlags_ProtocolParticipationPresenceFromFlag(t *testing.T) {
+	for _, flagValue := range []string{"124000", "0"} {
+		testCommand, testConfig, _ := initTestCommand()
+
+		args := []string{
+			cmdFlagsTests["ethereum.url"].flagName, cmdFlagsTests["ethereum.url"].flagValue,
+			cmdFlagsTests["ethereum.keyFile"].flagName, cmdFlagsTests["ethereum.keyFile"].flagValue,
+			cmdFlagsTests["bitcoin.electrum.url"].flagName, cmdFlagsTests["bitcoin.electrum.url"].flagValue,
+			cmdFlagsTests["storage.dir"].flagName, cmdFlagsTests["storage.dir"].flagValue,
+			"--protocolParticipation.cutoverBlock", flagValue,
+		}
+		testCommand.SetArgs(args)
+
+		testCommand.Execute()
+
+		if !testConfig.ProtocolParticipation.CutoverBlockSet {
+			t.Errorf(
+				"expected an explicit flag value [%s] to be detected as "+
+					"supplied",
+				flagValue,
+			)
+		}
+	}
+}
+
+// TestFlags_ProtocolParticipationNetworkMatrix proves the per-network cutover
+// schedule resolution rules on top of the command wiring: mainnet rejects any
+// override (including an explicit zero), testnet requires a nonzero value, and
+// developer mode accepts both zero (disabled) and nonzero.
+func TestFlags_ProtocolParticipationNetworkMatrix(t *testing.T) {
+	baseArgs := func() []string {
+		return []string{
+			cmdFlagsTests["ethereum.url"].flagName, cmdFlagsTests["ethereum.url"].flagValue,
+			cmdFlagsTests["ethereum.keyFile"].flagName, cmdFlagsTests["ethereum.keyFile"].flagValue,
+			cmdFlagsTests["bitcoin.electrum.url"].flagName, cmdFlagsTests["bitcoin.electrum.url"].flagValue,
+			cmdFlagsTests["storage.dir"].flagName, cmdFlagsTests["storage.dir"].flagValue,
+		}
+	}
+
+	var tests = map[string]struct {
+		networkFlag          string
+		cutoverFlagValue     string
+		expectResolutionErr  bool
+		expectedCutoverBlock uint64
+	}{
+		"mainnet rejects an override": {
+			networkFlag:         "",
+			cutoverFlagValue:    "124000",
+			expectResolutionErr: true,
+		},
+		"mainnet rejects an explicit zero override": {
+			networkFlag:         "",
+			cutoverFlagValue:    "0",
+			expectResolutionErr: true,
+		},
+		"testnet accepts a nonzero cutover block": {
+			networkFlag:          "--testnet",
+			cutoverFlagValue:     "124000",
+			expectedCutoverBlock: 124000,
+		},
+		"testnet rejects a zero cutover block": {
+			networkFlag:         "--testnet",
+			cutoverFlagValue:    "",
+			expectResolutionErr: true,
+		},
+		"developer accepts zero as disabled": {
+			networkFlag:          "--developer",
+			cutoverFlagValue:     "",
+			expectedCutoverBlock: 0,
+		},
+		"developer accepts a nonzero cutover block": {
+			networkFlag:          "--developer",
+			cutoverFlagValue:     "42",
+			expectedCutoverBlock: 42,
+		},
+	}
+
+	for testName, test := range tests {
+		t.Run(testName, func(t *testing.T) {
+			testCommand, testConfig, _ := initTestCommand()
+
+			args := baseArgs()
+			if test.networkFlag != "" {
+				args = append(args, test.networkFlag)
+			}
+			if test.cutoverFlagValue != "" {
+				args = append(
+					args,
+					"--protocolParticipation.cutoverBlock",
+					test.cutoverFlagValue,
+				)
+			}
+			testCommand.SetArgs(args)
+
+			testCommand.Execute()
+
+			schedule, err := participation.ResolveAndValidate(
+				testConfig.Ethereum.Network,
+				testConfig.ProtocolParticipation,
+			)
+
+			if test.expectResolutionErr {
+				if err == nil {
+					t.Fatal("expected a schedule resolution error")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected schedule resolution error: [%v]", err)
+			}
+			if schedule.CutoverBlock != test.expectedCutoverBlock {
+				t.Errorf(
+					"expected cutover block [%d], got [%d]",
+					test.expectedCutoverBlock,
+					schedule.CutoverBlock,
+				)
+			}
+		})
+	}
+}
+
+// TestFlags_ProtocolParticipationFromConfigFile proves that a
+// `[protocolParticipation] CutoverBlock` config file key is decoded and
+// detected as explicitly present, and that mainnet consequently rejects it.
+func TestFlags_ProtocolParticipationFromConfigFile(t *testing.T) {
+	testCommand, testConfig, _ := initTestCommand()
+
+	testCommand.SetArgs([]string{
+		"--config", "../test/config_participation_cutover.toml",
+	})
+
+	testCommand.Execute()
+
+	if testConfig.ProtocolParticipation.CutoverBlock != 124000 {
+		t.Errorf(
+			"expected the config file cutover block [124000], got [%d]",
+			testConfig.ProtocolParticipation.CutoverBlock,
+		)
+	}
+	if !testConfig.ProtocolParticipation.CutoverBlockSet {
+		t.Error("expected the config file key to be detected as supplied")
+	}
+
+	if _, err := participation.ResolveAndValidate(
+		commonEthereum.Mainnet,
+		testConfig.ProtocolParticipation,
+	); err == nil {
+		t.Error("expected mainnet to reject the config file override")
+	}
+}
+
+// TestFlags_ProtocolParticipationZeroFromConfigFile proves that an explicit
+// `[protocolParticipation] CutoverBlock = 0` config file key is detected as
+// present even though its decoded value equals the flag default, so mainnet
+// rejects it by presence and the rejection names the offending key.
+func TestFlags_ProtocolParticipationZeroFromConfigFile(t *testing.T) {
+	testCommand, testConfig, _ := initTestCommand()
+
+	testCommand.SetArgs([]string{
+		"--config", "../test/config_participation_cutover_zero.toml",
+	})
+
+	testCommand.Execute()
+
+	if testConfig.ProtocolParticipation.CutoverBlock != 0 {
+		t.Errorf(
+			"expected the config file cutover block [0], got [%d]",
+			testConfig.ProtocolParticipation.CutoverBlock,
+		)
+	}
+	if !testConfig.ProtocolParticipation.CutoverBlockSet {
+		t.Error(
+			"expected the explicit zero config file key to be detected as " +
+				"supplied",
+		)
+	}
+
+	_, err := participation.ResolveAndValidate(
+		commonEthereum.Mainnet,
+		testConfig.ProtocolParticipation,
+	)
+	if err == nil {
+		t.Fatal("expected mainnet to reject the explicit zero override")
+	}
+	if !strings.Contains(err.Error(), "protocolParticipation.cutoverBlock") {
+		t.Errorf(
+			"expected the rejection to name the offending key, got: [%v]",
+			err,
+		)
+	}
 }
