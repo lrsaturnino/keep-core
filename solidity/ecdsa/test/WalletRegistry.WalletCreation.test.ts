@@ -3015,10 +3015,15 @@ describe("WalletRegistry - Wallet Creation", async () => {
             context("with insufficient gas provided", async () => {
               it("should revert when gas check fails", async () => {
                 // This test verifies the gas check works correctly
+                // Above EIP-7623's intrinsic calldata floor, which hardhat
+                // 2.29 enforces before execution -- below it the node rejects
+                // the transaction outright and the contract's own gas check
+                // never runs, which is what this asserts on. Still far short of
+                // what `challengeDkgResult` needs to complete.
                 await expect(
                   walletRegistry
                     .connect(thirdParty)
-                    .challengeDkgResult(dkgResult, { gasLimit: 200000 })
+                    .challengeDkgResult(dkgResult, { gasLimit: 220000 })
                 ).to.be.reverted
               })
             })

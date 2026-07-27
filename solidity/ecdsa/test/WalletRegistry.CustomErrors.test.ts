@@ -493,7 +493,9 @@ describe("WalletRegistry - Custom Errors", () => {
         // The error will be triggered by the inline gas check at the end of challengeDkgResult
         await expect(
           walletRegistry.connect(unauthorized).challengeDkgResult(dkgResult, {
-            gasLimit: 100000, // Intentionally low gas
+            // Above EIP-7623's intrinsic calldata floor, which hardhat 2.29
+            // enforces before execution, and far below what the call needs.
+            gasLimit: 170000,
           })
         ).to.be.reverted // May revert with out-of-gas or NotEnoughExtraGasLeft
       })
