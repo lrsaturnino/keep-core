@@ -657,4 +657,28 @@ export async function expectCalledOnceWith(
   })
 }
 
+/**
+ * `expect(fake.fn).to.have.been.calledWith(...)` — some recorded call matched.
+ *
+ * Deliberately weaker than `expectCalledOnceWith`: smock's `calledWith` says
+ * nothing about how many times the function ran, so translating those sites to
+ * the `Once` variant would quietly add an assertion the test never made.
+ */
+export async function expectCalledWith(
+  fn: MockedFunction,
+  args: unknown[]
+): Promise<void> {
+  const calls = await fn.getCalls()
+
+  expect(calls.length, "expected at least one call").to.be.greaterThan(0)
+
+  const wanted = args.map(normalizeForComparison)
+  const seen = calls.map((call) => call.args.map(normalizeForComparison))
+
+  expect(
+    seen,
+    `expected a call with ${calls.length} recorded, none matching`
+  ).to.deep.include(wanted)
+}
+
 export default createMock

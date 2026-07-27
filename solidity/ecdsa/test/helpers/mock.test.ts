@@ -1,7 +1,7 @@
 import { ethers } from "hardhat"
 import { expect } from "chai"
 
-import { createMock } from "./mock"
+import { createMock, expectCalledWith } from "./mock"
 
 import type { Mock } from "./mock"
 import type { IMockTarget, MockTargetConsumer } from "../../typechain"
@@ -119,6 +119,24 @@ describe("MockContract", () => {
       const call = await target.doThing.getCall(0)
       expect(call.args[0]).to.equal(who)
       expect(call.args[1]).to.equal(123)
+    })
+
+    it("expectCalledWith matches any recorded call, not only a lone one", async () => {
+      await consumer.noReturn(5)
+      await consumer.noReturn(6)
+
+      // `calledWith` says nothing about how many calls there were, so both
+      // recorded calls must satisfy it and a third value must not.
+      await expectCalledWith(target.noReturn, [5])
+      await expectCalledWith(target.noReturn, [6])
+
+      let failed = false
+      try {
+        await expectCalledWith(target.noReturn, [7])
+      } catch {
+        failed = true
+      }
+      expect(failed, "expected a non-matching argument to fail").to.equal(true)
     })
 
     it("records a function that returns nothing", async () => {
