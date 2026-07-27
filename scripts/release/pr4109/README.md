@@ -34,7 +34,12 @@ and golangci-lint v2.12.2 — and `./rehearse.sh solidity-proofs` builds and
 tests the ECDSA contracts exactly as the contracts workflow does: Node
 18.15.0, the Corepack-managed yarn from `packageManager`, and a
 never-skipped `yarn install --immutable` before `yarn build` and
-`yarn test`. Every stage stamps the exact source commit into its log.
+`yarn test`. Every stage stamps the exact source commit into its log,
+marking any divergence from `HEAD` — untracked files included — as
+`-dirty`. Setting `PR4109_EXPECTED_SOURCE_COMMIT` makes the stamp a
+fail-closed binding instead: the stage refuses to run at all unless the
+tree under test is exactly that commit, so a log carrying a verified stamp
+is proof the stamped bytes were the tested bytes.
 
 The offline state classification the rollback barrier requires runs with
 `go run ./cmd/participation-state-audit --storage-snapshot <copy>`: it
@@ -83,9 +88,19 @@ Screenshots alone are insufficient. `./rehearse.sh validate-evidence` checks
 every record under `EVIDENCE_DIR` against the schema, and the
 `cutover-rehearsal` workflow (manually dispatched, in
 `.github/workflows/cutover-rehearsal.yml`) runs the local proofs, the
-static analyzers, and the contracts build/test on every dispatch —
-archiving each stage's log in a per-SHA artifact — and the container
-preflight when the image digests and chain inputs are supplied.
+static analyzers, and the contracts build/test on every dispatch — and the
+container preflight when the image digests and chain inputs are supplied.
+Each stage's log is archived in a per-SHA artifact whether the stage
+passes or fails, and the per-SHA name is backed by an in-stage proof, not
+just labeling: the workflow hands every proof stage the dispatched SHA via
+`PR4109_EXPECTED_SOURCE_COMMIT`, and for the build-image stage it mounts
+the checkout's `.git` and `scripts/` read-only into the container
+(`.dockerignore` keeps both out of the build context) and sets
+`PR4109_SOURCE_BINDING_MODE=build-image`, under which `rehearse.sh`
+accepts only the divergence the image produces by design —
+`.dockerignore`'d paths absent from the image and the `gen/` trees the
+image regenerates from published artifacts — and refuses to produce
+evidence on anything else.
 
 On a hosted runner the per-node keystore comes from the
 `REHEARSAL_KEYSTORE_BUNDLE_B64` repository secret: a base64-encoded tar.gz

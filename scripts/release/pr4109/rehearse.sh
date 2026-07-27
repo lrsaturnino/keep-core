@@ -23,6 +23,20 @@
 #                        operator key file
 #   KEEP_ETHEREUM_PASSWORD  operator key file password for the fleet
 #
+# Fail-closed source binding (every proof stage):
+#
+#   PR4109_EXPECTED_SOURCE_COMMIT
+#                        when set, a proof stage refuses to run unless the
+#                        tree under test is exactly this commit: readable
+#                        git metadata, HEAD equal to the value, and no
+#                        divergence — untracked files included
+#   PR4109_SOURCE_BINDING_MODE
+#                        exact (default) tolerates no divergence at all;
+#                        build-image additionally accepts only what the CI
+#                        build image produces by design — .dockerignore'd
+#                        paths absent from the image and the gen/ trees the
+#                        image regenerates from published artifacts
+#
 # Evidence is written under EVIDENCE_DIR (default: ./rehearsal-evidence).
 # Every accepted rehearsal run must produce a record conforming to
 # rehearsal-evidence.schema.json; the validate-evidence stage enforces that.
@@ -74,6 +88,14 @@ stages:
                       [BLOCKED until preflight passes]
   validate-evidence   validate every evidence record under EVIDENCE_DIR
                       against rehearsal-evidence.schema.json
+
+environment (every proof stage):
+  PR4109_EXPECTED_SOURCE_COMMIT
+                      fail closed: refuse to run unless the tree under test
+                      is exactly this commit (clean, untracked included)
+  PR4109_SOURCE_BINDING_MODE
+                      exact (default) | build-image (accept only the CI
+                      build image's .dockerignore/gen-rebuild divergence)
 EOF
 }
 
@@ -82,21 +104,126 @@ blocked() {
   printf 'BLOCKED: %s\n' "$*" >&2
   exit 3
 }
+fail() {
+  printf 'FAIL: %s\n' "$*" >&2
+  exit 1
+}
+
+# Working-tree divergence from HEAD as porcelain lines, untracked files
+# included: a file git does not track can still change what a go or yarn
+# invocation tests, so only ignored paths (evidence logs, build output) are
+# exempt. If git itself cannot answer, a sentinel line keeps every consumer
+# fail-closed instead of mistaking an error for a clean tree.
+source_divergence() {
+  git -C "${REPO_ROOT}" status --porcelain 2>/dev/null ||
+    printf '!! git status failed; divergence unknown\n'
+}
 
 # The exact source commit every stage stamps into its log. A working tree
-# that differs from HEAD is marked -dirty so a local log can never pass for
-# evidence of the clean commit; outside a git checkout (the build image)
-# the stamp degrades to "unknown" instead of failing the stage.
+# that differs from HEAD — untracked files included — is marked -dirty so a
+# local log can never pass for evidence of the clean commit; outside a git
+# checkout the stamp degrades to "unknown" instead of failing the stage.
+# Refusing to run on divergence is verify_source_binding's job.
 source_commit() {
   local commit
   if ! commit="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null)"; then
     printf 'unknown'
     return
   fi
-  if ! git -C "${REPO_ROOT}" diff --quiet HEAD 2>/dev/null; then
+  if [[ -n "$(source_divergence)" ]]; then
     commit="${commit}-dirty"
   fi
   printf '%s' "${commit}"
+}
+
+# Divergence the CI build image creates by design, and nothing else:
+# .dockerignore keeps these paths out of the build context entirely, so
+# against the mounted checkout metadata they surface as worktree deletions,
+# and `make get_artifacts`/`make generate` rebuild the gen/ trees from the
+# published contract artifacts, surfacing as modified, deleted, or
+# untracked gen/ and node_modules/ paths. Reads porcelain lines on stdin
+# and passes through every line neither family explains.
+unexplained_build_image_divergence() {
+  local regenerated='(^|/)(gen|node_modules)/'
+  local dockerignored='^(\..+|docs[^/]*/.+|infrastructure/.+|scripts/.+'
+  dockerignored+='|tmp/.+|CODEOWNERS|Dockerfile|[^/]+\.adoc|solidity/.+'
+  dockerignored+='|token-stakedrop/.+|token-tracker/.+)$'
+  local line status path
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] || continue
+    status="${line:0:2}"
+    path="${line:3}"
+    if [[ "${path}" =~ ${regenerated} ]]; then
+      continue
+    fi
+    if [[ "${status}" == " D" && "${path}" =~ ${dockerignored} ]]; then
+      continue
+    fi
+    printf '%s\n' "${line}"
+  done
+}
+
+# Fail-closed source binding. When PR4109_EXPECTED_SOURCE_COMMIT is set —
+# the workflow passes the dispatched SHA to every proof stage, mounting the
+# checkout's .git and scripts/ read-only into the build image so even the
+# container run can be held to it — the stage refuses to run unless the
+# tree under test is exactly that commit. Without the variable the stage
+# stamps its log via source_commit and runs anyway: a local iteration loop
+# may test a dirty tree, it just can never produce evidence claiming to be
+# a clean commit.
+verify_source_binding() {
+  local expected="${PR4109_EXPECTED_SOURCE_COMMIT:-}"
+  if [[ -z "${expected}" ]]; then
+    note "source commit: $(source_commit) (unbound run; set \
+PR4109_EXPECTED_SOURCE_COMMIT to fail closed on divergence)"
+    return
+  fi
+
+  local head
+  if ! head="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null)"; then
+    fail "source binding to ${expected} requested, but the tree under test \
+has no readable git metadata; mount the dispatched checkout's .git \
+(read-only) next to the source so the tested bytes can be verified"
+  fi
+  if [[ "${head}" != "${expected}" ]]; then
+    fail "source binding mismatch: the tree under test is at ${head}, the \
+dispatch expects ${expected}"
+  fi
+
+  local mode="${PR4109_SOURCE_BINDING_MODE:-exact}" divergence
+  divergence="$(source_divergence)"
+  case "${mode}" in
+  exact)
+    if [[ -n "${divergence}" ]]; then
+      printf '%s\n' "${divergence}" >&2
+      fail "source binding to ${expected} requested, but the tree diverges \
+from that commit (listing above; untracked files count); refusing to \
+produce evidence for bytes that are not the dispatched commit"
+    fi
+    note "source commit: ${expected} (verified against the dispatched SHA)"
+    ;;
+  build-image)
+    local unexplained accepted=0
+    unexplained="$(printf '%s\n' "${divergence}" |
+      unexplained_build_image_divergence)"
+    if [[ -n "${unexplained}" ]]; then
+      printf '%s\n' "${unexplained}" >&2
+      fail "source binding to ${expected} requested, but the build-image \
+tree diverges from that commit beyond the .dockerignore'd and regenerated \
+gen/ families (listing above); refusing to produce evidence"
+    fi
+    if [[ -n "${divergence}" ]]; then
+      accepted="$(printf '%s\n' "${divergence}" | grep -c .)"
+    fi
+    note "source commit: ${expected} (verified against the dispatched SHA \
+inside the build image; ${accepted} .dockerignore'd or regenerated path \
+divergence(s) accepted by design)"
+    ;;
+  *)
+    fail "unknown PR4109_SOURCE_BINDING_MODE [${mode}]; use exact or \
+build-image"
+    ;;
+  esac
 }
 
 require_env() {
@@ -123,7 +250,7 @@ stage_local_proofs() {
 
   (
     cd "${REPO_ROOT}"
-    note "source commit: $(source_commit)"
+    verify_source_binding
     go test -count=1 -v \
       -run 'TestJoinDKGIfEligible|TestMonitorRelayEntry|TestForwardSignatureShares' \
       ./pkg/beacon/
@@ -171,7 +298,7 @@ stage_static_analysis() {
 
   (
     cd "${REPO_ROOT}"
-    note "source commit: $(source_commit)"
+    verify_source_binding
 
     note "gofmt"
     if [[ "$(gofmt -l . | wc -l)" -gt 0 ]]; then
@@ -229,7 +356,7 @@ ${ci_node_version}' before running solidity-proofs"
 
   (
     cd "${REPO_ROOT}/solidity/ecdsa"
-    note "source commit: $(source_commit)"
+    verify_source_binding
 
     # Reproduce the contracts workflow's install exactly: the
     # Corepack-managed yarn release pinned in package.json's packageManager

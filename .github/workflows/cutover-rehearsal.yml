@@ -10,6 +10,15 @@ name: Cutover Rehearsal
 # rehearsal chain inputs; they report BLOCKED — a failed job — until the
 # rehearsal fleet inputs exist, because a rehearsal that cannot execute must
 # never look green.
+#
+# Provenance is fail-closed: every proof stage receives the dispatched SHA
+# in PR4109_EXPECTED_SOURCE_COMMIT and refuses to produce evidence unless
+# the tree it is about to test is exactly that commit. For the build-image
+# stage the checkout's .git and scripts/ are mounted read-only into the
+# container (.dockerignore keeps both out of the build context), so the
+# verification happens against the very bytes inside the image, not just
+# the runner checkout. Stage logs are archived even when a stage fails — a
+# red run's evidence is the most valuable kind.
 
 on:
   workflow_dispatch:
@@ -41,13 +50,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # Pin the checkout to the dispatched SHA so a branch moving
+          # between dispatch and run cannot change what is tested.
+          ref: ${{ github.sha }}
           # Fetch the whole history for the `git describe` command to work.
           fetch-depth: 0
 
       - name: Resolve versions
         run: |
-          echo "version=$(git describe --tags --match "v[0-9]*" HEAD)" >> $GITHUB_ENV
-          echo "revision=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          echo "version=$(git describe --tags --match "v[0-9]*" HEAD)" >> "$GITHUB_ENV"
+          echo "revision=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -76,12 +88,25 @@ jobs:
       - name: Run cutover gate local proofs
         run: |
           mkdir -p ${{ github.workspace }}/rehearsal-evidence
+          # .dockerignore keeps scripts/ and .git out of the build context,
+          # so both are mounted read-only from the dispatched checkout: the
+          # stage script runs at the dispatched revision, and rehearse.sh
+          # verifies the image's own source tree against the dispatched SHA
+          # before producing any evidence. safe.directory is required
+          # because the mounted metadata is owned by the runner user, not
+          # the container's root.
           docker run \
             --workdir /go/src/github.com/keep-network/keep-core \
             -v ${{ github.workspace }}/rehearsal-evidence:/rehearsal-evidence \
+            -v ${{ github.workspace }}/.git:/go/src/github.com/keep-network/keep-core/.git:ro \
+            -v ${{ github.workspace }}/scripts:/go/src/github.com/keep-network/keep-core/scripts:ro \
             -e EVIDENCE_DIR=/rehearsal-evidence \
+            -e PR4109_EXPECTED_SOURCE_COMMIT=${{ github.sha }} \
+            -e PR4109_SOURCE_BINDING_MODE=build-image \
             go-build-env \
-            ./scripts/release/pr4109/rehearse.sh local-proofs
+            bash -c 'git config --global --add safe.directory \
+              /go/src/github.com/keep-network/keep-core && \
+              exec ./scripts/release/pr4109/rehearse.sh local-proofs'
 
       - name: Validate evidence records against the schema
         run: |
@@ -93,6 +118,9 @@ jobs:
           fi
 
       - name: Upload rehearsal evidence
+        # A failing proof stage's log is the evidence most needed for
+        # diagnosis, so archive whatever was produced even on failure.
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: rehearsal-evidence-${{ github.sha }}
@@ -106,18 +134,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       - uses: actions/setup-go@v5
         with:
           go-version-file: "go.mod"
 
       - name: Run the immutable-version static analyzers
+        env:
+          PR4109_EXPECTED_SOURCE_COMMIT: ${{ github.sha }}
         run: |
           mkdir -p ${{ github.workspace }}/rehearsal-evidence
           EVIDENCE_DIR=${{ github.workspace }}/rehearsal-evidence \
             ./scripts/release/pr4109/rehearse.sh static-analysis
 
       - name: Upload static-analysis evidence
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: static-analysis-evidence-${{ github.sha }}
@@ -132,6 +165,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       - uses: actions/setup-node@v4
         with:
@@ -142,12 +177,15 @@ jobs:
           working-directory: ./solidity/ecdsa
 
       - name: Build and test the ECDSA contracts surface
+        env:
+          PR4109_EXPECTED_SOURCE_COMMIT: ${{ github.sha }}
         run: |
           mkdir -p ${{ github.workspace }}/rehearsal-evidence
           EVIDENCE_DIR=${{ github.workspace }}/rehearsal-evidence \
             ./scripts/release/pr4109/rehearse.sh solidity-proofs
 
       - name: Upload solidity-proofs evidence
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: solidity-proofs-evidence-${{ github.sha }}
@@ -172,6 +210,8 @@ jobs:
       KEEP_ETHEREUM_PASSWORD: ${{ secrets.REHEARSAL_KEEP_ETHEREUM_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       # The per-node keys and configurations come from one repository secret
       # holding a base64-encoded tar.gz with a <service>/config.toml plus key
