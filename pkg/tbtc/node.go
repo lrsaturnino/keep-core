@@ -1290,7 +1290,8 @@ func executeCoordinationProcedure(
 		// A gate-canceled permit — clock failure, forced quiescence — ended
 		// the procedure; that is a release-gate decision, not an ordinary
 		// coordination failure.
-		if participation.IsGateRefusal(context.Cause(permit.Context())) {
+		gateAborted := participation.IsGateRefusal(context.Cause(permit.Context()))
+		if gateAborted {
 			procedureLogger.Warnf(
 				"coordination procedure canceled by the participation "+
 					"gate: [%v]",
@@ -1301,28 +1302,15 @@ func executeCoordinationProcedure(
 		}
 		// Metrics are already recorded in executor.coordinate() for failures
 
-		// Record window metrics for failed coordination
-		if node.windowMetricsTracker != nil {
-			walletPublicKeyHash := bitcoin.PublicKeyHash(walletPublicKey)
-			// Extract leader and faults from partial result if available
-			// (e.g., when follower routine fails, we know who the leader was)
-			leader := chain.Address("")
-			var faults []*coordinationFault
-			if result != nil {
-				leader = result.leader
-				faults = result.faults
-			}
-			node.windowMetricsTracker.recordWalletCoordination(
-				window,
-				walletPublicKeyHash,
-				leader,
-				"",
-				false,
-				duration,
-				faults,
-				err, // capture the error message
-			)
-		}
+		recordCoordinationOutcome(
+			node,
+			window,
+			walletPublicKey,
+			result,
+			duration,
+			err,
+			gateAborted,
+		)
 		return nil, false
 	}
 
@@ -1333,26 +1321,76 @@ func executeCoordinationProcedure(
 
 	// Metrics are already recorded in executor.coordinate() for successful executions
 
-	// Record window metrics for successful coordination
-	if node.windowMetricsTracker != nil {
-		walletPublicKeyHash := bitcoin.PublicKeyHash(walletPublicKey)
-		actionType := ""
-		if result.proposal != nil {
-			actionType = result.proposal.ActionType().String()
+	recordCoordinationOutcome(
+		node,
+		window,
+		walletPublicKey,
+		result,
+		duration,
+		nil,
+		false,
+	)
+
+	return result, true
+}
+
+// recordCoordinationOutcome records one wallet's coordination outcome in the
+// window metrics tracker. A gate-aborted procedure is deliberately not
+// recorded at all: the release gate canceling a procedure is not a
+// coordination failure of the wallet or the window, so it must not
+// contaminate the window's coordinated/failed accounting that operators read
+// as ordinary protocol health.
+func recordCoordinationOutcome(
+	node *node,
+	window *coordinationWindow,
+	walletPublicKey *ecdsa.PublicKey,
+	result *coordinationResult,
+	duration time.Duration,
+	coordinationErr error,
+	gateAborted bool,
+) {
+	if node.windowMetricsTracker == nil || gateAborted {
+		return
+	}
+
+	walletPublicKeyHash := bitcoin.PublicKeyHash(walletPublicKey)
+
+	if coordinationErr != nil {
+		// Extract leader and faults from partial result if available
+		// (e.g., when follower routine fails, we know who the leader was)
+		leader := chain.Address("")
+		var faults []*coordinationFault
+		if result != nil {
+			leader = result.leader
+			faults = result.faults
 		}
 		node.windowMetricsTracker.recordWalletCoordination(
 			window,
 			walletPublicKeyHash,
-			result.leader,
-			actionType,
-			true,
+			leader,
+			"",
+			false,
 			duration,
-			result.faults,
-			nil, // no error on success
+			faults,
+			coordinationErr, // capture the error message
 		)
+		return
 	}
 
-	return result, true
+	actionType := ""
+	if result.proposal != nil {
+		actionType = result.proposal.ActionType().String()
+	}
+	node.windowMetricsTracker.recordWalletCoordination(
+		window,
+		walletPublicKeyHash,
+		result.leader,
+		actionType,
+		true,
+		duration,
+		result.faults,
+		nil, // no error on success
+	)
 }
 
 // processCoordinationResult processes the given coordination result. The

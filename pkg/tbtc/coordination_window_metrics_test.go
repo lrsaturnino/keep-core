@@ -1,6 +1,7 @@
 package tbtc
 
 import (
+	"encoding/hex"
 	"fmt"
 	"sync"
 	"testing"
@@ -9,6 +10,7 @@ import (
 	"github.com/keep-network/keep-core/internal/testutils"
 	"github.com/keep-network/keep-core/pkg/chain"
 	"github.com/keep-network/keep-core/pkg/clientinfo"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 )
 
 // noopMetrics satisfies clientinfo.PerformanceMetricsRecorder with no side effects.
@@ -345,4 +347,101 @@ func TestCoordinationWindowMetrics_Concurrent(t *testing.T) {
 	// All reads should complete without data races.
 	_ = cwm.GetSummary()
 	_ = cwm.GetRecentWindows(5)
+}
+
+// TestRecordCoordinationOutcome_GateAbortLeavesWindowMetricsUntouched proves
+// a gate-aborted coordination procedure changes no coordination-window
+// accounting — no coordinated, failed, or per-wallet entry — while an
+// ordinary coordination failure and an ordinary success of the same wallet
+// still reach the window's failure and success views.
+func TestRecordCoordinationOutcome_GateAbortLeavesWindowMetricsUntouched(
+	t *testing.T,
+) {
+	walletPublicKeyBytes, err := hex.DecodeString(
+		"0471e30bca60f6548d7b42582a478ea37ada63b402af7b3ddd57f0c95bb6843175" +
+			"aa0d2053a91a050a6797d85c38f2909cb7027f2344a01986aa2f9f8ca7a0c289",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	walletPublicKey := mustUnmarshalPublicKey(t, walletPublicKeyBytes)
+
+	tracker := newCoordinationWindowMetrics(nil, 10)
+	n := &node{windowMetricsTracker: tracker}
+
+	window := newCoordinationWindow(900)
+
+	recordCoordinationOutcome(
+		n,
+		window,
+		walletPublicKey,
+		nil,
+		time.Second,
+		fmt.Errorf("coordination canceled: %w", participation.ErrQuiescing),
+		true,
+	)
+
+	if _, exists := tracker.GetWindowMetrics(window.index()); exists {
+		t.Fatal("expected no window accounting after a gate abort")
+	}
+
+	recordCoordinationOutcome(
+		n,
+		window,
+		walletPublicKey,
+		nil,
+		time.Second,
+		fmt.Errorf("ordinary coordination failure"),
+		false,
+	)
+
+	windowMetrics, exists := tracker.GetWindowMetrics(window.index())
+	if !exists {
+		t.Fatal("expected window accounting after an ordinary failure")
+	}
+	testutils.AssertUintsEqual(
+		t,
+		"coordinated wallets after the ordinary failure",
+		1,
+		windowMetrics.WalletsCoordinated,
+	)
+	testutils.AssertUintsEqual(
+		t,
+		"failed wallets after the ordinary failure",
+		1,
+		windowMetrics.WalletsFailed,
+	)
+
+	recordCoordinationOutcome(
+		n,
+		window,
+		walletPublicKey,
+		&coordinationResult{leader: chain.Address("0xAA")},
+		time.Second,
+		nil,
+		false,
+	)
+
+	windowMetrics, exists = tracker.GetWindowMetrics(window.index())
+	if !exists {
+		t.Fatal("expected window accounting after a success")
+	}
+	testutils.AssertUintsEqual(
+		t,
+		"coordinated wallets after the success",
+		2,
+		windowMetrics.WalletsCoordinated,
+	)
+	testutils.AssertUintsEqual(
+		t,
+		"failed wallets after the success",
+		1,
+		windowMetrics.WalletsFailed,
+	)
+	testutils.AssertUintsEqual(
+		t,
+		"successful wallets after the success",
+		1,
+		windowMetrics.WalletsSuccessful,
+	)
 }
