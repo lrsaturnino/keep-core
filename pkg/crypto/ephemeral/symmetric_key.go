@@ -21,6 +21,11 @@ type SymmetricEcdhKey struct {
 // the protocol name and the canonical (sorted) peer-pair IDs so that keys
 // derived for different protocols or peer pairs are cryptographically
 // independent.
+//
+// This is the hardened security-v2 derivation. A ceremony participates with
+// exactly one of Ecdh or EcdhLegacy for its entire lifetime, selected
+// explicitly from the ceremony's pinned protocol mode — never from a global
+// toggle or the current chain height.
 func (pk *PrivateKey) Ecdh(publicKey *PublicKey, info []byte) *SymmetricEcdhKey {
 	shared := btcec.GenerateSharedSecret(
 		(*btcec.PrivateKey)(pk),
@@ -36,6 +41,23 @@ func (pk *PrivateKey) Ecdh(publicKey *PublicKey, info []byte) *SymmetricEcdhKey 
 
 	return &SymmetricEcdhKey{
 		box: encryption.NewBox(key),
+	}
+}
+
+// EcdhLegacy performs Elliptic Curve Diffie-Hellman between the private key
+// and publicKey and derives the symmetric key as a direct SHA-256 of the
+// shared secret, byte-for-byte as the pre-hardening production releases do.
+// It exists solely so a ceremony pinned to the legacy protocol mode can
+// interoperate with peers running the prior release during the coordinated
+// cutover; ceremonies pinned to security-v2 use Ecdh.
+func (pk *PrivateKey) EcdhLegacy(publicKey *PublicKey) *SymmetricEcdhKey {
+	shared := btcec.GenerateSharedSecret(
+		(*btcec.PrivateKey)(pk),
+		(*btcec.PublicKey)(publicKey),
+	)
+
+	return &SymmetricEcdhKey{
+		box: encryption.NewBox(sha256.Sum256(shared)),
 	}
 }
 
