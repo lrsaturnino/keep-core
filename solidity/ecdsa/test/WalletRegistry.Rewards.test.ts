@@ -1,13 +1,17 @@
 import { ethers, helpers } from "hardhat"
 import { expect } from "chai"
 
-import { walletRegistryFixture } from "./fixtures"
+import { params, walletRegistryFixture } from "./fixtures"
 import ecdsaData from "./data/ecdsa"
+import { hashDKGMembers, signAndSubmitCorrectDkgResult } from "./utils/dkg"
+import { submitRelayEntry } from "./utils/randomBeacon"
 import { createNewWallet } from "./utils/wallets"
 import { signOperatorInactivityClaim } from "./utils/inactivity"
 
+import type { ContractTransaction } from "ethers"
 import type { SignerWithAddress } from "@nomiclabs/hardhat-ethers/signers"
 import type { FakeContract } from "@defi-wonderland/smock"
+import type { DkgResult } from "./utils/dkg"
 import type { Operator, OperatorID } from "./utils/operators"
 import type {
   SortitionPool,
@@ -21,6 +25,7 @@ import type {
 } from "../typechain"
 
 const { to1e18 } = helpers.number
+const { mineBlocks } = helpers.time
 
 const { createSnapshot, restoreSnapshot } = helpers.snapshot
 
@@ -250,6 +255,10 @@ describe("WalletRegistry - Rewards", () => {
           .approveAndCall(sortitionPool.address, rewardAmount, [])
       })
 
+      after(async () => {
+        await restoreSnapshot()
+      })
+
       it("should withdraw ineligible rewards", async () => {
         // Withdraw rewards for ineligible operator. This action recalculates
         // the balance of "ineligible rewards" available for withdrawal from
@@ -259,6 +268,210 @@ describe("WalletRegistry - Rewards", () => {
           operator
         )
         await walletRegistry.withdrawRewards(stakingProvider)
+
+        expect(await tToken.balanceOf(thirdParty.address)).to.equal(0)
+        await walletRegistryGovernance
+          .connect(governance)
+          .withdrawIneligibleRewards(thirdParty.address)
+        expect(await tToken.balanceOf(thirdParty.address)).to.be.gt(0)
+      })
+    })
+  })
+
+  describe("DKG misbehavior at the group quorum boundary", () => {
+    // Ten misbehaved seats in a hundred-member group leave exactly ninety
+    // active members — the largest exclusion the DKG validator accepts. Such
+    // a result must be accepted on chain, and approval must make each of the
+    // ten excluded operators ineligible for sortition pool rewards for the
+    // governed ban duration.
+    const misbehavedIndices = [1, 12, 23, 34, 45, 56, 67, 78, 89, 100]
+    const boundaryWalletPublicKey: string = ecdsaData.group2.publicKey
+
+    let boundaryDkgResult: DkgResult
+    let boundarySubmitter: SignerWithAddress
+    let misbehavedOperators: Operator[]
+    let activeOperators: Operator[]
+
+    before(async () => {
+      await createSnapshot()
+
+      await walletRegistry.connect(walletOwner.wallet).requestNewWallet()
+
+      const { startBlock, dkgSeed } = await submitRelayEntry(
+        walletRegistry,
+        randomBeacon
+      )
+
+      let signers: Operator[]
+        // eslint-disable-next-line @typescript-eslint/no-extra-semi
+      ;({
+        dkgResult: boundaryDkgResult,
+        submitter: boundarySubmitter,
+        signers,
+      } = await signAndSubmitCorrectDkgResult(
+        walletRegistry,
+        boundaryWalletPublicKey,
+        dkgSeed,
+        startBlock,
+        misbehavedIndices
+      ))
+
+      // The group is sampled with replacement, so one operator can hold
+      // several seats: the ban is per operator, not per seat. The banned
+      // set is every operator holding a misbehaved seat; operators remain
+      // eligible only when none of their seats misbehaved.
+      const bannedOperatorIds = new Set(
+        misbehavedIndices.map((memberIndex) => signers[memberIndex - 1].id)
+      )
+
+      const seenBannedIds = new Set<number>()
+      misbehavedOperators = misbehavedIndices
+        .map((memberIndex) => signers[memberIndex - 1])
+        .filter((operator) => {
+          if (seenBannedIds.has(operator.id)) {
+            return false
+          }
+          seenBannedIds.add(operator.id)
+          return true
+        })
+
+      const seenActiveIds = new Set<number>()
+      activeOperators = signers.filter((operator) => {
+        if (bannedOperatorIds.has(operator.id)) {
+          return false
+        }
+        if (seenActiveIds.has(operator.id)) {
+          return false
+        }
+        seenActiveIds.add(operator.id)
+        return true
+      })
+
+      expect(misbehavedOperators.length).to.be.gt(0)
+      expect(activeOperators.length).to.be.gt(0)
+    })
+
+    after(async () => {
+      await restoreSnapshot()
+    })
+
+    it("should withstand a challenge of the boundary result", async () => {
+      await expect(
+        walletRegistry.connect(thirdParty).challengeDkgResult(boundaryDkgResult)
+      ).to.be.revertedWith("unjustified challenge")
+    })
+
+    context("when the boundary result is approved", () => {
+      let approvalTx: ContractTransaction
+      let banEndTimestamp: number
+
+      before(async () => {
+        await mineBlocks(params.dkgResultChallengePeriodLength)
+
+        approvalTx = await walletRegistry
+          .connect(boundarySubmitter)
+          .approveDkgResult(boundaryDkgResult)
+
+        banEndTimestamp =
+          (await helpers.time.lastBlockTime()) +
+          params.sortitionPoolRewardsBanDuration
+      })
+
+      it("should register the wallet with the ninety active members", async () => {
+        const boundaryWalletID = ethers.utils.keccak256(boundaryWalletPublicKey)
+
+        expect(
+          (await walletRegistry.getWallet(boundaryWalletID)).membersIdsHash
+        ).to.be.equal(
+          hashDKGMembers(
+            boundaryDkgResult.members as number[],
+            misbehavedIndices
+          )
+        )
+      })
+
+      it("should ban all ten misbehaved operators from sortition pool rewards", async () => {
+        const misbehavedIds = misbehavedIndices.map(
+          (memberIndex) => boundaryDkgResult.members[memberIndex - 1]
+        )
+
+        await expect(approvalTx)
+          .to.emit(sortitionPool, "IneligibleForRewards")
+          .withArgs(misbehavedIds, banEndTimestamp)
+
+        const eligibility = await Promise.all(
+          misbehavedOperators.map((operator) =>
+            sortitionPool.isEligibleForRewards(operator.signer.address)
+          )
+        )
+        expect(eligibility).to.deep.equal(
+          new Array(misbehavedOperators.length).fill(false)
+        )
+
+        const restorableAt = await Promise.all(
+          misbehavedOperators.map(async (operator) =>
+            (
+              await sortitionPool.rewardsEligibilityRestorableAt(
+                operator.signer.address
+              )
+            ).toNumber()
+          )
+        )
+        expect(restorableAt).to.deep.equal(
+          new Array(misbehavedOperators.length).fill(banEndTimestamp)
+        )
+      })
+
+      it("should keep operators without a misbehaved seat eligible for rewards", async () => {
+        const eligibility = await Promise.all(
+          activeOperators.map((operator) =>
+            sortitionPool.isEligibleForRewards(operator.signer.address)
+          )
+        )
+        expect(eligibility).to.deep.equal(
+          new Array(activeOperators.length).fill(true)
+        )
+      })
+
+      it("should divert new reward allocations away from the banned operators", async () => {
+        // Allocate sortition pool rewards after the ban.
+        await tToken.connect(deployer).mint(deployer.address, rewardAmount)
+        await tToken
+          .connect(deployer)
+          .approveAndCall(sortitionPool.address, rewardAmount, [])
+
+        const bannedRewards = await Promise.all(
+          misbehavedOperators.map(async (operator) =>
+            walletRegistry.availableRewards(
+              await walletRegistry.operatorToStakingProvider(
+                operator.signer.address
+              )
+            )
+          )
+        )
+        bannedRewards.forEach((amount, position) => {
+          expect(
+            amount,
+            `rewards of banned operator [${position}]`
+          ).to.be.equal(0)
+        })
+
+        const activeStakingProvider =
+          await walletRegistry.operatorToStakingProvider(
+            activeOperators[0].signer.address
+          )
+        expect(
+          await walletRegistry.availableRewards(activeStakingProvider)
+        ).to.be.gt(0)
+
+        // Withdrawing for a banned operator recalculates the pool's
+        // ineligible-rewards balance; the diverted share is then
+        // withdrawable by the governance only.
+        const bannedStakingProvider =
+          await walletRegistry.operatorToStakingProvider(
+            misbehavedOperators[0].signer.address
+          )
+        await walletRegistry.withdrawRewards(bannedStakingProvider)
 
         expect(await tToken.balanceOf(thirdParty.address)).to.equal(0)
         await walletRegistryGovernance

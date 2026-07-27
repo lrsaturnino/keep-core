@@ -199,6 +199,70 @@ describe("EcdsaDkgValidator", () => {
             await expect(result.errorMsg).to.equal("")
           })
         })
+
+        context(
+          "when misbehaved members leave exactly the active threshold",
+          () => {
+            it("should pass", async () => {
+              const activeThreshold = (
+                await validator.activeThreshold()
+              ).toNumber()
+              const maxMisbehavedCount = constants.groupSize - activeThreshold
+
+              const misbehavedMemberIds = Array.from(
+                { length: maxMisbehavedCount },
+                (_, i) => i + 1
+              )
+              const expectedMembersIds = [...selectedOperatorsIds].slice(
+                maxMisbehavedCount
+              )
+
+              const result = await testValidate(
+                selectedOperators,
+                selectedOperators,
+                groupPublicKey,
+                misbehavedMemberIds,
+                hashUint32Array(expectedMembersIds)
+              )
+
+              await expect(result.isValid).to.be.true
+              await expect(result.errorMsg).to.equal("")
+            })
+          }
+        )
+
+        context(
+          "when misbehaved members exceed the active threshold allowance",
+          () => {
+            it("should not pass", async () => {
+              const activeThreshold = (
+                await validator.activeThreshold()
+              ).toNumber()
+              const misbehavedCount = constants.groupSize - activeThreshold + 1
+
+              const misbehavedMemberIds = Array.from(
+                { length: misbehavedCount },
+                (_, i) => i + 1
+              )
+              const expectedMembersIds = [...selectedOperatorsIds].slice(
+                misbehavedCount
+              )
+
+              const result = await testValidate(
+                selectedOperators,
+                selectedOperators,
+                groupPublicKey,
+                misbehavedMemberIds,
+                hashUint32Array(expectedMembersIds)
+              )
+
+              await expect(result.isValid).to.be.false
+              await expect(result.errorMsg).to.equal(
+                "Too many members misbehaving during DKG"
+              )
+            })
+          }
+        )
       })
 
       context("when hashed group members is incorrect", () => {
