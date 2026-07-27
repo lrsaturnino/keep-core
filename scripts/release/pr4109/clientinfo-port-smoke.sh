@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# clientinfo-port-smoke.sh — Part B (section 14.2) container smoke matrix for the
-# temporary clientInfo.port 9601 compatibility default.
+# clientinfo-port-smoke.sh — container smoke matrix for the temporary
+# clientInfo.port 9601 compatibility default.
 #
 # This harness proves, against an immutable runtime image, that:
 #   - with no client-info setting the container listens on 9601 internally;
@@ -13,15 +13,17 @@
 # content (not just HTTP 200), including the stranded-peer observability signals
 # added by this release.
 #
-# The unit/config half of the acceptance (section 14.1) is proven by the Go
-# tests and does NOT need this harness:
+# The unit/config half of the acceptance is proven by the Go tests and does
+# NOT need this harness:
 #   go test ./cmd/... ./config/... ./pkg/clientinfo/... -run \
 #     'ClientInfoPort|TestReadConfig_ClientInfoPortZero'
 #
-# SCOPE NOTE: this build does not contain the block-height cutover gate (Part A),
-# so the gate-state metrics (performance_participation_gate_state, _drain_block,
-# _stop_block, _active_ceremonies) are intentionally NOT asserted — they are not
-# exposed. The stranded-peer observability metrics ARE exposed and are asserted.
+# SCOPE NOTE: this build contains the block-height cutover gate, whose fixed
+# gauges (performance_participation_gate_state, _cutover_block,
+# _active_ceremonies, ...) are all registered at construction, so a positive
+# /metrics response must carry them alongside the stranded-peer observability
+# metrics. The one-value schedule exposes a single cutover height; there are
+# no drain/stop metrics to assert.
 #
 # Two sub-steps CANNOT be exercised by this harness and are explicit manual /
 # ops follow-up (do not fake them):
@@ -100,10 +102,10 @@ require_digest() {
 }
 
 # Metric names every positive /metrics response must contain. The first six are
-# backed by the current performance constants; the rest are the stranded-peer /
-# roster observability metrics added by this release (all registered at zero, so
-# they appear before any event). Gate-state metrics are deliberately excluded —
-# Part A is not built.
+# backed by the current performance constants; the rest are the participation
+# gate and stranded-peer / roster observability metrics added by this release
+# (all registered at zero or their startup value, so they appear before any
+# event).
 REQUIRED_METRICS=(
   "client_info"
   "performance_signing_operations_total"
@@ -111,6 +113,11 @@ REQUIRED_METRICS=(
   "performance_signing_failed_total"
   "performance_signing_timeouts_total"
   "performance_dkg_failed_total"
+  "performance_participation_gate_state"
+  "performance_participation_current_block"
+  "performance_participation_cutover_block"
+  "performance_participation_allowed"
+  "performance_participation_active_ceremonies"
   "performance_announcer_session_id_mismatch_total"
   "performance_announcer_cross_format_peer_total"
   "performance_announcer_legacy_peers_current"
@@ -122,6 +129,7 @@ REQUIRED_METRICS=(
 REQUIRED_DIAGNOSTICS=(
   "client_info"
   "cutover_legacy_peers"
+  "protocol_participation"
 )
 
 log()  { printf '[port-smoke] %s\n' "$*"; }

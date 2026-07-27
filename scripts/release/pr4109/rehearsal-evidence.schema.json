@@ -1,8 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "keep-core/scripts/release/pr4109/rehearsal-evidence.schema.json",
-  "title": "PR #4109 Part A rehearsal evidence record",
-  "description": "One record per rehearsal run of smoke gate 6 (single-release) or smoke gate 7 (rollback). Screenshots alone are insufficient: every assertion must reference recorded values in this document.",
+  "title": "Cutover rehearsal evidence record",
+  "description": "One record per run of the exact-image single-release cutover rehearsal or the homogeneous rollback rehearsal. Screenshots alone are insufficient: every assertion must reference recorded values in this document.",
   "type": "object",
   "required": [
     "schema_version",
@@ -17,7 +16,7 @@
   "properties": {
     "schema_version": { "const": 1 },
     "gate": {
-      "description": "Which mandatory smoke gate this record evidences.",
+      "description": "Which mandatory rehearsal this record evidences.",
       "enum": ["single_release", "rollback"]
     },
     "generated_at": { "type": "string", "format": "date-time" },

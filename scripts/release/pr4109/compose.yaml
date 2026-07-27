@@ -1,4 +1,4 @@
-# compose.yaml — Part B (section 14.2) private-network smoke scaffold.
+# compose.yaml — client-info port private-network smoke scaffold.
 #
 # Demonstrates the intended topology for the client-info port matrix: a
 # keep-client node and a probe sit on a private Docker network, and the probe

@@ -1,0 +1,126 @@
+name: Cutover Rehearsal
+
+# Manually dispatched driver for the single-release cutover rehearsal
+# scaffold. Every dispatch runs the repository-local Go proofs of the cutover
+# gate inside the same build image the client CI uses and validates any
+# produced evidence records against the evidence schema. The container
+# rehearsal stages run only when explicitly requested with the immutable
+# image digests and rehearsal chain inputs; they report BLOCKED — a failed
+# job — until the rehearsal fleet inputs exist, because a rehearsal that
+# cannot execute must never look green.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_container_stages:
+        description: "Run the container rehearsal stages (needs all inputs below)"
+        type: boolean
+        required: false
+        default: false
+      prior_image_digest:
+        description: "Immutable prior-production runtime digest (repo@sha256:...)"
+        required: false
+      r1_image_digest:
+        description: "Immutable R1 candidate runtime digest (repo@sha256:...)"
+        required: false
+      eth_ws_url:
+        description: "Rehearsal chain websocket endpoint"
+        required: false
+      cutover_block:
+        description: "Rehearsed cutover block C on that chain"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  local-proofs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Fetch the whole history for the `git describe` command to work.
+          fetch-depth: 0
+
+      - name: Resolve versions
+        run: |
+          echo "version=$(git describe --tags --match "v[0-9]*" HEAD)" >> $GITHUB_ENV
+          echo "revision=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-rehearsal-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: Build Docker Build Image
+        uses: docker/build-push-action@v5
+        with:
+          target: build-docker
+          tags: go-build-env
+          build-args: |
+            VERSION=${{ env.version }}
+            REVISION=${{ env.revision }}
+          load: true # load image to local registry to use it in next steps
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new
+          context: .
+
+      - name: Run cutover gate local proofs
+        run: |
+          mkdir -p ${{ github.workspace }}/rehearsal-evidence
+          docker run \
+            --workdir /go/src/github.com/keep-network/keep-core \
+            -v ${{ github.workspace }}/rehearsal-evidence:/rehearsal-evidence \
+            -e EVIDENCE_DIR=/rehearsal-evidence \
+            go-build-env \
+            ./scripts/release/pr4109/rehearse.sh local-proofs
+
+      - name: Validate evidence records against the schema
+        run: |
+          if compgen -G "${{ github.workspace }}/rehearsal-evidence/*.json" > /dev/null; then
+            EVIDENCE_DIR=${{ github.workspace }}/rehearsal-evidence \
+              ./scripts/release/pr4109/rehearse.sh validate-evidence
+          else
+            echo "no JSON evidence records produced by this dispatch; nothing to validate"
+          fi
+
+      - name: Upload rehearsal evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: rehearsal-evidence
+          path: rehearsal-evidence/
+          if-no-files-found: warn
+
+  container-rehearsal:
+    # The container stages need the immutable digests, a rehearsal chain, and
+    # per-node keys/configs provisioned on the runner; they BLOCK (exit 3)
+    # until the fleet orchestration is extended against a real rehearsal
+    # chain. A red run here means the mandatory rehearsal is still blocked,
+    # which is the truthful status.
+    if: inputs.run_container_stages
+    needs: local-proofs
+    runs-on: ubuntu-latest
+    env:
+      PRIOR_IMAGE_DIGEST: ${{ inputs.prior_image_digest }}
+      R1_IMAGE_DIGEST: ${{ inputs.r1_image_digest }}
+      ETH_WS_URL: ${{ inputs.eth_ws_url }}
+      CUTOVER_BLOCK: ${{ inputs.cutover_block }}
+      KEYSTORE_DIR: ${{ github.workspace }}/rehearsal-keystore
+      KEEP_ETHEREUM_PASSWORD: ${{ secrets.REHEARSAL_KEEP_ETHEREUM_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Preflight the rehearsal inputs
+        run: ./scripts/release/pr4109/rehearse.sh preflight
+
+      - name: Exact-image single-release rehearsal
+        run: ./scripts/release/pr4109/rehearse.sh single-release
+
+      - name: Homogeneous rollback rehearsal
+        run: ./scripts/release/pr4109/rehearse.sh rollback
