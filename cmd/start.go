@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"os/signal"
 	"syscall"
@@ -76,6 +77,14 @@ func start(cmd *cobra.Command) error {
 	ctx := context.Background()
 	runCtx, cancelRunCtx := context.WithCancel(ctx)
 	defer cancelRunCtx()
+
+	// Signal capture is installed before anything else so that no window of
+	// the startup sequence is left to the default signal action: a signal
+	// arriving while components are still initializing is held in the buffered
+	// channel and handled by the lifecycle controller once startup completes.
+	signalChan := make(chan os.Signal, 2)
+	signal.Notify(signalChan, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(signalChan)
 
 	// Resolve the protocol participation schedule before connecting anywhere:
 	// these are configuration-only checks, and a misconfigured cutover block
@@ -241,17 +250,30 @@ func start(cmd *cobra.Command) error {
 		maximumCompletionBound = beaconCompletionBound
 	}
 
+	// The quiesce backstop is derived at startup with checked arithmetic: an
+	// overflowing deadline calculation refuses startup instead of producing a
+	// silently truncated grace period at shutdown time.
+	quiesceBackstop, err := quiesceBackstopDeadline(maximumCompletionBound)
+	if err != nil {
+		return fmt.Errorf("cannot derive the quiesce backstop: [%v]", err)
+	}
+
 	gateSnapshot := participationGate.State()
 	logger.Infof(
 		"protocol participation gate started [state=%s] [currentBlock=%d] "+
 			"[cutoverBlock=%d] [revision=%s] [epoch=%s] "+
-			"[maximumLegacyCompletionBlocks=%d] [source=%s]",
+			"[maximumLegacyCompletionBlocks=%d] [quiesceMarginBlocks=%d] "+
+			"[quiesceUpperBlockIntervalSeconds=%d] [quiesceBackstop=%s] "+
+			"[source=%s]",
 		gateSnapshot.State,
 		gateSnapshot.CurrentBlock,
 		gateSnapshot.CutoverBlock,
 		build.Revision,
 		participation.CompiledEpoch,
 		maximumCompletionBound,
+		quiesceReviewedMarginBlocks,
+		quiesceUpperBlockIntervalSeconds,
+		quiesceBackstop,
 		cutoverBlockSource,
 	)
 
@@ -369,11 +391,8 @@ func start(cmd *cobra.Command) error {
 	// context is canceled only afterwards, so in-flight protocol work keeps
 	// its network, chain, and persistence access for the whole drain. A
 	// second signal or the in-process backstop deadline forces the remainder
-	// through the gate's audited forced-cancellation path.
-	signalChan := make(chan os.Signal, 2)
-	signal.Notify(signalChan, syscall.SIGTERM, syscall.SIGINT)
-	defer signal.Stop(signalChan)
-
+	// through the gate's audited forced-cancellation path. The signal channel
+	// itself was armed before any component initialized.
 	select {
 	case receivedSignal := <-signalChan:
 		quiesceCause := fmt.Errorf("received signal [%v]", receivedSignal)
@@ -382,7 +401,7 @@ func start(cmd *cobra.Command) error {
 		reason := awaitQuiesce(
 			quiesceDone,
 			signalChan,
-			quiesceBackstopDeadline(maximumCompletionBound),
+			quiesceBackstop,
 		)
 		logger.Infof(
 			"protocol participation quiescence ended [reason=%s] "+
@@ -412,20 +431,63 @@ func start(cmd *cobra.Command) error {
 // this value only sizes the last-resort in-process deadline.
 const quiesceUpperBlockIntervalSeconds = 15
 
+// quiesceReviewedMarginBlocks is the reviewed block margin added on top of the
+// maximum legacy completion bound before the conversion to wall time: it
+// absorbs chain-clock jitter and late block delivery around the completion
+// bound so a ceremony finishing exactly at its protocol deadline is not
+// force-canceled by the backstop. The release manifest records this margin
+// beside the completion bound and the block-interval bound as the inputs of
+// the external termination grace.
+const quiesceReviewedMarginBlocks = uint64(100)
+
 // quiesceBackstopMargin absorbs RPC and processing skew on top of the
 // block-derived backstop.
 const quiesceBackstopMargin = 5 * time.Minute
 
-// quiesceBackstopDeadline converts the maximum legacy completion bound into
-// the in-process wall-clock backstop for the quiesce drain. The service
-// manager's configured termination grace, derived in the release manifest,
-// remains the authoritative external deadline; this backstop only guarantees
-// the audited forced-cancellation path runs even if no second signal ever
-// arrives.
-func quiesceBackstopDeadline(completionBoundBlocks uint64) time.Duration {
-	return time.Duration(completionBoundBlocks)*
-		quiesceUpperBlockIntervalSeconds*time.Second +
-		quiesceBackstopMargin
+// quiesceBackstopDeadline converts the maximum legacy completion bound plus
+// the reviewed block margin into the in-process wall-clock backstop for the
+// quiesce drain, with every step overflow-checked. The service manager's
+// configured termination grace, derived in the release manifest from the same
+// inputs, remains the authoritative external deadline; this backstop only
+// guarantees the audited forced-cancellation path runs even if no second
+// signal ever arrives.
+func quiesceBackstopDeadline(completionBoundBlocks uint64) (time.Duration, error) {
+	totalBlocks := completionBoundBlocks + quiesceReviewedMarginBlocks
+	if totalBlocks < completionBoundBlocks {
+		return 0, fmt.Errorf(
+			"quiesce backstop block bound overflows: completion bound [%d] "+
+				"plus margin [%d]",
+			completionBoundBlocks,
+			quiesceReviewedMarginBlocks,
+		)
+	}
+
+	totalSeconds := totalBlocks * quiesceUpperBlockIntervalSeconds
+	if totalSeconds/quiesceUpperBlockIntervalSeconds != totalBlocks {
+		return 0, fmt.Errorf(
+			"quiesce backstop seconds overflow: [%d] blocks at [%d] "+
+				"seconds per block",
+			totalBlocks,
+			quiesceUpperBlockIntervalSeconds,
+		)
+	}
+
+	if totalSeconds > uint64(math.MaxInt64/time.Second) {
+		return 0, fmt.Errorf(
+			"quiesce backstop duration overflows: [%d] seconds",
+			totalSeconds,
+		)
+	}
+	backstop := time.Duration(totalSeconds) * time.Second
+
+	if backstop > math.MaxInt64-quiesceBackstopMargin {
+		return 0, fmt.Errorf(
+			"quiesce backstop duration overflows with the [%s] margin",
+			quiesceBackstopMargin,
+		)
+	}
+
+	return backstop + quiesceBackstopMargin, nil
 }
 
 // awaitQuiesce waits for the quiesce drain to end and reports why: natural
