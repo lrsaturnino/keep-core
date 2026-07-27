@@ -606,12 +606,373 @@ func TestHeartbeatFailureCounter_Get(t *testing.T) {
 	)
 }
 
+// runHeartbeatAction executes one heartbeat action for the given active-member
+// count against the given permit and consecutive-failure counter, returning
+// the signing and inactivity-claim executors for assertions.
+func runHeartbeatAction(
+	t *testing.T,
+	hostChain *localChain,
+	activeMembers uint32,
+	failureCounter *heartbeatFailureCounter,
+	startBlock uint64,
+	permit participation.Permit,
+) (*mockHeartbeatSigningExecutor, *mockInactivityClaimExecutor, error) {
+	t.Helper()
+
+	walletPublicKeyHex, err := hex.DecodeString(heartbeatTestWalletKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	proposal := &HeartbeatProposal{
+		Message: [16]byte{
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+		},
+	}
+	hostChain.setHeartbeatProposalValidationResult(proposal, true)
+
+	mockExecutor := &mockHeartbeatSigningExecutor{}
+	mockExecutor.activeOperatorsCount = activeMembers
+
+	inactivityClaimExecutor := &mockInactivityClaimExecutor{}
+
+	action := newHeartbeatAction(
+		logger,
+		hostChain,
+		wallet{
+			publicKey: mustUnmarshalPublicKey(t, walletPublicKeyHex),
+		},
+		mockExecutor,
+		proposal,
+		failureCounter,
+		inactivityClaimExecutor,
+		startBlock,
+		startBlock+heartbeatTotalProposalValidityBlocks,
+		func(ctx context.Context, blockHeight uint64) error {
+			return nil
+		},
+		permit,
+	)
+
+	return mockExecutor, inactivityClaimExecutor, action.execute()
+}
+
+// heartbeatTestWalletKey returns the uncompressed public key hex of the
+// wallet used by runHeartbeatAction, which is also its failure-counter key.
+func heartbeatTestWalletKey() string {
+	return "0471e30bca60f6548d7b42582a478ea37ada63b402af7b3ddd57f0c95bb6843175" +
+		"aa0d2053a91a050a6797d85c38f2909cb7027f2344a01986aa2f9f8ca7a0c289"
+}
+
+// TestHeartbeatAction_InactivityBandMatrixBeforeCutover exercises the
+// inactivity band against a real participation gate whose cutover block is
+// far ahead, i.e. the pre-cutover fleet state where every heartbeat permit
+// pins the legacy mode and penalty accounting follows the normal current
+// rules: 51-69 active members produce a signature but count an inactivity
+// failure, the third consecutive failure files exactly one claim, and 70
+// active members reset the counter.
+func TestHeartbeatAction_InactivityBandMatrixBeforeCutover(t *testing.T) {
+	hostChain := Connect()
+	hostChain.setOperatorsEligibleStake(big.NewInt(100000))
+
+	blockCounter, err := hostChain.BlockCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := blockCounter.WaitForBlockHeight(1); err != nil {
+		t.Fatal(err)
+	}
+
+	gate := newTestGateWithCutover(t, blockCounter, 1_000_000)
+
+	tests := map[string]struct {
+		activeMembers    uint32
+		initialFailures  uint
+		expectedFailures uint64
+		expectedClaims   int
+	}{
+		"51 members sign but count an inactivity failure": {
+			activeMembers:    51,
+			initialFailures:  0,
+			expectedFailures: 1,
+			expectedClaims:   0,
+		},
+		"60 members sign but count an inactivity failure": {
+			activeMembers:    60,
+			initialFailures:  0,
+			expectedFailures: 1,
+			expectedClaims:   0,
+		},
+		"69 members sign but count an inactivity failure": {
+			activeMembers:    69,
+			initialFailures:  0,
+			expectedFailures: 1,
+			expectedClaims:   0,
+		},
+		"70 members reset the counter": {
+			activeMembers:    heartbeatSigningMinimumActiveMembers,
+			initialFailures:  heartbeatConsecutiveFailureThreshold - 1,
+			expectedFailures: 0,
+			expectedClaims:   0,
+		},
+		"third consecutive failure files one claim": {
+			activeMembers:    51,
+			initialFailures:  heartbeatConsecutiveFailureThreshold - 1,
+			expectedFailures: heartbeatConsecutiveFailureThreshold,
+			expectedClaims:   1,
+		},
+	}
+
+	for testName, test := range tests {
+		t.Run(testName, func(t *testing.T) {
+			failureCounter := newHeartbeatFailureCounter()
+			for i := uint(0); i < test.initialFailures; i++ {
+				failureCounter.increment(heartbeatTestWalletKey())
+			}
+
+			anchor, err := blockCounter.CurrentBlock()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			permit, err := gate.Begin(participation.TBTCHeartbeat, anchor)
+			if err != nil {
+				t.Fatal(err)
+			}
+			testutils.AssertStringsEqual(
+				t,
+				"permit mode before the cutover",
+				participation.ModeLegacy.String(),
+				permit.Mode().String(),
+			)
+
+			mockExecutor, inactivityClaimExecutor, err := runHeartbeatAction(
+				t,
+				hostChain,
+				test.activeMembers,
+				failureCounter,
+				anchor,
+				permit,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			testutils.AssertStringsEqual(
+				t,
+				"signing mode",
+				participation.ModeLegacy.String(),
+				mockExecutor.requestedMode.String(),
+			)
+			testutils.AssertUintsEqual(
+				t,
+				"consecutive failure counter",
+				test.expectedFailures,
+				uint64(failureCounter.get(heartbeatTestWalletKey())),
+			)
+			testutils.AssertIntsEqual(
+				t,
+				"inactivity claims",
+				test.expectedClaims,
+				inactivityClaimExecutor.calls,
+			)
+		})
+	}
+}
+
+// TestHeartbeatAction_LegacyAnchorFinishingAfterCutoverSuppressed proves the
+// exact boundary rule of the release gate: a heartbeat anchored below the
+// cutover block that finishes at or after it neither increments the
+// consecutive-failure counter nor files a claim, even when the counter is one
+// failure short of the claim threshold. The permit's mode stays legacy for
+// its entire lifetime; only the new penalty state is suppressed.
+func TestHeartbeatAction_LegacyAnchorFinishingAfterCutoverSuppressed(t *testing.T) {
+	hostChain := Connect()
+	hostChain.setOperatorsEligibleStake(big.NewInt(100000))
+
+	blockCounter, err := hostChain.BlockCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := blockCounter.WaitForBlockHeight(1); err != nil {
+		t.Fatal(err)
+	}
+
+	anchor, err := blockCounter.CurrentBlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cutoverBlock := anchor + 2
+
+	gate := newTestGateWithCutover(t, blockCounter, cutoverBlock)
+
+	permit, err := gate.Begin(participation.TBTCHeartbeat, anchor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testutils.AssertStringsEqual(
+		t,
+		"permit mode for the pre-cutover anchor",
+		participation.ModeLegacy.String(),
+		permit.Mode().String(),
+	)
+
+	// One failure short of the claim threshold: a normal low-activity result
+	// would increment the counter and file a claim.
+	failureCounter := newHeartbeatFailureCounter()
+	for i := uint(0); i < heartbeatConsecutiveFailureThreshold-1; i++ {
+		failureCounter.increment(heartbeatTestWalletKey())
+	}
+
+	// The heartbeat finishes at or after the cutover block.
+	if err := blockCounter.WaitForBlockHeight(cutoverBlock); err != nil {
+		t.Fatal(err)
+	}
+
+	mockExecutor, inactivityClaimExecutor, err := runHeartbeatAction(
+		t,
+		hostChain,
+		51,
+		failureCounter,
+		anchor,
+		permit,
+	)
+	if err != nil {
+		t.Fatalf("a suppressed penalty must not be an ordinary failure: [%v]", err)
+	}
+
+	testutils.AssertStringsEqual(
+		t,
+		"signing mode",
+		participation.ModeLegacy.String(),
+		mockExecutor.requestedMode.String(),
+	)
+	testutils.AssertUintsEqual(
+		t,
+		"consecutive failure counter after suppression",
+		uint64(heartbeatConsecutiveFailureThreshold-1),
+		uint64(failureCounter.get(heartbeatTestWalletKey())),
+	)
+	testutils.AssertIntsEqual(
+		t,
+		"inactivity claims",
+		0,
+		inactivityClaimExecutor.calls,
+	)
+}
+
+// TestHeartbeatAction_SecurityV2AtOrAfterCutoverNormalRules proves a
+// heartbeat anchored at or after the cutover block pins the security-v2 mode
+// and follows the normal current rules: low-activity results increment the
+// counter, the third consecutive failure files exactly one claim, and a
+// healthy result resets the counter.
+func TestHeartbeatAction_SecurityV2AtOrAfterCutoverNormalRules(t *testing.T) {
+	hostChain := Connect()
+	hostChain.setOperatorsEligibleStake(big.NewInt(100000))
+
+	blockCounter, err := hostChain.BlockCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := blockCounter.WaitForBlockHeight(1); err != nil {
+		t.Fatal(err)
+	}
+
+	gate := newTestGate(t, blockCounter)
+
+	failureCounter := newHeartbeatFailureCounter()
+	for i := uint(0); i < heartbeatConsecutiveFailureThreshold-1; i++ {
+		failureCounter.increment(heartbeatTestWalletKey())
+	}
+
+	anchor, err := blockCounter.CurrentBlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	permit, err := gate.Begin(participation.TBTCHeartbeat, anchor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testutils.AssertStringsEqual(
+		t,
+		"permit mode at or after the cutover",
+		participation.ModeSecurityV2.String(),
+		permit.Mode().String(),
+	)
+
+	// The third consecutive low-activity result files exactly one claim.
+	mockExecutor, inactivityClaimExecutor, err := runHeartbeatAction(
+		t,
+		hostChain,
+		69,
+		failureCounter,
+		anchor,
+		permit,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	testutils.AssertStringsEqual(
+		t,
+		"signing mode",
+		participation.ModeSecurityV2.String(),
+		mockExecutor.requestedMode.String(),
+	)
+	testutils.AssertUintsEqual(
+		t,
+		"consecutive failure counter after the third failure",
+		uint64(heartbeatConsecutiveFailureThreshold),
+		uint64(failureCounter.get(heartbeatTestWalletKey())),
+	)
+	testutils.AssertIntsEqual(
+		t,
+		"inactivity claims",
+		1,
+		inactivityClaimExecutor.calls,
+	)
+
+	// A healthy result resets the counter under the same normal rules.
+	healthyPermit, err := gate.Begin(participation.TBTCHeartbeat, anchor)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, healthyClaimExecutor, err := runHeartbeatAction(
+		t,
+		hostChain,
+		heartbeatSigningMinimumActiveMembers,
+		failureCounter,
+		anchor,
+		healthyPermit,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	testutils.AssertUintsEqual(
+		t,
+		"consecutive failure counter after the healthy heartbeat",
+		0,
+		uint64(failureCounter.get(heartbeatTestWalletKey())),
+	)
+	testutils.AssertIntsEqual(
+		t,
+		"inactivity claims after the healthy heartbeat",
+		0,
+		healthyClaimExecutor.calls,
+	)
+}
+
 type mockHeartbeatSigningExecutor struct {
 	shouldFail           bool
 	activeOperatorsCount uint32
 
 	requestedMessage    *big.Int
 	requestedStartBlock uint64
+	requestedMode       participation.ProtocolMode
 }
 
 func (mhse *mockHeartbeatSigningExecutor) sign(
@@ -622,6 +983,7 @@ func (mhse *mockHeartbeatSigningExecutor) sign(
 ) (*tecdsa.Signature, *signingActivityReport, uint64, error) {
 	mhse.requestedMessage = message
 	mhse.requestedStartBlock = startBlock
+	mhse.requestedMode = mode
 
 	if mhse.shouldFail {
 		return nil, nil, 0, fmt.Errorf("oofta")
@@ -650,6 +1012,7 @@ type mockInactivityClaimExecutor struct {
 	shouldFail bool
 
 	sessionID *big.Int
+	calls     int
 }
 
 func (mice *mockInactivityClaimExecutor) claimInactivity(
@@ -660,6 +1023,7 @@ func (mice *mockInactivityClaimExecutor) claimInactivity(
 	sessionID *big.Int,
 ) error {
 	mice.sessionID = sessionID
+	mice.calls++
 
 	if mice.shouldFail {
 		return fmt.Errorf("mock inactivity claim executor error")
