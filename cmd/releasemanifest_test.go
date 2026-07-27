@@ -17,6 +17,7 @@ const releaseManifestRepositoryPath = "../scripts/release/pr4109/release-manifes
 
 const releaseManifestDeployDirectory = "../scripts/release/pr4109/deploy"
 
+
 // validReleaseManifestForTests builds a manifest that must pass validation:
 // the derived termination grace under the reviewed default allowance,
 // wrapped in the identity fields of the current artifact.
@@ -416,6 +417,30 @@ func TestReleaseManifestLoadFailsClosed(t *testing.T) {
 			string(valid) + "{}",
 			"trailing content",
 		},
+		// A stray closing delimiter is the shape a hand-edit most easily
+		// leaves behind, and the one a More-style check waves through: More
+		// only asks whether another value begins next, and a bare delimiter
+		// does not.
+		"trailing closing brace": {
+			string(valid) + "}",
+			"trailing content",
+		},
+		"trailing closing bracket": {
+			string(valid) + "]",
+			"trailing content",
+		},
+		"trailing number": {
+			string(valid) + "\n7",
+			"trailing content",
+		},
+		"trailing string": {
+			string(valid) + ` "note"`,
+			"trailing content",
+		},
+		"trailing boolean": {
+			string(valid) + " true",
+			"trailing content",
+		},
 		"fractional grace": {
 			strings.Replace(
 				string(valid),
@@ -461,6 +486,30 @@ func TestReleaseManifestLoadFailsClosed(t *testing.T) {
 				)
 			}
 		})
+	}
+}
+
+// TestReleaseManifestLoadAcceptsTrailingWhitespace pins the boundary of the
+// end-of-document check: insignificant whitespace after the manifest object —
+// the newline every editor and generator appends — is not trailing content.
+func TestReleaseManifestLoadAcceptsTrailingWhitespace(t *testing.T) {
+	valid, err := json.Marshal(validReleaseManifestForTests(t))
+	if err != nil {
+		t.Fatalf("cannot encode the valid manifest: [%v]", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "release-manifest.json")
+	content := append(valid, " \t\r\n\n"...)
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatalf("cannot write the manifest fixture: [%v]", err)
+	}
+
+	manifest, err := loadReleaseManifest(path)
+	if err != nil {
+		t.Fatalf("expected the whitespace-terminated manifest to load: [%v]", err)
+	}
+	if err := validateReleaseManifest(manifest); err != nil {
+		t.Errorf("expected the loaded manifest to validate: [%v]", err)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"time"
@@ -169,7 +170,12 @@ func loadReleaseManifest(path string) (releaseManifest, error) {
 			err,
 		)
 	}
-	if decoder.More() {
+	// The end-of-document check must ask for the next token, not use More:
+	// More only reports whether another value begins next, so a stray closing
+	// delimiter after the manifest object would pass it. Token consumes
+	// whatever actually follows — a value, a delimiter, or malformed bytes —
+	// and only clean EOF is an intact single-document manifest.
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
 		return releaseManifest{}, fmt.Errorf(
 			"release manifest [%s] carries trailing content after the "+
 				"manifest object",
