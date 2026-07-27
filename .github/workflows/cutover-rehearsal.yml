@@ -2,12 +2,14 @@ name: Cutover Rehearsal
 
 # Manually dispatched driver for the single-release cutover rehearsal
 # scaffold. Every dispatch runs the repository-local Go proofs of the cutover
-# gate inside the same build image the client CI uses and validates any
-# produced evidence records against the evidence schema. The container
-# rehearsal stages run only when explicitly requested with the immutable
-# image digests and rehearsal chain inputs; they report BLOCKED — a failed
-# job — until the rehearsal fleet inputs exist, because a rehearsal that
-# cannot execute must never look green.
+# gate inside the same build image the client CI uses, the immutable-version
+# static analyzers, and the ECDSA contracts build/test, validates any
+# produced evidence records against the evidence schema, and archives each
+# stage's log for the dispatched SHA. The container rehearsal stages run
+# only when explicitly requested with the immutable image digests and
+# rehearsal chain inputs; they report BLOCKED — a failed job — until the
+# rehearsal fleet inputs exist, because a rehearsal that cannot execute must
+# never look green.
 
 on:
   workflow_dispatch:
@@ -93,9 +95,64 @@ jobs:
       - name: Upload rehearsal evidence
         uses: actions/upload-artifact@v4
         with:
-          name: rehearsal-evidence
+          name: rehearsal-evidence-${{ github.sha }}
           path: rehearsal-evidence/
           if-no-files-found: warn
+
+  static-analysis:
+    # Mirrors the client CI analyzer jobs' Go setup; the stage itself pins
+    # every analyzer to an immutable version so the archived log is
+    # reproducible evidence for this exact SHA.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Run the immutable-version static analyzers
+        run: |
+          mkdir -p ${{ github.workspace }}/rehearsal-evidence
+          EVIDENCE_DIR=${{ github.workspace }}/rehearsal-evidence \
+            ./scripts/release/pr4109/rehearse.sh static-analysis
+
+      - name: Upload static-analysis evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: static-analysis-evidence-${{ github.sha }}
+          path: rehearsal-evidence/
+          if-no-files-found: error
+
+  solidity-proofs:
+    # Mirrors contracts-ecdsa.yml's contracts-build-and-test job: exactly
+    # Node 18.15.0 (18.16+ produced broken hardhat compile artifacts) and
+    # the shared Corepack/immutable-install action, then the stage
+    # revalidates the install and runs the same build and test commands.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "18.15.0"
+
+      - uses: ./.github/actions/install-yarn-deps
+        with:
+          working-directory: ./solidity/ecdsa
+
+      - name: Build and test the ECDSA contracts surface
+        run: |
+          mkdir -p ${{ github.workspace }}/rehearsal-evidence
+          EVIDENCE_DIR=${{ github.workspace }}/rehearsal-evidence \
+            ./scripts/release/pr4109/rehearse.sh solidity-proofs
+
+      - name: Upload solidity-proofs evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: solidity-proofs-evidence-${{ github.sha }}
+          path: rehearsal-evidence/
+          if-no-files-found: error
 
   container-rehearsal:
     # The container stages need the immutable digests, a rehearsal chain, and

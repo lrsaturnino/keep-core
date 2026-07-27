@@ -49,15 +49,20 @@ stages:
                       roster wiring — under the race detector, plus the
                       integration-tag compile proof; ends with an explicit
                       report of every skipped case (runs today, no Docker)
-  static-analysis     run the same static analyzers CI enforces on the Go
-                      tree, at the CI-pinned versions and flags: gofmt,
-                      go vet, staticcheck 2025.1.1 (-SA1019), gosec
-                      (G115/G118 and generated bindings excluded), and
+  static-analysis     run the static analyzers CI enforces on the Go tree,
+                      every tool at an immutable version: gofmt, go vet
+                      over ./... (strictly wider than CI's root-only vet),
+                      staticcheck 2025.1.1 (-SA1019), gosec v2.28.0 with
+                      the CI flag set (G115/G118 and generated bindings
+                      excluded; CI's own gosec action floats on master, the
+                      pin keeps this evidence reproducible), and
                       golangci-lint v2.12.2 (network needed on first run to
                       fetch the pinned tools)
   solidity-proofs     build and test the changed ECDSA contracts surface
-                      exactly as the contracts workflow does (yarn build,
-                      yarn test; requires Node 18 and yarn)
+                      exactly as the contracts workflow does: Node 18.15.0,
+                      the Corepack-managed yarn from packageManager, and a
+                      never-skipped 'yarn install --immutable' before
+                      yarn build and yarn test
   preflight           validate the container-rehearsal inputs and image digests
   single-release      exact-image cutover rehearsal: prior+R1 mixed fleet
                       before C, work across C without restart, straggler
@@ -76,6 +81,22 @@ note() { printf '>> %s\n' "$*"; }
 blocked() {
   printf 'BLOCKED: %s\n' "$*" >&2
   exit 3
+}
+
+# The exact source commit every stage stamps into its log. A working tree
+# that differs from HEAD is marked -dirty so a local log can never pass for
+# evidence of the clean commit; outside a git checkout (the build image)
+# the stamp degrades to "unknown" instead of failing the stage.
+source_commit() {
+  local commit
+  if ! commit="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null)"; then
+    printf 'unknown'
+    return
+  fi
+  if ! git -C "${REPO_ROOT}" diff --quiet HEAD 2>/dev/null; then
+    commit="${commit}-dirty"
+  fi
+  printf '%s' "${commit}"
 }
 
 require_env() {
@@ -102,6 +123,7 @@ stage_local_proofs() {
 
   (
     cd "${REPO_ROOT}"
+    note "source commit: $(source_commit)"
     go test -count=1 -v \
       -run 'TestJoinDKGIfEligible|TestMonitorRelayEntry|TestForwardSignatureShares' \
       ./pkg/beacon/
@@ -143,12 +165,13 @@ stage_local_proofs() {
 }
 
 stage_static_analysis() {
-  note "running the CI-pinned Go static analyzers"
+  note "running the CI-enforced Go static analyzers at immutable versions"
   mkdir -p "${EVIDENCE_DIR}"
   local log="${EVIDENCE_DIR}/static-analysis.log"
 
   (
     cd "${REPO_ROOT}"
+    note "source commit: $(source_commit)"
 
     note "gofmt"
     if [[ "$(gofmt -l . | wc -l)" -gt 0 ]]; then
@@ -156,15 +179,19 @@ stage_static_analysis() {
       exit 1
     fi
 
-    note "go vet"
-    go vet
+    # CI's client-vet job vets the root package only; the rehearsal vets
+    # the whole tree so a finding in any changed package blocks evidence.
+    note "go vet ./..."
+    go vet ./...
 
     note "staticcheck 2025.1.1 (checks: -SA1019)"
     go run honnef.co/go/tools/cmd/staticcheck@2025.1.1 \
       -checks=-SA1019 ./...
 
-    note "gosec (CI flag set)"
-    go run github.com/securego/gosec/v2/cmd/gosec@latest \
+    # CI's gosec job floats on securego/gosec@master; a rehearsal log must
+    # be reproducible, so the same flag set runs at a pinned release.
+    note "gosec v2.28.0 (CI flag set)"
+    go run github.com/securego/gosec/v2/cmd/gosec@v2.28.0 \
       -exclude=G115,G118 \
       -exclude-dir=pkg/chain/ethereum/beacon/gen \
       -exclude-dir=pkg/chain/ethereum/ecdsa/gen \
@@ -185,24 +212,36 @@ stage_solidity_proofs() {
   local log="${EVIDENCE_DIR}/solidity-ecdsa-proofs.log"
 
   command -v node >/dev/null 2>&1 || blocked "Node.js is required"
-  command -v yarn >/dev/null 2>&1 || blocked "yarn is required"
+  command -v corepack >/dev/null 2>&1 ||
+    blocked "corepack is required (bundled with Node >= 16.9)"
 
-  # The contracts workflow pins Node 18 because newer majors have produced
-  # broken hardhat compile artifacts; replicate that constraint instead of
-  # guessing.
-  local node_major
-  node_major=$(node -p 'process.versions.node.split(".")[0]')
-  if [[ "${node_major}" != "18" ]]; then
-    blocked "the contracts workflow runs on Node 18 (found $(node -v)); \
-switch with 'nvm use 18' before running solidity-proofs"
+  # The contracts workflow runs on exactly Node 18.15.0 because newer
+  # releases have produced broken hardhat compile artifacts; evidence from
+  # any other version is not that workflow's evidence.
+  local ci_node_version="18.15.0"
+  local node_version
+  node_version=$(node -p 'process.versions.node')
+  if [[ "${node_version}" != "${ci_node_version}" ]]; then
+    blocked "the contracts workflow runs on Node ${ci_node_version} (found \
+$(node -v)); switch with 'nvm install ${ci_node_version} && nvm use \
+${ci_node_version}' before running solidity-proofs"
   fi
 
   (
     cd "${REPO_ROOT}/solidity/ecdsa"
-    if [[ ! -d node_modules ]]; then
-      note "installing frozen yarn dependencies"
-      yarn install --frozen-lockfile
-    fi
+    note "source commit: $(source_commit)"
+
+    # Reproduce the contracts workflow's install exactly: the
+    # Corepack-managed yarn release pinned in package.json's packageManager
+    # field and an immutable install on every run — never skipped, so a
+    # stale node_modules cannot masquerade as CI parity. Hardened mode is
+    # opted out for the same reason CI opts out: the lockfile carries
+    # legitimate npm-descriptor -> git-URL remaps that hardened mode
+    # rejects, while lockfile checksums stay enforced either way.
+    export YARN_ENABLE_HARDENED_MODE=0
+    corepack enable
+    note "yarn $(yarn --version)"
+    yarn install --immutable
     yarn build
     yarn test
   ) 2>&1 | tee "${log}"
