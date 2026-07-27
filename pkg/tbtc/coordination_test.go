@@ -359,7 +359,7 @@ func TestCoordinationExecutor_Coordinate(t *testing.T) {
 		operator3,
 	} {
 		go func(operatorIndex int, operator *operatorFixture) {
-			result, err := generateExecutor(operator).coordinate(window)
+			result, err := generateExecutor(operator).coordinate(context.Background(), window)
 
 			reportChan <- &report{
 				operatorIndex: operatorIndex,

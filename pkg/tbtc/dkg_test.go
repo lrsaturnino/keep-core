@@ -803,9 +803,19 @@ func TestDkgExecutor_GenerateSigningGroup_DKGParametersError(t *testing.T) {
 	c := &dkgParamsErrChain{Connect()}
 	netProvider := local.ConnectWithKey(operatorPublicKey)
 
+	blockCounter, err := c.BlockCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	de := &dkgExecutor{
-		chain:       c,
-		netProvider: netProvider,
+		chain:             c,
+		netProvider:       netProvider,
+		participationGate: newTestGate(t, blockCounter),
+		signerQuarantine: newSignerQuarantine(
+			logger,
+			&mockPersistenceHandle{},
+		),
 	}
 
 	gsr := &GroupSelectionResult{
@@ -847,9 +857,21 @@ func (c *dkgParamsErrChain) DKGParameters() (*DKGParameters, error) {
 // generateSigningGroup returns gracefully when the net.Provider fails to
 // create a broadcast channel. The function exits before spawning goroutines.
 func TestDkgExecutor_GenerateSigningGroup_BroadcastChannelError(t *testing.T) {
+	c := Connect()
+
+	blockCounter, err := c.BlockCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	de := &dkgExecutor{
-		chain:       Connect(),
-		netProvider: &errNetProvider{},
+		chain:             c,
+		netProvider:       &errNetProvider{},
+		participationGate: newTestGate(t, blockCounter),
+		signerQuarantine: newSignerQuarantine(
+			logger,
+			&mockPersistenceHandle{},
+		),
 	}
 
 	gsr := &GroupSelectionResult{

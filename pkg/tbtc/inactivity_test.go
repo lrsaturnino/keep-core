@@ -20,6 +20,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/operator"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/protocol/inactivity"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/tecdsa"
 )
 
@@ -39,6 +40,7 @@ func TestInactivityClaimExecutor_ClaimInactivity(t *testing.T) {
 
 	err = executor.claimInactivity(
 		ctx,
+		newTestPermit(participation.TBTCInactivityClaim),
 		inactiveMembersIndexes,
 		true,
 		message,
@@ -76,6 +78,7 @@ func TestInactivityClaimExecutor_ClaimInactivity_Busy(t *testing.T) {
 	go func() {
 		err := executor.claimInactivity(
 			ctx,
+			newTestPermit(participation.TBTCInactivityClaim),
 			inactiveMembersIndexes,
 			true,
 			message,
@@ -87,6 +90,7 @@ func TestInactivityClaimExecutor_ClaimInactivity_Busy(t *testing.T) {
 
 	err := executor.claimInactivity(
 		ctx,
+		newTestPermit(participation.TBTCInactivityClaim),
 		inactiveMembersIndexes,
 		true,
 		message,
@@ -457,6 +461,7 @@ func TestSubmitClaim_MemberSubmitsClaim(t *testing.T) {
 		groupParameters,
 		groupMembers,
 		testWaitForBlockFn(chain),
+		newTestPermit(participation.TBTCInactivityClaim),
 	)
 
 	ctx, cancelCtx := context.WithCancel(context.Background())
@@ -537,6 +542,7 @@ func TestSubmitClaim_AnotherMemberSubmitsClaim(t *testing.T) {
 		groupParameters,
 		groupMembers,
 		testWaitForBlockFn(chain),
+		newTestPermit(participation.TBTCInactivityClaim),
 	)
 
 	ctx, cancelCtx := context.WithCancel(context.Background())
@@ -664,6 +670,7 @@ func TestSubmitClaim_StaleNonceAfterDelayTreatedAsSubmitted(t *testing.T) {
 		groupParameters,
 		groupMembers,
 		func(context.Context, uint64) error { return nil },
+		newTestPermit(participation.TBTCInactivityClaim),
 	)
 
 	var firstMemberSubmitErr error
@@ -682,6 +689,7 @@ func TestSubmitClaim_StaleNonceAfterDelayTreatedAsSubmitted(t *testing.T) {
 			)
 			return nil
 		},
+		newTestPermit(participation.TBTCInactivityClaim),
 	)
 
 	err = secondMemberSubmitter.SubmitClaim(
@@ -745,6 +753,7 @@ func TestSubmitClaim_InvalidResult(t *testing.T) {
 		groupParameters,
 		groupMembers,
 		testWaitForBlockFn(chain),
+		newTestPermit(participation.TBTCInactivityClaim),
 	)
 
 	ctx, cancelCtx := context.WithCancel(context.Background())
@@ -817,6 +826,7 @@ func TestSubmitClaim_ContextCancelled(t *testing.T) {
 		groupParameters,
 		groupMembers,
 		testWaitForBlockFn(chain),
+		newTestPermit(participation.TBTCInactivityClaim),
 	)
 
 	ctx, cancelCtx := context.WithCancel(context.Background())
@@ -900,6 +910,7 @@ func TestSubmitClaim_TooFewSignatures(t *testing.T) {
 		groupParameters,
 		groupMembers,
 		testWaitForBlockFn(chain),
+		newTestPermit(participation.TBTCInactivityClaim),
 	)
 
 	ctx, cancelCtx := context.WithCancel(context.Background())
@@ -1008,6 +1019,7 @@ func TestSubmitClaim_NonceChangesDuringWait(t *testing.T) {
 		groupParameters,
 		groupMembers,
 		hookedWaitForBlockFn,
+		newTestPermit(participation.TBTCInactivityClaim),
 	)
 
 	ctx, cancelCtx := context.WithCancel(context.Background())

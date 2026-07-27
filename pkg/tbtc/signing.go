@@ -115,11 +115,14 @@ func (se *signingExecutor) setCutoverPeerRoster(roster *participation.CutoverPee
 // this function returns an error. If all messages were signed successfully,
 // a slice of signatures is returned. Order of the returned signatures matches
 // the order of the messages in the batch, i.e. the first signature corresponds
-// to the first message, and so on.
+// to the first message, and so on. The protocol mode comes from the wallet
+// action's participation permit and applies to every message and retry of the
+// batch.
 func (se *signingExecutor) signBatch(
 	ctx context.Context,
 	messages []*big.Int,
 	startBlock uint64,
+	mode participation.ProtocolMode,
 ) ([]*tecdsa.Signature, error) {
 	wallet := se.wallet()
 
@@ -172,7 +175,12 @@ func (se *signingExecutor) signBatch(
 			signingStartBlock = endBlocks[i-1] + signingBatchInterludeBlocks
 		}
 
-		signature, _, endBlock, err := se.sign(ctx, message, signingStartBlock)
+		signature, _, endBlock, err := se.sign(
+			ctx,
+			message,
+			signingStartBlock,
+			mode,
+		)
 		if err != nil {
 			// Error metrics are recorded in the sign() method for all error paths.
 			return nil, err
@@ -197,12 +205,27 @@ func (se *signingExecutor) signBatch(
 // signed successfully, this function returns the signature along with the
 // number of active members that participated in signing, the block at which the
 // signature was calculated. The end block is common for all wallet signers so
-// can be used as a synchronization point.
+// can be used as a synchronization point. The protocol mode comes from the
+// wallet action's participation permit and applies to every retry attempt.
 func (se *signingExecutor) sign(
 	ctx context.Context,
 	message *big.Int,
 	startBlock uint64,
+	mode participation.ProtocolMode,
 ) (*tecdsa.Signature, *signingActivityReport, uint64, error) {
+	// The pinned tss-lib fork exposes no per-party legacy mode, so a tECDSA
+	// signing ceremony cannot reproduce the legacy proof transcript. Running
+	// the hardened transcript under any other mode would emit wire traffic
+	// incompatible with both releases; refuse before any protocol work or
+	// ordinary failure accounting happens.
+	if mode != participation.ModeSecurityV2 {
+		return nil, nil, 0, fmt.Errorf(
+			"tECDSA signing cannot run in protocol mode [%s]: the pinned "+
+				"tss-lib revision has no reviewed legacy mode",
+			mode,
+		)
+	}
+
 	if lockAcquired := se.lock.TryAcquire(1); !lockAcquired {
 		// Record failure metrics for lock acquisition failure
 		if se.metricsRecorder != nil {
@@ -257,13 +280,12 @@ func (se *signingExecutor) sign(
 
 			defer wg.Done()
 
-			// currentMode is the local node's protocol mode for this ceremony.
-			// It classifies our own announcement so the mismatch observer can
+			// currentMode is the local node's protocol mode for this ceremony,
+			// pinned in the wallet action's participation permit. It
+			// classifies our own announcement so the mismatch observer can
 			// tell legacy peers apart from hardened ones during a coordinated
 			// cutover.
-			// TODO: replace with permit.Mode() once the Part A cutover gate
-			// lands; for now it is the hardened mode unconditionally.
-			currentMode := participation.ModeSecurityV2
+			currentMode := mode
 			// operatorAddresses maps a sender's signing-group member index
 			// (1-based) to its operator address so a mismatch can be attributed
 			// to an operator in the node-local cutover roster.
@@ -304,7 +326,7 @@ func (se *signingExecutor) sign(
 			retryLoop := newSigningRetryLoop(
 				signingLogger,
 				message,
-				participation.ModeSecurityV2,
+				mode,
 				startBlock,
 				signer.signingGroupMemberIndex,
 				wallet.signingGroupOperators,

@@ -14,6 +14,7 @@ import (
 	"github.com/keep-network/keep-core/internal/testutils"
 	"github.com/keep-network/keep-core/pkg/internal/tecdsatest"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/tecdsa"
 	"github.com/keep-network/keep-core/pkg/tecdsa/dkg"
 )
@@ -273,6 +274,7 @@ func TestSubmitResult_MemberSubmitsResult(t *testing.T) {
 		groupParameters,
 		groupSelectionResult,
 		testWaitForBlockFn(localChain),
+		newTestPermit(participation.TBTCDKG),
 	)
 
 	testData, err := tecdsatest.LoadPrivateKeyShareTestFixtures(1)
@@ -366,6 +368,7 @@ func TestSubmitResult_AnotherMemberSubmitsResult(t *testing.T) {
 		groupParameters,
 		groupSelectionResult,
 		testWaitForBlockFn(localChain),
+		newTestPermit(participation.TBTCDKG),
 	)
 
 	testData, err := tecdsatest.LoadPrivateKeyShareTestFixtures(1)
@@ -500,6 +503,7 @@ func TestSubmitResult_InvalidResult(t *testing.T) {
 		groupParameters,
 		groupSelectionResult,
 		testWaitForBlockFn(localChain),
+		newTestPermit(participation.TBTCDKG),
 	)
 
 	testData, err := tecdsatest.LoadPrivateKeyShareTestFixtures(1)
@@ -586,6 +590,7 @@ func TestSubmitResult_ContextCancelled(t *testing.T) {
 		groupParameters,
 		groupSelectionResult,
 		testWaitForBlockFn(localChain),
+		newTestPermit(participation.TBTCDKG),
 	)
 
 	testData, err := tecdsatest.LoadPrivateKeyShareTestFixtures(1)
@@ -668,6 +673,7 @@ func TestSubmitResult_TooFewSignatures(t *testing.T) {
 		groupParameters,
 		groupSelectionResult,
 		testWaitForBlockFn(localChain),
+		newTestPermit(participation.TBTCDKG),
 	)
 
 	testData, err := tecdsatest.LoadPrivateKeyShareTestFixtures(1)
@@ -809,6 +815,7 @@ func TestSubmitResult_StateChangesDuringWait(t *testing.T) {
 		groupParameters,
 		groupSelectionResult,
 		hookedWaitForBlockFn,
+		newTestPermit(participation.TBTCDKG),
 	)
 
 	ctx, cancelCtx := context.WithCancel(context.Background())

@@ -17,6 +17,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/net"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/protocol/inactivity"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 )
 
 const (
@@ -66,8 +67,14 @@ func newInactivityClaimExecutor(
 	}
 }
 
+// claimInactivity signs and submits an operator inactivity claim. The commit
+// guard is the owning ceremony's penalty fence: the terminal on-chain
+// submission consults it immediately before submitting, so a claim derived
+// from legacy work at or after the cutover block, or raced by process
+// quiescence, is suppressed instead of creating new penalty state.
 func (ice *inactivityClaimExecutor) claimInactivity(
 	ctx context.Context,
+	commitGuard participation.CommitGuard,
 	inactiveMembersIndexes []group.MemberIndex,
 	heartbeatFailed bool,
 	sessionID *big.Int,
@@ -152,6 +159,7 @@ func (ice *inactivityClaimExecutor) claimInactivity(
 			err := ice.publishInactivityClaim(
 				signerCtx,
 				execLogger,
+				commitGuard,
 				sessionID,
 				signer.signingGroupMemberIndex,
 				wallet.groupSize(),
@@ -217,6 +225,7 @@ func (ice *inactivityClaimExecutor) getWalletOperatorsIDs() ([]uint32, error) {
 func (ice *inactivityClaimExecutor) publishInactivityClaim(
 	ctx context.Context,
 	inactivityLogger log.StandardLogger,
+	commitGuard participation.CommitGuard,
 	sessionID *big.Int,
 	memberIndex group.MemberIndex,
 	groupSize int,
@@ -241,6 +250,7 @@ func (ice *inactivityClaimExecutor) publishInactivityClaim(
 			ice.groupParameters,
 			groupMembers,
 			ice.waitForBlockFn,
+			commitGuard,
 		),
 		inactivityClaim,
 	)
@@ -322,6 +332,11 @@ type inactivityClaimSubmitter struct {
 	groupMembers    []uint32
 
 	waitForBlockFn waitForBlockFn
+
+	// commitGuard fences the terminal on-chain submission with a penalty
+	// commit check: a refusal is a release-gate decision, not an ordinary
+	// submission failure.
+	commitGuard participation.CommitGuard
 }
 
 func newInactivityClaimSubmitter(
@@ -330,6 +345,7 @@ func newInactivityClaimSubmitter(
 	groupParameters *GroupParameters,
 	groupMembers []uint32,
 	waitForBlockFn waitForBlockFn,
+	commitGuard participation.CommitGuard,
 ) *inactivityClaimSubmitter {
 	return &inactivityClaimSubmitter{
 		inactivityLogger: inactivityLogger,
@@ -337,6 +353,7 @@ func newInactivityClaimSubmitter(
 		groupParameters:  groupParameters,
 		groupMembers:     groupMembers,
 		waitForBlockFn:   waitForBlockFn,
+		commitGuard:      commitGuard,
 	}
 }
 
@@ -458,6 +475,15 @@ func (ics *inactivityClaimSubmitter) SubmitClaim(
 		memberIndex,
 		len(signatures),
 	)
+
+	// The last-moment penalty fence immediately before the irreversible
+	// on-chain submission.
+	if err := ics.commitGuard.CheckCommit(
+		"tbtc_inactivity_claim_submission",
+		participation.PenaltyCommit,
+	); err != nil {
+		return err
+	}
 
 	err = ics.chain.SubmitInactivityClaim(
 		chainClaim,

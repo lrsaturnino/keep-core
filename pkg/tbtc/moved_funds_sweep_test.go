@@ -11,6 +11,7 @@ import (
 
 	"github.com/keep-network/keep-core/internal/testutils"
 	"github.com/keep-network/keep-core/pkg/bitcoin"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/tbtc/internal/test"
 )
 
@@ -112,6 +113,7 @@ func TestMovedFundsSweepAction_Execute(t *testing.T) {
 				func(ctx context.Context, blockHeight uint64) error {
 					return nil
 				},
+				newTestPermit(participation.TBTCSigning),
 			)
 
 			// Modify the default parameters of the action to make

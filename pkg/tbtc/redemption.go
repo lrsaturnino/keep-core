@@ -13,6 +13,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/bitcoin"
 	"github.com/keep-network/keep-core/pkg/chain"
 	"github.com/keep-network/keep-core/pkg/clientinfo"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 )
 
 const (
@@ -120,6 +121,11 @@ type redemptionAction struct {
 	feeDistribution  redemptionFeeDistributionFn
 	transactionShape RedemptionTransactionShape
 
+	// permit is the wallet action's participation permit: it pins the
+	// protocol mode for every signing of this action and is released when the
+	// action's execution ends.
+	permit participation.Permit
+
 	// metricsRecorder is optional and used for recording performance metrics
 	metricsRecorder interface {
 		IncrementCounter(name string, value float64)
@@ -137,12 +143,15 @@ func newRedemptionAction(
 	proposalProcessingStartBlock uint64,
 	proposalExpiryBlock uint64,
 	waitForBlockFn waitForBlockFn,
+	permit participation.Permit,
 ) *redemptionAction {
 	transactionExecutor := newWalletTransactionExecutor(
 		btcChain,
 		redeemingWallet,
 		signingExecutor,
 		waitForBlockFn,
+		permit,
+		"tbtc_redemption_bitcoin_broadcast",
 	)
 
 	feeDistribution := withRedemptionTotalFee(proposal.RedemptionTxFee.Int64())
@@ -161,10 +170,15 @@ func newRedemptionAction(
 		broadcastCheckDelay:              redemptionBroadcastCheckDelay,
 		feeDistribution:                  feeDistribution,
 		transactionShape:                 RedemptionChangeFirst,
+		permit:                           permit,
 	}
 }
 
 func (ra *redemptionAction) execute() error {
+	// The action owns its permit from dispatch on; releasing it here ends the
+	// ceremony's active accounting in the participation gate.
+	defer ra.permit.Close()
+
 	startTime := time.Now()
 
 	// Record redemption execution attempt

@@ -20,6 +20,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/bitcoin"
 	"github.com/keep-network/keep-core/pkg/chain"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/tecdsa"
 )
 
@@ -509,6 +510,7 @@ func TestWalletTransactionExecutor_SignTransaction_Success(t *testing.T) {
 	mockExec.setSignatures(sigHashes, startBlock, sigs)
 
 	executor := &walletTransactionExecutor{
+		permit:          newTestPermit(participation.TBTCSigning),
 		btcChain:        btcChain,
 		executingWallet: walletObj,
 		signingExecutor: mockExec,
@@ -541,6 +543,7 @@ func TestWalletTransactionExecutor_SignTransaction_Timeout(t *testing.T) {
 	mockExec := newMockWalletSigningExecutor()
 
 	executor := &walletTransactionExecutor{
+		permit:          newTestPermit(participation.TBTCSigning),
 		btcChain:        newLocalBitcoinChain(),
 		executingWallet: walletObj,
 		signingExecutor: mockExec,
@@ -564,6 +567,7 @@ func TestWalletTransactionExecutor_SignTransaction_InsufficientSigners(t *testin
 	mockExec := newMockWalletSigningExecutor() // no signatures set -> always errors
 
 	executor := &walletTransactionExecutor{
+		permit:          newTestPermit(participation.TBTCSigning),
 		btcChain:        newLocalBitcoinChain(),
 		executingWallet: walletObj,
 		signingExecutor: mockExec,
@@ -629,6 +633,7 @@ func (mwse *mockWalletSigningExecutor) signBatch(
 	ctx context.Context,
 	messages []*big.Int,
 	startBlock uint64,
+	mode participation.ProtocolMode,
 ) ([]*tecdsa.Signature, error) {
 	mwse.signaturesMutex.Lock()
 	defer mwse.signaturesMutex.Unlock()
@@ -684,6 +689,7 @@ func (c *noConfirmBtcChain) GetTransactionConfirmations(bitcoin.Hash) (uint, err
 
 func TestWalletTransactionExecutor_BroadcastTransaction_Success(t *testing.T) {
 	executor := &walletTransactionExecutor{
+		permit:          newTestPermit(participation.TBTCSigning),
 		btcChain:        newLocalBitcoinChain(),
 		executingWallet: generateWallet(big.NewInt(1)),
 	}
@@ -718,6 +724,7 @@ func TestWalletTransactionExecutor_BroadcastTransaction_Success(t *testing.T) {
 
 func TestWalletTransactionExecutor_BroadcastTransaction_Timeout(t *testing.T) {
 	executor := &walletTransactionExecutor{
+		permit:          newTestPermit(participation.TBTCSigning),
 		btcChain:        &noConfirmBtcChain{newLocalBitcoinChain()},
 		executingWallet: generateWallet(big.NewInt(1)),
 	}

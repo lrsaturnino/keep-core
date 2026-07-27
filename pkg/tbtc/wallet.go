@@ -18,6 +18,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/clientinfo"
 	"github.com/keep-network/keep-core/pkg/crypto/secp256k1"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/tecdsa"
 	"go.uber.org/zap"
 )
@@ -281,11 +282,15 @@ type walletSigningExecutor interface {
 		ctx context.Context,
 		messages []*big.Int,
 		startBlock uint64,
+		mode participation.ProtocolMode,
 	) ([]*tecdsa.Signature, error)
 }
 
 // walletTransactionExecutor is a component allowing to sign and broadcast
-// wallet Bitcoin transactions.
+// wallet Bitcoin transactions. Every cryptographic and terminal decision it
+// makes is scoped to the owning wallet action's participation permit: signing
+// uses the permit's pinned protocol mode and context, and each Bitcoin
+// broadcast attempt passes the permit's completion commit fence first.
 type walletTransactionExecutor struct {
 	btcChain bitcoin.Chain
 
@@ -293,6 +298,11 @@ type walletTransactionExecutor struct {
 	signingExecutor walletSigningExecutor
 
 	waitForBlockFn waitForBlockFn
+
+	permit participation.Permit
+	// broadcastOperation names the action-specific Bitcoin broadcast in the
+	// commit fence, e.g. "tbtc_deposit_sweep_bitcoin_broadcast".
+	broadcastOperation string
 }
 
 func newWalletTransactionExecutor(
@@ -300,12 +310,16 @@ func newWalletTransactionExecutor(
 	executingWallet wallet,
 	signingExecutor walletSigningExecutor,
 	waitForBlockFn waitForBlockFn,
+	permit participation.Permit,
+	broadcastOperation string,
 ) *walletTransactionExecutor {
 	return &walletTransactionExecutor{
-		btcChain:        btcChain,
-		executingWallet: executingWallet,
-		signingExecutor: signingExecutor,
-		waitForBlockFn:  waitForBlockFn,
+		btcChain:           btcChain,
+		executingWallet:    executingWallet,
+		signingExecutor:    signingExecutor,
+		waitForBlockFn:     waitForBlockFn,
+		permit:             permit,
+		broadcastOperation: broadcastOperation,
 	}
 }
 
@@ -330,8 +344,11 @@ func (wte *walletTransactionExecutor) signTransaction(
 
 	signTxLogger.Infof("signing transaction's sig hashes")
 
+	// The signing window is bound to the wallet action's permit: a permit
+	// cancellation — clock failure, forced quiescence — stops the signing
+	// exactly like the timeout block does.
 	signingCtx, cancelSigningCtx := withCancelOnBlock(
-		context.Background(),
+		wte.permit.Context(),
 		signingTimeoutBlock,
 		wte.waitForBlockFn,
 	)
@@ -341,6 +358,7 @@ func (wte *walletTransactionExecutor) signTransaction(
 		signingCtx,
 		sigHashes,
 		signingStartBlock,
+		wte.permit.Mode(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -384,8 +402,11 @@ func (wte *walletTransactionExecutor) broadcastTransaction(
 ) error {
 	txHash := tx.Hash()
 
+	// The broadcast window is bound to the wallet action's permit so a permit
+	// cancellation ends the retry loop instead of leaving it running on an
+	// unowned background context.
 	broadcastCtx, cancelBroadcastCtx := context.WithTimeout(
-		context.Background(),
+		wte.permit.Context(),
 		timeout,
 	)
 	defer cancelBroadcastCtx()
@@ -398,6 +419,16 @@ func (wte *walletTransactionExecutor) broadcastTransaction(
 			return fmt.Errorf("broadcast timeout exceeded")
 		default:
 			broadcastAttempt++
+
+			// The last-moment fence before every irreversible Bitcoin
+			// broadcast attempt. A refusal is a release-gate decision, not an
+			// ordinary broadcast failure.
+			if err := wte.permit.CheckCommit(
+				wte.broadcastOperation,
+				participation.CompletionCommit,
+			); err != nil {
+				return err
+			}
 
 			broadcastTxLogger.Infof(
 				"broadcasting transaction on the Bitcoin chain - attempt [%v]",

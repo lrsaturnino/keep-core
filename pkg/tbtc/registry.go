@@ -117,7 +117,25 @@ func (wr *walletRegistry) getWalletsPublicKeys() []*ecdsa.PublicKey {
 	return keys
 }
 
-// registerSigner registers the given signer using in the walletRegistry.
+// saveSigner durably persists the given signer in the active wallet storage
+// namespace without activating it in the in-memory wallet cache. The signer
+// becomes visible to this process only after a restart's storage scan. It is
+// the durable-save half of registerSigner, used when the release gate refuses
+// activation but the wallet is already registered on chain: the share must
+// survive, and any release's active scan may legitimately load it.
+func (wr *walletRegistry) saveSigner(signer *signer) error {
+	wr.mutex.Lock()
+	defer wr.mutex.Unlock()
+
+	if err := wr.walletStorage.saveSigner(signer); err != nil {
+		return fmt.Errorf("cannot save signer in the storage: [%w]", err)
+	}
+
+	return nil
+}
+
+// registerSigner registers the given signer using in the walletRegistry: it
+// durably persists the signer and activates it in the in-memory wallet cache.
 func (wr *walletRegistry) registerSigner(signer *signer) error {
 	wr.mutex.Lock()
 	defer wr.mutex.Unlock()

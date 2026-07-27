@@ -530,7 +530,7 @@ func TestNode_HandleHeartbeatProposal_WalletNotControlled(t *testing.T) {
 	uncontrolledWallet := uncontrolledWalletFor(signer)
 	proposal := &HeartbeatProposal{Message: [16]byte{0x01}}
 
-	n.handleHeartbeatProposal(uncontrolledWallet, proposal, 10, 100)
+	n.handleHeartbeatProposal(uncontrolledWallet, proposal, 10, 100, newTestPermit(participation.TBTCHeartbeat))
 
 	if count := dispatchedActionsCount(n); count != 0 {
 		t.Errorf("expected no dispatched actions for uncontrolled wallet, got %d", count)
@@ -550,7 +550,7 @@ func TestNode_HandleHeartbeatProposal_WalletBusy(t *testing.T) {
 		n.walletDispatcher.actions[walletKey] = ActionHeartbeat
 	}()
 
-	n.handleHeartbeatProposal(signer.wallet, &HeartbeatProposal{Message: [16]byte{0x02}}, 10, 100)
+	n.handleHeartbeatProposal(signer.wallet, &HeartbeatProposal{Message: [16]byte{0x02}}, 10, 100, newTestPermit(participation.TBTCHeartbeat))
 
 	// The pre-populated entry must still be there -- our call did not modify it.
 	actionType, ok := func() (WalletActionType, bool) {
@@ -574,7 +574,7 @@ func TestNode_HandleHeartbeatProposal_WalletBusy(t *testing.T) {
 func TestNode_HandleHeartbeatProposal_DispatchesAction(t *testing.T) {
 	n, signer := setupNodeForHandlerTests(t)
 
-	n.handleHeartbeatProposal(signer.wallet, &HeartbeatProposal{Message: [16]byte{0x03}}, 10, 100)
+	n.handleHeartbeatProposal(signer.wallet, &HeartbeatProposal{Message: [16]byte{0x03}}, 10, 100, newTestPermit(participation.TBTCHeartbeat))
 
 	waitForDispatcherIdle(t, n)
 
@@ -593,7 +593,7 @@ func TestNode_HandleDepositSweepProposal_WalletNotControlled(t *testing.T) {
 	uncontrolledWallet := uncontrolledWalletFor(signer)
 	proposal := &DepositSweepProposal{}
 
-	n.handleDepositSweepProposal(uncontrolledWallet, proposal, 10, 100)
+	n.handleDepositSweepProposal(uncontrolledWallet, proposal, 10, 100, newTestPermit(participation.TBTCSigning))
 
 	if count := dispatchedActionsCount(n); count != 0 {
 		t.Errorf("expected no dispatched actions for uncontrolled wallet, got %d", count)
@@ -612,7 +612,7 @@ func TestNode_HandleDepositSweepProposal_WalletBusy(t *testing.T) {
 		n.walletDispatcher.actions[walletKey] = ActionDepositSweep
 	}()
 
-	n.handleDepositSweepProposal(signer.wallet, &DepositSweepProposal{}, 10, 100)
+	n.handleDepositSweepProposal(signer.wallet, &DepositSweepProposal{}, 10, 100, newTestPermit(participation.TBTCSigning))
 
 	actionType, ok := func() (WalletActionType, bool) {
 		n.walletDispatcher.actionsMutex.Lock()
@@ -640,6 +640,7 @@ func TestNode_HandleDepositSweepProposal_DispatchesAction(t *testing.T) {
 		&DepositSweepProposal{SweepTxFee: big.NewInt(0)},
 		10,
 		100,
+		newTestPermit(participation.TBTCSigning),
 	)
 
 	waitForDispatcherIdle(t, n)
@@ -659,7 +660,7 @@ func TestNode_HandleRedemptionProposal_WalletNotControlled(t *testing.T) {
 	uncontrolledWallet := uncontrolledWalletFor(signer)
 	proposal := &RedemptionProposal{}
 
-	n.handleRedemptionProposal(uncontrolledWallet, proposal, 10, 100)
+	n.handleRedemptionProposal(uncontrolledWallet, proposal, 10, 100, newTestPermit(participation.TBTCSigning))
 
 	if count := dispatchedActionsCount(n); count != 0 {
 		t.Errorf("expected no dispatched actions for uncontrolled wallet, got %d", count)
@@ -678,7 +679,7 @@ func TestNode_HandleRedemptionProposal_WalletBusy(t *testing.T) {
 		n.walletDispatcher.actions[walletKey] = ActionRedemption
 	}()
 
-	n.handleRedemptionProposal(signer.wallet, &RedemptionProposal{RedemptionTxFee: big.NewInt(0)}, 10, 100)
+	n.handleRedemptionProposal(signer.wallet, &RedemptionProposal{RedemptionTxFee: big.NewInt(0)}, 10, 100, newTestPermit(participation.TBTCSigning))
 
 	actionType, ok := func() (WalletActionType, bool) {
 		n.walletDispatcher.actionsMutex.Lock()
@@ -706,6 +707,7 @@ func TestNode_HandleRedemptionProposal_DispatchesAction(t *testing.T) {
 		&RedemptionProposal{RedemptionTxFee: big.NewInt(0)},
 		10,
 		100,
+		newTestPermit(participation.TBTCSigning),
 	)
 
 	waitForDispatcherIdle(t, n)
@@ -725,7 +727,7 @@ func TestNode_HandleMovingFundsProposal_WalletNotControlled(t *testing.T) {
 	uncontrolledWallet := uncontrolledWalletFor(signer)
 	proposal := &MovingFundsProposal{}
 
-	n.handleMovingFundsProposal(uncontrolledWallet, proposal, 10, 100)
+	n.handleMovingFundsProposal(uncontrolledWallet, proposal, 10, 100, newTestPermit(participation.TBTCSigning))
 
 	if count := dispatchedActionsCount(n); count != 0 {
 		t.Errorf("expected no dispatched actions for uncontrolled wallet, got %d", count)
@@ -744,7 +746,7 @@ func TestNode_HandleMovingFundsProposal_WalletBusy(t *testing.T) {
 		n.walletDispatcher.actions[walletKey] = ActionMovingFunds
 	}()
 
-	n.handleMovingFundsProposal(signer.wallet, &MovingFundsProposal{}, 10, 100)
+	n.handleMovingFundsProposal(signer.wallet, &MovingFundsProposal{}, 10, 100, newTestPermit(participation.TBTCSigning))
 
 	actionType, ok := func() (WalletActionType, bool) {
 		n.walletDispatcher.actionsMutex.Lock()
@@ -767,7 +769,7 @@ func TestNode_HandleMovingFundsProposal_WalletBusy(t *testing.T) {
 func TestNode_HandleMovingFundsProposal_DispatchesAction(t *testing.T) {
 	n, signer := setupNodeForHandlerTests(t)
 
-	n.handleMovingFundsProposal(signer.wallet, &MovingFundsProposal{}, 10, 100)
+	n.handleMovingFundsProposal(signer.wallet, &MovingFundsProposal{}, 10, 100, newTestPermit(participation.TBTCSigning))
 
 	waitForDispatcherIdle(t, n)
 
@@ -786,7 +788,7 @@ func TestNode_HandleMovedFundsSweepProposal_WalletNotControlled(t *testing.T) {
 	uncontrolledWallet := uncontrolledWalletFor(signer)
 	proposal := &MovedFundsSweepProposal{}
 
-	n.handleMovedFundsSweepProposal(uncontrolledWallet, proposal, 10, 100)
+	n.handleMovedFundsSweepProposal(uncontrolledWallet, proposal, 10, 100, newTestPermit(participation.TBTCSigning))
 
 	if count := dispatchedActionsCount(n); count != 0 {
 		t.Errorf("expected no dispatched actions for uncontrolled wallet, got %d", count)
@@ -805,7 +807,7 @@ func TestNode_HandleMovedFundsSweepProposal_WalletBusy(t *testing.T) {
 		n.walletDispatcher.actions[walletKey] = ActionMovedFundsSweep
 	}()
 
-	n.handleMovedFundsSweepProposal(signer.wallet, &MovedFundsSweepProposal{}, 10, 100)
+	n.handleMovedFundsSweepProposal(signer.wallet, &MovedFundsSweepProposal{}, 10, 100, newTestPermit(participation.TBTCSigning))
 
 	actionType, ok := func() (WalletActionType, bool) {
 		n.walletDispatcher.actionsMutex.Lock()
@@ -833,6 +835,7 @@ func TestNode_HandleMovedFundsSweepProposal_DispatchesAction(t *testing.T) {
 		&MovedFundsSweepProposal{SweepTxFee: big.NewInt(0)},
 		10,
 		100,
+		newTestPermit(participation.TBTCSigning),
 	)
 
 	waitForDispatcherIdle(t, n)

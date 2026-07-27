@@ -6,6 +6,7 @@ import (
 
 	"github.com/ipfs/go-log/v2"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/tecdsa/dkg"
 )
 
@@ -83,6 +84,10 @@ type dkgResultSubmitter struct {
 	groupSelectionResult *GroupSelectionResult
 
 	waitForBlockFn waitForBlockFn
+
+	// commitGuard fences the terminal on-chain submission: a refusal is a
+	// release-gate decision, not an ordinary submission failure.
+	commitGuard participation.CommitGuard
 }
 
 func newDkgResultSubmitter(
@@ -91,6 +96,7 @@ func newDkgResultSubmitter(
 	groupParameters *GroupParameters,
 	groupSelectionResult *GroupSelectionResult,
 	waitForBlockFn waitForBlockFn,
+	commitGuard participation.CommitGuard,
 ) *dkgResultSubmitter {
 	return &dkgResultSubmitter{
 		dkgLogger:            dkgLogger,
@@ -98,6 +104,7 @@ func newDkgResultSubmitter(
 		groupSelectionResult: groupSelectionResult,
 		groupParameters:      groupParameters,
 		waitForBlockFn:       waitForBlockFn,
+		commitGuard:          commitGuard,
 	}
 }
 
@@ -227,6 +234,15 @@ func (drs *dkgResultSubmitter) SubmitResult(
 		memberIndex,
 		len(signatures),
 	)
+
+	// The last-moment fence immediately before the irreversible on-chain
+	// submission.
+	if err := drs.commitGuard.CheckCommit(
+		"tbtc_dkg_result_submission",
+		participation.CompletionCommit,
+	); err != nil {
+		return err
+	}
 
 	return drs.chain.SubmitDKGResult(dkgResult)
 }

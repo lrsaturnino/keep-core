@@ -11,6 +11,7 @@ import (
 
 	"github.com/keep-network/keep-core/internal/testutils"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/tecdsa"
 )
 
@@ -71,6 +72,7 @@ func TestHeartbeatAction_HappyPath(t *testing.T) {
 		func(ctx context.Context, blockHeight uint64) error {
 			return nil
 		},
+		newTestPermit(participation.TBTCHeartbeat),
 	)
 
 	err = action.execute()
@@ -150,6 +152,7 @@ func TestHeartbeatAction_OperatorUnstaking(t *testing.T) {
 		func(ctx context.Context, blockHeight uint64) error {
 			return nil
 		},
+		newTestPermit(participation.TBTCHeartbeat),
 	)
 
 	err = action.execute()
@@ -213,6 +216,7 @@ func TestHeartbeatAction_Failure_SigningError(t *testing.T) {
 		func(ctx context.Context, blockHeight uint64) error {
 			return nil
 		},
+		newTestPermit(participation.TBTCHeartbeat),
 	)
 
 	// Do not expect the execution to result in an error. Signing error does not
@@ -292,6 +296,7 @@ func TestHeartbeatAction_Failure_TooFewActiveOperators(t *testing.T) {
 		func(ctx context.Context, blockHeight uint64) error {
 			return nil
 		},
+		newTestPermit(participation.TBTCHeartbeat),
 	)
 
 	// Do not expect the execution to result in an error. Signing error does not
@@ -372,6 +377,7 @@ func TestHeartbeatAction_Failure_CounterExceeded(t *testing.T) {
 		func(ctx context.Context, blockHeight uint64) error {
 			return nil
 		},
+		newTestPermit(participation.TBTCHeartbeat),
 	)
 
 	// Do not expect the execution to result in an error. Signing error does not
@@ -453,6 +459,7 @@ func TestHeartbeatAction_Failure_InactivityExecutionFailure(t *testing.T) {
 		func(ctx context.Context, blockHeight uint64) error {
 			return nil
 		},
+		newTestPermit(participation.TBTCHeartbeat),
 	)
 
 	err = action.execute()
@@ -612,6 +619,7 @@ func (mhse *mockHeartbeatSigningExecutor) sign(
 	ctx context.Context,
 	message *big.Int,
 	startBlock uint64,
+	mode participation.ProtocolMode,
 ) (*tecdsa.Signature, *signingActivityReport, uint64, error) {
 	mhse.requestedMessage = message
 	mhse.requestedStartBlock = startBlock
@@ -647,6 +655,7 @@ type mockInactivityClaimExecutor struct {
 
 func (mice *mockInactivityClaimExecutor) claimInactivity(
 	ctx context.Context,
+	commitGuard participation.CommitGuard,
 	inactiveMembersIndexes []group.MemberIndex,
 	heartbeatFailed bool,
 	sessionID *big.Int,

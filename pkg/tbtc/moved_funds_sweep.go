@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/keep-network/keep-core/pkg/bitcoin"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"go.uber.org/zap"
 
 	"github.com/ipfs/go-log/v2"
@@ -95,6 +96,11 @@ type movedFundsSweepAction struct {
 	signingTimeoutSafetyMarginBlocks uint64
 	broadcastTimeout                 time.Duration
 	broadcastCheckDelay              time.Duration
+
+	// permit is the wallet action's participation permit: it pins the
+	// protocol mode for every signing of this action and is released when the
+	// action's execution ends.
+	permit participation.Permit
 }
 
 func newMovedFundsSweepAction(
@@ -107,12 +113,15 @@ func newMovedFundsSweepAction(
 	proposalProcessingStartBlock uint64,
 	proposalExpiryBlock uint64,
 	waitForBlockFn waitForBlockFn,
+	permit participation.Permit,
 ) *movedFundsSweepAction {
 	transactionExecutor := newWalletTransactionExecutor(
 		btcChain,
 		movedFundsSweepWallet,
 		signingExecutor,
 		waitForBlockFn,
+		permit,
+		"tbtc_moved_funds_sweep_bitcoin_broadcast",
 	)
 
 	return &movedFundsSweepAction{
@@ -127,10 +136,15 @@ func newMovedFundsSweepAction(
 		signingTimeoutSafetyMarginBlocks: movedFundsSweepSigningTimeoutSafetyMarginBlocks,
 		broadcastTimeout:                 movedFundsSweepBroadcastTimeout,
 		broadcastCheckDelay:              movedFundsSweepBroadcastCheckDelay,
+		permit:                           permit,
 	}
 }
 
 func (mfsa *movedFundsSweepAction) execute() error {
+	// The action owns its permit from dispatch on; releasing it here ends the
+	// ceremony's active accounting in the participation gate.
+	defer mfsa.permit.Close()
+
 	validateProposalLogger := mfsa.logger.With(
 		zap.String("step", "validateProposal"),
 	)

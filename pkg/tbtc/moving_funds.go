@@ -10,6 +10,7 @@ import (
 	"github.com/keep-network/keep-common/pkg/chain/ethereum"
 	"github.com/keep-network/keep-core/pkg/bitcoin"
 	"github.com/keep-network/keep-core/pkg/chain"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"go.uber.org/zap"
 )
 
@@ -91,6 +92,11 @@ type movingFundsAction struct {
 	signingTimeoutSafetyMarginBlocks uint64
 	broadcastTimeout                 time.Duration
 	broadcastCheckDelay              time.Duration
+
+	// permit is the wallet action's participation permit: it pins the
+	// protocol mode for every signing of this action and is released when the
+	// action's execution ends.
+	permit participation.Permit
 }
 
 func newMovingFundsAction(
@@ -103,12 +109,15 @@ func newMovingFundsAction(
 	proposalProcessingStartBlock uint64,
 	proposalExpiryBlock uint64,
 	waitForBlockFn waitForBlockFn,
+	permit participation.Permit,
 ) *movingFundsAction {
 	transactionExecutor := newWalletTransactionExecutor(
 		btcChain,
 		movingFundsWallet,
 		signingExecutor,
 		waitForBlockFn,
+		permit,
+		"tbtc_moving_funds_bitcoin_broadcast",
 	)
 
 	return &movingFundsAction{
@@ -123,10 +132,15 @@ func newMovingFundsAction(
 		signingTimeoutSafetyMarginBlocks: movingFundsSigningTimeoutSafetyMarginBlocks,
 		broadcastTimeout:                 movingFundsBroadcastTimeout,
 		broadcastCheckDelay:              movingFundsBroadcastCheckDelay,
+		permit:                           permit,
 	}
 }
 
 func (mfa *movingFundsAction) execute() error {
+	// The action owns its permit from dispatch on; releasing it here ends the
+	// ceremony's active accounting in the participation gate.
+	defer mfa.permit.Close()
+
 	validateProposalLogger := mfa.logger.With(
 		zap.String("step", "validateProposal"),
 	)

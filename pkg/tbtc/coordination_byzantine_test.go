@@ -235,7 +235,7 @@ func runByzantineCoordination(
 
 	for i, op := range []*operatorFixture{operator1, operator2, operator3} {
 		go func(operatorIndex int, op *operatorFixture) {
-			result, err := generateExecutor(op).coordinate(window)
+			result, err := generateExecutor(op).coordinate(context.Background(), window)
 			reportChan <- &byzantineCoordinationReport{
 				operatorIndex: operatorIndex,
 				address:       op.address,

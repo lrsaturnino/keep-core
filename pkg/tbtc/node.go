@@ -135,14 +135,10 @@ type node struct {
 	// participationGate issues the per-ceremony participation permits that pin
 	// each ceremony's protocol mode from its canonical chain anchor. It is
 	// constructed once at process startup beside the cutover peer roster and
-	// shared with the beacon application. It may be nil in tests that do not
-	// exercise the cutover path.
-	//
-	// TODO: Derive every tBTC ceremony's protocol mode from a permit issued by
-	// this gate at the canonical-anchor choke points (DKG, wallet coordination,
-	// wallet actions/signing, heartbeat/inactivity); until that wiring lands
-	// the protocol layers select security-v2 unconditionally at their mode
-	// call sites. That gap is a release blocker for the chain-clocked cutover.
+	// shared with the beacon application. Every tBTC ceremony choke point —
+	// DKG members, wallet coordination, wallet actions and their signings,
+	// heartbeat and derived inactivity work — acquires a permit from it and
+	// fails closed without one.
 	participationGate participation.Gate
 }
 
@@ -665,7 +661,18 @@ func (n *node) handleHeartbeatProposal(
 	proposal *HeartbeatProposal,
 	startBlock uint64,
 	expiryBlock uint64,
+	permit participation.Permit,
 ) {
+	// Until the action is dispatched the permit is owned here and every
+	// early return must release it; after a successful dispatch the action
+	// owns it for its whole execution.
+	permitHandedOff := false
+	defer func() {
+		if !permitHandedOff {
+			permit.Close()
+		}
+	}()
+
 	walletPublicKeyBytes, err := marshalPublicKey(wallet.publicKey)
 	if err != nil {
 		logger.Errorf("cannot marshal wallet public key: [%v]", err)
@@ -734,6 +741,7 @@ func (n *node) handleHeartbeatProposal(
 		startBlock,
 		expiryBlock,
 		n.waitForBlockHeight,
+		permit,
 	)
 
 	err = n.walletDispatcher.dispatch(action)
@@ -741,6 +749,7 @@ func (n *node) handleHeartbeatProposal(
 		walletActionLogger.Errorf("cannot dispatch wallet action: [%v]", err)
 		return
 	}
+	permitHandedOff = true
 
 	walletActionLogger.Infof("wallet action dispatched successfully")
 }
@@ -752,7 +761,18 @@ func (n *node) handleDepositSweepProposal(
 	proposal *DepositSweepProposal,
 	startBlock uint64,
 	expiryBlock uint64,
+	permit participation.Permit,
 ) {
+	// Until the action is dispatched the permit is owned here and every
+	// early return must release it; after a successful dispatch the action
+	// owns it for its whole execution.
+	permitHandedOff := false
+	defer func() {
+		if !permitHandedOff {
+			permit.Close()
+		}
+	}()
+
 	walletPublicKeyBytes, err := marshalPublicKey(wallet.publicKey)
 	if err != nil {
 		logger.Errorf("cannot marshal wallet public key: [%v]", err)
@@ -802,6 +822,7 @@ func (n *node) handleDepositSweepProposal(
 		startBlock,
 		expiryBlock,
 		n.waitForBlockHeight,
+		permit,
 	)
 
 	// Wire metrics recorder if available
@@ -814,6 +835,7 @@ func (n *node) handleDepositSweepProposal(
 		walletActionLogger.Errorf("cannot dispatch wallet action: [%v]", err)
 		return
 	}
+	permitHandedOff = true
 
 	walletActionLogger.Infof("wallet action dispatched successfully")
 }
@@ -825,7 +847,18 @@ func (n *node) handleRedemptionProposal(
 	proposal *RedemptionProposal,
 	startBlock uint64,
 	expiryBlock uint64,
+	permit participation.Permit,
 ) {
+	// Until the action is dispatched the permit is owned here and every
+	// early return must release it; after a successful dispatch the action
+	// owns it for its whole execution.
+	permitHandedOff := false
+	defer func() {
+		if !permitHandedOff {
+			permit.Close()
+		}
+	}()
+
 	walletPublicKeyBytes, err := marshalPublicKey(wallet.publicKey)
 	if err != nil {
 		logger.Errorf("cannot marshal wallet public key: [%v]", err)
@@ -875,6 +908,7 @@ func (n *node) handleRedemptionProposal(
 		startBlock,
 		expiryBlock,
 		n.waitForBlockHeight,
+		permit,
 	)
 
 	// Wire metrics recorder if available
@@ -887,6 +921,7 @@ func (n *node) handleRedemptionProposal(
 		walletActionLogger.Errorf("cannot dispatch wallet action: [%v]", err)
 		return
 	}
+	permitHandedOff = true
 
 	walletActionLogger.Infof("wallet action dispatched successfully")
 }
@@ -898,7 +933,18 @@ func (n *node) handleMovingFundsProposal(
 	proposal *MovingFundsProposal,
 	startBlock uint64,
 	expiryBlock uint64,
+	permit participation.Permit,
 ) {
+	// Until the action is dispatched the permit is owned here and every
+	// early return must release it; after a successful dispatch the action
+	// owns it for its whole execution.
+	permitHandedOff := false
+	defer func() {
+		if !permitHandedOff {
+			permit.Close()
+		}
+	}()
+
 	walletPublicKeyBytes, err := marshalPublicKey(wallet.publicKey)
 	if err != nil {
 		logger.Errorf("cannot marshal wallet public key: [%v]", err)
@@ -948,6 +994,7 @@ func (n *node) handleMovingFundsProposal(
 		startBlock,
 		expiryBlock,
 		n.waitForBlockHeight,
+		permit,
 	)
 
 	err = n.walletDispatcher.dispatch(action)
@@ -955,6 +1002,7 @@ func (n *node) handleMovingFundsProposal(
 		walletActionLogger.Errorf("cannot dispatch wallet action: [%v]", err)
 		return
 	}
+	permitHandedOff = true
 
 	walletActionLogger.Infof("wallet action dispatched successfully")
 }
@@ -966,7 +1014,18 @@ func (n *node) handleMovedFundsSweepProposal(
 	proposal *MovedFundsSweepProposal,
 	startBlock uint64,
 	expiryBlock uint64,
+	permit participation.Permit,
 ) {
+	// Until the action is dispatched the permit is owned here and every
+	// early return must release it; after a successful dispatch the action
+	// owns it for its whole execution.
+	permitHandedOff := false
+	defer func() {
+		if !permitHandedOff {
+			permit.Close()
+		}
+	}()
+
 	walletPublicKeyBytes, err := marshalPublicKey(wallet.publicKey)
 	if err != nil {
 		logger.Errorf("cannot marshal wallet public key: [%v]", err)
@@ -1016,6 +1075,7 @@ func (n *node) handleMovedFundsSweepProposal(
 		startBlock,
 		expiryBlock,
 		n.waitForBlockHeight,
+		permit,
 	)
 
 	err = n.walletDispatcher.dispatch(action)
@@ -1023,6 +1083,7 @@ func (n *node) handleMovedFundsSweepProposal(
 		walletActionLogger.Errorf("cannot dispatch wallet action: [%v]", err)
 		return
 	}
+	permitHandedOff = true
 
 	walletActionLogger.Infof("wallet action dispatched successfully")
 }
@@ -1190,8 +1251,37 @@ func executeCoordinationProcedure(
 		return nil, false
 	}
 
+	if node.participationGate == nil {
+		// Without the gate no permit can track the procedure for clock
+		// failure and quiescence. Fail closed.
+		procedureLogger.Errorf(
+			"no participation gate; refusing the coordination procedure",
+		)
+		return nil, false
+	}
+
+	// One coordination permit tracks the procedure for clock failure and
+	// quiescence, anchored at the window's coordination block. It ends with
+	// the procedure and does not authorize or select the later wallet
+	// action's cryptographic mode: the coordination wire format is shared by
+	// both releases, so the permit's mode is telemetry here and the procedure
+	// runs in either mode. A refusal is a gate decision, not an ordinary
+	// coordination failure.
+	permit, err := node.participationGate.Begin(
+		participation.TBTCWalletCoordination,
+		window.coordinationBlock,
+	)
+	if err != nil {
+		procedureLogger.Warnf(
+			"coordination procedure refused by the participation gate: [%v]",
+			err,
+		)
+		return nil, false
+	}
+	defer permit.Close()
+
 	startTime := time.Now()
-	result, err := executor.coordinate(window)
+	result, err := executor.coordinate(permit.Context(), window)
 	duration := time.Since(startTime)
 
 	if err != nil {
@@ -1270,6 +1360,17 @@ func processCoordinationResult(node *node, result *coordinationResult) {
 	startBlock := result.window.endBlock()
 	expiryBlock := startBlock + result.proposal.ValidityBlocks()
 
+	// One action permit, acquired before the handler and the dispatcher are
+	// set up and anchored at the proposal-processing start block. Every
+	// signing and terminal commit of the dispatched action derives from it;
+	// the heartbeat ceremony additionally fences its derived inactivity work
+	// through it. The handlers hand the permit to the action, which owns it
+	// until its execution ends.
+	permit := node.beginWalletActionPermit(proposedAction, startBlock)
+	if permit == nil {
+		return
+	}
+
 	switch proposedAction {
 	case ActionHeartbeat:
 		if proposal, ok := result.proposal.(*HeartbeatProposal); ok {
@@ -1278,7 +1379,9 @@ func processCoordinationResult(node *node, result *coordinationResult) {
 				proposal,
 				startBlock,
 				expiryBlock,
+				permit,
 			)
+			return
 		}
 	case ActionDepositSweep:
 		if proposal, ok := result.proposal.(*DepositSweepProposal); ok {
@@ -1287,7 +1390,9 @@ func processCoordinationResult(node *node, result *coordinationResult) {
 				proposal,
 				startBlock,
 				expiryBlock,
+				permit,
 			)
+			return
 		}
 	case ActionRedemption:
 		if proposal, ok := result.proposal.(*RedemptionProposal); ok {
@@ -1296,7 +1401,9 @@ func processCoordinationResult(node *node, result *coordinationResult) {
 				proposal,
 				startBlock,
 				expiryBlock,
+				permit,
 			)
+			return
 		}
 	case ActionMovingFunds:
 		if proposal, ok := result.proposal.(*MovingFundsProposal); ok {
@@ -1305,7 +1412,9 @@ func processCoordinationResult(node *node, result *coordinationResult) {
 				proposal,
 				startBlock,
 				expiryBlock,
+				permit,
 			)
+			return
 		}
 	case ActionMovedFundsSweep:
 		if proposal, ok := result.proposal.(*MovedFundsSweepProposal); ok {
@@ -1314,11 +1423,69 @@ func processCoordinationResult(node *node, result *coordinationResult) {
 				proposal,
 				startBlock,
 				expiryBlock,
+				permit,
 			)
+			return
 		}
 	default:
 		logger.Errorf("no handler for coordination result [%s]", result)
 	}
+
+	// A mismatched proposal type or an unknown action never reached a
+	// handler, so the permit is released here.
+	permit.Close()
+}
+
+// beginWalletActionPermit acquires the participation permit for a wallet
+// action about to be orchestrated. It fails closed: without a gate, on a gate
+// refusal, or for a protocol mode the tECDSA stack cannot run, no permit is
+// returned and the action must not be dispatched.
+func (n *node) beginWalletActionPermit(
+	proposedAction WalletActionType,
+	startBlock uint64,
+) participation.Permit {
+	if n.participationGate == nil {
+		logger.Errorf(
+			"no participation gate; refusing the [%s] wallet action",
+			proposedAction,
+		)
+		return nil
+	}
+
+	// The heartbeat is its own ceremony class because its penalty semantics
+	// differ; every other wallet action is a signing ceremony.
+	ceremony := participation.TBTCSigning
+	if proposedAction == ActionHeartbeat {
+		ceremony = participation.TBTCHeartbeat
+	}
+
+	permit, err := n.participationGate.Begin(ceremony, startBlock)
+	if err != nil {
+		logger.Warnf(
+			"[%s] wallet action refused by the participation gate: [%v]",
+			proposedAction,
+			err,
+		)
+		return nil
+	}
+
+	// The pinned tss-lib fork exposes no per-party legacy mode, so a tECDSA
+	// ceremony cannot reproduce the legacy proof transcript. Running the
+	// hardened transcript under a legacy permit would emit wire traffic
+	// incompatible with both releases, so a legacy-mode wallet action is
+	// refused outright instead.
+	if permit.Mode() != participation.ModeSecurityV2 {
+		permit.Close()
+		logger.Warnf(
+			"refusing the [%s] wallet action in protocol mode [%s]: the "+
+				"pinned tss-lib revision has no reviewed legacy mode",
+			proposedAction,
+			permit.Mode(),
+		)
+		return nil
+	}
+
+	return permit
 }
 
 // archiveClosedWallets archives closed or terminated wallets.
@@ -1467,6 +1634,12 @@ func (n *node) waitForBlockHeight(ctx context.Context, blockHeight uint64) error
 	select {
 	case <-wait:
 	case <-ctx.Done():
+		// The block counter delivers exactly one notification per waiter
+		// with a blocking send on an unbuffered channel once the height is
+		// reached. Simply abandoning the channel would park that sender
+		// goroutine forever, so a drain goroutine performs the single
+		// receive and lets the eventual sender terminate.
+		go func() { <-wait }()
 	}
 
 	return nil

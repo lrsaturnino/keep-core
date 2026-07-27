@@ -346,8 +346,12 @@ func (ce *coordinationExecutor) walletPublicKeyHash() [20]byte {
 }
 
 // coordinate executes the coordination procedure for the given coordination
-// window.
+// window. The given context bounds the procedure: it is the owning
+// coordination permit's context, so a release-gate cancellation — clock
+// failure or forced quiescence — ends the procedure like the active phase end
+// does.
 func (ce *coordinationExecutor) coordinate(
+	ctx context.Context,
 	window *coordinationWindow,
 ) (*coordinationResult, error) {
 	if lockAcquired := ce.lock.TryAcquire(1); !lockAcquired {
@@ -410,7 +414,7 @@ func (ce *coordinationExecutor) coordinate(
 	// The coordination follower cancels the context as soon as it receives
 	// the coordination message.
 	ctx, cancelCtx := withCancelOnBlock(
-		context.Background(),
+		ctx,
 		window.activePhaseEndBlock(),
 		ce.waitForBlockFn,
 	)

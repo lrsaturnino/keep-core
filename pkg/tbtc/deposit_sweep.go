@@ -10,6 +10,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/keep-network/keep-core/pkg/bitcoin"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 )
 
 const (
@@ -88,6 +89,11 @@ type depositSweepAction struct {
 	broadcastTimeout                 time.Duration
 	broadcastCheckDelay              time.Duration
 
+	// permit is the wallet action's participation permit: it pins the
+	// protocol mode for every signing of this action and is released when the
+	// action's execution ends.
+	permit participation.Permit
+
 	// metricsRecorder is optional and used for recording performance metrics
 	metricsRecorder interface {
 		IncrementCounter(name string, value float64)
@@ -105,12 +111,15 @@ func newDepositSweepAction(
 	proposalProcessingStartBlock uint64,
 	proposalExpiryBlock uint64,
 	waitForBlockFn waitForBlockFn,
+	permit participation.Permit,
 ) *depositSweepAction {
 	transactionExecutor := newWalletTransactionExecutor(
 		btcChain,
 		sweepingWallet,
 		signingExecutor,
 		waitForBlockFn,
+		permit,
+		"tbtc_deposit_sweep_bitcoin_broadcast",
 	)
 
 	return &depositSweepAction{
@@ -126,10 +135,15 @@ func newDepositSweepAction(
 		signingTimeoutSafetyMarginBlocks: depositSweepSigningTimeoutSafetyMarginBlocks,
 		broadcastTimeout:                 depositSweepBroadcastTimeout,
 		broadcastCheckDelay:              depositSweepBroadcastCheckDelay,
+		permit:                           permit,
 	}
 }
 
 func (dsa *depositSweepAction) execute() error {
+	// The action owns its permit from dispatch on; releasing it here ends the
+	// ceremony's active accounting in the participation gate.
+	defer dsa.permit.Close()
+
 	executionStartTime := time.Now()
 
 	// Record deposit sweep execution attempt

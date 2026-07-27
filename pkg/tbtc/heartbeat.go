@@ -10,6 +10,7 @@ import (
 	"github.com/ipfs/go-log/v2"
 	"github.com/keep-network/keep-core/pkg/bitcoin"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/tecdsa"
 )
 
@@ -60,15 +61,18 @@ type heartbeatSigningExecutor interface {
 		ctx context.Context,
 		message *big.Int,
 		startBlock uint64,
+		mode participation.ProtocolMode,
 	) (*tecdsa.Signature, *signingActivityReport, uint64, error)
 }
 
 // heartbeatInactivityClaimExecutor is an interface meant to decouple the
 // specific implementation of the inactivity claim executor from the heartbeat
-// action.
+// action. The commit guard is the heartbeat permit's penalty fence: the claim
+// is derived penalty work and inherits the heartbeat ceremony's permit.
 type heartbeatInactivityClaimExecutor interface {
 	claimInactivity(
 		ctx context.Context,
+		commitGuard participation.CommitGuard,
 		inactiveMembersIndexes []group.MemberIndex,
 		heartbeatFailed bool,
 		sessionID *big.Int,
@@ -93,6 +97,12 @@ type heartbeatAction struct {
 	expiryBlock uint64
 
 	waitForBlockFn waitForBlockFn
+
+	// permit is the heartbeat ceremony's participation permit: it pins the
+	// protocol mode for the heartbeat signing, fences the penalty path of any
+	// derived inactivity work, and is released when the action's execution
+	// ends.
+	permit participation.Permit
 }
 
 func newHeartbeatAction(
@@ -106,6 +116,7 @@ func newHeartbeatAction(
 	startBlock uint64,
 	expiryBlock uint64,
 	waitForBlockFn waitForBlockFn,
+	permit participation.Permit,
 ) *heartbeatAction {
 	return &heartbeatAction{
 		logger:                  logger,
@@ -118,10 +129,15 @@ func newHeartbeatAction(
 		startBlock:              startBlock,
 		expiryBlock:             expiryBlock,
 		waitForBlockFn:          waitForBlockFn,
+		permit:                  permit,
 	}
 }
 
 func (ha *heartbeatAction) execute() error {
+	// The action owns its permit from dispatch on; releasing it here ends the
+	// ceremony's active accounting in the participation gate.
+	defer ha.permit.Close()
+
 	// Do not execute the heartbeat action if the operator is unstaking.
 	isUnstaking, err := ha.isOperatorUnstaking()
 	if err != nil {
@@ -161,8 +177,11 @@ func (ha *heartbeatAction) execute() error {
 		return fmt.Errorf("invalid proposal expiry block")
 	}
 
+	// The signing window is bound to the heartbeat permit: a permit
+	// cancellation — clock failure, forced quiescence — stops the signing
+	// exactly like the timeout block does.
 	heartbeatSigningCtx, cancelHeartbeatSigningCtx := withCancelOnBlock(
-		context.Background(),
+		ha.permit.Context(),
 		ha.expiryBlock-heartbeatInactivityClaimValidityBlocks,
 		ha.waitForBlockFn,
 	)
@@ -172,6 +191,7 @@ func (ha *heartbeatAction) execute() error {
 		heartbeatSigningCtx,
 		messageToSign,
 		ha.startBlock,
+		ha.permit.Mode(),
 	)
 	if err != nil {
 		// Do not count this error as heartbeat inactivity failure. If the
@@ -208,6 +228,23 @@ func (ha *heartbeatAction) execute() error {
 		heartbeatSigningMinimumActiveMembers,
 	)
 
+	// The consecutive-failure counter and any derived claim are new penalty
+	// state. The permit's penalty fence suppresses both for legacy work at or
+	// after the cutover block and for every permit once process quiescence
+	// begins, so a boundary- or shutdown-caused low-activity result cannot
+	// turn into punishment.
+	if fenceErr := ha.permit.CheckCommit(
+		"tbtc_heartbeat_inactivity_accounting",
+		participation.PenaltyCommit,
+	); fenceErr != nil {
+		ha.logger.Warnf(
+			"heartbeat inactivity penalty suppressed by the release "+
+				"gate: [%v]",
+			fenceErr,
+		)
+		return nil
+	}
+
 	// Increment the heartbeat inactivity failure counter.
 	ha.failureCounter.increment(walletKey)
 
@@ -232,16 +269,18 @@ func (ha *heartbeatAction) execute() error {
 	}
 
 	heartbeatInactivityCtx, cancelHeartbeatInactivityCtx := withCancelOnBlock(
-		context.Background(),
+		ha.permit.Context(),
 		ha.expiryBlock-heartbeatTimeoutSafetyMarginBlocks,
 		ha.waitForBlockFn,
 	)
 	defer cancelHeartbeatInactivityCtx()
 
 	// The value of consecutive heartbeat inactivity failures exceeds the threshold.
-	// Proceed with operator inactivity claim.
+	// Proceed with operator inactivity claim. The claim is derived penalty
+	// work: it inherits the heartbeat permit as its commit fence.
 	err = ha.inactivityClaimExecutor.claimInactivity(
 		heartbeatInactivityCtx,
+		ha.permit,
 		// It's safe to consider unstaking members as inactive members in the claim.
 		// Inactive members are set ineligible for on-chain rewards for a certain
 		// period of time. This is a desired outcome for unstaking members as well.

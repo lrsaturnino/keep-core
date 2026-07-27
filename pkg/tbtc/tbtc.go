@@ -116,6 +116,7 @@ func Initialize(
 	btcChain bitcoin.Chain,
 	netProvider net.Provider,
 	keyStorePersistence persistence.ProtectedHandle,
+	quarantinePersistence persistence.ProtectedHandle,
 	workPersistence persistence.BasicHandle,
 	scheduler *generator.Scheduler,
 	proposalGenerator CoordinationProposalGenerator,
@@ -128,6 +129,9 @@ func Initialize(
 ) error {
 	if participationGate == nil {
 		return fmt.Errorf("the participation gate is required")
+	}
+	if quarantinePersistence == nil {
+		return fmt.Errorf("the signer quarantine persistence is required")
 	}
 	if cutoverRoster == nil {
 		return fmt.Errorf("the cutover peer roster is required")
@@ -173,12 +177,18 @@ func Initialize(
 		return fmt.Errorf("cannot set up TBTC node: [%v]", err)
 	}
 
-	// The gate and roster are installed BEFORE the coordination layer starts,
-	// so a signing executor created by an early coordination round already
-	// carries the roster and no legacy sighting is missed. The gate is stored
-	// for the ceremony choke points; their lifecycles are owned by the process
-	// startup that constructed them.
+	// The gate, quarantine store, and roster are installed BEFORE the
+	// coordination layer starts and BEFORE any chain event subscription
+	// exists, so every ceremony choke point already carries them when the
+	// first ceremony can possibly begin. The gate is stored for the ceremony
+	// choke points; their lifecycles are owned by the process startup that
+	// constructed them.
 	node.participationGate = participationGate
+	node.dkgExecutor.participationGate = participationGate
+	node.dkgExecutor.signerQuarantine = newSignerQuarantine(
+		logger,
+		quarantinePersistence,
+	)
 	node.setCutoverPeerRoster(cutoverRoster)
 
 	err = node.runCoordinationLayer(ctx)
