@@ -86,6 +86,18 @@ func StrategiesFor(mode participation.ProtocolMode) (Strategies, error) {
 	}
 }
 
+// Legacy returns the legacy strategy bundle. It is a deliberate, explicit
+// selection — never a fallback for an unset mode.
+func Legacy() Strategies {
+	return legacyStrategies{}
+}
+
+// SecurityV2 returns the security-v2 strategy bundle. It is a deliberate,
+// explicit selection — never a fallback for an unset mode.
+func SecurityV2() Strategies {
+	return securityV2Strategies{}
+}
+
 // legacyStrategies reproduces, byte for byte, the wire- and
 // transcript-sensitive behavior of the pre-hardening production releases.
 type legacyStrategies struct{}

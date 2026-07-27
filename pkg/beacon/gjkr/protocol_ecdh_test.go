@@ -9,6 +9,7 @@ import (
 	"github.com/keep-network/keep-core/internal/testutils"
 
 	"github.com/keep-network/keep-core/pkg/crypto/ephemeral"
+	"github.com/keep-network/keep-core/pkg/protocol/compatibility"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 )
 
@@ -146,7 +147,11 @@ func initializeEphemeralKeyPairMembersGroup(
 ) []*EphemeralKeyPairGeneratingMember {
 	dkgGroup := group.NewGroup(dishonestThreshold, groupSize)
 
-	protocolParameters := newProtocolParameters(big.NewInt(18313131145))
+	strategies := compatibility.SecurityV2()
+	protocolParameters := newProtocolParameters(
+		big.NewInt(18313131145),
+		strategies,
+	)
 
 	var members []*EphemeralKeyPairGeneratingMember
 	for i := 1; i <= groupSize; i++ {
@@ -159,6 +164,7 @@ func initializeEphemeralKeyPairMembersGroup(
 					group:              dkgGroup,
 					evidenceLog:        newDkgEvidenceLog(),
 					protocolParameters: protocolParameters,
+					strategies:         strategies,
 					sessionID:          "session-1",
 				},
 			},

@@ -14,10 +14,13 @@ import (
 	"github.com/keep-network/keep-core/pkg/beacon/gjkr"
 	"github.com/keep-network/keep-core/pkg/chain"
 	"github.com/keep-network/keep-core/pkg/net"
+	"github.com/keep-network/keep-core/pkg/protocol/compatibility"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 )
 
-// ExecuteDKG runs the full distributed key generation lifecycle.
+// ExecuteDKG runs the full distributed key generation lifecycle. The
+// compatibility strategy bundle selects the ceremony's wire-sensitive
+// cryptographic behavior and must be supplied explicitly.
 func ExecuteDKG(
 	logger log.StandardLogger,
 	seed *big.Int,
@@ -27,6 +30,7 @@ func ExecuteDKG(
 	channel net.BroadcastChannel,
 	membershipValidator *group.MembershipValidator,
 	selectedOperators []chain.Address,
+	strategies compatibility.Strategies,
 ) (*ThresholdSigner, error) {
 	beaconConfig := beaconChain.GetConfig()
 
@@ -50,6 +54,7 @@ func ExecuteDKG(
 		channel,
 		beaconConfig.DishonestThreshold(),
 		membershipValidator,
+		strategies,
 		startBlockHeight,
 	)
 	if err != nil {

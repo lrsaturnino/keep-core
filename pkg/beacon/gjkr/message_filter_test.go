@@ -9,6 +9,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/chain/local_v1"
 	"github.com/keep-network/keep-core/pkg/operator"
 
+	"github.com/keep-network/keep-core/pkg/protocol/compatibility"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 )
 
@@ -87,6 +88,7 @@ func TestShouldAcceptMessage(t *testing.T) {
 				membershipValdator,
 				big.NewInt(100),
 				"session-1",
+				compatibility.SecurityV2(),
 			)
 			if err != nil {
 				t.Fatal(err)

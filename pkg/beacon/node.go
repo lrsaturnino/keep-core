@@ -16,6 +16,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/beacon/registry"
 	"github.com/keep-network/keep-core/pkg/generator"
 	"github.com/keep-network/keep-core/pkg/net"
+	"github.com/keep-network/keep-core/pkg/protocol/compatibility"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 )
 
@@ -151,6 +152,13 @@ func (n *node) JoinDKGIfEligible(
 				n.protocolLatch.Lock()
 				defer n.protocolLatch.Unlock()
 
+				// TODO: The strategy bundle must come from the ceremony's
+				// participation permit once the gate is constructed and
+				// passed into the beacon node; until then the node
+				// participates in security-v2 mode unconditionally, which
+				// preserves the current behavior of this branch. This is a
+				// release blocker for the chain-clocked cutover: a node
+				// below the cutover block must run legacy strategies here.
 				signer, err := dkg.ExecuteDKG(
 					dkgLogger,
 					dkgSeed,
@@ -160,6 +168,7 @@ func (n *node) JoinDKGIfEligible(
 					broadcastChannel,
 					membershipValidator,
 					selectedOperators,
+					compatibility.SecurityV2(),
 				)
 				if err != nil {
 					dkgLogger.Errorf("failed to execute dkg: [%v]", err)

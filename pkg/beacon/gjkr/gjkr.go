@@ -8,6 +8,7 @@ import (
 
 	"github.com/keep-network/keep-core/pkg/chain"
 	"github.com/keep-network/keep-core/pkg/net"
+	"github.com/keep-network/keep-core/pkg/protocol/compatibility"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/protocol/state"
 )
@@ -53,6 +54,11 @@ func RegisterUnmarshallers(channel net.BroadcastChannel) {
 // If the generation is successful, it returns a threshold group member which
 // can participate in the signing group; if the generation fails, it returns an
 // error.
+//
+// The compatibility strategy bundle carries every wire- and
+// transcript-sensitive cryptographic decision of the ceremony — the ECDH
+// derivation and the hash-to-point mapping behind the Pedersen generator H —
+// and must be supplied explicitly; there is no implicit default mode.
 func Execute(
 	logger log.StandardLogger,
 	seed *big.Int,
@@ -63,6 +69,7 @@ func Execute(
 	channel net.BroadcastChannel,
 	dishonestThreshold int,
 	membershipValidator *group.MembershipValidator,
+	strategies compatibility.Strategies,
 	startBlockHeight uint64,
 ) (*Result, uint64, error) {
 	logger.Debugf("[member:%v] initializing member", memberIndex)
@@ -75,6 +82,7 @@ func Execute(
 		membershipValidator,
 		seed,
 		sessionID,
+		strategies,
 	)
 	if err != nil {
 		return nil, 0, fmt.Errorf("cannot create a new member: [%v]", err)

@@ -25,6 +25,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/internal/interception"
 	netLocal "github.com/keep-network/keep-core/pkg/net/local"
 	"github.com/keep-network/keep-core/pkg/operator"
+	"github.com/keep-network/keep-core/pkg/protocol/compatibility"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 )
 
@@ -198,6 +199,10 @@ func executeDKG(
 	for i := 0; i < beaconConfig.GroupSize; i++ {
 		memberIndex := group.MemberIndex(i + 1) // capture for goroutine
 		go func() {
+			// The harness pins security-v2 strategies: it exercises the
+			// hardened protocol behavior end to end. Per-mode cutover
+			// coverage constructs its members with an explicit bundle
+			// instead of going through this harness.
 			signer, err := dkg.ExecuteDKG(
 				memberLogger,
 				seed,
@@ -207,6 +212,7 @@ func executeDKG(
 				broadcastChannel,
 				membershipValidator,
 				selectedOperators,
+				compatibility.SecurityV2(),
 			)
 			if signer != nil {
 				signersMutex.Lock()

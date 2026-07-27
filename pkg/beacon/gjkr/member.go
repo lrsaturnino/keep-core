@@ -1,12 +1,14 @@
 package gjkr
 
 import (
+	"fmt"
 	"math/big"
 
 	"github.com/ipfs/go-log/v2"
 
 	bn256 "github.com/ethereum/go-ethereum/crypto/bn256/cloudflare"
 	"github.com/keep-network/keep-core/pkg/crypto/ephemeral"
+	"github.com/keep-network/keep-core/pkg/protocol/compatibility"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 )
 
@@ -30,6 +32,12 @@ type memberCore struct {
 
 	// Cryptographic protocol parameters, the same for all members in the group.
 	protocolParameters *protocolParameters
+
+	// Compatibility strategy bundle of the ceremony this member participates
+	// in. Every wire- and transcript-sensitive decision — the ECDH symmetric
+	// key derivation and the hash-to-point mapping behind protocolParameters —
+	// comes from this bundle and is immutable for the member lifetime.
+	strategies compatibility.Strategies
 
 	// Identifier of the particular DKG session this member is part of.
 	sessionID string
@@ -240,7 +248,9 @@ type FinalizingMember struct {
 	*CombiningMember
 }
 
-// NewMember creates a new member in an initial state
+// NewMember creates a new member in an initial state. The compatibility
+// strategy bundle is required: an implicit cryptographic mode is forbidden,
+// so a nil bundle is a construction error rather than a silent default.
 func NewMember(
 	logger log.StandardLogger,
 	memberID group.MemberIndex,
@@ -249,7 +259,14 @@ func NewMember(
 	membershipValidator *group.MembershipValidator,
 	seed *big.Int,
 	sessionID string,
+	strategies compatibility.Strategies,
 ) (*LocalMember, error) {
+	if strategies == nil {
+		return nil, fmt.Errorf(
+			"a compatibility strategy bundle is required: the cryptographic " +
+				"mode must be selected explicitly for the ceremony",
+		)
+	}
 	return &LocalMember{
 		memberCore: &memberCore{
 			logger,
@@ -257,7 +274,8 @@ func NewMember(
 			group.NewGroup(dishonestThreshold, groupSize),
 			membershipValidator,
 			newDkgEvidenceLog(),
-			newProtocolParameters(seed),
+			newProtocolParameters(seed, strategies),
+			strategies,
 			sessionID,
 		},
 	}, nil

@@ -115,8 +115,11 @@ func (sm *SymmetricKeyGeneratingMember) GenerateSymmetricKeys(
 		otherMemberEphemeralPublicKey := ephemeralPubKeyMessage.ephemeralPublicKeys[sm.ID]
 
 		// Create symmetric key for the current group member and the other
-		// group member by ECDH'ing the public and private key.
-		symmetricKey := thisMemberEphemeralPrivateKey.Ecdh(
+		// group member by ECDH'ing the public and private key. The derivation
+		// comes from the ceremony's compatibility strategy bundle so both
+		// sides of the exchange agree on it.
+		symmetricKey := sm.strategies.ECDH(
+			thisMemberEphemeralPrivateKey,
 			otherMemberEphemeralPublicKey,
 			gjkrEcdhInfo(sm.ID, otherMember),
 		)
@@ -668,7 +671,7 @@ func (sjm *SharesJustifyingMember) ResolveSecretSharesAccusationsMessages(
 				sjm.discardReceivedShares(accuserID)
 				continue
 			}
-			symmetricKey := revealedAccuserPrivateKey.Ecdh(accusedPublicKey, gjkrEcdhInfo(accuserID, accusedID))
+			symmetricKey := sjm.strategies.ECDH(revealedAccuserPrivateKey, accusedPublicKey, gjkrEcdhInfo(accuserID, accusedID))
 
 			// Get from evidence log peer shares message sent by the accused
 			// member. If the message is not present, this means the accused
@@ -1109,7 +1112,7 @@ func (pjm *PointsJustifyingMember) ResolvePublicKeySharePointsAccusationsMessage
 				pjm.group.MarkMemberAsDisqualified(accuserID)
 				continue
 			}
-			recoveredSymmetricKey := revealedAccuserPrivateKey.Ecdh(accusedPublicKey, gjkrEcdhInfo(accuserID, accusedID))
+			recoveredSymmetricKey := pjm.strategies.ECDH(revealedAccuserPrivateKey, accusedPublicKey, gjkrEcdhInfo(accuserID, accusedID))
 
 			// Get from evidence log peer shares message sent by the accused
 			// member. If the message is not present, this means the accused
@@ -1465,7 +1468,7 @@ func (rm *ReconstructingMember) recoverMisbehavedShares(
 				rm.group.MarkMemberAsDisqualified(revealingMemberID)
 				continue
 			}
-			recoveredSymmetricKey := revealedPrivateKey.Ecdh(misbehavedMemberPublicKey, gjkrEcdhInfo(revealingMemberID, misbehavedMemberID))
+			recoveredSymmetricKey := rm.strategies.ECDH(revealedPrivateKey, misbehavedMemberPublicKey, gjkrEcdhInfo(revealingMemberID, misbehavedMemberID))
 
 			// Get from the evidence log peer shares message sent by the member
 			// for which the private key has been revealed.
