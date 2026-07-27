@@ -29,6 +29,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -59,6 +60,7 @@ const (
 	beaconKeystoreNamespace   = "keystore/beacon"
 	beaconQuarantineNamespace = "keystore/beacon-quarantine"
 	tbtcKeystoreNamespace     = "keystore/tbtc"
+	tbtcQuarantineNamespace   = "keystore/tbtc-quarantine"
 	tbtcWorkNamespace         = "work/tbtc"
 )
 
@@ -68,8 +70,13 @@ const (
 // in the same change.
 var (
 	knownRootEntries     = []string{"keystore", "work"}
-	knownKeystoreEntries = []string{"beacon", "beacon-quarantine", "tbtc"}
-	knownWorkEntries     = []string{"tbtc"}
+	knownKeystoreEntries = []string{
+		"beacon",
+		"beacon-quarantine",
+		"tbtc",
+		"tbtc-quarantine",
+	}
+	knownWorkEntries = []string{"tbtc"}
 )
 
 // tbtcWorkPreparamsMarker classifies tECDSA pre-parameter pool records inside
@@ -105,13 +112,116 @@ type snapshotIdentity struct {
 }
 
 // evidenceRecord references one externally produced rollback-evidence input.
-// The audit records the reference and its checksum; it does not evaluate the
-// evidence content.
+// The audit records the reference and its checksum, validates the record
+// against its schema, and binds it to this exact snapshot; a record that
+// fails validation stays a rollback blocker exactly like a missing one.
 type evidenceRecord struct {
 	Name     string `json:"name"`
 	Supplied bool   `json:"supplied"`
+	Valid    bool   `json:"valid"`
 	Path     string `json:"path,omitempty"`
 	SHA256   string `json:"sha256,omitempty"`
+}
+
+// evidenceSchemaVersion versions the external rollback-evidence record
+// schemas this audit accepts.
+const evidenceSchemaVersion uint32 = 1
+
+// evidenceEnvelope is the common header of every external rollback-evidence
+// record. The snapshot binding makes a record usable for exactly one audited
+// snapshot: evidence generated for different storage cannot authorize this
+// rollback.
+type evidenceEnvelope struct {
+	SchemaVersion           uint32    `json:"schema_version"`
+	EvidenceType            string    `json:"evidence_type"`
+	GeneratedAt             time.Time `json:"generated_at"`
+	SnapshotAggregateSHA256 string    `json:"snapshot_aggregate_sha256"`
+}
+
+// chainReconciliationEvidence records the on-chain wallet/group registration
+// and DKG settlement state for every persisted group in the snapshot.
+type chainReconciliationEvidence struct {
+	evidenceEnvelope
+
+	EthereumChainID string `json:"ethereum_chain_id"`
+	Wallets         []struct {
+		WalletStorageKey string `json:"wallet_storage_key"`
+		WalletID         string `json:"wallet_id"`
+		Registered       bool   `json:"registered"`
+		// DKGSettlement is the wallet's DKG settlement state on chain:
+		// "approved" is the only state that permits its persisted signers in
+		// the prior binary's active scan.
+		DKGSettlement string `json:"dkg_settlement"`
+	} `json:"wallets"`
+	BeaconGroups []struct {
+		GroupPublicKey string `json:"group_public_key"`
+		Registered     bool   `json:"registered"`
+	} `json:"beacon_groups"`
+}
+
+// bitcoinReconciliationEvidence records every pending Bitcoin transaction of
+// the audited wallets and its mempool/chain state.
+type bitcoinReconciliationEvidence struct {
+	evidenceEnvelope
+
+	BitcoinNetwork string `json:"bitcoin_network"`
+	// Complete attests the generator enumerated every pending transaction; an
+	// explicitly incomplete reconciliation cannot authorize the barrier.
+	Complete            bool `json:"complete"`
+	PendingTransactions []struct {
+		TransactionHash string `json:"transaction_hash"`
+		State           string `json:"state"`
+	} `json:"pending_transactions"`
+}
+
+// quiescenceReportEvidence records the permits active at process quiescence
+// and each one's terminal outcome.
+type quiescenceReportEvidence struct {
+	evidenceEnvelope
+
+	QuiesceCause              string `json:"quiesce_cause"`
+	ActivePermitsAtQuiescence []struct {
+		Ceremony            string `json:"ceremony"`
+		Mode                string `json:"mode"`
+		CanonicalStartBlock uint64 `json:"canonical_start_block"`
+		Outcome             string `json:"outcome"`
+	} `json:"active_permits_at_quiescence"`
+}
+
+// priorReaderCompatibilityEvidence records the tested prior release and its
+// result against every schema this release writes, including loading and
+// signing with a wallet created after the cutover block.
+type priorReaderCompatibilityEvidence struct {
+	evidenceEnvelope
+
+	PriorVersion  string `json:"prior_version"`
+	PriorRevision string `json:"prior_revision"`
+	SchemaResults []struct {
+		Schema     string `json:"schema"`
+		Compatible bool   `json:"compatible"`
+	} `json:"schema_results"`
+}
+
+// The prior-reader compatibility evidence must cover every schema whose
+// unreadability makes the prior-binary rollback an unacceptable mechanism.
+var requiredPriorReaderSchemas = []string{
+	"beacon_membership",
+	"tbtc_membership",
+	"post_cutover_wallet_load_and_sign",
+}
+
+// Valid terminal states of a reconciled pending Bitcoin transaction.
+var validBitcoinTransactionStates = map[string]struct{}{
+	"signed":    {},
+	"broadcast": {},
+	"mined":     {},
+	"absent":    {},
+}
+
+// Valid terminal outcomes of a permit active at quiescence.
+var validQuiescencePermitOutcomes = map[string]struct{}{
+	"completed":   {},
+	"quarantined": {},
 }
 
 type beaconMembershipRecord struct {
@@ -137,6 +247,15 @@ type tbtcWalletRecord struct {
 	SigningGroupSize int     `json:"signing_group_size"`
 }
 
+type tbtcQuarantineRecord struct {
+	tbtc.QuarantinedSignerMetadata
+
+	// HasMembershipRecord reports whether the preserved signer bytes
+	// accompany the metadata; metadata without the signer means the key
+	// material was lost and the record is evidence only.
+	HasMembershipRecord bool `json:"has_membership_record"`
+}
+
 type manifest struct {
 	SchemaVersion uint32           `json:"schema_version"`
 	GeneratedAt   time.Time        `json:"generated_at"`
@@ -150,6 +269,7 @@ type manifest struct {
 	BeaconActiveMemberships  []beaconMembershipRecord `json:"beacon_active_memberships,omitempty"`
 	BeaconQuarantinedOutputs []beaconQuarantineRecord `json:"beacon_quarantined_outputs,omitempty"`
 	TBTCActiveWallets        []tbtcWalletRecord       `json:"tbtc_active_wallets,omitempty"`
+	TBTCQuarantinedOutputs   []tbtcQuarantineRecord   `json:"tbtc_quarantined_outputs,omitempty"`
 	// TBTCWorkClassification counts the tBTC work-namespace files by class;
 	// an unclassified work record is additionally a finding.
 	TBTCWorkClassification map[string]int `json:"tbtc_work_classification,omitempty"`
@@ -320,6 +440,7 @@ func runAudit(
 		beaconKeystoreNamespace,
 		beaconQuarantineNamespace,
 		tbtcKeystoreNamespace,
+		tbtcQuarantineNamespace,
 		tbtcWorkNamespace,
 	} {
 		inventory, err := inventoryNamespace(storageDir, namespace)
@@ -527,15 +648,17 @@ func classifyTBTCWork(r *auditRun) {
 	}
 }
 
-// recordExternalEvidence records every externally produced rollback input and
-// turns each missing one into a rollback blocker. A supplied reference that
-// cannot be read is an input error: fail fast instead of recording evidence
-// that does not exist.
+// recordExternalEvidence records every externally produced rollback input,
+// validates each supplied record against its mandatory schema and this exact
+// snapshot, and turns each missing or invalid one into a rollback blocker. A
+// supplied reference that cannot be read is an input error: fail fast instead
+// of recording evidence that does not exist.
 func recordExternalEvidence(r *auditRun, evidence evidenceInputs) error {
 	inputs := []struct {
-		name    string
-		path    string
-		missing string
+		name     string
+		path     string
+		missing  string
+		validate func([]byte) []string
 	}{
 		{
 			name: "chain_reconciliation",
@@ -543,18 +666,21 @@ func recordExternalEvidence(r *auditRun, evidence evidenceInputs) error {
 			missing: "chain reconciliation evidence not supplied: on-chain " +
 				"wallet/group registration and DKG settlement state are " +
 				"unverified",
+			validate: r.validateChainReconciliationEvidence,
 		},
 		{
 			name: "bitcoin_reconciliation",
 			path: evidence.bitcoinReconciliation,
 			missing: "bitcoin reconciliation evidence not supplied: pending " +
 				"transaction state is unverified",
+			validate: r.validateBitcoinReconciliationEvidence,
 		},
 		{
 			name: "quiescence_report",
 			path: evidence.quiescenceReport,
 			missing: "quiescence report not supplied: the permits active at " +
 				"quiescence and their terminal outcomes are unverified",
+			validate: r.validateQuiescenceReportEvidence,
 		},
 		{
 			name: "prior_reader_compatibility",
@@ -562,6 +688,7 @@ func recordExternalEvidence(r *auditRun, evidence evidenceInputs) error {
 			missing: "prior-reader compatibility evidence not supplied: the " +
 				"prior release's ability to read every persisted schema is " +
 				"unverified",
+			validate: r.validatePriorReaderCompatibilityEvidence,
 		},
 	}
 
@@ -592,12 +719,347 @@ func recordExternalEvidence(r *auditRun, evidence evidenceInputs) error {
 		record.Supplied = true
 		record.Path = input.path
 		record.SHA256 = hex.EncodeToString(checksum[:])
+
+		violations := input.validate(content)
+		record.Valid = len(violations) == 0
+		for _, violation := range violations {
+			r.manifest.RollbackBlockers = append(
+				r.manifest.RollbackBlockers,
+				fmt.Sprintf(
+					"[%s] evidence fails validation: %s",
+					input.name,
+					violation,
+				),
+			)
+		}
+
 		r.manifest.ExternalEvidence = append(
 			r.manifest.ExternalEvidence,
 			record,
 		)
 	}
 
+	return nil
+}
+
+// validateEnvelope checks the common header of one evidence record against
+// the expected type and this audit's snapshot identity.
+func (r *auditRun) validateEnvelope(
+	envelope evidenceEnvelope,
+	expectedType string,
+) []string {
+	var violations []string
+
+	if envelope.SchemaVersion != evidenceSchemaVersion {
+		violations = append(violations, fmt.Sprintf(
+			"schema version [%d], expected [%d]",
+			envelope.SchemaVersion,
+			evidenceSchemaVersion,
+		))
+	}
+	if envelope.EvidenceType != expectedType {
+		violations = append(violations, fmt.Sprintf(
+			"evidence type [%s], expected [%s]",
+			envelope.EvidenceType,
+			expectedType,
+		))
+	}
+	if envelope.GeneratedAt.IsZero() {
+		violations = append(violations, "the generation time is missing")
+	}
+	if envelope.SnapshotAggregateSHA256 !=
+		r.manifest.Snapshot.AggregateSHA256 {
+		violations = append(violations, fmt.Sprintf(
+			"bound to snapshot [%s], not to this audited snapshot [%s]",
+			envelope.SnapshotAggregateSHA256,
+			r.manifest.Snapshot.AggregateSHA256,
+		))
+	}
+
+	return violations
+}
+
+// validateChainReconciliationEvidence checks the Ethereum reconciliation
+// record: schema, snapshot binding, chain identity, full coverage of every
+// persisted tBTC wallet and beacon group, and a settled, registered on-chain
+// state for each of them.
+func (r *auditRun) validateChainReconciliationEvidence(
+	content []byte,
+) []string {
+	record := &chainReconciliationEvidence{}
+	if err := strictUnmarshal(content, record); err != nil {
+		return []string{fmt.Sprintf(
+			"cannot be decoded as a chain reconciliation record: [%v]",
+			err,
+		)}
+	}
+
+	violations := r.validateEnvelope(
+		record.evidenceEnvelope,
+		"chain_reconciliation",
+	)
+
+	if record.EthereumChainID == "" {
+		violations = append(violations, "the Ethereum chain ID is missing")
+	}
+
+	wallets := make(map[string]int)
+	for i, wallet := range record.Wallets {
+		if wallet.WalletStorageKey == "" || wallet.WalletID == "" {
+			violations = append(violations, fmt.Sprintf(
+				"wallet entry [%d] is missing its identity",
+				i,
+			))
+			continue
+		}
+		wallets[wallet.WalletStorageKey] = i
+	}
+	beaconGroups := make(map[string]int)
+	for i, beaconGroup := range record.BeaconGroups {
+		if beaconGroup.GroupPublicKey == "" {
+			violations = append(violations, fmt.Sprintf(
+				"beacon group entry [%d] is missing its group public key",
+				i,
+			))
+			continue
+		}
+		beaconGroups[beaconGroup.GroupPublicKey] = i
+	}
+
+	for _, wallet := range r.manifest.TBTCActiveWallets {
+		i, covered := wallets[wallet.WalletStorageKey]
+		if !covered {
+			violations = append(violations, fmt.Sprintf(
+				"persisted tbtc wallet [%s] is not reconciled",
+				wallet.WalletStorageKey,
+			))
+			continue
+		}
+		if !record.Wallets[i].Registered {
+			violations = append(violations, fmt.Sprintf(
+				"persisted tbtc wallet [%s] is not registered on chain",
+				wallet.WalletStorageKey,
+			))
+		}
+		if record.Wallets[i].DKGSettlement != "approved" {
+			violations = append(violations, fmt.Sprintf(
+				"persisted tbtc wallet [%s] has DKG settlement [%s], "+
+					"expected [approved]",
+				wallet.WalletStorageKey,
+				record.Wallets[i].DKGSettlement,
+			))
+		}
+	}
+	for _, membership := range r.manifest.BeaconActiveMemberships {
+		i, covered := beaconGroups[membership.GroupPublicKey]
+		if !covered {
+			violations = append(violations, fmt.Sprintf(
+				"persisted beacon group [%s] is not reconciled",
+				membership.GroupPublicKey,
+			))
+			continue
+		}
+		if !record.BeaconGroups[i].Registered {
+			violations = append(violations, fmt.Sprintf(
+				"persisted beacon group [%s] is not registered on chain",
+				membership.GroupPublicKey,
+			))
+		}
+	}
+
+	return violations
+}
+
+// validateBitcoinReconciliationEvidence checks the Bitcoin reconciliation
+// record: schema, snapshot binding, network identity, an attested-complete
+// pending set, and a valid terminal state for every pending transaction.
+func (r *auditRun) validateBitcoinReconciliationEvidence(
+	content []byte,
+) []string {
+	record := &bitcoinReconciliationEvidence{}
+	if err := strictUnmarshal(content, record); err != nil {
+		return []string{fmt.Sprintf(
+			"cannot be decoded as a bitcoin reconciliation record: [%v]",
+			err,
+		)}
+	}
+
+	violations := r.validateEnvelope(
+		record.evidenceEnvelope,
+		"bitcoin_reconciliation",
+	)
+
+	if record.BitcoinNetwork == "" {
+		violations = append(violations, "the Bitcoin network is missing")
+	}
+	if !record.Complete {
+		violations = append(
+			violations,
+			"the pending transaction set is not attested complete",
+		)
+	}
+	for i, transaction := range record.PendingTransactions {
+		if transaction.TransactionHash == "" {
+			violations = append(violations, fmt.Sprintf(
+				"pending transaction entry [%d] is missing its hash",
+				i,
+			))
+		}
+		if _, ok := validBitcoinTransactionStates[transaction.State]; !ok {
+			violations = append(violations, fmt.Sprintf(
+				"pending transaction entry [%d] has unknown state [%s]",
+				i,
+				transaction.State,
+			))
+		}
+	}
+
+	return violations
+}
+
+// validateQuiescenceReportEvidence checks the quiescence outcome record:
+// schema, snapshot binding, a stated cause, and a known ceremony, mode, and
+// terminal outcome for every permit active at quiescence. A quarantined DKG
+// outcome must be matched by preserved quarantine state in the snapshot.
+func (r *auditRun) validateQuiescenceReportEvidence(content []byte) []string {
+	record := &quiescenceReportEvidence{}
+	if err := strictUnmarshal(content, record); err != nil {
+		return []string{fmt.Sprintf(
+			"cannot be decoded as a quiescence report: [%v]",
+			err,
+		)}
+	}
+
+	violations := r.validateEnvelope(
+		record.evidenceEnvelope,
+		"quiescence_report",
+	)
+
+	if record.QuiesceCause == "" {
+		violations = append(violations, "the quiescence cause is missing")
+	}
+
+	knownCeremonies := make(map[string]struct{})
+	for _, ceremony := range participation.AllCeremonies() {
+		knownCeremonies[string(ceremony)] = struct{}{}
+	}
+
+	for i, permit := range record.ActivePermitsAtQuiescence {
+		if _, ok := knownCeremonies[permit.Ceremony]; !ok {
+			violations = append(violations, fmt.Sprintf(
+				"permit entry [%d] names unknown ceremony [%s]",
+				i,
+				permit.Ceremony,
+			))
+		}
+		if permit.Mode != participation.ModeLegacy.String() &&
+			permit.Mode != participation.ModeSecurityV2.String() {
+			violations = append(violations, fmt.Sprintf(
+				"permit entry [%d] names unknown protocol mode [%s]",
+				i,
+				permit.Mode,
+			))
+		}
+		if _, ok := validQuiescencePermitOutcomes[permit.Outcome]; !ok {
+			violations = append(violations, fmt.Sprintf(
+				"permit entry [%d] has unknown terminal outcome [%s]",
+				i,
+				permit.Outcome,
+			))
+			continue
+		}
+
+		if permit.Outcome != "quarantined" || !r.manifest.Interpreted {
+			continue
+		}
+		switch permit.Ceremony {
+		case string(participation.BeaconDKG):
+			if len(r.manifest.BeaconQuarantinedOutputs) == 0 {
+				violations = append(violations, fmt.Sprintf(
+					"permit entry [%d] claims a quarantined [%s] output but "+
+						"the beacon quarantine namespace holds none",
+					i,
+					permit.Ceremony,
+				))
+			}
+		case string(participation.TBTCDKG):
+			if len(r.manifest.TBTCQuarantinedOutputs) == 0 {
+				violations = append(violations, fmt.Sprintf(
+					"permit entry [%d] claims a quarantined [%s] output but "+
+						"the tbtc quarantine namespace holds none",
+					i,
+					permit.Ceremony,
+				))
+			}
+		}
+	}
+
+	return violations
+}
+
+// validatePriorReaderCompatibilityEvidence checks the prior-reader record:
+// schema, snapshot binding, an identified prior release, and an explicit
+// compatible result for every schema this release writes. Any missing or
+// incompatible schema means the prior-binary rollback is not an accepted
+// mechanism.
+func (r *auditRun) validatePriorReaderCompatibilityEvidence(
+	content []byte,
+) []string {
+	record := &priorReaderCompatibilityEvidence{}
+	if err := strictUnmarshal(content, record); err != nil {
+		return []string{fmt.Sprintf(
+			"cannot be decoded as a prior-reader compatibility record: [%v]",
+			err,
+		)}
+	}
+
+	violations := r.validateEnvelope(
+		record.evidenceEnvelope,
+		"prior_reader_compatibility",
+	)
+
+	if record.PriorVersion == "" {
+		violations = append(violations, "the tested prior version is missing")
+	}
+	if record.PriorRevision == "" {
+		violations = append(violations, "the tested prior revision is missing")
+	}
+
+	results := make(map[string]bool)
+	for _, result := range record.SchemaResults {
+		results[result.Schema] = result.Compatible
+	}
+	for _, schema := range requiredPriorReaderSchemas {
+		compatible, covered := results[schema]
+		if !covered {
+			violations = append(violations, fmt.Sprintf(
+				"required schema [%s] is not covered",
+				schema,
+			))
+			continue
+		}
+		if !compatible {
+			violations = append(violations, fmt.Sprintf(
+				"the prior release cannot read schema [%s]",
+				schema,
+			))
+		}
+	}
+
+	return violations
+}
+
+// strictUnmarshal decodes JSON while rejecting unknown fields and trailing
+// content, so a placeholder or mistyped record cannot pass as evidence.
+func strictUnmarshal(content []byte, target interface{}) error {
+	decoder := json.NewDecoder(bytes.NewReader(content))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if decoder.More() {
+		return fmt.Errorf("trailing content after the record")
+	}
 	return nil
 }
 
@@ -629,7 +1091,15 @@ func interpretKeyStoreNamespaces(
 	); err != nil {
 		return err
 	}
-	if err := interpretTBTCActiveNamespace(diskStorage, run); err != nil {
+	activeWallets, err := interpretTBTCActiveNamespace(diskStorage, run)
+	if err != nil {
+		return err
+	}
+	if err := interpretTBTCQuarantineNamespace(
+		diskStorage,
+		run,
+		activeWallets,
+	); err != nil {
 		return err
 	}
 
@@ -1059,20 +1529,23 @@ func validateQuarantineMode(
 
 // interpretTBTCActiveNamespace decodes every tBTC keystore record with the
 // same decode the wallet registry loader uses and cross-checks each record
-// against the wallet directory it is stored under.
+// against the wallet directory and member file name it is stored under, the
+// signing group bounds, and its sibling records. It returns the set of active
+// wallet storage keys for the quarantine overlap check.
 func interpretTBTCActiveNamespace(
 	diskStorage storage.Storage,
 	run *auditRun,
-) error {
+) (map[string]struct{}, error) {
 	tbtcHandle, err := diskStorage.InitializeKeyStorePersistence("tbtc")
 	if err != nil {
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"cannot open the tbtc keystore namespace: [%w]",
 			err,
 		)
 	}
 
 	wallets := make(map[string]*tbtcWalletRecord)
+	seenMembers := make(map[string]map[uint8]struct{})
 
 	tbtcData, tbtcErrors := tbtcHandle.ReadAll()
 	tbtcDone := make(chan struct{})
@@ -1116,6 +1589,35 @@ func interpretTBTCActiveNamespace(
 			)
 		}
 
+		// The registry saves each signer under "membership_<index>"; a record
+		// whose content disagrees with its file name belongs to a different
+		// member than the layout claims.
+		if expected := fmt.Sprintf(
+			"membership_%d",
+			record.MemberIndex,
+		); descriptor.Name() != expected {
+			run.finding(
+				"tbtc active record [%s/%s] contains member [%d], not the "+
+					"member its file name claims",
+				descriptor.Directory(),
+				descriptor.Name(),
+				record.MemberIndex,
+			)
+		}
+
+		if record.SigningGroupSize <= 0 ||
+			int(record.MemberIndex) < 1 ||
+			int(record.MemberIndex) > record.SigningGroupSize {
+			run.finding(
+				"tbtc active record [%s/%s] claims member index [%d] outside "+
+					"the signing group bounds [1, %d]",
+				descriptor.Directory(),
+				descriptor.Name(),
+				record.MemberIndex,
+				record.SigningGroupSize,
+			)
+		}
+
 		wallet, ok := wallets[record.WalletStorageKey]
 		if !ok {
 			wallet = &tbtcWalletRecord{
@@ -1123,6 +1625,7 @@ func interpretTBTCActiveNamespace(
 				SigningGroupSize: record.SigningGroupSize,
 			}
 			wallets[record.WalletStorageKey] = wallet
+			seenMembers[record.WalletStorageKey] = make(map[uint8]struct{})
 		}
 		if wallet.SigningGroupSize != record.SigningGroupSize {
 			run.finding(
@@ -1134,6 +1637,20 @@ func interpretTBTCActiveNamespace(
 				wallet.SigningGroupSize,
 			)
 		}
+		if _, duplicate := seenMembers[record.WalletStorageKey][uint8(
+			record.MemberIndex,
+		)]; duplicate {
+			run.finding(
+				"tbtc active record [%s/%s] duplicates member index [%d] of "+
+					"the same wallet",
+				descriptor.Directory(),
+				descriptor.Name(),
+				record.MemberIndex,
+			)
+		}
+		seenMembers[record.WalletStorageKey][uint8(
+			record.MemberIndex,
+		)] = struct{}{}
 		wallet.MemberIndexes = append(
 			wallet.MemberIndexes,
 			uint8(record.MemberIndex),
@@ -1141,6 +1658,7 @@ func interpretTBTCActiveNamespace(
 	}
 	<-tbtcDone
 
+	activeWallets := make(map[string]struct{})
 	for _, wallet := range wallets {
 		sort.Slice(wallet.MemberIndexes, func(i, j int) bool {
 			return wallet.MemberIndexes[i] < wallet.MemberIndexes[j]
@@ -1149,9 +1667,319 @@ func interpretTBTCActiveNamespace(
 			run.manifest.TBTCActiveWallets,
 			*wallet,
 		)
+		activeWallets[wallet.WalletStorageKey] = struct{}{}
+	}
+
+	return activeWallets, nil
+}
+
+// tbtcQuarantineEntry pairs the two halves of one quarantined tBTC signer
+// output while the namespace is scanned.
+type tbtcQuarantineEntry struct {
+	directory    string
+	memberSuffix string
+	metadata     *tbtc.QuarantinedSignerMetadata
+	signer       *tbtc.SignerAuditRecord
+}
+
+// interpretTBTCQuarantineNamespace decodes the tBTC quarantine namespace,
+// pairs metadata and signer halves by wallet directory and member suffix, and
+// cross-validates the metadata against its schema, this release's identity,
+// the cutover arithmetic, the storage location, the decoded signer, and the
+// active namespace.
+func interpretTBTCQuarantineNamespace(
+	diskStorage storage.Storage,
+	run *auditRun,
+	activeWallets map[string]struct{},
+) error {
+	quarantineHandle, err := diskStorage.InitializeKeyStorePersistence(
+		"tbtc-quarantine",
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"cannot open the tbtc quarantine namespace: [%w]",
+			err,
+		)
+	}
+
+	quarantineEntries := make(map[string]*tbtcQuarantineEntry)
+	entryFor := func(directory, name, prefix string) *tbtcQuarantineEntry {
+		suffix := strings.TrimPrefix(name, prefix)
+		key := directory + "/" + suffix
+		if _, ok := quarantineEntries[key]; !ok {
+			quarantineEntries[key] = &tbtcQuarantineEntry{
+				directory:    directory,
+				memberSuffix: suffix,
+			}
+		}
+		return quarantineEntries[key]
+	}
+
+	quarantineData, quarantineErrors := quarantineHandle.ReadAll()
+	quarantineDone := make(chan struct{})
+	go func() {
+		defer close(quarantineDone)
+		for err := range quarantineErrors {
+			run.finding("tbtc quarantine namespace read error: [%v]", err)
+		}
+	}()
+	for descriptor := range quarantineData {
+		content, err := descriptor.Content()
+		if err != nil {
+			run.finding(
+				"tbtc quarantine record [%s/%s] cannot be decrypted: [%v]",
+				descriptor.Directory(),
+				descriptor.Name(),
+				err,
+			)
+			continue
+		}
+
+		switch {
+		case strings.HasPrefix(descriptor.Name(), "metadata_"):
+			metadata := &tbtc.QuarantinedSignerMetadata{}
+			if err := json.Unmarshal(content, metadata); err != nil {
+				run.finding(
+					"tbtc quarantine metadata [%s/%s] cannot be decoded: [%v]",
+					descriptor.Directory(),
+					descriptor.Name(),
+					err,
+				)
+				continue
+			}
+			entryFor(
+				descriptor.Directory(),
+				descriptor.Name(),
+				"metadata_",
+			).metadata = metadata
+		case strings.HasPrefix(descriptor.Name(), "membership_"):
+			record, err := tbtc.DecodeSignerAuditRecord(content)
+			if err != nil {
+				run.finding(
+					"tbtc quarantine membership [%s/%s] cannot be decoded the "+
+						"way the wallet registry loader decodes it: [%v]",
+					descriptor.Directory(),
+					descriptor.Name(),
+					err,
+				)
+				continue
+			}
+			entryFor(
+				descriptor.Directory(),
+				descriptor.Name(),
+				"membership_",
+			).signer = record
+		default:
+			run.finding(
+				"tbtc quarantine record [%s/%s] has an unknown name",
+				descriptor.Directory(),
+				descriptor.Name(),
+			)
+		}
+	}
+	<-quarantineDone
+
+	keys := make([]string, 0, len(quarantineEntries))
+	for key := range quarantineEntries {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		entry := quarantineEntries[key]
+
+		validateTBTCQuarantineEntry(run, entry, activeWallets)
+
+		if entry.metadata == nil {
+			continue
+		}
+		run.manifest.TBTCQuarantinedOutputs = append(
+			run.manifest.TBTCQuarantinedOutputs,
+			tbtcQuarantineRecord{
+				QuarantinedSignerMetadata: *entry.metadata,
+				HasMembershipRecord:       entry.signer != nil,
+			},
+		)
 	}
 
 	return nil
+}
+
+// validateTBTCQuarantineEntry cross-validates one paired tBTC quarantine
+// output. The metadata exists for the offline audit alone, so any half or
+// field that contradicts the rest of the record makes the output
+// untrustworthy evidence.
+func validateTBTCQuarantineEntry(
+	run *auditRun,
+	entry *tbtcQuarantineEntry,
+	activeWallets map[string]struct{},
+) {
+	key := entry.directory + "/" + entry.memberSuffix
+
+	// A quarantined wallet visible in the active namespace is exactly the
+	// ambiguity the quarantine exists to prevent: the same wallet would be
+	// both activated and marked interrupted.
+	if _, active := activeWallets[entry.directory]; active {
+		run.finding(
+			"tbtc quarantine output [%s] belongs to wallet [%s] that is "+
+				"also present in the active namespace",
+			key,
+			entry.directory,
+		)
+	}
+
+	if entry.signer != nil {
+		if entry.signer.WalletStorageKey != entry.directory {
+			run.finding(
+				"tbtc quarantine membership [%s] contains wallet [%s], not "+
+					"the wallet its directory claims",
+				key,
+				entry.signer.WalletStorageKey,
+			)
+		}
+		if suffix := fmt.Sprint(
+			entry.signer.MemberIndex,
+		); suffix != entry.memberSuffix {
+			run.finding(
+				"tbtc quarantine membership [%s] contains member [%s], not "+
+					"the member its file name claims",
+				key,
+				suffix,
+			)
+		}
+	}
+
+	if entry.metadata == nil {
+		run.finding(
+			"tbtc quarantine output [%s] has a membership record without "+
+				"audit metadata",
+			key,
+		)
+		return
+	}
+
+	metadata := entry.metadata
+	if entry.signer == nil {
+		run.finding(
+			"tbtc quarantine output [%s] has audit metadata without a "+
+				"membership record; the key material was not preserved",
+			key,
+		)
+	}
+
+	if metadata.SchemaVersion != tbtc.QuarantineSchemaVersion {
+		run.finding(
+			"tbtc quarantine metadata [%s] has schema version [%d], "+
+				"expected [%d]",
+			key,
+			metadata.SchemaVersion,
+			tbtc.QuarantineSchemaVersion,
+		)
+	}
+	if metadata.ReleaseEpoch != participation.CompiledEpoch.String() {
+		run.finding(
+			"tbtc quarantine metadata [%s] was written by release epoch "+
+				"[%s], not by this audit's epoch [%s]",
+			key,
+			metadata.ReleaseEpoch,
+			participation.CompiledEpoch,
+		)
+	}
+	if metadata.Ceremony != string(participation.TBTCDKG) {
+		run.finding(
+			"tbtc quarantine metadata [%s] names ceremony [%s]; only [%s] "+
+				"outputs are quarantined",
+			key,
+			metadata.Ceremony,
+			participation.TBTCDKG,
+		)
+	}
+	if suffix := fmt.Sprint(metadata.MemberIndex); suffix != entry.memberSuffix {
+		run.finding(
+			"tbtc quarantine metadata [%s] names member [%s], not the "+
+				"member its file name claims",
+			key,
+			suffix,
+		)
+	}
+	if metadata.SeedHash == "" {
+		run.finding(
+			"tbtc quarantine metadata [%s] is missing the seed hash",
+			key,
+		)
+	}
+	if metadata.WalletPublicKeyHash == "" {
+		run.finding(
+			"tbtc quarantine metadata [%s] is missing the wallet public "+
+				"key hash",
+			key,
+		)
+	}
+
+	validateTBTCQuarantineMode(run, key, metadata)
+
+	if entry.signer != nil &&
+		uint8(entry.signer.MemberIndex) != metadata.MemberIndex {
+		run.finding(
+			"tbtc quarantine output [%s] pairs metadata for member [%d] "+
+				"with a membership of member [%d]",
+			key,
+			metadata.MemberIndex,
+			entry.signer.MemberIndex,
+		)
+	}
+}
+
+// validateTBTCQuarantineMode checks the recorded protocol mode against the
+// recorded cutover arithmetic: the mode is pinned from the canonical anchor,
+// so a record that contradicts that rule was not produced by the release
+// gate.
+func validateTBTCQuarantineMode(
+	run *auditRun,
+	key string,
+	metadata *tbtc.QuarantinedSignerMetadata,
+) {
+	legacy := participation.ModeLegacy.String()
+	securityV2 := participation.ModeSecurityV2.String()
+
+	switch metadata.ProtocolMode {
+	case legacy:
+		if metadata.CutoverBlock > 0 &&
+			metadata.CanonicalStartBlock >= metadata.CutoverBlock {
+			run.finding(
+				"tbtc quarantine metadata [%s] claims mode [%s] with "+
+					"canonical anchor [%d] at or after cutover block [%d]",
+				key,
+				legacy,
+				metadata.CanonicalStartBlock,
+				metadata.CutoverBlock,
+			)
+		}
+	case securityV2:
+		if metadata.CutoverBlock == 0 {
+			run.finding(
+				"tbtc quarantine metadata [%s] claims mode [%s] under a "+
+					"disabled all-zero schedule",
+				key,
+				securityV2,
+			)
+		} else if metadata.CanonicalStartBlock < metadata.CutoverBlock {
+			run.finding(
+				"tbtc quarantine metadata [%s] claims mode [%s] with "+
+					"canonical anchor [%d] before cutover block [%d]",
+				key,
+				securityV2,
+				metadata.CanonicalStartBlock,
+				metadata.CutoverBlock,
+			)
+		}
+	default:
+		run.finding(
+			"tbtc quarantine metadata [%s] names unknown protocol mode [%s]",
+			key,
+			metadata.ProtocolMode,
+		)
+	}
 }
 
 // sortRecords orders the interpreted records deterministically so two audits
@@ -1177,5 +2005,13 @@ func sortRecords(auditManifest *manifest) {
 	sort.Slice(auditManifest.TBTCActiveWallets, func(i, j int) bool {
 		return auditManifest.TBTCActiveWallets[i].WalletStorageKey <
 			auditManifest.TBTCActiveWallets[j].WalletStorageKey
+	})
+	sort.Slice(auditManifest.TBTCQuarantinedOutputs, func(i, j int) bool {
+		left := auditManifest.TBTCQuarantinedOutputs[i]
+		right := auditManifest.TBTCQuarantinedOutputs[j]
+		if left.WalletPublicKeyHash != right.WalletPublicKeyHash {
+			return left.WalletPublicKeyHash < right.WalletPublicKeyHash
+		}
+		return left.MemberIndex < right.MemberIndex
 	})
 }

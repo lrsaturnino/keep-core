@@ -2,11 +2,13 @@ package main
 
 import (
 	"encoding/hex"
+	"encoding/json"
 	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	bn256 "github.com/ethereum/go-ethereum/crypto/bn256/cloudflare"
 
@@ -113,9 +115,10 @@ func newTestStorage(t *testing.T) string {
 	return storageDir
 }
 
-// newTestEvidence writes one placeholder evidence file per external rollback
-// input and returns the populated inputs.
-func newTestEvidence(t *testing.T) evidenceInputs {
+// newPlaceholderEvidence writes one placeholder text file per external
+// rollback input and returns the populated inputs. Placeholder bytes satisfy
+// no evidence schema and must stay blocking.
+func newPlaceholderEvidence(t *testing.T) evidenceInputs {
 	t.Helper()
 
 	evidenceDir := t.TempDir()
@@ -133,6 +136,108 @@ func newTestEvidence(t *testing.T) evidenceInputs {
 		quiescenceReport:         write("quiescence-report"),
 		priorReaderCompatibility: write("prior-reader-compatibility"),
 	}
+}
+
+// newValidEvidence writes one schema-valid evidence record per external
+// rollback input, bound to the given already-audited manifest: every
+// persisted wallet and group the manifest interprets is reconciled as
+// registered and settled, and the prior reader covers every required schema.
+func newValidEvidence(t *testing.T, auditManifest *manifest) evidenceInputs {
+	t.Helper()
+
+	evidenceDir := t.TempDir()
+	write := func(name string, record interface{}) string {
+		path := filepath.Join(evidenceDir, name)
+		content, err := json.MarshalIndent(record, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, content, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	envelope := func(evidenceType string) evidenceEnvelope {
+		return evidenceEnvelope{
+			SchemaVersion:           evidenceSchemaVersion,
+			EvidenceType:            evidenceType,
+			GeneratedAt:             time.Now().UTC(),
+			SnapshotAggregateSHA256: auditManifest.Snapshot.AggregateSHA256,
+		}
+	}
+
+	chainRecord := &chainReconciliationEvidence{
+		evidenceEnvelope: envelope("chain_reconciliation"),
+		EthereumChainID:  "1",
+	}
+	for _, wallet := range auditManifest.TBTCActiveWallets {
+		chainRecord.Wallets = append(chainRecord.Wallets, struct {
+			WalletStorageKey string `json:"wallet_storage_key"`
+			WalletID         string `json:"wallet_id"`
+			Registered       bool   `json:"registered"`
+			DKGSettlement    string `json:"dkg_settlement"`
+		}{
+			WalletStorageKey: wallet.WalletStorageKey,
+			WalletID:         "0x" + strings.Repeat("11", 32),
+			Registered:       true,
+			DKGSettlement:    "approved",
+		})
+	}
+	for _, membership := range auditManifest.BeaconActiveMemberships {
+		chainRecord.BeaconGroups = append(chainRecord.BeaconGroups, struct {
+			GroupPublicKey string `json:"group_public_key"`
+			Registered     bool   `json:"registered"`
+		}{
+			GroupPublicKey: membership.GroupPublicKey,
+			Registered:     true,
+		})
+	}
+
+	bitcoinRecord := &bitcoinReconciliationEvidence{
+		evidenceEnvelope: envelope("bitcoin_reconciliation"),
+		BitcoinNetwork:   "mainnet",
+		Complete:         true,
+	}
+
+	quiescenceRecord := &quiescenceReportEvidence{
+		evidenceEnvelope: envelope("quiescence_report"),
+		QuiesceCause:     "rollback drill",
+	}
+
+	priorReaderRecord := &priorReaderCompatibilityEvidence{
+		evidenceEnvelope: envelope("prior_reader_compatibility"),
+		PriorVersion:     "v2.0.0",
+		PriorRevision:    strings.Repeat("ab", 20),
+	}
+	for _, schema := range requiredPriorReaderSchemas {
+		priorReaderRecord.SchemaResults = append(
+			priorReaderRecord.SchemaResults,
+			struct {
+				Schema     string `json:"schema"`
+				Compatible bool   `json:"compatible"`
+			}{Schema: schema, Compatible: true},
+		)
+	}
+
+	return evidenceInputs{
+		chainReconciliation:   write("chain-reconciliation", chainRecord),
+		bitcoinReconciliation: write("bitcoin-reconciliation", bitcoinRecord),
+		quiescenceReport:      write("quiescence-report", quiescenceRecord),
+		priorReaderCompatibility: write(
+			"prior-reader-compatibility",
+			priorReaderRecord,
+		),
+	}
+}
+
+func hasBlocker(auditManifest *manifest, fragment string) bool {
+	for _, blocker := range auditManifest.RollbackBlockers {
+		if strings.Contains(blocker, fragment) {
+			return true
+		}
+	}
+	return false
 }
 
 func hasFinding(auditManifest *manifest, fragment string) bool {
@@ -238,13 +343,21 @@ func TestRunAudit_ConsistentSnapshot(t *testing.T) {
 	}
 }
 
-func TestRunAudit_SuppliedEvidenceSatisfiesBarrier(t *testing.T) {
+func TestRunAudit_ValidEvidenceSatisfiesBarrier(t *testing.T) {
 	storageDir := newTestStorage(t)
+
+	// The two-phase workflow: the first audit produces the snapshot identity
+	// and interpreted inventory the external evidence must bind to and cover;
+	// the second audit validates the produced evidence.
+	firstPass, err := runAudit(storageDir, testPassword, evidenceInputs{})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	auditManifest, err := runAudit(
 		storageDir,
 		testPassword,
-		newTestEvidence(t),
+		newValidEvidence(t, firstPass),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -258,18 +371,352 @@ func TestRunAudit_SuppliedEvidenceSatisfiesBarrier(t *testing.T) {
 	}
 	if !auditManifest.RollbackBarrierReady {
 		t.Errorf(
-			"expected the barrier to be ready with all evidence supplied, "+
+			"expected the barrier to be ready with valid evidence supplied, "+
 				"blockers: %v",
 			auditManifest.RollbackBlockers,
 		)
 	}
 	for _, record := range auditManifest.ExternalEvidence {
-		if !record.Supplied || record.SHA256 == "" {
+		if !record.Supplied || !record.Valid || record.SHA256 == "" {
 			t.Errorf(
-				"expected evidence [%s] to be recorded with its checksum",
+				"expected evidence [%s] to be recorded as supplied and valid "+
+					"with its checksum",
 				record.Name,
 			)
 		}
+	}
+}
+
+func TestRunAudit_PlaceholderEvidenceIsBlocking(t *testing.T) {
+	storageDir := newTestStorage(t)
+
+	auditManifest, err := runAudit(
+		storageDir,
+		testPassword,
+		newPlaceholderEvidence(t),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if auditManifest.RollbackBarrierReady {
+		t.Error("placeholder evidence must never authorize the barrier")
+	}
+	for _, record := range auditManifest.ExternalEvidence {
+		if !record.Supplied {
+			t.Errorf("expected evidence [%s] to be recorded as supplied", record.Name)
+		}
+		if record.Valid {
+			t.Errorf("expected placeholder evidence [%s] to be invalid", record.Name)
+		}
+	}
+	if !hasBlocker(auditManifest, "cannot be decoded") {
+		t.Errorf(
+			"expected undecodable-evidence blockers, blockers: %v",
+			auditManifest.RollbackBlockers,
+		)
+	}
+}
+
+func TestRunAudit_EvidenceBoundToDifferentSnapshotIsBlocking(t *testing.T) {
+	storageDir := newTestStorage(t)
+
+	firstPass, err := runAudit(storageDir, testPassword, evidenceInputs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Rebind the otherwise valid evidence to a different snapshot identity.
+	foreign := *firstPass
+	foreign.Snapshot.AggregateSHA256 = strings.Repeat("00", 32)
+
+	auditManifest, err := runAudit(
+		storageDir,
+		testPassword,
+		newValidEvidence(t, &foreign),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if auditManifest.RollbackBarrierReady {
+		t.Error("evidence bound to another snapshot must not authorize the barrier")
+	}
+	if !hasBlocker(auditManifest, "not to this audited snapshot") {
+		t.Errorf(
+			"expected a snapshot-binding blocker, blockers: %v",
+			auditManifest.RollbackBlockers,
+		)
+	}
+}
+
+func TestRunAudit_UncoveredPersistedGroupIsBlocking(t *testing.T) {
+	storageDir := newTestStorage(t)
+
+	firstPass, err := runAudit(storageDir, testPassword, evidenceInputs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Drop the persisted beacon group from the reconciliation coverage.
+	uncovered := *firstPass
+	uncovered.BeaconActiveMemberships = nil
+
+	auditManifest, err := runAudit(
+		storageDir,
+		testPassword,
+		newValidEvidence(t, &uncovered),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if auditManifest.RollbackBarrierReady {
+		t.Error("an unreconciled persisted group must not authorize the barrier")
+	}
+	if !hasBlocker(auditManifest, "is not reconciled") {
+		t.Errorf(
+			"expected a coverage blocker, blockers: %v",
+			auditManifest.RollbackBlockers,
+		)
+	}
+}
+
+func TestRunAudit_IncompatiblePriorReaderIsBlocking(t *testing.T) {
+	storageDir := newTestStorage(t)
+
+	firstPass, err := runAudit(storageDir, testPassword, evidenceInputs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	evidence := newValidEvidence(t, firstPass)
+
+	// Rewrite the prior-reader record with one incompatible required schema.
+	record := &priorReaderCompatibilityEvidence{
+		evidenceEnvelope: evidenceEnvelope{
+			SchemaVersion:           evidenceSchemaVersion,
+			EvidenceType:            "prior_reader_compatibility",
+			GeneratedAt:             time.Now().UTC(),
+			SnapshotAggregateSHA256: firstPass.Snapshot.AggregateSHA256,
+		},
+		PriorVersion:  "v2.0.0",
+		PriorRevision: strings.Repeat("ab", 20),
+	}
+	for i, schema := range requiredPriorReaderSchemas {
+		record.SchemaResults = append(record.SchemaResults, struct {
+			Schema     string `json:"schema"`
+			Compatible bool   `json:"compatible"`
+		}{Schema: schema, Compatible: i != 0})
+	}
+	content, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		evidence.priorReaderCompatibility,
+		content,
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	auditManifest, err := runAudit(storageDir, testPassword, evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if auditManifest.RollbackBarrierReady {
+		t.Error("an unreadable prior-reader schema must not authorize the barrier")
+	}
+	if !hasBlocker(auditManifest, "cannot read schema") {
+		t.Errorf(
+			"expected a prior-reader blocker, blockers: %v",
+			auditManifest.RollbackBlockers,
+		)
+	}
+}
+
+func TestRunAudit_QuarantinedClaimWithoutQuarantineStateIsBlocking(
+	t *testing.T,
+) {
+	storageDir := newTestStorage(t)
+
+	firstPass, err := runAudit(storageDir, testPassword, evidenceInputs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	evidence := newValidEvidence(t, firstPass)
+
+	// Claim a quarantined tBTC DKG output; the snapshot's tbtc quarantine
+	// namespace holds none.
+	record := &quiescenceReportEvidence{
+		evidenceEnvelope: evidenceEnvelope{
+			SchemaVersion:           evidenceSchemaVersion,
+			EvidenceType:            "quiescence_report",
+			GeneratedAt:             time.Now().UTC(),
+			SnapshotAggregateSHA256: firstPass.Snapshot.AggregateSHA256,
+		},
+		QuiesceCause: "rollback drill",
+	}
+	record.ActivePermitsAtQuiescence = append(
+		record.ActivePermitsAtQuiescence,
+		struct {
+			Ceremony            string `json:"ceremony"`
+			Mode                string `json:"mode"`
+			CanonicalStartBlock uint64 `json:"canonical_start_block"`
+			Outcome             string `json:"outcome"`
+		}{
+			Ceremony:            "tbtc_dkg",
+			Mode:                "security_v2",
+			CanonicalStartBlock: 1_000,
+			Outcome:             "quarantined",
+		},
+	)
+	content, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		evidence.quiescenceReport,
+		content,
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	auditManifest, err := runAudit(storageDir, testPassword, evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if auditManifest.RollbackBarrierReady {
+		t.Error(
+			"an unevidenced quarantined-output claim must not authorize " +
+				"the barrier",
+		)
+	}
+	if !hasBlocker(
+		auditManifest,
+		"the tbtc quarantine namespace holds none",
+	) {
+		t.Errorf(
+			"expected a quarantine cross-check blocker, blockers: %v",
+			auditManifest.RollbackBlockers,
+		)
+	}
+}
+
+func TestRunAudit_TBTCQuarantineMetadataWithoutMembershipIsAFinding(
+	t *testing.T,
+) {
+	storageDir := newTestStorage(t)
+
+	diskStorage, err := storage.Initialize(
+		storage.Config{Dir: storageDir},
+		testPassword,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quarantineHandle, err := diskStorage.InitializeKeyStorePersistence(
+		"tbtc-quarantine",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := quarantineHandle.Save(
+		[]byte(`{`+
+			`"schema_version":1,`+
+			`"release_epoch":"security_v2_cutover",`+
+			`"protocol_mode":"security_v2",`+
+			`"cutover_block":100,`+
+			`"canonical_start_block":900,`+
+			`"ceremony":"tbtc_dkg",`+
+			`"seed_hash":"aa",`+
+			`"member_index":3,`+
+			`"wallet_id":"bb",`+
+			`"wallet_public_key_hash":"cc",`+
+			`"failed_operation":"tbtc_dkg_signer_activation",`+
+			`"last_observed_block":950,`+
+			`"preserved_at":"2026-01-01T00:00:00Z"}`),
+		"orphaned-wallet-directory",
+		"/metadata_3",
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	auditManifest, err := runAudit(storageDir, testPassword, evidenceInputs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if auditManifest.Consistent {
+		t.Error("expected an inconsistent manifest")
+	}
+	if !hasFinding(
+		auditManifest,
+		"tbtc quarantine output [orphaned-wallet-directory/3] has audit "+
+			"metadata without a membership record",
+	) {
+		t.Errorf(
+			"expected an orphaned-metadata finding, findings: %v",
+			auditManifest.Findings,
+		)
+	}
+
+	if got := len(auditManifest.TBTCQuarantinedOutputs); got != 1 {
+		t.Fatalf("expected [1] tbtc quarantined output, got [%d]", got)
+	}
+	if auditManifest.TBTCQuarantinedOutputs[0].HasMembershipRecord {
+		t.Error("expected the output to report its missing membership record")
+	}
+}
+
+func TestRunAudit_UndecodableTBTCQuarantineMembershipIsAFinding(
+	t *testing.T,
+) {
+	storageDir := newTestStorage(t)
+
+	diskStorage, err := storage.Initialize(
+		storage.Config{Dir: storageDir},
+		testPassword,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quarantineHandle, err := diskStorage.InitializeKeyStorePersistence(
+		"tbtc-quarantine",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := quarantineHandle.Save(
+		[]byte("not a signer record"),
+		"some-wallet-directory",
+		"/membership_1",
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	auditManifest, err := runAudit(storageDir, testPassword, evidenceInputs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if auditManifest.Consistent {
+		t.Error("expected an inconsistent manifest")
+	}
+	if !hasFinding(
+		auditManifest,
+		"tbtc quarantine membership [some-wallet-directory/membership_1] "+
+			"cannot be decoded",
+	) {
+		t.Errorf(
+			"expected a quarantine decode finding, findings: %v",
+			auditManifest.Findings,
+		)
 	}
 }
 
