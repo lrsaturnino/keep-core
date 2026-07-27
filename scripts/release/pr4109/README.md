@@ -16,13 +16,21 @@ permits, commit fences, quiescence and the signal lifecycle controller, and
 the signer quarantine namespace — is implemented in this tree and proven by
 repository-local Go tests, together with the tBTC cutover ceremony
 acceptance suites under the race detector: real security-v2 key-generation
-transcripts, the production-scale 90/10 split exclusion, heartbeat
-inactivity bands, and cutover roster wiring. Run those proofs, which need no
-Docker or chain, with:
+transcripts — including the ten-misbehaved-seat real result — the
+production-scale 90/10 split exclusion, heartbeat inactivity bands, and
+cutover roster wiring, ending with an explicit report of every skipped case.
+Run those proofs, which need no Docker or chain, with:
 
 ```
 ./rehearse.sh local-proofs
 ```
+
+Two sibling stages cover the rest of the changed risk surface locally:
+`./rehearse.sh static-analysis` runs the CI-enforced Go analyzers at their
+CI-pinned versions and flags (gofmt, go vet, staticcheck, gosec,
+golangci-lint), and `./rehearse.sh solidity-proofs` builds and tests the
+ECDSA contracts exactly as the contracts workflow does (Node 18 and yarn
+required).
 
 The offline state classification the rollback barrier requires runs with
 `go run ./cmd/participation-state-audit --storage-snapshot <copy>`: it

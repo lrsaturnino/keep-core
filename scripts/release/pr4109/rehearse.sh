@@ -44,9 +44,20 @@ stages:
                       quarantine, penalty suppression, forwarding lifecycle,
                       held-wait cancellation, the offline state audit, and the
                       tBTC cutover ceremony suites — real security-v2
-                      transcripts, the production-scale 90/10 split, heartbeat
-                      bands, and roster wiring — under the race detector
-                      (runs today, no Docker)
+                      transcripts, the ten-misbehaved-seat real result, the
+                      production-scale 90/10 split, heartbeat bands, and
+                      roster wiring — under the race detector, plus the
+                      integration-tag compile proof; ends with an explicit
+                      report of every skipped case (runs today, no Docker)
+  static-analysis     run the same static analyzers CI enforces on the Go
+                      tree, at the CI-pinned versions and flags: gofmt,
+                      go vet, staticcheck 2025.1.1 (-SA1019), gosec
+                      (G115/G118 and generated bindings excluded), and
+                      golangci-lint v2.12.2 (network needed on first run to
+                      fetch the pinned tools)
+  solidity-proofs     build and test the changed ECDSA contracts surface
+                      exactly as the contracts workflow does (yarn build,
+                      yarn test; requires Node 18 and yarn)
   preflight           validate the container-rehearsal inputs and image digests
   single-release      exact-image cutover rehearsal: prior+R1 mixed fleet
                       before C, work across C without restart, straggler
@@ -105,12 +116,98 @@ stage_local_proofs() {
       ./cmd/
     go test -count=1 -race ./cmd/participation-state-audit/
     go test -count=1 -run 'TestDecodeSignerAuditRecord' ./pkg/tbtc/
-    go test -count=1 -race -timeout 900s \
+    go test -count=1 -race -timeout 900s -v \
       -run 'Cutover|HandleAnnouncerSessionMismatch' \
       ./pkg/tbtc/
+    # The integration-tagged test files are not compiled by the ordinary
+    # suite; type-check them so a signature drift cannot hide behind the
+    # build tag. Their execution needs live Bitcoin/Ethereum endpoints and
+    # stays with the CI integration job.
+    go vet -tags=integration ./pkg/bitcoin/electrum/ ./pkg/chain/ethereum/
   ) 2>&1 | tee "${log}"
 
+  # Skips are part of the evidence, not noise: every mandatory acceptance
+  # case that cannot run yet must be visible in the proof output.
+  local skips
+  skips=$(grep -c '^--- SKIP' "${log}" || true)
+  if [[ "${skips}" -gt 0 ]]; then
+    note "ATTENTION: ${skips} skipped case(s) inside the local proofs:"
+    grep '^--- SKIP' "${log}" | sed 's/^/>>   /'
+    note "each skip above is a mandatory acceptance case still blocked on" \
+      "an external dependency; see the hard-dependency record in README.md"
+  else
+    note "no skipped cases inside the local proofs"
+  fi
+
   note "local proofs recorded in ${log}"
+}
+
+stage_static_analysis() {
+  note "running the CI-pinned Go static analyzers"
+  mkdir -p "${EVIDENCE_DIR}"
+  local log="${EVIDENCE_DIR}/static-analysis.log"
+
+  (
+    cd "${REPO_ROOT}"
+
+    note "gofmt"
+    if [[ "$(gofmt -l . | wc -l)" -gt 0 ]]; then
+      gofmt -d -e .
+      exit 1
+    fi
+
+    note "go vet"
+    go vet
+
+    note "staticcheck 2025.1.1 (checks: -SA1019)"
+    go run honnef.co/go/tools/cmd/staticcheck@2025.1.1 \
+      -checks=-SA1019 ./...
+
+    note "gosec (CI flag set)"
+    go run github.com/securego/gosec/v2/cmd/gosec@latest \
+      -exclude=G115,G118 \
+      -exclude-dir=pkg/chain/ethereum/beacon/gen \
+      -exclude-dir=pkg/chain/ethereum/ecdsa/gen \
+      -exclude-dir=pkg/chain/ethereum/threshold/gen \
+      -exclude-dir=pkg/chain/ethereum/tbtc/gen \
+      ./...
+
+    note "golangci-lint v2.12.2"
+    go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run
+  ) 2>&1 | tee "${log}"
+
+  note "static analysis recorded in ${log}"
+}
+
+stage_solidity_proofs() {
+  note "building and testing the ECDSA contracts surface"
+  mkdir -p "${EVIDENCE_DIR}"
+  local log="${EVIDENCE_DIR}/solidity-ecdsa-proofs.log"
+
+  command -v node >/dev/null 2>&1 || blocked "Node.js is required"
+  command -v yarn >/dev/null 2>&1 || blocked "yarn is required"
+
+  # The contracts workflow pins Node 18 because newer majors have produced
+  # broken hardhat compile artifacts; replicate that constraint instead of
+  # guessing.
+  local node_major
+  node_major=$(node -p 'process.versions.node.split(".")[0]')
+  if [[ "${node_major}" != "18" ]]; then
+    blocked "the contracts workflow runs on Node 18 (found $(node -v)); \
+switch with 'nvm use 18' before running solidity-proofs"
+  fi
+
+  (
+    cd "${REPO_ROOT}/solidity/ecdsa"
+    if [[ ! -d node_modules ]]; then
+      note "installing frozen yarn dependencies"
+      yarn install --frozen-lockfile
+    fi
+    yarn build
+    yarn test
+  ) 2>&1 | tee "${log}"
+
+  note "solidity proofs recorded in ${log}"
 }
 
 stage_preflight() {
@@ -190,6 +287,8 @@ run that produced no record cannot be accepted"
 
 case "${1:-}" in
 local-proofs) stage_local_proofs ;;
+static-analysis) stage_static_analysis ;;
+solidity-proofs) stage_solidity_proofs ;;
 preflight) stage_preflight ;;
 single-release) stage_single_release ;;
 rollback) stage_rollback ;;

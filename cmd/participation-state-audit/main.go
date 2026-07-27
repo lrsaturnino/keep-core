@@ -552,12 +552,17 @@ func main() {
 	encoded = append(encoded, '\n')
 
 	if outputPath != "" {
+		// #nosec G703 G304 (manifest destination provided as the operator's
+		// explicit output flag)
 		if err := os.WriteFile(outputPath, encoded, 0o600); err != nil {
 			fmt.Fprintf(os.Stderr, "cannot write the manifest: [%v]\n", err)
 			os.Exit(1)
 		}
 	} else {
-		os.Stdout.Write(encoded)
+		if _, err := os.Stdout.Write(encoded); err != nil {
+			fmt.Fprintf(os.Stderr, "cannot write the manifest: [%v]\n", err)
+			os.Exit(1)
+		}
 	}
 
 	if !auditManifest.Consistent || !auditManifest.RollbackBarrierReady {
@@ -771,7 +776,19 @@ func inventoryNamespace(
 		if entry.IsDir() {
 			return nil
 		}
+		// A symlink or other non-regular entry could point outside the
+		// snapshot; such a snapshot cannot be certified.
+		if !entry.Type().IsRegular() {
+			return fmt.Errorf(
+				"cannot inventory [%s]: non-regular entry in the storage "+
+					"snapshot",
+				path,
+			)
+		}
 
+		// #nosec G304 G122 (path walked from the snapshot root and
+		// non-regular entries rejected above; checksumming every snapshot
+		// file is this audit's purpose)
 		content, err := os.ReadFile(path)
 		if err != nil {
 			return fmt.Errorf("cannot read [%s]: [%w]", path, err)
