@@ -204,9 +204,19 @@ type Gate interface {
 	// which closes when the active permit count reaches zero or when Close
 	// force-cancels the remainder.
 	Quiesce(cause error) <-chan struct{}
+	// Drained returns a channel that closes once the gate no longer issues
+	// new permits — quiescence began or Close ran — and every issued permit
+	// has been released by its owner. Unlike the quiesce channel, which Close
+	// closes immediately, the drained channel stays open across a forced
+	// cancellation until the canceled owners finish their cleanup — the
+	// quarantine and audit writes included — and release their permits. It
+	// always returns the same channel.
+	Drained() <-chan struct{}
 	// Close is the terminal shutdown: it force-cancels any remaining permits
 	// with ErrQuiesceDeadline, closes the quiesce channel, and stops the
-	// clock supervisor. It is idempotent.
+	// clock supervisor. Force-canceled permits remain counted until their
+	// owners release them; the drained channel reports when that has
+	// happened. Close is idempotent.
 	Close()
 }
 
@@ -295,6 +305,8 @@ type chainGate struct {
 	closed            bool
 	quiesceDone       chan struct{}
 	quiesceDoneClosed bool
+	drained           chan struct{}
+	drainedClosed     bool
 	permits           map[*permit]struct{}
 	activeLegacy      uint64
 	activeSecurityV2  uint64
@@ -388,6 +400,7 @@ func newGate(
 		modeLogLimiter:    rate.NewLimiter(rate.Every(30*time.Second), 5),
 		refusalLogLimiter: rate.NewLimiter(rate.Every(30*time.Second), 5),
 		quiesceDone:       make(chan struct{}),
+		drained:           make(chan struct{}),
 		permits:           make(map[*permit]struct{}),
 		currentBlock:      currentBlock,
 		clockAvailable:    true,
@@ -986,9 +999,28 @@ func (p *permit) Close() {
 			g.quiesceDoneClosed = true
 			close(g.quiesceDone)
 		}
+		g.maybeCloseDrainedLocked()
 
 		g.refreshMetricsLocked()
 	})
+}
+
+// maybeCloseDrainedLocked closes the drained channel once the gate no longer
+// issues new permits — quiescence began or the gate closed — and the last
+// counted permit has been released. A clock failure alone never drains the
+// gate: it cancels permits but issuance resumes on clock recovery. The caller
+// must hold g.mu.
+func (g *chainGate) maybeCloseDrainedLocked() {
+	if !g.quiescing && !g.closed {
+		return
+	}
+	if g.activeLegacy+g.activeSecurityV2 > 0 {
+		return
+	}
+	if !g.drainedClosed {
+		g.drainedClosed = true
+		close(g.drained)
+	}
 }
 
 // State implements Gate.
@@ -1031,11 +1063,18 @@ func (g *chainGate) Quiesce(cause error) <-chan struct{} {
 			g.quiesceDoneClosed = true
 			close(g.quiesceDone)
 		}
+		g.maybeCloseDrainedLocked()
 
 		g.refreshMetricsLocked()
 	}
 
 	return g.quiesceDone
+}
+
+// Drained implements Gate. The channel is created once at construction and
+// never replaced, so no lock is needed to hand it out.
+func (g *chainGate) Drained() <-chan struct{} {
+	return g.drained
 }
 
 // Close implements Gate.
@@ -1066,6 +1105,7 @@ func (g *chainGate) Close() {
 			g.quiesceDoneClosed = true
 			close(g.quiesceDone)
 		}
+		g.maybeCloseDrainedLocked()
 
 		g.refreshMetricsLocked()
 		g.mu.Unlock()

@@ -269,6 +269,7 @@ func start(cmd *cobra.Command) error {
 		participationGate,
 		signalChan,
 		quiesceBackstop,
+		forcedCancellationAllowance(),
 	)
 
 	gateSnapshot := participationGate.State()
@@ -428,16 +429,21 @@ func start(cmd *cobra.Command) error {
 // permit is issued from that moment on, while existing ceremonies run to
 // natural completion. A second signal or the in-process backstop deadline
 // forces the remainder through the gate's audited forced-cancellation path.
-// The run context is canceled only after the drain resolves, so in-flight
-// protocol work keeps its network, chain, and persistence access for the
-// whole drain. The returned channel reports the shutdown cause once the
-// drive completes.
+// That path is two-phase: Close cancels the permits that outlived the drain,
+// and the controller then keeps the run context alive until their owners
+// finish the cancellation cleanup — the quarantine and audit writes included
+// — and release them, bounded by the reviewed forced-cancellation allowance.
+// Only then is the shutdown cause reported and the run context canceled, so
+// in-flight protocol work and its cleanup keep network, chain, and
+// persistence access for the whole shutdown. The returned channel reports
+// the shutdown cause once the drive completes.
 func startSignalLifecycleController(
 	runCtx context.Context,
 	cancelRunCtx context.CancelFunc,
 	gate participation.Gate,
 	signals <-chan os.Signal,
 	backstop time.Duration,
+	cancellationAllowance time.Duration,
 ) <-chan error {
 	shutdown := make(chan error, 1)
 
@@ -456,10 +462,43 @@ func startSignalLifecycleController(
 			)
 
 			// Close force-cancels any permit that outlived the drain and
-			// stops the clock supervisor. The shutdown report is sent before
-			// the run context is canceled so the report is already pending
-			// whenever the main goroutine observes the context end.
+			// stops the clock supervisor. The canceled permits stay counted
+			// until their owners finish the cancellation cleanup and release
+			// them, and the gate reports that through its drained channel.
 			gate.Close()
+
+			// Phase two of the forced cancellation: join the owners of the
+			// canceled permits before letting the process exit, so quarantine
+			// and audit writes are never cut off mid-flight. The wait is
+			// bounded by the reviewed forced-cancellation allowance — the
+			// same wall-clock room the release manifest grants the service
+			// manager between the in-process deadline and SIGKILL. After
+			// natural completion the drained channel is already closed and
+			// the wait returns immediately.
+			cleanupReason := awaitForcedCancellationCleanup(
+				gate.Drained(),
+				cancellationAllowance,
+			)
+			if cleanupReason == cleanupReasonAllowanceExceeded {
+				logger.Warnf(
+					"protocol participation forced-cancellation cleanup did "+
+						"not finish within the [%s] allowance; shutting down "+
+						"with permits still held [signal=%v]",
+					cancellationAllowance,
+					receivedSignal,
+				)
+			} else {
+				logger.Infof(
+					"protocol participation forced-cancellation cleanup "+
+						"ended [reason=%s] [signal=%v]",
+					cleanupReason,
+					receivedSignal,
+				)
+			}
+
+			// The shutdown report is sent before the run context is canceled
+			// so the report is already pending whenever the main goroutine
+			// observes the context end.
 			shutdown <- fmt.Errorf(
 				"shutting down the node after signal [%v]",
 				receivedSignal,
@@ -558,6 +597,45 @@ func awaitQuiesce(
 		return "forced_by_signal"
 	case <-backstopTimer.C:
 		return "backstop_deadline"
+	}
+}
+
+// The two ways the forced-cancellation cleanup wait can end: every canceled
+// permit was released by its owner, or the reviewed allowance elapsed first.
+const (
+	cleanupReasonDrained           = "drained"
+	cleanupReasonAllowanceExceeded = "allowance_exceeded"
+)
+
+// forcedCancellationAllowance is the wall-clock bound on the second phase of
+// a forced shutdown: the time the controller keeps the process alive after
+// canceling the remaining permits so their owners can finish quarantine and
+// audit writes. It is the same reviewed allowance the release manifest adds
+// on top of the in-process backstop when deriving the service manager's
+// termination grace, so the external SIGKILL deadline always ends after this
+// wait does. Deliberately not a signal-escapable wait: an operator hammering
+// the terminal must not be able to cut off key-material persistence.
+func forcedCancellationAllowance() time.Duration {
+	return time.Duration(defaultForcedCancellationAllowanceSeconds) *
+		time.Second
+}
+
+// awaitForcedCancellationCleanup waits for the owners of force-canceled
+// permits to finish their cancellation cleanup and release them, bounded by
+// the reviewed forced-cancellation allowance, and reports which of the two
+// ended the wait.
+func awaitForcedCancellationCleanup(
+	drained <-chan struct{},
+	allowance time.Duration,
+) string {
+	allowanceTimer := time.NewTimer(allowance)
+	defer allowanceTimer.Stop()
+
+	select {
+	case <-drained:
+		return cleanupReasonDrained
+	case <-allowanceTimer.C:
+		return cleanupReasonAllowanceExceeded
 	}
 }
 

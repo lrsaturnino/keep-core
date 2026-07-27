@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -90,6 +91,7 @@ func TestSignalLifecycleController_FirstSignalPreventsNewPermits(t *testing.T) {
 		gate,
 		signals,
 		time.Hour,
+		time.Hour,
 	)
 
 	signals <- syscall.SIGTERM
@@ -140,6 +142,234 @@ func TestSignalLifecycleController_FirstSignalPreventsNewPermits(t *testing.T) {
 	case <-runCtx.Done():
 	case <-time.After(10 * time.Second):
 		t.Fatal("the run context was not canceled after the shutdown report")
+	}
+}
+
+func TestAwaitForcedCancellationCleanup_Drained(t *testing.T) {
+	drained := make(chan struct{})
+	close(drained)
+
+	reason := awaitForcedCancellationCleanup(drained, time.Hour)
+	if reason != cleanupReasonDrained {
+		t.Errorf(
+			"expected reason [%s], got [%s]",
+			cleanupReasonDrained,
+			reason,
+		)
+	}
+}
+
+func TestAwaitForcedCancellationCleanup_AllowanceExceeded(t *testing.T) {
+	reason := awaitForcedCancellationCleanup(
+		make(chan struct{}),
+		time.Millisecond,
+	)
+	if reason != cleanupReasonAllowanceExceeded {
+		t.Errorf(
+			"expected reason [%s], got [%s]",
+			cleanupReasonAllowanceExceeded,
+			reason,
+		)
+	}
+}
+
+// TestForcedCancellationAllowance_BoundToManifestAllowance pins the runtime
+// phase-two wait to the reviewed allowance the release manifest adds on top
+// of the in-process backstop: the wall-clock room the controller actually
+// grants the cancellation cleanup must be exactly the room the service
+// manager's termination grace reserves for it before SIGKILL.
+func TestForcedCancellationAllowance_BoundToManifestAllowance(t *testing.T) {
+	grace, err := deriveTerminationGrace(
+		defaultForcedCancellationAllowanceSeconds,
+	)
+	if err != nil {
+		t.Fatalf("unexpected derivation error: [%v]", err)
+	}
+
+	expected := time.Duration(grace.ForcedCancellationAllowanceSeconds) *
+		time.Second
+	if got := forcedCancellationAllowance(); got != expected {
+		t.Errorf(
+			"expected the runtime allowance [%s] to match the manifest "+
+				"allowance, got [%s]",
+			expected,
+			got,
+		)
+	}
+
+	graceHeadroom := grace.TerminationGracePeriodSeconds -
+		grace.InProcessBackstopSeconds
+	if graceHeadroom != uint64(forcedCancellationAllowance()/time.Second) {
+		t.Errorf(
+			"the termination grace reserves [%d]s after the backstop, but "+
+				"the runtime waits [%s]",
+			graceHeadroom,
+			forcedCancellationAllowance(),
+		)
+	}
+}
+
+// TestSignalLifecycleController_JoinsForcedCancellationCleanup proves the
+// forced path is two-phase: after the second signal ends the drain, the
+// controller must not report shutdown or cancel the run context until the
+// owner of the force-canceled permit has finished its delayed cleanup — the
+// model of a quarantine persistence write racing process exit — and released
+// the permit.
+func TestSignalLifecycleController_JoinsForcedCancellationCleanup(t *testing.T) {
+	localChain := local_v1.Connect(10, 5)
+	blockCounter, err := localChain.BlockCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := blockCounter.WaitForBlockHeight(1); err != nil {
+		t.Fatal(err)
+	}
+
+	gate, err := participation.NewGate(
+		context.Background(),
+		participation.Schedule{CutoverBlock: 1_000_000},
+		blockCounter,
+		&clientinfo.NoOpPerformanceMetrics{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gate.Close()
+
+	permit, err := gate.Begin(participation.BeaconDKG, 1)
+	if err != nil {
+		t.Fatalf("cannot begin the in-flight ceremony: [%v]", err)
+	}
+
+	runCtx, cancelRunCtx := context.WithCancel(context.Background())
+	defer cancelRunCtx()
+
+	signals := make(chan os.Signal, 2)
+	shutdownChan := startSignalLifecycleController(
+		runCtx,
+		cancelRunCtx,
+		gate,
+		signals,
+		time.Hour,
+		time.Hour,
+	)
+
+	// The permit owner: it starts its cleanup only when the gate cancels the
+	// permit, holds the permit across a deliberately slow persistence write,
+	// and releases it only afterwards — exactly the shape of the quarantine
+	// paths in the beacon and tBTC nodes.
+	quarantineFinished := make(chan struct{})
+	var runCtxEndedDuringCleanup atomic.Bool
+	go func() {
+		<-permit.Context().Done()
+		time.Sleep(200 * time.Millisecond)
+		if runCtx.Err() != nil {
+			runCtxEndedDuringCleanup.Store(true)
+		}
+		close(quarantineFinished)
+		permit.Close()
+	}()
+
+	// The first signal quiesces; the second forces the drain to end while the
+	// permit is still held.
+	signals <- syscall.SIGTERM
+	signals <- syscall.SIGTERM
+
+	select {
+	case err := <-shutdownChan:
+		select {
+		case <-quarantineFinished:
+		default:
+			t.Fatal(
+				"shutdown reported before the delayed cleanup finished",
+			)
+		}
+		if err == nil || !strings.Contains(err.Error(), "signal") {
+			t.Errorf("expected a signal shutdown report, got [%v]", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("no shutdown report after the cleanup finished")
+	}
+
+	if runCtxEndedDuringCleanup.Load() {
+		t.Fatal("run context canceled while the cleanup was still running")
+	}
+
+	select {
+	case <-runCtx.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("the run context was not canceled after the shutdown report")
+	}
+}
+
+// TestSignalLifecycleController_CancellationAllowanceBoundsTheWait proves the
+// cleanup join cannot wedge the shutdown: a permit owner that never releases
+// its canceled permit delays the shutdown report by exactly the reviewed
+// allowance, not forever.
+func TestSignalLifecycleController_CancellationAllowanceBoundsTheWait(
+	t *testing.T,
+) {
+	localChain := local_v1.Connect(10, 5)
+	blockCounter, err := localChain.BlockCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := blockCounter.WaitForBlockHeight(1); err != nil {
+		t.Fatal(err)
+	}
+
+	gate, err := participation.NewGate(
+		context.Background(),
+		participation.Schedule{CutoverBlock: 1_000_000},
+		blockCounter,
+		&clientinfo.NoOpPerformanceMetrics{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gate.Close()
+
+	// Deliberately never released before the shutdown report: the owner is
+	// modeled as wedged.
+	permit, err := gate.Begin(participation.BeaconDKG, 1)
+	if err != nil {
+		t.Fatalf("cannot begin the in-flight ceremony: [%v]", err)
+	}
+	defer permit.Close()
+
+	runCtx, cancelRunCtx := context.WithCancel(context.Background())
+	defer cancelRunCtx()
+
+	allowance := 150 * time.Millisecond
+	signals := make(chan os.Signal, 2)
+	shutdownChan := startSignalLifecycleController(
+		runCtx,
+		cancelRunCtx,
+		gate,
+		signals,
+		time.Hour,
+		allowance,
+	)
+
+	waitStart := time.Now()
+	signals <- syscall.SIGTERM
+	signals <- syscall.SIGTERM
+
+	select {
+	case err := <-shutdownChan:
+		if elapsed := time.Since(waitStart); elapsed < allowance {
+			t.Errorf(
+				"shutdown reported after [%s], before the [%s] allowance "+
+					"was consumed",
+				elapsed,
+				allowance,
+			)
+		}
+		if err == nil || !strings.Contains(err.Error(), "signal") {
+			t.Errorf("expected a signal shutdown report, got [%v]", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the allowance did not bound the cleanup wait")
 	}
 }
 

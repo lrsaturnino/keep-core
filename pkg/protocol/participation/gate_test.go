@@ -1064,6 +1064,125 @@ func TestGate_CloseForcesQuiesceDeadline(t *testing.T) {
 	second.Close()
 }
 
+// TestGate_DrainedJoinsForcedPermitRelease pins the two-phase forced
+// cancellation: Close closes the quiesce channel immediately, but the drained
+// channel stays open until the owner of every force-canceled permit releases
+// it — the window in which the cancellation cleanup, quarantine writes
+// included, is still running.
+func TestGate_DrainedJoinsForcedPermitRelease(t *testing.T) {
+	gate, _, _ := newTestGate(
+		t, Schedule{CutoverBlock: 1000}, 999, inertPollInterval,
+	)
+
+	permit, err := gate.Begin(TBTCSigning, 999)
+	if err != nil {
+		t.Fatalf("unexpected error: [%v]", err)
+	}
+	drained := gate.Drained()
+
+	done := gate.Quiesce(fmt.Errorf("shutdown signal"))
+	gate.Close()
+
+	select {
+	case <-done:
+	default:
+		t.Fatal("quiesce channel must close at gate close")
+	}
+	select {
+	case <-drained:
+		t.Fatal("drained channel closed while a force-canceled permit was held")
+	default:
+	}
+
+	permit.Close()
+	select {
+	case <-drained:
+	case <-time.After(time.Second):
+		t.Fatal("drained channel did not close at the last permit release")
+	}
+}
+
+// TestGate_DrainedClosesWithNaturalQuiesceCompletion proves the drained
+// channel needs no Close on the natural path: once quiescence begins, the
+// release of the last permit both completes the quiesce drain and drains the
+// gate.
+func TestGate_DrainedClosesWithNaturalQuiesceCompletion(t *testing.T) {
+	gate, _, _ := newTestGate(
+		t, Schedule{CutoverBlock: 1000}, 999, inertPollInterval,
+	)
+
+	permit, err := gate.Begin(TBTCSigning, 999)
+	if err != nil {
+		t.Fatalf("unexpected error: [%v]", err)
+	}
+	drained := gate.Drained()
+
+	gate.Quiesce(fmt.Errorf("shutdown signal"))
+	select {
+	case <-drained:
+		t.Fatal("drained channel closed with an active permit")
+	default:
+	}
+
+	permit.Close()
+	select {
+	case <-drained:
+	case <-time.After(time.Second):
+		t.Fatal("drained channel did not close at natural completion")
+	}
+}
+
+// TestGate_DrainedStaysOpenWhileGateIssuesPermits pins the boundary of the
+// drained condition: neither an active count reaching zero during normal
+// operation nor a clock-failure cancellation drains the gate, because both
+// leave it able to issue permits again. Only quiescence or close does.
+func TestGate_DrainedStaysOpenWhileGateIssuesPermits(t *testing.T) {
+	gate, blockCounter, _ := newTestGate(
+		t, Schedule{CutoverBlock: 1000}, 999, inertPollInterval,
+	)
+	drained := gate.Drained()
+
+	permit, err := gate.Begin(TBTCSigning, 999)
+	if err != nil {
+		t.Fatalf("unexpected error: [%v]", err)
+	}
+	permit.Close()
+	select {
+	case <-drained:
+		t.Fatal("drained channel closed while the gate still issues permits")
+	default:
+	}
+
+	held, err := gate.Begin(TBTCDKG, 999)
+	if err != nil {
+		t.Fatalf("unexpected error: [%v]", err)
+	}
+	blockCounter.set(999, fmt.Errorf("rpc down"))
+	if _, err := gate.Begin(
+		TBTCHeartbeat, 999,
+	); !errors.Is(err, ErrClockUnavailable) {
+		t.Fatalf("expected a clock-unavailable refusal, got: [%v]", err)
+	}
+	if cause := context.Cause(
+		held.Context(),
+	); !errors.Is(cause, ErrClockUnavailable) {
+		t.Fatalf("expected a clock-failure cancellation, got: [%v]", cause)
+	}
+	held.Close()
+	select {
+	case <-drained:
+		t.Fatal("drained channel closed on a clock-failure cancellation")
+	default:
+	}
+
+	gate.Close()
+	select {
+	case <-drained:
+	case <-time.After(time.Second):
+		t.Fatal("drained channel did not close at the close of an idle gate")
+	}
+}
+
 func TestGate_ClosedPermitCommitRefused(t *testing.T) {
 	gate, _, _ := newTestGate(
 		t, Schedule{CutoverBlock: 1000}, 999, inertPollInterval,
