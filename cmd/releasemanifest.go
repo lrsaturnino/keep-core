@@ -31,6 +31,19 @@ const releaseManifestSchemaVersion = uint64(1)
 // the backstop itself; both absorb the same order of local skew.
 const defaultForcedCancellationAllowanceSeconds = uint64(300)
 
+// processExitHeadroomSeconds is the reviewed headroom the external
+// termination grace adds on top of the two in-process waits. The service
+// manager counts its grace from signal delivery, but the backstop timer arms
+// only after the lifecycle controller has been scheduled and has quiesced
+// the gate, the cancellation-allowance timer arms only after the gate has
+// closed, and the shutdown logging, run-context teardown, and process exit
+// run after both. This headroom budgets that overhead — purely local work
+// with no chain or network waits, sized far above what such work needs even
+// under heavy load — so the external SIGKILL deadline ends strictly after
+// the complete internal shutdown sequence instead of exactly at the sum of
+// the two timed waits.
+const processExitHeadroomSeconds = uint64(60)
+
 // beaconCompletionInputs records the beacon chain configuration from which
 // the beacon completion bound was derived, so a manifest reviewer can retrace
 // the arithmetic without reading the adapter source.
@@ -44,7 +57,8 @@ type beaconCompletionInputs struct {
 // external termination grace to the in-process quiesce deadline. Every field
 // except the forced-cancellation allowance is derived from this binary's
 // compiled protocol bounds; the allowance is the one reviewed input recorded
-// only here, and the grace period is the checked sum of the two deadlines.
+// only here, and the grace period is the checked sum of the backstop, the
+// allowance, and the compiled process-exit headroom.
 type terminationGrace struct {
 	TBTCCompletionBlocks               uint64                 `json:"tbtc_completion_blocks"`
 	BeaconCompletionBlocks             uint64                 `json:"beacon_completion_blocks"`
@@ -55,6 +69,7 @@ type terminationGrace struct {
 	RPCProcessingAllowanceSeconds      uint64                 `json:"rpc_processing_allowance_seconds"`
 	InProcessBackstopSeconds           uint64                 `json:"in_process_backstop_seconds"`
 	ForcedCancellationAllowanceSeconds uint64                 `json:"forced_cancellation_allowance_seconds"`
+	ProcessExitHeadroomSeconds         uint64                 `json:"process_exit_headroom_seconds"`
 	TerminationGracePeriodSeconds      uint64                 `json:"termination_grace_period_seconds"`
 	Notes                              string                 `json:"notes,omitempty"`
 }
@@ -117,11 +132,24 @@ func deriveTerminationGrace(
 	}
 	backstopSeconds := uint64(backstop / time.Second)
 
-	if backstopSeconds > math.MaxUint64-forcedCancellationAllowanceSeconds {
+	if forcedCancellationAllowanceSeconds >
+		math.MaxUint64-processExitHeadroomSeconds {
 		return terminationGrace{}, fmt.Errorf(
-			"termination grace overflows: backstop [%d]s plus allowance [%d]s",
+			"termination grace overflows: allowance [%d]s plus exit "+
+				"headroom [%d]s",
+			forcedCancellationAllowanceSeconds,
+			processExitHeadroomSeconds,
+		)
+	}
+	graceBeyondBackstop := forcedCancellationAllowanceSeconds +
+		processExitHeadroomSeconds
+	if backstopSeconds > math.MaxUint64-graceBeyondBackstop {
+		return terminationGrace{}, fmt.Errorf(
+			"termination grace overflows: backstop [%d]s plus allowance "+
+				"[%d]s plus exit headroom [%d]s",
 			backstopSeconds,
 			forcedCancellationAllowanceSeconds,
+			processExitHeadroomSeconds,
 		)
 	}
 
@@ -139,8 +167,8 @@ func deriveTerminationGrace(
 		RPCProcessingAllowanceSeconds:      uint64(quiesceBackstopMargin / time.Second),
 		InProcessBackstopSeconds:           backstopSeconds,
 		ForcedCancellationAllowanceSeconds: forcedCancellationAllowanceSeconds,
-		TerminationGracePeriodSeconds: backstopSeconds +
-			forcedCancellationAllowanceSeconds,
+		ProcessExitHeadroomSeconds:         processExitHeadroomSeconds,
+		TerminationGracePeriodSeconds:      backstopSeconds + graceBeyondBackstop,
 	}, nil
 }
 
@@ -247,6 +275,7 @@ func validateReleaseManifest(manifest releaseManifest) error {
 			{"upper_block_interval_seconds", recorded.UpperBlockIntervalSeconds, derived.UpperBlockIntervalSeconds},
 			{"rpc_processing_allowance_seconds", recorded.RPCProcessingAllowanceSeconds, derived.RPCProcessingAllowanceSeconds},
 			{"in_process_backstop_seconds", recorded.InProcessBackstopSeconds, derived.InProcessBackstopSeconds},
+			{"process_exit_headroom_seconds", recorded.ProcessExitHeadroomSeconds, derived.ProcessExitHeadroomSeconds},
 			{"termination_grace_period_seconds", recorded.TerminationGracePeriodSeconds, derived.TerminationGracePeriodSeconds},
 		} {
 			if mismatch.recorded != mismatch.derived {
@@ -272,9 +301,11 @@ var ReleaseManifestCommand = &cobra.Command{
 	Long: "The release-manifest command derives the service-manager " +
 		"termination grace from this binary's compiled protocol bounds and " +
 		"validates a reviewed release manifest against them. The external " +
-		"grace must end strictly after the in-process quiesce backstop, so " +
-		"the audited forced-cancellation path always runs before the " +
-		"service manager escalates to SIGKILL.",
+		"grace must end strictly after the complete in-process shutdown " +
+		"sequence — the quiesce backstop, the forced-cancellation cleanup " +
+		"allowance, and the process teardown budgeted by the compiled exit " +
+		"headroom — so the audited forced-cancellation path and its writes " +
+		"always finish before the service manager escalates to SIGKILL.",
 }
 
 var releaseManifestPath string

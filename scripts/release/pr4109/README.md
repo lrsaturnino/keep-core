@@ -87,14 +87,21 @@ the external `ETH_WS_URL` endpoint.
 Every accepted rehearsal run must produce an evidence record conforming to
 `rehearsal-evidence.schema.json`: exact source SHA, per-architecture image
 digests, chain ID and C, the sha256 of the reviewed `release-manifest.json`
-the fleet's termination grace was taken from, per-stage canonical/callback
-blocks, permit modes, gauge snapshots, transaction hashes, and non-secret
-state checksums. Screenshots alone are insufficient.
-`./rehearse.sh validate-evidence` checks every record under `EVIDENCE_DIR`
-against the schema and requires the recorded manifest hash to equal the
-checked-in manifest's — the Go drift tests pin that manifest's numbers to
-the compiled bounds, so an accepted record links the termination-grace
-record to the exact artifact and chain identity it carries — and the
+the fleet's termination grace was taken from and the grace value itself,
+per-stage canonical/callback blocks, permit modes, gauge snapshots,
+transaction hashes, and non-secret state checksums. Screenshots alone are
+insufficient. `./rehearse.sh validate-evidence` checks every record under
+`EVIDENCE_DIR` against the schema (ajv pinned to exact versions) and
+requires the recorded manifest hash *and* the recorded termination grace to
+equal the checked-in manifest's — the hash alone would accept a record that
+names the right manifest while claiming the fleet ran under some other
+grace; the Go drift tests pin that manifest's numbers to the compiled
+bounds, so an accepted record links the termination-grace record to the
+exact artifact and chain identity it carries. The validator proves itself
+before validating anything: `test-validate-evidence.sh` drives the stage
+over fixture records — correct binding, wrong hash, wrong grace, missing
+binding fields, malformed timestamp, empty record set — and the stage runs
+that self-test first on every invocation. The
 `cutover-rehearsal` workflow (manually dispatched, in
 `.github/workflows/cutover-rehearsal.yml`) runs the local proofs, the
 static analyzers, and the contracts build/test on every dispatch — and the
@@ -176,13 +183,22 @@ allowance between the backstop firing and SIGKILL. The client consumes the
 same allowance from its compiled constant: after the forced cancellation the
 lifecycle controller keeps the run context alive until every canceled permit
 owner finishes its quarantine/audit cleanup and releases its permit, waiting
-at most this allowance, so the external grace always outlasts the writes it
-exists to protect (a `cmd` test pins the runtime wait to the manifest field).
-The authoritative external grace is the checked sum
-`in_process_backstop_seconds + forced_cancellation_allowance_seconds`
-(currently `19800 + 300 = 20100` seconds). The client never reads the
-manifest at runtime; its bounds are compiled in, and the manifest exists so
-the SIGKILL deadline is derived from those same bounds.
+at most this allowance (a `cmd` test pins the runtime wait to the manifest
+field). The service manager counts its grace from SIGTERM delivery, but the
+backstop timer arms only after the controller has been scheduled and has
+quiesced the gate, the allowance timer only after the gate has closed, and
+the logging and teardown run after both — so the manifest adds the compiled
+process-exit headroom (`processExitHeadroomSeconds`) on top of the two timed
+waits, and the external grace strictly outlasts the complete internal
+shutdown sequence rather than merely equaling the sum of its timers. The
+authoritative external grace is the checked sum
+`in_process_backstop_seconds + forced_cancellation_allowance_seconds +
+process_exit_headroom_seconds` (currently `19800 + 300 + 60 = 20160`
+seconds); a lifecycle test walks a forced shutdown from the termination
+instant to exit readiness and requires the controller's overhead to fit
+inside that headroom. The client never reads the manifest at runtime; its
+bounds are compiled in, and the manifest exists so the SIGKILL deadline is
+derived from those same bounds.
 
 The chain is enforced at three layers, each fail-closed:
 

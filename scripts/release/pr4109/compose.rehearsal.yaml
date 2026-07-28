@@ -59,7 +59,7 @@ services:
 
   r1-node-1:
     image: "${R1_IMAGE_DIGEST}"
-    stop_grace_period: 20100s
+    stop_grace_period: 20160s
     command:
       - "start"
       - "--config"
@@ -79,7 +79,7 @@ services:
 
   r1-node-2:
     image: "${R1_IMAGE_DIGEST}"
-    stop_grace_period: 20100s
+    stop_grace_period: 20160s
     command:
       - "start"
       - "--config"

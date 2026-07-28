@@ -175,9 +175,11 @@ func TestAwaitForcedCancellationCleanup_AllowanceExceeded(t *testing.T) {
 
 // TestForcedCancellationAllowance_BoundToManifestAllowance pins the runtime
 // phase-two wait to the reviewed allowance the release manifest adds on top
-// of the in-process backstop: the wall-clock room the controller actually
-// grants the cancellation cleanup must be exactly the room the service
-// manager's termination grace reserves for it before SIGKILL.
+// of the in-process backstop, and pins the manifest's grace to strictly
+// outlast that wait: the room the termination grace reserves after the
+// backstop must be the full cleanup allowance the controller actually waits
+// plus the positive exit headroom for the teardown running outside both
+// timers — never exactly the allowance, or SIGKILL can land inside teardown.
 func TestForcedCancellationAllowance_BoundToManifestAllowance(t *testing.T) {
 	grace, err := deriveTerminationGrace(
 		defaultForcedCancellationAllowanceSeconds,
@@ -197,14 +199,120 @@ func TestForcedCancellationAllowance_BoundToManifestAllowance(t *testing.T) {
 		)
 	}
 
-	graceHeadroom := grace.TerminationGracePeriodSeconds -
+	graceBeyondBackstop := grace.TerminationGracePeriodSeconds -
 		grace.InProcessBackstopSeconds
-	if graceHeadroom != uint64(forcedCancellationAllowance()/time.Second) {
+	runtimeWaitSeconds := uint64(forcedCancellationAllowance() / time.Second)
+	if graceBeyondBackstop != runtimeWaitSeconds+grace.ProcessExitHeadroomSeconds {
 		t.Errorf(
 			"the termination grace reserves [%d]s after the backstop, but "+
-				"the runtime waits [%s]",
-			graceHeadroom,
+				"the runtime waits [%s] and the exit headroom is [%d]s",
+			graceBeyondBackstop,
 			forcedCancellationAllowance(),
+			grace.ProcessExitHeadroomSeconds,
+		)
+	}
+	if graceBeyondBackstop <= runtimeWaitSeconds {
+		t.Errorf(
+			"the termination grace must reserve strictly more than the "+
+				"[%d]s runtime cleanup wait after the backstop, got [%d]s",
+			runtimeWaitSeconds,
+			graceBeyondBackstop,
+		)
+	}
+}
+
+// TestSignalLifecycleController_TeardownFitsExitHeadroom walks the forced
+// shutdown from the original termination instant to exit readiness — the
+// shutdown report delivered and the run context canceled — with both timed
+// waits fully consumed by a wedged permit owner, and requires everything
+// outside those two waits (controller scheduling, the quiesce and close
+// calls, logging, report delivery, context cancellation) to fit within the
+// exit headroom the release manifest reserves for it. The service manager
+// counts its grace from the same instant this test starts counting, so this
+// is the in-process proof that the manifest's grace bounds the complete
+// sequence, not just the sum of the two timers.
+func TestSignalLifecycleController_TeardownFitsExitHeadroom(t *testing.T) {
+	localChain := local_v1.Connect(10, 5)
+	blockCounter, err := localChain.BlockCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := blockCounter.WaitForBlockHeight(1); err != nil {
+		t.Fatal(err)
+	}
+
+	gate, err := participation.NewGate(
+		context.Background(),
+		participation.Schedule{CutoverBlock: 1_000_000},
+		blockCounter,
+		&clientinfo.NoOpPerformanceMetrics{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gate.Close()
+
+	// Never released: the drain can only end through the backstop and the
+	// cleanup wait can only end through the allowance, so the elapsed time
+	// beyond those two budgets is exactly the controller's own overhead.
+	permit, err := gate.Begin(participation.BeaconDKG, 1)
+	if err != nil {
+		t.Fatalf("cannot begin the in-flight ceremony: [%v]", err)
+	}
+	defer permit.Close()
+
+	runCtx, cancelRunCtx := context.WithCancel(context.Background())
+	defer cancelRunCtx()
+
+	backstop := 50 * time.Millisecond
+	allowance := 50 * time.Millisecond
+	signals := make(chan os.Signal, 1)
+	shutdownChan := startSignalLifecycleController(
+		runCtx,
+		cancelRunCtx,
+		gate,
+		signals,
+		backstop,
+		allowance,
+	)
+
+	grace, err := deriveTerminationGrace(
+		defaultForcedCancellationAllowanceSeconds,
+	)
+	if err != nil {
+		t.Fatalf("unexpected derivation error: [%v]", err)
+	}
+	exitHeadroom := time.Duration(grace.ProcessExitHeadroomSeconds) *
+		time.Second
+
+	terminationInstant := time.Now()
+	signals <- syscall.SIGTERM
+
+	select {
+	case err := <-shutdownChan:
+		if err == nil || !strings.Contains(err.Error(), "signal") {
+			t.Errorf("expected a signal shutdown report, got [%v]", err)
+		}
+	case <-time.After(backstop + allowance + exitHeadroom):
+		t.Fatal(
+			"no shutdown report within the backstop, the allowance, and " +
+				"the exit headroom",
+		)
+	}
+
+	select {
+	case <-runCtx.Done():
+	case <-time.After(exitHeadroom):
+		t.Fatal("the run context was not canceled after the shutdown report")
+	}
+
+	overhead := time.Since(terminationInstant) - backstop - allowance
+	if overhead >= exitHeadroom {
+		t.Errorf(
+			"the controller consumed [%s] beyond the two timed waits, more "+
+				"than the [%s] exit headroom the termination grace reserves",
+			overhead,
+			exitHeadroom,
 		)
 	}
 }

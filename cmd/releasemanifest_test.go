@@ -19,7 +19,6 @@ const releaseManifestDeployDirectory = "../scripts/release/pr4109/deploy"
 
 const rehearsalEvidenceSchemaPath = "../scripts/release/pr4109/rehearsal-evidence.schema.json"
 
-
 // validReleaseManifestForTests builds a manifest that must pass validation:
 // the derived termination grace under the reviewed default allowance,
 // wrapped in the identity fields of the current artifact.
@@ -66,7 +65,8 @@ func TestReleaseManifestDeriveMatchesCompiledBounds(t *testing.T) {
 		{"rpc_processing_allowance_seconds", grace.RPCProcessingAllowanceSeconds, 300},
 		{"in_process_backstop_seconds", grace.InProcessBackstopSeconds, 19800},
 		{"forced_cancellation_allowance_seconds", grace.ForcedCancellationAllowanceSeconds, 300},
-		{"termination_grace_period_seconds", grace.TerminationGracePeriodSeconds, 20100},
+		{"process_exit_headroom_seconds", grace.ProcessExitHeadroomSeconds, 60},
+		{"termination_grace_period_seconds", grace.TerminationGracePeriodSeconds, 20160},
 	} {
 		if assertion.got != assertion.expected {
 			t.Errorf(
@@ -105,21 +105,33 @@ func TestReleaseManifestDeriveMatchesCompiledBounds(t *testing.T) {
 	}
 
 	graceIdentity := grace.InProcessBackstopSeconds +
-		grace.ForcedCancellationAllowanceSeconds
+		grace.ForcedCancellationAllowanceSeconds +
+		grace.ProcessExitHeadroomSeconds
 	if grace.TerminationGracePeriodSeconds != graceIdentity {
 		t.Errorf(
-			"grace identity broken: backstop+allowance is [%d], recorded "+
-				"grace is [%d]",
+			"grace identity broken: backstop+allowance+headroom is [%d], "+
+				"recorded grace is [%d]",
 			graceIdentity,
 			grace.TerminationGracePeriodSeconds,
 		)
 	}
-	if grace.TerminationGracePeriodSeconds <= grace.InProcessBackstopSeconds {
+	// The strict inequality is the entire point of the exit headroom: the
+	// service manager counts its grace from signal delivery, so a grace that
+	// merely equals the sum of the two in-process waits leaves controller
+	// scheduling, the quiesce and close calls, logging, and teardown
+	// unbudgeted and lets SIGKILL land inside them.
+	internalWaits := grace.InProcessBackstopSeconds +
+		grace.ForcedCancellationAllowanceSeconds
+	if grace.TerminationGracePeriodSeconds <= internalWaits {
 		t.Errorf(
-			"grace [%d]s must end strictly after the backstop [%d]s",
+			"grace [%d]s must end strictly after the complete internal wait "+
+				"[%d]s (backstop plus cancellation allowance)",
 			grace.TerminationGracePeriodSeconds,
-			grace.InProcessBackstopSeconds,
+			internalWaits,
 		)
+	}
+	if grace.ProcessExitHeadroomSeconds == 0 {
+		t.Error("the process-exit headroom must be positive")
 	}
 }
 
@@ -383,18 +395,38 @@ func TestReleaseManifestValidateFailsClosed(t *testing.T) {
 			},
 			"must be positive",
 		},
-		"grace not equal to backstop plus allowance": {
+		"stale exit headroom": {
+			func(m *releaseManifest) {
+				m.TerminationGrace.ProcessExitHeadroomSeconds++
+			},
+			"process_exit_headroom_seconds must be [60]",
+		},
+		"exit headroom dropped": {
+			func(m *releaseManifest) {
+				m.TerminationGrace.ProcessExitHeadroomSeconds = 0
+			},
+			"process_exit_headroom_seconds must be [60]",
+		},
+		"grace not equal to the full internal sequence": {
 			func(m *releaseManifest) {
 				m.TerminationGrace.TerminationGracePeriodSeconds++
 			},
-			"termination_grace_period_seconds must be [20100]",
+			"termination_grace_period_seconds must be [20160]",
 		},
 		"grace truncated to the backstop": {
 			func(m *releaseManifest) {
 				m.TerminationGrace.TerminationGracePeriodSeconds =
 					m.TerminationGrace.InProcessBackstopSeconds
 			},
-			"termination_grace_period_seconds must be [20100]",
+			"termination_grace_period_seconds must be [20160]",
+		},
+		"grace truncated to the two timed waits": {
+			func(m *releaseManifest) {
+				m.TerminationGrace.TerminationGracePeriodSeconds =
+					m.TerminationGrace.InProcessBackstopSeconds +
+						m.TerminationGrace.ForcedCancellationAllowanceSeconds
+			},
+			"termination_grace_period_seconds must be [20160]",
 		},
 	}
 
@@ -431,7 +463,7 @@ func TestReleaseManifestValidateReportsEveryViolation(t *testing.T) {
 	for _, expectedMessage := range []string{
 		"schema_version must be [1]",
 		"reviewed_margin_blocks must be [100]",
-		"termination_grace_period_seconds must be [20100]",
+		"termination_grace_period_seconds must be [20160]",
 	} {
 		if !strings.Contains(err.Error(), expectedMessage) {
 			t.Errorf(
@@ -496,8 +528,8 @@ func TestReleaseManifestLoadFailsClosed(t *testing.T) {
 		"fractional grace": {
 			strings.Replace(
 				string(valid),
-				`"termination_grace_period_seconds":20100`,
-				`"termination_grace_period_seconds":20100.5`,
+				`"termination_grace_period_seconds":20160`,
+				`"termination_grace_period_seconds":20160.5`,
 				1,
 			),
 			"cannot decode",

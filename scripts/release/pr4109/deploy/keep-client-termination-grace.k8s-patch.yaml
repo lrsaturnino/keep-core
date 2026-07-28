@@ -6,9 +6,13 @@
 # (19800 s — the compiled maximum legacy completion bound plus the reviewed
 # margin, converted at the reviewed upper block interval, plus the
 # RPC/processing allowance) plus the reviewed forced-cancellation allowance
-# (300 s). Without this patch the Kubernetes default of 30 s SIGKILLs a
-# draining node hours before already-started protocol work can complete and
-# before the audited forced-cancellation path runs.
+# (300 s) plus the process-exit headroom (60 s) for the controller
+# scheduling, quiesce and close calls, logging, and teardown that run
+# outside both in-process timers — Kubernetes counts this grace from SIGTERM
+# delivery, before either timer arms. Without this patch the Kubernetes
+# default of 30 s SIGKILLs a draining node hours before already-started
+# protocol work can complete and before the audited forced-cancellation
+# path runs.
 #
 # The grace is a ceiling, not a wait: a node whose drain completes exits
 # immediately. Kubernetes delivers SIGTERM to the container's PID 1 at
@@ -26,4 +30,4 @@
 spec:
   template:
     spec:
-      terminationGracePeriodSeconds: 20100
+      terminationGracePeriodSeconds: 20160

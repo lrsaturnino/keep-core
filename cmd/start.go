@@ -612,9 +612,13 @@ const (
 // canceling the remaining permits so their owners can finish quarantine and
 // audit writes. It is the same reviewed allowance the release manifest adds
 // on top of the in-process backstop when deriving the service manager's
-// termination grace, so the external SIGKILL deadline always ends after this
-// wait does. Deliberately not a signal-escapable wait: an operator hammering
-// the terminal must not be able to cut off key-material persistence.
+// termination grace — together with the compiled process-exit headroom that
+// budgets the controller scheduling, quiesce and close calls, shutdown
+// logging, and teardown running outside both in-process timers — so the
+// external SIGKILL deadline, counted from signal delivery, always ends
+// strictly after this wait does. Deliberately not a signal-escapable wait: an
+// operator hammering the terminal must not be able to cut off key-material
+// persistence.
 func forcedCancellationAllowance() time.Duration {
 	return time.Duration(defaultForcedCancellationAllowanceSeconds) *
 		time.Second

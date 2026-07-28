@@ -21,6 +21,7 @@
         "rpc_processing_allowance_seconds",
         "in_process_backstop_seconds",
         "forced_cancellation_allowance_seconds",
+        "process_exit_headroom_seconds",
         "termination_grace_period_seconds"
       ],
       "additionalProperties": false,
@@ -76,10 +77,15 @@
           "type": "integer",
           "minimum": 1
         },
-        "termination_grace_period_seconds": {
-          "description": "in_process_backstop_seconds + forced_cancellation_allowance_seconds — the exact value deployment scaffolds must configure (Kubernetes terminationGracePeriodSeconds, systemd TimeoutStopSec).",
+        "process_exit_headroom_seconds": {
+          "description": "Compiled reviewed headroom (processExitHeadroomSeconds) for the shutdown work outside both in-process timers: controller scheduling and the quiesce call before the backstop arms, the gate close between the timers, and the logging, teardown, and process exit after them. Must be positive: the service manager counts the grace from signal delivery, so a grace equal to the two timed waits alone leaves that work unbudgeted.",
           "type": "integer",
-          "minimum": 2
+          "minimum": 1
+        },
+        "termination_grace_period_seconds": {
+          "description": "in_process_backstop_seconds + forced_cancellation_allowance_seconds + process_exit_headroom_seconds — the exact value deployment scaffolds must configure (Kubernetes terminationGracePeriodSeconds, systemd TimeoutStopSec).",
+          "type": "integer",
+          "minimum": 3
         },
         "notes": { "type": "string" }
       }
