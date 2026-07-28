@@ -1398,6 +1398,8 @@ clock_readings() {
   CLOCK_REFUSALS_BEFORE="7"
   CLOCK_REFUSALS_AFTER="9"
   CLOCK_REFUSAL_ATTEMPTED=1
+  CLOCK_OFFER_FAILED=0
+  CLOCK_OFFER_RC=""
 }
 
 clock_case() {
@@ -1458,6 +1460,14 @@ run_verdict clock_case eval 'CLOCK_HELD_BEFORE="0"'
 check "a node holding nothing cannot evidence the cancel half" 3 \
   "cancel-what-is-held half of the contract was never exercised"
 
+# The offer was made and the instrument broke, which the counters cannot tell
+# apart from a gate nobody challenged — so the record has to.
+run_verdict clock_case eval \
+  'CLOCK_REFUSAL_ATTEMPTED=0; CLOCK_OFFER_FAILED=1; CLOCK_OFFER_RC="9"
+   CLOCK_REFUSALS_AFTER="7"'
+check "a driver that could not offer work is not a gate nobody asked" 3 \
+  "work driver exited \[9\] without naming a transaction"
+
 # A quiescence that held work, was offered more while quiescing, issued none,
 # and was seen with its in-flight count at zero before it went away.
 # The slots the verdict under test reads; shellcheck cannot follow them
@@ -1472,6 +1482,8 @@ quiesce_readings() {
   QUIESCE_FORCED_AFTER="4"
   QUIESCE_DRAINED=1
   QUIESCE_ATTEMPTED=1
+  QUIESCE_OFFER_FAILED=0
+  QUIESCE_OFFER_RC=""
   QUIESCE_GRACE="20160"
 }
 
@@ -1516,14 +1528,29 @@ run_verdict quiesce_case eval 'QUIESCE_STATE="open_security_v2"'
 check "a draining node that never reported quiescing refutes the gate" 1 \
   "never reported quiescing"
 
+run_verdict quiesce_case eval \
+  'QUIESCE_ATTEMPTED=0; QUIESCE_OFFER_FAILED=1; QUIESCE_OFFER_RC="4"'
+check "a driver that could not offer work is not a node nobody asked" 3 \
+  "work driver exited \[4\] without naming a transaction"
+
 # The straggler control, whose evidence used to be the gate's own refusal
 # counter — a counter that moves when a node declines its own Begin, for
 # reasons that need no legacy announcement behind them at all.
+STRAGGLER_OPERATOR="0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"
+
 straggler_readings() {
   # shellcheck disable=SC2034
   STRAGGLER_BEFORE=("10" "4" "2")
   # shellcheck disable=SC2034
   STRAGGLER_AFTER=("11" "5" "3")
+  # shellcheck disable=SC2034
+  STRAGGLER_EXPECTED_OPERATOR="${STRAGGLER_OPERATOR}"
+  # shellcheck disable=SC2034
+  STRAGGLER_DRIVER_SUPPLIED=1
+  # shellcheck disable=SC2034
+  STRAGGLER_DRIVER_RC=0
+  # shellcheck disable=SC2034
+  STRAGGLER_DRIVER_TX=2
 }
 
 straggler_case() {
@@ -1531,25 +1558,34 @@ straggler_case() {
   "$@"
 }
 
+# The same address as the fleet spells it back in lowercase, which is one of
+# the two spellings a roster entry arrives in.
+STRAGGLER_OPERATOR_LOWER="$(printf '%s' "${STRAGGLER_OPERATOR}" |
+  tr '[:upper:]' '[:lower:]')"
+
 run_verdict straggler_case eval \
-  'straggler_control_verdict "0xabc"'
+  "straggler_control_verdict '${STRAGGLER_OPERATOR}'"
 check "a straggler recognized, rostered, and named holds the control" 0 \
-  "recognized 1 of them as cross-format" "naming operator\(s\) 0xabc"
+  "recognized 1 of them as cross-format" \
+  "naming the straggler's own operator ${STRAGGLER_OPERATOR}"
 
 # The case the refusal counter could not tell apart from success: no legacy
 # announcement ever arrived, so there was nothing to fail closed against.
 run_verdict straggler_case eval \
-  'STRAGGLER_AFTER=("10" "5" "3"); straggler_control_verdict "0xabc"'
+  "STRAGGLER_AFTER=('10' '5' '3')
+   straggler_control_verdict '${STRAGGLER_OPERATOR}'"
 check "a roster entry with no session mismatch behind it is not the control" \
   3 "no session-ID mismatch"
 
 run_verdict straggler_case eval \
-  'STRAGGLER_AFTER=("11" "4" "3"); straggler_control_verdict "0xabc"'
+  "STRAGGLER_AFTER=('11' '4' '3')
+   straggler_control_verdict '${STRAGGLER_OPERATOR}'"
 check "a mismatch never recognized as cross-format refutes the control" 1 \
   "recognized none of them as cross-format"
 
 run_verdict straggler_case eval \
-  'STRAGGLER_AFTER=("11" "5" "2"); straggler_control_verdict "0xabc"'
+  "STRAGGLER_AFTER=('11' '5' '2')
+   straggler_control_verdict '${STRAGGLER_OPERATOR}'"
 check "a cross-format sighting that entered no roster refutes the control" 1 \
   "added none to its legacy roster"
 
@@ -1558,9 +1594,60 @@ check "a roster addition naming no new operator refutes the control" 1 \
   "named no operator it had not already seen"
 
 run_verdict straggler_case eval \
-  'STRAGGLER_AFTER=("11" "" "3"); straggler_control_verdict "0xabc"'
+  "STRAGGLER_AFTER=('11' '' '3')
+   straggler_control_verdict '${STRAGGLER_OPERATOR}'"
 check "an unreadable cross-format counter observes no straggler at all" 3 \
   "announcer_cross_format_peer_total"
+
+# The entry has to be the straggler's own. A roster that names some other peer
+# is the release attributing a legacy sighting to the wrong node, and a release
+# decision would act on the name.
+run_verdict straggler_case eval \
+  'straggler_control_verdict "0x1111111111111111111111111111111111111111"'
+check "a roster naming an operator that is not the straggler refutes it" 1 \
+  "none of them is the straggler's own operator"
+
+# The same address in the two spellings it arrives in must not read as two
+# operators: EIP-55 from one source, lowercase from another.
+run_verdict straggler_case eval \
+  "straggler_control_verdict '${STRAGGLER_OPERATOR_LOWER}'"
+check "the straggler's operator in another spelling still holds the control" \
+  0 "so the straggler failed closed and was named"
+
+# Among several newly named operators, the straggler's presence is what the
+# control is about.
+run_verdict straggler_case eval \
+  "straggler_control_verdict \
+'0x2222222222222222222222222222222222222222 ${STRAGGLER_OPERATOR}'"
+check "the straggler named alongside other operators holds the control" 0 \
+  "so the straggler failed closed and was named"
+
+run_verdict straggler_case eval \
+  "STRAGGLER_EXPECTED_OPERATOR=''
+   straggler_control_verdict '${STRAGGLER_OPERATOR}'"
+check "a straggler whose own operator could not be read proves no naming" 3 \
+  "straggler's own operator address could not be read"
+
+# The driver accounting the counters used to be read without. A driver that
+# failed, that named nothing, or that was never supplied leaves counter
+# movement no one can attribute to this control.
+run_verdict straggler_case eval \
+  "STRAGGLER_DRIVER_SUPPLIED=0
+   straggler_control_verdict '${STRAGGLER_OPERATOR}'"
+check "counter movement with no driver behind it is not the control" 3 \
+  "no PR4109_WORK_DRIVER was supplied"
+
+run_verdict straggler_case eval \
+  "STRAGGLER_DRIVER_RC=7
+   straggler_control_verdict '${STRAGGLER_OPERATOR}'"
+check "a failed driver leaves the sightings belonging to something else" 3 \
+  "work driver exited \[7\] originating the post-C ceremony"
+
+run_verdict straggler_case eval \
+  "STRAGGLER_DRIVER_TX=0
+   straggler_control_verdict '${STRAGGLER_OPERATOR}'"
+check "a driver that named no transaction attributes no sighting" 3 \
+  "named no transaction"
 
 # The all-candidate-down barrier, whose evidence used to be one probe of the
 # asking project's own two services. The readings below are the ones a passing
@@ -1635,6 +1722,148 @@ check "an enumeration blind to this gate's own candidates blocks" 3 \
 run_verdict barrier_case eval 'CANDIDATE_INVENTORY_READ=0'
 check "a daemon that could not be enumerated establishes no barrier" 3 \
   "could not be enumerated" "holds:0"
+
+# The rollback drain, whose step is named "with work represented" and used to
+# be decided by the stop command's exit status alone — a reading a fleet
+# holding nothing produces just as readily as one draining real ceremonies.
+drain_readings() {
+  # shellcheck disable=SC2034
+  ROLLBACK_DRIVER_SUPPLIED=1
+  # shellcheck disable=SC2034
+  ROLLBACK_DRIVER_RC=0
+  # shellcheck disable=SC2034
+  ROLLBACK_DRIVER_TX=3
+  # shellcheck disable=SC2034
+  ROLLBACK_INFLIGHT="2"
+  # shellcheck disable=SC2034
+  ROLLBACK_DRAIN_RC="0"
+  # shellcheck disable=SC2034
+  ROLLBACK_GRACE="20160"
+}
+
+drain_case() {
+  drain_readings
+  "$@"
+  rollback_drain_verdict
+}
+
+run_verdict drain_case :
+check "a drain over permits the driver originated and named holds" 0 \
+  "while the fleet held 2 security-v2 permit\(s\)"
+
+# The reading the exit status could not tell apart from success: nothing was in
+# flight, so a clean stop is a shutdown of idle processes.
+run_verdict drain_case eval 'ROLLBACK_INFLIGHT="0"'
+check "a clean stop of an idle fleet represents no work" 3 \
+  "no R1 node held a security-v2 permit when the stop was issued"
+
+run_verdict drain_case eval 'ROLLBACK_INFLIGHT="unreadable on r1-node-2"'
+check "an unreadable in-flight count is not read as work in flight" 3 \
+  "in-flight security-v2 permit count could not be read"
+
+run_verdict drain_case eval 'ROLLBACK_DRIVER_SUPPLIED=0'
+check "a drain with no driver behind it represents no originated work" 3 \
+  "no PR4109_WORK_DRIVER was supplied"
+
+run_verdict drain_case eval 'ROLLBACK_DRIVER_RC=5'
+check "a failed driver leaves the fleet holding whatever it happened to" 3 \
+  "work driver exited \[5\] originating the work this drain"
+
+run_verdict drain_case eval 'ROLLBACK_DRIVER_TX=0'
+check "a driver that named no transaction attributes no in-flight work" 3 \
+  "named no transaction"
+
+run_verdict drain_case eval 'ROLLBACK_DRAIN_RC="1"'
+check "a drain that did not complete is not a quiescence" 1 \
+  "termination grace exited \[1\] with 2 permit\(s\) in flight"
+
+run_verdict drain_case eval 'ROLLBACK_DRAIN_RC="no exit status"'
+check "a drain whose exit status was never observed is not a quiescence" 1 \
+  "exited \[no exit status\]"
+
+# The accounting every "was work offered here" rung above reads. It comes off a
+# real driver invocation rather than a constructed reading, because what is
+# being tested is that the driver's own exit status and report reach those
+# rungs at all — which is exactly what `|| true` around the call used to
+# discard.
+DRIVER="${WORK}/work-driver"
+HASH_A="0x$(printf 'a%.0s' {1..64})"
+HASH_B="0x$(printf 'b%.0s' {1..64})"
+
+write_driver() {
+  cat >"${DRIVER}"
+  chmod +x "${DRIVER}"
+}
+
+drive() {
+  set +e
+  CASE_OUT="$(
+    (
+      # shellcheck disable=SC2030,SC2031,SC2034
+      PR4109_WORK_DRIVER="${DRIVER}"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      STEP_TX_HASHES=""
+      run_work_driver "$1" || true
+      if driver_offered_work; then
+        printf 'offered:yes rc:%s tx:%s hashes:%s\n' \
+          "${WORK_DRIVER_RC}" "${WORK_DRIVER_TX_COUNT}" "${STEP_TX_HASHES}"
+      else
+        printf 'offered:no rc:%s tx:%s\n' \
+          "${WORK_DRIVER_RC}" "${WORK_DRIVER_TX_COUNT}"
+      fi
+    ) 2>&1
+  )"
+  CASE_RC=$?
+  set -e
+}
+
+write_driver <<EOF
+#!/usr/bin/env bash
+printf '{"transaction_hashes":["${HASH_A}","${HASH_B}"]}'
+EOF
+drive homogeneous-security-v2
+check "a driver that succeeds and names its transactions has offered work" 0 \
+  "offered:yes rc:0 tx:2" "${HASH_A}"
+
+write_driver <<'EOF'
+#!/usr/bin/env bash
+printf '{"transaction_hashes":[]}'
+EOF
+drive homogeneous-security-v2
+check "a driver that originated nothing has offered no work" 0 \
+  "offered:no rc:0 tx:0"
+
+write_driver <<'EOF'
+#!/usr/bin/env bash
+printf '{}'
+EOF
+drive homogeneous-security-v2
+check "a driver reporting no transactions at all has offered no work" 0 \
+  "offered:no rc:0 tx:0"
+
+write_driver <<EOF
+#!/usr/bin/env bash
+printf '{"transaction_hashes":["${HASH_A}"]}'
+exit 6
+EOF
+drive homogeneous-security-v2
+check "a driver that failed has offered no work whatever it printed" 0 \
+  "offered:no rc:6 tx:1"
+
+write_driver <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+drive homogeneous-security-v2
+check "a silent driver has offered no work" 0 "offered:no rc:0 tx:0"
+
+write_driver <<'EOF'
+#!/usr/bin/env bash
+printf 'not json at all'
+EOF
+drive homogeneous-security-v2
+check "a driver whose report cannot be read stops the step" 3 \
+  "in a form this rehearsal cannot read"
 
 # Neither container stage can be executed anywhere but a real rehearsal — they
 # need the immutable images, a chain, and persistent volumes — so a call site

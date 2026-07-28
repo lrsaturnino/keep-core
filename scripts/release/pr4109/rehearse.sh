@@ -3406,6 +3406,43 @@ fleet_metric_total() {
   printf '%s' "${total}"
 }
 
+# The operator chain address a node signs as, as it publishes it. This is the
+# identity a roster entry has to match for a legacy sighting to be attributed
+# to a specific node rather than to an unnamed peer.
+node_operator_address() {
+  probe_diagnostics "$1" |
+    node -e '
+      let raw = "";
+      process.stdin.on("data", (d) => (raw += d));
+      process.stdin.on("end", () => {
+        const address = (JSON.parse(raw).client_info || {}).chain_address;
+        if (!address) {
+          console.error("the node diagnostics carry no client_info.chain_address");
+          process.exit(1);
+        }
+        process.stdout.write(String(address));
+      });
+    '
+}
+
+# One live participation gauge summed across the whole R1 fleet, under the
+# same poisoning rule: a node whose gauge cannot be read leaves the total
+# unknown rather than smaller, because a step that treats an unreadable node as
+# a zero is reading a fleet it cannot see.
+fleet_gauge_total() {
+  local field="$1" service value total=0
+  for service in "${REHEARSAL_R1_SERVICES[@]}"; do
+    value="$(participation_field "${service}" "${field}" 2>/dev/null ||
+      printf '')"
+    if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
+      printf 'unreadable on %s' "${service}"
+      return 0
+    fi
+    total=$((total + value))
+  done
+  printf '%s' "${total}"
+}
+
 # One node's cutover peer roster snapshot, as it publishes it.
 roster_snapshot() {
   probe_diagnostics "$1" |
@@ -4089,10 +4126,32 @@ on: ${verdict}"
 # The output is either well formed or it is a broken instrument: a driver
 # whose report cannot be read has left the step unable to say what it drove,
 # and treating that as "no transactions" would record silence as evidence.
+
+# What the last run_work_driver call reported: its exit status, and how many
+# chain transactions it accounted for.
+#
+# Both are needed before a step may say work was offered. `|| true` around a
+# driver call turns a driver that failed, that was never installed, or that
+# originated nothing at all into "attempted", and every one of those leaves the
+# node in exactly the state a node nobody asked is in. A step whose contract is
+# that the gate refused something has to know something was actually put on the
+# chain for it to refuse.
+WORK_DRIVER_RC=0
+WORK_DRIVER_TX_COUNT=0
+
+# True when the last driver call both exited cleanly and named what it put on
+# the chain, which is the whole of "work was offered here".
+driver_offered_work() {
+  ((WORK_DRIVER_RC == 0)) && ((WORK_DRIVER_TX_COUNT > 0))
+}
+
 run_work_driver() {
   local phase="$1" report rc=0
   note "driving ${phase} work on the rehearsal chain"
+  WORK_DRIVER_RC=0
+  WORK_DRIVER_TX_COUNT=0
   report="$("${PR4109_WORK_DRIVER}" "${phase}")" || rc=$?
+  WORK_DRIVER_RC="${rc}"
 
   if [[ -n "${report//[[:space:]]/}" ]]; then
     local hashes
@@ -4126,6 +4185,11 @@ that cannot be read leaves the step with no account of what it drove"
 
     if [[ -n "${hashes}" ]]; then
       STEP_TX_HASHES="${STEP_TX_HASHES}${STEP_TX_HASHES:+,}${hashes}"
+      # A transaction hash cannot contain the separator, so the separators are
+      # the count. The number is what a step reads to know the driver named
+      # something rather than reported an empty run.
+      WORK_DRIVER_TX_COUNT=$(($(printf '%s' "${hashes}" | tr -cd ',' |
+        wc -c | tr -d '[:space:]') + 1))
     fi
   fi
 
@@ -4138,6 +4202,29 @@ that cannot be read leaves the step with no account of what it drove"
 STRAGGLER_BEFORE=()
 STRAGGLER_AFTER=()
 
+# The operator address the straggler publishes as its own, and the accounting
+# of the driver call that was supposed to make it announce.
+#
+# The expected operator is what turns "some operator entered the roster" into
+# the control's actual claim. The R1 fleet is on a network with exactly one
+# legacy peer, and the roster entry that matters is that peer's: an entry
+# naming anything else is the release attributing a legacy sighting to the
+# wrong node, which is worse evidence than no entry at all.
+STRAGGLER_EXPECTED_OPERATOR=""
+STRAGGLER_DRIVER_SUPPLIED=0
+STRAGGLER_DRIVER_RC=0
+STRAGGLER_DRIVER_TX=0
+
+# One operator address in the form two spellings of the same address share.
+# Chain addresses arrive EIP-55 checksummed from one source and lowercase from
+# another, and a comparison that reads those as different operators would
+# refuse the control for a difference in capitalization.
+normalize_operator() {
+  local address="${1#0x}"
+  address="${address#0X}"
+  printf '%s' "${address}" | tr '[:upper:]' '[:lower:]'
+}
+
 # The verdict those observations imply, over the same seam as the two below.
 #
 # The chain here is what the control is about and every link is required. A
@@ -4145,14 +4232,38 @@ STRAGGLER_AFTER=()
 # mismatch this node did not recognize as cross-format is a straggler it
 # failed to identify — the release's whole premise is that it does. A
 # recognized cross-format peer that never entered the roster is a sighting
-# that produced no evidence. And a roster whose revision moved without naming
-# an operator this node had not already seen is not the specific operator
-# becoming blocking evidence.
+# that produced no evidence. A roster whose revision moved without naming an
+# operator this node had not already seen is not the specific operator
+# becoming blocking evidence. And an operator that is not the straggler's own
+# is the release naming the wrong node.
 straggler_control_verdict() {
   local new_operators="$1"
   local step="post-cutover straggler fails closed and enters the roster"
   local assertion="old post-C behavior fails closed and becomes \
 operator-identified blocking evidence"
+
+  if ((STRAGGLER_DRIVER_SUPPLIED == 0)); then
+    block_step "${step}" "no PR4109_WORK_DRIVER was supplied, so no post-C \
+ceremony was originated for the straggler to announce into; whatever the \
+counters below hold was not produced by this control"
+    record_assertion "${assertion}" false "${step}"
+    return
+  fi
+  if ((STRAGGLER_DRIVER_RC != 0)); then
+    block_step "${step}" "the work driver exited [${STRAGGLER_DRIVER_RC}] \
+originating the post-C ceremony this control observes, so the announcement it \
+was meant to provoke was never provoked and any counter movement below \
+belongs to something else"
+    record_assertion "${assertion}" false "${step}"
+    return
+  fi
+  if ((STRAGGLER_DRIVER_TX == 0)); then
+    block_step "${step}" "the work driver exited cleanly but named no \
+transaction, so nothing attributes the sightings below to the post-C ceremony \
+this control claims to have originated"
+    record_assertion "${assertion}" false "${step}"
+    return
+  fi
 
   local i deltas=() unreadable=()
   for i in 0 1 2; do
@@ -4194,14 +4305,41 @@ legacy roster addition(s) from ${deltas[1]} cross-format sighting(s), but its \
 roster named no operator it had not already seen; a refusal that does not \
 become operator-identified evidence is not what this control is about"
     record_assertion "${assertion}" false "${step}"
+  elif [[ -z "${STRAGGLER_EXPECTED_OPERATOR}" ]]; then
+    block_step "${step}" "the observing node's roster newly named operator(s) \
+${new_operators}, but the straggler's own operator address could not be read \
+off the prior node, so nothing here can say the roster named the straggler \
+rather than some other peer"
+    record_assertion "${assertion}" false "${step}"
+  elif ! straggler_operator_named "${new_operators}"; then
+    record_step "${step}" fail "the observing node newly named operator(s) \
+${new_operators} in its legacy roster, and none of them is the straggler's own \
+operator ${STRAGGLER_EXPECTED_OPERATOR}; a sighting attributed to the wrong \
+node is worse evidence than none, because the operator the roster names is \
+what a release decision would act on"
+    record_assertion "${assertion}" false "${step}"
   else
     record_step "${step}" pass "the observing node saw ${deltas[0]} \
 session-ID mismatch(es), recognized ${deltas[1]} of them as cross-format, and \
-turned them into ${deltas[2]} legacy roster addition(s) naming operator(s) \
-${new_operators}, so the straggler failed closed and was named rather than \
-merely refused"
+turned them into ${deltas[2]} legacy roster addition(s) naming the straggler's \
+own operator ${STRAGGLER_EXPECTED_OPERATOR} (newly named: ${new_operators}), \
+so the straggler failed closed and was named rather than merely refused"
     record_assertion "${assertion}" true "${step}"
   fi
+}
+
+# True when the straggler's own operator is among the ones the roster newly
+# named. Kept apart from the ladder so the comparison — which is where two
+# spellings of one address decide a release gate — is one readable statement.
+straggler_operator_named() {
+  local expected operator
+  expected="$(normalize_operator "${STRAGGLER_EXPECTED_OPERATOR}")"
+  for operator in $1; do
+    if [[ "$(normalize_operator "${operator}")" == "${expected}" ]]; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 # What the clock-failure step observed. The step fills these from the fleet;
@@ -4216,6 +4354,11 @@ CLOCK_PERMITS_AFTER=""
 CLOCK_REFUSALS_BEFORE=""
 CLOCK_REFUSALS_AFTER=""
 CLOCK_REFUSAL_ATTEMPTED=0
+# The offer was made and the driver could not carry it out — a broken
+# instrument, not a gate nobody challenged. Both leave the permit counter
+# standing still, so the record has to tell them apart.
+CLOCK_OFFER_FAILED=0
+CLOCK_OFFER_RC=""
 
 # The verdict those observations imply, with no fleet interaction of its own,
 # so the decision can be exercised directly against constructed readings.
@@ -4270,6 +4413,14 @@ $((CLOCK_ABORTS_AFTER - CLOCK_ABORTS_BEFORE)) clock cancellation(s) \
 neither canceled nor accounted for, and ${CLOCK_HELD_AFTER:-an unreadable \
 number of} ceremonies remain active"
     record_assertion "${assertion}" false "${step}"
+  elif ((CLOCK_OFFER_FAILED == 1)); then
+    block_step "${step}" "the gate reported clock_unavailable and canceled the \
+$((CLOCK_ABORTS_AFTER - CLOCK_ABORTS_BEFORE)) permit(s) it held, but the work \
+driver exited [${CLOCK_OFFER_RC:-unreadable}] without naming a transaction \
+when it was asked to originate work against the blind gate; nothing was put on \
+the chain for the gate to refuse, so its permit counter standing still \
+evidences no refusal"
+    record_assertion "${assertion}" false "${step}"
   elif ((CLOCK_REFUSAL_ATTEMPTED == 0)); then
     block_step "${step}" "the gate reported clock_unavailable and canceled \
 the $((CLOCK_ABORTS_AFTER - CLOCK_ABORTS_BEFORE)) permit(s) it held, but no \
@@ -4313,6 +4464,11 @@ QUIESCE_FORCED_BEFORE=""
 QUIESCE_FORCED_AFTER=""
 QUIESCE_DRAINED=0
 QUIESCE_ATTEMPTED=0
+# Set when the offer was made and the driver could not carry it out, which is a
+# broken instrument rather than a node that was never asked. The two produce
+# the same unchanged counters and must not produce the same account of why.
+QUIESCE_OFFER_FAILED=0
+QUIESCE_OFFER_RC=""
 QUIESCE_GRACE=""
 
 quiescence_verdict() {
@@ -4358,6 +4514,13 @@ them; the node stopped answering with its in-flight count unobserved at zero, \
 so nothing here says those permits finished rather than went down with the \
 process"
     record_assertion "${assertion}" false "${step}"
+  elif ((QUIESCE_OFFER_FAILED == 1)); then
+    block_step "${step}" "${node} entered quiescing and let all \
+${QUIESCE_HELD_BEFORE} held permits finish, but the work driver exited \
+[${QUIESCE_OFFER_RC:-unreadable}] without naming a transaction when it was \
+asked to originate work against the quiescing node, so nothing was put on the \
+chain for it to refuse and the unchanged permit counter records only that"
+    record_assertion "${assertion}" false "${step}"
   elif ((QUIESCE_ATTEMPTED == 0)); then
     block_step "${step}" "${node} entered quiescing, let all \
 ${QUIESCE_HELD_BEFORE} held permits finish, and issued none — but no work was \
@@ -4372,6 +4535,69 @@ quiescing and issued no permit for it (${QUIESCE_ISSUED_BEFORE} to \
 ${QUIESCE_ISSUED_AFTER}), and let every held permit finish inside the \
 reviewed ${QUIESCE_GRACE}s grace — in-flight count observed at zero, no \
 forced abort (${QUIESCE_FORCED_BEFORE} to ${QUIESCE_FORCED_AFTER})"
+    record_assertion "${assertion}" true "${step}"
+  fi
+}
+
+# What the rollback gate's drain observed, and the verdict they imply.
+#
+# The step is named "with work represented" and used to record a pass on the
+# drain's exit status alone. A `compose stop` that returns zero over a fleet
+# holding nothing is a clean shutdown of idle processes: it evidences that
+# stopping works, not that a node holding protocol work drains rather than
+# dropping it, which is the property a rollback decision rests on. So the
+# permits have to be observed in flight at the moment the stop is issued, and
+# the driver that put them there has to have said what it put on the chain.
+ROLLBACK_DRIVER_SUPPLIED=0
+ROLLBACK_DRIVER_RC=0
+ROLLBACK_DRIVER_TX=0
+ROLLBACK_INFLIGHT=""
+ROLLBACK_DRAIN_RC=""
+ROLLBACK_GRACE=""
+
+rollback_drain_verdict() {
+  local step="quiesce every R1 node with work represented"
+  local assertion="every R1 node drains to a stop within the reviewed \
+termination grace"
+
+  if ((ROLLBACK_DRIVER_SUPPLIED == 0)); then
+    block_step "${step}" "no PR4109_WORK_DRIVER was supplied, so the fleet \
+held no originated work when it was told to stop; a drain of idle processes \
+says stopping works and nothing about what happens to work in flight"
+    record_assertion "${assertion}" false "${step}"
+  elif ((ROLLBACK_DRIVER_RC != 0)); then
+    block_step "${step}" "the work driver exited [${ROLLBACK_DRIVER_RC}] \
+originating the work this drain was to be performed over, so the fleet was \
+stopped holding whatever it happened to hold"
+    record_assertion "${assertion}" false "${step}"
+  elif ((ROLLBACK_DRIVER_TX == 0)); then
+    block_step "${step}" "the work driver exited cleanly but named no \
+transaction, so nothing attributes the fleet's in-flight work to this gate"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ ! "${ROLLBACK_INFLIGHT}" =~ ^[0-9]+$ ]]; then
+    block_step "${step}" "the fleet's in-flight security-v2 permit count could \
+not be read (${ROLLBACK_INFLIGHT:-unreadable}) when the stop was issued, so \
+nothing here observed whether the drain had any work to represent"
+    record_assertion "${assertion}" false "${step}"
+  elif ((ROLLBACK_INFLIGHT == 0)); then
+    block_step "${step}" "the driver originated work and named its \
+transactions, but no R1 node held a security-v2 permit when the stop was \
+issued; the drain below is a shutdown of idle processes and evidences nothing \
+about work in flight"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ "${ROLLBACK_DRAIN_RC}" != "0" ]]; then
+    record_step "${step}" fail "stopping the R1 nodes under the reviewed \
+manifest's ${ROLLBACK_GRACE}s termination grace exited \
+[${ROLLBACK_DRAIN_RC}] with ${ROLLBACK_INFLIGHT} permit(s) in flight; a drain \
+that did not complete is not a quiescence and the state it left is not what \
+the audit below reads"
+    record_assertion "${assertion}" false "${step}"
+  else
+    record_step "${step}" pass "every R1 node was stopped under the reviewed \
+manifest's ${ROLLBACK_GRACE}s termination grace while the fleet held \
+${ROLLBACK_INFLIGHT} security-v2 permit(s) the driver had originated and named \
+on chain, so a draining node holding work was never SIGKILLed before its \
+in-process backstop"
     record_assertion "${assertion}" true "${step}"
   fi
 }
@@ -4520,8 +4746,19 @@ current chain" false \
       printf '')")
   done
   operators_before="$(roster_operators "${observer}")"
+  # Read from the straggler itself while it is still on the network, because
+  # the operator this control is about is the one the prior node signs as —
+  # not one named in a configuration file the roster was never compared to.
+  STRAGGLER_EXPECTED_OPERATOR="$(node_operator_address \
+    "${REHEARSAL_PRIOR_SERVICE}" 2>/dev/null || printf '')"
+  STRAGGLER_DRIVER_SUPPLIED=0
+  STRAGGLER_DRIVER_RC=0
+  STRAGGLER_DRIVER_TX=0
   if [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
+    STRAGGLER_DRIVER_SUPPLIED=1
     run_work_driver post-cutover-straggler || true
+    STRAGGLER_DRIVER_RC="${WORK_DRIVER_RC}"
+    STRAGGLER_DRIVER_TX="${WORK_DRIVER_TX_COUNT}"
   fi
   for metric in "${ANNOUNCER_CUTOVER_METRICS[@]}"; do
     STRAGGLER_AFTER+=("$(metric_value "${observer}" "${metric}" || printf '')")
@@ -4697,9 +4934,21 @@ no new legacy permit (participation_mode_legacy_total unchanged at \
   # chain but still on the protocol network, so work originated now reaches it
   # as peer traffic and the gate is what decides whether it joins.
   CLOCK_REFUSAL_ATTEMPTED=0
+  CLOCK_OFFER_FAILED=0
+  CLOCK_OFFER_RC=""
   if [[ -n "${PR4109_WORK_DRIVER:-}" && "${CLOCK_STATE}" == "clock_unavailable" ]]; then
     run_work_driver clock-failure-refusal || true
-    CLOCK_REFUSAL_ATTEMPTED=1
+    # Only a driver that exited cleanly and named the transactions it submitted
+    # has offered this gate anything. A driver that failed, or one that
+    # originated nothing, leaves the node in the state a node nobody asked is
+    # in — and that state is what the rest of this ladder must not read as a
+    # refusal.
+    if driver_offered_work; then
+      CLOCK_REFUSAL_ATTEMPTED=1
+    else
+      CLOCK_OFFER_FAILED=1
+      CLOCK_OFFER_RC="${WORK_DRIVER_RC}"
+    fi
     # The offer travels peer-to-peer and the gate answers it on its own
     # schedule, so the counters are read after a settling window rather than
     # immediately, and the state is re-read to be sure the window was spent
@@ -4772,6 +5021,8 @@ originated on the rehearsal chain that is still running at shutdown"
     QUIESCE_FORCED_AFTER="${QUIESCE_FORCED_BEFORE}"
     QUIESCE_DRAINED=0
     QUIESCE_ATTEMPTED=0
+    QUIESCE_OFFER_FAILED=0
+    QUIESCE_OFFER_RC=""
     deadline=$((SECONDS + QUIESCE_GRACE))
     while ((SECONDS < deadline)); do
       state_now="$(participation_field "${quiesce_node}" gate_state \
@@ -4780,11 +5031,19 @@ originated on the rehearsal chain that is still running at shutdown"
         QUIESCE_STATE="quiescing"
         # Offered once the node has actually entered quiescence, because the
         # property is what a quiescing node does with new work — and a node
-        # that was never asked answers exactly like one that refused.
-        if ((QUIESCE_ATTEMPTED == 0)) &&
+        # that was never asked answers exactly like one that refused. Only a
+        # clean driver run that named its transactions counts as having asked;
+        # a failed or empty one leaves nothing for the node to have refused,
+        # and QUIESCE_OFFER_FAILED carries that apart from never having tried.
+        if ((QUIESCE_ATTEMPTED == 0 && QUIESCE_OFFER_FAILED == 0)) &&
           [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
           run_work_driver quiesce-refusal || true
-          QUIESCE_ATTEMPTED=1
+          if driver_offered_work; then
+            QUIESCE_ATTEMPTED=1
+          else
+            QUIESCE_OFFER_FAILED=1
+            QUIESCE_OFFER_RC="${WORK_DRIVER_RC}"
+          fi
         fi
       fi
       held_now="$(participation_field "${quiesce_node}" \
@@ -4867,9 +5126,24 @@ nowhere to capture them to"
   for service in "${REHEARSAL_R1_SERVICES[@]}"; do
     observe_gate_gauges "${service}"
   done
+  ROLLBACK_DRIVER_SUPPLIED=0
+  ROLLBACK_DRIVER_RC=0
+  ROLLBACK_DRIVER_TX=0
   if [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
+    ROLLBACK_DRIVER_SUPPLIED=1
     run_work_driver rollback-inflight || true
+    ROLLBACK_DRIVER_RC="${WORK_DRIVER_RC}"
+    ROLLBACK_DRIVER_TX="${WORK_DRIVER_TX_COUNT}"
   fi
+
+  # The permits the fleet is actually holding as the stop is issued. This is
+  # what makes the drain below a statement about work in flight rather than
+  # about idle processes exiting, and it is read after the driver has run and
+  # before anything is stopped, because that is the only moment it describes.
+  ROLLBACK_INFLIGHT="$(fleet_gauge_total active_security_v2_ceremonies)"
+  STEP_GAUGES="${STEP_GAUGES}${STEP_GAUGES:+,}\
+\"fleet_active_security_v2_ceremonies\":\"${ROLLBACK_INFLIGHT}\""
+
   # The grace comes out of the reviewed manifest, which the Go drift test
   # pins to the compiled bounds and the compose file's stop_grace_period to.
   # A number restated here would go on stopping nodes under the old ceiling
@@ -4877,6 +5151,7 @@ nowhere to capture them to"
   # evidence natural completion.
   local grace
   grace="$(manifest_termination_grace)"
+  ROLLBACK_GRACE="${grace}"
 
   local prior_samples=0 prior_sightings=0
   if node_reachable "${REHEARSAL_PRIOR_SERVICE}"; then
@@ -4925,20 +5200,8 @@ nowhere to capture them to"
   fi
   prior_samples=$((prior_samples + 1))
 
-  if [[ "${drain_rc}" == "0" ]]; then
-    record_step "quiesce every R1 node with work represented" pass \
-      "every R1 node was stopped under the reviewed manifest's ${grace}s \
-termination grace, so a draining node was never SIGKILLed before its \
-in-process backstop"
-  else
-    record_step "quiesce every R1 node with work represented" fail \
-      "stopping the R1 nodes under the reviewed manifest's ${grace}s \
-termination grace exited [${drain_rc}]; a drain that did not complete is not \
-a quiescence and the state it left is not what the audit below reads"
-    record_assertion \
-      "every R1 node drains to a stop within the reviewed termination grace" \
-      false "quiesce every R1 node with work represented"
-  fi
+  ROLLBACK_DRAIN_RC="${drain_rc}"
+  rollback_drain_verdict
 
   begin_step "no prior binary starts during quiescence"
   if ((prior_sightings > 0)); then

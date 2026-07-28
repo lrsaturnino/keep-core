@@ -203,6 +203,29 @@ recording that as "no transactions" would enter silence as evidence. The
 acceptance conditions still rest on the fleet's own counters; the hashes are
 what let those counters be checked against the chain.
 
+Both halves of that report are what a step reads to decide work was offered at
+all. A driver call that exited nonzero, that was never supplied, or that named
+no transaction leaves the fleet in exactly the state a fleet nobody asked is
+in — unchanged permit counters, an untouched roster — so a step whose contract
+is that the gate *refused* something requires a clean exit and at least one
+named transaction before it treats its readings as a refusal. The clock-failure
+and quiescence probes distinguish the two: a driver that failed while
+attempting the offer is recorded as a broken instrument naming its exit status,
+not as a gate nobody challenged. The rollback drain goes further and reads the
+fleet's in-flight security-v2 permits at the moment the stop is issued: a
+`compose stop` that returns zero over an idle fleet evidences that stopping
+works, not that a node holding protocol work drains rather than dropping it,
+which is the property a rollback decision rests on.
+
+The straggler control binds its roster entry to the straggler's own operator.
+The prior node publishes the address it signs as at `/diagnostics`
+(`client_info.chain_address`), and that address is read off it while it is
+still on the network and compared — insensitive to EIP-55 versus lowercase
+spelling — against the operators the observing node's roster newly named. A
+roster that moved without naming that operator is the release attributing a
+legacy sighting to the wrong node, which is worse evidence than none: the name
+is what a release decision would act on.
+
 The rollback gate's own barrier has two halves and neither substitutes for
 the other. Every release candidate must be provably down, and the prior binary
 must have been absent for the whole of it — so the drain runs while the prior
