@@ -949,6 +949,42 @@ run_capture wrong_cutover_fleet
 check "a fleet armed with another cutover block refuses the run" 3 \
   "armed cutover block \[8000000\]" "bound to C=\[9000000\]"
 
+# Neither container stage can be executed anywhere but a real rehearsal — they
+# need the immutable images, a chain, and persistent volumes — so a call site
+# left pointing at a renamed helper survives every check in this file and
+# every static analyzer, and surfaces in the most expensive place there is.
+# Each helper those stages name in command position must therefore exist now.
+# Only names carrying an underscore are examined: those are this driver's own
+# helpers, and testing them says nothing about which external tools happen to
+# be installed on the machine running the self-test.
+UNDEFINED_HELPERS=""
+while read -r HELPER; do
+  [[ -n "${HELPER}" ]] || continue
+  declare -F "${HELPER}" >/dev/null 2>&1 ||
+    UNDEFINED_HELPERS="${UNDEFINED_HELPERS} ${HELPER}"
+done < <(awk '
+  /^(stage_single_release|stage_rollback|fleet_up|capture_r1_release_identity|run_state_audit|emit_evidence_record)\(\) \{/ { inside = 1 }
+  inside {
+    # A wrapped string continues the line before it, so its first word is
+    # prose and not a command. Dropping those is what keeps this a scan of
+    # call sites rather than of the refusal messages around them.
+    if (!continuation) print
+    continuation = (/\\$/) ? 1 : 0
+  }
+  inside && /^\}/ { inside = 0 }
+' "${TEST_DIR}/rehearse.sh" |
+  sed -E 's/^[[:space:]]*//; s/^(if|elif|until|while|then|else|do|!)[[:space:]]+//' |
+  grep -oE '^[a-z_][a-z0-9_]*([[:space:]]|$)' |
+  sed -E 's/[[:space:]]+$//' | sort -u | grep _)
+if [[ -z "${UNDEFINED_HELPERS}" ]]; then
+  printf 'ok   every helper the container stages call is defined\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL the container stages call undefined helpers:%s\n' \
+    "${UNDEFINED_HELPERS}"
+  FAILED=$((FAILED + 1))
+fi
+
 # A rehearsal run from bytes no commit accounts for must not produce a record
 # at all: the emitter is where that is caught, before anything is written.
 E="${WORK}/emitted-dirty"

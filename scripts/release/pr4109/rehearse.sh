@@ -3042,6 +3042,58 @@ node_release_identity() {
     '
 }
 
+# One counter summed across the whole R1 fleet. A control that watched a
+# single node would pass on a fleet where every other node sat idle, and a
+# node whose counter cannot be read makes the total unknown rather than
+# smaller — so an unreadable one poisons the sum on purpose.
+fleet_metric_total() {
+  local metric="$1" service value total=0
+  for service in "${REHEARSAL_R1_SERVICES[@]}"; do
+    value="$(metric_value "${service}" "${metric}" 2>/dev/null || printf '')"
+    if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
+      printf 'unreadable on %s' "${service}"
+      return 0
+    fi
+    total=$((total + value))
+  done
+  printf '%s' "${total}"
+}
+
+# One node's cutover peer roster snapshot, as it publishes it.
+roster_snapshot() {
+  probe_diagnostics "$1" |
+    node -e '
+      let raw = "";
+      process.stdin.on("data", (d) => (raw += d));
+      process.stdin.on("end", () => {
+        const snapshot = JSON.parse(raw).cutover_legacy_peers;
+        process.stdout.write(JSON.stringify(snapshot || null));
+      });
+    '
+}
+
+# The operator addresses one node has attributed legacy sightings to, sorted
+# and one per line so two readings can be differenced. The roster object is
+# present from startup with an empty peer list, so its existence says nothing
+# and only the set of operators in it can be compared across an event.
+roster_operators() {
+  roster_snapshot "$1" |
+    node -e '
+      let raw = "";
+      process.stdin.on("data", (d) => (raw += d));
+      process.stdin.on("end", () => {
+        const snapshot = JSON.parse(raw) || {};
+        const operators = (snapshot.peers || [])
+          .map((peer) => peer.operator_address)
+          .filter(Boolean)
+          .sort();
+        process.stdout.write(
+          operators.length > 0 ? operators.join("\n") + "\n" : ""
+        );
+      });
+    '
+}
+
 # One field of a JSON document held in a shell variable.
 json_field() {
   printf '%s' "$1" | node -e '
@@ -3465,7 +3517,7 @@ stage_single_release() {
   REHEARSAL_GATE="single_release"
   stage_preflight
   fleet_up "${REHEARSAL_PRIOR_SERVICE}" "${REHEARSAL_R1_SERVICES[@]}"
-  capture_r1_identity
+  capture_r1_release_identity
 
   # Step 1 and step 2 both need R1 nodes running legacy-anchored ceremonies
   # alongside the prior binary, which is the one thing this release cannot do.
@@ -3483,24 +3535,66 @@ stage_single_release() {
   # in the processes started before C, with no restart in between.
   begin_step "cross C without restart"
   local service
+  # A crossing has two sides, and only the second one is observable at the
+  # end. A fleet started after C already reports open_security_v2 and would
+  # satisfy every check below without ever having crossed anything, so the
+  # pre-C side is established first: every node on the legacy side of its own
+  # gate, at a block below the C it armed. Without that this step evidences a
+  # state, not a transition.
+  local before_c=()
   for service in "${REHEARSAL_R1_SERVICES[@]}"; do
     observe_canonical_block "${service}"
+    local pre_state pre_block
+    pre_state="$(participation_field "${service}" gate_state 2>/dev/null || true)"
+    pre_block="$(participation_field "${service}" current_block 2>/dev/null || true)"
+    if [[ "${pre_state}" != "open_legacy" ]] ||
+      [[ ! "${pre_block}" =~ ^[0-9]+$ ]] ||
+      ((pre_block >= CUTOVER_BLOCK)); then
+      before_c+=("${service} reported [${pre_state:-unreadable}] at block \
+[${pre_block:-unreadable}]")
+    fi
   done
-  if await_gate_state open_security_v2 3600; then
+
+  if ((${#before_c[@]} > 0)); then
+    record_step "cross C without restart" blocked "the fleet was not on the \
+legacy side of C when this step began — ${before_c[*]} — so nothing here \
+could observe a crossing; the rehearsal chain must be below C=\
+[${CUTOVER_BLOCK}] when the fleet starts"
+    record_assertion \
+      "the gate crosses C in-process, without a restart or a global toggle" \
+      false "cross C without restart"
+  elif await_gate_state open_security_v2 3600; then
+    local permits_after=0 permits_read=1
     for service in "${REHEARSAL_R1_SERVICES[@]}"; do
       observe_canonical_block "${service}"
       observe_gate_gauges "${service}"
+      local issued
+      issued="$(metric_value "${service}" \
+        participation_mode_security_v2_total || printf 'unreadable')"
+      if [[ "${issued}" =~ ^[0-9]+$ ]]; then
+        permits_after=$((permits_after + issued))
+      else
+        permits_read=0
+      fi
     done
-    STEP_PERMIT_MODES='"security_v2"'
+    # The record names a permit mode only where a permit was seen. Writing
+    # security_v2 into every crossing record regardless would assert an
+    # observation of the thing this whole release is about on the strength of
+    # a state string.
+    if ((permits_read == 1 && permits_after > 0)); then
+      STEP_PERMIT_MODES='"security_v2"'
+    fi
     record_step "cross C without restart" pass \
-      "both R1 gates report open_security_v2 in the processes that were \
-running before C; neither was restarted"
+      "both R1 gates went from open_legacy below C to open_security_v2 in the \
+processes that were running before C; neither was restarted (security-v2 \
+permits issued fleet-wide so far: ${permits_after})"
     record_assertion \
       "the gate crosses C in-process, without a restart or a global toggle" \
       true "cross C without restart"
   else
     record_step "cross C without restart" fail \
-      "the R1 gates did not report open_security_v2 within an hour of C"
+      "the R1 gates were on the legacy side of C and did not report \
+open_security_v2 within an hour of it"
     record_assertion \
       "the gate crosses C in-process, without a restart or a global toggle" \
       false "cross C without restart"
@@ -3552,39 +3646,58 @@ current chain" false \
   # R1 fleet names its operator, is exactly what the negative control proves —
   # and it needs no legacy capability on the R1 side, only refusals.
   begin_step "post-cutover straggler fails closed and enters the roster"
-  local refusals_before refusals_after roster
-  refusals_before="$(metric_value "${REHEARSAL_R1_SERVICES[0]}" \
+  local observer="${REHEARSAL_R1_SERVICES[0]}"
+  local refusals_before refusals_after operators_before operators_after roster
+  refusals_before="$(metric_value "${observer}" \
     participation_refusals_total || printf '0')"
+  operators_before="$(roster_operators "${observer}")"
   if [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
     run_work_driver post-cutover-straggler || true
   fi
-  refusals_after="$(metric_value "${REHEARSAL_R1_SERVICES[0]}" \
+  refusals_after="$(metric_value "${observer}" \
     participation_refusals_total || printf '0')"
-  roster="$(probe_diagnostics "${REHEARSAL_R1_SERVICES[0]}" |
-    node -e '
-      let raw = "";
-      process.stdin.on("data", (d) => (raw += d));
-      process.stdin.on("end", () => {
-        const snapshot = JSON.parse(raw).cutover_legacy_peers;
-        process.stdout.write(JSON.stringify(snapshot || null));
-      });
-    ')"
-  observe_gate_gauges "${REHEARSAL_R1_SERVICES[0]}"
+  operators_after="$(roster_operators "${observer}")"
+  roster="$(roster_snapshot "${observer}")"
+  observe_gate_gauges "${observer}"
   STEP_STATE_CHECKSUMS="\"roster_snapshot_sha256\":\"$(printf '%s' "${roster}" |
     hash_stdin)\""
-  if [[ "${refusals_after}" != "${refusals_before}" && "${roster}" != "null" ]]; then
+
+  # The roster object exists on every node from startup and is non-null with
+  # an empty peer list, so its presence proves nothing. What the negative
+  # control is about is a specific operator becoming named blocking evidence,
+  # so the two readings are differenced: an operator this node had not seen
+  # before the driven post-C ceremony, alongside the refusal that put it
+  # there. A generic refusal counter moving on its own could be any refusal at
+  # all, including one with no cross-format announcement behind it.
+  local new_operators
+  new_operators="$(comm -13 <(printf '%s' "${operators_before}") \
+    <(printf '%s' "${operators_after}") | tr '\n' ' ')"
+  new_operators="${new_operators% }"
+
+  if [[ "${refusals_after}" != "${refusals_before}" && -n "${new_operators}" ]]; then
     record_step "post-cutover straggler fails closed and enters the roster" \
       pass "R1 refusals rose from ${refusals_before} to ${refusals_after} and \
-the node-local roster carries the straggler's operator"
+the node-local roster gained operator(s) ${new_operators}, so the straggler \
+was refused and named rather than merely refused"
     record_assertion \
       "old post-C behavior fails closed and becomes operator-identified \
 blocking evidence" true \
       "post-cutover straggler fails closed and enters the roster"
+  elif [[ "${refusals_after}" != "${refusals_before}" ]]; then
+    record_step "post-cutover straggler fails closed and enters the roster" \
+      fail "R1 refusals rose from ${refusals_before} to ${refusals_after}, but \
+the node-local roster named no operator it had not already seen; a refusal \
+that does not become operator-identified evidence is not what this control \
+is about"
+    record_assertion \
+      "old post-C behavior fails closed and becomes operator-identified \
+blocking evidence" false \
+      "post-cutover straggler fails closed and enters the roster"
   else
     record_step "post-cutover straggler fails closed and enters the roster" \
-      blocked "no refusal or roster movement was observed; without a work \
-driver originating post-C ceremonies the straggler never attempts one, so \
-there is nothing for the R1 fleet to refuse"
+      blocked "no refusal and no new roster operator was observed; without a \
+work driver originating post-C ceremonies the straggler never attempts one, \
+so there is nothing for the R1 fleet to refuse"
     record_assertion \
       "old post-C behavior fails closed and becomes operator-identified \
 blocking evidence" false \
@@ -3616,37 +3729,69 @@ network"
   # Step 6. A homogeneous R1 fleet running real security-v2 ceremonies is the
   # positive control, and it needs work originated on the chain.
   begin_step "homogeneous security-v2 controls with no legacy sightings"
-  if [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
-    if run_work_driver homogeneous-security-v2; then
-      local legacy_total
-      legacy_total="$(metric_value "${REHEARSAL_R1_SERVICES[0]}" \
-        participation_mode_legacy_total || printf 'unreadable')"
-      for service in "${REHEARSAL_R1_SERVICES[@]}"; do
-        observe_gate_gauges "${service}"
-      done
-      STEP_PERMIT_MODES='"security_v2"'
-      if [[ "${legacy_total}" == "0" ]]; then
-        record_step "homogeneous security-v2 controls with no legacy sightings" \
-          pass "every permit issued after C was security-v2 and no legacy \
-permit was issued at any point"
-        record_assertion \
-          "post-C ceremonies run security-v2 with no legacy sightings" true \
-          "homogeneous security-v2 controls with no legacy sightings"
-      else
-        record_step "homogeneous security-v2 controls with no legacy sightings" \
-          fail "participation_mode_legacy_total is [${legacy_total}]"
-        record_assertion \
-          "post-C ceremonies run security-v2 with no legacy sightings" false \
-          "homogeneous security-v2 controls with no legacy sightings"
-      fi
-    else
-      record_step "homogeneous security-v2 controls with no legacy sightings" \
-        fail "the work driver reported failure originating post-C ceremonies"
-    fi
-  else
+  if [[ -z "${PR4109_WORK_DRIVER:-}" ]]; then
     block_step "homogeneous security-v2 controls with no legacy sightings" \
       "no PR4109_WORK_DRIVER was supplied, so no tBTC or beacon ceremony was \
 originated on the rehearsal chain and there is nothing to observe"
+  else
+    # A zero legacy counter is true of a fleet that ran nothing at all, so the
+    # positive control has to be positive about something: permits actually
+    # issued under security-v2 while the driver ran. The count is taken before
+    # and after so it is this step's ceremonies being counted rather than the
+    # crossing's, and it is summed across the fleet because a control that
+    # only watched one node would pass on a fleet where the others sat idle.
+    local permits_before permits_after legacy_after
+    permits_before="$(fleet_metric_total participation_mode_security_v2_total)"
+    local driver_rc=0
+    run_work_driver homogeneous-security-v2 || driver_rc=$?
+    permits_after="$(fleet_metric_total participation_mode_security_v2_total)"
+    legacy_after="$(fleet_metric_total participation_mode_legacy_total)"
+    for service in "${REHEARSAL_R1_SERVICES[@]}"; do
+      observe_gate_gauges "${service}"
+    done
+
+    if ((driver_rc != 0)); then
+      record_step "homogeneous security-v2 controls with no legacy sightings" \
+        fail "the work driver exited [${driver_rc}] originating post-C \
+ceremonies"
+      record_assertion \
+        "post-C ceremonies run security-v2 with no legacy sightings" false \
+        "homogeneous security-v2 controls with no legacy sightings"
+    elif [[ ! "${permits_before}" =~ ^[0-9]+$ ]] ||
+      [[ ! "${permits_after}" =~ ^[0-9]+$ ]] ||
+      [[ ! "${legacy_after}" =~ ^[0-9]+$ ]]; then
+      record_step "homogeneous security-v2 controls with no legacy sightings" \
+        blocked "the fleet permit counters could not be read \
+(security-v2 [${permits_before}] to [${permits_after}], legacy \
+[${legacy_after}]), so nothing here observed which mode the ceremonies ran in"
+      record_assertion \
+        "post-C ceremonies run security-v2 with no legacy sightings" false \
+        "homogeneous security-v2 controls with no legacy sightings"
+    elif ((permits_after <= permits_before)); then
+      record_step "homogeneous security-v2 controls with no legacy sightings" \
+        fail "the work driver reported success but the fleet issued no new \
+security-v2 permit (still ${permits_after}); a control that observes no \
+ceremony is not a positive control"
+      record_assertion \
+        "post-C ceremonies run security-v2 with no legacy sightings" false \
+        "homogeneous security-v2 controls with no legacy sightings"
+    elif ((legacy_after > 0)); then
+      record_step "homogeneous security-v2 controls with no legacy sightings" \
+        fail "the fleet issued $((permits_after - permits_before)) new \
+security-v2 permits but participation_mode_legacy_total is [${legacy_after}]"
+      record_assertion \
+        "post-C ceremonies run security-v2 with no legacy sightings" false \
+        "homogeneous security-v2 controls with no legacy sightings"
+    else
+      STEP_PERMIT_MODES='"security_v2"'
+      record_step "homogeneous security-v2 controls with no legacy sightings" \
+        pass "the fleet issued $((permits_after - permits_before)) new \
+security-v2 permits driving post-C ceremonies and no legacy permit at any \
+point"
+      record_assertion \
+        "post-C ceremonies run security-v2 with no legacy sightings" true \
+        "homogeneous security-v2 controls with no legacy sightings"
+    fi
   fi
 
   # Step 7. Severing a node from the chain endpoint is a real clock failure:
@@ -3692,29 +3837,99 @@ of C" false "clock failure quarantines work rather than guessing a mode"
   # needs the fork.
   begin_step "quiescence with an in-flight security-v2 permit"
   local quiesce_node="${REHEARSAL_R1_SERVICES[1]}"
-  compose stop --timeout 60 "${quiesce_node}" &
-  local stop_pid=$!
-  local quiesce_state=""
-  deadline=$((SECONDS + 60))
-  while ((SECONDS < deadline)); do
-    quiesce_state="$(participation_field "${quiesce_node}" gate_state 2>/dev/null || true)"
-    [[ "${quiesce_state}" == "quiescing" ]] && break
-    sleep 2
-  done
-  wait "${stop_pid}" || true
-  if [[ "${quiesce_state}" == "quiescing" ]]; then
-    record_step "quiescence with an in-flight security-v2 permit" pass \
-      "the node entered quiescing on shutdown: no new permits issued, held \
-permits left to run to natural completion"
-    record_assertion \
-      "graceful quiescence starts no new work and lets held permits finish" \
-      true "quiescence with an in-flight security-v2 permit"
-  else
-    record_step "quiescence with an in-flight security-v2 permit" fail \
-      "the node reported [${quiesce_state:-unreadable}] during shutdown"
+
+  # The property is about a permit the node is holding while it is told to
+  # stop, so one has to be in flight before the stop is issued. A node with
+  # nothing running quiesces trivially and evidences nothing.
+  if [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
+    run_work_driver quiesce-inflight || true
+  fi
+  local held_before
+  held_before="$(participation_field "${quiesce_node}" \
+    active_security_v2_ceremonies 2>/dev/null || printf '')"
+  local forced_before
+  forced_before="$(metric_value "${quiesce_node}" \
+    participation_quiesce_forced_aborts_total || printf '')"
+
+  if [[ ! "${held_before}" =~ ^[0-9]+$ ]] || ((held_before == 0)); then
+    block_step "quiescence with an in-flight security-v2 permit" \
+      "${quiesce_node} held no security-v2 ceremony when the stop was due to \
+be issued (active_security_v2_ceremonies [${held_before:-unreadable}]); a \
+node with nothing in flight quiesces trivially, so this needs work \
+originated on the rehearsal chain that is still running at shutdown"
     record_assertion \
       "graceful quiescence starts no new work and lets held permits finish" \
       false "quiescence with an in-flight security-v2 permit"
+  else
+    # The same grace the manifest grants and the compose file declares, so the
+    # node is not SIGKILLed before its own in-process backstop can finish what
+    # it holds. A number restated here would go on stopping nodes under the
+    # old ceiling the first time the reviewed bounds moved.
+    local quiesce_grace
+    quiesce_grace="$(manifest_termination_grace)"
+    compose stop --timeout "${quiesce_grace}" "${quiesce_node}" &
+    local stop_pid=$!
+
+    # Watch the drain rather than sample its end: the contract is that no new
+    # permit is issued from the moment quiescing begins and that the held ones
+    # are left to finish, and both are statements about the whole window.
+    local quiesce_state="" held_peak="${held_before}" held_now forced_now
+    local forced_after="${forced_before}"
+    deadline=$((SECONDS + quiesce_grace))
+    while ((SECONDS < deadline)); do
+      local state_now
+      state_now="$(participation_field "${quiesce_node}" gate_state \
+        2>/dev/null || true)"
+      [[ "${state_now}" == "quiescing" ]] && quiesce_state="quiescing"
+      held_now="$(participation_field "${quiesce_node}" \
+        active_security_v2_ceremonies 2>/dev/null || printf '')"
+      if [[ "${held_now}" =~ ^[0-9]+$ ]] && ((held_now > held_peak)); then
+        held_peak="${held_now}"
+      fi
+      forced_now="$(metric_value "${quiesce_node}" \
+        participation_quiesce_forced_aborts_total 2>/dev/null || printf '')"
+      if [[ "${forced_now}" =~ ^[0-9]+$ ]]; then
+        forced_after="${forced_now}"
+      fi
+      # The node going unreachable is the drain finishing, not a failure.
+      node_reachable "${quiesce_node}" || break
+      sleep 2
+    done
+    wait "${stop_pid}" || true
+
+    if [[ "${quiesce_state}" != "quiescing" ]]; then
+      record_step "quiescence with an in-flight security-v2 permit" fail \
+        "${quiesce_node} never reported quiescing while draining with \
+${held_before} security-v2 ceremonies in flight"
+      record_assertion \
+        "graceful quiescence starts no new work and lets held permits finish" \
+        false "quiescence with an in-flight security-v2 permit"
+    elif ((held_peak > held_before)); then
+      record_step "quiescence with an in-flight security-v2 permit" fail \
+        "${quiesce_node} entered quiescing but its in-flight security-v2 \
+count rose from ${held_before} to ${held_peak}; a quiescing node issued a \
+new permit"
+      record_assertion \
+        "graceful quiescence starts no new work and lets held permits finish" \
+        false "quiescence with an in-flight security-v2 permit"
+    elif [[ "${forced_before}" =~ ^[0-9]+$ ]] &&
+      [[ "${forced_after}" =~ ^[0-9]+$ ]] &&
+      ((forced_after > forced_before)); then
+      record_step "quiescence with an in-flight security-v2 permit" fail \
+        "${quiesce_node} force-aborted $((forced_after - forced_before)) held \
+permit(s) rather than letting them finish inside the ${quiesce_grace}s grace"
+      record_assertion \
+        "graceful quiescence starts no new work and lets held permits finish" \
+        false "quiescence with an in-flight security-v2 permit"
+    else
+      record_step "quiescence with an in-flight security-v2 permit" pass \
+        "${quiesce_node} entered quiescing holding ${held_before} security-v2 \
+ceremonies, issued no new permit while draining, and force-aborted none of \
+them inside the reviewed ${quiesce_grace}s grace"
+      record_assertion \
+        "graceful quiescence starts no new work and lets held permits finish" \
+        true "quiescence with an in-flight security-v2 permit"
+    fi
   fi
 
   begin_step "quiescence with an in-flight legacy permit"
@@ -3736,7 +3951,7 @@ reads one storage snapshot per node and cannot be run against a live volume"
   # step that is allowed to release it and by nothing else.
   fleet_up "${REHEARSAL_R1_SERVICES[@]}"
   # While there is still a fleet to ask. Every step below stops these nodes.
-  capture_r1_identity
+  capture_r1_release_identity
 
   # Step 1 and 2. Quiesce every R1 node, and prove no prior binary comes up
   # while they drain — the barrier the whole gate exists to establish.

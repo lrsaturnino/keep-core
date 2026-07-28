@@ -135,6 +135,24 @@ none of the three reports success. A partial rehearsal can never read as a
 passed gate, a failed one can never read as either, and a refused gate is
 never silent about what it did prove.
 
+Each step is held to the property it names rather than to a proxy for it. The
+crossing step establishes the pre-C side first — every node reporting
+`open_legacy` at a block below the C it armed — because a fleet started after
+C already reports `open_security_v2` and would satisfy every closing check
+without having crossed anything; it names a permit mode in the record only
+where security-v2 permits were actually observed. The homogeneous positive
+control requires the fleet's security-v2 permit total to *rise* while the
+work driver runs, since a zero legacy counter is equally true of a fleet that
+ran nothing. The straggler control differences the roster before and after
+the driven ceremony and requires an operator the node had not already seen:
+the roster object exists from startup with an empty peer list, so its
+presence proves nothing, and a refusal counter moving on its own could be any
+refusal at all. Quiescence requires a security-v2 ceremony to be in flight
+when the stop is issued, stops the node under the reviewed manifest's grace
+rather than a restated number, and watches the whole drain — a node that
+issues a new permit while quiescing, or force-aborts a held one instead of
+letting it finish, fails the step rather than passing on the state string.
+
 The rollback gate's own barrier has two halves and neither substitutes for
 the other. The R1 fleet must be provably down, and the prior binary must have
 been absent for the whole of it — so the drain runs while the prior service
@@ -242,7 +260,12 @@ bytes, contradicting the reviewed bounds, taken at another commit than the
 run is bound to, taken on a divergent tree, and one differing only in
 notes, stamp, and key order — and over a divergent tree the stage must
 refuse to judge from, and the stage runs that self-test first on every
-invocation. The receipt lifecycle is proved through `stage_local_proofs`
+invocation. It also drives the fleet-identity capture the container stages
+open with, over fleets whose nodes disagree with each other, whose revision
+is not the commit the run is bound to, and whose armed cutover block is not
+the rehearsed C; and it resolves every helper those stages name in command
+position, because neither stage runs anywhere but a real rehearsal and a call
+site left pointing at a renamed function otherwise surfaces there. The receipt lifecycle is proved through `stage_local_proofs`
 itself rather than through the invalidation function alone: a reused
 evidence directory is given a valid inherited receipt, the stage's proof
 seam is failed the way any proof failure fails it, and the case requires
