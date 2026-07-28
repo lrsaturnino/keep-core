@@ -226,31 +226,44 @@ The work driver reports what it originated rather than only whether it
 succeeded: its stdout is a JSON object whose optional `transaction_hashes`
 array carries the chain transactions it submitted — those enter the step being
 recorded, so a reviewer can follow a step back to the transactions that caused
-it — and whose optional `ceremony_results` array carries `{ceremony, outcome,
-transaction_hash}` objects naming the terminal result of each ceremony those
-transactions started. The results are there because no fleet counter carries
-them: a permit says a node was allowed to begin, and the positive control is
-about a ceremony finishing. An optional `originated_ceremonies` array names
-what the driver put on the chain whatever became of it, for the phases whose
-subject is work still in flight — a drain, a forced deadline — which have no
-terminal outcome to read, since by the time one exists the work it was about is
-over. Every array is validated strictly, and a report that cannot be read stops
-the step — a driver whose account is unreadable has left the step unable to say
-what it drove, and recording that as "nothing happened" would enter silence as
-evidence.
+it — and whose optional `ceremony_results` array carries `{ceremony,
+canonical_start_block, outcome, transaction_hash}` objects naming the terminal
+result of each ceremony those transactions started. The results are there
+because no fleet counter carries them: a permit says a node was allowed to
+begin, and the positive control is about a ceremony finishing. An optional
+`originated_ceremonies` array carries `{ceremony, canonical_start_block,
+transaction_hash, holders}` objects naming what the driver put on the chain
+whatever became of it, for the phases whose subject is work still in flight —
+a drain, a forced deadline — which have no terminal outcome to read, since by
+the time one exists the work it was about is over. Every array is validated
+strictly, and a report that cannot be read stops the step — a driver whose
+account is unreadable has left the step unable to say what it drove, and
+recording that as "nothing happened" would enter silence as evidence.
 
 Each outcome is bound to the work it belongs to, and controls are decided on
-the bound form rather than on the arrays beside it. A result must name a
-`transaction_hash` the same report accounted for originating; without that,
-the hashes and the outcomes are two independent populations, and a stale or
-unrelated hash sitting beside an unrelated result satisfies any control that
-reads them in parallel. A result that succeeded must carry a `result` identity
-— the threshold output the ceremony left behind — because "succeeded" is a
-word and a positive control that cannot name what was produced has read a
-report rather than watched a ceremony settle. A result that did not succeed
-must carry a `termination` of `retry_exhausted` or `no_threshold`, because a
-bare "failed" is equally what a ceremony still retrying looks like from
-outside, and a fails-closed control cannot be read off work still in progress.
+the bound form rather than on the arrays beside it. The unit of that binding is
+one piece of work, identified by the canonical start block its permit pinned
+its mode from — `<ceremony>@<block>` — rather than by the ceremony name. Two
+runs of one ceremony are the same word and different work, and a threshold
+ceremony takes one permit on every node that joins it, so an account that names
+only ceremonies cannot say how many permits it is describing. `holders` names
+the R1 services that took a permit, because the population a drain reconciles
+is per (node, work) and only the party that originated the work can say which
+nodes it reached. A piece of work is originated once and ends once: a repeated
+identity, or one transaction claimed by two pieces of work, stops the step
+rather than being counted twice downstream.
+
+A result must name a `transaction_hash` the same report accounted for
+originating; without that, the hashes and the outcomes are two independent
+populations, and a stale or unrelated hash sitting beside an unrelated result
+satisfies any control that reads them in parallel. A result that succeeded must
+carry a `result` identity — the threshold output the ceremony left behind —
+because "succeeded" is a word and a positive control that cannot name what was
+produced has read a report rather than watched a ceremony settle. A result that
+did not succeed must carry a `termination` of `retry_exhausted` or
+`no_threshold`, because a bare "failed" is equally what a ceremony still
+retrying looks like from outside, and a fails-closed control cannot be read off
+work still in progress.
 
 Every outcome the driver reports is carried forward, not only the successes.
 A phase that kept the successes alone cannot tell a clean run from one where a
@@ -305,29 +318,61 @@ threshold ceremony loses a share and can be re-run, a wallet action can leave a
 Bitcoin transaction the fleet has already signed for. A rollback authorized
 over one class says nothing about the other, so both must be in flight at once.
 
-Then every permit is followed to an outcome, per node rather than in
-aggregate. A fleet total of zero after the drain is equally produced by permits
-that finished and by processes that exited holding them, and the difference is
-exactly the state a rollback restores onto. Each node's permits at the stop
-must therefore land somewhere a later reader can see: completed, evidenced by
-that node being observed without them, or force-canceled at the quiesce
-deadline — which the gate counts and which the offline audit must have written
-a quarantine record for. A force-cancel with no quarantine record behind it is
-in-flight state the rollback would restore onto with nothing describing it, and
-an unreadable counter blocks rather than subtracting like a zero, which is how
-a permit nobody could account for would otherwise disappear from the sum. The
-records must also be *enough* of them: one record does not describe three
-abandoned permits, so a count short of the force-cancels leaves the difference
-unaccounted for and refutes the step.
+Then every permit is followed to an outcome, per node and per piece of work
+rather than in aggregate. A fleet total of zero after the drain is equally
+produced by permits that finished and by processes that exited holding them,
+and the difference is exactly the state a rollback restores onto. Each node's
+permits at the stop must therefore land somewhere a later reader can see:
+completed, evidenced by that node being observed without them, or
+force-canceled at the quiesce deadline — which the gate counts and which the
+offline audit must have written a quarantine record for. A force-cancel with no
+quarantine record behind it is in-flight state the rollback would restore onto
+with nothing describing it, and an unreadable counter blocks rather than
+subtracting like a zero, which is how a permit nobody could account for would
+otherwise disappear from the sum. The records must also be *enough* of them:
+one record does not describe three abandoned permits, so a count short of the
+force-cancels leaves the difference unaccounted for and refutes the step.
+
+The permits and the work must be the same population before any of that means
+anything. Each node's held count is compared against the pieces of work the
+driver said it put on that node, and a node holding more permits than there was
+work to hold them for — or fewer — blocks: an outcome for one piece of work
+reconciles no particular permit when the two accounts are of different sizes,
+which is how one reported result came to stand in for however many permits
+happened to be outstanding.
+
+The quarantine records are read the same way. They are matched by work identity
+rather than counted, so a record for a ceremony this drain never put on that
+node refutes the step instead of padding the count, and they are filtered by
+the instant the stop was issued, because a quarantine namespace accumulates:
+records an earlier interruption wrote are still in it, and a bare count lets
+state from a run nobody is reconciling stand in for permits this drain
+abandoned. The driver's own work classes are translated into the gate's
+ceremony vocabulary for that comparison — every non-heartbeat wallet action is
+gated as a signing ceremony, and the beacon's signing class is its relay
+signing — because otherwise work that has a record would appear to have none.
 
 Neither is a permit simply "completed" because the gauge holding it fell.
 Being gone is what a ceremony that finished and a process that exited holding
 one both look like from outside. So the driver is asked, once the drain is
 over and the outcomes exist to be read, what became of the work this gate
-originated — the `rollback-terminal` phase — and every originated ceremony must
-have reached a terminal outcome. Permits that were not force-canceled reconcile
-against those outcomes rather than against the gauge, and a gate that never
-asked blocks rather than passing.
+originated — the `rollback-terminal` phase — and every piece of that work must
+have reached a terminal outcome of its own or appear in a fresh quarantine
+record. Permits that were not force-canceled reconcile against the outcome of
+the work they were issued for rather than against the gauge; a gate that never
+asked, a terminal report from a driver that exited nonzero, and an outcome for
+work this drain never originated all block rather than passing.
+
+The single-release quiescence gate is decided the same way, for the same
+reason. It retains the work the node was holding when the stop was issued —
+which pieces, and that the node's permit count matches how many there were —
+and asks the driver in a `quiesce-terminal` phase what became of each once the
+drain is over. A held permit whose work never reached an outcome is a permit
+the process took with it, and that is indistinguishable from completion in
+every counter the node publishes. Work that ended by giving up inside the grace
+blocks rather than passing: this gate audits no quarantined state, so a
+ceremony that exhausted its retries evidences neither that it was allowed to
+finish nor that what it left behind is accounted for.
 
 The straggler control binds its roster entry to the straggler's own operator.
 The prior node publishes the address it signs as at `/diagnostics`

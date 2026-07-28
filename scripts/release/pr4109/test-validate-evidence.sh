@@ -1604,6 +1604,13 @@ check "a driver that could not offer work is not a gate nobody asked" 3 \
 
 # A quiescence that held work, was offered more while quiescing, issued none,
 # and was seen with its in-flight count at zero before it went away.
+# The chain identifiers the held work is bound to. A held permit followed to an
+# outcome needs the outcome to name the same piece of work the permit was
+# issued for; without that the two are populations that happen to sit beside
+# each other.
+QUIESCE_TX1="0x3131313131313131313131313131313131313131313131313131313131313131"
+QUIESCE_TX2="0x3232323232323232323232323232323232323232323232323232323232323232"
+
 # The slots the verdict under test reads; shellcheck cannot follow them
 # across the source boundary into rehearse.sh.
 # shellcheck disable=SC2034
@@ -1631,6 +1638,15 @@ beacon_dkg=0"
   # What this offer actually put on the chain, which is what the moved counter
   # has to belong to.
   QUIESCE_OFFERED="tbtc_signing"
+  # The work the node was holding when the stop was issued, named rather than
+  # counted, and what the driver saw become of each piece once the drain was
+  # over. Two permits, two pieces of work, two outcomes.
+  QUIESCE_INFLIGHT_WORK="tbtc_signing@840=${QUIESCE_TX1}=r1-node-1,r1-node-2 \
+beacon_dkg@841=${QUIESCE_TX2}=r1-node-2"
+  QUIESCE_TERMINAL="tbtc_signing@840=succeeded=${QUIESCE_TX1}=0xsigned840 \
+beacon_dkg@841=succeeded=${QUIESCE_TX2}=0xgroup841"
+  QUIESCE_TERMINAL_ASKED=1
+  QUIESCE_TERMINAL_RC=0
 }
 
 quiesce_case() {
@@ -1642,7 +1658,46 @@ quiesce_case() {
 run_verdict quiesce_case :
 check "a quiescence that refused new work and drained its permits holds" 0 \
   "refused it on its own account \(tbtc_signing \+1" \
-  "in-flight count observed at zero"
+  "in-flight count observed at zero" \
+  "every piece of work it was holding settled on chain" \
+  "tbtc_signing@840 \(${QUIESCE_TX1}, 0xsigned840\)"
+
+# The reading a gauge cannot carry, and the one this step used to stop at. The
+# permits are gone; a process that exited holding them produces exactly that.
+run_verdict quiesce_case eval 'QUIESCE_INFLIGHT_WORK=""'
+check "held permits nobody identified cannot be followed anywhere" 3 \
+  "the driver named no identified work it was holding"
+
+# A permit total and a list of work are two populations until they are the same
+# size: an outcome for one piece of work reconciles no particular permit when
+# the node was holding more permits than there was work to hold them for.
+run_verdict quiesce_case eval 'QUIESCE_HELD_BEFORE="3"'
+check "more held permits than identified work reconciles neither" 3 \
+  "held 3 security-v2 permit\(s\) for 2 piece\(s\) of work"
+
+run_verdict quiesce_case eval 'QUIESCE_TERMINAL_ASKED=0
+   QUIESCE_TERMINAL=""'
+check "a drain nobody asked the driver about is not work that finished" 3 \
+  "never asked what became of the work behind them"
+
+run_verdict quiesce_case eval 'QUIESCE_TERMINAL_RC=7'
+check "a partial terminal report accounts for no held permit" 3 \
+  "work driver exited \[7\] reporting what became of the work"
+
+# The regression the whole rung exists for: one of the two held permits has no
+# outcome behind it at all, and the gauge fell to zero exactly the same way.
+run_verdict quiesce_case eval \
+  "QUIESCE_TERMINAL='tbtc_signing@840=succeeded=\${QUIESCE_TX1}=0xsigned840'"
+check "a permit whose work never ended went down with the process" 3 \
+  "no terminal outcome for beacon_dkg@841"
+
+# An end, but not the end this step claims. Nothing in this gate audits what a
+# ceremony that gave up left behind.
+run_verdict quiesce_case eval \
+  "QUIESCE_TERMINAL='tbtc_signing@840=succeeded=\${QUIESCE_TX1}=0xsigned840 \
+beacon_dkg@841=failed=\${QUIESCE_TX2}=retry_exhausted'"
+check "work that gave up inside the grace is not work allowed to finish" 3 \
+  "beacon_dkg@841=failed \(retry_exhausted\) came to nothing"
 
 run_verdict quiesce_case eval 'QUIESCE_ATTEMPTED=0'
 check "a quiescing node nobody asked evidences no refusal to start work" 3 \
@@ -2254,26 +2309,40 @@ RECONCILE_ASSERTION="every permit held at the stop completes or is audited \
 into quarantine"
 RECONCILE_TX="0xdd44444444444444444444444444444444444444444444444444444444444444"
 RECONCILE_TX2="0xee55555555555555555555555555555555555555555555555555555555555555"
+RECONCILE_TX3="0xff66666666666666666666666666666666666666666666666666666666666666"
 
-# One node that drained everything it held, and one that hit the deadline with
-# a permit the gate force-canceled and the audit wrote a quarantine record for.
+# One node that drained everything it held, and one that also held a third
+# piece of work and hit the deadline with its permit force-canceled and a
+# quarantine record written for exactly that work.
+#
+# The unit throughout is the permit, not the ceremony: the signing and the
+# wallet action each took a permit on both nodes, so five permits stand for
+# three pieces of work, and it is the five that have to reconcile.
 reconcile_readings() {
   # shellcheck disable=SC2034
   ROLLBACK_NODE_ACCOUNTS="r1-node-1 2 0 0
 r1-node-2 3 1 0"
   # shellcheck disable=SC2034
-  ROLLBACK_NODE_QUARANTINES="r1-node-1 0
-r1-node-2 1"
-  # What this gate put in flight, and what the driver saw become of it once
-  # the drain was over. A permit that was not force-canceled is completed only
-  # if the ceremony behind it actually ended.
+  ROLLBACK_NODE_QUARANTINES="r1-node-1 none
+r1-node-2 beacon_dkg@1002"
+  # What this gate put in flight, which node took a permit for each piece of
+  # it, and what the driver saw become of it once the drain was over. A permit
+  # that was not force-canceled is completed only if the work behind that
+  # permit actually ended.
   # shellcheck disable=SC2034
-  ROLLBACK_ORIGINATED="tbtc_signing tbtc_wallet_action"
+  ROLLBACK_ORIGINATED="tbtc_signing tbtc_wallet_action beacon_dkg"
+  # shellcheck disable=SC2034
+  ROLLBACK_ORIGINATED_WORK="\
+tbtc_signing@1000=${RECONCILE_TX}=r1-node-1,r1-node-2 \
+tbtc_wallet_action@1001=${RECONCILE_TX2}=r1-node-1,r1-node-2 \
+beacon_dkg@1002=${RECONCILE_TX3}=r1-node-2"
   # shellcheck disable=SC2034
   ROLLBACK_TERMINAL_ASKED=1
   # shellcheck disable=SC2034
-  ROLLBACK_TERMINAL="tbtc_signing=succeeded=${RECONCILE_TX}=0xsigned \
-tbtc_wallet_action=failed=${RECONCILE_TX2}=retry_exhausted"
+  ROLLBACK_TERMINAL_RC=0
+  # shellcheck disable=SC2034
+  ROLLBACK_TERMINAL="tbtc_signing@1000=succeeded=${RECONCILE_TX}=0xsigned \
+tbtc_wallet_action@1001=failed=${RECONCILE_TX2}=retry_exhausted"
 }
 
 reconcile_case() {
@@ -2285,9 +2354,139 @@ reconcile_case() {
 run_verdict reconcile_case :
 check "permits that completed or were audited into quarantine reconcile" 0 \
   "4 completed with the holding node observed without them and the driver \
-accounting for every ceremony it originated" \
-  "tbtc_signing \(${RECONCILE_TX}, 0xsigned\), tbtc_wallet_action=failed" \
+reporting an outcome for each one" \
+  "tbtc_signing@1000 \(${RECONCILE_TX}, 0xsigned\), tbtc_wallet_action@1001=\
+failed" \
   "and 1 were force-canceled"
+
+# The regression this whole accounting exists for: the permits outnumber the
+# work behind them, so one reported outcome stands in for however many permits
+# happen to be outstanding. Five permits over three pieces of work reconcile;
+# seven do not, and no aggregate count can tell the two apart.
+run_verdict reconcile_case eval 'ROLLBACK_NODE_ACCOUNTS="r1-node-1 2 0 0
+r1-node-2 5 1 0"'
+check "one outcome cannot stand in for permits nobody attributed work to" 3 \
+  "r1-node-2 held 5 permit\(s\) for 3 piece\(s\) of work"
+
+run_verdict reconcile_case eval 'ROLLBACK_NODE_ACCOUNTS="r1-node-1 1 0 0
+r1-node-2 3 1 0"'
+check "fewer permits than the work put on a node reconciles neither" 3 \
+  "r1-node-1 held 1 permit\(s\) for 2 piece\(s\) of work"
+
+# A quarantine record for work this drain never put on that node is state from
+# somewhere else standing in for the permits being followed.
+run_verdict reconcile_case eval 'ROLLBACK_NODE_QUARANTINES="r1-node-1 none
+r1-node-2 beacon_relay_signing@77"'
+check "a quarantine record for work the node never held accounts for none" 1 \
+  "r1-node-2 quarantined beacon_relay_signing@77"
+
+# And its mirror: an outcome for a ceremony this gate never originated.
+run_verdict reconcile_case eval \
+  "ROLLBACK_TERMINAL='tbtc_signing@1000=succeeded=\${RECONCILE_TX}=0xsigned \
+tbtc_wallet_action@1001=failed=\${RECONCILE_TX2}=retry_exhausted \
+beacon_signing@9999=succeeded=\${RECONCILE_TX3}=0xelsewhere'"
+check "an outcome for work this drain never originated reconciles nothing" 3 \
+  "terminal outcomes for beacon_signing@9999, which this drain never \
+originated"
+
+# A driver that printed a readable report and then failed has looked at part of
+# the chain; the permits it did not reach reconcile against nothing.
+run_verdict reconcile_case eval 'ROLLBACK_TERMINAL_RC=3'
+check "a terminal report from a driver that failed accounts for no permit" 3 \
+  "work driver exited \[3\] reporting what became of the drained work"
+
+run_verdict reconcile_case eval 'ROLLBACK_ORIGINATED_WORK=""'
+check "permits nobody identified the work for reconcile nothing" 3 \
+  "the driver named no identified work for the drain"
+
+# What the reconciliation reads a quarantine record off, and the reason it is
+# read with an instant rather than counted. A quarantine namespace accumulates:
+# the records an earlier interruption wrote are still in it, and a count of
+# whatever it holds lets state from a run nobody is reconciling stand in for
+# permits this drain abandoned.
+QUARANTINE_MANIFEST="${WORK}/quarantine-manifest.json"
+DRAIN_INSTANT="2026-07-28T12:00:00.000Z"
+
+write_quarantine_manifest() {
+  cat >"${QUARANTINE_MANIFEST}"
+}
+
+check_quarantine() {
+  local name="$1" want="$2" got
+  got="$(audit_quarantine_records "${QUARANTINE_MANIFEST}" "${DRAIN_INSTANT}")"
+  if [[ "${got}" == "${want}" ]]; then
+    printf 'ok   %s\n' "${name}"
+    PASS=$((PASS + 1))
+  else
+    printf 'FAIL %s: got [%s], want [%s]\n' "${name}" "${got}" "${want}"
+    FAILED=$((FAILED + 1))
+  fi
+}
+
+write_quarantine_manifest <<'EOF'
+{"beacon_quarantined_outputs":[
+  {"ceremony":"beacon_dkg","canonical_start_block":1002,
+   "preserved_at":"2026-07-28T12:04:10.500Z"}],
+ "tbtc_quarantined_outputs":[
+  {"ceremony":"tbtc_signing","canonical_start_block":1000,
+   "preserved_at":"2026-07-28T12:04:11.000Z"}]}
+EOF
+check_quarantine "records this drain wrote are read with their work identity" \
+  "beacon_dkg@1002,tbtc_signing@1000"
+
+# The regression the instant exists for.
+write_quarantine_manifest <<'EOF'
+{"beacon_quarantined_outputs":[
+  {"ceremony":"beacon_dkg","canonical_start_block":77,
+   "preserved_at":"2026-07-27T09:00:00.000Z"}]}
+EOF
+check_quarantine "a record an earlier interruption left behind is not this \
+drain's" "none"
+
+write_quarantine_manifest <<'EOF'
+{"beacon_quarantined_outputs":[
+  {"ceremony":"beacon_dkg","canonical_start_block":77,
+   "preserved_at":"2026-07-27T09:00:00.000Z"},
+  {"ceremony":"beacon_dkg","canonical_start_block":1002,
+   "preserved_at":"2026-07-28T12:04:10.500Z"}]}
+EOF
+check_quarantine "a stale record beside a fresh one accounts only for the \
+fresh one" "beacon_dkg@1002"
+
+# A record nobody could read authorizes nothing, and must not subtract like an
+# absence: an unreadable manifest is not a manifest holding no records.
+write_quarantine_manifest <<'EOF'
+{"beacon_quarantined_outputs":[
+  {"ceremony":"beacon_dkg","canonical_start_block":1002}]}
+EOF
+check_quarantine "a record with no preservation time is unreadable" \
+  "unreadable"
+
+write_quarantine_manifest <<'EOF'
+{"beacon_quarantined_outputs":[
+  {"canonical_start_block":1002,"preserved_at":"2026-07-28T12:04:10.500Z"}]}
+EOF
+check_quarantine "a record naming no ceremony is unreadable" "unreadable"
+
+write_quarantine_manifest <<'EOF'
+{"beacon_quarantined_outputs":[
+  {"ceremony":"beacon_dkg","preserved_at":"2026-07-28T12:04:10.500Z"}]}
+EOF
+check_quarantine "a record naming no anchor is unreadable" "unreadable"
+
+write_quarantine_manifest <<'EOF'
+{not a manifest
+EOF
+check_quarantine "a manifest that cannot be parsed is unreadable" "unreadable"
+
+write_quarantine_manifest <<'EOF'
+{"schema_version":1}
+EOF
+check_quarantine "a manifest with no quarantine namespace holds no record" \
+  "none"
+
+rm -f "${QUARANTINE_MANIFEST}"
+check_quarantine "a manifest that is not there is unreadable" "unreadable"
 
 # The regression this step exists for: the fleet total went to zero because a
 # node exited holding its permits, which no aggregate count distinguishes from
@@ -2299,13 +2498,17 @@ check "a node that stopped holding permits reconciles nothing" 1 \
   "went down with the process"
 
 # A force-cancel the audit never wrote a record for is in-flight state the
-# rollback would restore onto with nothing describing it.
-run_verdict reconcile_case eval 'ROLLBACK_NODE_QUARANTINES="r1-node-1 0
-r1-node-2 0"'
+# rollback would restore onto with nothing describing it. "none" is a manifest
+# that was read and holds nothing this drain produced — a record an earlier
+# interruption left behind is not this drain's force-cancel being accounted
+# for, which is exactly what a bare count of the namespace would have taken it
+# for.
+run_verdict reconcile_case eval 'ROLLBACK_NODE_QUARANTINES="r1-node-1 none
+r1-node-2 none"'
 check "a force-canceled permit with no quarantine record refutes the step" 1 \
   "r1-node-2 \(1 force-canceled, no quarantine record\)"
 
-run_verdict reconcile_case eval 'ROLLBACK_NODE_QUARANTINES="r1-node-1 0
+run_verdict reconcile_case eval 'ROLLBACK_NODE_QUARANTINES="r1-node-1 none
 r1-node-2 unreadable"'
 check "an unreadable audit manifest audits no quarantine" 1 \
   "quarantine records unreadable"
@@ -2315,9 +2518,7 @@ check "an unreadable audit manifest audits no quarantine" 1 \
 # describe three permits, and the difference is in-flight state the rollback
 # restores onto with nothing accounting for it.
 run_verdict reconcile_case eval 'ROLLBACK_NODE_ACCOUNTS="r1-node-1 2 0 0
-r1-node-2 3 2 0"
-   ROLLBACK_NODE_QUARANTINES="r1-node-1 0
-r1-node-2 1"'
+r1-node-2 3 2 0"'
 check "one quarantine record does not account for two force-cancels" 1 \
   "r1-node-2 \(2 force-canceled, only 1 quarantine record"
 
@@ -2326,14 +2527,16 @@ check "one quarantine record does not account for two force-cancels" 1 \
 run_verdict reconcile_case eval 'ROLLBACK_TERMINAL_ASKED=0
    ROLLBACK_TERMINAL=""'
 check "a gauge that fell with nothing asked of the driver is not completion" \
-  3 "the driver was never asked what became of the work behind them"
+  3 "the driver was never asked what became of the work behind the permits"
 
-# The originated work is two classes and only one of them ended: the other's
-# permits reconcile to a gauge that fell rather than to work that finished.
+# The regression this rung exists for. Three pieces of work were in flight and
+# one outcome came back: the permits behind the other two used to be counted as
+# completed because a ceremony *of that name* had ended somewhere.
 run_verdict reconcile_case eval \
-  "ROLLBACK_TERMINAL='tbtc_signing=succeeded=\${RECONCILE_TX}=0xsigned'"
+  "ROLLBACK_TERMINAL='tbtc_signing@1000=succeeded=\${RECONCILE_TX}=0xsigned'"
 check "work the driver never accounted for reconciles nothing" 3 \
-  "no terminal outcome for tbtc_wallet_action"
+  "r1-node-1 held a permit for tbtc_wallet_action@1001" \
+  "r1-node-2 held a permit for tbtc_wallet_action@1001"
 
 # An unreadable counter must not subtract like a zero; that is how a permit
 # nobody could account for disappears from a reconciliation.
@@ -2520,6 +2723,7 @@ drive() {
       printf 'results:%s\n' "${WORK_DRIVER_CEREMONY_RESULTS}"
       printf 'originated:%s\n' "${WORK_DRIVER_ORIGINATED}"
       printf 'bound:%s\n' "${WORK_DRIVER_BOUND_RESULTS}"
+      printf 'work:%s\n' "${WORK_DRIVER_ORIGINATED_WORK}"
       if driver_offered_work; then
         printf 'offered:yes rc:%s tx:%s hashes:%s\n' \
           "${WORK_DRIVER_RC}" "${WORK_DRIVER_TX_COUNT}" "${STEP_TX_HASHES}"
@@ -2587,27 +2791,31 @@ write_driver <<EOF
 #!/usr/bin/env bash
 printf '{"transaction_hashes":["${HASH_A}","${HASH_B}"],"ceremony_results":['
 printf '{"ceremony":"tbtc_signing","outcome":"succeeded",'
+printf '"canonical_start_block":500,'
 printf '"transaction_hash":"${HASH_A}","result":"0xsigned"},'
 printf '{"ceremony":"beacon_dkg","outcome":"failed",'
+printf '"canonical_start_block":501,'
 printf '"transaction_hash":"${HASH_B}","termination":"no_threshold"}]}'
 EOF
 drive homogeneous-security-v2
 check "a driver names the ceremonies it saw complete" 0 \
   "offered:yes rc:0 tx:2"
 
-# The binding itself: each outcome carries the transaction it belongs to and
-# what it left behind, so a control cannot read an outcome against a hash that
-# had nothing to do with it.
+# The binding itself: each outcome carries the piece of work it belongs to,
+# identified by the chain anchor its permit pinned from, the transaction that
+# started it, and what it left behind — so a control cannot read an outcome
+# against a hash that had nothing to do with it, nor take one outcome for as
+# many runs of that ceremony as happen to be outstanding.
 check "each outcome is bound to its transaction and what it produced" 0 \
-  "bound:tbtc_signing=succeeded=${HASH_A}=0xsigned \
-beacon_dkg=failed=${HASH_B}=no_threshold"
+  "bound:tbtc_signing@500=succeeded=${HASH_A}=0xsigned \
+beacon_dkg@501=failed=${HASH_B}=no_threshold"
 # The reading the controls actually decide on, taken over the same parse: only
 # the ceremony that settled is a settlement, and it is named with the
 # transaction and the threshold output rather than on its own.
 SETTLED_OUT="$(bound_settlements \
-  "tbtc_signing=succeeded=${HASH_A}=0xsigned \
-beacon_dkg=failed=${HASH_B}=no_threshold")"
-if [[ "${SETTLED_OUT}" == "tbtc_signing (${HASH_A}, 0xsigned)" ]]; then
+  "tbtc_signing@500=succeeded=${HASH_A}=0xsigned \
+beacon_dkg@501=failed=${HASH_B}=no_threshold")"
+if [[ "${SETTLED_OUT}" == "tbtc_signing@500 (${HASH_A}, 0xsigned)" ]]; then
   printf 'ok   only the ceremonies that settled are carried forward\n'
   PASS=$((PASS + 1))
 else
@@ -2620,10 +2828,10 @@ fi
 # ceremony that did not settle is named with the termination that says it
 # stopped trying.
 TERMINATED_OUT="$(bound_terminations \
-  "tbtc_signing=succeeded=${HASH_A}=0xsigned \
-beacon_dkg=failed=${HASH_B}=no_threshold")"
+  "tbtc_signing@500=succeeded=${HASH_A}=0xsigned \
+beacon_dkg@501=failed=${HASH_B}=no_threshold")"
 if [[ "${TERMINATED_OUT}" == \
-  "beacon_dkg=failed (${HASH_B}, no_threshold)" ]]; then
+  "beacon_dkg@501=failed (${HASH_B}, no_threshold)" ]]; then
   printf 'ok   an unsettled ceremony is named with why it stopped\n'
   PASS=$((PASS + 1))
 else
@@ -2642,24 +2850,121 @@ else
 fi
 
 # What a phase over work still in flight reads instead of a terminal outcome:
-# by the time one exists the work it was about is over.
+# by the time one exists the work it was about is over. Each piece names the
+# anchor that identifies it and the nodes that took a permit for it, because a
+# drain reconciles per (node, work) and a ceremony name carries neither.
 write_driver <<EOF
 #!/usr/bin/env bash
-printf '{"transaction_hashes":["${HASH_A}"],'
-printf '"originated_ceremonies":["tbtc_signing","tbtc_wallet_action"]}'
+printf '{"transaction_hashes":["${HASH_A}","${HASH_B}"],'
+printf '"originated_ceremonies":[{"ceremony":"tbtc_signing",'
+printf '"canonical_start_block":600,"transaction_hash":"${HASH_A}",'
+printf '"holders":["r1-node-1","r1-node-2"]},'
+printf '{"ceremony":"tbtc_wallet_action","canonical_start_block":601,'
+printf '"transaction_hash":"${HASH_B}","holders":["r1-node-2"]}]}'
 EOF
 drive rollback-inflight
 check "a driver names the work it put on the chain before it settles" 0 \
-  "originated:tbtc_signing tbtc_wallet_action" "results:"
+  "originated:tbtc_signing tbtc_wallet_action" "results:" \
+  "work:tbtc_signing@600=${HASH_A}=r1-node-1,r1-node-2 \
+tbtc_wallet_action@601=${HASH_B}=r1-node-2"
 
 write_driver <<EOF
 #!/usr/bin/env bash
 printf '{"transaction_hashes":["${HASH_A}"],'
-printf '"originated_ceremonies":["tbtc_signing","a wallet action probably"]}'
+printf '"originated_ceremonies":[{"ceremony":"a wallet action probably",'
+printf '"canonical_start_block":600,"transaction_hash":"${HASH_A}",'
+printf '"holders":["r1-node-1"]}]}'
 EOF
 drive rollback-inflight
 check "originated work this rehearsal does not know stops the step" 3 \
   "not a ceremony"
+
+# A ceremony name with no anchor behind it identifies nothing: two runs of one
+# ceremony are the same word, and the permits behind them are what a drain has
+# to follow separately.
+write_driver <<EOF
+#!/usr/bin/env bash
+printf '{"transaction_hashes":["${HASH_A}"],'
+printf '"originated_ceremonies":["tbtc_signing"]}'
+EOF
+drive rollback-inflight
+check "in-flight work named only by its ceremony stops the step" 3 \
+  "originated work is not an object naming a ceremony, canonical start block"
+
+# Work nobody holds is work no permit was issued for, and a permit is what the
+# drain reconciles.
+write_driver <<EOF
+#!/usr/bin/env bash
+printf '{"transaction_hashes":["${HASH_A}"],'
+printf '"originated_ceremonies":[{"ceremony":"tbtc_signing",'
+printf '"canonical_start_block":600,"transaction_hash":"${HASH_A}"}]}'
+EOF
+drive rollback-inflight
+check "in-flight work no node holds stops the step" 3 \
+  "names no holding node"
+
+# The same piece of work reported twice is either a duplicate or two permits
+# claimed from one origination; both make a reconciliation count it twice.
+write_driver <<EOF
+#!/usr/bin/env bash
+printf '{"transaction_hashes":["${HASH_A}","${HASH_B}"],'
+printf '"originated_ceremonies":[{"ceremony":"tbtc_signing",'
+printf '"canonical_start_block":600,"transaction_hash":"${HASH_A}",'
+printf '"holders":["r1-node-1"]},'
+printf '{"ceremony":"tbtc_signing","canonical_start_block":600,'
+printf '"transaction_hash":"${HASH_B}","holders":["r1-node-2"]}]}'
+EOF
+drive rollback-inflight
+check "one piece of work originated twice stops the step" 3 \
+  "work originated twice"
+
+# Two work classes claimed from one transaction. Read as parallel arrays this
+# is a driver that drove both halves of the release; read as work it is one
+# origination with two accounts of what it started.
+write_driver <<EOF
+#!/usr/bin/env bash
+printf '{"transaction_hashes":["${HASH_A}"],'
+printf '"originated_ceremonies":[{"ceremony":"tbtc_signing",'
+printf '"canonical_start_block":600,"transaction_hash":"${HASH_A}",'
+printf '"holders":["r1-node-1"]},'
+printf '{"ceremony":"beacon_dkg","canonical_start_block":601,'
+printf '"transaction_hash":"${HASH_A}","holders":["r1-node-1"]}]}'
+EOF
+drive rollback-inflight
+check "one transaction claimed by two pieces of work stops the step" 3 \
+  "transaction claimed by two pieces of work"
+
+# And its mirror across the terminal half: one transaction reused between the
+# tBTC and beacon outcomes.
+write_driver <<EOF
+#!/usr/bin/env bash
+printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
+printf '{"ceremony":"tbtc_signing","outcome":"succeeded",'
+printf '"canonical_start_block":600,'
+printf '"transaction_hash":"${HASH_A}","result":"0xs"},'
+printf '{"ceremony":"beacon_dkg","outcome":"succeeded",'
+printf '"canonical_start_block":601,'
+printf '"transaction_hash":"${HASH_A}","result":"0xg"}]}'
+EOF
+drive homogeneous-security-v2
+check "one transaction reused across both halves stops the step" 3 \
+  "transaction claimed by two pieces of work"
+
+# One piece of work ends once. A second terminal record for it is an outcome
+# counted twice by everything downstream.
+write_driver <<EOF
+#!/usr/bin/env bash
+printf '{"transaction_hashes":["${HASH_A}","${HASH_B}"],"ceremony_results":['
+printf '{"ceremony":"tbtc_signing","outcome":"succeeded",'
+printf '"canonical_start_block":600,'
+printf '"transaction_hash":"${HASH_A}","result":"0xs"},'
+printf '{"ceremony":"tbtc_signing","outcome":"failed",'
+printf '"canonical_start_block":600,'
+printf '"transaction_hash":"${HASH_B}","termination":"no_threshold"}]}'
+EOF
+drive homogeneous-security-v2
+check "one piece of work reported terminal twice stops the step" 3 \
+  "work reported terminal twice"
 
 write_driver <<EOF
 #!/usr/bin/env bash
@@ -2679,6 +2984,18 @@ drive homogeneous-security-v2
 check "a ceremony this rehearsal does not know stops the step" 3 \
   "not a ceremony"
 
+# An outcome that names no anchor names no particular ceremony run, and every
+# control that follows a permit to it would be following a ceremony name.
+write_driver <<EOF
+#!/usr/bin/env bash
+printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
+printf '{"ceremony":"tbtc_signing","outcome":"succeeded",'
+printf '"transaction_hash":"${HASH_A}","result":"0xs"}]}'
+EOF
+drive homogeneous-security-v2
+check "an outcome naming no anchor identifies no piece of work" 3 \
+  "names no canonical start block"
+
 # The regression this binding exists for. An outcome with no transaction
 # behind it is one population and the reported hashes are another: a stale or
 # unrelated hash sitting beside an unrelated result satisfied every control
@@ -2686,7 +3003,8 @@ check "a ceremony this rehearsal does not know stops the step" 3 \
 write_driver <<EOF
 #!/usr/bin/env bash
 printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
-printf '{"ceremony":"tbtc_signing","outcome":"succeeded","result":"0xs"}]}'
+printf '{"ceremony":"tbtc_signing","outcome":"succeeded",'
+printf '"canonical_start_block":600,"result":"0xs"}]}'
 EOF
 drive homogeneous-security-v2
 check "an outcome naming no transaction stops the step" 3 \
@@ -2698,6 +3016,7 @@ write_driver <<EOF
 #!/usr/bin/env bash
 printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
 printf '{"ceremony":"tbtc_signing","outcome":"succeeded",'
+printf '"canonical_start_block":600,'
 printf '"transaction_hash":"${HASH_B}","result":"0xs"}]}'
 EOF
 drive homogeneous-security-v2
@@ -2711,6 +3030,7 @@ write_driver <<EOF
 #!/usr/bin/env bash
 printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
 printf '{"ceremony":"tbtc_signing","outcome":"succeeded",'
+printf '"canonical_start_block":600,'
 printf '"transaction_hash":"${HASH_A}"}]}'
 EOF
 drive homogeneous-security-v2
@@ -2724,6 +3044,7 @@ write_driver <<EOF
 #!/usr/bin/env bash
 printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
 printf '{"ceremony":"tbtc_signing","outcome":"failed",'
+printf '"canonical_start_block":600,'
 printf '"transaction_hash":"${HASH_A}"}]}'
 EOF
 drive homogeneous-security-v2
@@ -2734,11 +3055,27 @@ write_driver <<EOF
 #!/usr/bin/env bash
 printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
 printf '{"ceremony":"tbtc_signing","outcome":"timed_out",'
+printf '"canonical_start_block":600,'
 printf '"transaction_hash":"${HASH_A}","termination":"gave up I think"}]}'
 EOF
 drive homogeneous-security-v2
 check "a termination this rehearsal does not know stops the step" 3 \
   "carries no termination evidence"
+
+# A driver that printed a readable report and then failed. The report parses,
+# every field is bound, and the exit status still has to reach the step —
+# which is what decides whether any of it counts as work having been driven.
+write_driver <<EOF
+#!/usr/bin/env bash
+printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
+printf '{"ceremony":"tbtc_signing","outcome":"succeeded",'
+printf '"canonical_start_block":600,'
+printf '"transaction_hash":"${HASH_A}","result":"0xs"}]}'
+exit 9
+EOF
+drive rollback-terminal
+check "a readable report from a driver that failed still reports failure" 0 \
+  "offered:no rc:9" "bound:tbtc_signing@600=succeeded=${HASH_A}=0xs"
 
 # Neither container stage can be executed anywhere but a real rehearsal — they
 # need the immutable images, a chain, and persistent volumes — so a call site

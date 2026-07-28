@@ -4636,6 +4636,17 @@ WORK_DRIVER_ORIGINATED=""
 # exhausted, or no threshold reached — for one that did not, which is the
 # distinction between work that came to nothing and work still trying.
 WORK_DRIVER_BOUND_RESULTS=""
+# The same in-flight work with the identity that survives to its outcome, space
+# joined as "<ceremony>@<canonical start block>=<transaction>=<holders>".
+#
+# The ceremony list above says what kind of work drained; it cannot say how
+# much. Two runs of one ceremony are the same word and two permits on every
+# node that joined them, so a reconciliation reading ceremony names counts a
+# population it never established the size of — which is how permits with no
+# outcome behind them reconcile against an outcome belonging to something else.
+# The anchor is the identity because it is what the permit pinned its mode
+# from, and it is what the quarantine record the audit writes carries.
+WORK_DRIVER_ORIGINATED_WORK=""
 
 # True when the last driver call both exited cleanly and named what it put on
 # the chain, which is the whole of "work was offered here".
@@ -4697,10 +4708,12 @@ missing_work_classes() {
   printf '%s' "${uncovered}"
 }
 
-# The fields of one bound result, "<ceremony>=<outcome>=<transaction>=<identity>".
-# Split here rather than at each reader so no control invents its own reading
-# of a record whose whole purpose is that every control reads it the same way.
-bound_ceremony() {
+# The fields of one bound result,
+# "<work>=<outcome>=<transaction>=<identity>", where <work> is the work
+# identity "<ceremony>@<canonical start block>". Split here rather than at each
+# reader so no control invents its own reading of a record whose whole purpose
+# is that every control reads it the same way.
+bound_work() {
   printf '%s' "${1%%=*}"
 }
 
@@ -4721,6 +4734,129 @@ bound_identity() {
   printf '%s' "${1##*=}"
 }
 
+# The ceremony half of a work identity. The anchor half is what distinguishes
+# two runs of the same ceremony from each other; the ceremony half is what the
+# class and family readers are about, and reading a whole identity as a
+# ceremony name would put every one of them in the "unknown" bucket.
+work_ceremony() {
+  printf '%s' "${1%%@*}"
+}
+
+# The fields of one originated-work record,
+# "<work>=<transaction>=<holder>[,<holder>...]". The holders are the R1
+# services that took a permit for it: a threshold ceremony consumes one permit
+# on every node that joins it, so the population a drain has to reconcile is
+# per (node, work) rather than per ceremony, and only the party that originated
+# the work can say which nodes it reached.
+work_id() {
+  printf '%s' "${1%%=*}"
+}
+
+work_transaction() {
+  local rest
+  rest="${1#*=}"
+  printf '%s' "${rest%%=*}"
+}
+
+work_holders() {
+  printf '%s' "${1##*=}"
+}
+
+# Whether a space-joined list contains an exact token. Substring tests are what
+# make "r1-node-1" match "r1-node-10", and a reconciliation that attributes one
+# node's permits to another has followed nothing.
+contains_token() {
+  local list="$1" token="$2" item
+  for item in ${list}; do
+    [[ "${item}" == "${token}" ]] && return 0
+  done
+  return 1
+}
+
+# The originated-work records one node took a permit for, space-joined.
+work_records_held_by() {
+  local records="$1" holder="$2" record holders out=""
+  for record in ${records}; do
+    holders="$(work_holders "${record}")"
+    contains_token "${holders//,/ }" "${holder}" || continue
+    out="${out}${out:+ }${record}"
+  done
+  printf '%s' "${out}"
+}
+
+# The same, as work identities alone.
+work_held_by() {
+  work_identities "$(work_records_held_by "$1" "$2")"
+}
+
+# Every work identity a set of originated records names, space-joined.
+work_identities() {
+  local records="$1" record out=""
+  for record in ${records}; do
+    out="${out}${out:+ }$(work_id "${record}")"
+  done
+  printf '%s' "${out}"
+}
+
+# The bound record for one work identity, empty when nothing terminal was
+# reported for it. The parser rejects a second record for an identity, so at
+# most one can match.
+terminal_record() {
+  local records="$1" work="$2" record
+  for record in ${records}; do
+    [[ "$(bound_work "${record}")" == "${work}" ]] || continue
+    printf '%s' "${record}"
+    return 0
+  done
+  printf ''
+}
+
+# Of the work a gate originated, the identities the driver reported no terminal
+# outcome for and no node quarantined. Space-joined, empty when every piece of
+# work ended somewhere a later reader can see.
+unended_work() {
+  local records="$1" bound="$2" quarantined="$3" record work uncovered=""
+  for record in ${records}; do
+    work="$(work_id "${record}")"
+    [[ -n "$(terminal_record "${bound}" "${work}")" ]] && continue
+    contains_token "${quarantined}" "$(audited_work_id "${work}")" && continue
+    uncovered="${uncovered}${uncovered:+ }${work}"
+  done
+  printf '%s' "${uncovered}"
+}
+
+# Of that same work, the pieces whose terminal record says they came to
+# nothing, rendered with the termination. A control whose claim is that held
+# work was allowed to finish reads this: retries exhausted is an end, but it is
+# not the end that claim is about, and without an audited quarantine record
+# beside it nothing distinguishes work that gave up from work that was dropped.
+unsettled_work() {
+  local records="$1" bound="$2" record work terminal out=""
+  for record in ${records}; do
+    work="$(work_id "${record}")"
+    terminal="$(terminal_record "${bound}" "${work}")"
+    [[ -n "${terminal}" ]] || continue
+    [[ "$(bound_outcome "${terminal}")" == "succeeded" ]] && continue
+    out="${out}${out:+, }${work}=$(bound_outcome "${terminal}") \
+($(bound_identity "${terminal}"))"
+  done
+  printf '%s' "${out}"
+}
+
+# Of the terminal records the driver reported, the ones naming work this gate
+# never originated. An outcome belonging to somebody else's ceremony is not a
+# permit of this fleet's reconciling.
+unoriginated_terminals() {
+  local bound="$1" records="$2" record work identities stray=""
+  identities="$(work_identities "${records}")"
+  for record in ${bound}; do
+    work="$(bound_work "${record}")"
+    contains_token "${identities}" "${work}" && continue
+    stray="${stray}${stray:+, }${work}"
+  done
+  printf '%s' "${stray}"
+}
+
 # Of the required families, the ones no bound successful result covers.
 #
 # The unbound mirror of this reads a population of outcomes that need not have
@@ -4733,7 +4869,8 @@ missing_bound_families() {
     covered=0
     for record in ${records}; do
       [[ "$(bound_outcome "${record}")" == "succeeded" ]] || continue
-      [[ "$(ceremony_family "$(bound_ceremony "${record}")")" == "${family}" ]] ||
+      [[ "$(ceremony_family \
+        "$(work_ceremony "$(bound_work "${record}")")")" == "${family}" ]] ||
         continue
       covered=1
       break
@@ -4749,7 +4886,7 @@ bound_settlements() {
   local records="$1" record out=""
   for record in ${records}; do
     [[ "$(bound_outcome "${record}")" == "succeeded" ]] || continue
-    out="${out}${out:+, }$(bound_ceremony "${record}") \
+    out="${out}${out:+, }$(bound_work "${record}") \
 ($(bound_transaction "${record}"), $(bound_identity "${record}"))"
   done
   printf '%s' "${out}"
@@ -4761,7 +4898,7 @@ bound_terminations() {
   local records="$1" record out=""
   for record in ${records}; do
     [[ "$(bound_outcome "${record}")" == "succeeded" ]] && continue
-    out="${out}${out:+, }$(bound_ceremony "${record}")=\
+    out="${out}${out:+, }$(bound_work "${record}")=\
 $(bound_outcome "${record}") ($(bound_transaction "${record}"), \
 $(bound_identity "${record}"))"
   done
@@ -4776,14 +4913,16 @@ run_work_driver() {
   WORK_DRIVER_CEREMONY_RESULTS=""
   WORK_DRIVER_ORIGINATED=""
   WORK_DRIVER_BOUND_RESULTS=""
+  WORK_DRIVER_ORIGINATED_WORK=""
   report="$("${PR4109_WORK_DRIVER}" "${phase}")" || rc=$?
   WORK_DRIVER_RC="${rc}"
 
   if [[ -n "${report//[[:space:]]/}" ]]; then
-    # Four lines out of one parse: the hashes, the outcomes, the work still in
-    # flight, and the outcomes bound to what started them. Parsing four times
-    # would report a malformed object four times and, worse, could accept one
-    # part of a report whose other parts are unreadable.
+    # Five lines out of one parse: the hashes, the outcomes, the ceremonies
+    # still in flight, the outcomes bound to what started them, and the
+    # in-flight work bound to the nodes holding a permit for it. Parsing five
+    # times would report a malformed object five times and, worse, could accept
+    # one part of a report whose other parts are unreadable.
     local parsed hashes
     parsed="$(printf '%s' "${report}" | node -e '
       const CEREMONIES = ["beacon_dkg", "beacon_signing", "tbtc_dkg",
@@ -4811,27 +4950,113 @@ run_work_driver() {
             encoded.push(JSON.stringify(hash));
           }
         }
-        // What the driver put on the chain, whatever became of it. A phase
-        // whose subject is work still in flight cannot read the terminal
-        // outcomes: by the time one exists the work it was about is over.
+        // The chain anchor a permit pins its mode from, and the identity of
+        // one piece of work. Two runs of the same ceremony are the same word
+        // and different work: an account that names only the ceremony cannot
+        // say how many permits it is describing, which is the whole of what a
+        // drain has to reconcile.
+        const anchorOf = (entry, what) => {
+          const block = (entry || {}).canonical_start_block;
+          if (!Number.isInteger(block) || block < 1) {
+            console.error(what + " names no canonical start block: " +
+              JSON.stringify((entry || {}).ceremony));
+            process.exit(1);
+          }
+          return block;
+        };
+        // One transaction starts one piece of work. Without this a report can
+        // name several ceremonies against a single hash, and every control
+        // that follows an outcome back to a transaction would confirm work
+        // that was never separately originated.
+        const owners = new Map();
+        const claim = (work, tx) => {
+          const owner = owners.get(tx);
+          if (owner !== undefined && owner !== work) {
+            console.error("transaction claimed by two pieces of work: " +
+              JSON.stringify(tx));
+            process.exit(1);
+          }
+          owners.set(tx, work);
+        };
+        // What the driver put on the chain, whatever became of it, and which
+        // nodes took a permit for it. A phase whose subject is work still in
+        // flight cannot read the terminal outcomes: by the time one exists the
+        // work it was about is over.
         const originated = report.originated_ceremonies;
         const started = [];
+        const inflight = [];
+        const startedWork = new Set();
         if (originated !== undefined) {
           if (!Array.isArray(originated)) {
             console.error("originated_ceremonies is not an array");
             process.exit(1);
           }
-          for (const ceremony of originated) {
+          for (const entry of originated) {
+            // A bare ceremony name is the shape this report used to take, and
+            // it identifies nothing: the drain that reads it has to follow
+            // permits, and a name says neither which run of the ceremony nor
+            // which nodes took one. Refusing it by name rather than by field
+            // keeps a driver still emitting the old form from reporting as a
+            // run that originated nothing.
+            if (entry === null || typeof entry !== "object" ||
+              Array.isArray(entry)) {
+              console.error("originated work is not an object naming a " +
+                "ceremony, canonical start block, transaction and holders: " +
+                JSON.stringify(entry));
+              process.exit(1);
+            }
+            const ceremony = entry.ceremony;
             if (!CEREMONIES.includes(ceremony)) {
               console.error("not a ceremony: " + JSON.stringify(ceremony));
               process.exit(1);
             }
+            const block = anchorOf(entry, "originated work");
+            const tx = (entry || {}).transaction_hash;
+            if (typeof tx !== "string" ||
+              !encoded.includes(JSON.stringify(tx))) {
+              console.error("originated work names no transaction the report " +
+                "originated: " + JSON.stringify(ceremony));
+              process.exit(1);
+            }
+            // The nodes this work reached. A drain reconciles per (node,
+            // work): a threshold ceremony consumes one permit on every node
+            // that joins it, so a fleet total cannot be compared with a count
+            // of ceremonies at all.
+            const holders = (entry || {}).holders;
+            if (!Array.isArray(holders) || holders.length === 0) {
+              console.error("originated work names no holding node: " +
+                JSON.stringify(ceremony));
+              process.exit(1);
+            }
+            const seenHolders = new Set();
+            for (const holder of holders) {
+              if (typeof holder !== "string" ||
+                !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(holder)) {
+                console.error("not a holding node: " + JSON.stringify(holder));
+                process.exit(1);
+              }
+              if (seenHolders.has(holder)) {
+                console.error("holding node named twice for one piece of " +
+                  "work: " + JSON.stringify(holder));
+                process.exit(1);
+              }
+              seenHolders.add(holder);
+            }
+            const work = ceremony + "@" + block;
+            if (startedWork.has(work)) {
+              console.error("work originated twice: " + JSON.stringify(work));
+              process.exit(1);
+            }
+            startedWork.add(work);
+            claim(work, tx);
             started.push(ceremony);
+            inflight.push(work + "=" + tx + "=" + holders.join(","));
           }
         }
         const results = report.ceremony_results;
         const all = [];
         const bound = [];
+        const endedWork = new Set();
         if (results !== undefined) {
           if (!Array.isArray(results)) {
             console.error("ceremony_results is not an array");
@@ -4848,6 +5073,19 @@ run_work_driver() {
               console.error("not an outcome: " + JSON.stringify(outcome));
               process.exit(1);
             }
+            // The same identity the in-flight half carries, so a phase can
+            // follow one piece of work from the permit it took to what became
+            // of it. One piece of work ends once: a second record for the same
+            // identity is either a duplicate or two outcomes for one ceremony,
+            // and both make the reconciliation below count an outcome twice.
+            const block = anchorOf(result, "result");
+            const work = ceremony + "@" + block;
+            if (endedWork.has(work)) {
+              console.error("work reported terminal twice: " +
+                JSON.stringify(work));
+              process.exit(1);
+            }
+            endedWork.add(work);
             // The transaction this outcome belongs to, and it has to be one
             // the same report accounted for putting on the chain. Without it
             // the hashes and the outcomes are two independent populations,
@@ -4864,6 +5102,7 @@ run_work_driver() {
                 "originate: " + JSON.stringify(tx));
               process.exit(1);
             }
+            claim(work, tx);
             // What the ceremony actually left behind. A control that asks
             // whether a ceremony settled cannot read that off the word
             // "succeeded": the identity of the threshold output is the thing
@@ -4892,28 +5131,34 @@ run_work_driver() {
             // could not see a ceremony succeeding where the property under
             // test is that it must not.
             all.push(ceremony + "=" + outcome);
-            bound.push(ceremony + "=" + outcome + "=" + tx + "=" +
+            bound.push(work + "=" + outcome + "=" + tx + "=" +
               (outcome === "succeeded" ? identity : termination));
           }
         }
         process.stdout.write(encoded.join(",") + "\n" +
-          all.join(" ") + "\n" + started.join(" ") + "\n" + bound.join(" "));
+          all.join(" ") + "\n" + started.join(" ") + "\n" + bound.join(" ") +
+          "\n" + inflight.join(" "));
       });
     ')" ||
       blocked "the work driver reported the ${phase} phase in a form this \
 rehearsal cannot read; its stdout must be a JSON object whose optional \
-transaction_hashes array carries 0x-prefixed 32-byte hashes and whose \
-optional ceremony_results array carries {ceremony, outcome, transaction_hash} \
-objects over the known ceremonies and outcomes, each naming a transaction the \
-same report originated and carrying either a result identity when it \
+transaction_hashes array carries 0x-prefixed 32-byte hashes, whose optional \
+originated_ceremonies array carries {ceremony, canonical_start_block, \
+transaction_hash, holders} objects naming work put on the chain and the R1 \
+services that took a permit for it, and whose optional ceremony_results array \
+carries {ceremony, canonical_start_block, outcome, transaction_hash} objects \
+over the known ceremonies and outcomes — each naming a transaction the same \
+report originated and no other piece of work claims, each identifying one \
+piece of work exactly once, and each carrying either a result identity when it \
 succeeded or a termination of retry_exhausted or no_threshold when it did \
-not, and a report that cannot be read leaves the step with no account of what \
+not — and a report that cannot be read leaves the step with no account of what \
 it drove"
 
     hashes="$(printf '%s\n' "${parsed}" | sed -n '1p')"
     WORK_DRIVER_CEREMONY_RESULTS="$(printf '%s\n' "${parsed}" | sed -n '2p')"
     WORK_DRIVER_ORIGINATED="$(printf '%s\n' "${parsed}" | sed -n '3p')"
     WORK_DRIVER_BOUND_RESULTS="$(printf '%s\n' "${parsed}" | sed -n '4p')"
+    WORK_DRIVER_ORIGINATED_WORK="$(printf '%s\n' "${parsed}" | sed -n '5p')"
 
     if [[ -n "${hashes}" ]]; then
       STEP_TX_HASHES="${STEP_TX_HASHES}${STEP_TX_HASHES:+,}${hashes}"
@@ -5264,6 +5509,19 @@ QUIESCE_CEREMONY_REFUSALS_AFTER=""
 # reasons moves the total and one per-ceremony counter together, which is
 # indistinguishable from this offer being refused.
 QUIESCE_OFFERED=""
+# The work this node was actually holding when the stop was issued, and what
+# became of it, asked of the driver once the drain is over.
+#
+# "Lets held permits finish" is a claim about the work, and the node's own
+# gauge cannot carry it: a process that exits holding a permit stops reporting
+# the permit exactly as one that completed it does, and a gauge seen at zero is
+# the same reading either way. Nor can a forced-abort counter that did not move
+# stand in for it — a permit dropped when the process went is not a permit the
+# gate force-canceled, and neither is it one that finished.
+QUIESCE_INFLIGHT_WORK=""
+QUIESCE_TERMINAL=""
+QUIESCE_TERMINAL_ASKED=0
+QUIESCE_TERMINAL_RC=0
 
 quiescence_verdict() {
   local node="$1"
@@ -5307,6 +5565,59 @@ ${QUIESCE_HELD_BEFORE} security-v2 ceremonies and was never seen without \
 them; the node stopped answering with its in-flight count unobserved at zero, \
 so nothing here says those permits finished rather than went down with the \
 process"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ -z "${QUIESCE_INFLIGHT_WORK//[[:space:]]/}" ]]; then
+    # The gauge fell, and a gauge falling is where this step used to stop. It
+    # is the same reading a process that exited holding its permits produces,
+    # so the permits have to be named before anything can be said about them.
+    block_step "${step}" "${node} was seen without the \
+${QUIESCE_HELD_BEFORE} security-v2 ceremonies it held, but the driver named no \
+identified work it was holding; an in-flight count says how many permits there \
+were and not which work each one was issued for, and a count that fell to zero \
+cannot be followed to anything"
+    record_assertion "${assertion}" false "${step}"
+  elif ((QUIESCE_HELD_BEFORE != $(count_tokens \
+    "$(work_identities "${QUIESCE_INFLIGHT_WORK}")"))); then
+    block_step "${step}" "${node} held ${QUIESCE_HELD_BEFORE} security-v2 \
+permit(s) for $(count_tokens "$(work_identities \
+      "${QUIESCE_INFLIGHT_WORK}")") piece(s) of work the driver put on it \
+($(work_identities "${QUIESCE_INFLIGHT_WORK}")); the permit counter and the \
+driver's account describe different populations, so an outcome for one piece \
+of work cannot be said to be the outcome of any particular held permit"
+    record_assertion "${assertion}" false "${step}"
+  elif ((QUIESCE_TERMINAL_ASKED == 0)); then
+    block_step "${step}" "${node} let all ${QUIESCE_HELD_BEFORE} held permits \
+go without being force-aborted, but the driver was never asked what became of \
+the work behind them; a gauge that fell to zero is equally a ceremony that \
+finished and a process that exited holding it, and only one of those is a \
+permit that was allowed to finish"
+    record_assertion "${assertion}" false "${step}"
+  elif ((QUIESCE_TERMINAL_RC != 0)); then
+    block_step "${step}" "the work driver exited [${QUIESCE_TERMINAL_RC}] \
+reporting what became of the work ${node} held, so its account of the chain \
+stops wherever it failed; held permits reconciled against a partial report \
+take the outcomes it happened to reach for all there were"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ -n "$(unended_work "${QUIESCE_INFLIGHT_WORK}" \
+    "${QUIESCE_TERMINAL}" "")" ]]; then
+    block_step "${step}" "${node} was seen without the permits it held, but \
+the driver reported no terminal outcome for $(unended_work \
+      "${QUIESCE_INFLIGHT_WORK}" "${QUIESCE_TERMINAL}" ""); a permit that \
+stopped being counted while the work behind it never ended is a permit the \
+process took with it, which is the one reading this step exists to refuse"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ -n "$(unsettled_work "${QUIESCE_INFLIGHT_WORK}" \
+    "${QUIESCE_TERMINAL}")" ]]; then
+    # An end, but not the end this step's assertion is about. Nothing in this
+    # gate audits the state a ceremony that gave up left behind — that is the
+    # rollback gate's quarantine reconciliation — so a quiescence that produced
+    # one is recorded as unproven rather than as work allowed to finish.
+    block_step "${step}" "${node} let its held permits go and the driver \
+followed them to an end, but $(unsettled_work "${QUIESCE_INFLIGHT_WORK}" \
+      "${QUIESCE_TERMINAL}") came to nothing rather than settling on chain; \
+this gate audits no quarantined state, so work that gave up inside the grace \
+evidences neither that it was allowed to finish nor that what it left behind \
+is accounted for"
     record_assertion "${assertion}" false "${step}"
   elif ((QUIESCE_OFFER_FAILED == 1)); then
     block_step "${step}" "${node} entered quiescing and let all \
@@ -5383,7 +5694,8 @@ ${QUIESCE_REFUSALS_BEFORE} to ${QUIESCE_REFUSALS_AFTER}) while issuing no \
 permit (${QUIESCE_ISSUED_BEFORE} to ${QUIESCE_ISSUED_AFTER}), and let every \
 held permit finish inside the reviewed ${QUIESCE_GRACE}s grace — in-flight \
 count observed at zero, no forced abort (${QUIESCE_FORCED_BEFORE} to \
-${QUIESCE_FORCED_AFTER})"
+${QUIESCE_FORCED_AFTER}), and every piece of work it was holding settled on \
+chain ($(bound_settlements "${QUIESCE_TERMINAL}"))"
     record_assertion "${assertion}" true "${step}"
   fi
 }
@@ -5629,8 +5941,10 @@ holding work was never SIGKILLed before its in-process backstop"
 # absence, which is exactly how a permit nobody could account for would
 # disappear from the reconciliation.
 ROLLBACK_NODE_ACCOUNTS=""
-# The audited quarantine record counts, "<service> <count>", read from each
-# node's audit manifest after the audit has run.
+# The audited quarantine records, "<service> <id>[,<id>...]", read from each
+# node's audit manifest after the audit has run and restricted to records this
+# drain produced. "none" when the manifest holds no such record, "unreadable"
+# when it could not be read.
 ROLLBACK_NODE_QUARANTINES=""
 # What became of the work this gate originated, asked of the driver once the
 # drain is over. A permit that was not force-canceled is only "completed" if
@@ -5639,24 +5953,17 @@ ROLLBACK_NODE_QUARANTINES=""
 # like, and the driver is the only party that can watch a ceremony settle on
 # chain.
 ROLLBACK_TERMINAL=""
-# 1 when the driver was asked for those outcomes at all.
+# 1 when the driver was asked for those outcomes at all, and the status it
+# exited with when it was. A terminal report from a driver that failed is a
+# partial account of an interrupted look at the chain, and reconciling permits
+# against it would take the ceremonies it happened to reach for all there were.
 ROLLBACK_TERMINAL_ASKED=0
-
-# Of the ceremonies a gate originated, the ones the driver reported no terminal
-# outcome for. Space-joined, empty when every one of them ended somewhere.
-missing_terminal_ceremonies() {
-  local originated="$1" bound="$2" ceremony record uncovered="" covered
-  for ceremony in ${originated}; do
-    covered=0
-    for record in ${bound}; do
-      [[ "$(bound_ceremony "${record}")" == "${ceremony}" ]] || continue
-      covered=1
-      break
-    done
-    ((covered == 1)) || uncovered="${uncovered}${uncovered:+ }${ceremony}"
-  done
-  printf '%s' "${uncovered}"
-}
+ROLLBACK_TERMINAL_RC=0
+# The identified work the drain was performed over, and the instant the stop
+# was issued. The first is what each permit is followed to an outcome through;
+# the second is what keeps the audit's quarantine records about this drain.
+ROLLBACK_ORIGINATED_WORK=""
+ROLLBACK_DRAIN_SINCE=""
 
 # The verdict over that accounting.
 #
@@ -5668,21 +5975,71 @@ missing_terminal_ceremonies() {
 # the state a rollback then restores onto is the difference between those two.
 #
 # So every permit a node held when the stop was issued has to land somewhere:
-# completed, which the node evidences by being seen without it, or force-
-# canceled at the quiesce deadline, which the gate counts and the offline audit
-# must have written a quarantine record for. A permit that reconciles to
-# neither went down with its process, and nothing in the state left behind says
-# so.
+# completed, which the node evidences by being seen without it and the driver
+# by an outcome for the work behind it, or force-canceled at the quiesce
+# deadline, which the gate counts and the offline audit must have written a
+# quarantine record for. A permit that reconciles to neither went down with its
+# process, and nothing in the state left behind says so.
+#
+# The unit is the permit, not the ceremony. A count of ceremony names cannot
+# close over a population of permits: a threshold ceremony takes one permit on
+# every node that joins it, and two runs of one ceremony are the same name.
+# Reconciled by name, one outcome covers as many permits as happen to be
+# outstanding, which is the reading this exists to refuse rather than a weaker
+# version of following each one.
 rollback_reconciliation_verdict() {
   local step="$1" assertion="$2"
   local line service held forced final quarantined
-  local unread="" unreconciled="" unaudited="" impossible=""
+  local unread="" unreconciled="" unaudited="" impossible="" miscounted=""
+  local strayed="" orphaned=""
   local completed_total=0 quarantined_total=0 nodes=0
+  local node_work expected quarantine_ids quarantine_count work audited
 
   if [[ -z "${ROLLBACK_NODE_ACCOUNTS//[[:space:]]/}" ]]; then
     block_step "${step}" "no R1 node's permit accounting was captured across \
 the drain, so nothing here followed a single permit from the stop to an \
 outcome"
+    record_assertion "${assertion}" false "${step}"
+    return
+  fi
+
+  if [[ -z "${ROLLBACK_ORIGINATED_WORK//[[:space:]]/}" ]]; then
+    block_step "${step}" "the driver named no identified work for the drain, \
+so the permits the fleet held cannot be followed to anything; a ceremony name \
+says what kind of work was in flight and a permit count says how much, and \
+neither says which permit belongs to which piece of work"
+    record_assertion "${assertion}" false "${step}"
+    return
+  fi
+
+  if ((ROLLBACK_TERMINAL_ASKED == 0)); then
+    # The reading this rung exists for. A permit that was not force-canceled
+    # used to be counted as completed because the node was later seen without
+    # it — and a node that exited holding one is also a node later seen without
+    # it. Being gone is not an outcome.
+    block_step "${step}" "the driver was never asked what became of the work \
+behind the permits the fleet held; a gauge that fell to zero is equally a \
+ceremony that finished and a process that exited holding it, and only one of \
+those is a permit that completed"
+    record_assertion "${assertion}" false "${step}"
+    return
+  fi
+
+  if ((ROLLBACK_TERMINAL_RC != 0)); then
+    block_step "${step}" "the work driver exited [${ROLLBACK_TERMINAL_RC}] \
+reporting what became of the drained work, so its account of the chain stops \
+wherever it failed; permits reconciled against a partial report take the \
+outcomes it happened to reach for all there were"
+    record_assertion "${assertion}" false "${step}"
+    return
+  fi
+
+  strayed="$(unoriginated_terminals "${ROLLBACK_TERMINAL}" \
+    "${ROLLBACK_ORIGINATED_WORK}")"
+  if [[ -n "${strayed}" ]]; then
+    block_step "${step}" "the driver reported terminal outcomes for \
+${strayed}, which this drain never originated; an outcome belonging to \
+somebody else's ceremony reconciles none of this fleet's permits"
     record_assertion "${assertion}" false "${step}"
     return
   fi
@@ -5709,14 +6066,50 @@ ${forced} of ${held} held"
 holding ${final} of ${held} permit(s)"
       continue
     fi
+
+    # What this node was actually holding, named rather than counted. A permit
+    # total that does not match the work the driver put on this node is an
+    # accounting over two different populations: either the node joined work
+    # nobody attributed to it, or work attributed to it never reached it, and
+    # in both readings the outcomes below belong to a different set of permits.
+    node_work="$(work_held_by "${ROLLBACK_ORIGINATED_WORK}" "${service}")"
+    expected="$(count_tokens "${node_work}")"
+    if ((held != expected)); then
+      miscounted="${miscounted}${miscounted:+, }${service} held ${held} \
+permit(s) for ${expected} piece(s) of work the driver put on it \
+(${node_work:-none})"
+      continue
+    fi
+
     quarantined="$(listing_value "${ROLLBACK_NODE_QUARANTINES}" "${service}")"
-    if ((forced > 0)); then
-      if [[ ! "${quarantined}" =~ ^[0-9]+$ ]]; then
+    quarantine_ids=""
+    quarantine_count=0
+    if [[ "${quarantined}" != "none" ]]; then
+      if [[ -z "${quarantined}" || "${quarantined}" == "unreadable" ]]; then
         unaudited="${unaudited}${unaudited:+, }${service} (${forced} \
-force-canceled, quarantine records ${quarantined:-unreadable})"
+force-canceled, quarantine records unreadable)"
         continue
       fi
-      if ((quarantined == 0)); then
+      quarantine_ids="${quarantined//,/ }"
+      quarantine_count="$(count_tokens "${quarantine_ids}")"
+    fi
+
+    # A record has to be about work this node held. The namespace is written by
+    # whatever the node was doing, and a record for a ceremony nobody
+    # attributed to this drain accounts for none of the permits being followed
+    # — it is state from somewhere else standing in for them.
+    audited=""
+    for work in ${node_work}; do
+      audited="${audited}${audited:+ }$(audited_work_id "${work}")"
+    done
+    for work in ${quarantine_ids}; do
+      contains_token "${audited}" "${work}" && continue
+      strayed="${strayed}${strayed:+, }${service} quarantined ${work}"
+    done
+    [[ -n "${strayed}" ]] && continue
+
+    if ((forced > 0)); then
+      if ((quarantine_count == 0)); then
         unaudited="${unaudited}${unaudited:+, }${service} (${forced} \
 force-canceled, no quarantine record)"
         continue
@@ -5727,13 +6120,25 @@ force-canceled, no quarantine record)"
       # rollback restores onto with nothing describing it — which is the
       # reading this reconciliation exists to refuse, not a weaker version of
       # a record being present at all.
-      if ((quarantined < forced)); then
+      if ((quarantine_count < forced)); then
         unaudited="${unaudited}${unaudited:+, }${service} (${forced} \
-force-canceled, only ${quarantined} quarantine record(s))"
+force-canceled, only ${quarantine_count} quarantine record(s))"
         continue
       fi
       quarantined_total=$((quarantined_total + forced))
     fi
+
+    # And the permits that were not force-canceled: each one belongs to a piece
+    # of work, and that work has to have ended somewhere the driver watched
+    # rather than merely stopped being counted here.
+    for work in ${node_work}; do
+      contains_token "${quarantine_ids}" "$(audited_work_id "${work}")" &&
+        continue
+      [[ -n "$(terminal_record "${ROLLBACK_TERMINAL}" "${work}")" ]] && continue
+      orphaned="${orphaned}${orphaned:+, }${service} held a permit for \
+${work}"
+    done
+
     completed_total=$((completed_total + held - forced))
   done <<<"${ROLLBACK_NODE_ACCOUNTS}"
 
@@ -5753,31 +6158,35 @@ other"
 neither completion nor quarantine — they went down with the process, and the \
 state a rollback would restore onto carries no account of them"
     record_assertion "${assertion}" false "${step}"
+  elif [[ -n "${miscounted}" ]]; then
+    block_step "${step}" "${miscounted}; the permit counters and the driver's \
+account of what it put on each node describe different populations, so an \
+outcome for one piece of work cannot be said to reconcile any particular \
+permit"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ -n "${strayed}" ]]; then
+    record_step "${step}" fail "${strayed}, which this drain never put on that \
+node; a quarantine record for work nobody attributed to this drain is state \
+from somewhere else standing in for the permits being followed"
+    record_assertion "${assertion}" false "${step}"
   elif [[ -n "${unaudited}" ]]; then
     record_step "${step}" fail "${unaudited}; a permit the gate force-canceled \
 at the quiesce deadline that left no audited quarantine record behind is \
 in-flight state the rollback would restore onto with nothing describing it"
     record_assertion "${assertion}" false "${step}"
-  elif ((completed_total > 0)) && ((ROLLBACK_TERMINAL_ASKED == 0)); then
-    # The reading this rung exists for. A permit that was not force-canceled
-    # used to be counted as completed because the node was later seen without
-    # it — and a node that exited holding one is also a node later seen
-    # without it. Being gone is not an outcome.
-    block_step "${step}" "${completed_total} permit(s) left the fleet without \
-being force-canceled, but the driver was never asked what became of the work \
-behind them; a gauge that fell to zero is equally a ceremony that finished and \
-a process that exited holding it, and only one of those is a permit that \
-completed"
+  elif [[ -n "${orphaned}" ]]; then
+    block_step "${step}" "${orphaned} that neither ended in a terminal outcome \
+the driver watched nor was written into a quarantine record; that permit \
+reconciles to a gauge that fell rather than to work that ended, and the state \
+a rollback restores onto carries no account of it"
     record_assertion "${assertion}" false "${step}"
-  elif ((completed_total > 0)) &&
-    [[ -n "$(missing_terminal_ceremonies "${ROLLBACK_ORIGINATED}" \
-      "${ROLLBACK_TERMINAL}")" ]]; then
-    block_step "${step}" "${completed_total} permit(s) left the fleet without \
-being force-canceled, but the driver reported no terminal outcome for \
-$(missing_terminal_ceremonies "${ROLLBACK_ORIGINATED}" \
-      "${ROLLBACK_TERMINAL}"); those permits reconcile to a gauge that fell \
-rather than to work that ended, and the state a rollback restores onto carries \
-no account of them"
+  elif [[ -n "$(unended_work "${ROLLBACK_ORIGINATED_WORK}" \
+    "${ROLLBACK_TERMINAL}" "$(quarantined_identities)")" ]]; then
+    block_step "${step}" "the driver reported no terminal outcome and no node \
+quarantined $(unended_work "${ROLLBACK_ORIGINATED_WORK}" \
+      "${ROLLBACK_TERMINAL}" "$(quarantined_identities)"); work this gate put \
+on the chain and never followed to an end is work the rollback restores onto \
+with nothing describing it"
     record_assertion "${assertion}" false "${step}"
   else
     local settled terminated accounted
@@ -5788,13 +6197,24 @@ no account of them"
       accounted="${accounted}${accounted:+, }${terminated}"
     fi
     record_step "${step}" pass "every permit the ${nodes} R1 node(s) held when \
-the stop was issued reconciles: ${completed_total} completed with the holding \
-node observed without them and the driver accounting for every ceremony it \
-originated (${accounted}), and ${quarantined_total} were \
-force-canceled at the quiesce deadline and written into the audit's \
-quarantine records"
+the stop was issued reconciles to the piece of work it was issued for: \
+${completed_total} completed with the holding node observed without them and \
+the driver reporting an outcome for each one (${accounted}), and \
+${quarantined_total} were force-canceled at the quiesce deadline and written \
+into the audit's quarantine records for the work they held"
     record_assertion "${assertion}" true "${step}"
   fi
+}
+
+# Every audited quarantine identity this drain produced, across the fleet.
+quarantined_identities() {
+  local k v out=""
+  while read -r k v; do
+    [[ -n "${k}" ]] || continue
+    [[ "${v}" == "none" || "${v}" == "unreadable" || -z "${v}" ]] && continue
+    out="${out}${out:+ }${v//,/ }"
+  done <<<"${ROLLBACK_NODE_QUARANTINES}"
+  printf '%s' "${out}"
 }
 
 # One value out of a "<key> <value>" listing, empty when the key is absent.
@@ -5809,30 +6229,87 @@ listing_value() {
   printf ''
 }
 
-# The number of quarantined outputs an audit manifest records, across both
-# protocols. Emitted as "unreadable" when the manifest cannot be parsed, since
-# a manifest nobody could read authorizes nothing.
-audit_quarantine_count() {
-  local manifest="$1"
+# The quarantined outputs an audit manifest records for work interrupted after
+# a given instant, one comma-joined "<ceremony>@<canonical start block>" per
+# record across both protocols. Emitted as "unreadable" when the manifest or
+# any record in it cannot be read, since a manifest nobody could read
+# authorizes nothing, and as "none" when the manifest is readable and holds no
+# record newer than the instant.
+#
+# The instant is what keeps the reading about this drain. A quarantine
+# namespace accumulates: records an earlier interruption wrote are still there,
+# and counting whatever the namespace holds lets state from a run nobody is
+# reconciling stand in for permits this drain abandoned.
+audit_quarantine_records() {
+  local manifest="$1" since="$2"
   [[ -f "${manifest}" ]] || {
     printf 'unreadable'
     return 0
   }
   node -e '
     const fs = require("fs");
-    try {
+    const render = () => {
       const m = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      const since = Date.parse(process.argv[2]);
       const beacon = m.beacon_quarantined_outputs || [];
       const tbtc = m.tbtc_quarantined_outputs || [];
-      if (!Array.isArray(beacon) || !Array.isArray(tbtc)) {
-        process.stdout.write("unreadable");
-      } else {
-        process.stdout.write(String(beacon.length + tbtc.length));
+      if (!Array.isArray(beacon) || !Array.isArray(tbtc) ||
+        !Number.isFinite(since)) {
+        return "unreadable";
       }
+      const ids = [];
+      for (const record of beacon.concat(tbtc)) {
+        const ceremony = (record || {}).ceremony;
+        const block = (record || {}).canonical_start_block;
+        const preserved = Date.parse((record || {}).preserved_at);
+        if (typeof ceremony !== "string" || !/^[a-z0-9_]+$/.test(ceremony) ||
+          !Number.isInteger(block) || !Number.isFinite(preserved)) {
+          return "unreadable";
+        }
+        if (preserved < since) {
+          continue;
+        }
+        ids.push(ceremony + "@" + block);
+      }
+      return ids.length === 0 ? "none" : ids.join(",");
+    };
+    try {
+      process.stdout.write(render());
     } catch (e) {
       process.stdout.write("unreadable");
     }
-  ' "${manifest}" 2>/dev/null || printf 'unreadable'
+  ' "${manifest}" "${since}" 2>/dev/null || printf 'unreadable'
+}
+
+# The gate ceremony a driven work class takes its permit under, which is what
+# the quarantine record the audit writes carries. The driver names work the way
+# an operator drives it; the gate names it the way it is gated, and the two
+# vocabularies differ where one gate class covers several driven ones: every
+# non-heartbeat wallet action is a signing ceremony, and the beacon's signing
+# class is its relay signing. Comparing the driver's word with the audit's
+# without this mapping would find no quarantine record for work that has one.
+gate_ceremony() {
+  case "$1" in
+  tbtc_wallet_action | tbtc_signing) printf 'tbtc_signing' ;;
+  beacon_signing) printf 'beacon_relay_signing' ;;
+  *) printf '%s' "$1" ;;
+  esac
+}
+
+# One work identity in the audit's vocabulary rather than the driver's.
+audited_work_id() {
+  local ceremony
+  ceremony="$(work_ceremony "$1")"
+  printf '%s@%s' "$(gate_ceremony "${ceremony}")" "${1##*@}"
+}
+
+# How many tokens a space-joined list holds.
+count_tokens() {
+  local item count=0
+  for item in $1; do
+    count=$((count + 1))
+  done
+  printf '%s' "${count}"
 }
 
 stage_single_release() {
@@ -6189,8 +6666,18 @@ network"
   # The property is about a permit the node is holding while it is told to
   # stop, so one has to be in flight before the stop is issued. A node with
   # nothing running quiesces trivially and evidences nothing.
+  #
+  # The work it puts in flight is retained, not only the fact that it ran: the
+  # permits this node is about to be told to drain have to be followed to an
+  # outcome afterwards, and only the driver's account names which piece of work
+  # each one was issued for.
+  QUIESCE_INFLIGHT_WORK=""
   if [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
     run_work_driver quiesce-inflight || true
+    if driver_offered_work; then
+      QUIESCE_INFLIGHT_WORK="$(work_records_held_by \
+        "${WORK_DRIVER_ORIGINATED_WORK}" "${quiesce_node}")"
+    fi
   fi
   QUIESCE_HELD_BEFORE="$(participation_field "${quiesce_node}" \
     active_security_v2_ceremonies 2>/dev/null || printf '')"
@@ -6291,6 +6778,20 @@ originated on the rehearsal chain that is still running at shutdown"
     done
     wait "${stop_pid}" || true
 
+    # What became of the work the node was holding, asked once the drain is
+    # over and the outcomes exist to be read. The window above cannot ask: its
+    # subject is work still running, and by the time an outcome exists the work
+    # it was about is finished.
+    QUIESCE_TERMINAL=""
+    QUIESCE_TERMINAL_ASKED=0
+    QUIESCE_TERMINAL_RC=0
+    if [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
+      QUIESCE_TERMINAL_ASKED=1
+      run_work_driver quiesce-terminal || true
+      QUIESCE_TERMINAL="${WORK_DRIVER_BOUND_RESULTS}"
+      QUIESCE_TERMINAL_RC="${WORK_DRIVER_RC}"
+    fi
+
     quiescence_verdict "${quiesce_node}"
   fi
 
@@ -6354,12 +6855,14 @@ nowhere to capture them to"
   ROLLBACK_DRIVER_RC=0
   ROLLBACK_DRIVER_TX=0
   ROLLBACK_ORIGINATED=""
+  ROLLBACK_ORIGINATED_WORK=""
   if [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
     ROLLBACK_DRIVER_SUPPLIED=1
     run_work_driver rollback-inflight || true
     ROLLBACK_DRIVER_RC="${WORK_DRIVER_RC}"
     ROLLBACK_DRIVER_TX="${WORK_DRIVER_TX_COUNT}"
     ROLLBACK_ORIGINATED="${WORK_DRIVER_ORIGINATED}"
+    ROLLBACK_ORIGINATED_WORK="${WORK_DRIVER_ORIGINATED_WORK}"
   fi
 
   # The permits the fleet is actually holding as the stop is issued. This is
@@ -6405,6 +6908,14 @@ nowhere to capture them to"
 
   reset_prior_drain_samples
   sample_prior_absence
+
+  # The instant the stop is issued, so the audit's quarantine records can be
+  # read as this drain's rather than as whatever the namespace has accumulated.
+  # Taken from the same runtime the manifest is parsed with, at millisecond
+  # resolution, because a record written in the same second as a whole-second
+  # stamp would otherwise be indistinguishable from one written before it.
+  ROLLBACK_DRAIN_SINCE="$(node -e \
+    'process.stdout.write(new Date().toISOString())')"
 
   # The drain runs in the background so the prior service can be sampled
   # while it is happening. The marker carries the drain's own exit status out
@@ -6562,16 +7073,19 @@ reconciliation, quiescence, and prior-reader evidence"
   # work it was about is finished.
   ROLLBACK_TERMINAL=""
   ROLLBACK_TERMINAL_ASKED=0
+  ROLLBACK_TERMINAL_RC=0
   if [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
     ROLLBACK_TERMINAL_ASKED=1
     run_work_driver rollback-terminal || true
     ROLLBACK_TERMINAL="${WORK_DRIVER_BOUND_RESULTS}"
+    ROLLBACK_TERMINAL_RC="${WORK_DRIVER_RC}"
   fi
   ROLLBACK_NODE_QUARANTINES=""
   for service in "${REHEARSAL_R1_SERVICES[@]}"; do
     ROLLBACK_NODE_QUARANTINES="${ROLLBACK_NODE_QUARANTINES}\
 ${ROLLBACK_NODE_QUARANTINES:+$'\n'}${service} \
-$(audit_quarantine_count "${EVIDENCE_DIR}/state-audit/${service}.json")"
+$(audit_quarantine_records "${EVIDENCE_DIR}/state-audit/${service}.json" \
+      "${ROLLBACK_DRAIN_SINCE}")"
   done
   rollback_reconciliation_verdict \
     "every in-flight permit reconciles to completion or quarantine" \
