@@ -2775,6 +2775,21 @@ manifest_termination_grace() {
   ' "${SCRIPT_DIR}/release-manifest.json"
 }
 
+# The release epoch the reviewed manifest is for. Every bound this run
+# measures a fleet against comes out of that manifest, so a node running some
+# other epoch is being judged by numbers that were never derived for it.
+manifest_protocol_epoch() {
+  node -e '
+    const fs = require("fs");
+    const manifest = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    if (!manifest.protocol_epoch) {
+      console.error("no protocol_epoch in " + process.argv[1]);
+      process.exit(1);
+    }
+    process.stdout.write(String(manifest.protocol_epoch));
+  ' "${SCRIPT_DIR}/release-manifest.json"
+}
+
 # One counter from a node's Prometheus text exposition. The parser reads the
 # exposition's own shape: the metric name, optional labels, the value, and the
 # trailing timestamp the client-info registry appends.
@@ -3127,8 +3142,10 @@ REHEARSAL_R1_EPOCH=""
 REHEARSAL_R1_CUTOVER_BLOCK=""
 
 capture_r1_release_identity() {
-  local attested service reported revision epoch cutover agreed=""
+  local attested manifest_epoch service reported revision epoch cutover
+  local agreed=""
   attested="$(attested_source_identity)"
+  manifest_epoch="$(manifest_protocol_epoch)"
   for service in "${REHEARSAL_R1_SERVICES[@]}"; do
     reported="$(node_release_identity "${service}")" ||
       blocked "${service} does not report the version, revision, protocol \
@@ -3150,6 +3167,14 @@ rehearsal is bound to C=[${CUTOVER_BLOCK}]; every crossing, refusal, and \
 straggler observation below would be evidence about a different schedule"
     fi
 
+    epoch="$(json_field "${reported}" protocol_epoch)"
+    if [[ "${epoch}" != "${manifest_epoch}" ]]; then
+      blocked "${service} reports protocol epoch [${epoch}], but the reviewed \
+release manifest this run measures everything against is for \
+[${manifest_epoch}]; the node is a different release than the one these \
+bounds and this record describe"
+    fi
+
     if [[ -z "${agreed}" ]]; then
       agreed="${reported}"
     elif [[ "${reported}" != "${agreed}" ]]; then
@@ -3159,9 +3184,8 @@ fleet is not one release under test and one record cannot speak for both"
     fi
   done
 
-  epoch="$(json_field "${agreed}" protocol_epoch)"
   REHEARSAL_R1_IDENTITY="${agreed}"
-  REHEARSAL_R1_EPOCH="${epoch}"
+  REHEARSAL_R1_EPOCH="$(json_field "${agreed}" protocol_epoch)"
   REHEARSAL_R1_CUTOVER_BLOCK="$(json_field "${agreed}" cutover_block)"
   note "every R1 node reports ${agreed}, matching the attested source \
 ${attested} and the rehearsed C"
@@ -3349,6 +3373,47 @@ so the legacy strategy bundle refuses every legacy TSS configuration and no \
 R1 node can join a legacy ceremony; this step needs the reviewed dual-mode \
 fork pinned first"
 
+# Prove the named services are running the image the rehearsal was told to
+# run.
+#
+# The record attributes everything it observed to the supplied digests, and
+# nothing so far has checked that those digests are what the daemon actually
+# created these containers from. compose resolves a service to an image
+# through the compose file and the local image store, so a stale local tag, an
+# edited compose file, or a service whose image was never refreshed all
+# produce a fleet running other bytes under a record that names these ones.
+#
+# Image IDs are compared rather than references because the ID is the identity
+# the container was created from; a reference can be re-pointed, and a
+# container carries no memory of which name it was started by.
+verify_running_images() {
+  local reference="$1"
+  shift
+  local expected_id
+  expected_id="$(docker image inspect --format '{{.Id}}' "${reference}" \
+    2>/dev/null)" ||
+    blocked "cannot resolve ${reference} in the local image store; the \
+rehearsal cannot say what its containers were supposed to be running"
+
+  local service container running_id
+  for service in "$@"; do
+    container="$(compose ps --quiet "${service}" 2>/dev/null || true)"
+    if [[ -z "${container}" ]]; then
+      blocked "${service} has no container, so nothing can be shown to be \
+running ${reference}"
+    fi
+    running_id="$(docker inspect --format '{{.Image}}' "${container}" \
+      2>/dev/null)" ||
+      blocked "cannot read the image ${service} is running"
+    if [[ "${running_id}" != "${expected_id}" ]]; then
+      blocked "${service} is running image [${running_id}] but this \
+rehearsal supplied [${reference}] ([${expected_id}]); every observation this \
+fleet produces would be recorded against an artifact it did not run"
+    fi
+    note "${service} is running ${reference}"
+  done
+}
+
 # Start exactly the named services from the immutable digests and wait for
 # each to serve its evidence port.
 #
@@ -3517,6 +3582,8 @@ stage_single_release() {
   REHEARSAL_GATE="single_release"
   stage_preflight
   fleet_up "${REHEARSAL_PRIOR_SERVICE}" "${REHEARSAL_R1_SERVICES[@]}"
+  verify_running_images "${R1_IMAGE_DIGEST}" "${REHEARSAL_R1_SERVICES[@]}"
+  verify_running_images "${PRIOR_IMAGE_DIGEST}" "${REHEARSAL_PRIOR_SERVICE}"
   capture_r1_release_identity
 
   # Step 1 and step 2 both need R1 nodes running legacy-anchored ceremonies
@@ -3950,6 +4017,7 @@ reads one storage snapshot per node and cannot be run against a live volume"
   # keep off the network until the barrier holds, so it is started by the one
   # step that is allowed to release it and by nothing else.
   fleet_up "${REHEARSAL_R1_SERVICES[@]}"
+  verify_running_images "${R1_IMAGE_DIGEST}" "${REHEARSAL_R1_SERVICES[@]}"
   # While there is still a fleet to ask. Every step below stops these nodes.
   capture_r1_release_identity
 
@@ -4130,9 +4198,13 @@ supplied reconciliation, quiescence, and prior-reader evidence"
   begin_step "stage the prior digest behind the all-candidate-down barrier"
   if ((${#still_up[@]} == 0 && audit_ready == 1)); then
     compose start "${REHEARSAL_PRIOR_SERVICE}"
+    # The binary that was released has to be the prior artifact the audit
+    # authorized rolling back to, not whatever the compose file resolved.
+    verify_running_images "${PRIOR_IMAGE_DIGEST}" "${REHEARSAL_PRIOR_SERVICE}"
     record_step "stage the prior digest behind the all-candidate-down barrier" \
       pass "the prior binary was released only after every R1 node was proved \
-unreachable and every snapshot audited rollback-safe"
+unreachable and every snapshot audited rollback-safe, and the container that \
+came up is the audited prior digest"
   elif ((${#still_up[@]} > 0)); then
     record_step "stage the prior digest behind the all-candidate-down barrier" \
       blocked "the barrier does not hold — ${still_up[*]} still answer — so \

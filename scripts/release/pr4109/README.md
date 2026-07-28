@@ -107,11 +107,16 @@ prior binary participates until the barrier holds, and a fleet that brought
 the prior service up with everything else would have put the thing under test
 on the network before the first step ran.
 
-Before either gate touches the fleet it captures what that fleet says it is —
-version, revision, compiled protocol epoch, and armed cutover block — from
-*every* R1 node, not the first. Any disagreement between nodes refuses the
-run, a revision that is not the commit the run is bound to refuses it, and an
-armed cutover block that is not the rehearsed C refuses it. The record is
+Before either gate touches the fleet it proves the containers are running the
+supplied digests — image IDs compared against what the daemon actually created
+each container from, because a stale local tag or an edited compose file
+otherwise produces a fleet running other bytes under a record naming these
+ones — and then captures what that fleet says it is: version, revision,
+compiled protocol epoch, and armed cutover block, from *every* R1 node and not
+the first. Any disagreement between nodes refuses the run, as does a revision
+that is not the commit the run is bound to, an armed cutover block that is not
+the rehearsed C, or a protocol epoch that is not the one the reviewed manifest
+was derived for. The record is
 then built from what was captured rather than from what the driver was told,
 so its epoch and C are the fleet's own and not a restatement of the
 environment. Capturing up front is also what lets the rollback gate emit a
@@ -265,7 +270,13 @@ open with, over fleets whose nodes disagree with each other, whose revision
 is not the commit the run is bound to, and whose armed cutover block is not
 the rehearsed C; and it resolves every helper those stages name in command
 position, because neither stage runs anywhere but a real rehearsal and a call
-site left pointing at a renamed function otherwise surfaces there. The receipt lifecycle is proved through `stage_local_proofs`
+site left pointing at a renamed function otherwise surfaces there.
+
+One binding the harness still cannot make is the chain identity: the record's
+`chain_id` is the supplied `CHAIN_ID`, because a node publishes its chain
+address and gate state but not the chain it is connected to, and the fleet
+reaches that chain over a websocket no probe here can interrogate. Every other
+identity in a record is now an observation. The receipt lifecycle is proved through `stage_local_proofs`
 itself rather than through the invalidation function alone: a reused
 evidence directory is given a valid inherited receipt, the stage's proof
 seam is failed the way any proof failure fails it, and the case requires

@@ -949,6 +949,17 @@ run_capture wrong_cutover_fleet
 check "a fleet armed with another cutover block refuses the run" 3 \
   "armed cutover block \[8000000\]" "bound to C=\[9000000\]"
 
+# A release whose epoch is not the one the reviewed manifest was derived for:
+# every bound this run measures it against was computed for something else.
+wrong_epoch_fleet() {
+  # shellcheck disable=SC2329
+  probe_diagnostics() { diagnostics_document "${FIXTURE_SHA}" legacy_epoch; }
+}
+
+run_capture wrong_epoch_fleet
+check "a fleet on another protocol epoch refuses the run" 3 \
+  "reports protocol epoch \[legacy_epoch\]" "release manifest"
+
 # Neither container stage can be executed anywhere but a real rehearsal — they
 # need the immutable images, a chain, and persistent volumes — so a call site
 # left pointing at a renamed helper survives every check in this file and
