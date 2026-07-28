@@ -1075,6 +1075,43 @@ check "a fleet on another protocol epoch refuses the run" 3 \
 DRIVER_HASH_A="0x$(printf 'a%.0s' {1..64})"
 DRIVER_HASH_B="0x$(printf 'b%.0s' {1..64})"
 
+# The chain a driver's report is confirmed against. Every reading a phase takes
+# off a report is only as good as the chain corroborating it, so the self-test
+# answers the way a chain would rather than removing the check: a report that
+# names transactions is confirmed here exactly as it would be in a rehearsal,
+# and the cases below change what the chain says rather than whether it is
+# asked.
+# shellcheck disable=SC2034
+ETH_RPC_URL="http://chain.rehearsal.invalid"
+FIXTURE_CHAIN_ID="0xaa36a7"
+FIXTURE_RECEIPT_STATUS="0x1"
+FIXTURE_RECEIPT_BLOCK="0x1"
+FIXTURE_RECEIPT_ABSENT=""
+FIXTURE_RPC_BODY=""
+
+# shellcheck disable=SC2329
+chain_rpc() {
+  if [[ -n "${FIXTURE_RPC_BODY}" ]]; then
+    printf '%s' "${FIXTURE_RPC_BODY}"
+    return 0
+  fi
+  case "$1" in
+  eth_chainId)
+    printf '{"jsonrpc":"2.0","id":1,"result":"%s"}' "${FIXTURE_CHAIN_ID}"
+    ;;
+  eth_getTransactionReceipt)
+    if [[ -n "${FIXTURE_RECEIPT_ABSENT}" ]]; then
+      printf '{"jsonrpc":"2.0","id":1,"result":null}'
+    else
+      printf \
+        '{"jsonrpc":"2.0","id":1,"result":{"status":"%s","blockNumber":"%s"}}' \
+        "${FIXTURE_RECEIPT_STATUS}" "${FIXTURE_RECEIPT_BLOCK}"
+    fi
+    ;;
+  *) printf '{"jsonrpc":"2.0","id":1,"result":null}' ;;
+  esac
+}
+
 make_driver() {
   local path="$1" status="$2" report="$3"
   cat >"${path}" <<DRIVER
@@ -3125,6 +3162,118 @@ EOF
 drive rollback-terminal
 check "a readable report from a driver that failed still reports failure" 0 \
   "offered:no rc:9" "bound:tbtc_signing@600=succeeded=${HASH_A}=0xs"
+
+# The chain itself, asked about what a report claims. Every other check on a
+# driver report is a check of the report against itself: the hashes look like
+# hashes, the outcomes name them, the anchors identify work. A report that is
+# internally consistent and entirely invented passes all of it, and only the
+# chain can tell the two apart.
+CONFIRM_WORK="tbtc_signing@600=${HASH_A}=r1-node-1"
+CONFIRM_BOUND="tbtc_signing@600=succeeded=${HASH_A}=0xsigned"
+
+confirm_case() {
+  set +e
+  CASE_OUT="$(
+    (
+      "$@"
+      confirm_reported_work rollback-inflight "\"${HASH_A}\"" \
+        "${CONFIRM_WORK}" "${CONFIRM_BOUND}"
+      printf 'confirmed\n'
+    ) 2>&1
+  )"
+  CASE_RC=$?
+  set -e
+}
+
+confirm_case :
+check "a report the chain corroborates is confirmed" 0 "confirmed"
+
+# The regression this seam exists for: the transaction is on chain and it
+# reverted, which from outside is the same shape as one that succeeded.
+confirm_case eval 'FIXTURE_RECEIPT_STATUS="0x0"'
+check "a reverted transaction started no work a control can rest on" 3 \
+  "records as reverted"
+
+confirm_case eval 'FIXTURE_RECEIPT_ABSENT=1
+   WORK_DRIVER_CONFIRMATION_TIMEOUT=0'
+check "a transaction the chain never mined started nothing" 3 \
+  "still has no receipt for"
+
+confirm_case eval 'FIXTURE_RPC_BODY="not json"'
+check "an endpoint that cannot be read confirms nothing" 3 \
+  "could not be asked what became of it"
+
+confirm_case eval \
+  'FIXTURE_RPC_BODY="{\"error\":{\"code\":-32000,\"message\":\"nope\"}}"'
+check "an endpoint that answers with an error confirms nothing" 3 \
+  "could not be asked what became of it"
+
+# An anchor earlier than the block its own transaction landed in is a permit
+# pinning its mode from a block at which the work did not exist — which is
+# exactly what a report inventing anchors produces.
+confirm_case eval 'FIXTURE_RECEIPT_BLOCK="0x300"'
+check "work anchored before its own transaction is refused" 3 \
+  "anchors tbtc_signing@600 at block 600, but the transaction it names landed \
+in block 768"
+
+# And a report naming nothing: there is nothing to confirm, and demanding an
+# endpoint for it would block every phase that legitimately drove no work.
+confirm_case eval 'CONFIRM_WORK=""; CONFIRM_BOUND=""'
+check "a report naming transactions is confirmed whatever else it carries" 0 \
+  "confirmed"
+
+CONFIRM_NOTHING_OUT=""
+set +e
+CONFIRM_NOTHING_OUT="$(
+  (
+    # The stage under test reads this; shellcheck cannot follow it across the
+    # source boundary into rehearse.sh.
+    # shellcheck disable=SC2030,SC2034
+    ETH_RPC_URL=""
+    confirm_reported_work rollback-inflight "" "" ""
+    printf 'confirmed\n'
+  ) 2>&1
+)"
+CONFIRM_NOTHING_RC=$?
+set -e
+if [[ "${CONFIRM_NOTHING_RC}" -eq 0 && \
+  "${CONFIRM_NOTHING_OUT}" == *"confirmed"* ]]; then
+  printf 'ok   a report naming no transaction needs no chain to confirm it\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL an empty report demanded a chain endpoint: rc %s, %s\n' \
+    "${CONFIRM_NOTHING_RC}" "${CONFIRM_NOTHING_OUT}"
+  FAILED=$((FAILED + 1))
+fi
+
+# The endpoint has to be the chain the fleet ran on. One answering about some
+# other chain confirms transactions that have nothing to do with this
+# rehearsal, in exactly the same shape.
+endpoint_case() {
+  set +e
+  CASE_OUT="$(
+    (
+      # shellcheck disable=SC2030,SC2034
+      CHAIN_ID="11155111"
+      "$@"
+      verify_chain_endpoint
+    ) 2>&1
+  )"
+  CASE_RC=$?
+  set -e
+}
+
+endpoint_case :
+check "an endpoint on the rehearsed chain is accepted" 0 \
+  "confirmed on chain id 11155111"
+
+endpoint_case eval 'FIXTURE_CHAIN_ID="0x1"'
+check "an endpoint answering about another chain confirms nothing" 3 \
+  "reports chain id \[1\], but this rehearsal names \[11155111\]"
+
+endpoint_case eval 'FIXTURE_RPC_BODY="{}"'
+check "an endpoint with no readable chain id confirms nothing" 3 \
+  "did not report a chain id this rehearsal can read"
 
 # The two programs the rehearsal executes but does not contain. Both arrive
 # from a mutable secret bundle, and both produce readings that become release

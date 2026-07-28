@@ -21,6 +21,10 @@
 #                        so a mutable tag would leave the reading instrument
 #                        outside the record's own provenance
 #   ETH_WS_URL           rehearsal chain websocket endpoint
+#   ETH_RPC_URL          the same chain's JSON-RPC endpoint, questioned to
+#                        confirm every transaction a work driver reports;
+#                        an unconfirmed report is the driver's own account
+#                        of itself
 #   CUTOVER_BLOCK        rehearsed cutover block C on that chain
 #   CHAIN_ID             that chain's numeric id, recorded in the evidence
 #   KEYSTORE_DIR         per-node rehearsal inputs, one subdirectory per
@@ -268,6 +272,8 @@ environment (preflight, single-release, rollback):
   PROBE_IMAGE_DIGEST  immutable digest of the wget-carrying image every
                       evidence reading is scraped with
   ETH_WS_URL          rehearsal chain websocket endpoint
+  ETH_RPC_URL         the same chain's JSON-RPC endpoint, questioned to
+                      confirm every reported transaction
   CUTOVER_BLOCK       rehearsed cutover block C on that chain
   CHAIN_ID            that chain's numeric chain id
   KEYSTORE_DIR        per-node inputs, one <service>/ directory each holding
@@ -2885,6 +2891,91 @@ probe_get() {
 probe_diagnostics() { probe_get "$1" /diagnostics; }
 probe_metrics() { probe_get "$1" /metrics; }
 
+# One JSON-RPC call against the rehearsal chain, from the egress network the
+# fleet reaches the chain over — the same reachability the nodes have, so an
+# endpoint this rehearsal can question is one they could act on.
+chain_rpc() {
+  local method="$1" params="$2"
+  docker run --rm --network "$(compose_project)_chain-egress" \
+    "${PROBE_IMAGE_DIGEST}" \
+    wget --quiet --output-document=- --timeout=10 \
+    --header='Content-Type: application/json' \
+    --post-data="{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"${method}\",\
+\"params\":${params}}" \
+    "${ETH_RPC_URL}" 2>/dev/null
+}
+
+# What the chain says became of one transaction: "succeeded <block>",
+# "reverted <block>", "pending" while no receipt exists yet, or "unreadable"
+# when the endpoint could not be questioned or did not answer in a form this
+# rehearsal can read.
+transaction_receipt() {
+  local tx="$1" response
+  response="$(chain_rpc eth_getTransactionReceipt "[\"${tx}\"]")" || {
+    printf 'unreadable'
+    return 0
+  }
+  printf '%s' "${response}" | node -e '
+    let raw = "";
+    process.stdin.on("data", (d) => (raw += d));
+    process.stdin.on("end", () => {
+      let body;
+      try {
+        body = JSON.parse(raw);
+      } catch (e) {
+        process.stdout.write("unreadable");
+        return;
+      }
+      if (body === null || typeof body !== "object" || body.error) {
+        process.stdout.write("unreadable");
+        return;
+      }
+      const receipt = body.result;
+      if (receipt === null || receipt === undefined) {
+        process.stdout.write("pending");
+        return;
+      }
+      const status = receipt.status;
+      const block = receipt.blockNumber;
+      if (typeof status !== "string" || typeof block !== "string" ||
+        !/^0x[0-9a-f]+$/.test(block)) {
+        process.stdout.write("unreadable");
+        return;
+      }
+      process.stdout.write((status === "0x1" ? "succeeded" : "reverted") +
+        " " + String(parseInt(block, 16)));
+    });
+  ' 2>/dev/null || printf 'unreadable'
+}
+
+# The chain id the questioned endpoint reports, or "unreadable".
+endpoint_chain_id() {
+  local response
+  response="$(chain_rpc eth_chainId '[]')" || {
+    printf 'unreadable'
+    return 0
+  }
+  printf '%s' "${response}" | node -e '
+    let raw = "";
+    process.stdin.on("data", (d) => (raw += d));
+    process.stdin.on("end", () => {
+      let body;
+      try {
+        body = JSON.parse(raw);
+      } catch (e) {
+        process.stdout.write("unreadable");
+        return;
+      }
+      const id = (body || {}).result;
+      if (typeof id !== "string" || !/^0x[0-9a-f]+$/.test(id)) {
+        process.stdout.write("unreadable");
+        return;
+      }
+      process.stdout.write(String(parseInt(id, 16)));
+    });
+  ' 2>/dev/null || printf 'unreadable'
+}
+
 # True when a node answers its client-info port at all. Used both ways: to
 # wait for a node to come up, and to prove a quarantined one has gone.
 #
@@ -4126,7 +4217,8 @@ conclude_rehearsal() {
 
 stage_preflight() {
   require_env PRIOR_IMAGE_DIGEST R1_IMAGE_DIGEST PROBE_IMAGE_DIGEST \
-    ETH_WS_URL CUTOVER_BLOCK CHAIN_ID KEYSTORE_DIR KEEP_ETHEREUM_PASSWORD
+    ETH_WS_URL ETH_RPC_URL CUTOVER_BLOCK CHAIN_ID KEYSTORE_DIR \
+    KEEP_ETHEREUM_PASSWORD
   require_immutable_digest PRIOR_IMAGE_DIGEST "${PRIOR_IMAGE_DIGEST}"
   require_immutable_digest R1_IMAGE_DIGEST "${R1_IMAGE_DIGEST}"
   # The probe reads every number that becomes evidence, so a mutable probe tag
@@ -4167,7 +4259,32 @@ path, and storage directory"
   docker pull "${R1_IMAGE_DIGEST}"
   docker pull "${PROBE_IMAGE_DIGEST}"
 
+  verify_chain_endpoint
+
   note "preflight passed"
+}
+
+# The endpoint every reported transaction is confirmed against has to be the
+# chain the fleet ran on. An endpoint that answers about some other chain
+# confirms transactions that have nothing to do with this rehearsal, and it
+# answers in exactly the same shape — a receipt, a status, a block — so
+# nothing downstream could tell the difference. The chain id is asked of the
+# endpoint rather than restated from the dispatch input, because a configured
+# value only ever agrees with itself.
+verify_chain_endpoint() {
+  local reported
+  reported="$(endpoint_chain_id)"
+  if [[ "${reported}" == "unreadable" ]]; then
+    blocked "the ETH_RPC_URL endpoint did not report a chain id this \
+rehearsal can read; every transaction a driver names is confirmed against \
+this endpoint, and one that cannot be questioned confirms nothing"
+  fi
+  if [[ "${reported}" != "${CHAIN_ID}" ]]; then
+    blocked "the ETH_RPC_URL endpoint reports chain id [${reported}], but \
+this rehearsal names [${CHAIN_ID}]; transactions confirmed against another \
+chain say nothing about the work this fleet did"
+  fi
+  note "chain endpoint confirmed on chain id ${reported}"
 }
 
 # The one refusal that decides which rehearsal steps this release can execute
@@ -4729,6 +4846,105 @@ WORK_DRIVER_BOUND_RESULTS=""
 # from, and it is what the quarantine record the audit writes carries.
 WORK_DRIVER_ORIGINATED_WORK=""
 
+# How long a reported transaction may still be unmined before the rehearsal
+# stops waiting for it. A transaction that started work the fleet is holding
+# has already been mined — the event that anchors a ceremony comes out of a
+# mined transaction — so this covers submission latency rather than a wait for
+# something to happen.
+WORK_DRIVER_CONFIRMATION_TIMEOUT=180
+
+# Confirm on the chain the fleet ran on that every transaction the last report
+# named is really there, succeeded, and landed no later than the anchor the
+# report claims for the work it started.
+#
+# Without this the whole account is the driver's own. Every field is checked
+# for shape and cross-referenced against the other fields of the same report,
+# and a report that is internally consistent and entirely invented passes all
+# of it: the hashes look like hashes, the outcomes name them, and nothing has
+# asked the chain whether any of it happened. A reverted transaction is the
+# same shape as a successful one from outside, and an anchor earlier than the
+# block its own transaction landed in is work attributed to a ceremony that
+# had not started yet.
+confirm_reported_work() {
+  local phase="$1" hashes="$2" records="$3" bound="$4"
+  local tx list pending reading status block deadline record anchor
+
+  [[ -n "${hashes//[[:space:]]/}" ]] || return 0
+  [[ -n "${ETH_RPC_URL:-}" ]] ||
+    blocked "the ${phase} phase reported transactions, but no ETH_RPC_URL was \
+supplied to confirm them on the chain the fleet ran on; a report nobody \
+questioned is the driver's own account of itself"
+
+  list="${hashes//\"/}"
+  list="${list//,/ }"
+
+  # Every hash, waited on together rather than one at a time, so a report
+  # naming several does not spend the timeout on each in turn.
+  deadline=$((SECONDS + WORK_DRIVER_CONFIRMATION_TIMEOUT))
+  while :; do
+    pending=""
+    for tx in ${list}; do
+      reading="$(transaction_receipt "${tx}")"
+      status="${reading%% *}"
+      case "${status}" in
+      succeeded) ;;
+      pending) pending="${pending}${pending:+, }${tx}" ;;
+      reverted)
+        blocked "the ${phase} phase reported transaction ${tx}, which the \
+rehearsal chain records as reverted; work that never happened cannot be the \
+work a control was decided on"
+        ;;
+      *)
+        blocked "the ${phase} phase reported transaction ${tx}, and the \
+rehearsal chain endpoint could not be asked what became of it; an \
+unconfirmed transaction leaves the report as the driver's own account of \
+itself"
+        ;;
+      esac
+    done
+    [[ -n "${pending}" ]] || break
+    if ((SECONDS >= deadline)); then
+      blocked "the ${phase} phase reported ${pending}, which the rehearsal \
+chain still has no receipt for after \
+${WORK_DRIVER_CONFIRMATION_TIMEOUT}s; a transaction that never landed started \
+no ceremony for this fleet to have participated in"
+    fi
+    sleep 5
+  done
+
+  # And the anchors, against the blocks those transactions landed in. The
+  # anchor is what pins a permit's mode, so an anchor before its own
+  # transaction is a mode selected from a block at which the work did not
+  # exist — and it is exactly what a report inventing anchors produces.
+  # The two record shapes carry the transaction in different positions, so
+  # each is read through its own accessor rather than through whichever one
+  # happens to be in scope.
+  for record in ${records}; do
+    confirm_record_anchor "${phase}" "$(work_id "${record}")" \
+      "$(work_transaction "${record}")"
+  done
+  for record in ${bound}; do
+    confirm_record_anchor "${phase}" "$(bound_work "${record}")" \
+      "$(bound_transaction "${record}")"
+  done
+}
+
+# One work identity against the block its transaction landed in.
+confirm_record_anchor() {
+  local phase="$1" work="$2" tx="$3" anchor block reading
+  anchor="${work##*@}"
+  [[ "${anchor}" =~ ^[0-9]+$ ]] || return 0
+  [[ "${tx}" =~ ^0x[0-9a-f]{64}$ ]] || return 0
+  reading="$(transaction_receipt "${tx}")"
+  block="${reading##* }"
+  [[ "${block}" =~ ^[0-9]+$ ]] || return 0
+  if ((anchor < block)); then
+    blocked "the ${phase} phase anchors ${work} at block ${anchor}, but the \
+transaction it names landed in block ${block}; a permit cannot pin its mode \
+from a block at which the work it is for did not exist"
+  fi
+}
+
 # True when the last driver call both exited cleanly and named what it put on
 # the chain, which is the whole of "work was offered here".
 driver_offered_work() {
@@ -5240,6 +5456,12 @@ it drove"
     WORK_DRIVER_ORIGINATED="$(printf '%s\n' "${parsed}" | sed -n '3p')"
     WORK_DRIVER_BOUND_RESULTS="$(printf '%s\n' "${parsed}" | sed -n '4p')"
     WORK_DRIVER_ORIGINATED_WORK="$(printf '%s\n' "${parsed}" | sed -n '5p')"
+
+    # Before any of it enters a step's record. A reading taken from a report
+    # the chain does not corroborate is not a weaker reading, it is a
+    # different kind of thing, and nothing downstream could tell them apart.
+    confirm_reported_work "${phase}" "${hashes}" \
+      "${WORK_DRIVER_ORIGINATED_WORK}" "${WORK_DRIVER_BOUND_RESULTS}"
 
     if [[ -n "${hashes}" ]]; then
       STEP_TX_HASHES="${STEP_TX_HASHES}${STEP_TX_HASHES:+,}${hashes}"

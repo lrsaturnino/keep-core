@@ -45,6 +45,9 @@ on:
       eth_ws_url:
         description: "Rehearsal chain websocket endpoint"
         required: false
+      eth_rpc_url:
+        description: "The same chain's JSON-RPC endpoint. Every transaction a work driver reports is confirmed against it — mined, successful, and no later than the anchor claimed for the work it started — because an unconfirmed report is the driver's own account of itself"
+        required: false
       cutover_block:
         description: "Rehearsed cutover block C on that chain"
         required: false
@@ -269,6 +272,7 @@ jobs:
       R1_IMAGE_DIGEST: ${{ inputs.r1_image_digest }}
       PROBE_IMAGE_DIGEST: ${{ inputs.probe_image_digest }}
       ETH_WS_URL: ${{ inputs.eth_ws_url }}
+      ETH_RPC_URL: ${{ inputs.eth_rpc_url }}
       CUTOVER_BLOCK: ${{ inputs.cutover_block }}
       CHAIN_ID: ${{ inputs.chain_id }}
       KEEP_ETHEREUM_PASSWORD: ${{ secrets.REHEARSAL_KEEP_ETHEREUM_PASSWORD }}

@@ -253,6 +253,21 @@ nodes it reached. A piece of work is originated once and ends once: a repeated
 identity, or one transaction claimed by two pieces of work, stops the step
 rather than being counted twice downstream.
 
+Everything above is the report checked against itself, and a report that is
+internally consistent and entirely invented passes all of it. So the chain is
+asked. Every transaction a report names must have a receipt on the endpoint
+supplied as `ETH_RPC_URL`, that receipt must say the transaction succeeded, and
+each piece of work must be anchored at or after the block its own transaction
+landed in — an anchor before it is a permit pinning its mode from a block at
+which the work did not exist, which is precisely what invented anchors look
+like. A reverted transaction is the same shape as a successful one from
+outside, and an unmined one is the same shape as work in flight, so both stop
+the step rather than being read as the work a control was decided on. The
+endpoint is itself checked against the rehearsed chain id, asked of the
+endpoint rather than restated from the dispatch input: one answering about
+another chain confirms transactions that have nothing to do with this
+rehearsal, in exactly the same shape.
+
 A result must name a `transaction_hash` the same report accounted for
 originating; without that, the hashes and the outcomes are two independent
 populations, and a stale or unrelated hash sitting beside an unrelated result
@@ -880,8 +895,10 @@ the artifacts and the chain: the prior, R1, and probe digests (all three
 immutable — every evidence reading is a scrape through the probe, so a
 mutable probe tag would leave the reading instrument outside the record's
 provenance), the rehearsal chain's websocket endpoint and numeric chain id,
-the rehearsed `C`, and the Bitcoin network, prior version, and prior revision
-the rollback state audit binds its verdict to. The
+its JSON-RPC endpoint — the one every transaction a driver reports is
+confirmed against, and which preflight refuses unless it answers with the
+rehearsed chain id — the rehearsed `C`, and the Bitcoin network, prior
+version, and prior revision the rollback state audit binds its verdict to. The
 `REHEARSAL_CHAIN_INPUTS_BUNDLE_B64` secret carries two executables, not data:
 a base64-encoded tar.gz holding `work-driver` — called with the phase name,
 because the fleet only reacts to chain events and without something
