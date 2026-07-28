@@ -87,17 +87,21 @@ as `<service> <identity-manifest> <output-directory>` and must write
 snapshot; and the second pass, over those records, is the one that authorizes
 anything. A generator that failed, that wrote only some of the four, or that
 cannot be run leaves the barrier unestablished rather than the audit refusing.
-Each `active_permits_at_quiescence` entry in the quiescence report names
-`work_id` and `permit_id` as well as ceremony, mode, anchor, and outcome.
-DKG claims use the canonical SHA-256 seed hash (exactly 64 lowercase
-hexadecimal characters) and the canonical decimal member index (1 through
-255) respectively. Beacon relay-signing permits likewise use the member index;
-other work and permit identities use the driver's stable identifier alphabet.
-The audit rejects a repeated full permit identity for every outcome, including
-`completed`, so duplicating one completed entry cannot conceal a different
-active permit. Quarantined claims additionally match the exact local permit
-rather than letting one output cover another event or membership at the same
-block.
+The quiescence record contains a `gate_snapshot` captured when the gate entered
+`quiescing`, including its exact `active_permits` inventory and total,
+legacy, and security-v2 counts. The later
+`active_permits_at_quiescence` outcome list must cover that inventory
+one-to-one and reproduce all three counts; an empty or shortened outcome list
+over a nonempty snapshot blocks rollback. Both lists name `work_id` and
+`permit_id` as well as ceremony, mode, and anchor. DKG claims use the canonical
+SHA-256 seed hash (exactly 64 lowercase hexadecimal characters) and the
+canonical decimal member index (1 through 255) respectively. Beacon
+relay-signing permits likewise use the member index; other work and permit
+identities use the driver's stable identifier alphabet. The audit rejects a
+repeated full permit identity and checks every identity against the cutover
+arithmetic (`legacy` below C, `security_v2` at or above C), including completed
+outcomes. Quarantined claims additionally match the exact local permit rather
+than letting one output cover another event or membership at the same block.
 
 The identities the audit binds that evidence to — the release being rolled
 back: version, revision, epoch, and armed C — come from what the R1 fleet

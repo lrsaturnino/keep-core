@@ -135,7 +135,7 @@ type evidenceRecord struct {
 
 // evidenceSchemaVersion versions the external rollback-evidence record
 // schemas this audit accepts.
-const evidenceSchemaVersion uint32 = 2
+const evidenceSchemaVersion uint32 = 3
 
 // evidenceFutureSkewAllowance bounds how far in the future an evidence
 // record's generation time may lie relative to this audit before it is a
@@ -204,15 +204,40 @@ type quiescencePermitEvidence struct {
 	Outcome             string `json:"outcome"`
 }
 
+// quiescencePermitInventoryEvidence is the immutable identity of one permit
+// captured directly from the gate at the quiescence transition. It is kept
+// separate from the later terminal-outcome list so omitting an active permit
+// from that list cannot make a drain appear complete.
+type quiescencePermitInventoryEvidence struct {
+	Ceremony            string `json:"ceremony"`
+	Mode                string `json:"mode"`
+	CanonicalStartBlock uint64 `json:"canonical_start_block"`
+	WorkID              string `json:"work_id"`
+	PermitID            string `json:"permit_id"`
+}
+
+// quiescenceGateSnapshotEvidence records the independently captured gate
+// inventory at the instant quiescence began. The declared aggregate counts
+// are checked both against this inventory and against the terminal outcomes.
+type quiescenceGateSnapshotEvidence struct {
+	CapturedAt                 time.Time                           `json:"captured_at"`
+	State                      string                              `json:"state"`
+	ActiveCeremonies           uint64                              `json:"active_ceremonies"`
+	ActiveLegacyCeremonies     uint64                              `json:"active_legacy_ceremonies"`
+	ActiveSecurityV2Ceremonies uint64                              `json:"active_security_v2_ceremonies"`
+	ActivePermits              []quiescencePermitInventoryEvidence `json:"active_permits"`
+}
+
 type quiescenceReportEvidence struct {
 	evidenceEnvelope
 
-	ReleaseVersion            string                     `json:"release_version"`
-	ReleaseRevision           string                     `json:"release_revision"`
-	ReleaseEpoch              string                     `json:"release_epoch"`
-	CutoverBlock              uint64                     `json:"cutover_block"`
-	QuiesceCause              string                     `json:"quiesce_cause"`
-	ActivePermitsAtQuiescence []quiescencePermitEvidence `json:"active_permits_at_quiescence"`
+	ReleaseVersion            string                         `json:"release_version"`
+	ReleaseRevision           string                         `json:"release_revision"`
+	ReleaseEpoch              string                         `json:"release_epoch"`
+	CutoverBlock              uint64                         `json:"cutover_block"`
+	QuiesceCause              string                         `json:"quiesce_cause"`
+	GateSnapshot              quiescenceGateSnapshotEvidence `json:"gate_snapshot"`
+	ActivePermitsAtQuiescence []quiescencePermitEvidence     `json:"active_permits_at_quiescence"`
 }
 
 // priorReaderCompatibilityEvidence records the tested prior release and its
@@ -438,8 +463,8 @@ func main() {
 		&evidence.quiescenceReport,
 		"quiescence-report",
 		"",
-		"path to the node's quiescence outcome record: the permits active at "+
-			"quiescence and each one's terminal outcome",
+		"path to the node's quiescence record: the independently captured "+
+			"gate inventory and each active permit's terminal outcome",
 	)
 	flag.StringVar(
 		&evidence.priorReaderCompatibility,
@@ -1085,8 +1110,8 @@ func recordExternalEvidence(r *auditRun, evidence evidenceInputs) error {
 		{
 			name: "quiescence_report",
 			path: evidence.quiescenceReport,
-			missing: "quiescence report not supplied: the permits active at " +
-				"quiescence and their terminal outcomes are unverified",
+			missing: "quiescence report not supplied: the at-quiescence gate " +
+				"inventory and terminal outcomes are unverified",
 			validate: r.validateQuiescenceReportEvidence,
 		},
 		{
@@ -1587,6 +1612,60 @@ type quarantineIdentity struct {
 	permitID            string
 }
 
+// cutoverModeViolation applies the release gate's one-value schedule to
+// persisted evidence. It is shared by quiescence records and both quarantine
+// namespaces so completed and interrupted work are judged by the same
+// boundary rule.
+func cutoverModeViolation(
+	subject string,
+	mode string,
+	canonicalStartBlock uint64,
+	cutoverBlock uint64,
+) string {
+	legacy := participation.ModeLegacy.String()
+	securityV2 := participation.ModeSecurityV2.String()
+
+	switch mode {
+	case legacy:
+		if cutoverBlock > 0 && canonicalStartBlock >= cutoverBlock {
+			return fmt.Sprintf(
+				"%s claims mode [%s] with canonical anchor [%d] at or "+
+					"after cutover block [%d]",
+				subject,
+				legacy,
+				canonicalStartBlock,
+				cutoverBlock,
+			)
+		}
+	case securityV2:
+		if cutoverBlock == 0 {
+			return fmt.Sprintf(
+				"%s claims mode [%s] under a disabled all-zero schedule",
+				subject,
+				securityV2,
+			)
+		}
+		if canonicalStartBlock < cutoverBlock {
+			return fmt.Sprintf(
+				"%s claims mode [%s] with canonical anchor [%d] before "+
+					"cutover block [%d]",
+				subject,
+				securityV2,
+				canonicalStartBlock,
+				cutoverBlock,
+			)
+		}
+	default:
+		return fmt.Sprintf(
+			"%s names unknown protocol mode [%s]",
+			subject,
+			mode,
+		)
+	}
+
+	return ""
+}
+
 // validateQuiescencePermitIdentity checks the chain-work and local-permit
 // portions of one quiescence entry. DKG work is identified by the SHA-256 hash
 // of its seed and each DKG or relay-signing permit belongs to one group member;
@@ -1648,16 +1727,37 @@ func validateQuiescencePermitIdentity(
 	return violations
 }
 
+func inventoryIdentity(
+	permit quiescencePermitInventoryEvidence,
+) quarantineIdentity {
+	return quarantineIdentity{
+		ceremony:            permit.Ceremony,
+		mode:                permit.Mode,
+		canonicalStartBlock: permit.CanonicalStartBlock,
+		workID:              permit.WorkID,
+		permitID:            permit.PermitID,
+	}
+}
+
+func outcomeIdentity(permit quiescencePermitEvidence) quarantineIdentity {
+	return quarantineIdentity{
+		ceremony:            permit.Ceremony,
+		mode:                permit.Mode,
+		canonicalStartBlock: permit.CanonicalStartBlock,
+		workID:              permit.WorkID,
+		permitID:            permit.PermitID,
+	}
+}
+
 // validateQuiescenceReportEvidence checks the quiescence outcome record:
 // schema, snapshot binding, the quiescing node's exact artifact identity and
-// cutover schedule, a stated cause, and a known ceremony, mode, and terminal
-// outcome for every permit active at quiescence. Every full permit identity
-// must occur exactly once regardless of outcome, so repeating a completed
-// permit cannot conceal an omitted active permit. Every quarantined DKG outcome
-// must be matched by preserved quarantine state carrying the same ceremony,
-// protocol mode, canonical anchor, chain-work ID, and local permit ID — one
-// preserved output per claiming permit, so one real output cannot vouch for
-// several claims.
+// cutover schedule, a stated cause, and an independently captured gate
+// inventory. The inventory and terminal outcomes must cover exactly the same
+// unique permit identities and agree with the gate's total and per-mode
+// counts. Every quarantined DKG outcome must also be matched by preserved
+// quarantine state carrying the same ceremony, protocol mode, canonical
+// anchor, chain-work ID, and local permit ID — one preserved output per
+// claiming permit, so one real output cannot vouch for several claims.
 func (r *auditRun) validateQuiescenceReportEvidence(content []byte) []string {
 	record := &quiescenceReportEvidence{}
 	if err := strictUnmarshal(content, record); err != nil {
@@ -1710,6 +1810,134 @@ func (r *auditRun) validateQuiescenceReportEvidence(content []byte) []string {
 		knownCeremonies[string(ceremony)] = struct{}{}
 	}
 
+	snapshot := record.GateSnapshot
+	if snapshot.CapturedAt.IsZero() {
+		violations = append(
+			violations,
+			"the at-quiescence gate snapshot capture time is missing",
+		)
+	} else if !record.GeneratedAt.IsZero() &&
+		snapshot.CapturedAt.After(record.GeneratedAt) {
+		violations = append(
+			violations,
+			"the at-quiescence gate snapshot was captured after the "+
+				"quiescence report was generated",
+		)
+	}
+	if snapshot.State != participation.StateQuiescing.String() {
+		violations = append(violations, fmt.Sprintf(
+			"the at-quiescence gate snapshot has state [%s], expected [%s]",
+			snapshot.State,
+			participation.StateQuiescing,
+		))
+	}
+	if snapshot.ActiveLegacyCeremonies >
+		snapshot.ActiveCeremonies ||
+		snapshot.ActiveSecurityV2Ceremonies >
+			snapshot.ActiveCeremonies-
+				snapshot.ActiveLegacyCeremonies {
+		violations = append(violations, fmt.Sprintf(
+			"the at-quiescence gate snapshot mode counts [%d legacy, "+
+				"%d security-v2] do not sum to total [%d]",
+			snapshot.ActiveLegacyCeremonies,
+			snapshot.ActiveSecurityV2Ceremonies,
+			snapshot.ActiveCeremonies,
+		))
+	} else if snapshot.ActiveLegacyCeremonies+
+		snapshot.ActiveSecurityV2Ceremonies != snapshot.ActiveCeremonies {
+		violations = append(violations, fmt.Sprintf(
+			"the at-quiescence gate snapshot mode counts [%d legacy, "+
+				"%d security-v2] do not sum to total [%d]",
+			snapshot.ActiveLegacyCeremonies,
+			snapshot.ActiveSecurityV2Ceremonies,
+			snapshot.ActiveCeremonies,
+		))
+	}
+	if snapshot.ActiveCeremonies != uint64(len(snapshot.ActivePermits)) {
+		violations = append(violations, fmt.Sprintf(
+			"the at-quiescence gate snapshot inventories [%d] permits, "+
+				"but declares total [%d]",
+			len(snapshot.ActivePermits),
+			snapshot.ActiveCeremonies,
+		))
+	}
+
+	inventoryPermits := make(map[quarantineIdentity]int)
+	var inventoryLegacy uint64
+	var inventorySecurityV2 uint64
+	for i, permit := range snapshot.ActivePermits {
+		if _, ok := knownCeremonies[permit.Ceremony]; !ok {
+			violations = append(violations, fmt.Sprintf(
+				"gate inventory entry [%d] names unknown ceremony [%s]",
+				i,
+				permit.Ceremony,
+			))
+		}
+		switch permit.Mode {
+		case participation.ModeLegacy.String():
+			inventoryLegacy++
+		case participation.ModeSecurityV2.String():
+			inventorySecurityV2++
+		default:
+			violations = append(violations, fmt.Sprintf(
+				"gate inventory entry [%d] names unknown protocol mode [%s]",
+				i,
+				permit.Mode,
+			))
+		}
+		if violation := cutoverModeViolation(
+			fmt.Sprintf("gate inventory entry [%d]", i),
+			permit.Mode,
+			permit.CanonicalStartBlock,
+			record.CutoverBlock,
+		); violation != "" &&
+			(permit.Mode == participation.ModeLegacy.String() ||
+				permit.Mode == participation.ModeSecurityV2.String()) {
+			violations = append(violations, violation)
+		}
+		violations = append(
+			violations,
+			validateQuiescencePermitIdentity(
+				i,
+				quiescencePermitEvidence{
+					Ceremony:            permit.Ceremony,
+					Mode:                permit.Mode,
+					CanonicalStartBlock: permit.CanonicalStartBlock,
+					WorkID:              permit.WorkID,
+					PermitID:            permit.PermitID,
+				},
+			)...,
+		)
+
+		identity := inventoryIdentity(permit)
+		if firstIndex, duplicate := inventoryPermits[identity]; duplicate {
+			violations = append(violations, fmt.Sprintf(
+				"gate inventory entry [%d] duplicates the full permit "+
+					"identity first recorded by entry [%d]",
+				i,
+				firstIndex,
+			))
+		} else {
+			inventoryPermits[identity] = i
+		}
+	}
+	if inventoryLegacy != snapshot.ActiveLegacyCeremonies {
+		violations = append(violations, fmt.Sprintf(
+			"the at-quiescence gate inventory contains [%d] legacy "+
+				"permits, but the snapshot declares [%d]",
+			inventoryLegacy,
+			snapshot.ActiveLegacyCeremonies,
+		))
+	}
+	if inventorySecurityV2 != snapshot.ActiveSecurityV2Ceremonies {
+		violations = append(violations, fmt.Sprintf(
+			"the at-quiescence gate inventory contains [%d] security-v2 "+
+				"permits, but the snapshot declares [%d]",
+			inventorySecurityV2,
+			snapshot.ActiveSecurityV2Ceremonies,
+		))
+	}
+
 	beaconQuarantined := make(map[quarantineIdentity]int)
 	for _, quarantined := range r.manifest.BeaconQuarantinedOutputs {
 		beaconQuarantined[quarantineIdentity{
@@ -1732,6 +1960,8 @@ func (r *auditRun) validateQuiescenceReportEvidence(content []byte) []string {
 	}
 
 	seenPermits := make(map[quarantineIdentity]int)
+	var outcomeLegacy uint64
+	var outcomeSecurityV2 uint64
 	for i, permit := range record.ActivePermitsAtQuiescence {
 		if _, ok := knownCeremonies[permit.Ceremony]; !ok {
 			violations = append(violations, fmt.Sprintf(
@@ -1747,6 +1977,20 @@ func (r *auditRun) validateQuiescenceReportEvidence(content []byte) []string {
 				i,
 				permit.Mode,
 			))
+		} else {
+			if permit.Mode == participation.ModeLegacy.String() {
+				outcomeLegacy++
+			} else {
+				outcomeSecurityV2++
+			}
+			if violation := cutoverModeViolation(
+				fmt.Sprintf("permit entry [%d]", i),
+				permit.Mode,
+				permit.CanonicalStartBlock,
+				record.CutoverBlock,
+			); violation != "" {
+				violations = append(violations, violation)
+			}
 		}
 		if _, ok := validQuiescencePermitOutcomes[permit.Outcome]; !ok {
 			violations = append(violations, fmt.Sprintf(
@@ -1762,13 +2006,7 @@ func (r *auditRun) validateQuiescenceReportEvidence(content []byte) []string {
 			validateQuiescencePermitIdentity(i, permit)...,
 		)
 
-		identity := quarantineIdentity{
-			ceremony:            permit.Ceremony,
-			mode:                permit.Mode,
-			canonicalStartBlock: permit.CanonicalStartBlock,
-			workID:              permit.WorkID,
-			permitID:            permit.PermitID,
-		}
+		identity := outcomeIdentity(permit)
 		if firstIndex, duplicate := seenPermits[identity]; duplicate {
 			violations = append(violations, fmt.Sprintf(
 				"permit entry [%d] duplicates the full permit identity "+
@@ -1784,6 +2022,13 @@ func (r *auditRun) validateQuiescenceReportEvidence(content []byte) []string {
 			))
 		} else {
 			seenPermits[identity] = i
+		}
+		if _, inventoried := inventoryPermits[identity]; !inventoried {
+			violations = append(violations, fmt.Sprintf(
+				"permit entry [%d] has no matching identity in the "+
+					"at-quiescence gate inventory",
+				i,
+			))
 		}
 
 		if permit.Outcome != "quarantined" || !r.manifest.Interpreted {
@@ -1824,6 +2069,47 @@ func (r *auditRun) validateQuiescenceReportEvidence(content []byte) []string {
 				continue
 			}
 			tbtcQuarantined[identity]--
+		}
+	}
+
+	if uint64(len(record.ActivePermitsAtQuiescence)) !=
+		snapshot.ActiveCeremonies {
+		violations = append(violations, fmt.Sprintf(
+			"the terminal outcome list contains [%d] permits, but the "+
+				"at-quiescence gate snapshot declares total [%d]",
+			len(record.ActivePermitsAtQuiescence),
+			snapshot.ActiveCeremonies,
+		))
+	}
+	if outcomeLegacy != snapshot.ActiveLegacyCeremonies {
+		violations = append(violations, fmt.Sprintf(
+			"the terminal outcome list contains [%d] legacy permits, but "+
+				"the at-quiescence gate snapshot declares [%d]",
+			outcomeLegacy,
+			snapshot.ActiveLegacyCeremonies,
+		))
+	}
+	if outcomeSecurityV2 != snapshot.ActiveSecurityV2Ceremonies {
+		violations = append(violations, fmt.Sprintf(
+			"the terminal outcome list contains [%d] security-v2 permits, "+
+				"but the at-quiescence gate snapshot declares [%d]",
+			outcomeSecurityV2,
+			snapshot.ActiveSecurityV2Ceremonies,
+		))
+	}
+	for identity, inventoryIndex := range inventoryPermits {
+		if _, reported := seenPermits[identity]; !reported {
+			violations = append(violations, fmt.Sprintf(
+				"gate inventory entry [%d] has no terminal outcome "+
+					"[ceremony=%s] [mode=%s] "+
+					"[canonicalStartBlock=%d] [workID=%s] [permitID=%s]",
+				inventoryIndex,
+				identity.ceremony,
+				identity.mode,
+				identity.canonicalStartBlock,
+				identity.workID,
+				identity.permitID,
+			))
 		}
 	}
 
@@ -2385,47 +2671,13 @@ func validateQuarantineMode(
 		)
 	}
 
-	legacy := participation.ModeLegacy.String()
-	securityV2 := participation.ModeSecurityV2.String()
-
-	switch metadata.ProtocolMode {
-	case legacy:
-		if metadata.CutoverBlock > 0 &&
-			metadata.CanonicalStartBlock >= metadata.CutoverBlock {
-			run.finding(
-				"beacon quarantine metadata [%s] claims mode [%s] with "+
-					"canonical anchor [%d] at or after cutover block [%d]",
-				key,
-				legacy,
-				metadata.CanonicalStartBlock,
-				metadata.CutoverBlock,
-			)
-		}
-	case securityV2:
-		if metadata.CutoverBlock == 0 {
-			run.finding(
-				"beacon quarantine metadata [%s] claims mode [%s] under a "+
-					"disabled all-zero schedule",
-				key,
-				securityV2,
-			)
-		} else if metadata.CanonicalStartBlock < metadata.CutoverBlock {
-			run.finding(
-				"beacon quarantine metadata [%s] claims mode [%s] with "+
-					"canonical anchor [%d] before cutover block [%d]",
-				key,
-				securityV2,
-				metadata.CanonicalStartBlock,
-				metadata.CutoverBlock,
-			)
-		}
-	default:
-		run.finding(
-			"beacon quarantine metadata [%s] names unknown protocol mode "+
-				"[%s]",
-			key,
-			metadata.ProtocolMode,
-		)
+	if violation := cutoverModeViolation(
+		fmt.Sprintf("beacon quarantine metadata [%s]", key),
+		metadata.ProtocolMode,
+		metadata.CanonicalStartBlock,
+		metadata.CutoverBlock,
+	); violation != "" {
+		run.finding("%s", violation)
 	}
 }
 
@@ -2893,46 +3145,13 @@ func validateTBTCQuarantineMode(
 		)
 	}
 
-	legacy := participation.ModeLegacy.String()
-	securityV2 := participation.ModeSecurityV2.String()
-
-	switch metadata.ProtocolMode {
-	case legacy:
-		if metadata.CutoverBlock > 0 &&
-			metadata.CanonicalStartBlock >= metadata.CutoverBlock {
-			run.finding(
-				"tbtc quarantine metadata [%s] claims mode [%s] with "+
-					"canonical anchor [%d] at or after cutover block [%d]",
-				key,
-				legacy,
-				metadata.CanonicalStartBlock,
-				metadata.CutoverBlock,
-			)
-		}
-	case securityV2:
-		if metadata.CutoverBlock == 0 {
-			run.finding(
-				"tbtc quarantine metadata [%s] claims mode [%s] under a "+
-					"disabled all-zero schedule",
-				key,
-				securityV2,
-			)
-		} else if metadata.CanonicalStartBlock < metadata.CutoverBlock {
-			run.finding(
-				"tbtc quarantine metadata [%s] claims mode [%s] with "+
-					"canonical anchor [%d] before cutover block [%d]",
-				key,
-				securityV2,
-				metadata.CanonicalStartBlock,
-				metadata.CutoverBlock,
-			)
-		}
-	default:
-		run.finding(
-			"tbtc quarantine metadata [%s] names unknown protocol mode [%s]",
-			key,
-			metadata.ProtocolMode,
-		)
+	if violation := cutoverModeViolation(
+		fmt.Sprintf("tbtc quarantine metadata [%s]", key),
+		metadata.ProtocolMode,
+		metadata.CanonicalStartBlock,
+		metadata.CutoverBlock,
+	); violation != "" {
+		run.finding("%s", violation)
 	}
 }
 
