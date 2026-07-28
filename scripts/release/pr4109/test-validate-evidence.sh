@@ -1648,6 +1648,9 @@ check "a quiescing node nobody asked evidences no refusal to start work" 3 \
 # The regression this rung exists for: work went out and no permit came back,
 # which is what a refusal looks like and equally what an offer that never
 # arrived looks like. Only the node's own counter tells the two apart.
+# The `before` value is the case's own, so it has to expand inside the case
+# and not out here where the fixture has not been laid down yet.
+# shellcheck disable=SC2016
 run_verdict quiesce_case eval 'QUIESCE_CEREMONY_REFUSALS_AFTER="\
 ${QUIESCE_CEREMONY_REFUSALS_BEFORE}"
    QUIESCE_REFUSALS_AFTER="7"'
@@ -1656,6 +1659,7 @@ check "an offer the node never recorded refusing is not a refusal" 1 \
 
 # A total that moved with no ceremony behind it names nothing a release could
 # act on, and the total alone is satisfied by a refusal from any other cause.
+# shellcheck disable=SC2016
 run_verdict quiesce_case eval 'QUIESCE_CEREMONY_REFUSALS_AFTER="\
 ${QUIESCE_CEREMONY_REFUSALS_BEFORE}"'
 check "a refusal no ceremony counter accounts for attributes nothing" 3 \
@@ -1969,6 +1973,9 @@ check "a daemon with every prior container stopped holds the barrier" 0 \
 # The regression this seam exists for: this project's own prior stays stopped
 # for the whole window — so the probe keyed on it answers nothing — while
 # another project's prior runs on a network throughout.
+# Each of these appends to the listing the case itself laid down, so the
+# expansion belongs to the case subshell and not to this line.
+# shellcheck disable=SC2016
 run_verdict prior_case eval \
   'PRIOR_SAMPLE_LISTING="${PRIOR_SAMPLE_LISTING}
 pr4109-rollback/prior-node running pr4109-rollback_rehearsal"
@@ -1979,6 +1986,7 @@ check "another project's prior left running refutes the barrier" 1 \
 
 # A prior started outside any rehearsal project, recognized by the image it was
 # created from rather than by a label it need not carry.
+# shellcheck disable=SC2016
 run_verdict prior_case eval \
   'PRIOR_SAMPLE_LISTING="${PRIOR_SAMPLE_LISTING}
 stray-prior running bridge"
@@ -1989,6 +1997,7 @@ check "an unlabelled prior on a network refutes the barrier" 1 \
 # The sequence a single post-drain probe cannot tell from a clean window: a
 # prior that participated for part of quiescence and was gone before the last
 # sample was taken.
+# shellcheck disable=SC2016
 run_verdict prior_case eval \
   'prior_sample_window 1
    PRIOR_SAMPLE_LISTING="${PRIOR_SAMPLE_LISTING}
@@ -2001,6 +2010,7 @@ check "a prior seen only mid-drain still refutes the barrier" 1 \
 
 # Attached to nothing is the one quarantine this script can read rather than
 # take on trust, and it is the same reading the candidate barrier takes.
+# shellcheck disable=SC2016
 run_verdict prior_case eval \
   'PRIOR_SAMPLE_LISTING="${PRIOR_SAMPLE_LISTING}
 pr4109-rollback/prior-node running -"
@@ -2008,6 +2018,7 @@ pr4109-rollback/prior-node running -"
 check "a running prior attached to no network is quarantined" 0 \
   "no container built from the prior image was running and network-attached"
 
+# shellcheck disable=SC2016
 run_verdict prior_case eval \
   'PRIOR_SAMPLE_LISTING="${PRIOR_SAMPLE_LISTING}
 pr4109-rollback/prior-node unreadable -"
@@ -2030,6 +2041,7 @@ run_verdict prior_case eval 'PRIOR_SAMPLE_LISTING=""
 check "an enumeration blind to this project's staged prior blocks" 3 \
   "did not find this project's own staged prior container in 3 of 3 samples"
 
+# shellcheck disable=SC2016
 run_verdict prior_case eval \
   'prior_sample_window
    PRIOR_DRAIN_SAMPLES=$((PRIOR_DRAIN_SAMPLES + 1))

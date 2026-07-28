@@ -6169,12 +6169,12 @@ nowhere to capture them to"
       active_now="$(participation_field "${svc}" \
         active_security_v2_ceremonies 2>/dev/null || printf '')"
       if [[ "${active_now}" =~ ^[0-9]+$ ]]; then
-        final_active[${idx}]="${active_now}"
+        final_active[idx]="${active_now}"
       fi
       forced_now="$(metric_value "${svc}" \
         participation_quiesce_forced_aborts_total 2>/dev/null || printf '')"
       if [[ "${forced_now}" =~ ^[0-9]+$ ]]; then
-        forced_after[${idx}]="${forced_now}"
+        forced_after[idx]="${forced_now}"
       fi
       idx=$((idx + 1))
     done
