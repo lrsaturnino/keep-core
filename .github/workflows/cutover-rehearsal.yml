@@ -254,12 +254,13 @@ jobs:
 
   container-rehearsal:
     # The container stages need the immutable digests, a rehearsal chain, the
-    # per-node keys/configs, and the chain-side inputs no repository can
-    # derive — the driver that originates protocol work, and the
-    # reconciliation, quiescence, and prior-reader evidence the rollback audit
-    # binds its verdict to. Everything the runner can be given is given below;
-    # anything still missing reports BLOCKED (exit 3) naming the exact input,
-    # which is the truthful status for a rehearsal that cannot execute.
+    # per-node keys/configs, and the chain-side programs no repository can
+    # derive — the driver that originates protocol work, and the generator that
+    # produces the reconciliation, quiescence, and prior-reader evidence the
+    # rollback audit binds its verdict to, for the snapshot the drain leaves.
+    # Everything the runner can be given is given below; anything still missing
+    # reports BLOCKED (exit 3) naming the exact input, which is the truthful
+    # status for a rehearsal that cannot execute.
     if: inputs.run_container_stages
     needs: local-proofs
     runs-on: ubuntu-latest
