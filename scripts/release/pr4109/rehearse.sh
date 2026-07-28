@@ -43,6 +43,12 @@
 #                        that fails on anything left beyond the
 #                        context-excluded absences
 #
+# Which absences build-image mode may explain away is decided by a
+# classification written out in this script, so it is held to the commit's
+# own .dockerignore rather than trusted: local-proofs and shell-analysis both
+# compare the two over every tracked path and refuse to go on once they
+# disagree in any direction the image build does not account for.
+#
 # Evidence is written under EVIDENCE_DIR (default: ./rehearsal-evidence).
 # Every accepted rehearsal run must produce a record conforming to
 # rehearsal-evidence.schema.json and binding the checked-in release
@@ -86,8 +92,10 @@ stages:
                       integration-tag compile proof; self-tests the
                       source-binding and evidence-record validators first
                       (the latter needs node/npx), reports every skipped
-                      case explicitly, discards any inherited
-                      EVIDENCE_DIR/attestation before proving anything, and
+                      case explicitly, holds the verifier's build-context
+                      classification to the commit's own .dockerignore,
+                      discards any inherited EVIDENCE_DIR/attestation before
+                      proving anything, and
                       ends by attesting the checked-in release manifest
                       against the compiled bounds — stamped with the commit
                       the binding check proved — into that directory by
@@ -103,11 +111,14 @@ stages:
                       fetch the pinned tools)
   shell-analysis      analyze the rehearsal scaffold itself: bash -n and
                       ShellCheck over every script here, actionlint v1.7.12
-                      over the scaffold's own workflows, and both validator
-                      self-tests — the gate the scaffold's CI job runs on
-                      every change to these files, so the checkers that
-                      admit rehearsal evidence are never proved only by a
-                      manual dispatch
+                      over the scaffold's own workflows, the build-context
+                      classification checked against the commit's own
+                      .dockerignore over every tracked path, and both
+                      validator self-tests — the gate the scaffold's CI job
+                      runs on every change to these files and to the build
+                      inputs they mirror, so the checkers that admit
+                      rehearsal evidence are never proved only by a manual
+                      dispatch
   solidity-proofs     build and test the changed ECDSA contracts surface
                       exactly as the contracts workflow does: Node 18.15.0,
                       the Corepack-managed yarn from packageManager, and a
@@ -259,6 +270,193 @@ regenerated_by_design_path() {
   [[ "${path}" =~ (^|/)gen/.+\.go$ ]] && return 0
   [[ "${path}" =~ (^|/)gen/_address/[^/]+$ ]] && return 0
   return 1
+}
+
+# The .dockerignore rules the two classifications above mirror, compiled once
+# per tree into one extended regular expression per pattern with a parallel
+# flag marking the negations. They are read from the commit, not from disk:
+# the build context of a dispatched commit is that commit's own tree, and
+# inside the build image the file itself is one of the paths its own `.*`
+# rule kept out.
+DOCKERIGNORE_REGEX=()
+DOCKERIGNORE_NEGATED=()
+
+# Translate one normalized .dockerignore pattern into an extended regular
+# expression over a whole context-relative path, following the build daemon's
+# own compilation: `*` stops at a path separator, `?` is a single
+# non-separator character, `**` spans any number of whole segments (`.*` when
+# it ends the pattern), and every other character is literal. Backslash
+# escapes are the one construct not modelled; load_dockerignore_patterns
+# rejects a pattern carrying one before this ever sees it, because a failure
+# raised here would run inside a command substitution and exit nothing but
+# its own subshell.
+dockerignore_pattern_regex() {
+  local pattern="$1" out="^" i ch
+  for ((i = 0; i < ${#pattern}; i++)); do
+    ch="${pattern:i:1}"
+    if [[ "${ch}" == '*' ]]; then
+      if [[ "${pattern:i+1:1}" == '*' ]]; then
+        i=$((i + 1))
+        # A `**/` prefix spans whole segments, so the separator belongs to it.
+        [[ "${pattern:i+1:1}" == '/' ]] && i=$((i + 1))
+        if ((i + 1 == ${#pattern})); then
+          out+='.*'
+        else
+          out+='(.*/)?'
+        fi
+      else
+        out+='[^/]*'
+      fi
+    elif [[ "${ch}" == '?' ]]; then
+      out+='[^/]'
+    elif [[ '.[](){}+|^$' == *"${ch}"* ]]; then
+      out+="\\${ch}"
+    else
+      out+="${ch}"
+    fi
+  done
+  printf '%s$' "${out}"
+}
+
+# Compile the committed .dockerignore the way the build daemon reads it:
+# lines opening with `#` are comments, surrounding whitespace is trimmed, a
+# leading `!` splits off as a negation, and the remainder is path-cleaned of
+# its leading and trailing separators.
+load_dockerignore_patterns() {
+  DOCKERIGNORE_REGEX=()
+  DOCKERIGNORE_NEGATED=()
+
+  local content
+  if ! content="$(git -C "${REPO_ROOT}" show HEAD:.dockerignore 2>/dev/null)"; then
+    fail "the commit under test carries no .dockerignore; the build-context \
+classification in this script has nothing left to be checked against"
+  fi
+
+  local line negated
+  while IFS= read -r line; do
+    [[ "${line}" == '#'* ]] && continue
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -n "${line}" ]] || continue
+    negated=0
+    if [[ "${line}" == '!'* ]]; then
+      negated=1
+      line="${line#!}"
+      line="${line#"${line%%[![:space:]]*}"}"
+    fi
+    while [[ "${line}" == /* ]]; do line="${line#/}"; done
+    while [[ "${line}" == */ ]]; do line="${line%/}"; done
+    [[ -n "${line}" ]] || continue
+    # Checked here, in the shell that can still stop the run: the compiler
+    # below runs inside a command substitution, where refusing would exit
+    # only the subshell and leave the unmodelled pattern silently empty.
+    [[ "${line}" != *$'\\'* ]] ||
+      fail "the committed .dockerignore pattern [${line}] uses a backslash \
+escape, which the build-context classification in this script does not model; \
+extend dockerignore_pattern_regex before relying on it"
+    DOCKERIGNORE_REGEX+=("$(dockerignore_pattern_regex "${line}")")
+    DOCKERIGNORE_NEGATED+=("${negated}")
+  done <<<"${content}"
+
+  ((${#DOCKERIGNORE_REGEX[@]} > 0)) ||
+    fail "the committed .dockerignore carries no pattern at all; the \
+build-context classification in this script has nothing to be checked against"
+}
+
+# True when the build daemon would keep this committed path out of the build
+# context. Patterns apply in file order with the last one to match deciding,
+# and a path matches when it or any of its ancestor directories does — the
+# daemon's own rule, and the reason a bare directory pattern like `solidity`
+# removes everything beneath it.
+dockerignore_context_excluded() {
+  local path="$1" excluded=1 i regex negated matched prefix rest
+  for ((i = 0; i < ${#DOCKERIGNORE_REGEX[@]}; i++)); do
+    negated="${DOCKERIGNORE_NEGATED[i]}"
+    # A negation has nothing to re-include while the path is still in the
+    # context, and an exclusion has nothing to add once it is already out.
+    if [[ "${negated}" == 1 ]]; then
+      [[ "${excluded}" == 0 ]] || continue
+    else
+      [[ "${excluded}" == 1 ]] || continue
+    fi
+
+    regex="${DOCKERIGNORE_REGEX[i]}"
+    matched=1
+    if [[ "${path}" =~ ${regex} ]]; then
+      matched=0
+    else
+      prefix=""
+      rest="${path}"
+      while [[ "${rest}" == */* ]]; do
+        prefix+="${rest%%/*}"
+        rest="${rest#*/}"
+        if [[ "${prefix}" =~ ${regex} ]]; then
+          matched=0
+          break
+        fi
+        prefix+="/"
+      done
+    fi
+
+    if [[ "${matched}" == 0 ]]; then
+      if [[ "${negated}" == 1 ]]; then excluded=1; else excluded=0; fi
+    fi
+  done
+  return "${excluded}"
+}
+
+# The two classifications above are hand-written mirrors of build inputs that
+# live elsewhere, and a mirror is only ever as good as its last
+# synchronization. This walks every path the commit tracks and compares each
+# mirror's verdict against the rules .dockerignore itself carries.
+#
+# A path the mirror calls context-excluded while the context in fact holds it
+# is the dangerous direction: build-image mode would explain that file's
+# absence from the image as the image's own construction and accept a tree
+# missing it. The opposite direction is safe — the mirror would report a
+# legitimate absence as unexplained divergence and refuse to produce evidence
+# — but it is still drift, so it is tolerated only for the families the image
+# regenerates by design, which verify_build_image_tree restores byte-exact
+# rather than explains away.
+verify_build_context_mirror() {
+  load_dockerignore_patterns
+  note "build-context mirror: checking this script's classification against \
+the ${#DOCKERIGNORE_REGEX[@]} committed .dockerignore pattern(s)"
+
+  local path mirror context tracked=0 excluded=0 regenerated=0 drift=""
+  while IFS= read -r -d '' path; do
+    [[ -n "${path}" ]] || continue
+    tracked=$((tracked + 1))
+    if dockerignore_excluded_path "${path}"; then mirror=0; else mirror=1; fi
+    if dockerignore_context_excluded "${path}"; then context=0; else context=1; fi
+
+    if [[ "${mirror}" == 0 && "${context}" == 0 ]]; then
+      excluded=$((excluded + 1))
+    elif [[ "${mirror}" == 0 ]]; then
+      drift+="${path}: this script explains an absence here as a \
+context-excluded path, but .dockerignore keeps it in the build context"$'\n'
+    elif [[ "${context}" == 0 ]]; then
+      if regenerated_by_design_path "${path}"; then
+        regenerated=$((regenerated + 1))
+      else
+        drift+="${path}: .dockerignore keeps this path out of the build \
+context, but this script neither excludes it nor treats it as regenerated"$'\n'
+      fi
+    fi
+  done < <(git -C "${REPO_ROOT}" ls-tree -r -z --name-only HEAD)
+
+  if [[ -n "${drift}" ]]; then
+    printf '%s' "${drift}" >&2
+    fail "the build-context classification in this script no longer mirrors \
+.dockerignore (listing above); re-derive dockerignore_excluded_path and \
+regenerated_by_design_path from the current build inputs before this scaffold \
+admits any further evidence"
+  fi
+
+  note "build-context mirror: ${tracked} tracked path(s) classified \
+identically by .dockerignore and this script (${excluded} kept out of the \
+build context; ${regenerated} excluded from the context but regenerated into \
+the image by design)"
 }
 
 # The artifact input identity behind the image build: get_artifacts leaves
@@ -572,6 +770,11 @@ run_local_proof_suite() {
   # — and its verdicts land in this stage's archived log.
   "${SCRIPT_DIR}/test-validate-evidence.sh"
   verify_source_binding
+  # The verifier's own build-context classification is what the binding check
+  # just used to explain away every absence from the image, so its agreement
+  # with the committed build inputs is proved here, where evidence is
+  # produced, and not only in the scaffold's static-analysis gate.
+  verify_build_context_mirror
   go test -count=1 -v \
     -run 'TestJoinDKGIfEligible|TestMonitorRelayEntry|TestForwardSignatureShares' \
     ./pkg/beacon/
@@ -719,6 +922,12 @@ stage_shell_analysis() {
     while IFS= read -r workflow; do
       go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 "${workflow}"
     done < <(cutover_workflow_files)
+
+    # The verifier's build-context classification is a hand-written mirror of
+    # .dockerignore, so it drifts silently whenever the real build inputs
+    # change. This gate runs on every change to those inputs, which is why it
+    # is where the mirror is held to them.
+    verify_build_context_mirror
 
     # The two validators gate every piece of rehearsal evidence, so the gate
     # that runs on every change to them runs their self-tests too — without

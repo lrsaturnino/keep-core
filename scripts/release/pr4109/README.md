@@ -216,6 +216,29 @@ runs both as an early workflow step on the runner and inside
 `./rehearse.sh verify-source-binding` runs the binding check alone and
 records it under `EVIDENCE_DIR`.
 
+Which absences that verifier may explain away is decided by a
+classification of the build context written out in `rehearse.sh`, and a
+hand-written mirror drifts silently whenever the thing it mirrors changes.
+Both `local-proofs` and `shell-analysis` therefore hold it to the commit's
+own `.dockerignore`, compiled the way the build daemon reads it — comments
+and blanks dropped, negations split off, patterns path-cleaned, `*` stopping
+at a separator, `**` spanning whole segments, last match winning, a path
+excluded when it or any ancestor matches — and compared against the script's
+verdict for every tracked path. The rules are read from the commit rather
+than from disk, because inside the build image the file is one of the paths
+its own `.*` rule kept out. A path the script calls context-excluded while
+`.dockerignore` keeps it in the context is the dangerous direction and
+always fails: build-image mode would otherwise explain that file's absence
+as the image's construction and accept a tree missing it. The opposite
+direction is safe but still drift, and is tolerated only for the families
+the image regenerates by design — the ones the verifier restores byte-exact
+rather than explains away. A pattern construct the compilation does not
+model, an absent `.dockerignore`, and one carrying no rule at all each fail
+closed. `test-source-binding.sh` proves all of it against throwaway trees
+carrying the checked-in rules and deliberate drifts of them, and refuses to
+build a drift case out of a filter that removes no line, so a case cannot
+pass because the rule it targets was renamed.
+
 The rehearsal workflow writes its evidence into the workspace root rather
 than the script's own default, and every proof stage refuses to run on a
 tree that diverges from the dispatched commit — untracked files included —
@@ -227,12 +250,17 @@ Everything above runs only when somebody dispatches it, which is the wrong
 gate for the checkers that decide what may become release evidence. The
 `cutover-scaffold-lint` workflow
 (`.github/workflows/cutover-scaffold-lint.yml`) closes that: on every push
-and pull request touching `scripts/release/pr4109/**` or either cutover
-workflow it runs `./rehearse.sh shell-analysis`, so a change to
-`rehearse.sh`, to either self-test, or to the workflows themselves cannot
-merge without shell syntax, ShellCheck, actionlint, and both validator
-self-tests passing. It builds no image and runs no Go suite, so it is cheap
-enough to require.
+and pull request touching the scaffold it runs `./rehearse.sh
+shell-analysis`, so a change to `rehearse.sh`, to either self-test, or to
+the workflows themselves cannot merge without shell syntax, ShellCheck,
+actionlint, the build-context mirror check, and both validator self-tests
+passing. Its path filters cover the build inputs the trust model is derived
+from as well as the scaffold's own files — `.dockerignore`, the root and
+nested `.gitignore` rules, `Dockerfile`, and `Makefile` — because each of
+them decides what the verifier accepts just as directly as its own code
+does, and a change to any of them can widen what an image tree is allowed to
+be missing without touching a line under `scripts/`. It builds no image and
+runs no Go suite, so it is cheap enough to require.
 
 On a hosted runner the per-node keystore comes from the
 `REHEARSAL_KEYSTORE_BUNDLE_B64` repository secret: a base64-encoded tar.gz

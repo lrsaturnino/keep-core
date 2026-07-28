@@ -8,23 +8,46 @@ name: Cutover Scaffold Lint
 # dispatched workflow. Nothing therefore proved a change to them until
 # somebody remembered to dispatch a rehearsal. This job runs on every push
 # and pull request that touches those files: shell syntax, ShellCheck,
-# actionlint over the scaffold's own workflows, and both validator
-# self-tests. It is deliberately cheap — no Docker image build, no Go test
-# suite — so it can be required without slowing anything down.
+# actionlint over the scaffold's own workflows, both validator self-tests,
+# and the check holding the verifier's hand-written build-context
+# classification to the rules .dockerignore really carries. It is
+# deliberately cheap — no Docker image build, no Go test suite — so it can be
+# required without slowing anything down.
+#
+# The path filters cover the scaffold plus the build inputs its trust model
+# is derived from, because those decide what it accepts just as directly as
+# its own code does: .dockerignore is what the verifier's context
+# classification mirrors, the ignore rules decide which working-tree paths
+# count as divergence at all, and the Dockerfile and Makefile define the
+# regeneration the verifier restores over rather than trusts. A change to any
+# of them can widen what an image tree is allowed to be missing without
+# touching a line under scripts/.
 
 on:
   push:
     branches:
       - main
+    # Kept in step with the pull_request list below; the workflow parser has
+    # no anchors, so the two are written out.
     paths:
       - "scripts/release/pr4109/**"
       - ".github/workflows/cutover-rehearsal.yml"
       - ".github/workflows/cutover-scaffold-lint.yml"
+      - ".dockerignore"
+      - ".gitignore"
+      - "**/.gitignore"
+      - "Dockerfile"
+      - "Makefile"
   pull_request:
     paths:
       - "scripts/release/pr4109/**"
       - ".github/workflows/cutover-rehearsal.yml"
       - ".github/workflows/cutover-scaffold-lint.yml"
+      - ".dockerignore"
+      - ".gitignore"
+      - "**/.gitignore"
+      - "Dockerfile"
+      - "Makefile"
   workflow_dispatch:
 
 permissions:
