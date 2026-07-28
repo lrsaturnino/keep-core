@@ -4591,17 +4591,28 @@ on: ${verdict}"
 # actually put on the chain for it to refuse.
 WORK_DRIVER_RC=0
 WORK_DRIVER_TX_COUNT=0
-WORK_DRIVER_SUCCEEDED_CEREMONIES=""
 # Every terminal outcome the driver reported, space-joined as
-# "<ceremony>=<outcome>". The successes above are a projection of this, kept
-# because most phases read them directly; this is what a phase reads when the
-# outcomes it must not see are as load-bearing as the ones it must.
+# "<ceremony>=<outcome>". This is what a phase reads when the outcomes it must
+# not see are as load-bearing as the ones it must. What a phase decides a
+# control on is the bound form below: this one names what happened without
+# naming what it happened to.
 WORK_DRIVER_CEREMONY_RESULTS=""
 # The ceremonies the driver put on the chain, whatever became of them. A phase
 # whose subject is work still in flight — a drain, a forced deadline — has no
 # terminal outcome to read: by the time one exists the work it was about is
 # over. This is what such a phase reads to know what kind of work it drained.
 WORK_DRIVER_ORIGINATED=""
+# The same outcomes with what ties each one to the chain and to what it left
+# behind, space-joined as "<ceremony>=<outcome>=<transaction>=<identity>".
+#
+# The projections above are populations that happen to sit beside each other:
+# read from them, a control cannot tell a ceremony this driver originated from
+# one that was already running, nor a ceremony that produced a threshold
+# output from a report that merely says "succeeded". The identity is the
+# threshold output for a ceremony that settled and the termination — retries
+# exhausted, or no threshold reached — for one that did not, which is the
+# distinction between work that came to nothing and work still trying.
+WORK_DRIVER_BOUND_RESULTS=""
 
 # True when the last driver call both exited cleanly and named what it put on
 # the chain, which is the whole of "work was offered here".
@@ -4691,26 +4702,101 @@ successful_results() {
   printf '%s' "${out}"
 }
 
+# The fields of one bound result, "<ceremony>=<outcome>=<transaction>=<identity>".
+# Split here rather than at each reader so no control invents its own reading
+# of a record whose whole purpose is that every control reads it the same way.
+bound_ceremony() {
+  printf '%s' "${1%%=*}"
+}
+
+bound_outcome() {
+  local rest
+  rest="${1#*=}"
+  printf '%s' "${rest%%=*}"
+}
+
+bound_transaction() {
+  local rest
+  rest="${1#*=}"
+  rest="${rest#*=}"
+  printf '%s' "${rest%%=*}"
+}
+
+bound_identity() {
+  printf '%s' "${1##*=}"
+}
+
+# Of the required families, the ones no bound successful result covers.
+#
+# The unbound mirror of this reads a population of outcomes that need not have
+# anything to do with the transactions reported beside them. A control whose
+# claim is that this driver's ceremonies ran under this fleet's gate has to
+# decide on records that name both.
+missing_bound_families() {
+  local records="$1" required="$2" family record uncovered="" covered
+  for family in ${required}; do
+    covered=0
+    for record in ${records}; do
+      [[ "$(bound_outcome "${record}")" == "succeeded" ]] || continue
+      [[ "$(ceremony_family "$(bound_ceremony "${record}")")" == "${family}" ]] ||
+        continue
+      covered=1
+      break
+    done
+    ((covered == 1)) || uncovered="${uncovered}${uncovered:+ }${family}"
+  done
+  printf '%s' "${uncovered}"
+}
+
+# The bound records that settled, rendered as "<ceremony> (<transaction>,
+# <identity>)" so a verdict names what it decided on rather than asserting it.
+bound_settlements() {
+  local records="$1" record out=""
+  for record in ${records}; do
+    [[ "$(bound_outcome "${record}")" == "succeeded" ]] || continue
+    out="${out}${out:+, }$(bound_ceremony "${record}") \
+($(bound_transaction "${record}"), $(bound_identity "${record}"))"
+  done
+  printf '%s' "${out}"
+}
+
+# The mirror, for the controls whose claim is that work came to nothing: each
+# unsettled record with the termination that says it stopped trying.
+bound_terminations() {
+  local records="$1" record out=""
+  for record in ${records}; do
+    [[ "$(bound_outcome "${record}")" == "succeeded" ]] && continue
+    out="${out}${out:+, }$(bound_ceremony "${record}")=\
+$(bound_outcome "${record}") ($(bound_transaction "${record}"), \
+$(bound_identity "${record}"))"
+  done
+  printf '%s' "${out}"
+}
+
 run_work_driver() {
   local phase="$1" report rc=0
   note "driving ${phase} work on the rehearsal chain"
   WORK_DRIVER_RC=0
   WORK_DRIVER_TX_COUNT=0
-  WORK_DRIVER_SUCCEEDED_CEREMONIES=""
   WORK_DRIVER_CEREMONY_RESULTS=""
   WORK_DRIVER_ORIGINATED=""
+  WORK_DRIVER_BOUND_RESULTS=""
   report="$("${PR4109_WORK_DRIVER}" "${phase}")" || rc=$?
   WORK_DRIVER_RC="${rc}"
 
   if [[ -n "${report//[[:space:]]/}" ]]; then
-    # Two lines out of one parse: the hashes, then the ceremonies that
-    # succeeded. Parsing twice would report a malformed object twice and, worse,
-    # could accept one half of a report whose other half is unreadable.
-    local parsed hashes ceremonies
+    # Four lines out of one parse: the hashes, the outcomes, the work still in
+    # flight, and the outcomes bound to what started them. Parsing four times
+    # would report a malformed object four times and, worse, could accept one
+    # part of a report whose other parts are unreadable.
+    local parsed hashes
     parsed="$(printf '%s' "${report}" | node -e '
       const CEREMONIES = ["beacon_dkg", "beacon_signing", "tbtc_dkg",
         "tbtc_signing", "tbtc_wallet_action"];
       const OUTCOMES = ["succeeded", "failed", "timed_out"];
+      // The two ways work legitimately comes to nothing, as opposed to work
+      // that has simply not finished yet.
+      const TERMINATIONS = ["retry_exhausted", "no_threshold"];
       let raw = "";
       process.stdin.on("data", (d) => (raw += d));
       process.stdin.on("end", () => {
@@ -4749,8 +4835,8 @@ run_work_driver() {
           }
         }
         const results = report.ceremony_results;
-        const succeeded = [];
         const all = [];
+        const bound = [];
         if (results !== undefined) {
           if (!Array.isArray(results)) {
             console.error("ceremony_results is not an array");
@@ -4767,33 +4853,72 @@ run_work_driver() {
               console.error("not an outcome: " + JSON.stringify(outcome));
               process.exit(1);
             }
+            // The transaction this outcome belongs to, and it has to be one
+            // the same report accounted for putting on the chain. Without it
+            // the hashes and the outcomes are two independent populations,
+            // and a stale hash beside an unrelated result satisfies every
+            // control that reads them as parallel arrays.
+            const tx = (result || {}).transaction_hash;
+            if (typeof tx !== "string" || !/^0x[0-9a-f]{64}$/.test(tx)) {
+              console.error("result carries no transaction hash: " +
+                JSON.stringify(ceremony));
+              process.exit(1);
+            }
+            if (!encoded.includes(JSON.stringify(tx))) {
+              console.error("result names a transaction the report did not " +
+                "originate: " + JSON.stringify(tx));
+              process.exit(1);
+            }
+            // What the ceremony actually left behind. A control that asks
+            // whether a ceremony settled cannot read that off the word
+            // "succeeded": the identity of the threshold output is the thing
+            // that distinguishes a ceremony that produced one from a report
+            // that says it did.
+            const identity = (result || {}).result;
+            const termination = (result || {}).termination;
+            if (outcome === "succeeded") {
+              if (typeof identity !== "string" || !/^\S+$/.test(identity)) {
+                console.error("successful result carries no threshold " +
+                  "output identity: " + JSON.stringify(ceremony));
+                process.exit(1);
+              }
+            } else if (!TERMINATIONS.includes(termination)) {
+              // The mirror of the above for the outcomes a fails-closed
+              // control is about. "failed" alone is equally what a ceremony
+              // still retrying looks like from outside, and a control about
+              // work coming to nothing cannot be read off one in progress.
+              console.error("unsettled result carries no termination " +
+                "evidence: " + JSON.stringify(ceremony));
+              process.exit(1);
+            }
             // Every outcome is carried out, not only the successes. A phase
             // that kept the successes alone could not tell a clean run from
             // one where a required ceremony failed beside a passing one, and
             // could not see a ceremony succeeding where the property under
             // test is that it must not.
             all.push(ceremony + "=" + outcome);
-            if (outcome === "succeeded") {
-              succeeded.push(ceremony);
-            }
+            bound.push(ceremony + "=" + outcome + "=" + tx + "=" +
+              (outcome === "succeeded" ? identity : termination));
           }
         }
         process.stdout.write(encoded.join(",") + "\n" +
-          succeeded.join(" ") + "\n" + all.join(" ") + "\n" +
-          started.join(" "));
+          all.join(" ") + "\n" + started.join(" ") + "\n" + bound.join(" "));
       });
     ')" ||
       blocked "the work driver reported the ${phase} phase in a form this \
 rehearsal cannot read; its stdout must be a JSON object whose optional \
 transaction_hashes array carries 0x-prefixed 32-byte hashes and whose \
-optional ceremony_results array carries {ceremony, outcome} objects over the \
-known ceremonies and outcomes, and a report that cannot be read leaves the \
-step with no account of what it drove"
+optional ceremony_results array carries {ceremony, outcome, transaction_hash} \
+objects over the known ceremonies and outcomes, each naming a transaction the \
+same report originated and carrying either a result identity when it \
+succeeded or a termination of retry_exhausted or no_threshold when it did \
+not, and a report that cannot be read leaves the step with no account of what \
+it drove"
 
     hashes="$(printf '%s\n' "${parsed}" | sed -n '1p')"
-    ceremonies="$(printf '%s\n' "${parsed}" | sed -n '2p')"
-    WORK_DRIVER_CEREMONY_RESULTS="$(printf '%s\n' "${parsed}" | sed -n '3p')"
-    WORK_DRIVER_ORIGINATED="$(printf '%s\n' "${parsed}" | sed -n '4p')"
+    WORK_DRIVER_CEREMONY_RESULTS="$(printf '%s\n' "${parsed}" | sed -n '2p')"
+    WORK_DRIVER_ORIGINATED="$(printf '%s\n' "${parsed}" | sed -n '3p')"
+    WORK_DRIVER_BOUND_RESULTS="$(printf '%s\n' "${parsed}" | sed -n '4p')"
 
     if [[ -n "${hashes}" ]]; then
       STEP_TX_HASHES="${STEP_TX_HASHES}${STEP_TX_HASHES:+,}${hashes}"
@@ -4803,7 +4928,6 @@ step with no account of what it drove"
       WORK_DRIVER_TX_COUNT=$(($(printf '%s' "${hashes}" | tr -cd ',' |
         wc -c | tr -d '[:space:]') + 1))
     fi
-    WORK_DRIVER_SUCCEEDED_CEREMONIES="${ceremonies}"
   fi
 
   return "${rc}"
@@ -4836,7 +4960,14 @@ STRAGGLER_DRIVER_TX=0
 # result that settled means either the straggler was not refused after all or
 # the ceremony never depended on it — and a control that did not need the
 # node it is about has not exercised the failure path it claims to.
-STRAGGLER_RESULTS=""
+#
+# Each outcome is bound to the transaction that started it and to the
+# termination that says the ceremony stopped trying. A bare "failed" is
+# equally what a ceremony still retrying looks like from outside this fleet:
+# only retries exhausted, or a round that reached no threshold, tells the two
+# apart, and a control about work that came to nothing cannot be read off work
+# still in progress.
+STRAGGLER_BOUND=""
 
 # One operator address in the form two spellings of the same address share.
 # Chain addresses arrive EIP-55 checksummed from one source and lowercase from
@@ -4887,7 +5018,7 @@ this control claims to have originated"
     record_assertion "${assertion}" false "${step}"
     return
   fi
-  if [[ -z "${STRAGGLER_RESULTS}" ]]; then
+  if [[ -z "${STRAGGLER_BOUND}" ]]; then
     block_step "${step}" "the work driver named no terminal outcome for the \
 post-C ceremony it originated, so nothing says whether that ceremony \
 exhausted its retries or is still running; a ceremony that has not finished \
@@ -4896,8 +5027,9 @@ still in progress"
     record_assertion "${assertion}" false "${step}"
     return
   fi
-  local settled
-  settled="$(successful_results "${STRAGGLER_RESULTS}")"
+  local settled terminations
+  settled="$(bound_settlements "${STRAGGLER_BOUND}")"
+  terminations="$(bound_terminations "${STRAGGLER_BOUND}")"
   if [[ -n "${settled}" ]]; then
     record_step "${step}" fail "the post-C ceremony this control drove \
 produced a threshold output (${settled}); the straggler entering the roster \
@@ -4907,6 +5039,10 @@ nothing"
     record_assertion "${assertion}" false "${step}"
     return
   fi
+  # Recorded rather than merely required: the claim this control carries out
+  # is that a named ceremony stopped trying, so the record names which
+  # transaction it was and how it ended.
+  note "the post-C ceremony came to nothing: ${terminations}"
 
   local i deltas=() unreadable=()
   for i in 0 1 2; do
@@ -5242,8 +5378,14 @@ ${QUIESCE_FORCED_AFTER})"
 HOMOGENEOUS_DRIVER_SUPPLIED=0
 HOMOGENEOUS_DRIVER_RC=0
 HOMOGENEOUS_TX=0
-HOMOGENEOUS_CEREMONIES=""
 HOMOGENEOUS_RESULTS=""
+# The same outcomes bound to the transactions that started them and to the
+# threshold output each left behind, which is what this control decides on.
+# A bare list of ceremonies that succeeded is not enough to decide it: read
+# from that alone, a ceremony this driver originated is indistinguishable from
+# one that was already running, and a ceremony that produced a threshold
+# output from a report that merely says it did.
+HOMOGENEOUS_BOUND=""
 HOMOGENEOUS_PERMITS_BEFORE=""
 HOMOGENEOUS_PERMITS_AFTER=""
 HOMOGENEOUS_LEGACY_BEFORE=""
@@ -5264,10 +5406,11 @@ homogeneous_control_verdict() {
   # The required set is both halves of the release, because that is what
   # "controls" in the step's name means. Read before the ladder so the two
   # readings it adds are stated once.
-  local failed_results missing_families
+  local failed_results missing_families settlements
   failed_results="$(unsuccessful_results "${HOMOGENEOUS_RESULTS}")"
-  missing_families="$(missing_required_families \
-    "${HOMOGENEOUS_RESULTS}" "${HOMOGENEOUS_REQUIRED_FAMILIES}")"
+  missing_families="$(missing_bound_families \
+    "${HOMOGENEOUS_BOUND}" "${HOMOGENEOUS_REQUIRED_FAMILIES}")"
+  settlements="$(bound_settlements "${HOMOGENEOUS_BOUND}")"
 
   if ((HOMOGENEOUS_DRIVER_SUPPLIED == 0)); then
     block_step "${step}" "no PR4109_WORK_DRIVER was supplied, so no tBTC or \
@@ -5306,24 +5449,24 @@ ceremonies this control claims to have originated"
 driving post-C ceremonies; a control over ceremonies that ran security-v2 \
 cannot be read off the subset of them that survived"
     record_assertion "${assertion}" false "${step}"
-  elif [[ -z "${HOMOGENEOUS_CEREMONIES}" ]]; then
+  elif [[ -z "${settlements}" ]]; then
     block_step "${step}" "the work driver named no ceremony that completed \
-successfully, so this control observed work being allowed to start and \
-nothing about it finishing; a permit is not a result, and a positive control \
-that never sees one is not positive about anything"
+successfully on a transaction it originated, so this control observed work \
+being allowed to start and nothing about it finishing; a permit is not a \
+result, and a positive control that never sees one is not positive about \
+anything"
     record_assertion "${assertion}" false "${step}"
   elif [[ -n "${missing_families}" ]]; then
-    block_step "${step}" "the work driver reported \
-${HOMOGENEOUS_CEREMONIES} completing but nothing from the \
-${missing_families} half of the release, so this control covers one call path \
-into the gate and says nothing about the other; a post-C control has to \
-succeed on ${HOMOGENEOUS_REQUIRED_FAMILIES}"
+    block_step "${step}" "the work driver settled ${settlements} but nothing \
+from the ${missing_families} half of the release, so this control covers one \
+call path into the gate and says nothing about the other; a post-C control \
+has to succeed on ${HOMOGENEOUS_REQUIRED_FAMILIES}"
     record_assertion "${assertion}" false "${step}"
   elif ((HOMOGENEOUS_PERMITS_AFTER <= HOMOGENEOUS_PERMITS_BEFORE)); then
-    record_step "${step}" fail "the work driver reported the ceremonies \
-${HOMOGENEOUS_CEREMONIES} completing, but the fleet issued no new security-v2 \
-permit (still ${HOMOGENEOUS_PERMITS_AFTER}); the ceremonies it named were not \
-run under this fleet's gate"
+    record_step "${step}" fail "the work driver settled ${settlements}, but \
+the fleet issued no new security-v2 permit (still \
+${HOMOGENEOUS_PERMITS_AFTER}); the ceremonies it named were not run under \
+this fleet's gate"
     record_assertion "${assertion}" false "${step}"
   elif ((HOMOGENEOUS_LEGACY_AFTER > HOMOGENEOUS_LEGACY_BEFORE)); then
     record_step "${step}" fail "the fleet issued \
@@ -5357,8 +5500,8 @@ ran; a control with no legacy sightings cannot produce a legacy roster entry"
     STEP_PERMIT_MODES='"security_v2"'
     record_step "${step}" pass "the fleet issued \
 $((HOMOGENEOUS_PERMITS_AFTER - HOMOGENEOUS_PERMITS_BEFORE)) new security-v2 \
-permits driving the post-C ceremonies the driver originated, the driver saw \
-${HOMOGENEOUS_CEREMONIES} complete successfully with nothing failing beside \
+permits driving the post-C ceremonies the driver originated, the driver \
+settled ${settlements} with nothing failing beside \
 them and both ${HOMOGENEOUS_REQUIRED_FAMILIES} represented, and the fleet took no legacy \
 permit (participation_mode_legacy_total unchanged at \
 [${HOMOGENEOUS_LEGACY_AFTER}]), recognized no cross-format peer (unchanged at \
@@ -5755,13 +5898,13 @@ current chain" false \
   STRAGGLER_DRIVER_SUPPLIED=0
   STRAGGLER_DRIVER_RC=0
   STRAGGLER_DRIVER_TX=0
-  STRAGGLER_RESULTS=""
+  STRAGGLER_BOUND=""
   if [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
     STRAGGLER_DRIVER_SUPPLIED=1
     run_work_driver post-cutover-straggler || true
     STRAGGLER_DRIVER_RC="${WORK_DRIVER_RC}"
     STRAGGLER_DRIVER_TX="${WORK_DRIVER_TX_COUNT}"
-    STRAGGLER_RESULTS="${WORK_DRIVER_CEREMONY_RESULTS}"
+    STRAGGLER_BOUND="${WORK_DRIVER_BOUND_RESULTS}"
   fi
   for metric in "${ANNOUNCER_CUTOVER_METRICS[@]}"; do
     STRAGGLER_AFTER+=("$(metric_value "${observer}" "${metric}" || printf '')")
@@ -5812,8 +5955,8 @@ network"
   HOMOGENEOUS_DRIVER_SUPPLIED=0
   HOMOGENEOUS_DRIVER_RC=0
   HOMOGENEOUS_TX=0
-  HOMOGENEOUS_CEREMONIES=""
   HOMOGENEOUS_RESULTS=""
+  HOMOGENEOUS_BOUND=""
   HOMOGENEOUS_NEW_OPERATORS=""
 
   # A zero legacy counter is true of a fleet that ran nothing at all, so the
@@ -5847,8 +5990,8 @@ network"
     run_work_driver homogeneous-security-v2 || true
     HOMOGENEOUS_DRIVER_RC="${WORK_DRIVER_RC}"
     HOMOGENEOUS_TX="${WORK_DRIVER_TX_COUNT}"
-    HOMOGENEOUS_CEREMONIES="${WORK_DRIVER_SUCCEEDED_CEREMONIES}"
     HOMOGENEOUS_RESULTS="${WORK_DRIVER_CEREMONY_RESULTS}"
+    HOMOGENEOUS_BOUND="${WORK_DRIVER_BOUND_RESULTS}"
   fi
 
   HOMOGENEOUS_PERMITS_AFTER="$(fleet_metric_total \

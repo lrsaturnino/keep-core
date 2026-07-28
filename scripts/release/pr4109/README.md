@@ -217,18 +217,31 @@ The work driver reports what it originated rather than only whether it
 succeeded: its stdout is a JSON object whose optional `transaction_hashes`
 array carries the chain transactions it submitted — those enter the step being
 recorded, so a reviewer can follow a step back to the transactions that caused
-it — and whose optional `ceremony_results` array carries `{ceremony, outcome}`
-objects naming the terminal result of each ceremony those transactions started.
-The results are there because no fleet counter carries them: a permit says a
-node was allowed to begin, and the positive control is about a ceremony
-finishing. An optional `originated_ceremonies` array names what the driver put
-on the chain whatever became of it, for the phases whose subject is work still
-in flight — a drain, a forced deadline — which have no terminal outcome to
-read, since by the time one exists the work it was about is over. Every array
-is validated strictly, and a report that cannot be read stops the step — a
-driver whose account is unreadable has left the step unable to say what it
-drove, and recording that as "nothing happened" would enter silence as
+it — and whose optional `ceremony_results` array carries `{ceremony, outcome,
+transaction_hash}` objects naming the terminal result of each ceremony those
+transactions started. The results are there because no fleet counter carries
+them: a permit says a node was allowed to begin, and the positive control is
+about a ceremony finishing. An optional `originated_ceremonies` array names
+what the driver put on the chain whatever became of it, for the phases whose
+subject is work still in flight — a drain, a forced deadline — which have no
+terminal outcome to read, since by the time one exists the work it was about is
+over. Every array is validated strictly, and a report that cannot be read stops
+the step — a driver whose account is unreadable has left the step unable to say
+what it drove, and recording that as "nothing happened" would enter silence as
 evidence.
+
+Each outcome is bound to the work it belongs to, and controls are decided on
+the bound form rather than on the arrays beside it. A result must name a
+`transaction_hash` the same report accounted for originating; without that,
+the hashes and the outcomes are two independent populations, and a stale or
+unrelated hash sitting beside an unrelated result satisfies any control that
+reads them in parallel. A result that succeeded must carry a `result` identity
+— the threshold output the ceremony left behind — because "succeeded" is a
+word and a positive control that cannot name what was produced has read a
+report rather than watched a ceremony settle. A result that did not succeed
+must carry a `termination` of `retry_exhausted` or `no_threshold`, because a
+bare "failed" is equally what a ceremony still retrying looks like from
+outside, and a fails-closed control cannot be read off work still in progress.
 
 Every outcome the driver reports is carried forward, not only the successes.
 A phase that kept the successes alone cannot tell a clean run from one where a
@@ -236,9 +249,10 @@ required ceremony failed beside a passing one, and cannot see a ceremony
 succeeding where the property under test is that it must not.
 
 The homogeneous control is decided against both halves of its own name, over
-the whole report. "security-v2 controls" needs a ceremony the driver watched
-complete, not only permits the fleet issued — and it needs one from each half
-of the release. tBTC and the beacon take their permits from the same gate
+the whole report, on bound records. "security-v2 controls" needs a ceremony the
+driver watched complete on a transaction it originated and that left a
+threshold output behind, not only permits the fleet issued — and it needs one
+from each half of the release. tBTC and the beacon take their permits from the same gate
 through different call paths, so a driver that only ever drove tBTC leaves the
 beacon's path unexercised however many tBTC ceremonies settled; a control
 covering half the release cannot support a claim made about all of it, and the
@@ -311,7 +325,10 @@ a control that did not need the node it is about has not exercised the failure
 path it claims to. A ceremony with no terminal outcome at all blocks rather
 than passing — retry exhaustion is what makes "produced no threshold output"
 a statement about a ceremony that finished, and the roster deltas would
-otherwise be read off one still in flight.
+otherwise be read off one still in flight. That is why the driver must say
+which of the two terminations it reached rather than only that the ceremony
+failed, and why the record names the transaction and the termination it
+decided on.
 
 The rollback gate's own barrier has two halves and neither substitutes for
 the other. Every release candidate must be provably down, and the prior binary

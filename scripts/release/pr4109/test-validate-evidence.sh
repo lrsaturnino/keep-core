@@ -1713,6 +1713,14 @@ check "a driver that could not offer work is not a node nobody asked" 3 \
 # reasons that need no legacy announcement behind them at all.
 STRAGGLER_OPERATOR="0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"
 
+# The chain identifiers a driven ceremony is bound to: the transaction that
+# originated it, and — for the cases where one settles — the threshold output
+# that settling produced. A control decided on outcomes alone accepts any of
+# these detached from the work it claims to be about.
+STRAGGLER_TX="0x1111111111111111111111111111111111111111111111111111111111111111"
+STRAGGLER_TX2="0x2222222222222222222222222222222222222222222222222222222222222222"
+STRAGGLER_SIG="0xabc123def456"
+
 straggler_readings() {
   # shellcheck disable=SC2034
   STRAGGLER_BEFORE=("10" "4" "2")
@@ -1728,8 +1736,10 @@ straggler_readings() {
   STRAGGLER_DRIVER_TX=2
   # The driven ceremony came to nothing, which is the outcome "fails closed"
   # names. The fleet is sized so it needs the straggler to reach threshold.
+  # Bound to the transaction that started it and to the termination that says
+  # it stopped trying rather than is still trying.
   # shellcheck disable=SC2034
-  STRAGGLER_RESULTS="tbtc_signing=failed"
+  STRAGGLER_BOUND="tbtc_signing=failed=${STRAGGLER_TX}=retry_exhausted"
 }
 
 straggler_case() {
@@ -1753,24 +1763,26 @@ check "a straggler recognized, rostered, and named holds the control" 0 \
 # being refused, and this control is about post-C legacy work coming to
 # nothing.
 run_verdict straggler_case eval \
-  "STRAGGLER_RESULTS='tbtc_signing=succeeded'
+  "STRAGGLER_BOUND='tbtc_signing=succeeded=${STRAGGLER_TX}=${STRAGGLER_SIG}'
    straggler_control_verdict '${STRAGGLER_OPERATOR}'"
 check "a rostered straggler whose ceremony settled has not failed closed" 1 \
-  "produced a threshold output \(tbtc_signing=succeeded\)"
+  "produced a threshold output \(tbtc_signing \(${STRAGGLER_TX}, \
+${STRAGGLER_SIG}\)\)"
 
 # The same, with the settled ceremony sitting beside one that did not: a report
 # is read whole here too.
 run_verdict straggler_case eval \
-  "STRAGGLER_RESULTS='tbtc_signing=failed beacon_dkg=succeeded'
+  "STRAGGLER_BOUND='tbtc_signing=failed=${STRAGGLER_TX}=retry_exhausted \
+beacon_dkg=succeeded=${STRAGGLER_TX2}=${STRAGGLER_SIG}'
    straggler_control_verdict '${STRAGGLER_OPERATOR}'"
 check "one settled ceremony among the driven work refutes the control" 1 \
-  "beacon_dkg=succeeded"
+  "beacon_dkg \(${STRAGGLER_TX2}, ${STRAGGLER_SIG}\)"
 
 # Retry exhaustion is what makes the outcome terminal. A ceremony still running
 # has produced no threshold output yet, which is not the same as having failed
 # to produce one, and the sightings would be read off a ceremony mid-flight.
 run_verdict straggler_case eval \
-  "STRAGGLER_RESULTS=''
+  "STRAGGLER_BOUND=''
    straggler_control_verdict '${STRAGGLER_OPERATOR}'"
 check "a ceremony with no terminal outcome cannot evidence failing closed" 3 \
   "exhausted its retries or is still running"
@@ -2286,6 +2298,15 @@ check "a drain nobody accounted for reconciles nothing" 3 \
 # says a node was allowed to begin, not that a ceremony finished; and the
 # legacy permit counter is about work this fleet took on, not about whether it
 # saw a legacy peer.
+# The chain identifiers this control's ceremonies are bound to. A control
+# decided on a bare list of outcomes accepts them detached from the
+# transactions that started them and from any threshold output at all.
+HOM_TX1="0xaa11111111111111111111111111111111111111111111111111111111111111"
+HOM_TX2="0xbb22222222222222222222222222222222222222222222222222222222222222"
+HOM_TX3="0xcc33333333333333333333333333333333333333333333333333333333333333"
+HOM_SIG1="0xsig1abc"
+HOM_SIG2="0xsig2def"
+
 homogeneous_readings() {
   # shellcheck disable=SC2034
   HOMOGENEOUS_DRIVER_SUPPLIED=1
@@ -2294,9 +2315,10 @@ homogeneous_readings() {
   # shellcheck disable=SC2034
   HOMOGENEOUS_TX=2
   # shellcheck disable=SC2034
-  HOMOGENEOUS_CEREMONIES="tbtc_signing beacon_dkg"
-  # shellcheck disable=SC2034
   HOMOGENEOUS_RESULTS="tbtc_signing=succeeded beacon_dkg=succeeded"
+  # shellcheck disable=SC2034
+  HOMOGENEOUS_BOUND="tbtc_signing=succeeded=${HOM_TX1}=${HOM_SIG1} \
+beacon_dkg=succeeded=${HOM_TX2}=${HOM_SIG2}"
   # shellcheck disable=SC2034
   HOMOGENEOUS_PERMITS_BEFORE="20"
   # shellcheck disable=SC2034
@@ -2321,13 +2343,14 @@ homogeneous_case() {
 
 run_verdict homogeneous_case :
 check "post-C ceremonies that completed under security-v2 hold the control" 0 \
-  "saw tbtc_signing beacon_dkg complete successfully" \
+  "settled tbtc_signing \(${HOM_TX1}, ${HOM_SIG1}\)" \
+  "beacon_dkg \(${HOM_TX2}, ${HOM_SIG2}\)" \
   "recognized no cross-format peer"
 
 # The half a permit counter cannot carry: work was allowed to start and
 # nothing was observed finishing.
-run_verdict homogeneous_case eval 'HOMOGENEOUS_CEREMONIES=""
-   HOMOGENEOUS_RESULTS=""'
+run_verdict homogeneous_case eval 'HOMOGENEOUS_RESULTS=""
+   HOMOGENEOUS_BOUND=""'
 check "permits without a completed ceremony are not a positive control" 3 \
   "named no ceremony that completed successfully"
 
@@ -2335,15 +2358,18 @@ check "permits without a completed ceremony are not a positive control" 3 \
 # release failing outright used to be dropped on the way to the verdict, and
 # the half that passed recorded the control on its own.
 run_verdict homogeneous_case eval \
-  'HOMOGENEOUS_CEREMONIES="tbtc_signing"
-   HOMOGENEOUS_RESULTS="tbtc_signing=succeeded beacon_dkg=failed"'
+  "HOMOGENEOUS_RESULTS='tbtc_signing=succeeded beacon_dkg=failed'
+   HOMOGENEOUS_BOUND='tbtc_signing=succeeded=${HOM_TX1}=${HOM_SIG1} \
+beacon_dkg=failed=${HOM_TX2}=no_threshold'"
 check "a required ceremony failing beside a passing one refutes the control" \
   1 "reported beacon_dkg=failed" "cannot be read off the subset"
 
 run_verdict homogeneous_case eval \
-  'HOMOGENEOUS_CEREMONIES="tbtc_signing beacon_dkg"
-   HOMOGENEOUS_RESULTS="tbtc_signing=succeeded beacon_dkg=succeeded \
-tbtc_wallet_action=timed_out"'
+  "HOMOGENEOUS_RESULTS='tbtc_signing=succeeded beacon_dkg=succeeded \
+tbtc_wallet_action=timed_out'
+   HOMOGENEOUS_BOUND='tbtc_signing=succeeded=${HOM_TX1}=${HOM_SIG1} \
+beacon_dkg=succeeded=${HOM_TX2}=${HOM_SIG2} \
+tbtc_wallet_action=timed_out=${HOM_TX3}=retry_exhausted'"
 check "a ceremony that timed out beside the controls refutes them" 1 \
   "tbtc_wallet_action=timed_out"
 
@@ -2351,14 +2377,16 @@ check "a ceremony that timed out beside the controls refutes them" 1 \
 # different call paths, so a driver that only ever drove one of them leaves the
 # other unexercised however many times it succeeded.
 run_verdict homogeneous_case eval \
-  'HOMOGENEOUS_CEREMONIES="tbtc_signing tbtc_dkg"
-   HOMOGENEOUS_RESULTS="tbtc_signing=succeeded tbtc_dkg=succeeded"'
+  "HOMOGENEOUS_RESULTS='tbtc_signing=succeeded tbtc_dkg=succeeded'
+   HOMOGENEOUS_BOUND='tbtc_signing=succeeded=${HOM_TX1}=${HOM_SIG1} \
+tbtc_dkg=succeeded=${HOM_TX2}=${HOM_SIG2}'"
 check "a control that drove only tBTC says nothing about the beacon" 3 \
   "nothing from the beacon half of the release"
 
 run_verdict homogeneous_case eval \
-  'HOMOGENEOUS_CEREMONIES="beacon_dkg beacon_signing"
-   HOMOGENEOUS_RESULTS="beacon_dkg=succeeded beacon_signing=succeeded"'
+  "HOMOGENEOUS_RESULTS='beacon_dkg=succeeded beacon_signing=succeeded'
+   HOMOGENEOUS_BOUND='beacon_dkg=succeeded=${HOM_TX1}=${HOM_SIG1} \
+beacon_signing=succeeded=${HOM_TX2}=${HOM_SIG2}'"
 check "a control that drove only the beacon says nothing about tBTC" 3 \
   "nothing from the tbtc half of the release"
 
@@ -2424,9 +2452,9 @@ drive() {
       # shellcheck disable=SC2030,SC2031,SC2034
       STEP_TX_HASHES=""
       run_work_driver "$1" || true
-      printf 'ceremonies:%s\n' "${WORK_DRIVER_SUCCEEDED_CEREMONIES}"
       printf 'results:%s\n' "${WORK_DRIVER_CEREMONY_RESULTS}"
       printf 'originated:%s\n' "${WORK_DRIVER_ORIGINATED}"
+      printf 'bound:%s\n' "${WORK_DRIVER_BOUND_RESULTS}"
       if driver_offered_work; then
         printf 'offered:yes rc:%s tx:%s hashes:%s\n' \
           "${WORK_DRIVER_RC}" "${WORK_DRIVER_TX_COUNT}" "${STEP_TX_HASHES}"
@@ -2492,19 +2520,50 @@ check "a driver whose report cannot be read stops the step" 3 \
 # was allowed to begin and a positive control is about a ceremony finishing.
 write_driver <<EOF
 #!/usr/bin/env bash
-printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
-printf '{"ceremony":"tbtc_signing","outcome":"succeeded"},'
-printf '{"ceremony":"beacon_dkg","outcome":"failed"}]}'
+printf '{"transaction_hashes":["${HASH_A}","${HASH_B}"],"ceremony_results":['
+printf '{"ceremony":"tbtc_signing","outcome":"succeeded",'
+printf '"transaction_hash":"${HASH_A}","result":"0xsigned"},'
+printf '{"ceremony":"beacon_dkg","outcome":"failed",'
+printf '"transaction_hash":"${HASH_B}","termination":"no_threshold"}]}'
 EOF
 drive homogeneous-security-v2
 check "a driver names the ceremonies it saw complete" 0 \
-  "offered:yes rc:0 tx:1"
-if [[ "${CASE_OUT}" == *$'ceremonies:tbtc_signing\n'* ]]; then
-  printf 'ok   only the ceremonies that succeeded are carried forward\n'
+  "offered:yes rc:0 tx:2"
+
+# The binding itself: each outcome carries the transaction it belongs to and
+# what it left behind, so a control cannot read an outcome against a hash that
+# had nothing to do with it.
+check "each outcome is bound to its transaction and what it produced" 0 \
+  "bound:tbtc_signing=succeeded=${HASH_A}=0xsigned \
+beacon_dkg=failed=${HASH_B}=no_threshold"
+# The reading the controls actually decide on, taken over the same parse: only
+# the ceremony that settled is a settlement, and it is named with the
+# transaction and the threshold output rather than on its own.
+SETTLED_OUT="$(bound_settlements \
+  "tbtc_signing=succeeded=${HASH_A}=0xsigned \
+beacon_dkg=failed=${HASH_B}=no_threshold")"
+if [[ "${SETTLED_OUT}" == "tbtc_signing (${HASH_A}, 0xsigned)" ]]; then
+  printf 'ok   only the ceremonies that settled are carried forward\n'
   PASS=$((PASS + 1))
 else
-  printf 'FAIL a failed ceremony was carried forward as a result: %s\n' \
-    "${CASE_OUT}"
+  printf 'FAIL a failed ceremony was carried forward as a settlement: %s\n' \
+    "${SETTLED_OUT}"
+  FAILED=$((FAILED + 1))
+fi
+
+# Its mirror, for the controls whose claim is that work came to nothing: the
+# ceremony that did not settle is named with the termination that says it
+# stopped trying.
+TERMINATED_OUT="$(bound_terminations \
+  "tbtc_signing=succeeded=${HASH_A}=0xsigned \
+beacon_dkg=failed=${HASH_B}=no_threshold")"
+if [[ "${TERMINATED_OUT}" == \
+  "beacon_dkg=failed (${HASH_B}, no_threshold)" ]]; then
+  printf 'ok   an unsettled ceremony is named with why it stopped\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL an unsettled ceremony lost its termination: %s\n' \
+    "${TERMINATED_OUT}"
   FAILED=$((FAILED + 1))
 fi
 # And the one the successes alone could not carry: the failure is still there
@@ -2554,6 +2613,67 @@ EOF
 drive homogeneous-security-v2
 check "a ceremony this rehearsal does not know stops the step" 3 \
   "not a ceremony"
+
+# The regression this binding exists for. An outcome with no transaction
+# behind it is one population and the reported hashes are another: a stale or
+# unrelated hash sitting beside an unrelated result satisfied every control
+# that read the two as parallel arrays.
+write_driver <<EOF
+#!/usr/bin/env bash
+printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
+printf '{"ceremony":"tbtc_signing","outcome":"succeeded","result":"0xs"}]}'
+EOF
+drive homogeneous-security-v2
+check "an outcome naming no transaction stops the step" 3 \
+  "carries no transaction hash"
+
+# And the same hole one step in: a transaction this report never claimed to
+# have originated attributes the outcome to work done by somebody else.
+write_driver <<EOF
+#!/usr/bin/env bash
+printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
+printf '{"ceremony":"tbtc_signing","outcome":"succeeded",'
+printf '"transaction_hash":"${HASH_B}","result":"0xs"}]}'
+EOF
+drive homogeneous-security-v2
+check "an outcome naming a transaction nobody originated stops the step" 3 \
+  "did not originate"
+
+# "succeeded" is a word; a threshold output is a thing the ceremony left
+# behind. A positive control that cannot name one has not seen a ceremony
+# settle, it has read a report that says so.
+write_driver <<EOF
+#!/usr/bin/env bash
+printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
+printf '{"ceremony":"tbtc_signing","outcome":"succeeded",'
+printf '"transaction_hash":"${HASH_A}"}]}'
+EOF
+drive homogeneous-security-v2
+check "a success with no threshold output behind it stops the step" 3 \
+  "carries no threshold output identity"
+
+# The mirror, for the fails-closed controls: "failed" is equally what a
+# ceremony still retrying looks like from outside, and a control about work
+# that came to nothing cannot be read off work still in progress.
+write_driver <<EOF
+#!/usr/bin/env bash
+printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
+printf '{"ceremony":"tbtc_signing","outcome":"failed",'
+printf '"transaction_hash":"${HASH_A}"}]}'
+EOF
+drive homogeneous-security-v2
+check "an unsettled outcome with no termination behind it stops the step" 3 \
+  "carries no termination evidence"
+
+write_driver <<EOF
+#!/usr/bin/env bash
+printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
+printf '{"ceremony":"tbtc_signing","outcome":"timed_out",'
+printf '"transaction_hash":"${HASH_A}","termination":"gave up I think"}]}'
+EOF
+drive homogeneous-security-v2
+check "a termination this rehearsal does not know stops the step" 3 \
+  "carries no termination evidence"
 
 # Neither container stage can be executed anywhere but a real rehearsal — they
 # need the immutable images, a chain, and persistent volumes — so a call site
