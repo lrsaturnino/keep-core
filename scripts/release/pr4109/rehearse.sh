@@ -3452,6 +3452,29 @@ refused_ceremony_delta() {
   printf '%s' "${out}"
 }
 
+# The same delta restricted to the ceremonies an offer actually put on the
+# chain.
+#
+# The unrestricted reading answers "the node refused something". A control
+# whose claim is that the node refused *this* offer needs the ceremony the
+# driver originated to be the one whose counter moved: a rehearsal chain
+# carries other traffic, and any other ceremony being refused for its own
+# reasons moves both the total and a per-ceremony counter, which is exactly
+# the shape of the reading this step is looking for.
+refused_offered_delta() {
+  local before="$1" after="$2" offered="$3" ceremony from to out=""
+  local wanted=" ${offered} "
+  while IFS='=' read -r ceremony from; do
+    [[ -n "${ceremony}" ]] || continue
+    [[ "${wanted}" == *" ${ceremony} "* ]] || continue
+    to="$(printf '%s\n' "${after}" | sed -n "s/^${ceremony}=//p")"
+    [[ "${from}" =~ ^[0-9]+$ && "${to}" =~ ^[0-9]+$ ]] || continue
+    ((to > from)) || continue
+    out="${out}${out:+, }${ceremony} +$((to - from))"
+  done <<<"${before}"
+  printf '%s' "${out}"
+}
+
 # Snapshot the gate gauges of one node into the step being recorded. Reading
 # none of them is a broken instrument rather than an absent value — a renamed
 # application prefix or metric family would otherwise leave every step
@@ -5262,6 +5285,13 @@ QUIESCE_REFUSALS_BEFORE=""
 QUIESCE_REFUSALS_AFTER=""
 QUIESCE_CEREMONY_REFUSALS_BEFORE=""
 QUIESCE_CEREMONY_REFUSALS_AFTER=""
+# The ceremonies the offer itself put on the chain, retained so the counter
+# that moved can be compared against the work that was actually offered. A
+# per-ceremony delta on its own says the node refused something; the rehearsal
+# chain carries other traffic, and any unrelated ceremony refused for its own
+# reasons moves the total and one per-ceremony counter together, which is
+# indistinguishable from this offer being refused.
+QUIESCE_OFFERED=""
 
 quiescence_verdict() {
   local node="$1"
@@ -5341,7 +5371,7 @@ before it stopped, and an unchanged permit counter is equally the shape of \
 work that was never presented to it"
     record_assertion "${assertion}" false "${step}"
   else
-    local refused
+    local refused refused_offered
     refused="$(refused_ceremony_delta "${QUIESCE_CEREMONY_REFUSALS_BEFORE}" \
       "${QUIESCE_CEREMONY_REFUSALS_AFTER}")"
     if [[ -z "${refused}" ]]; then
@@ -5353,9 +5383,30 @@ attribute to a ceremony is not evidence about that ceremony"
       record_assertion "${assertion}" false "${step}"
       return
     fi
+    if [[ -z "${QUIESCE_OFFERED}" ]]; then
+      block_step "${step}" "${node} refused ${refused} while quiescing, but \
+the offer named no ceremony it originated, so nothing says the counter that \
+moved belongs to the work this step put in front of it; a refusal of \
+something else is not this offer being refused"
+      record_assertion "${assertion}" false "${step}"
+      return
+    fi
+    refused_offered="$(refused_offered_delta \
+      "${QUIESCE_CEREMONY_REFUSALS_BEFORE}" \
+      "${QUIESCE_CEREMONY_REFUSALS_AFTER}" "${QUIESCE_OFFERED}")"
+    if [[ -z "${refused_offered}" ]]; then
+      block_step "${step}" "${node} refused ${refused} while quiescing, but \
+this offer originated ${QUIESCE_OFFERED} and none of those counters moved; \
+the rehearsal chain carries other traffic, and a ceremony refused for its own \
+reasons moves the total and a per-ceremony counter together exactly as this \
+offer being refused would"
+      record_assertion "${assertion}" false "${step}"
+      return
+    fi
     record_step "${step}" pass "${node} entered quiescing holding \
-${QUIESCE_HELD_BEFORE} security-v2 ceremonies, was offered new work while \
-quiescing and refused it on its own account (${refused}; refusals \
+${QUIESCE_HELD_BEFORE} security-v2 ceremonies, was offered \
+${QUIESCE_OFFERED} while quiescing and refused it on its own account \
+(${refused_offered}; refusals \
 ${QUIESCE_REFUSALS_BEFORE} to ${QUIESCE_REFUSALS_AFTER}) while issuing no \
 permit (${QUIESCE_ISSUED_BEFORE} to ${QUIESCE_ISSUED_AFTER}), and let every \
 held permit finish inside the reviewed ${QUIESCE_GRACE}s grace — in-flight \
@@ -6146,6 +6197,7 @@ originated on the rehearsal chain that is still running at shutdown"
     QUIESCE_OFFER_RC=""
     QUIESCE_REFUSALS_AFTER="${QUIESCE_REFUSALS_BEFORE}"
     QUIESCE_CEREMONY_REFUSALS_AFTER="${QUIESCE_CEREMONY_REFUSALS_BEFORE}"
+    QUIESCE_OFFERED=""
     deadline=$((SECONDS + QUIESCE_GRACE))
     while ((SECONDS < deadline)); do
       state_now="$(participation_field "${quiesce_node}" gate_state \
@@ -6163,6 +6215,7 @@ originated on the rehearsal chain that is still running at shutdown"
           run_work_driver quiesce-refusal || true
           if driver_offered_work; then
             QUIESCE_ATTEMPTED=1
+            QUIESCE_OFFERED="${WORK_DRIVER_ORIGINATED}"
           else
             QUIESCE_OFFER_FAILED=1
             QUIESCE_OFFER_RC="${WORK_DRIVER_RC}"

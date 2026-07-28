@@ -213,6 +213,15 @@ at zero, because a node that stopped answering while still holding permits is
 indistinguishable in its last reading from one that finished them, and it
 blocks rather than passes on a counter it could not read.
 
+The refusal it records has to belong to the work it offered. The offer retains
+the ceremonies the driver put on the chain, and one of *those* per-ceremony
+refusal counters must be the one that moved. A per-ceremony delta on its own
+only says the node refused something: a rehearsal chain carries other traffic,
+and any unrelated ceremony refused for its own reasons moves the total and one
+per-ceremony counter together, which is precisely the reading this step looks
+for. An offer that named no ceremony it originated blocks, because nothing can
+then be tied back to it.
+
 The work driver reports what it originated rather than only whether it
 succeeded: its stdout is a JSON object whose optional `transaction_hashes`
 array carries the chain transactions it submitted — those enter the step being

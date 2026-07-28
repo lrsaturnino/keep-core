@@ -1628,6 +1628,9 @@ beacon_dkg=0"
   QUIESCE_CEREMONY_REFUSALS_AFTER="tbtc_dkg=1
 tbtc_signing=4
 beacon_dkg=0"
+  # What this offer actually put on the chain, which is what the moved counter
+  # has to belong to.
+  QUIESCE_OFFERED="tbtc_signing"
 }
 
 quiesce_case() {
@@ -1664,6 +1667,29 @@ run_verdict quiesce_case eval 'QUIESCE_CEREMONY_REFUSALS_AFTER="\
 ${QUIESCE_CEREMONY_REFUSALS_BEFORE}"'
 check "a refusal no ceremony counter accounts for attributes nothing" 3 \
   "no per-ceremony refusal counter moved with the total"
+
+# The regression this seam exists for: a per-ceremony counter did move, so the
+# reading has the exact shape this step looks for — but it belongs to a
+# ceremony this offer never originated. A rehearsal chain carries other
+# traffic, and any ceremony refused for its own reasons moves the total and
+# one per-ceremony counter together.
+run_verdict quiesce_case eval 'QUIESCE_CEREMONY_REFUSALS_AFTER="tbtc_dkg=2
+tbtc_signing=3
+beacon_dkg=0"'
+check "another ceremony's refusal is not this offer being refused" 3 \
+  "this offer originated tbtc_signing and none of those counters moved"
+
+# And the reading that cannot be attributed at all: the offer went out without
+# saying what it put on the chain, so no counter can be tied back to it.
+run_verdict quiesce_case eval 'QUIESCE_OFFERED=""'
+check "an offer that named no ceremony attributes no refusal" 3 \
+  "the offer named no ceremony it originated"
+
+# The offer originated two ceremonies and one of them was refused, which is
+# this offer being refused whatever the other one did.
+run_verdict quiesce_case eval 'QUIESCE_OFFERED="beacon_dkg tbtc_signing"'
+check "one refused ceremony among those offered holds the control" 0 \
+  "refused it on its own account \(tbtc_signing \+1"
 
 run_verdict quiesce_case eval 'QUIESCE_REFUSALS_AFTER=""'
 check "an unreadable refusal counter observes no refusal at all" 3 \
