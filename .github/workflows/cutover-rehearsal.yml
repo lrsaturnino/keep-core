@@ -202,6 +202,11 @@ jobs:
     # Node 18.15.0 (18.16+ produced broken hardhat compile artifacts) and
     # the shared Corepack/immutable-install action, then the stage
     # revalidates the install and runs the same build and test commands.
+    #
+    # The version below is not maintained by hand: shell-analysis reads the
+    # release that job pins and fails unless this one matches, and the stage
+    # itself blocks on any other interpreter. Bumping CI without bumping
+    # this line is caught by a lint, not by a dispatch nobody ran.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

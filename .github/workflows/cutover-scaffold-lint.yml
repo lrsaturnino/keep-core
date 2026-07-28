@@ -31,9 +31,15 @@ name: Cutover Scaffold Lint
 # These lists are not maintained by hand: shell-analysis resolves the
 # Dockerfile the rehearsal workflow's build step really compiles and requires
 # both lists below to cover it, the ignore file its name selects, the root
-# .dockerignore, and both workflows. Moving the build onto another Dockerfile
-# without moving these entries with it fails that check — the entries are
-# what makes this gate run when those files change at all.
+# .dockerignore, and all three workflows. Moving the build onto another
+# Dockerfile without moving these entries with it fails that check — the
+# entries are what makes this gate run when those files change at all.
+#
+# contracts-ecdsa.yml is listed for the same reason: the contracts stage's
+# evidence claims to reproduce one of its jobs, and shell-analysis holds both
+# that stage and the rehearsal workflow's own setup-node to the Node release
+# that job pins. A bump there touches no line under scripts/ and would
+# otherwise leave the claim standing over a run that no longer reproduces it.
 
 on:
   push:
@@ -45,6 +51,7 @@ on:
       - "scripts/release/pr4109/**"
       - ".github/workflows/cutover-rehearsal.yml"
       - ".github/workflows/cutover-scaffold-lint.yml"
+      - ".github/workflows/contracts-ecdsa.yml"
       - ".dockerignore"
       - "Dockerfile.dockerignore"
       - ".gitignore"
@@ -56,6 +63,7 @@ on:
       - "scripts/release/pr4109/**"
       - ".github/workflows/cutover-rehearsal.yml"
       - ".github/workflows/cutover-scaffold-lint.yml"
+      - ".github/workflows/contracts-ecdsa.yml"
       - ".dockerignore"
       - "Dockerfile.dockerignore"
       - ".gitignore"

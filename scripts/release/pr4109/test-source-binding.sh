@@ -75,11 +75,31 @@ DEFAULT_BUILD_STEP="        uses: ${BUILD_ACTION}@v5
 DEFAULT_PATH_FILTERS="scripts/release/pr4109/**
 ${REHEARSAL_WORKFLOW}
 ${SCAFFOLD_LINT_WORKFLOW}
+${CONTRACTS_WORKFLOW}
 .dockerignore
 Dockerfile.dockerignore
 .gitignore
 Dockerfile
 Makefile"
+
+# The rehearsal job that provisions the contracts toolchain, and the CI job's
+# steps it has to agree with. The lint job around them pins a different release
+# on purpose: a resolution that searched a whole workflow instead of the job a
+# parity claim names would read that one, or trip over having found two.
+DEFAULT_SOLIDITY_JOB="  ${SOLIDITY_PROOFS_JOB}:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ${SETUP_NODE_ACTION}@v4
+        with:
+          node-version: \"18.15.0\""
+DEFAULT_CONTRACTS_STEPS="      - uses: actions/checkout@v3
+      - uses: ${SETUP_NODE_ACTION}@v3
+        with:
+          node-version: \"18.15.0\"
+      - uses: ./.github/actions/install-yarn-deps
+        with:
+          working-directory: ./solidity/ecdsa"
 
 # The two scaffold workflows every fixture carries: the dispatch whose build
 # step names the Dockerfile and the context it is compiled from, and the lint
@@ -94,6 +114,7 @@ Makefile"
 # build step's inputs somewhere else entirely.
 write_scaffold_workflows() {
   local repo="$1" step="$2" filters="$3" entry
+  local jobs="${4-${DEFAULT_SOLIDITY_JOB}}"
   mkdir -p "${repo}/$(dirname "${REHEARSAL_WORKFLOW}")"
   {
     printf 'name: Cutover Rehearsal\non:\n  workflow_dispatch:\njobs:\n'
@@ -105,6 +126,7 @@ write_scaffold_workflows() {
     printf '        run: |\n'
     printf '          docker run go-build-env \\\n'
     printf '            ./scripts/release/pr4109/rehearse.sh local-proofs\n'
+    [[ -n "${jobs}" ]] && printf '%s\n' "${jobs}"
   } >"${repo}/${REHEARSAL_WORKFLOW}"
 
   {
@@ -133,6 +155,7 @@ ALT_BUILD_STEP="        uses: ${BUILD_ACTION}@v5
 ALT_PATH_FILTERS="scripts/release/pr4109/**
 ${REHEARSAL_WORKFLOW}
 ${SCAFFOLD_LINT_WORKFLOW}
+${CONTRACTS_WORKFLOW}
 .dockerignore
 build/Alt.Dockerfile.dockerignore
 .gitignore
@@ -154,8 +177,47 @@ commit_fixture() {
 # whatever else the case has staged.
 recommit_scaffold_workflows() {
   local repo="$1" step="$2" filters="$3"
-  write_scaffold_workflows "${repo}" "${step}" "${filters}"
+  write_scaffold_workflows "${repo}" "${step}" "${filters}" \
+    "${4-${DEFAULT_SOLIDITY_JOB}}"
   commit_fixture "${repo}"
+}
+
+# The CI workflow the contracts stage reproduces. The job the claim names is
+# surrounded by jobs pinning other releases, so a resolution that read the
+# workflow instead of the job would resolve the wrong one — or, having found
+# several, would have to guess.
+write_contracts_workflow() {
+  local repo="$1" steps="$2" job="${3-${CONTRACTS_JOB}}"
+  mkdir -p "${repo}/$(dirname "${CONTRACTS_WORKFLOW}")"
+  {
+    printf 'name: Solidity ECDSA\non:\n  pull_request:\njobs:\n'
+    printf '  contracts-lint:\n    runs-on: ubuntu-latest\n    steps:\n'
+    printf '      - uses: actions/checkout@v3\n'
+    printf '      - uses: %s@v3\n        with:\n' "${SETUP_NODE_ACTION}"
+    printf '          node-version: "20.11.0"\n'
+    printf '  %s:\n    runs-on: ubuntu-latest\n    steps:\n' "${job}"
+    [[ -n "${steps}" ]] && printf '%s\n' "${steps}"
+    printf '  contracts-publish:\n    runs-on: ubuntu-latest\n    steps:\n'
+    printf '      - uses: actions/checkout@v3\n'
+    printf '      - uses: %s@v3\n        with:\n' "${SETUP_NODE_ACTION}"
+    printf '          node-version: "16.20.2"\n'
+  } >"${repo}/${CONTRACTS_WORKFLOW}"
+}
+
+# A throwaway repository carrying just the two workflows the contracts
+# toolchain claim is read out of.
+make_toolchain_repo() {
+  local repo="$1" contracts_steps="$2"
+  mkdir -p "${repo}"
+  (
+    cd "${repo}"
+    git_q init -q
+    write_scaffold_workflows "${repo}" "${DEFAULT_BUILD_STEP}" \
+      "${DEFAULT_PATH_FILTERS}" "${3-${DEFAULT_SOLIDITY_JOB}}"
+    write_contracts_workflow "${repo}" "${contracts_steps}"
+    git_q add -Af
+    git_q commit -q -m 'toolchain fixture'
+  )
 }
 
 # Lay down the alternate Dockerfile the cases move the build onto, beside the
@@ -365,6 +427,22 @@ run_context_mirror() {
       # shellcheck disable=SC2034
       REPO_ROOT="${root}"
       verify_build_context_mirror
+    ) 2>&1
+  )"
+  CASE_RC=$?
+  set -e
+}
+
+# Run verify_contracts_toolchain_pin against a throwaway repository, in the
+# same isolated shape as the mirror runner above.
+run_toolchain_pin() {
+  local root="$1"
+  set +e
+  CASE_OUT="$(
+    (
+      # shellcheck disable=SC2034
+      REPO_ROOT="${root}"
+      verify_contracts_toolchain_pin
     ) 2>&1
   )"
   CASE_RC=$?
@@ -970,13 +1048,16 @@ closed" 1 \
   "sets no context" \
   "rather than the dispatched checkout"
 
+# The same refusal reached from the other shape: no inputs at all rather than
+# inputs that happen not to name a context.
 T="${WORK}/step-no-inputs"
 make_context_repo "${T}" "${CHECKED_IN_DOCKERIGNORE}"
 recommit_scaffold_workflows "${T}" "        uses: ${BUILD_ACTION}@v5" \
   "${DEFAULT_PATH_FILTERS}"
 run_context_mirror "${T}"
 check "build step: a build action passing no inputs at all fails closed" 1 \
-  "passes no inputs"
+  "sets no context" \
+  "rather than the dispatched checkout"
 
 T="${WORK}/step-two-actions"
 make_context_repo "${T}" "${CHECKED_IN_DOCKERIGNORE}"
@@ -1039,6 +1120,144 @@ recommit_scaffold_workflows "${T}" "        uses: ${BUILD_ACTION}@v5
 run_context_mirror "${T}"
 check "build step: a Dockerfile outside the build context fails closed" 1 \
   "does not resolve to a path inside the build context"
+
+T="${WORK}/lint-contracts-unfiltered"
+make_context_repo "${T}" "${CHECKED_IN_DOCKERIGNORE}"
+recommit_scaffold_workflows "${T}" "${DEFAULT_BUILD_STEP}" \
+  "$(grep -vxF "${CONTRACTS_WORKFLOW}" <<<"${DEFAULT_PATH_FILTERS}")"
+run_context_mirror "${T}"
+check "build step: a filter list that stops covering the contracts workflow \
+fails closed" 1 \
+  "the push filter list does not cover \
+\.github/workflows/contracts-ecdsa\.yml" \
+  "no longer runs on every build input"
+
+# --- contracts toolchain: the parity the stage's evidence claims ------------
+#
+# The contracts stage's log says it reproduces one named CI job, and that claim
+# holds only while the stage and the dispatch that provisions it run the
+# toolchain that job pins. Restated as a constant the claim survives the job
+# moving and goes on being made about a run that no longer reproduces
+# anything, so it is read out of the job instead — from the job the claim
+# names, not from the workflow around it, and never from a pin loose enough to
+# let the runner decide.
+
+T="${WORK}/toolchain-agrees"
+make_toolchain_repo "${T}" "${DEFAULT_CONTRACTS_STEPS}"
+run_toolchain_pin "${T}"
+check "contracts toolchain: the named job's pin is the one both sides are \
+held to" 0 \
+  "both pin Node 18\.15\.0"
+
+# The jobs on either side of the named one pin other releases, so a resolution
+# reading the workflow rather than the job would resolve one of those.
+T="${WORK}/toolchain-job-scope"
+make_toolchain_repo "${T}" "      - uses: ${SETUP_NODE_ACTION}@v3
+        with:
+          node-version: \"20.11.0\"" \
+  "  ${SOLIDITY_PROOFS_JOB}:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ${SETUP_NODE_ACTION}@v4
+        with:
+          node-version: \"20.11.0\""
+run_toolchain_pin "${T}"
+check "contracts toolchain: the pin is read from the named job, not its \
+neighbours" 0 \
+  "both pin Node 20\.11\.0"
+
+T="${WORK}/toolchain-rehearsal-drift"
+make_toolchain_repo "${T}" "${DEFAULT_CONTRACTS_STEPS}" \
+  "  ${SOLIDITY_PROOFS_JOB}:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ${SETUP_NODE_ACTION}@v4
+        with:
+          node-version: \"20.11.0\""
+run_toolchain_pin "${T}"
+check "contracts toolchain: a dispatch provisioning another release fails \
+closed" 1 \
+  "provisions Node 20\.11\.0 while" \
+  "pins 18\.15\.0" \
+  "evidence produced on another toolchain is not its evidence"
+
+# The direction the constant made invisible: CI moves, the scaffold does not.
+T="${WORK}/toolchain-ci-bumped"
+make_toolchain_repo "${T}" "      - uses: ${SETUP_NODE_ACTION}@v3
+        with:
+          node-version: \"22.11.0\""
+run_toolchain_pin "${T}"
+check "contracts toolchain: a bump in CI the scaffold has not followed fails \
+closed" 1 \
+  "provisions Node 18\.15\.0 while" \
+  "pins 22\.11\.0"
+
+T="${WORK}/toolchain-no-pin"
+make_toolchain_repo "${T}" "      - uses: ${SETUP_NODE_ACTION}@v3
+        with:
+          cache: yarn"
+run_toolchain_pin "${T}"
+check "contracts toolchain: a job taking whatever the runner ships fails \
+closed" 1 \
+  "pins no node-version"
+
+T="${WORK}/toolchain-range"
+make_toolchain_repo "${T}" "      - uses: ${SETUP_NODE_ACTION}@v3
+        with:
+          node-version: \"18.x\""
+run_toolchain_pin "${T}"
+check "contracts toolchain: a pin loose enough for the runner to choose fails \
+closed" 1 \
+  "pins node-version \[18\.x\], which is not one exact release"
+
+T="${WORK}/toolchain-expression"
+make_toolchain_repo "${T}" "      - uses: ${SETUP_NODE_ACTION}@v3
+        with:
+          node-version: \${{ inputs.node }}"
+run_toolchain_pin "${T}"
+check "contracts toolchain: a release decided at dispatch time fails closed" 1 \
+  "writes its node-version as a workflow expression"
+
+T="${WORK}/toolchain-two-steps"
+make_toolchain_repo "${T}" "      - uses: ${SETUP_NODE_ACTION}@v3
+        with:
+          node-version: \"18.15.0\"
+      - uses: ${SETUP_NODE_ACTION}@v3
+        with:
+          node-version: \"20.11.0\""
+run_toolchain_pin "${T}"
+check "contracts toolchain: a job setting up Node twice fails closed" 1 \
+  "has 2 actions/setup-node steps"
+
+T="${WORK}/toolchain-no-step"
+make_toolchain_repo "${T}" "      - uses: actions/checkout@v3"
+run_toolchain_pin "${T}"
+check "contracts toolchain: a job that no longer sets up Node fails closed" 1 \
+  "has no actions/setup-node step"
+
+T="${WORK}/toolchain-job-renamed"
+make_toolchain_repo "${T}" "${DEFAULT_CONTRACTS_STEPS}"
+write_contracts_workflow "${T}" "${DEFAULT_CONTRACTS_STEPS}" "contracts-build"
+commit_fixture "${T}"
+run_toolchain_pin "${T}"
+check "contracts toolchain: a named job that no longer exists fails closed" 1 \
+  "has no contracts-build-and-test job"
+
+T="${WORK}/toolchain-rehearsal-job-gone"
+make_toolchain_repo "${T}" "${DEFAULT_CONTRACTS_STEPS}" ""
+run_toolchain_pin "${T}"
+check "contracts toolchain: a dispatch with no contracts job at all fails \
+closed" 1 \
+  "has no solidity-proofs job"
+
+T="${WORK}/toolchain-workflow-absent"
+make_toolchain_repo "${T}" "${DEFAULT_CONTRACTS_STEPS}"
+(cd "${T}" && git_q rm -q "${CONTRACTS_WORKFLOW}" &&
+  git_q commit -q -m 'drop the contracts workflow')
+run_toolchain_pin "${T}"
+check "contracts toolchain: a commit carrying no contracts workflow fails \
+closed" 1 \
+  "carries no \.github/workflows/contracts-ecdsa\.yml"
 
 # ----------------------------------------------------------------------------
 

@@ -127,8 +127,11 @@ stages:
                       rehearsal evidence are never proved only by a manual
                       dispatch
   solidity-proofs     build and test the changed ECDSA contracts surface
-                      exactly as the contracts workflow does: Node 18.15.0,
-                      the Corepack-managed yarn from packageManager, and a
+                      exactly as the contracts workflow's build-and-test job
+                      does: the exact Node release that job pins — read out
+                      of it, not restated here, so the stage blocks rather
+                      than claims a parity CI has moved away from — the
+                      Corepack-managed yarn from packageManager, and a
                       never-skipped 'yarn install --immutable' before
                       yarn build and yarn test
   preflight           validate the container-rehearsal inputs and image digests
@@ -537,6 +540,247 @@ yaml_block_end() {
   printf '%s' "${#YAML_INDENTS[@]}"
 }
 
+# The inputs of the step yaml_locate_action_step last placed, split into keys
+# and their still-raw values. Parallel arrays because the shapes below have to
+# stay bash-3 portable, and globals because the placement refuses unmodelled
+# shapes as it goes and a refusal inside a command substitution would exit
+# nothing but its own subshell.
+YAML_STEP_INPUT_KEYS=()
+YAML_STEP_INPUT_VALUES=()
+
+# Place the one step in [from, to) whose `uses:` names the given action and
+# read its inputs. Placing a step is the same problem wherever the step lives,
+# and every shape this parser does not read the way the workflow parser does is
+# refused by name: a value resolved on a guess is worse than no value, because
+# the guess is what every claim built on it would then be measured against.
+yaml_locate_action_step() {
+  local source="$1" action="$2" from="$3" to="$4"
+  YAML_STEP_INPUT_KEYS=()
+  YAML_STEP_INPUT_VALUES=()
+
+  # Every step using the action, whichever of the two spellings its `uses:`
+  # line takes — opening the sequence item or following one.
+  local -a hits=()
+  local i body value
+  for ((i = from; i < to; i++)); do
+    ((YAML_INDENTS[i] < 0)) && continue
+    body="${YAML_BODIES[i]}"
+    if [[ "${body}" == '-'[[:space:]]* ]]; then
+      body="${body#-}"
+      body="${body#"${body%%[![:space:]]*}"}"
+    fi
+    [[ "${body}" == 'uses:'* ]] || continue
+    value="$(yaml_scalar_value "${body#uses:}")" || continue
+    [[ "${value}" == "${action}@"* ]] || continue
+    hits+=("${i}")
+  done
+
+  ((${#hits[@]} != 0)) ||
+    fail "${source} has no ${action} step; the values this script would \
+otherwise be restating are read out of that step, and there is nothing left \
+to read them from"
+  ((${#hits[@]} == 1)) ||
+    fail "${source} has ${#hits[@]} ${action} steps; this script cannot tell \
+which one the values it reads belong to"
+
+  # The step's mapping keys sit at the sequence item's content column: on the
+  # `uses:` line itself when that line opens the item, and otherwise at the
+  # column the item's own dash line opened.
+  local hit="${hits[0]}" start key_indent opened
+  if key_indent="$(yaml_item_key_indent "${hit}")"; then
+    start="${hit}"
+  else
+    key_indent="${YAML_INDENTS[hit]}"
+    start=-1
+    for ((i = hit - 1; i >= from; i--)); do
+      ((YAML_INDENTS[i] < 0)) && continue
+      ((YAML_INDENTS[i] < key_indent)) || continue
+      start="${i}"
+      break
+    done
+    ((start >= 0)) ||
+      fail "${source}: the ${action} step on line $((hit + 1)) opens no \
+sequence item this parser can place"
+    opened="$(yaml_item_key_indent "${start}")" || opened=""
+    [[ "${opened}" == "${key_indent}" ]] ||
+      fail "${source} line $((start + 1)) is not the sequence item opening the \
+${action} step; this parser cannot place that step's inputs"
+  fi
+
+  local end with_line=-1
+  end="$(yaml_block_end "$((start + 1))" "${key_indent}")"
+  ((end > to)) && end="${to}"
+
+  # The `with:` mapping, and nothing else read as one: a key line this parser
+  # cannot split is a step shape it is not reading the way the workflow parser
+  # does, wherever in the step it sits.
+  for ((i = start + 1; i < end; i++)); do
+    ((YAML_INDENTS[i] == key_indent)) || continue
+    body="${YAML_BODIES[i]}"
+    [[ "${body}" == *:* && "${body%%:*}" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]] ||
+      fail "${source} line $((i + 1)) is not a key this parser can read inside \
+the ${action} step"
+    [[ "${body%%:*}" == 'with' ]] || continue
+    value="${body#with:}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    [[ -z "${value}" || "${value}" == '#'* ]] ||
+      fail "${source} line $((i + 1)) writes the ${action} step's inputs as \
+[${value}]; this parser reads only a block mapping"
+    with_line="${i}"
+  done
+
+  # A step passing no inputs at all is a legible shape. Whether it is an
+  # acceptable one is the caller's question, not this parser's.
+  ((with_line >= 0)) || return 0
+
+  local input_indent=-1
+  for ((i = with_line + 1; i < end; i++)); do
+    ((YAML_INDENTS[i] < 0)) && continue
+    # The step's own next key closes the mapping.
+    ((YAML_INDENTS[i] <= key_indent)) && break
+    if ((input_indent < 0)); then
+      input_indent="${YAML_INDENTS[i]}"
+    fi
+    ((YAML_INDENTS[i] > input_indent)) && continue
+    ((YAML_INDENTS[i] == input_indent)) ||
+      fail "${source} line $((i + 1)) is indented under the ${action} step's \
+inputs at a column this parser cannot place"
+    body="${YAML_BODIES[i]}"
+    [[ "${body}" == *:* && "${body%%:*}" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]] ||
+      fail "${source} line $((i + 1)) is not an input this parser can read \
+inside the ${action} step"
+    YAML_STEP_INPUT_KEYS+=("${body%%:*}")
+    YAML_STEP_INPUT_VALUES+=("${body#*:}")
+  done
+}
+
+# The still-raw value the placed step passes for an input, or non-zero when it
+# passes none — which is a different thing from passing an empty one, and the
+# callers below tell the two apart.
+yaml_step_input() {
+  local key="$1" i
+  for ((i = 0; i < ${#YAML_STEP_INPUT_KEYS[@]}; i++)); do
+    [[ "${YAML_STEP_INPUT_KEYS[i]}" == "${key}" ]] || continue
+    printf '%s' "${YAML_STEP_INPUT_VALUES[i]}"
+    return 0
+  done
+  return 1
+}
+
+# The line range of one job in the workflow currently indexed, so a step search
+# can be scoped to it: a workflow runs the same action in several jobs, and
+# only one of them is the job a claim of parity names.
+YAML_JOB_START=-1
+YAML_JOB_END=-1
+yaml_locate_job() {
+  local source="$1" job="$2" i jobs_line=-1 jobs_end job_indent=-1
+  YAML_JOB_START=-1
+  YAML_JOB_END=-1
+
+  for ((i = 0; i < ${#YAML_BODIES[@]}; i++)); do
+    ((YAML_INDENTS[i] == 0)) || continue
+    [[ "${YAML_BODIES[i]}" == 'jobs:' ]] || continue
+    jobs_line="${i}"
+    break
+  done
+  ((jobs_line >= 0)) ||
+    fail "${source} declares no jobs this parser can read"
+
+  jobs_end="$(yaml_block_end "$((jobs_line + 1))" 1)"
+  for ((i = jobs_line + 1; i < jobs_end; i++)); do
+    ((YAML_INDENTS[i] < 0)) && continue
+    ((job_indent < 0)) && job_indent="${YAML_INDENTS[i]}"
+    ((YAML_INDENTS[i] == job_indent)) || continue
+    [[ "${YAML_BODIES[i]}" == "${job}:" ]] || continue
+    YAML_JOB_START="${i}"
+    YAML_JOB_END="$(yaml_block_end "$((i + 1))" "$((job_indent + 1))")"
+    return 0
+  done
+
+  fail "${source} has no ${job} job; the values this script reads out of that \
+job have nowhere left to come from"
+}
+
+# The CI job the contracts stage reproduces, and the rehearsal job that has to
+# run it on the same toolchain. Naming a job is a claim about what a stage's
+# evidence is evidence of, and the release is entitled to have that claim
+# checked rather than restated.
+CONTRACTS_WORKFLOW=".github/workflows/contracts-ecdsa.yml"
+CONTRACTS_JOB="contracts-build-and-test"
+SOLIDITY_PROOFS_JOB="solidity-proofs"
+SETUP_NODE_ACTION="actions/setup-node"
+
+# Read by resolve_setup_node_version: the exact Node release a job pins.
+SETUP_NODE_VERSION=""
+
+# The Node release one workflow job pins, read out of that job's setup-node
+# step. The contracts stage claims to reproduce a named CI job, and a claim of
+# parity restated as a constant beside the claim stops being a claim about
+# anything the moment the job moves: the stage would go on producing green
+# evidence whose log says it ran what CI runs while running something else.
+resolve_setup_node_version() {
+  local workflow="$1" job="$2" content raw unmodelled version
+  SETUP_NODE_VERSION=""
+
+  content="$(git -C "${REPO_ROOT}" show "HEAD:${workflow}" 2>/dev/null)" ||
+    fail "the commit under test carries no ${workflow}; the toolchain this \
+scaffold reproduces is pinned there, and this script has nothing left to read \
+it from"
+
+  yaml_index_lines "${workflow}" "${content}"
+  yaml_locate_job "${workflow}" "${job}"
+  yaml_locate_action_step "${workflow}" "${SETUP_NODE_ACTION}" \
+    "${YAML_JOB_START}" "${YAML_JOB_END}"
+
+  raw="$(yaml_step_input node-version)" ||
+    fail "the ${SETUP_NODE_ACTION} step in ${workflow}'s ${job} job pins no \
+node-version, so it takes whatever the runner image ships; evidence from a \
+toolchain nobody named is not that job's evidence"
+  raw="${raw#"${raw%%[![:space:]]*}"}"
+  raw="${raw%"${raw##*[![:space:]]}"}"
+
+  if unmodelled="$(yaml_unmodelled_value "${raw}")"; then
+    fail "the ${SETUP_NODE_ACTION} step in ${workflow}'s ${job} job writes its \
+node-version as ${unmodelled}, which this parser does not resolve"
+  fi
+  version="$(yaml_scalar_value "${raw}")" ||
+    fail "the ${SETUP_NODE_ACTION} step in ${workflow}'s ${job} job quotes its \
+node-version in a form this parser does not read"
+
+  # A range or a major line lets the runner choose the release, and the
+  # contracts build is pinned precisely because one it chose broke compile
+  # artifacts. Reproducing "whatever 18.x resolved to today" reproduces
+  # nothing.
+  [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+    fail "the ${SETUP_NODE_ACTION} step in ${workflow}'s ${job} job pins \
+node-version [${version}], which is not one exact release; the contracts \
+build is pinned exactly because a release the runner chose broke its compile \
+artifacts"
+
+  SETUP_NODE_VERSION="${version}"
+}
+
+# Both halves of the contracts stage's parity claim held to the job it names:
+# the dispatch that provisions the toolchain, and — through the stage itself —
+# the interpreter the proofs actually run on. Checked here, in the gate that
+# runs on every change to either workflow, so a bump in CI is caught by a lint
+# rather than by a dispatch that blocks on the wrong version.
+verify_contracts_toolchain_pin() {
+  local ci_version
+  resolve_setup_node_version "${CONTRACTS_WORKFLOW}" "${CONTRACTS_JOB}"
+  ci_version="${SETUP_NODE_VERSION}"
+
+  resolve_setup_node_version "${REHEARSAL_WORKFLOW}" "${SOLIDITY_PROOFS_JOB}"
+  [[ "${SETUP_NODE_VERSION}" == "${ci_version}" ]] ||
+    fail "${REHEARSAL_WORKFLOW}'s ${SOLIDITY_PROOFS_JOB} job provisions Node \
+${SETUP_NODE_VERSION} while ${CONTRACTS_WORKFLOW}'s ${CONTRACTS_JOB} job pins \
+${ci_version}; the contracts stage reproduces that job, and evidence produced \
+on another toolchain is not its evidence"
+
+  note "contracts toolchain: ${CONTRACTS_WORKFLOW}'s ${CONTRACTS_JOB} job and \
+${REHEARSAL_WORKFLOW}'s ${SOLIDITY_PROOFS_JOB} job both pin Node ${ci_version}"
+}
+
 # The Dockerfile the rehearsal dispatch compiles and the context root it
 # compiles from, read out of the workflow that does the building rather than
 # restated here. The pair decides which ignore file the build applies, so a
@@ -561,111 +805,12 @@ compiled from, and so which ignore rules the build-context classification in \
 this script has to be checked against"
 
   yaml_index_lines "${REHEARSAL_WORKFLOW}" "${content}"
+  yaml_locate_action_step "${REHEARSAL_WORKFLOW}" "${BUILD_ACTION}" 0 \
+    "${#YAML_BODIES[@]}"
 
-  # Every step using the build action, whichever of the two spellings its
-  # `uses:` line takes — opening the sequence item or following one.
-  local -a hits=()
-  local i body value
-  for ((i = 0; i < ${#YAML_BODIES[@]}; i++)); do
-    ((YAML_INDENTS[i] < 0)) && continue
-    body="${YAML_BODIES[i]}"
-    if [[ "${body}" == '-'[[:space:]]* ]]; then
-      body="${body#-}"
-      body="${body#"${body%%[![:space:]]*}"}"
-    fi
-    [[ "${body}" == 'uses:'* ]] || continue
-    value="$(yaml_scalar_value "${body#uses:}")" || continue
-    [[ "${value}" == "${BUILD_ACTION}@"* ]] || continue
-    hits+=("${i}")
-  done
-
-  ((${#hits[@]} != 0)) ||
-    fail "${REHEARSAL_WORKFLOW} has no ${BUILD_ACTION} step; the proof image's \
-Dockerfile and build context are read out of that step, and this script has \
-nothing left to derive them from"
-  ((${#hits[@]} == 1)) ||
-    fail "${REHEARSAL_WORKFLOW} has ${#hits[@]} ${BUILD_ACTION} steps; this \
-script cannot tell which one builds the proof image whose tree it verifies"
-
-  # The step's mapping keys sit at the sequence item's content column: on the
-  # `uses:` line itself when that line opens the item, and otherwise at the
-  # column the item's own dash line opened.
-  local hit="${hits[0]}" start key_indent opened
-  if key_indent="$(yaml_item_key_indent "${hit}")"; then
-    start="${hit}"
-  else
-    key_indent="${YAML_INDENTS[hit]}"
-    start=-1
-    for ((i = hit - 1; i >= 0; i--)); do
-      ((YAML_INDENTS[i] < 0)) && continue
-      ((YAML_INDENTS[i] < key_indent)) || continue
-      start="${i}"
-      break
-    done
-    ((start >= 0)) ||
-      fail "${REHEARSAL_WORKFLOW}: the ${BUILD_ACTION} step on line \
-$((hit + 1)) opens no sequence item this parser can place"
-    opened="$(yaml_item_key_indent "${start}")" || opened=""
-    [[ "${opened}" == "${key_indent}" ]] ||
-      fail "${REHEARSAL_WORKFLOW} line $((start + 1)) is not the sequence item \
-opening the ${BUILD_ACTION} step; this parser cannot place that step's inputs"
-  fi
-
-  local end
-  end="$(yaml_block_end "$((start + 1))" "${key_indent}")"
-
-  # The `with:` mapping, and nothing else read as one: a key line this parser
-  # cannot split is a step shape it is not reading the way the workflow parser
-  # does, wherever in the step it sits.
-  local with_line=-1
-  for ((i = start + 1; i < end; i++)); do
-    ((YAML_INDENTS[i] == key_indent)) || continue
-    body="${YAML_BODIES[i]}"
-    [[ "${body}" == *:* && "${body%%:*}" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]] ||
-      fail "${REHEARSAL_WORKFLOW} line $((i + 1)) is not a key this parser can \
-read inside the ${BUILD_ACTION} step"
-    [[ "${body%%:*}" == 'with' ]] || continue
-    value="${body#with:}"
-    value="${value#"${value%%[![:space:]]*}"}"
-    [[ -z "${value}" || "${value}" == '#'* ]] ||
-      fail "${REHEARSAL_WORKFLOW} line $((i + 1)) writes the ${BUILD_ACTION} \
-step's inputs as [${value}]; this parser reads only a block mapping"
-    with_line="${i}"
-  done
-  ((with_line >= 0)) ||
-    fail "${REHEARSAL_WORKFLOW}: the ${BUILD_ACTION} step passes no inputs, so \
-it builds the default Git context rather than this commit's tree; the \
-build-context classification in this script describes a checkout"
-
-  local raw_context="" raw_file="" seen_context=0 seen_file=0
-  local input_indent=-1 unmodelled
-  for ((i = with_line + 1; i < end; i++)); do
-    ((YAML_INDENTS[i] < 0)) && continue
-    if ((input_indent < 0)); then
-      ((YAML_INDENTS[i] > key_indent)) ||
-        fail "${REHEARSAL_WORKFLOW} line $((i + 1)) is placed outside the \
-${BUILD_ACTION} step's inputs this parser opened on line $((with_line + 1))"
-      input_indent="${YAML_INDENTS[i]}"
-    fi
-    ((YAML_INDENTS[i] > input_indent)) && continue
-    ((YAML_INDENTS[i] == input_indent)) ||
-      fail "${REHEARSAL_WORKFLOW} line $((i + 1)) is indented under the \
-${BUILD_ACTION} step's inputs at a column this parser cannot place"
-    body="${YAML_BODIES[i]}"
-    [[ "${body}" == *:* && "${body%%:*}" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]] ||
-      fail "${REHEARSAL_WORKFLOW} line $((i + 1)) is not an input this parser \
-can read inside the ${BUILD_ACTION} step"
-    case "${body%%:*}" in
-    context)
-      seen_context=1
-      raw_context="${body#context:}"
-      ;;
-    file)
-      seen_file=1
-      raw_file="${body#file:}"
-      ;;
-    esac
-  done
+  local raw_context raw_file seen_context=1 seen_file=1 unmodelled
+  raw_context="$(yaml_step_input context)" || seen_context=0
+  raw_file="$(yaml_step_input file)" || seen_file=0
 
   # An unset `context` is the action's Git context — a build of the repository
   # URL, not of this checkout — under which nothing the classification below
@@ -751,6 +896,7 @@ mirrors"
   LINT_REQUIRED_INPUTS=(
     "${REHEARSAL_WORKFLOW}"
     "${SCAFFOLD_LINT_WORKFLOW}"
+    "${CONTRACTS_WORKFLOW}"
     "${BUILD_DOCKERFILE}"
     "${BUILD_DOCKERFILE}.dockerignore"
     ".dockerignore"
@@ -1503,6 +1649,11 @@ stage_shell_analysis() {
     # is where the mirror is held to them.
     verify_build_context_mirror
 
+    # The contracts stage's evidence is only the named CI job's evidence while
+    # both run the toolchain that job pins, and a bump there touches no line
+    # of this scaffold. Same reason, same gate.
+    verify_contracts_toolchain_pin
+
     # The two validators gate every piece of rehearsal evidence, so the gate
     # that runs on every change to them runs their self-tests too — without
     # this they are proved only by the manually dispatched proof stages,
@@ -1525,16 +1676,20 @@ stage_solidity_proofs() {
   command -v corepack >/dev/null 2>&1 ||
     blocked "corepack is required (bundled with Node >= 16.9)"
 
-  # The contracts workflow runs on exactly Node 18.15.0 because newer
-  # releases have produced broken hardhat compile artifacts; evidence from
-  # any other version is not that workflow's evidence.
-  local ci_node_version="18.15.0"
+  # The contracts workflow pins one exact Node release because newer ones have
+  # produced broken hardhat compile artifacts, and evidence from any other
+  # release is not that workflow's evidence. Which release that is comes out
+  # of the job this stage reproduces rather than out of a constant here: a
+  # constant would go on claiming parity after CI moved.
+  resolve_setup_node_version "${CONTRACTS_WORKFLOW}" "${CONTRACTS_JOB}"
+  local ci_node_version="${SETUP_NODE_VERSION}"
   local node_version
   node_version=$(node -p 'process.versions.node')
   if [[ "${node_version}" != "${ci_node_version}" ]]; then
-    blocked "the contracts workflow runs on Node ${ci_node_version} (found \
-$(node -v)); switch with 'nvm install ${ci_node_version} && nvm use \
-${ci_node_version}' before running solidity-proofs"
+    blocked "${CONTRACTS_WORKFLOW}'s ${CONTRACTS_JOB} job runs on Node \
+${ci_node_version} (found $(node -v)); switch with 'nvm install \
+${ci_node_version} && nvm use ${ci_node_version}' before running \
+solidity-proofs"
   fi
 
   (

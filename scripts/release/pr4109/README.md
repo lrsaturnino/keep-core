@@ -35,10 +35,11 @@ every tool at an immutable version — gofmt, `go vet ./...` (strictly wider
 than CI's root-only vet), staticcheck 2025.1.1, gosec v2.28.0 (CI's own
 gosec action floats on `master`; the pin keeps the evidence reproducible),
 and golangci-lint v2.12.2 — `./rehearse.sh solidity-proofs` builds and
-tests the ECDSA contracts exactly as the contracts workflow does: Node
-18.15.0, the Corepack-managed yarn from `packageManager`, and a
-never-skipped `yarn install --immutable` before `yarn build` and
-`yarn test` — and `./rehearse.sh shell-analysis` analyzes this scaffold
+tests the ECDSA contracts exactly as the contracts workflow's
+`contracts-build-and-test` job does: the exact Node release that job pins,
+read out of it rather than restated here, plus the Corepack-managed yarn
+from `packageManager` and a never-skipped `yarn install --immutable` before
+`yarn build` and `yarn test` — and `./rehearse.sh shell-analysis` analyzes this scaffold
 itself: `bash -n` and ShellCheck over every script here, actionlint v1.7.12
 over the scaffold's own workflows (scoped to them on purpose; the unrelated
 workflows carry pre-existing findings, and a gate that is red for reasons
@@ -285,12 +286,27 @@ resolved build step rather than maintained by hand beside it: a build moved
 onto another Dockerfile takes its ignore file with it, and a filter list left
 behind would leave every later change to that file ungated while the mirror
 check went on passing, on a file nobody was told had changed. Each `push` and
-`pull_request` trigger must therefore cover both workflows, the resolved
+`pull_request` trigger must therefore cover all three workflows, the resolved
 Dockerfile, the ignore file that Dockerfile selects, and the root
 `.dockerignore` — or carry no filter at all, which runs on everything and
 covers everything. A `paths-ignore` list, an empty filter list, and a
 workflow reachable only by dispatch each fail closed; the last is the state
 this workflow exists to end.
+
+The same reasoning covers the other claim this scaffold makes about work it
+did not do itself. `solidity-proofs` says its evidence is
+`contracts-ecdsa.yml`'s `contracts-build-and-test` job's evidence, and that
+holds only while the stage and the dispatch that provisions it run the Node
+release that job pins — a release picked precisely because another one broke
+hardhat's compile artifacts. So it is read out of that job rather than
+restated beside the claim: `shell-analysis` resolves it from the named job
+(not from the workflow around it, whose other jobs pin other releases) and
+requires the rehearsal workflow's own `solidity-proofs` setup-node to match,
+while the stage itself blocks on any other interpreter. A pin loose enough
+for the runner to choose, one decided by a workflow expression, a job that
+sets up Node twice or not at all, and a renamed or absent job each fail
+closed. That is why `contracts-ecdsa.yml` is one of the lint's path filters:
+a bump there touches no line under `scripts/`.
 
 On a hosted runner the per-node keystore comes from the
 `REHEARSAL_KEYSTORE_BUNDLE_B64` repository secret: a base64-encoded tar.gz
