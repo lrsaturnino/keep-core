@@ -221,10 +221,14 @@ it — and whose optional `ceremony_results` array carries `{ceremony, outcome}`
 objects naming the terminal result of each ceremony those transactions started.
 The results are there because no fleet counter carries them: a permit says a
 node was allowed to begin, and the positive control is about a ceremony
-finishing. Both arrays are validated strictly, and a report that cannot be read
-stops the step — a driver whose account is unreadable has left the step unable
-to say what it drove, and recording that as "nothing happened" would enter
-silence as evidence.
+finishing. An optional `originated_ceremonies` array names what the driver put
+on the chain whatever became of it, for the phases whose subject is work still
+in flight — a drain, a forced deadline — which have no terminal outcome to
+read, since by the time one exists the work it was about is over. Every array
+is validated strictly, and a report that cannot be read stops the step — a
+driver whose account is unreadable has left the step unable to say what it
+drove, and recording that as "nothing happened" would enter silence as
+evidence.
 
 Every outcome the driver reports is carried forward, not only the successes.
 A phase that kept the successes alone cannot tell a clean run from one where a
@@ -255,11 +259,40 @@ is that the gate *refused* something requires a clean exit and at least one
 named transaction before it treats its readings as a refusal. The clock-failure
 and quiescence probes distinguish the two: a driver that failed while
 attempting the offer is recorded as a broken instrument naming its exit status,
-not as a gate nobody challenged. The rollback drain goes further and reads the
-fleet's in-flight security-v2 permits at the moment the stop is issued: a
-`compose stop` that returns zero over an idle fleet evidences that stopping
-works, not that a node holding protocol work drains rather than dropping it,
-which is the property a rollback decision rests on.
+not as a gate nobody challenged.
+
+A clean offer is still not a refusal, though — an unchanged permit counter is
+equally the shape of work that never reached the node at all. So the quiescence
+step also requires the node's *own* account: the gate counts every refusal it
+makes, and counts it per ceremony, so the quiescing node's refusal total must
+move and a per-ceremony counter must move with it. That is what puts the
+refusal on the node rather than on the prober's inference, and what names which
+ceremony was refused; a total that moved with no ceremony behind it blocks,
+because a refusal a release cannot attribute to a ceremony is not evidence
+about that ceremony.
+
+The rollback drain reads the fleet's in-flight security-v2 permits at the
+moment the stop is issued: a `compose stop` that returns zero over an idle
+fleet evidences that stopping works, not that a node holding protocol work
+drains rather than dropping it. It also reads *what kind* of work was in
+flight, from the driver's `originated_ceremonies` — a permit total counts
+ceremonies without distinguishing a threshold round from a Bitcoin wallet
+action, and the two fail differently when a shutdown interrupts them: a
+threshold ceremony loses a share and can be re-run, a wallet action can leave a
+Bitcoin transaction the fleet has already signed for. A rollback authorized
+over one class says nothing about the other, so both must be in flight at once.
+
+Then every permit is followed to an outcome, per node rather than in
+aggregate. A fleet total of zero after the drain is equally produced by permits
+that finished and by processes that exited holding them, and the difference is
+exactly the state a rollback restores onto. Each node's permits at the stop
+must therefore land somewhere a later reader can see: completed, evidenced by
+that node being observed without them, or force-canceled at the quiesce
+deadline — which the gate counts and which the offline audit must have written
+a quarantine record for. A force-cancel with no quarantine record behind it is
+in-flight state the rollback would restore onto with nothing describing it, and
+an unreadable counter blocks rather than subtracting like a zero, which is how
+a permit nobody could account for would otherwise disappear from the sum.
 
 The straggler control binds its roster entry to the straggler's own operator.
 The prior node publishes the address it signs as at `/diagnostics`

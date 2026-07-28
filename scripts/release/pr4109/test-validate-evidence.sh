@@ -1619,6 +1619,15 @@ quiesce_readings() {
   QUIESCE_OFFER_FAILED=0
   QUIESCE_OFFER_RC=""
   QUIESCE_GRACE="20160"
+  # The node's own account of the refusal, total and per ceremony.
+  QUIESCE_REFUSALS_BEFORE="7"
+  QUIESCE_REFUSALS_AFTER="8"
+  QUIESCE_CEREMONY_REFUSALS_BEFORE="tbtc_dkg=1
+tbtc_signing=3
+beacon_dkg=0"
+  QUIESCE_CEREMONY_REFUSALS_AFTER="tbtc_dkg=1
+tbtc_signing=4
+beacon_dkg=0"
 }
 
 quiesce_case() {
@@ -1629,12 +1638,40 @@ quiesce_case() {
 
 run_verdict quiesce_case :
 check "a quiescence that refused new work and drained its permits holds" 0 \
-  "was offered new work while quiescing and issued no permit" \
+  "refused it on its own account \(tbtc_signing \+1" \
   "in-flight count observed at zero"
 
 run_verdict quiesce_case eval 'QUIESCE_ATTEMPTED=0'
 check "a quiescing node nobody asked evidences no refusal to start work" 3 \
   "no work was offered to it while it was quiescing"
+
+# The regression this rung exists for: work went out and no permit came back,
+# which is what a refusal looks like and equally what an offer that never
+# arrived looks like. Only the node's own counter tells the two apart.
+run_verdict quiesce_case eval 'QUIESCE_CEREMONY_REFUSALS_AFTER="\
+${QUIESCE_CEREMONY_REFUSALS_BEFORE}"
+   QUIESCE_REFUSALS_AFTER="7"'
+check "an offer the node never recorded refusing is not a refusal" 1 \
+  "its own refusal counter never moved"
+
+# A total that moved with no ceremony behind it names nothing a release could
+# act on, and the total alone is satisfied by a refusal from any other cause.
+run_verdict quiesce_case eval 'QUIESCE_CEREMONY_REFUSALS_AFTER="\
+${QUIESCE_CEREMONY_REFUSALS_BEFORE}"'
+check "a refusal no ceremony counter accounts for attributes nothing" 3 \
+  "no per-ceremony refusal counter moved with the total"
+
+run_verdict quiesce_case eval 'QUIESCE_REFUSALS_AFTER=""'
+check "an unreadable refusal counter observes no refusal at all" 3 \
+  "refusal counter could not be read"
+
+# A per-ceremony counter that could not be read must not subtract like a zero
+# and turn an unobserved ceremony into an attributed one.
+run_verdict quiesce_case eval 'QUIESCE_CEREMONY_REFUSALS_BEFORE="\
+tbtc_signing=unreadable"
+   QUIESCE_CEREMONY_REFUSALS_AFTER="tbtc_signing=4"'
+check "an unreadable ceremony counter attributes no refusal" 3 \
+  "no per-ceremony refusal counter moved with the total"
 
 # The issuance counter and not the gauge peak: a permit taken and closed
 # between two samples never raises the peak it would have been compared to.
@@ -2014,6 +2051,10 @@ drain_readings() {
   ROLLBACK_DRIVER_RC=0
   # shellcheck disable=SC2034
   ROLLBACK_DRIVER_TX=3
+  # Both classes of work in flight at once: a threshold round and a Bitcoin
+  # wallet action, which fail differently when a shutdown interrupts them.
+  # shellcheck disable=SC2034
+  ROLLBACK_ORIGINATED="tbtc_signing tbtc_wallet_action"
   # shellcheck disable=SC2034
   ROLLBACK_INFLIGHT="2"
   # shellcheck disable=SC2034
@@ -2030,7 +2071,23 @@ drain_case() {
 
 run_verdict drain_case :
 check "a drain over permits the driver originated and named holds" 0 \
-  "while the fleet held 2 security-v2 permit\(s\)"
+  "while the fleet held 2 security-v2 permit\(s\)" \
+  "threshold_ceremony and bitcoin_action both in flight"
+
+# The reading the permit total could not carry: it counts ceremonies without
+# distinguishing a threshold round from a wallet action, so a drain that only
+# ever held one class reads identically to one that held both.
+run_verdict drain_case eval 'ROLLBACK_ORIGINATED="tbtc_signing beacon_dkg"'
+check "a drain holding no Bitcoin action authorizes no rollback over one" 3 \
+  "nothing of class bitcoin_action"
+
+run_verdict drain_case eval 'ROLLBACK_ORIGINATED="tbtc_wallet_action"'
+check "a drain holding no threshold ceremony authorizes no rollback over one" \
+  3 "nothing of class threshold_ceremony"
+
+run_verdict drain_case eval 'ROLLBACK_ORIGINATED=""'
+check "named transactions with no ceremony behind them say what drained" 3 \
+  "no ceremony they originated"
 
 # The reading the exit status could not tell apart from success: nothing was in
 # flight, so a clean stop is a shutdown of idle processes.
@@ -2061,6 +2118,81 @@ check "a drain that did not complete is not a quiescence" 1 \
 run_verdict drain_case eval 'ROLLBACK_DRAIN_RC="no exit status"'
 check "a drain whose exit status was never observed is not a quiescence" 1 \
   "exited \[no exit status\]"
+
+# Where the permits went, which neither the drain's exit status nor the audit's
+# consistency verdict follows. An aggregate in-flight count describes the
+# beginning of the drain; a fleet total of zero afterwards is equally produced
+# by permits that finished and by processes that exited holding them, and the
+# difference is exactly the state a rollback restores onto.
+RECONCILE_STEP="every in-flight permit reconciles to completion or quarantine"
+RECONCILE_ASSERTION="every permit held at the stop completes or is audited \
+into quarantine"
+
+# One node that drained everything it held, and one that hit the deadline with
+# a permit the gate force-canceled and the audit wrote a quarantine record for.
+reconcile_readings() {
+  # shellcheck disable=SC2034
+  ROLLBACK_NODE_ACCOUNTS="r1-node-1 2 0 0
+r1-node-2 3 1 0"
+  # shellcheck disable=SC2034
+  ROLLBACK_NODE_QUARANTINES="r1-node-1 0
+r1-node-2 1"
+}
+
+reconcile_case() {
+  reconcile_readings
+  "$@"
+  rollback_reconciliation_verdict "${RECONCILE_STEP}" "${RECONCILE_ASSERTION}"
+}
+
+run_verdict reconcile_case :
+check "permits that completed or were audited into quarantine reconcile" 0 \
+  "4 completed with the holding node observed without them, and 1 were \
+force-canceled"
+
+# The regression this step exists for: the fleet total went to zero because a
+# node exited holding its permits, which no aggregate count distinguishes from
+# a node that finished them.
+run_verdict reconcile_case eval 'ROLLBACK_NODE_ACCOUNTS="r1-node-1 2 0 0
+r1-node-2 3 0 2"'
+check "a node that stopped holding permits reconciles nothing" 1 \
+  "r1-node-2 stopped holding 2 of 3 permit\(s\)" \
+  "went down with the process"
+
+# A force-cancel the audit never wrote a record for is in-flight state the
+# rollback would restore onto with nothing describing it.
+run_verdict reconcile_case eval 'ROLLBACK_NODE_QUARANTINES="r1-node-1 0
+r1-node-2 0"'
+check "a force-canceled permit with no quarantine record refutes the step" 1 \
+  "r1-node-2 \(1 force-canceled, no quarantine record\)"
+
+run_verdict reconcile_case eval 'ROLLBACK_NODE_QUARANTINES="r1-node-1 0
+r1-node-2 unreadable"'
+check "an unreadable audit manifest audits no quarantine" 1 \
+  "quarantine records unreadable"
+
+# An unreadable counter must not subtract like a zero; that is how a permit
+# nobody could account for disappears from a reconciliation.
+run_verdict reconcile_case eval 'ROLLBACK_NODE_ACCOUNTS="r1-node-1 2 0 0
+r1-node-2 unreadable 1 0"'
+check "a permit count nobody could read reconciles nothing" 3 \
+  "held unreadable"
+
+run_verdict reconcile_case eval 'ROLLBACK_NODE_ACCOUNTS="r1-node-1 2 0 0
+r1-node-2 3 unreadable 0"'
+check "an unreadable forced-abort delta reconciles nothing" 3 \
+  "forced unreadable"
+
+# More force-cancels than permits held: the two counters describe different
+# populations and nothing can be followed from one to the other.
+run_verdict reconcile_case eval 'ROLLBACK_NODE_ACCOUNTS="r1-node-1 2 0 0
+r1-node-2 1 3 0"'
+check "more force-cancels than permits held closes no accounting" 3 \
+  "force-canceled 3 of 1 held"
+
+run_verdict reconcile_case eval 'ROLLBACK_NODE_ACCOUNTS=""'
+check "a drain nobody accounted for reconciles nothing" 3 \
+  "no R1 node's permit accounting was captured"
 
 # The homogeneous positive control, which used to be decided by two permit
 # counters — neither of which is either half of the property it names. A permit
@@ -2207,6 +2339,7 @@ drive() {
       run_work_driver "$1" || true
       printf 'ceremonies:%s\n' "${WORK_DRIVER_SUCCEEDED_CEREMONIES}"
       printf 'results:%s\n' "${WORK_DRIVER_CEREMONY_RESULTS}"
+      printf 'originated:%s\n' "${WORK_DRIVER_ORIGINATED}"
       if driver_offered_work; then
         printf 'offered:yes rc:%s tx:%s hashes:%s\n' \
           "${WORK_DRIVER_RC}" "${WORK_DRIVER_TX_COUNT}" "${STEP_TX_HASHES}"
@@ -2296,6 +2429,26 @@ else
   printf 'FAIL a failed outcome was discarded at the parse: %s\n' "${CASE_OUT}"
   FAILED=$((FAILED + 1))
 fi
+
+# What a phase over work still in flight reads instead of a terminal outcome:
+# by the time one exists the work it was about is over.
+write_driver <<EOF
+#!/usr/bin/env bash
+printf '{"transaction_hashes":["${HASH_A}"],'
+printf '"originated_ceremonies":["tbtc_signing","tbtc_wallet_action"]}'
+EOF
+drive rollback-inflight
+check "a driver names the work it put on the chain before it settles" 0 \
+  "originated:tbtc_signing tbtc_wallet_action" "results:"
+
+write_driver <<EOF
+#!/usr/bin/env bash
+printf '{"transaction_hashes":["${HASH_A}"],'
+printf '"originated_ceremonies":["tbtc_signing","a wallet action probably"]}'
+EOF
+drive rollback-inflight
+check "originated work this rehearsal does not know stops the step" 3 \
+  "not a ceremony"
 
 write_driver <<EOF
 #!/usr/bin/env bash

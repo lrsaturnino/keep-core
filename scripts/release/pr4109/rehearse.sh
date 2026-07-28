@@ -3374,6 +3374,50 @@ ANNOUNCER_CUTOVER_METRICS=(
   announcer_legacy_peer_additions_total
 )
 
+# The gated ceremonies, whose per-ceremony refusal counters name what a node
+# refused rather than only that it refused something. A drift test in the Go
+# tree holds this list to the gate's own closed set.
+GATED_CEREMONIES=(
+  tbtc_dkg
+  tbtc_wallet_coordination
+  tbtc_signing
+  tbtc_heartbeat
+  tbtc_inactivity_claim
+  beacon_dkg
+  beacon_relay_signing
+  beacon_relay_forwarding
+  beacon_timeout_report
+)
+
+# Every per-ceremony refusal counter on one node, as "<ceremony>=<count>"
+# lines. A counter that cannot be read is emitted as "unreadable" rather than
+# as zero, because a reading that failed must not subtract like an absence.
+ceremony_refusal_counters() {
+  local service="$1" ceremony value
+  for ceremony in "${GATED_CEREMONIES[@]}"; do
+    value="$(metric_value "${service}" \
+      "participation_refusals_${ceremony}_total" 2>/dev/null || printf '')"
+    [[ "${value}" =~ ^[0-9]+$ ]] || value="unreadable"
+    printf '%s=%s\n' "${ceremony}" "${value}"
+  done
+}
+
+# The ceremonies whose refusal counter moved between two such readings,
+# comma-joined with their deltas. This is what turns "the node refused
+# something" into "the node refused this", which is the only form a release
+# decision can act on.
+refused_ceremony_delta() {
+  local before="$1" after="$2" line ceremony from to out=""
+  while IFS='=' read -r ceremony from; do
+    [[ -n "${ceremony}" ]] || continue
+    to="$(printf '%s\n' "${after}" | sed -n "s/^${ceremony}=//p")"
+    [[ "${from}" =~ ^[0-9]+$ && "${to}" =~ ^[0-9]+$ ]] || continue
+    ((to > from)) || continue
+    out="${out}${out:+, }${ceremony} +$((to - from))"
+  done <<<"${before}"
+  printf '%s' "${out}"
+}
+
 # Snapshot the gate gauges of one node into the step being recorded. Reading
 # none of them is a broken instrument rather than an absent value — a renamed
 # application prefix or metric family would otherwise leave every step
@@ -4519,6 +4563,11 @@ WORK_DRIVER_SUCCEEDED_CEREMONIES=""
 # because most phases read them directly; this is what a phase reads when the
 # outcomes it must not see are as load-bearing as the ones it must.
 WORK_DRIVER_CEREMONY_RESULTS=""
+# The ceremonies the driver put on the chain, whatever became of them. A phase
+# whose subject is work still in flight — a drain, a forced deadline — has no
+# terminal outcome to read: by the time one exists the work it was about is
+# over. This is what such a phase reads to know what kind of work it drained.
+WORK_DRIVER_ORIGINATED=""
 
 # True when the last driver call both exited cleanly and named what it put on
 # the chain, which is the whole of "work was offered here".
@@ -4568,6 +4617,35 @@ unsuccessful_results() {
   printf '%s' "${out}"
 }
 
+# The kind of work a ceremony is, for the phases that must drain more than one
+# kind at once. The two fail differently under an interrupted shutdown: a
+# threshold ceremony cut off mid-round loses a share and can be re-run, while a
+# wallet action cut off mid-flight can leave a Bitcoin transaction this fleet
+# has already signed for and cannot unsign.
+ceremony_class() {
+  case "$1" in
+  *_wallet_action) printf 'bitcoin_action' ;;
+  *_dkg | *_signing) printf 'threshold_ceremony' ;;
+  *) printf 'unknown' ;;
+  esac
+}
+
+# Of the required work classes, the ones no originated ceremony represents.
+# Space-joined, empty when every required class is in flight.
+missing_work_classes() {
+  local originated="$1" required="$2" class ceremony uncovered="" covered
+  for class in ${required}; do
+    covered=0
+    for ceremony in ${originated}; do
+      [[ "$(ceremony_class "${ceremony}")" == "${class}" ]] || continue
+      covered=1
+      break
+    done
+    ((covered == 1)) || uncovered="${uncovered}${uncovered:+ }${class}"
+  done
+  printf '%s' "${uncovered}"
+}
+
 # Every result the driver reported that did succeed, comma-joined. The mirror
 # of the above, for the phases whose contract is that nothing settles.
 successful_results() {
@@ -4586,6 +4664,7 @@ run_work_driver() {
   WORK_DRIVER_TX_COUNT=0
   WORK_DRIVER_SUCCEEDED_CEREMONIES=""
   WORK_DRIVER_CEREMONY_RESULTS=""
+  WORK_DRIVER_ORIGINATED=""
   report="$("${PR4109_WORK_DRIVER}" "${phase}")" || rc=$?
   WORK_DRIVER_RC="${rc}"
 
@@ -4615,6 +4694,24 @@ run_work_driver() {
               process.exit(1);
             }
             encoded.push(JSON.stringify(hash));
+          }
+        }
+        // What the driver put on the chain, whatever became of it. A phase
+        // whose subject is work still in flight cannot read the terminal
+        // outcomes: by the time one exists the work it was about is over.
+        const originated = report.originated_ceremonies;
+        const started = [];
+        if (originated !== undefined) {
+          if (!Array.isArray(originated)) {
+            console.error("originated_ceremonies is not an array");
+            process.exit(1);
+          }
+          for (const ceremony of originated) {
+            if (!CEREMONIES.includes(ceremony)) {
+              console.error("not a ceremony: " + JSON.stringify(ceremony));
+              process.exit(1);
+            }
+            started.push(ceremony);
           }
         }
         const results = report.ceremony_results;
@@ -4648,7 +4745,8 @@ run_work_driver() {
           }
         }
         process.stdout.write(encoded.join(",") + "\n" +
-          succeeded.join(" ") + "\n" + all.join(" "));
+          succeeded.join(" ") + "\n" + all.join(" ") + "\n" +
+          started.join(" "));
       });
     ')" ||
       blocked "the work driver reported the ${phase} phase in a form this \
@@ -4661,6 +4759,7 @@ step with no account of what it drove"
     hashes="$(printf '%s\n' "${parsed}" | sed -n '1p')"
     ceremonies="$(printf '%s\n' "${parsed}" | sed -n '2p')"
     WORK_DRIVER_CEREMONY_RESULTS="$(printf '%s\n' "${parsed}" | sed -n '3p')"
+    WORK_DRIVER_ORIGINATED="$(printf '%s\n' "${parsed}" | sed -n '4p')"
 
     if [[ -n "${hashes}" ]]; then
       STEP_TX_HASHES="${STEP_TX_HASHES}${STEP_TX_HASHES:+,}${hashes}"
@@ -4980,6 +5079,19 @@ QUIESCE_ATTEMPTED=0
 QUIESCE_OFFER_FAILED=0
 QUIESCE_OFFER_RC=""
 QUIESCE_GRACE=""
+# The node's own account of having refused the offer, and of what it refused.
+#
+# An unchanged issued-permit counter is the shape of a refusal and also the
+# shape of an offer that never arrived — a driver that submitted while the node
+# was already gone, an event the node never saw, a ceremony that started
+# somewhere else entirely. The gate counts every refusal it makes and counts it
+# per ceremony, so requiring that counter to move on this node is what puts the
+# refusal on the node rather than on the prober's inference, and the
+# per-ceremony delta names what was refused.
+QUIESCE_REFUSALS_BEFORE=""
+QUIESCE_REFUSALS_AFTER=""
+QUIESCE_CEREMONY_REFUSALS_BEFORE=""
+QUIESCE_CEREMONY_REFUSALS_AFTER=""
 
 quiescence_verdict() {
   local node="$1"
@@ -5038,13 +5150,47 @@ offered to it while it was quiescing, so the starts-no-new-work half rests on \
 nothing having asked; it needs work originated on the rehearsal chain after \
 the node enters quiescence"
     record_assertion "${assertion}" false "${step}"
+  elif [[ ! "${QUIESCE_REFUSALS_BEFORE}" =~ ^[0-9]+$ ]] ||
+    [[ ! "${QUIESCE_REFUSALS_AFTER}" =~ ^[0-9]+$ ]]; then
+    block_step "${step}" "${node} entered quiescing and was offered work, but \
+its refusal counter could not be read \
+(${QUIESCE_REFUSALS_BEFORE:-unreadable} to \
+${QUIESCE_REFUSALS_AFTER:-unreadable}); without it the node's own account of \
+having refused the offer is missing, and an unchanged permit counter is all \
+that is left"
+    record_assertion "${assertion}" false "${step}"
+  elif ((QUIESCE_REFUSALS_AFTER <= QUIESCE_REFUSALS_BEFORE)); then
+    # The reading this rung exists for. Work was submitted and no permit was
+    # issued, which is what a refusal looks like — and also what an offer that
+    # never reached this node looks like. The gate counts every refusal it
+    # makes, so a node that refused says so itself.
+    record_step "${step}" fail "${node} entered quiescing, was offered work, \
+and issued no permit — but its own refusal counter never moved (still \
+${QUIESCE_REFUSALS_AFTER}); nothing here says the offer reached this node \
+before it stopped, and an unchanged permit counter is equally the shape of \
+work that was never presented to it"
+    record_assertion "${assertion}" false "${step}"
   else
+    local refused
+    refused="$(refused_ceremony_delta "${QUIESCE_CEREMONY_REFUSALS_BEFORE}" \
+      "${QUIESCE_CEREMONY_REFUSALS_AFTER}")"
+    if [[ -z "${refused}" ]]; then
+      block_step "${step}" "${node} refused \
+$((QUIESCE_REFUSALS_AFTER - QUIESCE_REFUSALS_BEFORE)) offer(s) while \
+quiescing, but no per-ceremony refusal counter moved with the total, so \
+nothing here says which ceremony it refused; a refusal a release cannot \
+attribute to a ceremony is not evidence about that ceremony"
+      record_assertion "${assertion}" false "${step}"
+      return
+    fi
     record_step "${step}" pass "${node} entered quiescing holding \
 ${QUIESCE_HELD_BEFORE} security-v2 ceremonies, was offered new work while \
-quiescing and issued no permit for it (${QUIESCE_ISSUED_BEFORE} to \
-${QUIESCE_ISSUED_AFTER}), and let every held permit finish inside the \
-reviewed ${QUIESCE_GRACE}s grace — in-flight count observed at zero, no \
-forced abort (${QUIESCE_FORCED_BEFORE} to ${QUIESCE_FORCED_AFTER})"
+quiescing and refused it on its own account (${refused}; refusals \
+${QUIESCE_REFUSALS_BEFORE} to ${QUIESCE_REFUSALS_AFTER}) while issuing no \
+permit (${QUIESCE_ISSUED_BEFORE} to ${QUIESCE_ISSUED_AFTER}), and let every \
+held permit finish inside the reviewed ${QUIESCE_GRACE}s grace — in-flight \
+count observed at zero, no forced abort (${QUIESCE_FORCED_BEFORE} to \
+${QUIESCE_FORCED_AFTER})"
     record_assertion "${assertion}" true "${step}"
   fi
 }
@@ -5199,9 +5345,18 @@ permit (participation_mode_legacy_total unchanged at \
 ROLLBACK_DRIVER_SUPPLIED=0
 ROLLBACK_DRIVER_RC=0
 ROLLBACK_DRIVER_TX=0
+ROLLBACK_ORIGINATED=""
 ROLLBACK_INFLIGHT=""
 ROLLBACK_DRAIN_RC=""
 ROLLBACK_GRACE=""
+# The kinds of work a rollback has to be authorized over, both in flight at
+# once. A rollback decision is taken over a fleet that was holding whatever it
+# was holding, and the two classes fail differently under an interrupted
+# shutdown — a threshold ceremony loses a share and can be re-run, a wallet
+# action can leave a Bitcoin transaction this fleet already signed for. A drain
+# that only ever held one class evidences the rollback path for that class and
+# says nothing about the other, and a permit total cannot tell them apart.
+ROLLBACK_REQUIRED_CLASSES="threshold_ceremony bitcoin_action"
 
 rollback_drain_verdict() {
   local step="quiesce every R1 node with work represented"
@@ -5221,6 +5376,23 @@ stopped holding whatever it happened to hold"
   elif ((ROLLBACK_DRIVER_TX == 0)); then
     block_step "${step}" "the work driver exited cleanly but named no \
 transaction, so nothing attributes the fleet's in-flight work to this gate"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ -z "${ROLLBACK_ORIGINATED}" ]]; then
+    block_step "${step}" "the work driver named transactions but no ceremony \
+they originated, so nothing here says what kind of work the fleet was holding \
+when it was told to stop; a permit total counts ceremonies without \
+distinguishing a threshold round from a Bitcoin wallet action, and a rollback \
+is authorized over what was actually in flight"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ -n "$(missing_work_classes "${ROLLBACK_ORIGINATED}" \
+    "${ROLLBACK_REQUIRED_CLASSES}")" ]]; then
+    block_step "${step}" "the work driver originated \
+${ROLLBACK_ORIGINATED// /, } but nothing of class \
+$(missing_work_classes "${ROLLBACK_ORIGINATED}" \
+      "${ROLLBACK_REQUIRED_CLASSES}"), so this drain was performed over one \
+kind of in-flight work; the two fail differently when a shutdown interrupts \
+them, and a rollback authorized over ${ROLLBACK_REQUIRED_CLASSES// / and } \
+needs both represented at once"
     record_assertion "${assertion}" false "${step}"
   elif [[ ! "${ROLLBACK_INFLIGHT}" =~ ^[0-9]+$ ]]; then
     block_step "${step}" "the fleet's in-flight security-v2 permit count could \
@@ -5244,10 +5416,157 @@ the audit below reads"
     record_step "${step}" pass "every R1 node was stopped under the reviewed \
 manifest's ${ROLLBACK_GRACE}s termination grace while the fleet held \
 ${ROLLBACK_INFLIGHT} security-v2 permit(s) the driver had originated and named \
-on chain, so a draining node holding work was never SIGKILLed before its \
-in-process backstop"
+on chain, covering ${ROLLBACK_ORIGINATED// /, } — \
+${ROLLBACK_REQUIRED_CLASSES// / and } both in flight — so a draining node \
+holding work was never SIGKILLed before its in-process backstop"
     record_assertion "${assertion}" true "${step}"
   fi
+}
+
+# Per-node rollback accounting, one line per R1 service, as
+# "<service> <held> <forced> <final_active>". An unreadable value is carried as
+# "unreadable" rather than as zero: a read that failed must not subtract like an
+# absence, which is exactly how a permit nobody could account for would
+# disappear from the reconciliation.
+ROLLBACK_NODE_ACCOUNTS=""
+# The audited quarantine record counts, "<service> <count>", read from each
+# node's audit manifest after the audit has run.
+ROLLBACK_NODE_QUARANTINES=""
+
+# The verdict over that accounting.
+#
+# The drain step above establishes that the fleet held work and that stopping
+# it returned cleanly. Neither says where the permits went. An aggregate
+# in-flight count read at the moment of the stop is a statement about the
+# beginning of the drain, and a fleet total of zero afterwards is equally
+# produced by permits that finished and by processes that exited holding them —
+# the state a rollback then restores onto is the difference between those two.
+#
+# So every permit a node held when the stop was issued has to land somewhere:
+# completed, which the node evidences by being seen without it, or force-
+# canceled at the quiesce deadline, which the gate counts and the offline audit
+# must have written a quarantine record for. A permit that reconciles to
+# neither went down with its process, and nothing in the state left behind says
+# so.
+rollback_reconciliation_verdict() {
+  local step="$1" assertion="$2"
+  local line service held forced final quarantined
+  local unread="" unreconciled="" unaudited="" impossible=""
+  local completed_total=0 quarantined_total=0 nodes=0
+
+  if [[ -z "${ROLLBACK_NODE_ACCOUNTS//[[:space:]]/}" ]]; then
+    block_step "${step}" "no R1 node's permit accounting was captured across \
+the drain, so nothing here followed a single permit from the stop to an \
+outcome"
+    record_assertion "${assertion}" false "${step}"
+    return
+  fi
+
+  while read -r service held forced final; do
+    [[ -n "${service}" ]] || continue
+    nodes=$((nodes + 1))
+    if [[ ! "${held}" =~ ^[0-9]+$ ]] || [[ ! "${forced}" =~ ^[0-9]+$ ]] ||
+      [[ ! "${final}" =~ ^[0-9]+$ ]]; then
+      unread="${unread}${unread:+, }${service} (held \
+${held}, forced ${forced}, final ${final})"
+      continue
+    fi
+    if ((forced > held)); then
+      # More permits force-canceled than were ever held: the two counters
+      # describe different populations and the reconciliation cannot close
+      # over them at all.
+      impossible="${impossible}${impossible:+, }${service} force-canceled \
+${forced} of ${held} held"
+      continue
+    fi
+    if ((final > 0)); then
+      unreconciled="${unreconciled}${unreconciled:+, }${service} stopped \
+holding ${final} of ${held} permit(s)"
+      continue
+    fi
+    quarantined="$(listing_value "${ROLLBACK_NODE_QUARANTINES}" "${service}")"
+    if ((forced > 0)); then
+      if [[ ! "${quarantined}" =~ ^[0-9]+$ ]]; then
+        unaudited="${unaudited}${unaudited:+, }${service} (${forced} \
+force-canceled, quarantine records ${quarantined:-unreadable})"
+        continue
+      fi
+      if ((quarantined == 0)); then
+        unaudited="${unaudited}${unaudited:+, }${service} (${forced} \
+force-canceled, no quarantine record)"
+        continue
+      fi
+      quarantined_total=$((quarantined_total + forced))
+    fi
+    completed_total=$((completed_total + held - forced))
+  done <<<"${ROLLBACK_NODE_ACCOUNTS}"
+
+  if [[ -n "${unread}" ]]; then
+    block_step "${step}" "the permit accounting could not be read on \
+${unread}; a permit whose fate is unknown is not a permit known to have \
+completed, and treating an unreadable counter as zero is how one disappears \
+from this reconciliation"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ -n "${impossible}" ]]; then
+    block_step "${step}" "${impossible}, so the held and force-canceled counts \
+describe different populations and no permit can be followed from one to the \
+other"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ -n "${unreconciled}" ]]; then
+    record_step "${step}" fail "${unreconciled}; those permits reconcile to \
+neither completion nor quarantine — they went down with the process, and the \
+state a rollback would restore onto carries no account of them"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ -n "${unaudited}" ]]; then
+    record_step "${step}" fail "${unaudited}; a permit the gate force-canceled \
+at the quiesce deadline that left no audited quarantine record behind is \
+in-flight state the rollback would restore onto with nothing describing it"
+    record_assertion "${assertion}" false "${step}"
+  else
+    record_step "${step}" pass "every permit the ${nodes} R1 node(s) held when \
+the stop was issued reconciles: ${completed_total} completed with the holding \
+node observed without them, and ${quarantined_total} were force-canceled at \
+the quiesce deadline and written into the audit's quarantine records"
+    record_assertion "${assertion}" true "${step}"
+  fi
+}
+
+# One value out of a "<key> <value>" listing, empty when the key is absent.
+listing_value() {
+  local listing="$1" key="$2" k v
+  while read -r k v; do
+    if [[ "${k}" == "${key}" ]]; then
+      printf '%s' "${v}"
+      return 0
+    fi
+  done <<<"${listing}"
+  printf ''
+}
+
+# The number of quarantined outputs an audit manifest records, across both
+# protocols. Emitted as "unreadable" when the manifest cannot be parsed, since
+# a manifest nobody could read authorizes nothing.
+audit_quarantine_count() {
+  local manifest="$1"
+  [[ -f "${manifest}" ]] || {
+    printf 'unreadable'
+    return 0
+  }
+  node -e '
+    const fs = require("fs");
+    try {
+      const m = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      const beacon = m.beacon_quarantined_outputs || [];
+      const tbtc = m.tbtc_quarantined_outputs || [];
+      if (!Array.isArray(beacon) || !Array.isArray(tbtc)) {
+        process.stdout.write("unreadable");
+      } else {
+        process.stdout.write(String(beacon.length + tbtc.length));
+      }
+    } catch (e) {
+      process.stdout.write("unreadable");
+    }
+  ' "${manifest}" 2>/dev/null || printf 'unreadable'
 }
 
 stage_single_release() {
@@ -5613,6 +5932,10 @@ network"
     participation_quiesce_forced_aborts_total || printf '')"
   QUIESCE_ISSUED_BEFORE="$(metric_value "${quiesce_node}" \
     participation_mode_security_v2_total || printf '')"
+  QUIESCE_REFUSALS_BEFORE="$(metric_value "${quiesce_node}" \
+    participation_refusals_total || printf '')"
+  QUIESCE_CEREMONY_REFUSALS_BEFORE="$(ceremony_refusal_counters \
+    "${quiesce_node}")"
 
   if [[ ! "${QUIESCE_HELD_BEFORE}" =~ ^[0-9]+$ ]] ||
     ((QUIESCE_HELD_BEFORE == 0)); then
@@ -5636,7 +5959,7 @@ originated on the rehearsal chain that is still running at shutdown"
     # Watch the drain rather than sample its end: the contract is that no new
     # permit is issued from the moment quiescing begins and that the held ones
     # are left to finish, and both are statements about the whole window.
-    local held_now forced_now issued_now state_now
+    local held_now forced_now issued_now state_now refusals_now
     QUIESCE_STATE=""
     QUIESCE_ISSUED_AFTER="${QUIESCE_ISSUED_BEFORE}"
     QUIESCE_FORCED_AFTER="${QUIESCE_FORCED_BEFORE}"
@@ -5644,6 +5967,8 @@ originated on the rehearsal chain that is still running at shutdown"
     QUIESCE_ATTEMPTED=0
     QUIESCE_OFFER_FAILED=0
     QUIESCE_OFFER_RC=""
+    QUIESCE_REFUSALS_AFTER="${QUIESCE_REFUSALS_BEFORE}"
+    QUIESCE_CEREMONY_REFUSALS_AFTER="${QUIESCE_CEREMONY_REFUSALS_BEFORE}"
     deadline=$((SECONDS + QUIESCE_GRACE))
     while ((SECONDS < deadline)); do
       state_now="$(participation_field "${quiesce_node}" gate_state \
@@ -5681,6 +6006,16 @@ originated on the rehearsal chain that is still running at shutdown"
         participation_quiesce_forced_aborts_total 2>/dev/null || printf '')"
       if [[ "${forced_now}" =~ ^[0-9]+$ ]]; then
         QUIESCE_FORCED_AFTER="${forced_now}"
+      fi
+      # Sampled inside the window rather than after it, for the same reason the
+      # issued counter is: the node stops answering when the drain finishes, and
+      # a refusal it recorded is only readable while it is still serving.
+      refusals_now="$(metric_value "${quiesce_node}" \
+        participation_refusals_total 2>/dev/null || printf '')"
+      if [[ "${refusals_now}" =~ ^[0-9]+$ ]]; then
+        QUIESCE_REFUSALS_AFTER="${refusals_now}"
+        QUIESCE_CEREMONY_REFUSALS_AFTER="$(ceremony_refusal_counters \
+          "${quiesce_node}")"
       fi
       # The node going unreachable is the drain finishing, not a failure.
       node_reachable "${quiesce_node}" || break
@@ -5750,11 +6085,13 @@ nowhere to capture them to"
   ROLLBACK_DRIVER_SUPPLIED=0
   ROLLBACK_DRIVER_RC=0
   ROLLBACK_DRIVER_TX=0
+  ROLLBACK_ORIGINATED=""
   if [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
     ROLLBACK_DRIVER_SUPPLIED=1
     run_work_driver rollback-inflight || true
     ROLLBACK_DRIVER_RC="${WORK_DRIVER_RC}"
     ROLLBACK_DRIVER_TX="${WORK_DRIVER_TX_COUNT}"
+    ROLLBACK_ORIGINATED="${WORK_DRIVER_ORIGINATED}"
   fi
 
   # The permits the fleet is actually holding as the stop is issued. This is
@@ -5764,6 +6101,30 @@ nowhere to capture them to"
   ROLLBACK_INFLIGHT="$(fleet_gauge_total active_security_v2_ceremonies)"
   STEP_GAUGES="${STEP_GAUGES}${STEP_GAUGES:+,}\
 \"fleet_active_security_v2_ceremonies\":\"${ROLLBACK_INFLIGHT}\""
+
+  # The same moment, read per node rather than summed. A fleet total says how
+  # much work was in flight; only a per-node reading can follow the permits one
+  # node held to what became of them, and the reconciliation below is about
+  # each permit rather than about the size of the population.
+  local held_at_stop=() forced_before=() forced_after=() final_active=()
+  local svc reading
+  for svc in "${REHEARSAL_R1_SERVICES[@]}"; do
+    reading="$(participation_field "${svc}" active_security_v2_ceremonies \
+      2>/dev/null || printf 'unreadable')"
+    [[ "${reading}" =~ ^[0-9]+$ ]] || reading="unreadable"
+    held_at_stop+=("${reading}")
+    # Seeded with the reading at the stop so a node that never answers again
+    # reconciles against what it was holding rather than against a zero nobody
+    # observed.
+    final_active+=("${reading}")
+
+    reading="$(metric_value "${svc}" \
+      participation_quiesce_forced_aborts_total 2>/dev/null ||
+      printf 'unreadable')"
+    [[ "${reading}" =~ ^[0-9]+$ ]] || reading="unreadable"
+    forced_before+=("${reading}")
+    forced_after+=("${reading}")
+  done
 
   # The grace comes out of the reviewed manifest, which the Go drift test
   # pins to the compiled bounds and the compose file's stop_grace_period to.
@@ -5798,6 +6159,24 @@ nowhere to capture them to"
       break
     fi
     sample_prior_absence
+    # Each node's own drain, sampled while it can still be asked. The last
+    # readable value stands: a node that has stopped answering cannot report
+    # that it finished, and its last reading is what it was holding when it
+    # went.
+    local idx=0 active_now forced_now
+    for svc in "${REHEARSAL_R1_SERVICES[@]}"; do
+      active_now="$(participation_field "${svc}" \
+        active_security_v2_ceremonies 2>/dev/null || printf '')"
+      if [[ "${active_now}" =~ ^[0-9]+$ ]]; then
+        final_active[${idx}]="${active_now}"
+      fi
+      forced_now="$(metric_value "${svc}" \
+        participation_quiesce_forced_aborts_total 2>/dev/null || printf '')"
+      if [[ "${forced_now}" =~ ^[0-9]+$ ]]; then
+        forced_after[${idx}]="${forced_now}"
+      fi
+      idx=$((idx + 1))
+    done
     sleep 2
   done
   wait
@@ -5811,6 +6190,26 @@ nowhere to capture them to"
   # the barrier's precondition is finally established rather than a probe
   # earlier.
   sample_prior_absence
+
+  # The accounting the reconciliation step reads, assembled once the drain is
+  # over. The forced-abort figure is the delta across the drain rather than the
+  # node's lifetime total: aborts this rehearsal's earlier steps provoked are
+  # not permits this drain force-canceled.
+  ROLLBACK_NODE_ACCOUNTS=""
+  local pos=0 forced_delta
+  for svc in "${REHEARSAL_R1_SERVICES[@]}"; do
+    if [[ "${forced_before[${pos}]}" =~ ^[0-9]+$ ]] &&
+      [[ "${forced_after[${pos}]}" =~ ^[0-9]+$ ]] &&
+      ((forced_after[pos] >= forced_before[pos])); then
+      forced_delta=$((forced_after[pos] - forced_before[pos]))
+    else
+      forced_delta="unreadable"
+    fi
+    ROLLBACK_NODE_ACCOUNTS="${ROLLBACK_NODE_ACCOUNTS}\
+${ROLLBACK_NODE_ACCOUNTS:+$'\n'}${svc} ${held_at_stop[${pos}]} \
+${forced_delta} ${final_active[${pos}]}"
+    pos=$((pos + 1))
+  done
 
   ROLLBACK_DRAIN_RC="${drain_rc}"
   rollback_drain_verdict
@@ -5879,6 +6278,25 @@ reconciliation, quiescence, and prior-reader evidence"
     record_assertion "the offline state audit passes before rollback" false \
       "offline state audit produces a rollback-safe manifest"
   fi
+
+  # Step 5b. Every permit the fleet held at the stop, followed to an outcome.
+  #
+  # The drain step says the fleet held work and that stopping it returned
+  # cleanly; the audit says the state left behind is internally consistent.
+  # Neither follows a permit. A rollback restores onto whatever the drain left,
+  # so each permit has to land somewhere a later reader can see — completed, or
+  # force-canceled into a quarantine record the audit wrote — and the audit's
+  # manifests are read here because that is where the quarantine records are.
+  begin_step "every in-flight permit reconciles to completion or quarantine"
+  ROLLBACK_NODE_QUARANTINES=""
+  for service in "${REHEARSAL_R1_SERVICES[@]}"; do
+    ROLLBACK_NODE_QUARANTINES="${ROLLBACK_NODE_QUARANTINES}\
+${ROLLBACK_NODE_QUARANTINES:+$'\n'}${service} \
+$(audit_quarantine_count "${EVIDENCE_DIR}/state-audit/${service}.json")"
+  done
+  rollback_reconciliation_verdict \
+    "every in-flight permit reconciles to completion or quarantine" \
+    "every permit held at the stop completes or is audited into quarantine"
 
   # Step 6. Release the prior digest, and only behind the whole barrier.
   #
