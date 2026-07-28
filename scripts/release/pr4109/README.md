@@ -275,23 +275,41 @@ actionlint, the build-context mirror check, and both validator self-tests
 passing. Its path filters cover the build inputs the trust model is derived
 from as well as the scaffold's own files — `.dockerignore`, both ignore files
 the build could select, the root and nested `.gitignore` rules, `Dockerfile`,
-and `Makefile` — because each of them decides what the verifier accepts just
-as directly as its own code does, and a change to any of them can widen what
-an image tree is allowed to be missing without touching a line under
-`scripts/`. It builds no image and runs no Go suite, so it is cheap enough to
-require.
+and the root and per-package `Makefile`s — because each of them decides what
+the verifier accepts just as directly as its own code does, and a change to
+any of them can widen what an image tree is allowed to be missing without
+touching a line under `scripts/`. It builds no image and runs no Go suite, so
+it is cheap enough to require.
 
-Those filters decide when this gate runs at all, so they are held to the
-resolved build step rather than maintained by hand beside it: a build moved
-onto another Dockerfile takes its ignore file with it, and a filter list left
-behind would leave every later change to that file ungated while the mirror
-check went on passing, on a file nobody was told had changed. Each `push` and
-`pull_request` trigger must therefore cover all three workflows, the resolved
-Dockerfile, the ignore file that Dockerfile selects, and the root
-`.dockerignore` — or carry no filter at all, which runs on everything and
-covers everything. A `paths-ignore` list, an empty filter list, and a
-workflow reachable only by dispatch each fail closed; the last is the state
-this workflow exists to end.
+Those filters decide when this gate runs at all, so neither they nor the list
+they are measured against is maintained by hand: a build moved onto another
+Dockerfile takes its ignore file with it, and a filter list left behind would
+leave every later change to that file ungated while the mirror check went on
+passing, on a file nobody was told had changed. `shell-analysis` therefore
+enumerates the required inputs out of the commit under test — the three
+workflows, the resolved Dockerfile, the ignore file that Dockerfile selects,
+the root `.dockerignore`, every file under this directory, and every committed
+`.gitignore` and `Makefile` — and requires each `push` and `pull_request`
+trigger to run on all of them, or to carry no filter at all, which runs on
+everything and covers everything. Adding a `gen/Makefile` or a nested
+`.gitignore` therefore extends what the gate must cover without anyone
+remembering to say so.
+
+The list is read the way the workflow parser reads it, in order with the last
+matching entry deciding, so an entry listed and then negated further down is
+not coverage; a pattern construct this scaffold has no reading for is refused
+rather than guessed at. A `paths-ignore` list, an empty filter list, and a
+workflow reachable only by dispatch each fail closed.
+
+Trigger shape is held to the same standard, because a restriction there is
+invisible to a check that reads only paths and leaves the same hole. A `push`
+trigger fires only after a branch has already moved, so a `pull_request`
+trigger is required outright and refused if it carries `branches` or
+`branches-ignore` — every restriction of it exempts some merge — or if its
+`types` list drops one of `opened`, `synchronize`, `reopened`: without
+`synchronize` the gate runs when a pull request opens and never again on what
+is pushed into it afterwards. The `push` trigger's own `branches: [main]` is
+accepted, since the `pull_request` trigger beside it is what holds the merge.
 
 The same reasoning covers the other claim this scaffold makes about work it
 did not do itself. `solidity-proofs` says its evidence is

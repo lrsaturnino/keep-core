@@ -24,12 +24,20 @@
 # takes over from the root .dockerignore entirely.
 #
 # Which file that is, in turn, is selected by a Dockerfile named in a workflow
-# rather than in this scaffold, so the last cases move the real build step onto
+# rather than in this scaffold, so the next cases move the real build step onto
 # another Dockerfile and another context and require the resolution to follow
 # it, the path filters that gate this whole check to be held to it, and every
 # step shape the resolution does not model to be refused rather than guessed
-# at. Runs anywhere bash and git exist; everything lives under mktemp and this
-# repository is only ever read.
+# at.
+#
+# All of that in turn rests on that gate running, so the last cases hold the
+# reading of when it does: one removal per class of input the requirement is
+# derived from, filters read in order so a listing a later entry negates is
+# not coverage, patterns whose grammar this scaffold has no reading for
+# refused, and the trigger shapes — push without a pull request, a restricted
+# base branch, a narrowed activity type list — that let a change merge with
+# the gate never having run on it. Runs anywhere bash and git exist;
+# everything lives under mktemp and this repository is only ever read.
 
 set -euo pipefail
 
@@ -72,15 +80,17 @@ DEFAULT_BUILD_STEP="        uses: ${BUILD_ACTION}@v5
           target: build-docker
           load: true
           context: ."
-DEFAULT_PATH_FILTERS="scripts/release/pr4109/**
+DEFAULT_PATH_FILTERS="${SCAFFOLD_DIR}/**
 ${REHEARSAL_WORKFLOW}
 ${SCAFFOLD_LINT_WORKFLOW}
 ${CONTRACTS_WORKFLOW}
 .dockerignore
 Dockerfile.dockerignore
 .gitignore
+**/.gitignore
 Dockerfile
-Makefile"
+Makefile
+**/Makefile"
 
 # The rehearsal job that provisions the contracts toolchain, and the CI job's
 # steps it has to agree with. The lint job around them pins a different release
@@ -152,15 +162,17 @@ ALT_BUILD_STEP="        uses: ${BUILD_ACTION}@v5
           target: build-docker
           context: .
           file: build/Alt.Dockerfile"
-ALT_PATH_FILTERS="scripts/release/pr4109/**
+ALT_PATH_FILTERS="${SCAFFOLD_DIR}/**
 ${REHEARSAL_WORKFLOW}
 ${SCAFFOLD_LINT_WORKFLOW}
 ${CONTRACTS_WORKFLOW}
 .dockerignore
 build/Alt.Dockerfile.dockerignore
 .gitignore
+**/.gitignore
 build/Alt.Dockerfile
-Makefile"
+Makefile
+**/Makefile"
 
 # Commit whatever a case has written into a built fixture. The resolution
 # reads the workflows and the ignore rules from the commit, so an uncommitted
@@ -926,7 +938,7 @@ fails closed" 1 \
   "the push filter list does not cover build/Alt\.Dockerfile$" \
   "the push filter list does not cover build/Alt\.Dockerfile\.dockerignore" \
   "the pull_request filter list does not cover build/Alt\.Dockerfile$" \
-  "no longer runs on every build input"
+  "no longer runs on every input this scaffold.s trust model"
 
 T="${WORK}/lint-root-ignore-unfiltered"
 make_context_repo "${T}" "${CHECKED_IN_DOCKERIGNORE}"
@@ -936,7 +948,7 @@ run_context_mirror "${T}"
 check "build step: a filter list that stops covering the root ignore file \
 fails closed" 1 \
   "the push filter list does not cover \.dockerignore" \
-  "no longer runs on every build input"
+  "no longer runs on every input this scaffold.s trust model"
 
 # The gate cannot hold the resolution to the build step if a change to the
 # build step does not run it.
@@ -949,7 +961,7 @@ check "build step: a filter list that stops covering the build workflow fails \
 closed" 1 \
   "the push filter list does not cover \
 \.github/workflows/cutover-rehearsal\.yml" \
-  "no longer runs on every build input"
+  "no longer runs on every input this scaffold.s trust model"
 
 # An exclusion list says which changes are exempt rather than which are
 # covered, so a trigger carrying one cannot be read as coverage at all.
@@ -1003,7 +1015,7 @@ make_context_repo "${T}" "${CHECKED_IN_DOCKERIGNORE}"
 commit_fixture "${T}"
 run_context_mirror "${T}"
 check "build step: a lint reachable only by dispatch fails closed" 1 \
-  "runs on no push or pull request"
+  "runs on no pull request"
 
 T="${WORK}/lint-absent"
 make_context_repo "${T}" "${CHECKED_IN_DOCKERIGNORE}"
@@ -1130,7 +1142,282 @@ check "build step: a filter list that stops covering the contracts workflow \
 fails closed" 1 \
   "the push filter list does not cover \
 \.github/workflows/contracts-ecdsa\.yml" \
-  "no longer runs on every build input"
+  "no longer runs on every input this scaffold.s trust model"
+
+# --- scaffold lint: which changes really reach the gate ---------------------
+#
+# Everything above rests on that gate running, and a filter list read as a set
+# of names on triggers read as a count says it does in states where it does
+# not. So these cases hold the reading itself: the required inputs are the ones
+# the commit carries rather than a list kept by hand, the filters are read the
+# way the workflow parser reads them — in order, last match deciding — and a
+# trigger is read for the changes it actually fires on rather than for being
+# spelled push or pull_request.
+#
+# They run the gate on its own, without the mirror behind it: what is being
+# proved here is which changes reach it, and a case that had to keep a whole
+# build context consistent to say so would prove that less clearly.
+
+# One representative of every class the required-input derivation reads out of
+# a commit, so each of the removal cases below has something real to uncover:
+# the scaffold's own files (a script, a data file, and one a directory deep),
+# the build inputs, and the root and nested ignore and build rules.
+make_lint_repo() {
+  local repo="$1"
+  mkdir -p "${repo}"
+  (
+    cd "${repo}"
+    git_q init -q
+    mkdir -p "${SCAFFOLD_DIR}/deploy" pkg/chain/gen solidity
+    echo 'FROM scratch' >Dockerfile
+    printf '.git\n' >.dockerignore
+    printf '/keep-client\n' >.gitignore
+    printf 'build/\n' >solidity/.gitignore
+    printf 'all:\n\t@true\n' >Makefile
+    printf 'abi:\n\t@true\n' >pkg/chain/gen/Makefile
+    echo '#!/usr/bin/env bash' >"${SCAFFOLD_DIR}/rehearse.sh"
+    echo '{}' >"${SCAFFOLD_DIR}/release-manifest.json"
+    echo 'services: {}' >"${SCAFFOLD_DIR}/deploy/compose.yaml"
+    write_contracts_workflow "${repo}" "${DEFAULT_CONTRACTS_STEPS}"
+    write_scaffold_workflows "${repo}" "${DEFAULT_BUILD_STEP}" \
+      "${DEFAULT_PATH_FILTERS}"
+    git_q add -Af
+    git_q commit -q -m 'lint fixture'
+  )
+}
+
+# The path-filter block one trigger carries, at a given indentation. The
+# trigger cases build `on:` bodies a line at a time so they can shape one
+# trigger without disturbing the other, and every filtered trigger needs this
+# list written out under it.
+lint_paths_block() {
+  local indent="$1" filters="$2" entry
+  printf '%*spaths:\n' "${indent}" ''
+  while IFS= read -r entry; do
+    [[ -n "${entry}" ]] && printf '%*s- "%s"\n' "$((indent + 2))" '' "${entry}"
+  done <<<"${filters}"
+}
+
+# Rewrite a lint fixture's scaffold-lint workflow around a given `on:` body,
+# and commit it. The body is given whole because what these cases vary is the
+# trigger shape itself.
+recommit_lint_triggers() {
+  local repo="$1" on_body="$2"
+  {
+    printf 'name: Cutover Scaffold Lint\non:\n'
+    # Whole-line, because command substitution took the body's last newline.
+    printf '%s\n' "${on_body}"
+    printf 'jobs:\n  scaffold-lint:\n    runs-on: ubuntu-latest\n    steps:\n'
+    printf '      - uses: actions/checkout@v4\n'
+  } >"${repo}/${SCAFFOLD_LINT_WORKFLOW}"
+  commit_fixture "${repo}"
+}
+
+# Run the gate on its own against a throwaway repository, in the same isolated
+# shape as the mirror runner. The build identity is resolved first because the
+# required inputs include the Dockerfile the build really compiles.
+run_lint_filters() {
+  local root="$1"
+  set +e
+  CASE_OUT="$(
+    (
+      # shellcheck disable=SC2034
+      REPO_ROOT="${root}"
+      resolve_build_step_identity
+      verify_scaffold_lint_path_filters
+    ) 2>&1
+  )"
+  CASE_RC=$?
+  set -e
+}
+
+T="${WORK}/lint-covers-every-class"
+make_lint_repo "${T}"
+run_lint_filters "${T}"
+check "scaffold lint: the checked-in filter shape covers every input class \
+the commit carries" 0 \
+  "runs on every change to the 13 tracked input\(s\)" \
+  "on all 2 push/pull-request trigger\(s\)"
+
+# One removal per class the derivation reads out of the commit. Each one is a
+# path the gate has to run on that no other entry in the list covers, so a
+# check trusting the list by inspection passes every one of them.
+
+T="${WORK}/lint-drops-scaffold"
+make_lint_repo "${T}"
+recommit_scaffold_workflows "${T}" "${DEFAULT_BUILD_STEP}" \
+  "$(grep -vxF "${SCAFFOLD_DIR}/**" <<<"${DEFAULT_PATH_FILTERS}")"
+run_lint_filters "${T}"
+check "scaffold lint: a filter list that stops covering the scaffold's own \
+files fails closed" 1 \
+  "does not cover ${SCAFFOLD_DIR}/rehearse\.sh" \
+  "does not cover ${SCAFFOLD_DIR}/deploy/compose\.yaml" \
+  "does not cover ${SCAFFOLD_DIR}/release-manifest\.json"
+
+T="${WORK}/lint-drops-root-gitignore"
+make_lint_repo "${T}"
+recommit_scaffold_workflows "${T}" "${DEFAULT_BUILD_STEP}" \
+  "$(grep -vxF '.gitignore' <<<"${DEFAULT_PATH_FILTERS}")"
+run_lint_filters "${T}"
+check "scaffold lint: a filter list that stops covering the root ignore rules \
+fails closed" 1 \
+  "the push filter list does not cover \.gitignore" \
+  "the pull_request filter list does not cover \.gitignore"
+
+# The root entry does not cover a nested file and the nested entry does not
+# cover the root one, so dropping either leaves rules that decide what counts
+# as divergence changing without this gate running.
+T="${WORK}/lint-drops-nested-gitignore"
+make_lint_repo "${T}"
+recommit_scaffold_workflows "${T}" "${DEFAULT_BUILD_STEP}" \
+  "$(grep -vxF '**/.gitignore' <<<"${DEFAULT_PATH_FILTERS}")"
+run_lint_filters "${T}"
+check "scaffold lint: a filter list that stops covering nested ignore rules \
+fails closed" 1 \
+  "does not cover solidity/\.gitignore"
+
+T="${WORK}/lint-drops-root-makefile"
+make_lint_repo "${T}"
+recommit_scaffold_workflows "${T}" "${DEFAULT_BUILD_STEP}" \
+  "$(grep -vxF 'Makefile' <<<"${DEFAULT_PATH_FILTERS}")"
+run_lint_filters "${T}"
+check "scaffold lint: a filter list that stops covering the root Makefile \
+fails closed" 1 \
+  "the push filter list does not cover Makefile" \
+  "the pull_request filter list does not cover Makefile"
+
+# The regeneration whose output the verifier explains absences by is run by the
+# per-package gen Makefiles, not by the root one.
+T="${WORK}/lint-drops-nested-makefile"
+make_lint_repo "${T}"
+recommit_scaffold_workflows "${T}" "${DEFAULT_BUILD_STEP}" \
+  "$(grep -vxF '**/Makefile' <<<"${DEFAULT_PATH_FILTERS}")"
+run_lint_filters "${T}"
+check "scaffold lint: a filter list that stops covering the gen Makefiles \
+fails closed" 1 \
+  "does not cover pkg/chain/gen/Makefile"
+
+# Order decides. An entry listed and then negated further down covers nothing,
+# and a check reading the list for membership cannot see the difference.
+T="${WORK}/lint-negates-required"
+make_lint_repo "${T}"
+recommit_scaffold_workflows "${T}" "${DEFAULT_BUILD_STEP}" \
+  "${DEFAULT_PATH_FILTERS}
+!${SCAFFOLD_DIR}/**"
+run_lint_filters "${T}"
+check "scaffold lint: a required path listed and then negated fails closed" 1 \
+  "does not cover ${SCAFFOLD_DIR}/rehearse\.sh"
+
+# And the same reading has to accept the other order: a negation a later entry
+# re-includes over excludes nothing.
+T="${WORK}/lint-negation-reincluded"
+make_lint_repo "${T}"
+recommit_scaffold_workflows "${T}" "${DEFAULT_BUILD_STEP}" \
+  "${DEFAULT_PATH_FILTERS}
+!${SCAFFOLD_DIR}/**
+${SCAFFOLD_DIR}/**"
+run_lint_filters "${T}"
+check "scaffold lint: a negation a later entry re-includes over excludes \
+nothing" 0 \
+  "runs on every change to the 13 tracked input\(s\)"
+
+# A negation that misses every required input is not a hole, and reporting one
+# would make the check something a maintainer routes around.
+T="${WORK}/lint-negation-elsewhere"
+make_lint_repo "${T}"
+recommit_scaffold_workflows "${T}" "${DEFAULT_BUILD_STEP}" \
+  "${DEFAULT_PATH_FILTERS}
+!docs/**"
+run_lint_filters "${T}"
+check "scaffold lint: a negation covering nothing required is accepted" 0 \
+  "runs on every change to the 13 tracked input\(s\)"
+
+# `?` and `+` quantify the character before them in this grammar rather than
+# standing for one of any character, so a required path measured against
+# either would be measured wrong.
+T="${WORK}/lint-unmodelled-pattern"
+make_lint_repo "${T}"
+recommit_scaffold_workflows "${T}" "${DEFAULT_BUILD_STEP}" \
+  "${DEFAULT_PATH_FILTERS}
+Dockerfile?"
+run_lint_filters "${T}"
+check "scaffold lint: a path filter this script has no reading for fails \
+closed" 1 \
+  "filters on \[Dockerfile\?\], whose \[\?\] this script has no reading for"
+
+# The hole a trigger count cannot see: push fires only after a branch has
+# already moved, so a push-only gate never runs on the change under review.
+T="${WORK}/lint-push-only"
+make_lint_repo "${T}"
+recommit_lint_triggers "${T}" "$(
+  printf '  push:\n    branches:\n      - main\n'
+  lint_paths_block 4 "${DEFAULT_PATH_FILTERS}"
+)"
+run_lint_filters "${T}"
+check "scaffold lint: a gate running on pushes but no pull request fails \
+closed" 1 \
+  "runs on no pull request"
+
+# A base-branch restriction exempts every pull request into any other branch,
+# which is exactly where a release branch's changes land.
+T="${WORK}/lint-pr-branch-restricted"
+make_lint_repo "${T}"
+recommit_lint_triggers "${T}" "$(
+  printf '  pull_request:\n    branches:\n      - main\n'
+  lint_paths_block 4 "${DEFAULT_PATH_FILTERS}"
+)"
+run_lint_filters "${T}"
+check "scaffold lint: a pull_request trigger restricted to one base branch \
+fails closed" 1 \
+  "restricts its pull_request trigger with branches"
+
+T="${WORK}/lint-pr-branch-excluded"
+make_lint_repo "${T}"
+recommit_lint_triggers "${T}" "$(
+  printf '  pull_request:\n    branches-ignore:\n      - "release/**"\n'
+  lint_paths_block 4 "${DEFAULT_PATH_FILTERS}"
+)"
+run_lint_filters "${T}"
+check "scaffold lint: a pull_request trigger excluding a branch family fails \
+closed" 1 \
+  "restricts its pull_request trigger with branches-ignore"
+
+# The subtler one: without synchronize the gate runs when the pull request
+# opens and never again on what is pushed into it afterwards.
+T="${WORK}/lint-pr-types-narrowed"
+make_lint_repo "${T}"
+recommit_lint_triggers "${T}" "$(
+  printf '  pull_request:\n    types:\n      - opened\n      - reopened\n'
+  lint_paths_block 4 "${DEFAULT_PATH_FILTERS}"
+)"
+run_lint_filters "${T}"
+check "scaffold lint: a pull_request trigger narrowed away from synchronize \
+fails closed" 1 \
+  "activity types missing synchronize"
+
+# Widening past the default set leaves every state the gate already ran in
+# still covered, so it is accepted.
+T="${WORK}/lint-pr-types-widened"
+make_lint_repo "${T}"
+recommit_lint_triggers "${T}" "$(
+  printf '  pull_request:\n    types:\n      - opened\n      - synchronize\n'
+  printf '      - reopened\n      - ready_for_review\n'
+  lint_paths_block 4 "${DEFAULT_PATH_FILTERS}"
+)"
+run_lint_filters "${T}"
+check "scaffold lint: a pull_request trigger widened past the default types \
+is accepted" 0 \
+  "runs on every change to the 13 tracked input\(s\)"
+
+# A push trigger restricted to one branch is not a hole: the pull_request
+# trigger beside it is what holds the merge, and refusing this would only push
+# maintainers to delete the push trigger instead.
+T="${WORK}/lint-push-branch-restricted"
+make_lint_repo "${T}"
+run_lint_filters "${T}"
+check "scaffold lint: a push trigger restricted to one branch is accepted \
+beside an unrestricted pull_request" 0 \
+  "on all 2 push/pull-request trigger\(s\)"
 
 # --- contracts toolchain: the parity the stage's evidence claims ------------
 #

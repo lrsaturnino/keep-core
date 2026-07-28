@@ -28,18 +28,28 @@ name: Cutover Scaffold Lint
 # this build, which rewrites the whole context classification without
 # touching the file the classification used to be derived from.
 #
-# These lists are not maintained by hand: shell-analysis resolves the
-# Dockerfile the rehearsal workflow's build step really compiles and requires
-# both lists below to cover it, the ignore file its name selects, the root
-# .dockerignore, and all three workflows. Moving the build onto another
-# Dockerfile without moving these entries with it fails that check — the
-# entries are what makes this gate run when those files change at all.
+# These lists are not maintained by hand, and are not trusted by inspection:
+# shell-analysis enumerates the inputs out of the commit itself — the three
+# workflows, the Dockerfile the rehearsal workflow's build step really
+# compiles, the ignore file that name selects, the root .dockerignore, every
+# file under the scaffold directory, and every committed .gitignore and
+# Makefile — and requires both lists below to run on each one. It reads them
+# the way the workflow parser does, last matching entry winning, so an entry
+# listed here and negated further down is not coverage either. Moving the
+# build onto another Dockerfile, or adding a gen/ Makefile, without moving
+# these entries with it fails that check.
 #
 # contracts-ecdsa.yml is listed for the same reason: the contracts stage's
 # evidence claims to reproduce one of its jobs, and shell-analysis holds both
 # that stage and the rehearsal workflow's own setup-node to the Node release
 # that job pins. A bump there touches no line under scripts/ and would
 # otherwise leave the claim standing over a run that no longer reproduces it.
+#
+# The pull_request trigger carries no branches or types restriction on
+# purpose, and shell-analysis refuses one: push fires only after a branch has
+# already moved, so the pull_request event is the only one that can stop a
+# change to these inputs from merging unchecked, and every restriction of it
+# exempts some pull request from the gate.
 
 on:
   push:
@@ -58,6 +68,7 @@ on:
       - "**/.gitignore"
       - "Dockerfile"
       - "Makefile"
+      - "**/Makefile"
   pull_request:
     paths:
       - "scripts/release/pr4109/**"
@@ -70,6 +81,7 @@ on:
       - "**/.gitignore"
       - "Dockerfile"
       - "Makefile"
+      - "**/Makefile"
   workflow_dispatch:
 
 permissions:

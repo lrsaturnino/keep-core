@@ -73,6 +73,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 EVIDENCE_DIR="${EVIDENCE_DIR:-${SCRIPT_DIR}/rehearsal-evidence}"
 
+# Where this scaffold lives inside the repository, resolved from the two paths
+# above rather than restated. The gate below has to run on every change to the
+# scaffold's own code, and naming that directory a second time is exactly the
+# restatement that would go stale the first time the scaffold moved.
+SCAFFOLD_DIR="${SCRIPT_DIR#"${REPO_ROOT}/"}"
+
 # The commit verify_source_binding proved the tree under test to be, empty
 # until it has proved one. Only a caller-supplied binding can establish an
 # identity a stage may stamp into evidence; an unbound run leaves this empty
@@ -881,8 +887,9 @@ context ${BUILD_CONTEXT}"
 # would keep passing, on a file nobody was told had changed.
 #
 # A trigger carrying no filter at all runs on every change and so covers
-# everything; what this refuses is a gate reachable only by remembering to
-# dispatch it, which is the state this workflow exists to end.
+# everything; what this refuses is a gate that some class of change can get
+# past — reachable only by remembering to dispatch it, restricted away from
+# the merges it exists to hold, or listing an input it later negates again.
 verify_scaffold_lint_path_filters() {
   local content
   content="$(git -C "${REPO_ROOT}" show "HEAD:${SCAFFOLD_LINT_WORKFLOW}" \
@@ -893,14 +900,7 @@ mirrors"
 
   yaml_index_lines "${SCAFFOLD_LINT_WORKFLOW}" "${content}"
 
-  LINT_REQUIRED_INPUTS=(
-    "${REHEARSAL_WORKFLOW}"
-    "${SCAFFOLD_LINT_WORKFLOW}"
-    "${CONTRACTS_WORKFLOW}"
-    "${BUILD_DOCKERFILE}"
-    "${BUILD_DOCKERFILE}.dockerignore"
-    ".dockerignore"
-  )
+  load_lint_required_inputs
   LINT_FILTER_MISSING=""
 
   local i on_line=-1
@@ -914,7 +914,7 @@ mirrors"
     fail "${SCAFFOLD_LINT_WORKFLOW} declares no triggers this parser can read, \
 so nothing says when the gate holding this script to the build inputs runs"
 
-  local on_end trigger_indent=-1 covered=0
+  local on_end trigger_indent=-1 covered=0 merges=0
   on_end="$(yaml_block_end "$((on_line + 1))" 1)"
   for ((i = on_line + 1; i < on_end; i++)); do
     ((YAML_INDENTS[i] < 0)) && continue
@@ -924,25 +924,31 @@ so nothing says when the gate holding this script to the build inputs runs"
     'push:' | 'pull_request:')
       verify_lint_trigger_filters "${i}" "${trigger_indent}"
       covered=$((covered + 1))
+      [[ "${YAML_BODIES[i]}" == 'pull_request:' ]] && merges=1
       ;;
     esac
   done
 
-  ((covered > 0)) ||
-    fail "${SCAFFOLD_LINT_WORKFLOW} runs on no push or pull request, so the \
-build-context classification in this script is only ever rechecked when \
-somebody remembers to dispatch it"
+  # A push trigger is not the merge gate: it fires after the branch already
+  # moved, and on a repository that merges by pull request it never fires on
+  # the release branch at all. Only a pull_request trigger can stop a change
+  # to these inputs from landing unchecked, so its absence is refused however
+  # many other events the workflow names.
+  ((merges > 0)) ||
+    fail "${SCAFFOLD_LINT_WORKFLOW} runs on no pull request, so a change to \
+the build inputs the classification in this script mirrors can merge without \
+the gate that holds the two together ever having run"
 
   if [[ -n "${LINT_FILTER_MISSING}" ]]; then
     printf '%s' "${LINT_FILTER_MISSING}" >&2
-    fail "${SCAFFOLD_LINT_WORKFLOW} no longer runs on every build input the \
-build-context classification in this script is derived from (listing above); \
-a change to an uncovered one would retire rules this scaffold never rechecks"
+    fail "${SCAFFOLD_LINT_WORKFLOW} no longer runs on every input this \
+scaffold's trust model is derived from (listing above); a change to an \
+uncovered one would retire rules this scaffold never rechecks"
   fi
 
   note "scaffold lint: ${SCAFFOLD_LINT_WORKFLOW} runs on every change to the \
-${#LINT_REQUIRED_INPUTS[@]} build input(s) this classification is derived \
-from, on all ${covered} push/pull-request trigger(s)"
+${#LINT_REQUIRED_INPUTS[@]} tracked input(s) this scaffold's trust model is \
+derived from, on all ${covered} push/pull-request trigger(s)"
 }
 
 # The inputs a filter list has to cover and the ones a run found uncovered.
@@ -953,13 +959,120 @@ from, on all ${covered} push/pull-request trigger(s)"
 LINT_REQUIRED_INPUTS=()
 LINT_FILTER_MISSING=""
 
-# One push or pull_request trigger's path filter.
+# Every path a change to which can move what this scaffold accepts, read out
+# of the commit under test rather than listed by hand — a hand-kept list is
+# trusted by inspection, and the whole point of this gate is that nothing
+# here is.
+#
+# Four classes, each one something this script really reads:
+#
+#   the three workflows      one names the build step every classification
+#                            below is resolved from, one is this gate itself,
+#                            and one pins the toolchain the contracts stage
+#                            claims to reproduce
+#   the build's ignore rules the resolved Dockerfile, the ignore file its name
+#                            selects, and the root .dockerignore that applies
+#                            only while no such file exists — the last two are
+#                            required whether or not the commit carries them,
+#                            because adding one retires the other's every rule
+#   the scaffold itself      the checkers deciding what may be accepted as
+#                            release evidence, all of them, not just the ones
+#                            written in shell
+#   ignore and build rules   every committed .gitignore, root and nested,
+#                            because build-image mode classifies untracked
+#                            paths under the restored ones; and every
+#                            committed Makefile, because the regeneration the
+#                            gen/ classification models is what they run
+load_lint_required_inputs() {
+  local path
+  LINT_REQUIRED_INPUTS=()
+  while IFS= read -r path; do
+    [[ -n "${path}" ]] && LINT_REQUIRED_INPUTS+=("${path}")
+  done < <(
+    {
+      printf '%s\n' \
+        "${REHEARSAL_WORKFLOW}" \
+        "${SCAFFOLD_LINT_WORKFLOW}" \
+        "${CONTRACTS_WORKFLOW}" \
+        "${BUILD_DOCKERFILE}" \
+        "${BUILD_DOCKERFILE}.dockerignore" \
+        '.dockerignore'
+      git -C "${REPO_ROOT}" ls-tree -r --name-only HEAD |
+        {
+          grep -E "^${SCAFFOLD_DIR}/|(^|/)\.gitignore$|(^|/)Makefile$" || true
+        }
+    } | sort -u
+  )
+}
+
+# GitHub's filter-pattern grammar, which is not the glob grammar the build's
+# ignore rules are written in: `*` stops at a separator and `**` does not, and
+# a leading `!` is handled by the caller because it negates the patterns
+# before it rather than anything inside its own.
+lint_pattern_regex() {
+  local pattern="$1" out="^" i ch
+  for ((i = 0; i < ${#pattern}; i++)); do
+    ch="${pattern:i:1}"
+    if [[ "${ch}" == '*' ]]; then
+      if [[ "${pattern:i+1:1}" == '*' ]]; then
+        i=$((i + 1))
+        out+='.*'
+      else
+        out+='[^/]*'
+      fi
+    elif [[ '.(){}|^$' == *"${ch}"* ]]; then
+      out+="\\${ch}"
+    else
+      out+="${ch}"
+    fi
+  done
+  printf '%s$' "${out}"
+}
+
+# The characters this grammar gives a meaning that reading them literally
+# would get wrong, and that this script has no translation for. `?` and `+`
+# quantify the character before them here rather than standing for one of any
+# character — the reading the build's ignore rules would give them — so a
+# required path measured against either would be measured wrong.
+lint_pattern_unmodelled_construct() {
+  local pattern="$1" i ch
+  for ((i = 0; i < ${#pattern}; i++)); do
+    ch="${pattern:i:1}"
+    if [[ '?+[]' == *"${ch}"* || "${ch}" == $'\\' ]]; then
+      printf '%s' "${ch}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# One trigger's compiled filter list, in the order it was written: the verdict
+# a pattern carries when it matches (0 covers, 1 excludes again) travels beside
+# it because order is what decides, and a later negation of an earlier listing
+# is exactly the shape a coverage check reading membership cannot see.
+LINT_FILTER_REGEX=()
+LINT_FILTER_VERDICT=()
+
+# Whether the compiled list above runs on a change to one path. GitHub reads
+# the whole list and lets the last matching entry decide, so this does too; a
+# path no entry matches at all is not covered.
+lint_filter_covers() {
+  local path="$1" i verdict=1
+  for ((i = 0; i < ${#LINT_FILTER_REGEX[@]}; i++)); do
+    [[ "${path}" =~ ${LINT_FILTER_REGEX[i]} ]] || continue
+    verdict="${LINT_FILTER_VERDICT[i]}"
+  done
+  return "${verdict}"
+}
+
+# One push or pull_request trigger: the events it really fires on, and the
+# paths it really runs for.
 verify_lint_trigger_filters() {
   local line="$1" trigger_indent="$2"
   local trigger="${YAML_BODIES[line]%:}" end key_indent=-1
-  local i j body listed paths_line=-1 entry entries=0
-  end="$(yaml_block_end "$((line + 1))" "$((trigger_indent + 1))")"
+  local i j body paths_line=-1 entry entries=0 bad negated
 
+  end="$(yaml_block_end "$((line + 1))" "$((trigger_indent + 1))")"
   for ((i = line + 1; i < end; i++)); do
     ((YAML_INDENTS[i] < 0)) && continue
     ((key_indent < 0)) && key_indent="${YAML_INDENTS[i]}"
@@ -972,12 +1085,16 @@ verify_lint_trigger_filters() {
 paths-ignore, which this check cannot read as coverage of the build inputs the \
 classification in this script mirrors"
     [[ "${body}" == 'paths:' ]] && paths_line="${i}"
+    if [[ "${trigger}" == 'pull_request' ]]; then
+      verify_lint_pull_request_reach "${i}" "${key_indent}" "${body}"
+    fi
   done
 
-  # No filter at all is the whole repository: every build input is covered.
+  # No filter at all is the whole repository: every required input is covered.
   ((paths_line >= 0)) || return 0
 
-  listed=""
+  LINT_FILTER_REGEX=()
+  LINT_FILTER_VERDICT=()
   end="$(yaml_block_end "$((paths_line + 1))" "$((key_indent + 1))")"
   for ((j = paths_line + 1; j < end; j++)); do
     ((YAML_INDENTS[j] < 0)) && continue
@@ -988,7 +1105,18 @@ entry this parser can read"
     entry="$(yaml_scalar_value "${body#-}")" ||
       fail "${SCAFFOLD_LINT_WORKFLOW} line $((j + 1)) quotes its path filter \
 in a form this parser does not read"
-    listed+="${entry}"$'\n'
+    negated=0
+    if [[ "${entry}" == '!'* ]]; then
+      negated=1
+      entry="${entry#!}"
+    fi
+    if bad="$(lint_pattern_unmodelled_construct "${entry}")"; then
+      fail "${SCAFFOLD_LINT_WORKFLOW} line $((j + 1)) filters on [${entry}], \
+whose [${bad}] this script has no reading for; a required input measured \
+against a guess would be reported covered on a guess"
+    fi
+    LINT_FILTER_REGEX+=("$(lint_pattern_regex "${entry}")")
+    LINT_FILTER_VERDICT+=("${negated}")
     entries=$((entries + 1))
   done
 
@@ -998,10 +1126,58 @@ path list, which no change matches; the gate holding this script to the build \
 inputs would never run"
 
   for entry in "${LINT_REQUIRED_INPUTS[@]}"; do
-    grep -qxF -- "${entry}" <<<"${listed}" ||
+    lint_filter_covers "${entry}" ||
       LINT_FILTER_MISSING+="${SCAFFOLD_LINT_WORKFLOW} line \
 $((paths_line + 1)): the ${trigger} filter list does not cover ${entry}"$'\n'
   done
+}
+
+# The pull_request event states and base branches a run really covers.
+#
+# A restriction on either is invisible to a check that reads only paths, and
+# both leave the same hole: a change to these inputs that merges without this
+# gate having run on it. `branches` is refused outright rather than compared
+# against a branch name — naming the branch here would be one more restated
+# constant, and every restriction of it exempts some merge. `types` is read,
+# because narrowing it is the subtler hole: a list without `synchronize` runs
+# once when the pull request opens and never again on what is pushed into it
+# afterwards, which is to say never on the change that actually merges.
+verify_lint_pull_request_reach() {
+  local line="$1" key_indent="$2" body="$3"
+  local end j entry seen="" want required=""
+
+  case "${body}" in
+  'branches:' | 'branches-ignore:')
+    fail "${SCAFFOLD_LINT_WORKFLOW} restricts its pull_request trigger with \
+${body%:}, so a pull request into any branch that restriction leaves out \
+merges a change to these inputs without this gate having run"
+    ;;
+  'types:') ;;
+  *) return 0 ;;
+  esac
+
+  end="$(yaml_block_end "$((line + 1))" "$((key_indent + 1))")"
+  for ((j = line + 1; j < end; j++)); do
+    ((YAML_INDENTS[j] < 0)) && continue
+    body="${YAML_BODIES[j]}"
+    [[ "${body}" == '-'[[:space:]]* ]] ||
+      fail "${SCAFFOLD_LINT_WORKFLOW} line $((j + 1)) is not a pull_request \
+activity type this parser can read"
+    entry="$(yaml_scalar_value "${body#-}")" ||
+      fail "${SCAFFOLD_LINT_WORKFLOW} line $((j + 1)) quotes its pull_request \
+activity type in a form this parser does not read"
+    seen+="${entry}"$'\n'
+  done
+
+  # The three the event carries when nothing narrows it. A list may widen past
+  # them; dropping one is what leaves a pull request state this never runs in.
+  for want in opened synchronize reopened; do
+    grep -qxF -- "${want}" <<<"${seen}" || required+=" ${want}"
+  done
+  [[ -z "${required}" ]] ||
+    fail "${SCAFFOLD_LINT_WORKFLOW} narrows its pull_request trigger to \
+activity types missing${required}, leaving pull request states in which a \
+change to these inputs is never rechecked"
 }
 
 # Compile the ignore rules the build itself reads, from the commit under
