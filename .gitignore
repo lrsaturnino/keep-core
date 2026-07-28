@@ -97,5 +97,10 @@ dist/
 .DS_Store
 build/
 
-# Locally produced cutover rehearsal evidence (rehearse.sh)
+# Locally produced cutover rehearsal evidence (rehearse.sh). The rehearsal
+# workflow writes into the workspace root instead of the script's own
+# default, and every proof stage refuses to run on a tree that diverges from
+# the dispatched commit — untracked files included — so both locations have
+# to be ignore rules the commit itself carries.
 scripts/release/pr4109/rehearsal-evidence/
+/rehearsal-evidence/

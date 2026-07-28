@@ -104,26 +104,54 @@ anything until it holds the receipt proving that. `local-proofs` writes it
 under `EVIDENCE_DIR/attestation` as its last step, after every proof has
 passed: `release-manifest validate` accepts the reviewed file against the
 compiled bounds, `release-manifest derive` records the bounds themselves in
-`derived-manifest.json`, and `reviewed-manifest.sha256` names the exact
-bytes that were validated. `validate-evidence` requires both files, the
-hash to match the manifest as it stands now, and the derived bounds to
-match the reviewed ones field by field — hash-matching alone would accept
-an attestation and a manifest regenerated together around numbers no
-compiled binary produces. Only the free-form notes and the generation
-stamp may differ, and keys are canonically ordered so reformatting a
-reviewed manifest cannot read as drift. The attestation lives in a
-subdirectory because the record glob and the workflow's record probe both
-look at the top level of `EVIDENCE_DIR` only: writing the receipt never
-makes a dispatch that produced no rehearsal record look like it produced
-one. Running `validate-evidence` without a matching attestation is
-BLOCKED, not accepted — regenerate it by re-running `local-proofs` at the
-same commit. The validator proves itself before validating anything:
-`test-validate-evidence.sh` drives the stage over fixture records —
-correct binding, wrong hash, wrong grace, missing binding fields,
-malformed timestamp, empty record set — and over fixture attestations —
-absent, taken over other manifest bytes, contradicting the reviewed
-bounds, and one differing only in notes, stamp, and key order — and the
-stage runs that self-test first on every invocation. The
+`derived-manifest.json`, `reviewed-manifest.sha256` names the exact bytes
+that were validated, and `source-commit.txt` names the commit those bounds
+were compiled from. `validate-evidence` requires all three files, the hash
+to match the manifest as it stands now, and the derived bounds to match the
+reviewed ones field by field — hash-matching alone would accept an
+attestation and a manifest regenerated together around numbers no compiled
+binary produces. Only the free-form notes and the generation stamp may
+differ, and keys are canonically ordered so reformatting a reviewed
+manifest cannot read as drift. The attestation lives in a subdirectory
+because the record glob and the workflow's record probe both look at the
+top level of `EVIDENCE_DIR` only: writing the receipt never makes a
+dispatch that produced no rehearsal record look like it produced one.
+Running `validate-evidence` without a matching attestation is BLOCKED, not
+accepted — regenerate it by re-running `local-proofs` at the same commit.
+
+A receipt belongs to one run at one commit, and three rules keep it that
+way. `local-proofs` destroys the receipt it inherits — interrupted staging
+directories included — *before* it proves anything, so a run failing at any
+proof leaves nothing behind; without that, a reused evidence directory kept
+whichever earlier run happened to succeed in it and the acceptance stage
+read that as this run's receipt. The new receipt is built beside its
+destination and published by a single rename, so a reader sees a complete
+receipt or none, never a half-written one or parts from two runs. And the
+receipt carries the commit the binding check *proved* rather than the raw
+stamp — `build-image` mode verifies a tree that legitimately diverges from
+`HEAD`, so the raw stamp would call the very tree it just accepted `-dirty`
+— which `validate-evidence` then requires to equal both its own
+`PR4109_EXPECTED_SOURCE_COMMIT` and every record's `source_sha`. A receipt
+taken at one commit can otherwise admit records from another whenever the
+manifest bytes did not change between them, since the hash and bounds
+comparisons have nothing to see in that case. Anything but a clean 40-hex
+commit — a `-dirty` stamp, the `unknown` of a run outside a checkout — is
+refused outright, and `validate-evidence` verifies its own source binding
+like any other proof stage, because the manifest, schema, and comparison
+rules it judges by all come out of the tree it runs from.
+
+The validator proves itself before validating anything:
+`test-validate-evidence.sh` drives the stage over fixture records — correct
+binding, wrong hash, wrong grace, wrong source commit, missing binding
+fields, malformed timestamp, empty record set — over fixture attestations —
+absent, incomplete, a leftover staging directory, taken over other manifest
+bytes, contradicting the reviewed bounds, taken at another commit than the
+run is bound to, taken on a divergent tree, and one differing only in
+notes, stamp, and key order — over a divergent tree the stage must refuse
+to judge from, and over the invalidation itself, and the stage runs that
+self-test first on every invocation. Its cases run against throwaway git
+checkouts it creates, not against the working tree, so every verdict is the
+same mid-edit on a workstation and on a bound CI dispatch. The
 `cutover-rehearsal` workflow (manually dispatched, in
 `.github/workflows/cutover-rehearsal.yml`) runs the local proofs, the
 static analyzers, and the contracts build/test on every dispatch — and the
@@ -172,6 +200,13 @@ runs both as an early workflow step on the runner and inside
 `local-proofs`, so its verdicts land in the archived evidence.
 `./rehearse.sh verify-source-binding` runs the binding check alone and
 records it under `EVIDENCE_DIR`.
+
+The rehearsal workflow writes its evidence into the workspace root rather
+than the script's own default, and every proof stage refuses to run on a
+tree that diverges from the dispatched commit — untracked files included —
+so `/rehearsal-evidence/` is an ignore rule the repository's root
+`.gitignore` carries alongside the script-local one. Without it a stage's
+own log would count as divergence and fail the stage that wrote it.
 
 On a hosted runner the per-node keystore comes from the
 `REHEARSAL_KEYSTORE_BUNDLE_B64` repository secret: a base64-encoded tar.gz

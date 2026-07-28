@@ -138,7 +138,16 @@ jobs:
       # written by local-proofs into the same bind-mounted evidence
       # directory, one level down, so it is here and it does not make the
       # top-level record probe below see a record that does not exist.
+      #
+      # The dispatched SHA is handed to this stage like to every other proof
+      # stage: the manifest, schema, and comparison rules it judges records
+      # by come out of this checkout, and the attestation and every record it
+      # accepts must name that same commit. Without the binding a receipt
+      # produced at one commit would admit records claiming another whenever
+      # the manifest bytes did not change between them.
       - name: Validate evidence records against the schema
+        env:
+          PR4109_EXPECTED_SOURCE_COMMIT: ${{ github.sha }}
         run: |
           if compgen -G "${{ github.workspace }}/rehearsal-evidence/*.json" > /dev/null; then
             EVIDENCE_DIR=${{ github.workspace }}/rehearsal-evidence \

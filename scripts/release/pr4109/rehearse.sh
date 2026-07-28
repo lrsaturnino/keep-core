@@ -50,13 +50,24 @@
 # stage enforces both, self-testing its own checker first. Those comparisons
 # only speak for the release while that manifest still matches the compiled
 # bounds, so local-proofs attests it under EVIDENCE_DIR/attestation and
-# validate-evidence refuses to measure a record without that receipt.
+# validate-evidence refuses to measure a record without that receipt. The
+# receipt belongs to one run at one commit: local-proofs destroys the
+# inherited one before it proves anything and publishes its own by atomic
+# rename only after every proof passed, stamping the commit the binding
+# check proved, and validate-evidence requires that stamp to equal both its
+# own binding and every record's source_sha.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 EVIDENCE_DIR="${EVIDENCE_DIR:-${SCRIPT_DIR}/rehearsal-evidence}"
+
+# The commit verify_source_binding proved the tree under test to be, empty
+# until it has proved one. Only a caller-supplied binding can establish an
+# identity a stage may stamp into evidence; an unbound run leaves this empty
+# and falls back to the tree's own (possibly -dirty) stamp.
+VERIFIED_SOURCE_COMMIT=""
 
 usage() {
   cat <<'EOF'
@@ -75,9 +86,12 @@ stages:
                       integration-tag compile proof; self-tests the
                       source-binding and evidence-record validators first
                       (the latter needs node/npx), reports every skipped
-                      case explicitly, and ends by attesting the checked-in
-                      release manifest against the compiled bounds under
-                      EVIDENCE_DIR/attestation (runs today, no Docker)
+                      case explicitly, discards any inherited
+                      EVIDENCE_DIR/attestation before proving anything, and
+                      ends by attesting the checked-in release manifest
+                      against the compiled bounds — stamped with the commit
+                      the binding check proved — into that directory by
+                      atomic rename (runs today, no Docker)
   static-analysis     run the static analyzers CI enforces on the Go tree,
                       every tool at an immutable version: gofmt, go vet
                       over ./... (strictly wider than CI's root-only vet),
@@ -111,8 +125,11 @@ stages:
                       manifest hash and the termination grace the fleet ran
                       under — to match the checked-in reviewed manifest;
                       requires the local-proofs attestation proving that
-                      manifest still matches the compiled bounds, and
-                      self-tests its own checker first
+                      manifest still matches the compiled bounds, requires
+                      the attestation, every record, and this run's own
+                      binding to name one commit, verifies its own source
+                      binding like any proof stage, and self-tests its
+                      checker first
 
 environment (every proof stage):
   PR4109_EXPECTED_SOURCE_COMMIT
@@ -419,6 +436,14 @@ produce evidence for bytes that are not the dispatched commit"
 build-image"
     ;;
   esac
+
+  # Reaching here means the tested bytes were proved to be this commit's:
+  # fail and blocked both exit. Later steps in the same stage stamp their
+  # output with this identity rather than re-deriving it, because the raw
+  # stamp cannot express what was proved — build-image mode verifies a tree
+  # that legitimately diverges from HEAD, so source_commit would call the
+  # very tree this function just accepted -dirty.
+  VERIFIED_SOURCE_COMMIT="${expected}"
 }
 
 require_env() {
@@ -446,6 +471,36 @@ require_immutable_digest() {
 # rehearsal record.
 attestation_dir() { printf '%s\n' "${EVIDENCE_DIR}/attestation"; }
 
+# The source identity a receipt written now may claim: what the binding
+# check proved, or — for an unbound run — the tree's own stamp, which carries
+# its -dirty marker and its outside-a-checkout "unknown" with it. The
+# acceptance stage refuses anything but a clean commit id, so an unbound or
+# divergent run still produces a receipt; it just produces one that cannot
+# launder bytes into release evidence.
+attested_source_identity() {
+  if [[ -n "${VERIFIED_SOURCE_COMMIT}" ]]; then
+    printf '%s' "${VERIFIED_SOURCE_COMMIT}"
+    return
+  fi
+  source_commit
+}
+
+# A receipt speaks for the run that wrote it and for no other, so every proof
+# run destroys the receipt it inherits before it proves anything. Evidence
+# directories get reused — a re-dispatch into the same workspace, a local
+# iteration loop — and without this a run failing anywhere before the
+# attestation step would leave its predecessor's receipt standing for the
+# acceptance stage to find and accept. Interrupted staging directories go the
+# same way, so no fragment of an older run survives into this one.
+invalidate_release_manifest_attestation() {
+  local dir
+  dir="$(attestation_dir)"
+  if [[ -e "${dir}" ]]; then
+    note "discarding the release-manifest attestation inherited in ${dir}"
+  fi
+  rm -rf "${dir}" "${dir}".staging.*
+}
+
 # The acceptance stage judges a rehearsal record by comparing it against the
 # checked-in release manifest, but that manifest only speaks for the release
 # while it still matches this binary's compiled bounds. The Go proofs pin that
@@ -455,9 +510,16 @@ attestation_dir() { printf '%s\n' "${EVIDENCE_DIR}/attestation"; }
 # carrying a toolchain of its own.
 attest_release_manifest() {
   local manifest="${SCRIPT_DIR}/release-manifest.json"
-  local dir
+  local dir staging
   dir="$(attestation_dir)"
-  mkdir -p "${dir}"
+  # Build the receipt beside its destination and publish it with a single
+  # rename, so a reader sees this run's complete receipt or no receipt at
+  # all. Writing the files straight into the destination would publish a
+  # half-built receipt while it is being written, and would let files from
+  # two different runs end up sitting in one directory.
+  staging="${dir}.staging.$$"
+  rm -rf "${staging}"
+  mkdir -p "${staging}"
 
   note "attesting the release manifest against the compiled bounds"
   # validate is the binary's own reviewed check: it rejects a manifest whose
@@ -468,10 +530,22 @@ attest_release_manifest() {
   # derive emits the manifest the compiled bounds produce, so the receipt
   # carries those bounds themselves rather than an assertion about them, and
   # the hash names the exact reviewed bytes validate just accepted.
-  go run . release-manifest derive >"${dir}/derived-manifest.json"
-  hash_stdin <"${manifest}" >"${dir}/reviewed-manifest.sha256"
+  go run . release-manifest derive >"${staging}/derived-manifest.json"
+  hash_stdin <"${manifest}" >"${staging}/reviewed-manifest.sha256"
 
-  note "release-manifest attestation written to ${dir}"
+  # The commit these bounds were compiled from. The acceptance stage requires
+  # every record it measures to name this same commit, so a receipt can never
+  # vouch for records built from other bytes — the case the manifest hash
+  # alone misses entirely, since a manifest that did not change between two
+  # commits hashes the same at both.
+  attested_source_identity >"${staging}/source-commit.txt"
+  printf '\n' >>"${staging}/source-commit.txt"
+
+  rm -rf "${dir}"
+  mv "${staging}" "${dir}"
+
+  note "release-manifest attestation written to ${dir} for source \
+$(tr -d '[:space:]' <"${dir}/source-commit.txt")"
 }
 
 stage_local_proofs() {
@@ -480,6 +554,12 @@ stage_local_proofs() {
   local log="${EVIDENCE_DIR}/local-proofs.log"
 
   (
+    # Before anything is proved, so no proof below can fail while an earlier
+    # run's receipt stays behind to be accepted in this run's name. Runs
+    # ahead of the cd because EVIDENCE_DIR may be relative to the caller's
+    # directory.
+    invalidate_release_manifest_attestation
+
     cd "${REPO_ROOT}"
     # The verifier gates every piece of evidence below, so it proves itself
     # first: the self-test builds throwaway repositories shaped like the
@@ -694,16 +774,43 @@ stage_verify_source_binding() {
 # beside an edited manifest.
 require_manifest_attestation() {
   local manifest="${SCRIPT_DIR}/release-manifest.json"
-  local dir derived reviewed_hash
+  local dir derived reviewed_hash source_file
   dir="$(attestation_dir)"
   derived="${dir}/derived-manifest.json"
   reviewed_hash="${dir}/reviewed-manifest.sha256"
+  source_file="${dir}/source-commit.txt"
 
-  if [[ ! -f "${derived}" || ! -f "${reviewed_hash}" ]]; then
-    blocked "no release-manifest attestation under ${dir}; run the \
+  # All three or none: a receipt missing any part is a fragment, and a
+  # fragment must never be read as a receipt — which is also what keeps an
+  # interrupted staging directory from ever standing in for one.
+  if [[ ! -f "${derived}" || ! -f "${reviewed_hash}" || ! -f "${source_file}" ]]; then
+    blocked "no complete release-manifest attestation under ${dir}; run the \
 local-proofs stage at the same commit first — without it nothing here \
 proves the manifest these records are measured against still matches the \
 compiled bounds"
+  fi
+
+  # A receipt names the tree its bounds were compiled from. Anything but a
+  # clean commit id — the -dirty stamp of a divergent tree, the "unknown" of
+  # a run outside a checkout — means those bounds came from bytes no commit
+  # accounts for, so the receipt carries no provenance for anything.
+  local attested_source
+  attested_source="$(tr -d '[:space:]' <"${source_file}")"
+  if [[ ! "${attested_source}" =~ ^[0-9a-f]{40}$ ]]; then
+    blocked "the release-manifest attestation under ${dir} was taken at \
+source [${attested_source:-absent}], which is not a clean commit; re-run the \
+local-proofs stage on a checkout bound to the dispatched commit"
+  fi
+
+  # A receipt from another commit would otherwise vouch for this one whenever
+  # the manifest bytes happened not to change between the two — the hash and
+  # bounds comparisons below cannot see the difference, because there is none
+  # to see in them.
+  local expected="${PR4109_EXPECTED_SOURCE_COMMIT:-}"
+  if [[ -n "${expected}" && "${attested_source}" != "${expected}" ]]; then
+    blocked "the release-manifest attestation was taken at source \
+[${attested_source}], but this run is bound to [${expected}]; re-run the \
+local-proofs stage at the dispatched commit"
   fi
 
   local attested_sha manifest_sha
@@ -754,7 +861,15 @@ hashing to [${attested_sha:-absent}], but ${manifest} now hashes to \
 bounds recorded in ${derived} (differences above); these records are \
 measured against a manifest this release would reject"
 
-  note "release-manifest attestation binds ${manifest} to the compiled bounds"
+  note "release-manifest attestation binds ${manifest} to the compiled \
+bounds of ${attested_source}"
+}
+
+# The commit the receipt was taken at, for the record comparison below.
+# require_manifest_attestation has already proved it is a clean commit id and,
+# on a bound run, the dispatched one.
+attestation_source_commit() {
+  tr -d '[:space:]' <"$(attestation_dir)/source-commit.txt"
 }
 
 stage_validate_evidence() {
@@ -772,6 +887,12 @@ stage_validate_evidence() {
     PR4109_EVIDENCE_SELFTEST=1 "${SCRIPT_DIR}/test-validate-evidence.sh"
   fi
 
+  # This stage is a proof stage like any other: the manifest, the schema, and
+  # the comparison rules it judges records by all come out of the tree it is
+  # running from, so that tree has to be the dispatched commit before its
+  # verdict means anything.
+  verify_source_binding
+
   shopt -s nullglob
   local records=("${EVIDENCE_DIR}"/*.json)
   shopt -u nullglob
@@ -786,6 +907,8 @@ run that produced no record cannot be accepted"
     blocked "node (Node.js) is required to validate evidence records"
 
   require_manifest_attestation
+  local attested_source
+  attested_source="$(attestation_source_commit)"
 
   # Schema conformance requires the record to name a manifest hash and the
   # grace the fleet ran under; this cross-check requires both to match the
@@ -823,7 +946,23 @@ run that produced no record cannot be accepted"
       --spec=draft2020 -c ajv-formats -s "${schema}" -d "${record}" ||
       blocked "evidence record ${record} does not conform to ${schema}"
 
-    local recorded_sha recorded_grace
+    local recorded_source recorded_sha recorded_grace
+    # The record, the bounds it is judged by, and — on a bound run — the
+    # dispatch itself must all name one commit. Without this a record built
+    # from any other bytes validates as soon as it copies the right manifest
+    # hash and grace into itself.
+    recorded_source="$(node -e '
+      const fs = require("fs");
+      const record = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      process.stdout.write(String(record.source_sha || ""));
+    ' "${record}")"
+    if [[ "${recorded_source}" != "${attested_source}" ]]; then
+      blocked "evidence record ${record} was produced from source commit \
+[${recorded_source:-absent}], but the release-manifest attestation it is \
+measured against was taken at [${attested_source}]; a record and the \
+compiled bounds judging it must come from the same commit"
+    fi
+
     recorded_sha="$(node -e '
       const fs = require("fs");
       const record = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
@@ -850,8 +989,9 @@ grace is not evidence for this release"
     fi
   done
 
-  note "all evidence records conform to the schema and bind the reviewed \
-release manifest's hash and termination grace"
+  note "all evidence records conform to the schema, were produced at \
+${attested_source}, and bind the reviewed release manifest's hash and \
+termination grace"
 }
 
 # Sourceable for the source-binding self-test: dispatch only when executed.
