@@ -5660,6 +5660,31 @@ ROLLBACK_NODE_ACCOUNTS=""
 # The audited quarantine record counts, "<service> <count>", read from each
 # node's audit manifest after the audit has run.
 ROLLBACK_NODE_QUARANTINES=""
+# What became of the work this gate originated, asked of the driver once the
+# drain is over. A permit that was not force-canceled is only "completed" if
+# the ceremony behind it actually reached an outcome; the fleet's own gauge
+# falling to zero is equally what a process exiting while holding it looks
+# like, and the driver is the only party that can watch a ceremony settle on
+# chain.
+ROLLBACK_TERMINAL=""
+# 1 when the driver was asked for those outcomes at all.
+ROLLBACK_TERMINAL_ASKED=0
+
+# Of the ceremonies a gate originated, the ones the driver reported no terminal
+# outcome for. Space-joined, empty when every one of them ended somewhere.
+missing_terminal_ceremonies() {
+  local originated="$1" bound="$2" ceremony record uncovered="" covered
+  for ceremony in ${originated}; do
+    covered=0
+    for record in ${bound}; do
+      [[ "$(bound_ceremony "${record}")" == "${ceremony}" ]] || continue
+      covered=1
+      break
+    done
+    ((covered == 1)) || uncovered="${uncovered}${uncovered:+ }${ceremony}"
+  done
+  printf '%s' "${uncovered}"
+}
 
 # The verdict over that accounting.
 #
@@ -5724,6 +5749,17 @@ force-canceled, quarantine records ${quarantined:-unreadable})"
 force-canceled, no quarantine record)"
         continue
       fi
+      # One record cannot account for many abandoned permits. The audit writes
+      # a quarantine record per output it could not release, so a count short
+      # of the force-cancels leaves the difference as in-flight state the
+      # rollback restores onto with nothing describing it — which is the
+      # reading this reconciliation exists to refuse, not a weaker version of
+      # a record being present at all.
+      if ((quarantined < forced)); then
+        unaudited="${unaudited}${unaudited:+, }${service} (${forced} \
+force-canceled, only ${quarantined} quarantine record(s))"
+        continue
+      fi
       quarantined_total=$((quarantined_total + forced))
     fi
     completed_total=$((completed_total + held - forced))
@@ -5750,11 +5786,41 @@ state a rollback would restore onto carries no account of them"
 at the quiesce deadline that left no audited quarantine record behind is \
 in-flight state the rollback would restore onto with nothing describing it"
     record_assertion "${assertion}" false "${step}"
+  elif ((completed_total > 0)) && ((ROLLBACK_TERMINAL_ASKED == 0)); then
+    # The reading this rung exists for. A permit that was not force-canceled
+    # used to be counted as completed because the node was later seen without
+    # it — and a node that exited holding one is also a node later seen
+    # without it. Being gone is not an outcome.
+    block_step "${step}" "${completed_total} permit(s) left the fleet without \
+being force-canceled, but the driver was never asked what became of the work \
+behind them; a gauge that fell to zero is equally a ceremony that finished and \
+a process that exited holding it, and only one of those is a permit that \
+completed"
+    record_assertion "${assertion}" false "${step}"
+  elif ((completed_total > 0)) &&
+    [[ -n "$(missing_terminal_ceremonies "${ROLLBACK_ORIGINATED}" \
+      "${ROLLBACK_TERMINAL}")" ]]; then
+    block_step "${step}" "${completed_total} permit(s) left the fleet without \
+being force-canceled, but the driver reported no terminal outcome for \
+$(missing_terminal_ceremonies "${ROLLBACK_ORIGINATED}" \
+      "${ROLLBACK_TERMINAL}"); those permits reconcile to a gauge that fell \
+rather than to work that ended, and the state a rollback restores onto carries \
+no account of them"
+    record_assertion "${assertion}" false "${step}"
   else
+    local settled terminated accounted
+    settled="$(bound_settlements "${ROLLBACK_TERMINAL}")"
+    terminated="$(bound_terminations "${ROLLBACK_TERMINAL}")"
+    accounted="${settled}"
+    if [[ -n "${terminated}" ]]; then
+      accounted="${accounted}${accounted:+, }${terminated}"
+    fi
     record_step "${step}" pass "every permit the ${nodes} R1 node(s) held when \
 the stop was issued reconciles: ${completed_total} completed with the holding \
-node observed without them, and ${quarantined_total} were force-canceled at \
-the quiesce deadline and written into the audit's quarantine records"
+node observed without them and the driver accounting for every ceremony it \
+originated (${accounted}), and ${quarantined_total} were \
+force-canceled at the quiesce deadline and written into the audit's \
+quarantine records"
     record_assertion "${assertion}" true "${step}"
   fi
 }
@@ -6518,6 +6584,17 @@ reconciliation, quiescence, and prior-reader evidence"
   # force-canceled into a quarantine record the audit wrote — and the audit's
   # manifests are read here because that is where the quarantine records are.
   begin_step "every in-flight permit reconciles to completion or quarantine"
+  # What became of the work this gate put in flight, asked once the drain is
+  # over and the outcomes exist to be read. The drain phase itself cannot ask:
+  # its subject is work still running, and by the time an outcome exists the
+  # work it was about is finished.
+  ROLLBACK_TERMINAL=""
+  ROLLBACK_TERMINAL_ASKED=0
+  if [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
+    ROLLBACK_TERMINAL_ASKED=1
+    run_work_driver rollback-terminal || true
+    ROLLBACK_TERMINAL="${WORK_DRIVER_BOUND_RESULTS}"
+  fi
   ROLLBACK_NODE_QUARANTINES=""
   for service in "${REHEARSAL_R1_SERVICES[@]}"; do
     ROLLBACK_NODE_QUARANTINES="${ROLLBACK_NODE_QUARANTINES}\

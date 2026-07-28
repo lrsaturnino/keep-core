@@ -2252,6 +2252,8 @@ check "a drain whose exit status was never observed is not a quiescence" 1 \
 RECONCILE_STEP="every in-flight permit reconciles to completion or quarantine"
 RECONCILE_ASSERTION="every permit held at the stop completes or is audited \
 into quarantine"
+RECONCILE_TX="0xdd44444444444444444444444444444444444444444444444444444444444444"
+RECONCILE_TX2="0xee55555555555555555555555555555555555555555555555555555555555555"
 
 # One node that drained everything it held, and one that hit the deadline with
 # a permit the gate force-canceled and the audit wrote a quarantine record for.
@@ -2262,6 +2264,16 @@ r1-node-2 3 1 0"
   # shellcheck disable=SC2034
   ROLLBACK_NODE_QUARANTINES="r1-node-1 0
 r1-node-2 1"
+  # What this gate put in flight, and what the driver saw become of it once
+  # the drain was over. A permit that was not force-canceled is completed only
+  # if the ceremony behind it actually ended.
+  # shellcheck disable=SC2034
+  ROLLBACK_ORIGINATED="tbtc_signing tbtc_wallet_action"
+  # shellcheck disable=SC2034
+  ROLLBACK_TERMINAL_ASKED=1
+  # shellcheck disable=SC2034
+  ROLLBACK_TERMINAL="tbtc_signing=succeeded=${RECONCILE_TX}=0xsigned \
+tbtc_wallet_action=failed=${RECONCILE_TX2}=retry_exhausted"
 }
 
 reconcile_case() {
@@ -2272,8 +2284,10 @@ reconcile_case() {
 
 run_verdict reconcile_case :
 check "permits that completed or were audited into quarantine reconcile" 0 \
-  "4 completed with the holding node observed without them, and 1 were \
-force-canceled"
+  "4 completed with the holding node observed without them and the driver \
+accounting for every ceremony it originated" \
+  "tbtc_signing \(${RECONCILE_TX}, 0xsigned\), tbtc_wallet_action=failed" \
+  "and 1 were force-canceled"
 
 # The regression this step exists for: the fleet total went to zero because a
 # node exited holding its permits, which no aggregate count distinguishes from
@@ -2295,6 +2309,31 @@ run_verdict reconcile_case eval 'ROLLBACK_NODE_QUARANTINES="r1-node-1 0
 r1-node-2 unreadable"'
 check "an unreadable audit manifest audits no quarantine" 1 \
   "quarantine records unreadable"
+
+# The regression this rung exists for: a record was present, so the step used
+# to accept it however many permits the gate had abandoned. One record does not
+# describe three permits, and the difference is in-flight state the rollback
+# restores onto with nothing accounting for it.
+run_verdict reconcile_case eval 'ROLLBACK_NODE_ACCOUNTS="r1-node-1 2 0 0
+r1-node-2 3 2 0"
+   ROLLBACK_NODE_QUARANTINES="r1-node-1 0
+r1-node-2 1"'
+check "one quarantine record does not account for two force-cancels" 1 \
+  "r1-node-2 \(2 force-canceled, only 1 quarantine record"
+
+# And the reading a gauge cannot carry: the permits are gone, but nothing says
+# the work behind them ended rather than the process holding it exiting.
+run_verdict reconcile_case eval 'ROLLBACK_TERMINAL_ASKED=0
+   ROLLBACK_TERMINAL=""'
+check "a gauge that fell with nothing asked of the driver is not completion" \
+  3 "the driver was never asked what became of the work behind them"
+
+# The originated work is two classes and only one of them ended: the other's
+# permits reconcile to a gauge that fell rather than to work that finished.
+run_verdict reconcile_case eval \
+  "ROLLBACK_TERMINAL='tbtc_signing=succeeded=\${RECONCILE_TX}=0xsigned'"
+check "work the driver never accounted for reconciles nothing" 3 \
+  "no terminal outcome for tbtc_wallet_action"
 
 # An unreadable counter must not subtract like a zero; that is how a permit
 # nobody could account for disappears from a reconciliation.

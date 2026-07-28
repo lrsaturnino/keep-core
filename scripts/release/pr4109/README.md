@@ -315,7 +315,19 @@ deadline — which the gate counts and which the offline audit must have written
 a quarantine record for. A force-cancel with no quarantine record behind it is
 in-flight state the rollback would restore onto with nothing describing it, and
 an unreadable counter blocks rather than subtracting like a zero, which is how
-a permit nobody could account for would otherwise disappear from the sum.
+a permit nobody could account for would otherwise disappear from the sum. The
+records must also be *enough* of them: one record does not describe three
+abandoned permits, so a count short of the force-cancels leaves the difference
+unaccounted for and refutes the step.
+
+Neither is a permit simply "completed" because the gauge holding it fell.
+Being gone is what a ceremony that finished and a process that exited holding
+one both look like from outside. So the driver is asked, once the drain is
+over and the outcomes exist to be read, what became of the work this gate
+originated — the `rollback-terminal` phase — and every originated ceremony must
+have reached a terminal outcome. Permits that were not force-canceled reconcile
+against those outcomes rather than against the gauge, and a gate that never
+asked blocks rather than passing.
 
 The straggler control binds its roster entry to the straggler's own operator.
 The prior node publishes the address it signs as at `/diagnostics`
