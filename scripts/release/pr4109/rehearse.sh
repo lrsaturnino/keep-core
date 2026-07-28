@@ -3840,6 +3840,178 @@ that cannot be read leaves the step with no account of what it drove"
   return "${rc}"
 }
 
+# What the clock-failure step observed. The step fills these from the fleet;
+# the verdict below reads nothing else.
+CLOCK_STATE=""
+CLOCK_HELD_BEFORE=""
+CLOCK_HELD_AFTER=""
+CLOCK_ABORTS_BEFORE=""
+CLOCK_ABORTS_AFTER=""
+CLOCK_PERMITS_BEFORE=""
+CLOCK_PERMITS_AFTER=""
+CLOCK_REFUSALS_BEFORE=""
+CLOCK_REFUSALS_AFTER=""
+CLOCK_REFUSAL_ATTEMPTED=0
+
+# The verdict those observations imply, with no fleet interaction of its own,
+# so the decision can be exercised directly against constructed readings.
+# A ladder this layered is exactly the kind that passes on a proxy for the
+# property rather than the property, and only a seam like this catches it.
+#
+# The contract has two halves and the ladder holds both. Cancellation is read
+# from the abort counter and not from the active gauge, because the gate
+# cancels every permit it finds and counts each one while the permits stay
+# counted until their owners close them — so a falling active count is the
+# owners noticing, not the gate acting. Refusal is read from a refusal
+# recorded against work actually offered while the clock was down, because a
+# permit counter that did not move is what a node nobody asked looks like too.
+clock_failure_verdict() {
+  local step="clock failure quarantines work rather than guessing a mode"
+  local assertion="a failed chain-clock read refuses new work instead of \
+assuming a side of C"
+
+  if [[ "${CLOCK_STATE}" != "clock_unavailable" ]]; then
+    record_step "${step}" fail "the gate reported \
+[${CLOCK_STATE:-unreadable}] with its chain endpoint severed"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ ! "${CLOCK_PERMITS_BEFORE}" =~ ^[0-9]+$ ]] ||
+    [[ ! "${CLOCK_PERMITS_AFTER}" =~ ^[0-9]+$ ]] ||
+    [[ ! "${CLOCK_ABORTS_BEFORE}" =~ ^[0-9]+$ ]] ||
+    [[ ! "${CLOCK_ABORTS_AFTER}" =~ ^[0-9]+$ ]]; then
+    record_step "${step}" blocked "the gate reported clock_unavailable, but \
+its permit and abort counters could not be read (permits \
+[${CLOCK_PERMITS_BEFORE:-unreadable}] to [${CLOCK_PERMITS_AFTER:-unreadable}], \
+aborts [${CLOCK_ABORTS_BEFORE:-unreadable}] to \
+[${CLOCK_ABORTS_AFTER:-unreadable}]), so nothing here observed what happened \
+to the work it was holding"
+    record_assertion "${assertion}" false "${step}"
+  elif ((CLOCK_PERMITS_AFTER > CLOCK_PERMITS_BEFORE)); then
+    record_step "${step}" fail "the gate reported clock_unavailable and still \
+issued $((CLOCK_PERMITS_AFTER - CLOCK_PERMITS_BEFORE)) new permit(s); a gate \
+that cannot read the chain picked a side of C anyway"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ ! "${CLOCK_HELD_BEFORE}" =~ ^[0-9]+$ ]] ||
+    ((CLOCK_HELD_BEFORE == 0)); then
+    block_step "${step}" "the gate reported clock_unavailable and issued no \
+new permit, but it held no ceremony when its clock failed (active_ceremonies \
+[${CLOCK_HELD_BEFORE:-unreadable}]), so the cancel-what-is-held half of the \
+contract was never exercised; it needs work originated on the rehearsal chain \
+and still running when the endpoint is severed"
+    record_assertion "${assertion}" false "${step}"
+  elif ((CLOCK_ABORTS_AFTER - CLOCK_ABORTS_BEFORE < CLOCK_HELD_BEFORE)); then
+    record_step "${step}" fail "the gate reported clock_unavailable holding \
+${CLOCK_HELD_BEFORE} ceremonies but recorded only \
+$((CLOCK_ABORTS_AFTER - CLOCK_ABORTS_BEFORE)) clock cancellation(s) \
+(${CLOCK_ABORTS_BEFORE} to ${CLOCK_ABORTS_AFTER}); work it was holding was \
+neither canceled nor accounted for, and ${CLOCK_HELD_AFTER:-an unreadable \
+number of} ceremonies remain active"
+    record_assertion "${assertion}" false "${step}"
+  elif ((CLOCK_REFUSAL_ATTEMPTED == 0)); then
+    block_step "${step}" "the gate reported clock_unavailable and canceled \
+the $((CLOCK_ABORTS_AFTER - CLOCK_ABORTS_BEFORE)) permit(s) it held, but no \
+work was offered to it while it was blind, so its permit counter standing \
+still says only that nothing asked; proving the refusal half needs work \
+originated on the rehearsal chain after the endpoint is severed"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ ! "${CLOCK_REFUSALS_BEFORE}" =~ ^[0-9]+$ ]] ||
+    [[ ! "${CLOCK_REFUSALS_AFTER}" =~ ^[0-9]+$ ]] ||
+    ((CLOCK_REFUSALS_AFTER <= CLOCK_REFUSALS_BEFORE)); then
+    block_step "${step}" "work was originated while the gate reported \
+clock_unavailable, but its refusal counter did not move \
+(${CLOCK_REFUSALS_BEFORE:-unreadable} to \
+${CLOCK_REFUSALS_AFTER:-unreadable}), so nothing reached the gate to be \
+refused and the unchanged permit counter evidences no refusal"
+    record_assertion "${assertion}" false "${step}"
+  else
+    record_step "${step}" pass "with the chain endpoint severed the gate \
+reported clock_unavailable, canceled all ${CLOCK_HELD_BEFORE} ceremonies it \
+held (clock aborts ${CLOCK_ABORTS_BEFORE} to ${CLOCK_ABORTS_AFTER}), and \
+refused the work originated while it was blind — \
+$((CLOCK_REFUSALS_AFTER - CLOCK_REFUSALS_BEFORE)) refusal(s) and no new \
+permit (${CLOCK_PERMITS_BEFORE} to ${CLOCK_PERMITS_AFTER})"
+    record_assertion "${assertion}" true "${step}"
+  fi
+}
+
+# What the quiescence step observed across the whole drain window, and the
+# verdict they imply — same seam, same reason.
+#
+# Issuance is read from the permit counter rather than from a peak of the
+# active gauge: a permit taken and closed between two samples never raises
+# that peak. Completion is read from having seen the in-flight count at zero,
+# because a node that stopped answering while still holding permits is
+# indistinguishable, in its last reading, from one that finished them.
+QUIESCE_STATE=""
+QUIESCE_HELD_BEFORE=""
+QUIESCE_ISSUED_BEFORE=""
+QUIESCE_ISSUED_AFTER=""
+QUIESCE_FORCED_BEFORE=""
+QUIESCE_FORCED_AFTER=""
+QUIESCE_DRAINED=0
+QUIESCE_ATTEMPTED=0
+QUIESCE_GRACE=""
+
+quiescence_verdict() {
+  local node="$1"
+  local step="quiescence with an in-flight security-v2 permit"
+  local assertion="graceful quiescence starts no new work and lets held \
+permits finish"
+
+  if [[ "${QUIESCE_STATE}" != "quiescing" ]]; then
+    record_step "${step}" fail "${node} never reported quiescing while \
+draining with ${QUIESCE_HELD_BEFORE} security-v2 ceremonies in flight"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ ! "${QUIESCE_ISSUED_BEFORE}" =~ ^[0-9]+$ ]] ||
+    [[ ! "${QUIESCE_ISSUED_AFTER}" =~ ^[0-9]+$ ]]; then
+    block_step "${step}" "${node} entered quiescing, but its issued-permit \
+counter could not be read (${QUIESCE_ISSUED_BEFORE:-unreadable} to \
+${QUIESCE_ISSUED_AFTER:-unreadable}); the active gauge alone cannot say \
+whether a permit was taken and closed between two samples"
+    record_assertion "${assertion}" false "${step}"
+  elif ((QUIESCE_ISSUED_AFTER > QUIESCE_ISSUED_BEFORE)); then
+    record_step "${step}" fail "${node} entered quiescing and still issued \
+$((QUIESCE_ISSUED_AFTER - QUIESCE_ISSUED_BEFORE)) new permit(s) \
+(${QUIESCE_ISSUED_BEFORE} to ${QUIESCE_ISSUED_AFTER}); a quiescing node \
+started new work"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ ! "${QUIESCE_FORCED_BEFORE}" =~ ^[0-9]+$ ]] ||
+    [[ ! "${QUIESCE_FORCED_AFTER}" =~ ^[0-9]+$ ]]; then
+    block_step "${step}" "${node} entered quiescing and issued no new permit, \
+but its forced-abort counter could not be read \
+(${QUIESCE_FORCED_BEFORE:-unreadable} to ${QUIESCE_FORCED_AFTER:-unreadable}), \
+so nothing here observed whether the permits it held finished or were cut \
+short"
+    record_assertion "${assertion}" false "${step}"
+  elif ((QUIESCE_FORCED_AFTER > QUIESCE_FORCED_BEFORE)); then
+    record_step "${step}" fail "${node} force-aborted \
+$((QUIESCE_FORCED_AFTER - QUIESCE_FORCED_BEFORE)) held permit(s) rather than \
+letting them finish inside the ${QUIESCE_GRACE}s grace"
+    record_assertion "${assertion}" false "${step}"
+  elif ((QUIESCE_DRAINED == 0)); then
+    block_step "${step}" "${node} entered quiescing holding \
+${QUIESCE_HELD_BEFORE} security-v2 ceremonies and was never seen without \
+them; the node stopped answering with its in-flight count unobserved at zero, \
+so nothing here says those permits finished rather than went down with the \
+process"
+    record_assertion "${assertion}" false "${step}"
+  elif ((QUIESCE_ATTEMPTED == 0)); then
+    block_step "${step}" "${node} entered quiescing, let all \
+${QUIESCE_HELD_BEFORE} held permits finish, and issued none — but no work was \
+offered to it while it was quiescing, so the starts-no-new-work half rests on \
+nothing having asked; it needs work originated on the rehearsal chain after \
+the node enters quiescence"
+    record_assertion "${assertion}" false "${step}"
+  else
+    record_step "${step}" pass "${node} entered quiescing holding \
+${QUIESCE_HELD_BEFORE} security-v2 ceremonies, was offered new work while \
+quiescing and issued no permit for it (${QUIESCE_ISSUED_BEFORE} to \
+${QUIESCE_ISSUED_AFTER}), and let every held permit finish inside the \
+reviewed ${QUIESCE_GRACE}s grace — in-flight count observed at zero, no \
+forced abort (${QUIESCE_FORCED_BEFORE} to ${QUIESCE_FORCED_AFTER})"
+    record_assertion "${assertion}" true "${step}"
+  fi
+}
+
 stage_single_release() {
   REHEARSAL_GATE="single_release"
   stage_preflight
@@ -4136,95 +4308,60 @@ point"
   if [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
     run_work_driver clock-failure-inflight || true
   fi
-  local clock_state held_before aborts_before permits_before
-  held_before="$(participation_field "${clock_node}" active_ceremonies \
+  CLOCK_HELD_BEFORE="$(participation_field "${clock_node}" active_ceremonies \
     2>/dev/null || printf '')"
-  aborts_before="$(metric_value "${clock_node}" \
+  CLOCK_ABORTS_BEFORE="$(metric_value "${clock_node}" \
     participation_clock_aborts_total || printf '')"
-  permits_before="$(metric_value "${clock_node}" \
+  CLOCK_PERMITS_BEFORE="$(metric_value "${clock_node}" \
     participation_mode_security_v2_total || printf '')"
+  CLOCK_REFUSALS_BEFORE="$(metric_value "${clock_node}" \
+    participation_refusals_total || printf '')"
 
   docker network disconnect "$(compose_project)_chain-egress" \
     "$(compose ps --quiet "${clock_node}")"
   deadline=$((SECONDS + 300))
   while :; do
-    clock_state="$(participation_field "${clock_node}" gate_state 2>/dev/null || true)"
-    [[ "${clock_state}" == "clock_unavailable" ]] && break
+    CLOCK_STATE="$(participation_field "${clock_node}" gate_state 2>/dev/null || true)"
+    [[ "${CLOCK_STATE}" == "clock_unavailable" ]] && break
     ((SECONDS >= deadline)) && break
     sleep 5
   done
   observe_gate_gauges "${clock_node}"
 
-  local held_after aborts_after permits_after
-  held_after="$(participation_field "${clock_node}" active_ceremonies \
+  # The refusal half of the contract, attempted rather than inferred. Until
+  # something asks this gate to start work while it cannot read the chain, an
+  # unchanged permit counter says only that nothing was offered — which is
+  # what a node holding no work looks like too. The node is severed from the
+  # chain but still on the protocol network, so work originated now reaches it
+  # as peer traffic and the gate is what decides whether it joins.
+  CLOCK_REFUSAL_ATTEMPTED=0
+  if [[ -n "${PR4109_WORK_DRIVER:-}" && "${CLOCK_STATE}" == "clock_unavailable" ]]; then
+    run_work_driver clock-failure-refusal || true
+    CLOCK_REFUSAL_ATTEMPTED=1
+    # The offer travels peer-to-peer and the gate answers it on its own
+    # schedule, so the counters are read after a settling window rather than
+    # immediately, and the state is re-read to be sure the window was spent
+    # with the clock still down.
+    sleep 30
+    CLOCK_STATE="$(participation_field "${clock_node}" gate_state \
+      2>/dev/null || true)"
+  fi
+
+  CLOCK_HELD_AFTER="$(participation_field "${clock_node}" active_ceremonies \
     2>/dev/null || printf '')"
-  aborts_after="$(metric_value "${clock_node}" \
+  CLOCK_ABORTS_AFTER="$(metric_value "${clock_node}" \
     participation_clock_aborts_total || printf '')"
-  permits_after="$(metric_value "${clock_node}" \
+  CLOCK_PERMITS_AFTER="$(metric_value "${clock_node}" \
     participation_mode_security_v2_total || printf '')"
+  CLOCK_REFUSALS_AFTER="$(metric_value "${clock_node}" \
+    participation_refusals_total || printf '')"
 
   # Reconnect before recording, so the verdict is decided with the node back
   # on the chain rather than leaving it severed if the branch below exits.
   docker network connect "$(compose_project)_chain-egress" \
     "$(compose ps --quiet "${clock_node}")"
 
-  if [[ "${clock_state}" != "clock_unavailable" ]]; then
-    record_step "clock failure quarantines work rather than guessing a mode" \
-      fail "the gate reported [${clock_state:-unreadable}] with its chain \
-endpoint severed"
-    record_assertion \
-      "a failed chain-clock read refuses new work instead of assuming a side \
-of C" false "clock failure quarantines work rather than guessing a mode"
-  elif [[ ! "${permits_before}" =~ ^[0-9]+$ ]] ||
-    [[ ! "${permits_after}" =~ ^[0-9]+$ ]] ||
-    [[ ! "${aborts_before}" =~ ^[0-9]+$ ]] ||
-    [[ ! "${aborts_after}" =~ ^[0-9]+$ ]]; then
-    record_step "clock failure quarantines work rather than guessing a mode" \
-      blocked "the gate reported clock_unavailable, but its permit and abort \
-counters could not be read (permits [${permits_before:-unreadable}] to \
-[${permits_after:-unreadable}], aborts [${aborts_before:-unreadable}] to \
-[${aborts_after:-unreadable}]), so nothing here observed what happened to \
-the work it was holding"
-    record_assertion \
-      "a failed chain-clock read refuses new work instead of assuming a side \
-of C" false "clock failure quarantines work rather than guessing a mode"
-  elif ((permits_after > permits_before)); then
-    record_step "clock failure quarantines work rather than guessing a mode" \
-      fail "the gate reported clock_unavailable and still issued \
-$((permits_after - permits_before)) new permit(s); a gate that cannot read \
-the chain picked a side of C anyway"
-    record_assertion \
-      "a failed chain-clock read refuses new work instead of assuming a side \
-of C" false "clock failure quarantines work rather than guessing a mode"
-  elif [[ ! "${held_before}" =~ ^[0-9]+$ ]] || ((held_before == 0)); then
-    block_step "clock failure quarantines work rather than guessing a mode" \
-      "the gate reported clock_unavailable and issued no new permit, but it \
-held no ceremony when its clock failed (active_ceremonies \
-[${held_before:-unreadable}]), so the cancel-what-is-held half of the \
-contract was never exercised; it needs work originated on the rehearsal \
-chain and still running when the endpoint is severed"
-    record_assertion \
-      "a failed chain-clock read refuses new work instead of assuming a side \
-of C" false "clock failure quarantines work rather than guessing a mode"
-  elif ((aborts_after <= aborts_before)) &&
-    [[ "${held_after}" =~ ^[0-9]+$ ]] && ((held_after >= held_before)); then
-    record_step "clock failure quarantines work rather than guessing a mode" \
-      fail "the gate reported clock_unavailable holding ${held_before} \
-ceremonies, but aborted none of them (${aborts_before} to ${aborts_after}) \
-and still holds ${held_after}; work was neither completed nor quarantined"
-    record_assertion \
-      "a failed chain-clock read refuses new work instead of assuming a side \
-of C" false "clock failure quarantines work rather than guessing a mode"
-  else
-    record_step "clock failure quarantines work rather than guessing a mode" \
-      pass "with the chain endpoint severed the gate reported \
-clock_unavailable, issued no new permit, and quarantined the work it held: \
-${held_before} ceremonies in flight, clock aborts ${aborts_before} to \
-${aborts_after}, ${held_after:-unreadable} still active"
-    record_assertion \
-      "a failed chain-clock read refuses new work instead of assuming a side \
-of C" true "clock failure quarantines work rather than guessing a mode"
-  fi
+  clock_failure_verdict
 
   # Step 8. Quiescence must hold both an in-flight legacy permit and an
   # in-flight security-v2 permit. The security-v2 half runs; the legacy half
@@ -4238,18 +4375,19 @@ of C" true "clock failure quarantines work rather than guessing a mode"
   if [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
     run_work_driver quiesce-inflight || true
   fi
-  local held_before
-  held_before="$(participation_field "${quiesce_node}" \
+  QUIESCE_HELD_BEFORE="$(participation_field "${quiesce_node}" \
     active_security_v2_ceremonies 2>/dev/null || printf '')"
-  local forced_before
-  forced_before="$(metric_value "${quiesce_node}" \
+  QUIESCE_FORCED_BEFORE="$(metric_value "${quiesce_node}" \
     participation_quiesce_forced_aborts_total || printf '')"
+  QUIESCE_ISSUED_BEFORE="$(metric_value "${quiesce_node}" \
+    participation_mode_security_v2_total || printf '')"
 
-  if [[ ! "${held_before}" =~ ^[0-9]+$ ]] || ((held_before == 0)); then
+  if [[ ! "${QUIESCE_HELD_BEFORE}" =~ ^[0-9]+$ ]] ||
+    ((QUIESCE_HELD_BEFORE == 0)); then
     block_step "quiescence with an in-flight security-v2 permit" \
       "${quiesce_node} held no security-v2 ceremony when the stop was due to \
-be issued (active_security_v2_ceremonies [${held_before:-unreadable}]); a \
-node with nothing in flight quiesces trivially, so this needs work \
+be issued (active_security_v2_ceremonies [${QUIESCE_HELD_BEFORE:-unreadable}]); \
+a node with nothing in flight quiesces trivially, so this needs work \
 originated on the rehearsal chain that is still running at shutdown"
     record_assertion \
       "graceful quiescence starts no new work and lets held permits finish" \
@@ -4259,31 +4397,48 @@ originated on the rehearsal chain that is still running at shutdown"
     # node is not SIGKILLed before its own in-process backstop can finish what
     # it holds. A number restated here would go on stopping nodes under the
     # old ceiling the first time the reviewed bounds moved.
-    local quiesce_grace
-    quiesce_grace="$(manifest_termination_grace)"
-    compose stop --timeout "${quiesce_grace}" "${quiesce_node}" &
+    QUIESCE_GRACE="$(manifest_termination_grace)"
+    compose stop --timeout "${QUIESCE_GRACE}" "${quiesce_node}" &
     local stop_pid=$!
 
     # Watch the drain rather than sample its end: the contract is that no new
     # permit is issued from the moment quiescing begins and that the held ones
     # are left to finish, and both are statements about the whole window.
-    local quiesce_state="" held_peak="${held_before}" held_now forced_now
-    local forced_after="${forced_before}"
-    deadline=$((SECONDS + quiesce_grace))
+    local held_now forced_now issued_now state_now
+    QUIESCE_STATE=""
+    QUIESCE_ISSUED_AFTER="${QUIESCE_ISSUED_BEFORE}"
+    QUIESCE_FORCED_AFTER="${QUIESCE_FORCED_BEFORE}"
+    QUIESCE_DRAINED=0
+    QUIESCE_ATTEMPTED=0
+    deadline=$((SECONDS + QUIESCE_GRACE))
     while ((SECONDS < deadline)); do
-      local state_now
       state_now="$(participation_field "${quiesce_node}" gate_state \
         2>/dev/null || true)"
-      [[ "${state_now}" == "quiescing" ]] && quiesce_state="quiescing"
+      if [[ "${state_now}" == "quiescing" ]]; then
+        QUIESCE_STATE="quiescing"
+        # Offered once the node has actually entered quiescence, because the
+        # property is what a quiescing node does with new work — and a node
+        # that was never asked answers exactly like one that refused.
+        if ((QUIESCE_ATTEMPTED == 0)) &&
+          [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
+          run_work_driver quiesce-refusal || true
+          QUIESCE_ATTEMPTED=1
+        fi
+      fi
       held_now="$(participation_field "${quiesce_node}" \
         active_security_v2_ceremonies 2>/dev/null || printf '')"
-      if [[ "${held_now}" =~ ^[0-9]+$ ]] && ((held_now > held_peak)); then
-        held_peak="${held_now}"
+      if [[ "${held_now}" =~ ^[0-9]+$ ]] && ((held_now == 0)); then
+        QUIESCE_DRAINED=1
+      fi
+      issued_now="$(metric_value "${quiesce_node}" \
+        participation_mode_security_v2_total 2>/dev/null || printf '')"
+      if [[ "${issued_now}" =~ ^[0-9]+$ ]]; then
+        QUIESCE_ISSUED_AFTER="${issued_now}"
       fi
       forced_now="$(metric_value "${quiesce_node}" \
         participation_quiesce_forced_aborts_total 2>/dev/null || printf '')"
       if [[ "${forced_now}" =~ ^[0-9]+$ ]]; then
-        forced_after="${forced_now}"
+        QUIESCE_FORCED_AFTER="${forced_now}"
       fi
       # The node going unreachable is the drain finishing, not a failure.
       node_reachable "${quiesce_node}" || break
@@ -4291,39 +4446,7 @@ originated on the rehearsal chain that is still running at shutdown"
     done
     wait "${stop_pid}" || true
 
-    if [[ "${quiesce_state}" != "quiescing" ]]; then
-      record_step "quiescence with an in-flight security-v2 permit" fail \
-        "${quiesce_node} never reported quiescing while draining with \
-${held_before} security-v2 ceremonies in flight"
-      record_assertion \
-        "graceful quiescence starts no new work and lets held permits finish" \
-        false "quiescence with an in-flight security-v2 permit"
-    elif ((held_peak > held_before)); then
-      record_step "quiescence with an in-flight security-v2 permit" fail \
-        "${quiesce_node} entered quiescing but its in-flight security-v2 \
-count rose from ${held_before} to ${held_peak}; a quiescing node issued a \
-new permit"
-      record_assertion \
-        "graceful quiescence starts no new work and lets held permits finish" \
-        false "quiescence with an in-flight security-v2 permit"
-    elif [[ "${forced_before}" =~ ^[0-9]+$ ]] &&
-      [[ "${forced_after}" =~ ^[0-9]+$ ]] &&
-      ((forced_after > forced_before)); then
-      record_step "quiescence with an in-flight security-v2 permit" fail \
-        "${quiesce_node} force-aborted $((forced_after - forced_before)) held \
-permit(s) rather than letting them finish inside the ${quiesce_grace}s grace"
-      record_assertion \
-        "graceful quiescence starts no new work and lets held permits finish" \
-        false "quiescence with an in-flight security-v2 permit"
-    else
-      record_step "quiescence with an in-flight security-v2 permit" pass \
-        "${quiesce_node} entered quiescing holding ${held_before} security-v2 \
-ceremonies, issued no new permit while draining, and force-aborted none of \
-them inside the reviewed ${quiesce_grace}s grace"
-      record_assertion \
-        "graceful quiescence starts no new work and lets held permits finish" \
-        true "quiescence with an in-flight security-v2 permit"
-    fi
+    quiescence_verdict "${quiesce_node}"
   fi
 
   begin_step "quiescence with an in-flight legacy permit"

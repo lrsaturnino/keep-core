@@ -1318,6 +1318,180 @@ check "an earlier run's manifest cannot authorize this run's rollback" 0 \
 
 unset -f compose docker go
 
+# ----------------------------------------------------------------------------
+#
+# The two step verdicts whose contracts have two halves each. Both used to
+# pass on a proxy for the property — an unchanged permit counter nobody had
+# challenged, a peak the gauge could not have risen above, a fallen active
+# count that meant the owners noticed rather than the gate acted — so both are
+# decided by functions that read only their observation slots and touch no
+# fleet, and the cases drive them straight against constructed readings.
+
+run_verdict() {
+  set +e
+  CASE_OUT="$(
+    (
+      set -o pipefail
+      # shellcheck disable=SC2030,SC2031,SC2034
+      REHEARSAL_GATE="single_release"
+      # A ledger belonging to this case alone, so a verdict is read against
+      # what it recorded and not against what an earlier case left behind.
+      # shellcheck disable=SC2030,SC2031,SC2034
+      REHEARSAL_STEPS=()
+      # shellcheck disable=SC2030,SC2031,SC2034
+      REHEARSAL_FAILED_STEPS=()
+      # shellcheck disable=SC2030,SC2031,SC2034
+      REHEARSAL_BLOCKED_STEPS=()
+      # shellcheck disable=SC2030,SC2031,SC2034
+      REHEARSAL_REFUTED_ASSERTIONS=()
+      # shellcheck disable=SC2030,SC2031,SC2034
+      REHEARSAL_ASSERTIONS=()
+      "$@"
+      # A passing step logs only its name, so the ledger itself is printed:
+      # what a verdict wrote into the record is the thing under test, not the
+      # console line it happened to emit on the way.
+      printf 'ledger:%s\n' "${REHEARSAL_STEPS[*]}"
+      conclude_verdict
+    ) 2>&1
+  )"
+  CASE_RC=$?
+  set -e
+}
+
+# A clock failure that held work, canceled all of it, was offered new work
+# while blind, and refused it. Each case below changes exactly one reading.
+# The slots the verdict under test reads; shellcheck cannot follow them
+# across the source boundary into rehearse.sh.
+# shellcheck disable=SC2034
+clock_readings() {
+  CLOCK_STATE="clock_unavailable"
+  CLOCK_HELD_BEFORE="3"
+  CLOCK_HELD_AFTER="0"
+  CLOCK_ABORTS_BEFORE="5"
+  CLOCK_ABORTS_AFTER="8"
+  CLOCK_PERMITS_BEFORE="42"
+  CLOCK_PERMITS_AFTER="42"
+  CLOCK_REFUSALS_BEFORE="7"
+  CLOCK_REFUSALS_AFTER="9"
+  CLOCK_REFUSAL_ATTEMPTED=1
+}
+
+clock_case() {
+  clock_readings
+  "$@"
+  clock_failure_verdict
+}
+
+run_verdict clock_case :
+check "a clock failure that canceled its work and refused new work holds" 0 \
+  "canceled all 3 ceremonies it held" "2 refusal\(s\) and no new permit"
+
+# The half that used to pass on silence: nothing was ever offered, so a permit
+# counter standing still is what an unasked node looks like.
+run_verdict clock_case eval 'CLOCK_REFUSAL_ATTEMPTED=0'
+check "an unchallenged permit counter is not a refusal" 3 \
+  "no work was offered to it while it was blind"
+
+# Work was offered and the gate never saw it, so nothing was refused either.
+run_verdict clock_case eval 'CLOCK_REFUSALS_AFTER="7"'
+check "work that never reached the gate evidences no refusal" 3 \
+  "nothing reached the gate to be refused"
+
+run_verdict clock_case eval 'CLOCK_REFUSALS_AFTER="not-a-number"'
+check "an unreadable refusal counter is not read as a refusal" 3 \
+  "refusal counter did not move"
+
+# The half that used to pass on the active count falling: permits stay counted
+# until their owners close them, so a fall is the owners noticing rather than
+# the gate canceling. Only the abort counter says the gate acted.
+run_verdict clock_case eval 'CLOCK_ABORTS_AFTER="5"'
+check "held work that was never canceled refutes the gate" 1 \
+  "recorded only 0 clock cancellation\(s\)"
+
+run_verdict clock_case eval 'CLOCK_ABORTS_AFTER="7"'
+check "cancelling fewer permits than were held refutes the gate" 1 \
+  "recorded only 2 clock cancellation\(s\)"
+
+# The same partial cancellation, with the active count fallen to zero and then
+# unreadable: neither may stand in for the cancellations that did not happen.
+run_verdict clock_case eval 'CLOCK_ABORTS_AFTER="5"; CLOCK_HELD_AFTER="0"'
+check "a drained active count does not excuse missing cancellations" 1 \
+  "recorded only 0 clock cancellation\(s\)"
+
+run_verdict clock_case eval 'CLOCK_ABORTS_AFTER="5"; CLOCK_HELD_AFTER=""'
+check "an unreadable active count does not excuse missing cancellations" 1 \
+  "recorded only 0 clock cancellation\(s\)"
+
+run_verdict clock_case eval 'CLOCK_PERMITS_AFTER="43"'
+check "a blind gate that issued a permit refutes the gate" 1 \
+  "still issued 1 new permit"
+
+run_verdict clock_case eval 'CLOCK_STATE="open_security_v2"'
+check "a severed node that never reported clock_unavailable refutes it" 1 \
+  "reported \[open_security_v2\] with its chain endpoint severed"
+
+run_verdict clock_case eval 'CLOCK_HELD_BEFORE="0"'
+check "a node holding nothing cannot evidence the cancel half" 3 \
+  "cancel-what-is-held half of the contract was never exercised"
+
+# A quiescence that held work, was offered more while quiescing, issued none,
+# and was seen with its in-flight count at zero before it went away.
+# The slots the verdict under test reads; shellcheck cannot follow them
+# across the source boundary into rehearse.sh.
+# shellcheck disable=SC2034
+quiesce_readings() {
+  QUIESCE_STATE="quiescing"
+  QUIESCE_HELD_BEFORE="2"
+  QUIESCE_ISSUED_BEFORE="11"
+  QUIESCE_ISSUED_AFTER="11"
+  QUIESCE_FORCED_BEFORE="4"
+  QUIESCE_FORCED_AFTER="4"
+  QUIESCE_DRAINED=1
+  QUIESCE_ATTEMPTED=1
+  QUIESCE_GRACE="20160"
+}
+
+quiesce_case() {
+  quiesce_readings
+  "$@"
+  quiescence_verdict r1-node-2
+}
+
+run_verdict quiesce_case :
+check "a quiescence that refused new work and drained its permits holds" 0 \
+  "was offered new work while quiescing and issued no permit" \
+  "in-flight count observed at zero"
+
+run_verdict quiesce_case eval 'QUIESCE_ATTEMPTED=0'
+check "a quiescing node nobody asked evidences no refusal to start work" 3 \
+  "no work was offered to it while it was quiescing"
+
+# The issuance counter and not the gauge peak: a permit taken and closed
+# between two samples never raises the peak it would have been compared to.
+run_verdict quiesce_case eval 'QUIESCE_ISSUED_AFTER="12"'
+check "a permit issued and closed between samples still refutes the gate" 1 \
+  "still issued 1 new permit"
+
+run_verdict quiesce_case eval 'QUIESCE_ISSUED_AFTER=""'
+check "an unreadable issuance counter is not read as no issuance" 3 \
+  "issued-permit counter could not be read"
+
+run_verdict quiesce_case eval 'QUIESCE_DRAINED=0'
+check "permits unobserved at zero are not evidence they finished" 3 \
+  "never seen without them"
+
+run_verdict quiesce_case eval 'QUIESCE_FORCED_AFTER="5"'
+check "a held permit cut short rather than finished refutes the gate" 1 \
+  "force-aborted 1 held permit"
+
+run_verdict quiesce_case eval 'QUIESCE_FORCED_AFTER=""'
+check "an unreadable forced-abort counter is not read as none" 3 \
+  "forced-abort counter could not be read"
+
+run_verdict quiesce_case eval 'QUIESCE_STATE="open_security_v2"'
+check "a draining node that never reported quiescing refutes the gate" 1 \
+  "never reported quiescing"
+
 # Neither container stage can be executed anywhere but a real rehearsal — they
 # need the immutable images, a chain, and persistent volumes — so a call site
 # left pointing at a renamed helper survives every check in this file and
