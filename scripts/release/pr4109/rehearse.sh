@@ -3917,9 +3917,21 @@ point"
   # C.
   begin_step "clock failure quarantines work rather than guessing a mode"
   local clock_node="${REHEARSAL_R1_SERVICES[0]}"
-  local aborts_before clock_state
+
+  # The contract has two halves — refuse new work, and cancel what is already
+  # held — and the second one needs something held. A node that was idle when
+  # its clock failed evidences only the first.
+  if [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
+    run_work_driver clock-failure-inflight || true
+  fi
+  local clock_state held_before aborts_before permits_before
+  held_before="$(participation_field "${clock_node}" active_ceremonies \
+    2>/dev/null || printf '')"
   aborts_before="$(metric_value "${clock_node}" \
-    participation_clock_aborts_total || printf '0')"
+    participation_clock_aborts_total || printf '')"
+  permits_before="$(metric_value "${clock_node}" \
+    participation_mode_security_v2_total || printf '')"
+
   docker network disconnect "$(compose_project)_chain-egress" \
     "$(compose ps --quiet "${clock_node}")"
   deadline=$((SECONDS + 300))
@@ -3930,24 +3942,77 @@ point"
     sleep 5
   done
   observe_gate_gauges "${clock_node}"
-  if [[ "${clock_state}" == "clock_unavailable" ]]; then
-    record_step "clock failure quarantines work rather than guessing a mode" \
-      pass "with the chain endpoint severed the gate reported \
-clock_unavailable and stopped issuing permits (aborts before: \
-${aborts_before})"
-    record_assertion \
-      "a failed chain-clock read refuses new work instead of assuming a side \
-of C" true "clock failure quarantines work rather than guessing a mode"
-  else
+
+  local held_after aborts_after permits_after
+  held_after="$(participation_field "${clock_node}" active_ceremonies \
+    2>/dev/null || printf '')"
+  aborts_after="$(metric_value "${clock_node}" \
+    participation_clock_aborts_total || printf '')"
+  permits_after="$(metric_value "${clock_node}" \
+    participation_mode_security_v2_total || printf '')"
+
+  # Reconnect before recording, so the verdict is decided with the node back
+  # on the chain rather than leaving it severed if the branch below exits.
+  docker network connect "$(compose_project)_chain-egress" \
+    "$(compose ps --quiet "${clock_node}")"
+
+  if [[ "${clock_state}" != "clock_unavailable" ]]; then
     record_step "clock failure quarantines work rather than guessing a mode" \
       fail "the gate reported [${clock_state:-unreadable}] with its chain \
 endpoint severed"
     record_assertion \
       "a failed chain-clock read refuses new work instead of assuming a side \
 of C" false "clock failure quarantines work rather than guessing a mode"
+  elif [[ ! "${permits_before}" =~ ^[0-9]+$ ]] ||
+    [[ ! "${permits_after}" =~ ^[0-9]+$ ]] ||
+    [[ ! "${aborts_before}" =~ ^[0-9]+$ ]] ||
+    [[ ! "${aborts_after}" =~ ^[0-9]+$ ]]; then
+    record_step "clock failure quarantines work rather than guessing a mode" \
+      blocked "the gate reported clock_unavailable, but its permit and abort \
+counters could not be read (permits [${permits_before:-unreadable}] to \
+[${permits_after:-unreadable}], aborts [${aborts_before:-unreadable}] to \
+[${aborts_after:-unreadable}]), so nothing here observed what happened to \
+the work it was holding"
+    record_assertion \
+      "a failed chain-clock read refuses new work instead of assuming a side \
+of C" false "clock failure quarantines work rather than guessing a mode"
+  elif ((permits_after > permits_before)); then
+    record_step "clock failure quarantines work rather than guessing a mode" \
+      fail "the gate reported clock_unavailable and still issued \
+$((permits_after - permits_before)) new permit(s); a gate that cannot read \
+the chain picked a side of C anyway"
+    record_assertion \
+      "a failed chain-clock read refuses new work instead of assuming a side \
+of C" false "clock failure quarantines work rather than guessing a mode"
+  elif [[ ! "${held_before}" =~ ^[0-9]+$ ]] || ((held_before == 0)); then
+    block_step "clock failure quarantines work rather than guessing a mode" \
+      "the gate reported clock_unavailable and issued no new permit, but it \
+held no ceremony when its clock failed (active_ceremonies \
+[${held_before:-unreadable}]), so the cancel-what-is-held half of the \
+contract was never exercised; it needs work originated on the rehearsal \
+chain and still running when the endpoint is severed"
+    record_assertion \
+      "a failed chain-clock read refuses new work instead of assuming a side \
+of C" false "clock failure quarantines work rather than guessing a mode"
+  elif ((aborts_after <= aborts_before)) &&
+    [[ "${held_after}" =~ ^[0-9]+$ ]] && ((held_after >= held_before)); then
+    record_step "clock failure quarantines work rather than guessing a mode" \
+      fail "the gate reported clock_unavailable holding ${held_before} \
+ceremonies, but aborted none of them (${aborts_before} to ${aborts_after}) \
+and still holds ${held_after}; work was neither completed nor quarantined"
+    record_assertion \
+      "a failed chain-clock read refuses new work instead of assuming a side \
+of C" false "clock failure quarantines work rather than guessing a mode"
+  else
+    record_step "clock failure quarantines work rather than guessing a mode" \
+      pass "with the chain endpoint severed the gate reported \
+clock_unavailable, issued no new permit, and quarantined the work it held: \
+${held_before} ceremonies in flight, clock aborts ${aborts_before} to \
+${aborts_after}, ${held_after:-unreadable} still active"
+    record_assertion \
+      "a failed chain-clock read refuses new work instead of assuming a side \
+of C" true "clock failure quarantines work rather than guessing a mode"
   fi
-  docker network connect "$(compose_project)_chain-egress" \
-    "$(compose ps --quiet "${clock_node}")"
 
   # Step 8. Quiescence must hold both an in-flight legacy permit and an
   # in-flight security-v2 permit. The security-v2 half runs; the legacy half

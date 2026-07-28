@@ -152,9 +152,14 @@ ran nothing. The straggler control differences the roster before and after
 the driven ceremony and requires an operator the node had not already seen:
 the roster object exists from startup with an empty peer list, so its
 presence proves nothing, and a refusal counter moving on its own could be any
-refusal at all. Quiescence requires a security-v2 ceremony to be in flight
-when the stop is issued, stops the node under the reviewed manifest's grace
-rather than a restated number, and watches the whole drain — a node that
+refusal at all. The clock-failure step reads the same
+contract as two halves and needs evidence for both: with the endpoint severed
+the gate must report `clock_unavailable`, must issue no new permit, and must
+have quarantined the ceremonies it was holding — a node that was idle when its
+clock failed exercises only the refusal half and records the step blocked
+rather than passing. Quiescence requires a security-v2 ceremony to be in
+flight when the stop is issued, stops the node under the reviewed manifest's
+grace rather than a restated number, and watches the whole drain — a node that
 issues a new permit while quiescing, or force-aborts a held one instead of
 letting it finish, fails the step rather than passing on the state string.
 
