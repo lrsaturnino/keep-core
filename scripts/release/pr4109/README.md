@@ -261,10 +261,26 @@ is what a release decision would act on.
 The rollback gate's own barrier has two halves and neither substitutes for
 the other. Every release candidate must be provably down, and the prior binary
 must have been absent for the whole of it — so the drain runs while the prior
-service is sampled repeatedly, from before the drain starts to after it
+artifact is sampled repeatedly, from before the drain starts to after it
 finishes, rather than probed once at the end. A single closing probe is
 satisfied by a prior binary that participated for all of quiescence and stopped
 a second before the probe, which is exactly the sequence the barrier forbids.
+
+"The prior binary" is daemon-wide too, for the same reason "every release
+candidate" is, and each sample takes two readings of it. The node probe answers
+whether the prior service *this project* staged is serving; the daemon
+enumeration answers which containers anywhere were created from the prior
+image, including ones this project neither named nor started. Neither reading
+subsumes the other: a prior container left by another gate's project — or
+started directly under no compose project at all — is invisible to a probe
+keyed on this project's service name while watching the same rehearsal chain,
+and a process still answering its client-info port after the daemon called its
+container stopped is invisible to the enumeration. A prior container is counted
+as participating when it is running and attached to any network, quarantined
+when running and attached to none, and its unreadable state blocks rather than
+passes. As on the candidate side, an enumeration that cannot see this project's
+own staged prior container blocks: an empty active set read from a blind
+instrument looks exactly like a barrier that holds.
 
 "Every release candidate" is daemon-wide, not this project's two services. A
 rollback rehearsal runs after a cutover rehearsal, and the cutover fleet is a

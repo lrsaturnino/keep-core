@@ -2859,12 +2859,17 @@ REHEARSAL_PROJECT_PREFIX="pr4109-"
 # all, and a container attached to nothing can reach neither its peers nor the
 # chain. Anything else — a name, a project, a stopped sibling — is a claim
 # about quarantine rather than a reading of it.
-candidate_container_inventory() {
-  local candidate="$1" prior="$2" candidate_id prior_id ids raw
-  candidate_id="$(docker image inspect --format '{{.Id}}' "${candidate}" \
-    2>/dev/null)" || return 1
-  prior_id="$(docker image inspect --format '{{.Id}}' "${prior}" \
-    2>/dev/null)" || return 1
+#
+# Enumeration and inspection are factored out of the readings that filter them
+# so that every barrier on this daemon describes the same instrument. Two
+# independent enumerations taken moments apart could disagree about a fleet
+# being torn down between them, and a candidate reading that disagreed with the
+# prior reading about which containers exist would fence neither artifact.
+#
+# Emits one raw record per container as
+# "<image>|<running>|<project>|<service>|<networks>|<name>".
+daemon_container_records() {
+  local ids
   ids="$(docker ps --all --quiet --no-trunc 2>/dev/null)" || return 1
   [[ -n "${ids//[[:space:]]/}" ]] || return 0
 
@@ -2873,11 +2878,41 @@ candidate_container_inventory() {
   # vanished between the two calls into an inspect failure, and a failure to
   # read is exactly what this must not confuse with an absence.
   # shellcheck disable=SC2086
-  raw="$(docker inspect --format \
+  docker inspect --format \
     '{{.Image}}|{{.State.Running}}|{{with index .Config.Labels "com.docker.compose.project"}}{{.}}{{end}}|{{with index .Config.Labels "com.docker.compose.service"}}{{.}}{{end}}|{{range $name, $_ := .NetworkSettings.Networks}}{{$name}},{{end}}|{{.Name}}' \
-    ${ids} 2>/dev/null)" || return 1
+    ${ids} 2>/dev/null || return 1
+}
 
-  local image running project service networks name label state
+# The one place a raw record becomes the "<label> <state> <networks>" line a
+# barrier classifies, so the candidate and prior readings cannot drift into
+# describing running-ness or network attachment differently.
+emit_container_record() {
+  local running="$1" project="$2" service="$3" networks="$4" name="$5"
+  local label state
+  if [[ -n "${project}" && -n "${service}" ]]; then
+    label="${project}/${service}"
+  else
+    label="${name#/}"
+  fi
+  case "${running}" in
+  true) state="running" ;;
+  false) state="stopped" ;;
+  *) state="unreadable" ;;
+  esac
+  networks="${networks%,}"
+  printf '%s %s %s\n' "${label}" "${state}" "${networks:--}"
+}
+
+candidate_container_inventory() {
+  local candidate="$1" prior="$2" candidate_id prior_id raw
+  candidate_id="$(docker image inspect --format '{{.Id}}' "${candidate}" \
+    2>/dev/null)" || return 1
+  prior_id="$(docker image inspect --format '{{.Id}}' "${prior}" \
+    2>/dev/null)" || return 1
+  raw="$(daemon_container_records)" || return 1
+  [[ -n "${raw//[[:space:]]/}" ]] || return 0
+
+  local image running project service networks name
   while IFS='|' read -r image running project service networks name; do
     [[ -n "${image}" ]] || continue
     if [[ "${image}" == "${prior_id}" ]]; then
@@ -2887,18 +2922,40 @@ candidate_container_inventory() {
       [[ "${project}" != "${REHEARSAL_PROJECT_PREFIX}"* ]]; then
       continue
     fi
-    if [[ -n "${project}" && -n "${service}" ]]; then
-      label="${project}/${service}"
-    else
-      label="${name#/}"
-    fi
-    case "${running}" in
-    true) state="running" ;;
-    false) state="stopped" ;;
-    *) state="unreadable" ;;
-    esac
-    networks="${networks%,}"
-    printf '%s %s %s\n' "${label}" "${state}" "${networks:--}"
+    emit_container_record \
+      "${running}" "${project}" "${service}" "${networks}" "${name}"
+  done <<<"${raw}"
+}
+
+# Every container on this daemon created from the prior image, in the same
+# "<label> <state> <networks>" shape.
+#
+# The candidate inventory above skips these by design — the prior artifact is
+# what a rollback restores rather than one it fences — but "no prior binary
+# participates before every R1 node is down" is a claim about this whole
+# daemon, and asking this project's own prior service whether it answers cannot
+# support it. A prior container left behind by an earlier rehearsal project, or
+# started directly with no compose project at all, watches the same rehearsal
+# chain and submits against the same contracts under a name this project never
+# chose; a probe keyed on this project's service name is blind to exactly the
+# container that would break the barrier without breaking the probe.
+#
+# So the prior reading is taken daemon-wide and keyed only on the image the
+# container was created from, which is the one property a rollback's precondition
+# is actually about: what artifact is executing.
+prior_container_inventory() {
+  local prior="$1" prior_id raw
+  prior_id="$(docker image inspect --format '{{.Id}}' "${prior}" \
+    2>/dev/null)" || return 1
+  raw="$(daemon_container_records)" || return 1
+  [[ -n "${raw//[[:space:]]/}" ]] || return 0
+
+  local image running project service networks name
+  while IFS='|' read -r image running project service networks name; do
+    [[ -n "${image}" ]] || continue
+    [[ "${image}" == "${prior_id}" ]] || continue
+    emit_container_record \
+      "${running}" "${project}" "${service}" "${networks}" "${name}"
   done <<<"${raw}"
 }
 
@@ -3049,6 +3106,166 @@ read_candidate_inventory() {
     ((found == 1)) || other+=("${label} running $(rehearsal_network)")
     CANDIDATE_INVENTORY=("${other[@]}")
   done
+}
+
+# What the daemon-wide prior reading saw across a drain, accumulated one sample
+# at a time. Absence has to be watched for the whole window rather than probed
+# once at its end, so these are counters over samples rather than a final
+# state: a prior binary that participated for all of quiescence and stopped a
+# second before the last probe is the sequence the barrier forbids, and only a
+# sampled window can distinguish it from one that never ran.
+PRIOR_DRAIN_SAMPLES=0
+PRIOR_DRAIN_SERVICE_SIGHTINGS=0
+PRIOR_DRAIN_ACTIVE_SIGHTINGS=0
+PRIOR_DRAIN_UNREADABLE_SAMPLES=0
+PRIOR_DRAIN_EXPECTED_MISSING=0
+# Semicolon-joined listings rather than arrays: bash 3.2 has no name
+# references, and every sample would otherwise re-list the same container once
+# per sample taken.
+PRIOR_DRAIN_ACTIVE_LABELS=""
+PRIOR_DRAIN_UNREADABLE_LABELS=""
+
+# Append a value to a semicolon-joined listing unless it is already there.
+append_unique_listing() {
+  local current="$1" value="$2"
+  case ";${current};" in
+  *";${value};"*) printf '%s' "${current}" ;;
+  *) printf '%s' "${current}${current:+;}${value}" ;;
+  esac
+}
+
+reset_prior_drain_samples() {
+  PRIOR_DRAIN_SAMPLES=0
+  PRIOR_DRAIN_SERVICE_SIGHTINGS=0
+  PRIOR_DRAIN_ACTIVE_SIGHTINGS=0
+  PRIOR_DRAIN_UNREADABLE_SAMPLES=0
+  PRIOR_DRAIN_EXPECTED_MISSING=0
+  PRIOR_DRAIN_ACTIVE_LABELS=""
+  PRIOR_DRAIN_UNREADABLE_LABELS=""
+}
+
+# Fold one sample's worth of prior-image containers into the accumulators,
+# reading the "<label> <state> <networks>" listing on stdin.
+#
+# Kept separate from the reading that produces the listing because the
+# classification is the part that decides the barrier, and the readings it has
+# to decide correctly — another project's prior left running while this
+# project's own staged prior sits stopped — are exactly the ones no passing
+# rehearsal produces and no fleet can be arranged to produce on demand.
+absorb_prior_inventory_sample() {
+  PRIOR_DRAIN_SAMPLES=$((PRIOR_DRAIN_SAMPLES + 1))
+
+  local expected label state networks found_expected=0 active_this_sample=0
+  expected="$(compose_project)/${REHEARSAL_PRIOR_SERVICE}"
+  while read -r label state networks; do
+    [[ -n "${label}" ]] || continue
+    if [[ "${label}" == "${expected}" ]]; then
+      found_expected=1
+    fi
+    case "${state}" in
+    running)
+      # Attached to no network at all, a container can reach neither its peers
+      # nor the chain, which is the same reading the candidate barrier takes of
+      # the same daemon fact.
+      if [[ "${networks}" != "-" ]]; then
+        active_this_sample=1
+        PRIOR_DRAIN_ACTIVE_LABELS="$(append_unique_listing \
+          "${PRIOR_DRAIN_ACTIVE_LABELS}" "${label} on ${networks}")"
+      fi
+      ;;
+    stopped) ;;
+    *)
+      PRIOR_DRAIN_UNREADABLE_LABELS="$(append_unique_listing \
+        "${PRIOR_DRAIN_UNREADABLE_LABELS}" "${label} [${state:-unreadable}]")"
+      ;;
+    esac
+  done
+
+  ((active_this_sample == 0)) ||
+    PRIOR_DRAIN_ACTIVE_SIGHTINGS=$((PRIOR_DRAIN_ACTIVE_SIGHTINGS + 1))
+  # This project staged its own prior container before the drain began, so an
+  # enumeration that cannot see it is not seeing the containers this stage
+  # created, and the empty active set drawn from it is the instrument failing
+  # rather than the daemon being clear.
+  ((found_expected == 1)) ||
+    PRIOR_DRAIN_EXPECTED_MISSING=$((PRIOR_DRAIN_EXPECTED_MISSING + 1))
+}
+
+# One sample of "is any prior artifact executing anywhere on this daemon".
+#
+# Two independent readings, for the same reason the candidate barrier takes
+# two. The node probe answers whether the process this project staged is
+# serving; the daemon enumeration answers which containers built from the prior
+# image exist at all, including the ones this project neither named nor
+# started. Neither subsumes the other: a prior container in another project is
+# invisible to the probe, and a process still answering its port after the
+# daemon called its container stopped is invisible to the enumeration.
+sample_prior_absence() {
+  if node_reachable "${REHEARSAL_PRIOR_SERVICE}"; then
+    PRIOR_DRAIN_SERVICE_SIGHTINGS=$((PRIOR_DRAIN_SERVICE_SIGHTINGS + 1))
+  fi
+
+  local inventory
+  if ! inventory="$(prior_container_inventory "${PRIOR_IMAGE_DIGEST}")"; then
+    # An enumeration that failed says nothing about absence, so the failure is
+    # counted rather than being read as an empty daemon.
+    PRIOR_DRAIN_SAMPLES=$((PRIOR_DRAIN_SAMPLES + 1))
+    PRIOR_DRAIN_UNREADABLE_SAMPLES=$((PRIOR_DRAIN_UNREADABLE_SAMPLES + 1))
+    return 0
+  fi
+
+  absorb_prior_inventory_sample <<<"${inventory}"
+}
+
+# The verdict over the sampled window, recorded as the named step.
+prior_absence_verdict() {
+  local step="$1" assertion="$2"
+
+  if ((PRIOR_DRAIN_SAMPLES == 0)); then
+    block_step "${step}" "no sample of the daemon was taken across the drain, \
+so nothing here watched for a prior binary at all"
+    record_assertion "${assertion}" false "${step}"
+  elif ((PRIOR_DRAIN_UNREADABLE_SAMPLES > 0)); then
+    block_step "${step}" "the container daemon could not be enumerated in \
+${PRIOR_DRAIN_UNREADABLE_SAMPLES} of ${PRIOR_DRAIN_SAMPLES} samples taken \
+across the drain; an absence read from an instrument that failed is not an \
+absence"
+    record_assertion "${assertion}" false "${step}"
+  elif ((PRIOR_DRAIN_EXPECTED_MISSING > 0)); then
+    block_step "${step}" "the enumeration did not find this project's own \
+staged prior container in ${PRIOR_DRAIN_EXPECTED_MISSING} of \
+${PRIOR_DRAIN_SAMPLES} samples, so it is not seeing the containers this stage \
+created; an empty active set read from it is the instrument failing rather \
+than the barrier holding"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ -n "${PRIOR_DRAIN_UNREADABLE_LABELS}" ]]; then
+    block_step "${step}" "the run state of \
+${PRIOR_DRAIN_UNREADABLE_LABELS//;/, } could not be read; a prior artifact \
+whose state is unknown is not one known to be down"
+    record_assertion "${assertion}" false "${step}"
+  elif ((PRIOR_DRAIN_SERVICE_SIGHTINGS > 0 ||
+    PRIOR_DRAIN_ACTIVE_SIGHTINGS > 0)); then
+    local detail=""
+    if ((PRIOR_DRAIN_SERVICE_SIGHTINGS > 0)); then
+      detail="${REHEARSAL_PRIOR_SERVICE} answered on the rehearsal network in \
+${PRIOR_DRAIN_SERVICE_SIGHTINGS} of ${PRIOR_DRAIN_SAMPLES} samples"
+    fi
+    if ((PRIOR_DRAIN_ACTIVE_SIGHTINGS > 0)); then
+      detail="${detail}${detail:+; }a container built from the prior image was \
+running and network-attached in ${PRIOR_DRAIN_ACTIVE_SIGHTINGS} of \
+${PRIOR_DRAIN_SAMPLES} samples: ${PRIOR_DRAIN_ACTIVE_LABELS//;/, } — a \
+separate compose project is not quarantine, and a prior binary on any network \
+watches the same rehearsal chain"
+    fi
+    record_step "${step}" fail "${detail}"
+    record_assertion "${assertion}" false "${step}"
+  else
+    record_step "${step}" pass "no container built from the prior image was \
+running and network-attached anywhere on the daemon, and \
+${REHEARSAL_PRIOR_SERVICE} did not answer, in any of ${PRIOR_DRAIN_SAMPLES} \
+samples taken from before the drain started to after it finished"
+    record_assertion "${assertion}" true "${step}"
+  fi
 }
 
 # One field of a node's live participation gate state. This is the gate's own
@@ -5424,11 +5641,8 @@ nowhere to capture them to"
   grace="$(manifest_termination_grace)"
   ROLLBACK_GRACE="${grace}"
 
-  local prior_samples=0 prior_sightings=0
-  if node_reachable "${REHEARSAL_PRIOR_SERVICE}"; then
-    prior_sightings=$((prior_sightings + 1))
-  fi
-  prior_samples=$((prior_samples + 1))
+  reset_prior_drain_samples
+  sample_prior_absence
 
   # The drain runs in the background so the prior service can be sampled
   # while it is happening. The marker carries the drain's own exit status out
@@ -5450,10 +5664,7 @@ nowhere to capture them to"
     if ((SECONDS >= drain_deadline)); then
       break
     fi
-    if node_reachable "${REHEARSAL_PRIOR_SERVICE}"; then
-      prior_sightings=$((prior_sightings + 1))
-    fi
-    prior_samples=$((prior_samples + 1))
+    sample_prior_absence
     sleep 2
   done
   wait
@@ -5466,30 +5677,14 @@ nowhere to capture them to"
   # One last sample once the drain is over, so the watched window ends where
   # the barrier's precondition is finally established rather than a probe
   # earlier.
-  if node_reachable "${REHEARSAL_PRIOR_SERVICE}"; then
-    prior_sightings=$((prior_sightings + 1))
-  fi
-  prior_samples=$((prior_samples + 1))
+  sample_prior_absence
 
   ROLLBACK_DRAIN_RC="${drain_rc}"
   rollback_drain_verdict
 
   begin_step "no prior binary starts during quiescence"
-  if ((prior_sightings > 0)); then
-    record_step "no prior binary starts during quiescence" fail \
-      "${REHEARSAL_PRIOR_SERVICE} answered on the rehearsal network in \
-${prior_sightings} of ${prior_samples} samples taken across the drain"
-    record_assertion \
-      "no prior binary participates before every R1 node is down" false \
-      "no prior binary starts during quiescence"
-  else
-    record_step "no prior binary starts during quiescence" pass \
-      "${REHEARSAL_PRIOR_SERVICE} was absent in all ${prior_samples} samples \
-taken from before the drain started to after it finished"
-    record_assertion \
-      "no prior binary participates before every R1 node is down" true \
-      "no prior binary starts during quiescence"
-  fi
+  prior_absence_verdict "no prior binary starts during quiescence" \
+    "no prior binary participates before every R1 node is down"
 
   # Step 3. A forced deadline in an isolated case, so the audited quarantine
   # path is exercised rather than assumed.

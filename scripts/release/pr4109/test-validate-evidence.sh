@@ -1857,6 +1857,122 @@ run_verdict barrier_case eval 'CANDIDATE_INVENTORY_READ=0'
 check "a daemon that could not be enumerated establishes no barrier" 3 \
   "could not be enumerated" "holds:0"
 
+# The other half of that barrier, and the half the candidate inventory skips by
+# construction: no prior artifact executing anywhere while the fleet drains.
+# The evidence for it used to be one HTTP probe of this project's own prior
+# service, which is blind to precisely the container that breaks the barrier
+# without breaking the probe — a prior started by another project, or started
+# directly under no project at all, watching the same rehearsal chain.
+#
+# The readings below are sampled ones: the step's claim is about a window, so
+# the cases fold several samples and the verdict is taken over all of them.
+PRIOR_STEP="no prior binary starts during quiescence"
+PRIOR_ASSERTION="no prior binary participates before every R1 node is down"
+
+# The daemon as a held barrier shows it: this project's staged prior created
+# and stopped, and an earlier gate's prior stopped beside it.
+PRIOR_CLEAN_LISTING="pr4109-single_release/prior-node stopped -
+pr4109-rollback/prior-node stopped -"
+
+prior_readings() {
+  reset_prior_drain_samples
+  PRIOR_SAMPLE_LISTING="${PRIOR_CLEAN_LISTING}"
+}
+
+# Fold the current listing as many times as a drain would sample it, so a
+# reading that only appears mid-window is what the verdict decides on.
+prior_sample_window() {
+  local count="${1:-3}" i
+  for ((i = 0; i < count; i++)); do
+    absorb_prior_inventory_sample <<<"${PRIOR_SAMPLE_LISTING}"
+  done
+}
+
+prior_case() {
+  prior_readings
+  "$@"
+  prior_absence_verdict "${PRIOR_STEP}" "${PRIOR_ASSERTION}"
+}
+
+run_verdict prior_case prior_sample_window
+check "a daemon with every prior container stopped holds the barrier" 0 \
+  "no container built from the prior image was running and network-attached"
+
+# The regression this seam exists for: this project's own prior stays stopped
+# for the whole window — so the probe keyed on it answers nothing — while
+# another project's prior runs on a network throughout.
+run_verdict prior_case eval \
+  'PRIOR_SAMPLE_LISTING="${PRIOR_SAMPLE_LISTING}
+pr4109-rollback/prior-node running pr4109-rollback_rehearsal"
+   prior_sample_window'
+check "another project's prior left running refutes the barrier" 1 \
+  "pr4109-rollback/prior-node on pr4109-rollback_rehearsal" \
+  "separate compose project is not quarantine"
+
+# A prior started outside any rehearsal project, recognized by the image it was
+# created from rather than by a label it need not carry.
+run_verdict prior_case eval \
+  'PRIOR_SAMPLE_LISTING="${PRIOR_SAMPLE_LISTING}
+stray-prior running bridge"
+   prior_sample_window'
+check "an unlabelled prior on a network refutes the barrier" 1 \
+  "stray-prior on bridge"
+
+# The sequence a single post-drain probe cannot tell from a clean window: a
+# prior that participated for part of quiescence and was gone before the last
+# sample was taken.
+run_verdict prior_case eval \
+  'prior_sample_window 1
+   PRIOR_SAMPLE_LISTING="${PRIOR_SAMPLE_LISTING}
+pr4109-rollback/prior-node running pr4109-rollback_rehearsal"
+   prior_sample_window 1
+   PRIOR_SAMPLE_LISTING="${PRIOR_CLEAN_LISTING}"
+   prior_sample_window 1'
+check "a prior seen only mid-drain still refutes the barrier" 1 \
+  "in 1 of 3 samples"
+
+# Attached to nothing is the one quarantine this script can read rather than
+# take on trust, and it is the same reading the candidate barrier takes.
+run_verdict prior_case eval \
+  'PRIOR_SAMPLE_LISTING="${PRIOR_SAMPLE_LISTING}
+pr4109-rollback/prior-node running -"
+   prior_sample_window'
+check "a running prior attached to no network is quarantined" 0 \
+  "no container built from the prior image was running and network-attached"
+
+run_verdict prior_case eval \
+  'PRIOR_SAMPLE_LISTING="${PRIOR_SAMPLE_LISTING}
+pr4109-rollback/prior-node unreadable -"
+   prior_sample_window'
+check "a prior whose state cannot be read is not a prior known down" 3 \
+  "run state of pr4109-rollback/prior-node"
+
+# This project's own prior service answering is still a refutation on its own,
+# whatever the daemon believes about the container behind it.
+run_verdict prior_case eval \
+  'prior_sample_window
+   PRIOR_DRAIN_SERVICE_SIGHTINGS=2'
+check "this project's prior answering its port refutes the barrier" 1 \
+  "answered on the rehearsal network in 2 of 3 samples"
+
+# The vacuous pass: an enumeration returning nothing has an empty active set
+# too, and an empty active set is what the barrier holding looks like.
+run_verdict prior_case eval 'PRIOR_SAMPLE_LISTING=""
+   prior_sample_window'
+check "an enumeration blind to this project's staged prior blocks" 3 \
+  "did not find this project's own staged prior container in 3 of 3 samples"
+
+run_verdict prior_case eval \
+  'prior_sample_window
+   PRIOR_DRAIN_SAMPLES=$((PRIOR_DRAIN_SAMPLES + 1))
+   PRIOR_DRAIN_UNREADABLE_SAMPLES=1'
+check "a daemon that could not be enumerated proves no absence" 3 \
+  "could not be enumerated in 1 of 4 samples"
+
+run_verdict prior_case :
+check "a window nothing sampled proves no absence" 3 \
+  "no sample of the daemon was taken across the drain"
+
 # The rollback drain, whose step is named "with work represented" and used to
 # be decided by the stop command's exit status alone — a reading a fleet
 # holding nothing produces just as readily as one draining real ceremonies.
