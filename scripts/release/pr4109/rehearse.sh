@@ -73,11 +73,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 EVIDENCE_DIR="${EVIDENCE_DIR:-${SCRIPT_DIR}/rehearsal-evidence}"
 
-# Where this scaffold lives inside the repository, resolved from the two paths
-# above rather than restated. The gate below has to run on every change to the
-# scaffold's own code, and naming that directory a second time is exactly the
+# Where this scaffold lives inside the repository, and what invokes it, both
+# resolved from the paths above rather than restated. The gate below has to
+# run on every change to the scaffold's own code and has to be checked for
+# still invoking it, and naming either a second time is exactly the
 # restatement that would go stale the first time the scaffold moved.
 SCAFFOLD_DIR="${SCRIPT_DIR#"${REPO_ROOT}/"}"
+SCAFFOLD_ENTRYPOINT="$(basename "${BASH_SOURCE[0]}")"
+
+# The stage that gate exists to run — this script's own analysis verb, which
+# is the one thing about the invocation it cannot read off its own identity.
+SCAFFOLD_LINT_STAGE="shell-analysis"
 
 # The commit verify_source_binding proved the tree under test to be, empty
 # until it has proved one. Only a caller-supplied binding can establish an
@@ -1132,6 +1138,139 @@ $((paths_line + 1)): the ${trigger} filter list does not cover ${entry}"$'\n'
   done
 }
 
+# Triggers and filters say when the gate runs. They say nothing about what it
+# runs, and a workflow firing on every change to every input while its job no
+# longer invokes this script — or invokes it behind a condition, or with its
+# failure declared survivable — is the same ungated state written a different
+# way. So the invocation is placed and read: exactly one of it, no condition
+# on the step or on the job around it, and no licence for either to fail.
+verify_scaffold_lint_runs_analysis() {
+  local content
+  content="$(git -C "${REPO_ROOT}" show "HEAD:${SCAFFOLD_LINT_WORKFLOW}" \
+    2>/dev/null)" ||
+    fail "the commit under test carries no ${SCAFFOLD_LINT_WORKFLOW}; nothing \
+runs the analysis the evidence this scaffold admits rests on"
+
+  yaml_index_lines "${SCAFFOLD_LINT_WORKFLOW}" "${content}"
+
+  # Anywhere in the file, because the invocation sits inside a block scalar
+  # whose lines are shell rather than structure. Where it sits is the next
+  # question; that there is exactly one of it is this one.
+  local invocation="${SCAFFOLD_DIR}/${SCAFFOLD_ENTRYPOINT//./\\.}"
+  invocation+="[[:space:]]+${SCAFFOLD_LINT_STAGE}([[:space:]]|$)"
+  local -a hits=()
+  local i
+  for ((i = 0; i < ${#YAML_BODIES[@]}; i++)); do
+    ((YAML_INDENTS[i] < 0)) && continue
+    [[ "${YAML_BODIES[i]}" =~ ${invocation} ]] && hits+=("${i}")
+  done
+
+  ((${#hits[@]} != 0)) ||
+    fail "${SCAFFOLD_LINT_WORKFLOW} no longer runs ${SCAFFOLD_ENTRYPOINT} \
+${SCAFFOLD_LINT_STAGE}; it would go on firing on every change to the inputs \
+this scaffold's trust model is derived from and checking none of them"
+  ((${#hits[@]} == 1)) ||
+    fail "${SCAFFOLD_LINT_WORKFLOW} runs ${SCAFFOLD_ENTRYPOINT} \
+${SCAFFOLD_LINT_STAGE} ${#hits[@]} times; this parser cannot tell which of \
+them the conditions it reads below belong to"
+
+  local run_line="${hits[0]}" step=-1 step_keys=""
+  if step_keys="$(yaml_item_key_indent "${run_line}")"; then
+    step="${run_line}"
+  else
+    # The invocation's own line is shell inside a block scalar, so the step is
+    # the nearest sequence item opened shallower than it.
+    for ((i = run_line - 1; i >= 0; i--)); do
+      ((YAML_INDENTS[i] < 0)) && continue
+      ((YAML_INDENTS[i] < YAML_INDENTS[run_line])) || continue
+      step_keys="$(yaml_item_key_indent "${i}")" || continue
+      step="${i}"
+      break
+    done
+  fi
+  ((step >= 0)) ||
+    fail "${SCAFFOLD_LINT_WORKFLOW} line $((run_line + 1)) runs \
+${SCAFFOLD_LINT_STAGE} outside any step this parser can place, so nothing \
+here can say whether that run is conditioned away"
+
+  local step_end
+  step_end="$(yaml_block_end "$((step + 1))" "${step_keys}")"
+  verify_scaffold_lint_unconditional "${step}" "${step_end}" "${step_keys}" \
+    "step"
+
+  local jobs_line=-1 job_indent=-1 job=-1
+  for ((i = 0; i < ${#YAML_BODIES[@]}; i++)); do
+    ((YAML_INDENTS[i] == 0)) || continue
+    [[ "${YAML_BODIES[i]}" == 'jobs:' ]] || continue
+    jobs_line="${i}"
+    break
+  done
+  ((jobs_line >= 0)) ||
+    fail "${SCAFFOLD_LINT_WORKFLOW} declares no jobs this parser can read, so \
+nothing here can say what surrounds the ${SCAFFOLD_LINT_STAGE} run"
+
+  # The last job opened before the step is the one the step belongs to; a line
+  # shallower than a job name means the step sits outside jobs: altogether.
+  for ((i = jobs_line + 1; i <= step; i++)); do
+    ((YAML_INDENTS[i] < 0)) && continue
+    ((job_indent < 0)) && job_indent="${YAML_INDENTS[i]}"
+    if ((YAML_INDENTS[i] < job_indent)); then
+      job=-1
+      break
+    fi
+    ((YAML_INDENTS[i] == job_indent)) && job="${i}"
+  done
+  ((job >= 0)) ||
+    fail "${SCAFFOLD_LINT_WORKFLOW} line $((step + 1)) runs \
+${SCAFFOLD_LINT_STAGE} in no job this parser can place, so nothing here can \
+say whether that job is conditioned away"
+
+  local job_end job_keys=-1
+  job_end="$(yaml_block_end "$((job + 1))" "$((job_indent + 1))")"
+  for ((i = job + 1; i < job_end; i++)); do
+    ((YAML_INDENTS[i] < 0)) && continue
+    job_keys="${YAML_INDENTS[i]}"
+    break
+  done
+  ((job_keys >= 0)) ||
+    fail "${SCAFFOLD_LINT_WORKFLOW} job [${YAML_BODIES[job]%:}] carries \
+nothing this parser can read, so nothing here can say whether the \
+${SCAFFOLD_LINT_STAGE} run inside it is conditioned away"
+  verify_scaffold_lint_unconditional "${job}" "${job_end}" "${job_keys}" \
+    "job [${YAML_BODIES[job]%:}]"
+
+  note "scaffold lint: ${SCAFFOLD_LINT_WORKFLOW} runs ${SCAFFOLD_ENTRYPOINT} \
+${SCAFFOLD_LINT_STAGE} unconditionally, on line $((hits[0] + 1))"
+}
+
+# The two keys that turn a step or the job around it into something a change
+# can get past without this analysis having judged it: one deciding whether it
+# runs at all, one deciding that its failure does not fail the run. A
+# condition is refused rather than evaluated — this parser cannot tell which
+# runs it would hold for, and a gate whose reachability rests on a condition
+# nothing here reads is not a gate this scaffold has proved reachable.
+verify_scaffold_lint_unconditional() {
+  local from="$1" to="$2" key_indent="$3" where="$4" i body value
+  for ((i = from + 1; i < to; i++)); do
+    ((YAML_INDENTS[i] == key_indent)) || continue
+    body="${YAML_BODIES[i]}"
+    case "${body}" in
+    'if:'*)
+      fail "${SCAFFOLD_LINT_WORKFLOW} line $((i + 1)) conditions the ${where} \
+running ${SCAFFOLD_LINT_STAGE} on [${body#if:}]; a gate that runs only when a \
+condition holds is not the unconditional one this scaffold's evidence rests on"
+      ;;
+    'continue-on-error:'*)
+      value="$(yaml_scalar_value "${body#continue-on-error:}")" || value=""
+      [[ "${value}" == 'false' ]] && continue
+      fail "${SCAFFOLD_LINT_WORKFLOW} line $((i + 1)) lets the ${where} \
+running ${SCAFFOLD_LINT_STAGE} fail without failing the run; a check nothing \
+depends on gates nothing"
+      ;;
+    esac
+  done
+}
+
 # The pull_request event states and base branches a run really covers.
 #
 # A restriction on either is invisible to a check that reads only paths, and
@@ -1312,6 +1451,7 @@ verify_build_context_mirror() {
   # single pattern is compiled.
   resolve_build_step_identity
   verify_scaffold_lint_path_filters
+  verify_scaffold_lint_runs_analysis
   load_dockerignore_patterns
   note "build-context mirror: checking this script's classification against \
 the ${#DOCKERIGNORE_REGEX[@]} pattern(s) the build reads from \

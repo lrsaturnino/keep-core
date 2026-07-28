@@ -36,7 +36,9 @@
 # not coverage, patterns whose grammar this scaffold has no reading for
 # refused, and the trigger shapes — push without a pull request, a restricted
 # base branch, a narrowed activity type list — that let a change merge with
-# the gate never having run on it. Runs anywhere bash and git exist;
+# the gate never having run on it. And because none of that says the gate
+# does anything once reached, the last of them drop, duplicate, condition and
+# excuse the analysis run itself. Runs anywhere bash and git exist;
 # everything lives under mktemp and this repository is only ever read.
 
 set -euo pipefail
@@ -122,6 +124,23 @@ DEFAULT_CONTRACTS_STEPS="      - uses: actions/checkout@v3
 # one carries a block scalar on purpose: its content is indented past the
 # step's own keys, and a parser that read it as structure would slice the
 # build step's inputs somewhere else entirely.
+
+# The step the lint fixture's job runs the analysis from, and the shape of the
+# job around it, unless a case is proving a drift in one of them. The
+# invocation sits in a block scalar under `run:` the way the checked-in one
+# does, so the cases prove the placement over the shape it really has.
+DEFAULT_LINT_JOB="  scaffold-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Analyze the rehearsal scaffold
+        run: |
+          EVIDENCE_DIR=/tmp/evidence \\
+            ./${SCAFFOLD_DIR}/${SCAFFOLD_ENTRYPOINT} ${SCAFFOLD_LINT_STAGE}
+      - name: Upload scaffold-lint evidence
+        if: \${{ always() }}
+        uses: actions/upload-artifact@v4"
+
 write_scaffold_workflows() {
   local repo="$1" step="$2" filters="$3" entry
   local jobs="${4-${DEFAULT_SOLIDITY_JOB}}"
@@ -149,8 +168,7 @@ write_scaffold_workflows() {
     while IFS= read -r entry; do
       [[ -n "${entry}" ]] && printf '      - "%s"\n' "${entry}"
     done <<<"${filters}"
-    printf 'jobs:\n  scaffold-lint:\n    runs-on: ubuntu-latest\n    steps:\n'
-    printf '      - uses: actions/checkout@v4\n'
+    printf 'jobs:\n%s\n' "${5-${DEFAULT_LINT_JOB}}"
   } >"${repo}/${SCAFFOLD_LINT_WORKFLOW}"
 }
 
@@ -993,8 +1011,7 @@ T="${WORK}/lint-unfiltered-trigger"
 make_context_repo "${T}" "${CHECKED_IN_DOCKERIGNORE}"
 {
   printf 'name: Cutover Scaffold Lint\non:\n  pull_request:\n'
-  printf 'jobs:\n  scaffold-lint:\n    runs-on: ubuntu-latest\n    steps:\n'
-  printf '      - uses: actions/checkout@v4\n'
+  printf 'jobs:\n%s\n' "${DEFAULT_LINT_JOB}"
 } >"${T}/${SCAFFOLD_LINT_WORKFLOW}"
 commit_fixture "${T}"
 run_context_mirror "${T}"
@@ -1198,25 +1215,34 @@ lint_paths_block() {
   done <<<"${filters}"
 }
 
-# Rewrite a lint fixture's scaffold-lint workflow around a given `on:` body,
-# and commit it. The body is given whole because what these cases vary is the
-# trigger shape itself.
-recommit_lint_triggers() {
+# Rewrite a lint fixture's scaffold-lint workflow around a given `on:` body
+# and, optionally, a given jobs block, then commit it. Both are given whole
+# because what these cases vary is one of those two shapes.
+recommit_lint_workflow() {
   local repo="$1" on_body="$2"
   {
     printf 'name: Cutover Scaffold Lint\non:\n'
     # Whole-line, because command substitution took the body's last newline.
     printf '%s\n' "${on_body}"
-    printf 'jobs:\n  scaffold-lint:\n    runs-on: ubuntu-latest\n    steps:\n'
-    printf '      - uses: actions/checkout@v4\n'
+    printf 'jobs:\n%s\n' "${3-${DEFAULT_LINT_JOB}}"
   } >"${repo}/${SCAFFOLD_LINT_WORKFLOW}"
   commit_fixture "${repo}"
 }
 
+# The default `on:` body, for the cases varying only the jobs block under it.
+lint_default_on() {
+  printf '  push:\n    branches:\n      - main\n'
+  lint_paths_block 4 "${DEFAULT_PATH_FILTERS}"
+  printf '  pull_request:\n'
+  lint_paths_block 4 "${DEFAULT_PATH_FILTERS}"
+}
+
 # Run the gate on its own against a throwaway repository, in the same isolated
-# shape as the mirror runner. The build identity is resolved first because the
-# required inputs include the Dockerfile the build really compiles.
-run_lint_filters() {
+# shape as the mirror runner and in the same order the mirror runs it: which
+# changes reach the gate, then whether reaching it runs anything. The build
+# identity is resolved first because the required inputs include the
+# Dockerfile the build really compiles.
+run_lint_gate() {
   local root="$1"
   set +e
   CASE_OUT="$(
@@ -1225,6 +1251,7 @@ run_lint_filters() {
       REPO_ROOT="${root}"
       resolve_build_step_identity
       verify_scaffold_lint_path_filters
+      verify_scaffold_lint_runs_analysis
     ) 2>&1
   )"
   CASE_RC=$?
@@ -1233,7 +1260,7 @@ run_lint_filters() {
 
 T="${WORK}/lint-covers-every-class"
 make_lint_repo "${T}"
-run_lint_filters "${T}"
+run_lint_gate "${T}"
 check "scaffold lint: the checked-in filter shape covers every input class \
 the commit carries" 0 \
   "runs on every change to the 13 tracked input\(s\)" \
@@ -1247,7 +1274,7 @@ T="${WORK}/lint-drops-scaffold"
 make_lint_repo "${T}"
 recommit_scaffold_workflows "${T}" "${DEFAULT_BUILD_STEP}" \
   "$(grep -vxF "${SCAFFOLD_DIR}/**" <<<"${DEFAULT_PATH_FILTERS}")"
-run_lint_filters "${T}"
+run_lint_gate "${T}"
 check "scaffold lint: a filter list that stops covering the scaffold's own \
 files fails closed" 1 \
   "does not cover ${SCAFFOLD_DIR}/rehearse\.sh" \
@@ -1258,7 +1285,7 @@ T="${WORK}/lint-drops-root-gitignore"
 make_lint_repo "${T}"
 recommit_scaffold_workflows "${T}" "${DEFAULT_BUILD_STEP}" \
   "$(grep -vxF '.gitignore' <<<"${DEFAULT_PATH_FILTERS}")"
-run_lint_filters "${T}"
+run_lint_gate "${T}"
 check "scaffold lint: a filter list that stops covering the root ignore rules \
 fails closed" 1 \
   "the push filter list does not cover \.gitignore" \
@@ -1271,7 +1298,7 @@ T="${WORK}/lint-drops-nested-gitignore"
 make_lint_repo "${T}"
 recommit_scaffold_workflows "${T}" "${DEFAULT_BUILD_STEP}" \
   "$(grep -vxF '**/.gitignore' <<<"${DEFAULT_PATH_FILTERS}")"
-run_lint_filters "${T}"
+run_lint_gate "${T}"
 check "scaffold lint: a filter list that stops covering nested ignore rules \
 fails closed" 1 \
   "does not cover solidity/\.gitignore"
@@ -1280,7 +1307,7 @@ T="${WORK}/lint-drops-root-makefile"
 make_lint_repo "${T}"
 recommit_scaffold_workflows "${T}" "${DEFAULT_BUILD_STEP}" \
   "$(grep -vxF 'Makefile' <<<"${DEFAULT_PATH_FILTERS}")"
-run_lint_filters "${T}"
+run_lint_gate "${T}"
 check "scaffold lint: a filter list that stops covering the root Makefile \
 fails closed" 1 \
   "the push filter list does not cover Makefile" \
@@ -1292,7 +1319,7 @@ T="${WORK}/lint-drops-nested-makefile"
 make_lint_repo "${T}"
 recommit_scaffold_workflows "${T}" "${DEFAULT_BUILD_STEP}" \
   "$(grep -vxF '**/Makefile' <<<"${DEFAULT_PATH_FILTERS}")"
-run_lint_filters "${T}"
+run_lint_gate "${T}"
 check "scaffold lint: a filter list that stops covering the gen Makefiles \
 fails closed" 1 \
   "does not cover pkg/chain/gen/Makefile"
@@ -1304,7 +1331,7 @@ make_lint_repo "${T}"
 recommit_scaffold_workflows "${T}" "${DEFAULT_BUILD_STEP}" \
   "${DEFAULT_PATH_FILTERS}
 !${SCAFFOLD_DIR}/**"
-run_lint_filters "${T}"
+run_lint_gate "${T}"
 check "scaffold lint: a required path listed and then negated fails closed" 1 \
   "does not cover ${SCAFFOLD_DIR}/rehearse\.sh"
 
@@ -1316,7 +1343,7 @@ recommit_scaffold_workflows "${T}" "${DEFAULT_BUILD_STEP}" \
   "${DEFAULT_PATH_FILTERS}
 !${SCAFFOLD_DIR}/**
 ${SCAFFOLD_DIR}/**"
-run_lint_filters "${T}"
+run_lint_gate "${T}"
 check "scaffold lint: a negation a later entry re-includes over excludes \
 nothing" 0 \
   "runs on every change to the 13 tracked input\(s\)"
@@ -1328,7 +1355,7 @@ make_lint_repo "${T}"
 recommit_scaffold_workflows "${T}" "${DEFAULT_BUILD_STEP}" \
   "${DEFAULT_PATH_FILTERS}
 !docs/**"
-run_lint_filters "${T}"
+run_lint_gate "${T}"
 check "scaffold lint: a negation covering nothing required is accepted" 0 \
   "runs on every change to the 13 tracked input\(s\)"
 
@@ -1340,7 +1367,7 @@ make_lint_repo "${T}"
 recommit_scaffold_workflows "${T}" "${DEFAULT_BUILD_STEP}" \
   "${DEFAULT_PATH_FILTERS}
 Dockerfile?"
-run_lint_filters "${T}"
+run_lint_gate "${T}"
 check "scaffold lint: a path filter this script has no reading for fails \
 closed" 1 \
   "filters on \[Dockerfile\?\], whose \[\?\] this script has no reading for"
@@ -1349,11 +1376,11 @@ closed" 1 \
 # already moved, so a push-only gate never runs on the change under review.
 T="${WORK}/lint-push-only"
 make_lint_repo "${T}"
-recommit_lint_triggers "${T}" "$(
+recommit_lint_workflow "${T}" "$(
   printf '  push:\n    branches:\n      - main\n'
   lint_paths_block 4 "${DEFAULT_PATH_FILTERS}"
 )"
-run_lint_filters "${T}"
+run_lint_gate "${T}"
 check "scaffold lint: a gate running on pushes but no pull request fails \
 closed" 1 \
   "runs on no pull request"
@@ -1362,22 +1389,22 @@ closed" 1 \
 # which is exactly where a release branch's changes land.
 T="${WORK}/lint-pr-branch-restricted"
 make_lint_repo "${T}"
-recommit_lint_triggers "${T}" "$(
+recommit_lint_workflow "${T}" "$(
   printf '  pull_request:\n    branches:\n      - main\n'
   lint_paths_block 4 "${DEFAULT_PATH_FILTERS}"
 )"
-run_lint_filters "${T}"
+run_lint_gate "${T}"
 check "scaffold lint: a pull_request trigger restricted to one base branch \
 fails closed" 1 \
   "restricts its pull_request trigger with branches"
 
 T="${WORK}/lint-pr-branch-excluded"
 make_lint_repo "${T}"
-recommit_lint_triggers "${T}" "$(
+recommit_lint_workflow "${T}" "$(
   printf '  pull_request:\n    branches-ignore:\n      - "release/**"\n'
   lint_paths_block 4 "${DEFAULT_PATH_FILTERS}"
 )"
-run_lint_filters "${T}"
+run_lint_gate "${T}"
 check "scaffold lint: a pull_request trigger excluding a branch family fails \
 closed" 1 \
   "restricts its pull_request trigger with branches-ignore"
@@ -1386,11 +1413,11 @@ closed" 1 \
 # opens and never again on what is pushed into it afterwards.
 T="${WORK}/lint-pr-types-narrowed"
 make_lint_repo "${T}"
-recommit_lint_triggers "${T}" "$(
+recommit_lint_workflow "${T}" "$(
   printf '  pull_request:\n    types:\n      - opened\n      - reopened\n'
   lint_paths_block 4 "${DEFAULT_PATH_FILTERS}"
 )"
-run_lint_filters "${T}"
+run_lint_gate "${T}"
 check "scaffold lint: a pull_request trigger narrowed away from synchronize \
 fails closed" 1 \
   "activity types missing synchronize"
@@ -1399,12 +1426,12 @@ fails closed" 1 \
 # still covered, so it is accepted.
 T="${WORK}/lint-pr-types-widened"
 make_lint_repo "${T}"
-recommit_lint_triggers "${T}" "$(
+recommit_lint_workflow "${T}" "$(
   printf '  pull_request:\n    types:\n      - opened\n      - synchronize\n'
   printf '      - reopened\n      - ready_for_review\n'
   lint_paths_block 4 "${DEFAULT_PATH_FILTERS}"
 )"
-run_lint_filters "${T}"
+run_lint_gate "${T}"
 check "scaffold lint: a pull_request trigger widened past the default types \
 is accepted" 0 \
   "runs on every change to the 13 tracked input\(s\)"
@@ -1414,10 +1441,128 @@ is accepted" 0 \
 # maintainers to delete the push trigger instead.
 T="${WORK}/lint-push-branch-restricted"
 make_lint_repo "${T}"
-run_lint_filters "${T}"
+run_lint_gate "${T}"
 check "scaffold lint: a push trigger restricted to one branch is accepted \
 beside an unrestricted pull_request" 0 \
   "on all 2 push/pull-request trigger\(s\)"
+
+# Everything above says when the gate runs. None of it says that reaching it
+# runs anything: a workflow firing on every change to every input while its
+# job no longer invokes the analysis, or invokes it behind a condition, or
+# lets it fail without failing the run, is the same ungated state spelled
+# differently — and it passes every check above.
+
+T="${WORK}/lint-runs-nothing"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "  scaffold-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4"
+run_lint_gate "${T}"
+check "scaffold lint: a gate whose job no longer runs the analysis fails \
+closed" 1 \
+  "no longer runs ${SCAFFOLD_ENTRYPOINT} ${SCAFFOLD_LINT_STAGE}" \
+  "checking none of them"
+
+# Two invocations are two placements, and the conditions read below belong to
+# one step; guessing which would be guessing at the answer.
+T="${WORK}/lint-runs-twice"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "${DEFAULT_LINT_JOB}
+  scaffold-lint-again:
+    runs-on: ubuntu-latest
+    steps:
+      - run: ./${SCAFFOLD_DIR}/${SCAFFOLD_ENTRYPOINT} ${SCAFFOLD_LINT_STAGE}"
+run_lint_gate "${T}"
+check "scaffold lint: a workflow running the analysis twice fails closed" 1 \
+  "${SCAFFOLD_LINT_STAGE} 2 times"
+
+T="${WORK}/lint-step-conditioned"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "  scaffold-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Analyze the rehearsal scaffold
+        if: \${{ github.actor != 'dependabot[bot]' }}
+        run: ./${SCAFFOLD_DIR}/${SCAFFOLD_ENTRYPOINT} ${SCAFFOLD_LINT_STAGE}"
+run_lint_gate "${T}"
+check "scaffold lint: a conditioned analysis step fails closed" 1 \
+  "conditions the step running ${SCAFFOLD_LINT_STAGE}"
+
+# The same hole one level out, where a check reading only the step would miss
+# it entirely.
+T="${WORK}/lint-job-conditioned"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "  scaffold-lint:
+    runs-on: ubuntu-latest
+    if: \${{ github.event_name == 'push' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Analyze the rehearsal scaffold
+        run: ./${SCAFFOLD_DIR}/${SCAFFOLD_ENTRYPOINT} ${SCAFFOLD_LINT_STAGE}"
+run_lint_gate "${T}"
+check "scaffold lint: a conditioned analysis job fails closed" 1 \
+  "conditions the job \[scaffold-lint\] running ${SCAFFOLD_LINT_STAGE}"
+
+T="${WORK}/lint-step-survivable"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "  scaffold-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Analyze the rehearsal scaffold
+        continue-on-error: true
+        run: ./${SCAFFOLD_DIR}/${SCAFFOLD_ENTRYPOINT} ${SCAFFOLD_LINT_STAGE}"
+run_lint_gate "${T}"
+check "scaffold lint: an analysis step allowed to fail gates nothing" 1 \
+  "lets the step running ${SCAFFOLD_LINT_STAGE} fail without failing the run"
+
+T="${WORK}/lint-job-survivable"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "  scaffold-lint:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Analyze the rehearsal scaffold
+        run: ./${SCAFFOLD_DIR}/${SCAFFOLD_ENTRYPOINT} ${SCAFFOLD_LINT_STAGE}"
+run_lint_gate "${T}"
+check "scaffold lint: an analysis job allowed to fail gates nothing" 1 \
+  "lets the job \[scaffold-lint\] running ${SCAFFOLD_LINT_STAGE} fail"
+
+# Spelled out as the no-op it is, it changes nothing and is accepted; refusing
+# it would be refusing the shape rather than the hole.
+T="${WORK}/lint-survivable-false"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "  scaffold-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Analyze the rehearsal scaffold
+        continue-on-error: false
+        run: ./${SCAFFOLD_DIR}/${SCAFFOLD_ENTRYPOINT} ${SCAFFOLD_LINT_STAGE}"
+run_lint_gate "${T}"
+check "scaffold lint: an analysis step declared unsurvivable is accepted" 0 \
+  "runs ${SCAFFOLD_ENTRYPOINT} ${SCAFFOLD_LINT_STAGE} unconditionally"
+
+# A condition on some other step is not a condition on this one — the
+# checked-in workflow uploads its evidence under `if: always()` precisely so a
+# failing analyzer's log survives, and refusing that would be refusing the
+# shape that makes the gate diagnosable.
+T="${WORK}/lint-other-step-conditioned"
+make_lint_repo "${T}"
+run_lint_gate "${T}"
+check "scaffold lint: a condition on a step beside the analysis is not a \
+condition on it" 0 \
+  "runs ${SCAFFOLD_ENTRYPOINT} ${SCAFFOLD_LINT_STAGE} unconditionally"
 
 # --- contracts toolchain: the parity the stage's evidence claims ------------
 #

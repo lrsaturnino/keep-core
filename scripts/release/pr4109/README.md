@@ -311,6 +311,20 @@ trigger is required outright and refused if it carries `branches` or
 is pushed into it afterwards. The `push` trigger's own `branches: [main]` is
 accepted, since the `pull_request` trigger beside it is what holds the merge.
 
+All of that says when the gate runs and none of it says that reaching it runs
+anything, so the invocation is placed too: a workflow firing on every change
+to every input while its job no longer calls `rehearse.sh shell-analysis` is
+the same ungated state spelled differently, and it satisfies every rule above.
+`shell-analysis` requires exactly one such invocation — two would leave it
+unable to say which placement the rest of the reading belongs to — and refuses
+an `if:` on either that step or the job around it, along with a
+`continue-on-error` on either that is not spelled `false`. A condition is
+refused rather than evaluated: nothing here can tell which runs it would hold
+for, and a gate whose reachability rests on a condition nothing reads is not
+one this scaffold has proved reachable. A condition on some *other* step is
+untouched — the evidence upload runs under `if: always()` precisely so a
+failing analyzer's log survives.
+
 The same reasoning covers the other claim this scaffold makes about work it
 did not do itself. `solidity-proofs` says its evidence is
 `contracts-ecdsa.yml`'s `contracts-build-and-test` job's evidence, and that
