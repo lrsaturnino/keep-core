@@ -3,6 +3,7 @@
   "title": "Cutover rehearsal evidence record",
   "description": "One record per run of the exact-image single-release cutover rehearsal or the homogeneous rollback rehearsal. Screenshots alone are insufficient: every assertion must reference recorded values in this document.",
   "type": "object",
+  "additionalProperties": false,
   "required": [
     "schema_version",
     "gate",
@@ -28,6 +29,7 @@
     },
     "artifacts": {
       "type": "object",
+      "additionalProperties": false,
       "required": ["r1_image_digests", "prior_image_digests", "version", "revision", "protocol_epoch"],
       "properties": {
         "r1_image_digests": {
@@ -46,6 +48,7 @@
     },
     "chain": {
       "type": "object",
+      "additionalProperties": false,
       "required": ["chain_id", "cutover_block"],
       "properties": {
         "chain_id": { "type": "string" },
@@ -55,6 +58,7 @@
     "release_manifest": {
       "description": "Content binding to the reviewed release manifest whose termination grace the rehearsal fleet ran under. The sha256 is over the exact release-manifest.json bytes; validate-evidence cross-checks it against the checked-in manifest, so a record links the grace record to the source SHA, image digests, and chain identity recorded above.",
       "type": "object",
+      "additionalProperties": false,
       "required": ["sha256", "termination_grace_period_seconds"],
       "properties": {
         "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
@@ -76,6 +80,7 @@
       "minItems": 1,
       "items": {
         "type": "object",
+        "additionalProperties": false,
         "required": ["name", "outcome"],
         "properties": {
           "name": { "type": "string" },
@@ -110,7 +115,8 @@
       "minItems": 1,
       "items": {
         "type": "object",
-        "required": ["assertion", "holds"],
+        "additionalProperties": false,
+        "required": ["assertion", "holds", "evidence_stage"],
         "properties": {
           "assertion": { "type": "string" },
           "holds": { "type": "boolean" },

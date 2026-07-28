@@ -2,6 +2,7 @@ package beacon
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -256,6 +257,7 @@ func (n *node) JoinDKGIfEligible(
 						// preserve the orphaned share for the offline audit.
 						n.quarantineSigner(
 							dkgLogger,
+							dkgSeed,
 							memberIndex,
 							interrupted,
 							permit,
@@ -344,6 +346,7 @@ func (n *node) JoinDKGIfEligible(
 // never suppressed.
 func (n *node) quarantineSigner(
 	dkgLogger log.StandardLogger,
+	dkgSeed *big.Int,
 	memberIndex group.MemberIndex,
 	interrupted *dkg.PublicationInterruptedError,
 	permit participation.Permit,
@@ -360,6 +363,7 @@ func (n *node) quarantineSigner(
 	channelName := hex.EncodeToString(
 		interrupted.Signer.GroupPublicKeyBytesCompressed(),
 	)
+	seedHash := sha256.Sum256(dkgSeed.Bytes())
 
 	err := n.signerQuarantine.Preserve(
 		&registry.Membership{
@@ -372,6 +376,7 @@ func (n *node) quarantineSigner(
 			CutoverBlock:        gateSnapshot.CutoverBlock,
 			CanonicalStartBlock: permit.CanonicalStartBlock(),
 			Ceremony:            string(permit.Ceremony()),
+			SeedHash:            hex.EncodeToString(seedHash[:]),
 			FailedOperation:     "beacon_dkg_result_publication",
 			LastObservedBlock:   gateSnapshot.CurrentBlock,
 		},

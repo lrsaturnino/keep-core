@@ -3698,6 +3698,11 @@ REHEARSAL_BLOCKED_STEPS=()
 # ran and one of which failed as a success.
 REHEARSAL_FAILED_STEPS=()
 REHEARSAL_REFUTED_ASSERTIONS=()
+# The record emitted by the current run. conclude_rehearsal checks this exact
+# record against the gate contract before it may report success; using the
+# whole evidence directory there would let an older record decide the current
+# run's verdict.
+EMITTED_EVIDENCE_RECORD=""
 
 # Observations of the step currently running. begin_step clears them, so a
 # step records what was seen while it ran and never inherits the readings of
@@ -4162,6 +4167,7 @@ that never captured it has nothing to bind"
     "${steps}" "${assertions}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     >"${record}" ||
     fail "cannot build the rehearsal evidence record"
+  EMITTED_EVIDENCE_RECORD="${record}"
   unset PR4109_MANIFEST_SHA256 PR4109_WORK_DRIVER_SHA256 \
     PR4109_ROLLBACK_GENERATOR_SHA256
 
@@ -4212,6 +4218,22 @@ and every acceptance assertion holds"
 # refused leaves the reviewable account of why, not just a console line.
 conclude_rehearsal() {
   emit_evidence_record
+
+  # Preserve the rehearsal's strongest first-hand verdict. A failed or
+  # blocked step, or a refused assertion, already tells us more than a
+  # secondary roster defect and conclude_verdict reports it with the exact
+  # observations the run made.
+  if ((${#REHEARSAL_FAILED_STEPS[@]} > 0 ||
+    ${#REHEARSAL_BLOCKED_STEPS[@]} > 0 ||
+    ${#REHEARSAL_REFUTED_ASSERTIONS[@]} > 0)); then
+    conclude_verdict
+  fi
+
+  # A ledger containing an arbitrary passing subset used to reach the success
+  # line below. Check the just-emitted record against the complete gate
+  # contract first, through the same acceptance code used for archived
+  # evidence.
+  assess_evidence_record_set "${EMITTED_EVIDENCE_RECORD}"
   conclude_verdict
 }
 
@@ -4834,16 +4856,17 @@ WORK_DRIVER_ORIGINATED=""
 # exhausted, or no threshold reached — for one that did not, which is the
 # distinction between work that came to nothing and work still trying.
 WORK_DRIVER_BOUND_RESULTS=""
-# The same in-flight work with the identity that survives to its outcome, space
-# joined as "<ceremony>@<canonical start block>=<transaction>=<holders>".
+# The same in-flight permits with the identity that survives to their outcome,
+# space joined as "<ceremony>@<canonical start block>@<chain-work-id>=\
+# <transaction>=<holder>~<local-permit-id>".
 #
 # The ceremony list above says what kind of work drained; it cannot say how
 # much. Two runs of one ceremony are the same word and two permits on every
 # node that joined them, so a reconciliation reading ceremony names counts a
 # population it never established the size of — which is how permits with no
 # outcome behind them reconcile against an outcome belonging to something else.
-# The anchor is the identity because it is what the permit pinned its mode
-# from, and it is what the quarantine record the audit writes carries.
+# The chain work ID distinguishes work items sharing an anchor; the holder and
+# local permit ID distinguish several permits one node took for that work.
 WORK_DRIVER_ORIGINATED_WORK=""
 
 # How long a reported transaction may still be unmined before the rehearsal
@@ -4931,8 +4954,9 @@ no ceremony for this fleet to have participated in"
 
 # One work identity against the block its transaction landed in.
 confirm_record_anchor() {
-  local phase="$1" work="$2" tx="$3" anchor block reading
-  anchor="${work##*@}"
+  local phase="$1" work="$2" tx="$3" anchor block reading remainder
+  remainder="${work#*@}"
+  anchor="${remainder%%@*}"
   [[ "${anchor}" =~ ^[0-9]+$ ]] || return 0
   [[ "${tx}" =~ ^0x[0-9a-f]{64}$ ]] || return 0
   reading="$(transaction_receipt "${tx}")"
@@ -5007,9 +5031,9 @@ missing_work_classes() {
 
 # The fields of one bound result,
 # "<work>=<outcome>=<transaction>=<identity>", where <work> is the work
-# identity "<ceremony>@<canonical start block>". Split here rather than at each
-# reader so no control invents its own reading of a record whose whole purpose
-# is that every control reads it the same way.
+# identity "<ceremony>@<canonical start block>@<chain-work-id>". Split here
+# rather than at each reader so no control invents its own reading of a record
+# whose whole purpose is that every control reads it the same way.
 bound_work() {
   printf '%s' "${1%%=*}"
 }
@@ -5039,12 +5063,12 @@ work_ceremony() {
   printf '%s' "${1%%@*}"
 }
 
-# The fields of one originated-work record,
-# "<work>=<transaction>=<holder>[,<holder>...]". The holders are the R1
-# services that took a permit for it: a threshold ceremony consumes one permit
-# on every node that joins it, so the population a drain has to reconcile is
-# per (node, work) rather than per ceremony, and only the party that originated
-# the work can say which nodes it reached.
+# The fields of one originated-permit record,
+# "<work>=<transaction>=<holder>~<permit-id>". Work is
+# "<ceremony>@<canonical start block>@<chain-work-id>". There is one record per
+# local permit, rather than one record per ceremony or holder name: one node
+# can control several memberships in the same chain work and therefore hold
+# several permits with the same ceremony, anchor, transaction, and holder.
 work_id() {
   printf '%s' "${1%%=*}"
 }
@@ -5055,13 +5079,21 @@ work_transaction() {
   printf '%s' "${rest%%=*}"
 }
 
-work_holders() {
+work_permit() {
   printf '%s' "${1##*=}"
 }
 
-# Whether a space-joined list contains an exact token. Substring tests are what
-# make "r1-node-1" match "r1-node-10", and a reconciliation that attributes one
-# node's permits to another has followed nothing.
+permit_holder() {
+  printf '%s' "${1%%~*}"
+}
+
+permit_local_id() {
+  printf '%s' "${1#*~}"
+}
+
+# Whether a space-joined list contains an exact token, preserving
+# multiplicity. Substring tests are what make "r1-node-1" match "r1-node-10",
+# and set projection is what makes two local memberships look like one.
 contains_token() {
   local list="$1" token="$2" item
   for item in ${list}; do
@@ -5070,38 +5102,59 @@ contains_token() {
   return 1
 }
 
-# The originated-work records one node took a permit for, space-joined.
+# The originated-permit records one node took a permit for, space-joined.
 work_records_held_by() {
-  local records="$1" holder="$2" record holders out=""
+  local records="$1" holder="$2" record permit out=""
   for record in ${records}; do
-    holders="$(work_holders "${record}")"
-    contains_token "${holders//,/ }" "${holder}" || continue
+    permit="$(work_permit "${record}")"
+    [[ "$(permit_holder "${permit}")" == "${holder}" ]] || continue
     out="${out}${out:+ }${record}"
   done
   printf '%s' "${out}"
 }
 
-# The same, as work identities alone.
-work_held_by() {
-  work_identities "$(work_records_held_by "$1" "$2")"
+# One permit record's identity, which retains the local permit after the chain
+# work it belongs to. This is the unit counted and matched to quarantine.
+permit_identity() {
+  printf '%s#%s' "$(work_id "$1")" \
+    "$(permit_local_id "$(work_permit "$1")")"
 }
 
-# Every work identity a set of originated records names, space-joined.
-work_identities() {
+# Every permit identity a set of originated records names, space-joined. Work
+# may repeat here: two local permits for one chain work are two tokens.
+permit_identities() {
   local records="$1" record out=""
   for record in ${records}; do
-    out="${out}${out:+ }$(work_id "${record}")"
+    out="${out}${out:+ }$(permit_identity "${record}")"
   done
   printf '%s' "${out}"
 }
 
-# The bound record for one work identity, empty when nothing terminal was
-# reported for it. The parser rejects a second record for an identity, so at
-# most one can match.
-terminal_record() {
+# The originated record for one work identity, empty when this phase did not
+# originate it. The parser rejects a second record for an identity, so at most
+# one can match.
+originated_record() {
   local records="$1" work="$2" record
   for record in ${records}; do
+    [[ "$(work_id "${record}")" == "${work}" ]] || continue
+    printf '%s' "${record}"
+    return 0
+  done
+  printf ''
+}
+
+# The bound record for one originated record, empty when nothing terminal was
+# reported for the same work and transaction. The transaction is part of the
+# binding even though the work identity also carries an anchor: separate
+# driver phases must not replace the transaction that originated a permit with
+# an unrelated successful transaction when they later report its outcome.
+terminal_record() {
+  local records="$1" originated="$2" record work transaction
+  work="$(work_id "${originated}")"
+  transaction="$(work_transaction "${originated}")"
+  for record in ${records}; do
     [[ "$(bound_work "${record}")" == "${work}" ]] || continue
+    [[ "$(bound_transaction "${record}")" == "${transaction}" ]] || continue
     printf '%s' "${record}"
     return 0
   done
@@ -5112,12 +5165,12 @@ terminal_record() {
 # outcome for and no node quarantined. Space-joined, empty when every piece of
 # work ended somewhere a later reader can see.
 unended_work() {
-  local records="$1" bound="$2" quarantined="$3" record work uncovered=""
+  local records="$1" bound="$2" quarantined="$3" record permit uncovered=""
   for record in ${records}; do
-    work="$(work_id "${record}")"
-    [[ -n "$(terminal_record "${bound}" "${work}")" ]] && continue
-    contains_token "${quarantined}" "$(audited_work_id "${work}")" && continue
-    uncovered="${uncovered}${uncovered:+ }${work}"
+    [[ -n "$(terminal_record "${bound}" "${record}")" ]] && continue
+    permit="$(audited_permit_id "${record}")"
+    contains_token "${quarantined}" "${permit}" && continue
+    uncovered="${uncovered}${uncovered:+ }$(permit_identity "${record}")"
   done
   printf '%s' "${uncovered}"
 }
@@ -5128,28 +5181,35 @@ unended_work() {
 # not the end that claim is about, and without an audited quarantine record
 # beside it nothing distinguishes work that gave up from work that was dropped.
 unsettled_work() {
-  local records="$1" bound="$2" record work terminal out=""
+  local records="$1" bound="$2" record terminal out=""
   for record in ${records}; do
-    work="$(work_id "${record}")"
-    terminal="$(terminal_record "${bound}" "${work}")"
+    terminal="$(terminal_record "${bound}" "${record}")"
     [[ -n "${terminal}" ]] || continue
     [[ "$(bound_outcome "${terminal}")" == "succeeded" ]] && continue
-    out="${out}${out:+, }${work}=$(bound_outcome "${terminal}") \
+    out="${out}${out:+, }$(permit_identity "${record}")=\
+$(bound_outcome "${terminal}") \
 ($(bound_identity "${terminal}"))"
   done
   printf '%s' "${out}"
 }
 
 # Of the terminal records the driver reported, the ones naming work this gate
-# never originated. An outcome belonging to somebody else's ceremony is not a
-# permit of this fleet's reconciling.
+# did not originate with the transaction the terminal record claims. An
+# outcome belonging to somebody else's ceremony or transaction is not a permit
+# of this fleet's reconciling.
 unoriginated_terminals() {
-  local bound="$1" records="$2" record work identities stray=""
-  identities="$(work_identities "${records}")"
+  local bound="$1" records="$2" record work originated expected actual stray=""
   for record in ${bound}; do
     work="$(bound_work "${record}")"
-    contains_token "${identities}" "${work}" && continue
-    stray="${stray}${stray:+, }${work}"
+    originated="$(originated_record "${records}" "${work}")"
+    if [[ -z "${originated}" ]]; then
+      stray="${stray}${stray:+, }${work}"
+      continue
+    fi
+    expected="$(work_transaction "${originated}")"
+    actual="$(bound_transaction "${record}")"
+    [[ "${actual}" == "${expected}" ]] && continue
+    stray="${stray}${stray:+, }${work} (${actual}, originated as ${expected})"
   done
   printf '%s' "${stray}"
 }
@@ -5247,11 +5307,10 @@ run_work_driver() {
             encoded.push(JSON.stringify(hash));
           }
         }
-        // The chain anchor a permit pins its mode from, and the identity of
-        // one piece of work. Two runs of the same ceremony are the same word
-        // and different work: an account that names only the ceremony cannot
-        // say how many permits it is describing, which is the whole of what a
-        // drain has to reconcile.
+        // The chain anchor a permit pins its mode from and the chain-native
+        // identity of the request, group, wallet action, or DKG seed behind
+        // the work. Several events can share a block, so ceremony plus anchor
+        // is not an identity.
         const anchorOf = (entry, what) => {
           const block = (entry || {}).canonical_start_block;
           if (!Number.isInteger(block) || block < 1) {
@@ -5261,11 +5320,23 @@ run_work_driver() {
           }
           return block;
         };
-        // One transaction starts one piece of work. Without this a report can
-        // name several ceremonies against a single hash, and every control
-        // that follows an outcome back to a transaction would confirm work
-        // that was never separately originated.
+        const workIDOf = (entry, what) => {
+          const id = (entry || {}).work_id;
+          if (typeof id !== "string" ||
+            !/^[A-Za-z0-9][A-Za-z0-9_.:-]*$/.test(id)) {
+            console.error(what + " names no chain work id: " +
+              JSON.stringify((entry || {}).ceremony));
+            process.exit(1);
+          }
+          return id;
+        };
+        // One transaction starts one piece of work, and one piece of work
+        // retains that transaction when the report also carries its terminal
+        // outcome. Without both directions a report can name several
+        // ceremonies against one hash or replace an origination hash with an
+        // unrelated successful hash at the terminal boundary.
         const owners = new Map();
+        const transactions = new Map();
         const claim = (work, tx) => {
           const owner = owners.get(tx);
           if (owner !== undefined && owner !== work) {
@@ -5273,7 +5344,14 @@ run_work_driver() {
               JSON.stringify(tx));
             process.exit(1);
           }
+          const transaction = transactions.get(work);
+          if (transaction !== undefined && transaction !== tx) {
+            console.error("work claimed by two transactions: " +
+              JSON.stringify(work));
+            process.exit(1);
+          }
           owners.set(tx, work);
+          transactions.set(work, tx);
         };
         // What the driver put on the chain, whatever became of it, and which
         // nodes took a permit for it. A phase whose subject is work still in
@@ -5283,6 +5361,7 @@ run_work_driver() {
         const started = [];
         const inflight = [];
         const startedWork = new Set();
+        const startedPermits = new Set();
         if (originated !== undefined) {
           if (!Array.isArray(originated)) {
             console.error("originated_ceremonies is not an array");
@@ -5315,31 +5394,34 @@ run_work_driver() {
                 "originated: " + JSON.stringify(ceremony));
               process.exit(1);
             }
-            // The nodes this work reached. A drain reconciles per (node,
-            // work): a threshold ceremony consumes one permit on every node
-            // that joins it, so a fleet total cannot be compared with a count
-            // of ceremonies at all.
+            // The local permits this work produced. A node controlling two
+            // memberships takes two permits, so holders are records rather
+            // than a set of service names. permit_id is the stable local
+            // membership/member index or wallet/action identity by which a
+            // quarantine record can be matched one-to-one.
             const holders = (entry || {}).holders;
             if (!Array.isArray(holders) || holders.length === 0) {
               console.error("originated work names no holding node: " +
                 JSON.stringify(ceremony));
               process.exit(1);
             }
-            const seenHolders = new Set();
             for (const holder of holders) {
-              if (typeof holder !== "string" ||
-                !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(holder)) {
+              if (holder === null || typeof holder !== "object" ||
+                Array.isArray(holder) ||
+                typeof holder.service !== "string" ||
+                !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(holder.service)) {
                 console.error("not a holding node: " + JSON.stringify(holder));
                 process.exit(1);
               }
-              if (seenHolders.has(holder)) {
-                console.error("holding node named twice for one piece of " +
-                  "work: " + JSON.stringify(holder));
+              if (typeof holder.permit_id !== "string" ||
+                !/^[A-Za-z0-9][A-Za-z0-9_.:-]*$/.test(holder.permit_id)) {
+                console.error("holding node names no local permit identity: " +
+                  JSON.stringify(holder.service));
                 process.exit(1);
               }
-              seenHolders.add(holder);
             }
-            const work = ceremony + "@" + block;
+            const work = ceremony + "@" + block + "@" +
+              workIDOf(entry, "originated work");
             if (startedWork.has(work)) {
               console.error("work originated twice: " + JSON.stringify(work));
               process.exit(1);
@@ -5347,7 +5429,17 @@ run_work_driver() {
             startedWork.add(work);
             claim(work, tx);
             started.push(ceremony);
-            inflight.push(work + "=" + tx + "=" + holders.join(","));
+            for (const holder of holders) {
+              const localPermit = holder.service + "~" + holder.permit_id;
+              const permit = work + "#" + localPermit;
+              if (startedPermits.has(permit)) {
+                console.error("local permit originated twice: " +
+                  JSON.stringify(permit));
+                process.exit(1);
+              }
+              startedPermits.add(permit);
+              inflight.push(work + "=" + tx + "=" + localPermit);
+            }
           }
         }
         const results = report.ceremony_results;
@@ -5376,7 +5468,8 @@ run_work_driver() {
             // identity is either a duplicate or two outcomes for one ceremony,
             // and both make the reconciliation below count an outcome twice.
             const block = anchorOf(result, "result");
-            const work = ceremony + "@" + block;
+            const work = ceremony + "@" + block + "@" +
+              workIDOf(result, "result");
             if (endedWork.has(work)) {
               console.error("work reported terminal twice: " +
                 JSON.stringify(work));
@@ -5440,16 +5533,18 @@ run_work_driver() {
       blocked "the work driver reported the ${phase} phase in a form this \
 rehearsal cannot read; its stdout must be a JSON object whose optional \
 transaction_hashes array carries 0x-prefixed 32-byte hashes, whose optional \
-originated_ceremonies array carries {ceremony, canonical_start_block, \
-transaction_hash, holders} objects naming work put on the chain and the R1 \
-services that took a permit for it, and whose optional ceremony_results array \
-carries {ceremony, canonical_start_block, outcome, transaction_hash} objects \
-over the known ceremonies and outcomes — each naming a transaction the same \
-report originated and no other piece of work claims, each identifying one \
-piece of work exactly once, and each carrying either a result identity when it \
-succeeded or a termination of retry_exhausted or no_threshold when it did \
-not — and a report that cannot be read leaves the step with no account of what \
-it drove"
+originated_ceremonies array carries {ceremony, canonical_start_block, work_id, \
+transaction_hash, holders} objects naming work put on the chain, with holders \
+as {service, permit_id} objects naming every local permit separately, and \
+whose optional ceremony_results array carries {ceremony, \
+canonical_start_block, work_id, outcome, transaction_hash} objects over the \
+known ceremonies and outcomes — each naming a transaction the same report \
+originated and no other piece of work claims, each retaining the same \
+transaction wherever the same work appears, each identifying one chain work \
+item and local permit exactly once, and each carrying either a result identity \
+when it succeeded or a termination of retry_exhausted or no_threshold when it \
+did not — and a report that cannot be read leaves the step with no account of \
+what it drove"
 
     hashes="$(printf '%s\n' "${parsed}" | sed -n '1p')"
     WORK_DRIVER_CEREMONY_RESULTS="$(printf '%s\n' "${parsed}" | sed -n '2p')"
@@ -5880,11 +5975,11 @@ were and not which work each one was issued for, and a count that fell to zero \
 cannot be followed to anything"
     record_assertion "${assertion}" false "${step}"
   elif ((QUIESCE_HELD_BEFORE != $(count_tokens \
-    "$(work_identities "${QUIESCE_INFLIGHT_WORK}")"))); then
+    "$(permit_identities "${QUIESCE_INFLIGHT_WORK}")"))); then
     block_step "${step}" "${node} held ${QUIESCE_HELD_BEFORE} security-v2 \
-permit(s) for $(count_tokens "$(work_identities \
+permit(s) for $(count_tokens "$(permit_identities \
       "${QUIESCE_INFLIGHT_WORK}")") piece(s) of work the driver put on it \
-($(work_identities "${QUIESCE_INFLIGHT_WORK}")); the permit counter and the \
+($(permit_identities "${QUIESCE_INFLIGHT_WORK}")); the permit counter and the \
 driver's account describe different populations, so an outcome for one piece \
 of work cannot be said to be the outcome of any particular held permit"
     record_assertion "${assertion}" false "${step}"
@@ -5900,6 +5995,14 @@ permit that was allowed to finish"
 reporting what became of the work ${node} held, so its account of the chain \
 stops wherever it failed; held permits reconciled against a partial report \
 take the outcomes it happened to reach for all there were"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ -n "$(unoriginated_terminals "${QUIESCE_TERMINAL}" \
+    "${QUIESCE_INFLIGHT_WORK}")" ]]; then
+    block_step "${step}" "the driver reported terminal outcomes for \
+$(unoriginated_terminals "${QUIESCE_TERMINAL}" \
+      "${QUIESCE_INFLIGHT_WORK}"), which ${node} did not originate with those \
+transactions; a later phase cannot replace the transaction that started held \
+work with an unrelated transaction and call its outcome the held permit's end"
     record_assertion "${assertion}" false "${step}"
   elif [[ -n "$(unended_work "${QUIESCE_INFLIGHT_WORK}" \
     "${QUIESCE_TERMINAL}" "")" ]]; then
@@ -6296,7 +6399,8 @@ rollback_reconciliation_verdict() {
   local unread="" unreconciled="" unaudited="" impossible="" miscounted=""
   local strayed="" orphaned=""
   local completed_total=0 quarantined_total=0 nodes=0
-  local node_work expected quarantine_ids quarantine_count work audited
+  local node_records node_permits expected quarantine_ids quarantine_count
+  local record permit audited
 
   if [[ -z "${ROLLBACK_NODE_ACCOUNTS//[[:space:]]/}" ]]; then
     block_step "${step}" "no R1 node's permit accounting was captured across \
@@ -6341,8 +6445,9 @@ outcomes it happened to reach for all there were"
     "${ROLLBACK_ORIGINATED_WORK}")"
   if [[ -n "${strayed}" ]]; then
     block_step "${step}" "the driver reported terminal outcomes for \
-${strayed}, which this drain never originated; an outcome belonging to \
-somebody else's ceremony reconciles none of this fleet's permits"
+${strayed}, which this drain never originated with those transactions; an \
+outcome belonging to somebody else's ceremony or substituting a different \
+transaction reconciles none of this fleet's permits"
     record_assertion "${assertion}" false "${step}"
     return
   fi
@@ -6375,12 +6480,14 @@ holding ${final} of ${held} permit(s)"
     # accounting over two different populations: either the node joined work
     # nobody attributed to it, or work attributed to it never reached it, and
     # in both readings the outcomes below belong to a different set of permits.
-    node_work="$(work_held_by "${ROLLBACK_ORIGINATED_WORK}" "${service}")"
-    expected="$(count_tokens "${node_work}")"
+    node_records="$(work_records_held_by \
+      "${ROLLBACK_ORIGINATED_WORK}" "${service}")"
+    node_permits="$(permit_identities "${node_records}")"
+    expected="$(count_tokens "${node_permits}")"
     if ((held != expected)); then
       miscounted="${miscounted}${miscounted:+, }${service} held ${held} \
 permit(s) for ${expected} piece(s) of work the driver put on it \
-(${node_work:-none})"
+(${node_permits:-none})"
       continue
     fi
 
@@ -6402,12 +6509,12 @@ force-canceled, quarantine records unreadable)"
     # attributed to this drain accounts for none of the permits being followed
     # — it is state from somewhere else standing in for them.
     audited=""
-    for work in ${node_work}; do
-      audited="${audited}${audited:+ }$(audited_work_id "${work}")"
+    for record in ${node_records}; do
+      audited="${audited}${audited:+ }$(audited_permit_id "${record}")"
     done
-    for work in ${quarantine_ids}; do
-      contains_token "${audited}" "${work}" && continue
-      strayed="${strayed}${strayed:+, }${service} quarantined ${work}"
+    for permit in ${quarantine_ids}; do
+      contains_token "${audited}" "${permit}" && continue
+      strayed="${strayed}${strayed:+, }${service} quarantined ${permit}"
     done
     [[ -n "${strayed}" ]] && continue
 
@@ -6434,12 +6541,14 @@ force-canceled, only ${quarantine_count} quarantine record(s))"
     # And the permits that were not force-canceled: each one belongs to a piece
     # of work, and that work has to have ended somewhere the driver watched
     # rather than merely stopped being counted here.
-    for work in ${node_work}; do
-      contains_token "${quarantine_ids}" "$(audited_work_id "${work}")" &&
+    for record in ${node_records}; do
+      contains_token "${quarantine_ids}" "$(audited_permit_id "${record}")" &&
         continue
-      [[ -n "$(terminal_record "${ROLLBACK_TERMINAL}" "${work}")" ]] && continue
+      [[ -n "$(terminal_record "${ROLLBACK_TERMINAL}" \
+        "${record}")" ]] &&
+        continue
       orphaned="${orphaned}${orphaned:+, }${service} held a permit for \
-${work}"
+$(permit_identity "${record}")"
     done
 
     completed_total=$((completed_total + held - forced))
@@ -6533,11 +6642,14 @@ listing_value() {
 }
 
 # The quarantined outputs an audit manifest records for work interrupted after
-# a given instant, one comma-joined "<ceremony>@<canonical start block>" per
-# record across both protocols. Emitted as "unreadable" when the manifest or
-# any record in it cannot be read, since a manifest nobody could read
-# authorizes nothing, and as "none" when the manifest is readable and holds no
-# record newer than the instant.
+# a given instant, one comma-joined
+# "<ceremony>@<canonical start block>@<chain-work-id>#<member-index>" per
+# record across both protocols. The DKG seed hash is the chain-work identity;
+# the member index is the local permit identity. Keeping both is what lets two
+# memberships on one node at one anchor remain two quarantined permits.
+# Emitted as "unreadable" when the manifest or any record in it cannot be read,
+# since a manifest nobody could read authorizes nothing, and as "none" when
+# the manifest is readable and holds no record newer than the instant.
 #
 # The instant is what keeps the reading about this drain. A quarantine
 # namespace accumulates: records an earlier interruption wrote are still there,
@@ -6564,15 +6676,21 @@ audit_quarantine_records() {
       for (const record of beacon.concat(tbtc)) {
         const ceremony = (record || {}).ceremony;
         const block = (record || {}).canonical_start_block;
+        const workID = (record || {}).seed_hash;
+        const memberIndex = (record || {}).member_index;
         const preserved = Date.parse((record || {}).preserved_at);
         if (typeof ceremony !== "string" || !/^[a-z0-9_]+$/.test(ceremony) ||
-          !Number.isInteger(block) || !Number.isFinite(preserved)) {
+          !Number.isInteger(block) ||
+          typeof workID !== "string" ||
+          !/^[A-Za-z0-9][A-Za-z0-9_.:-]*$/.test(workID) ||
+          !Number.isInteger(memberIndex) || memberIndex < 1 ||
+          !Number.isFinite(preserved)) {
           return "unreadable";
         }
         if (preserved < since) {
           continue;
         }
-        ids.push(ceremony + "@" + block);
+        ids.push(ceremony + "@" + block + "@" + workID + "#" + memberIndex);
       }
       return ids.length === 0 ? "none" : ids.join(",");
     };
@@ -6601,9 +6719,16 @@ gate_ceremony() {
 
 # One work identity in the audit's vocabulary rather than the driver's.
 audited_work_id() {
-  local ceremony
+  local ceremony remainder
   ceremony="$(work_ceremony "$1")"
-  printf '%s@%s' "$(gate_ceremony "${ceremony}")" "${1##*@}"
+  remainder="${1#*@}"
+  printf '%s@%s' "$(gate_ceremony "${ceremony}")" "${remainder}"
+}
+
+# One originated permit in the audit manifest's vocabulary.
+audited_permit_id() {
+  printf '%s#%s' "$(audited_work_id "$(work_id "$1")")" \
+    "$(permit_local_id "$(work_permit "$1")")"
 }
 
 # How many tokens a space-joined list holds.
@@ -7767,47 +7892,264 @@ ${attested_source}, and bind the reviewed release manifest's hash and \
 termination grace"
 }
 
-# Do the records show the gates held?
+# Render every acceptance-relevant finding in one record. The gate contracts
+# here are the authoritative rosters for evidence acceptance: each mandatory
+# stage and assertion must occur exactly once and in execution order, every
+# assertion must point to its designated passing stage, and each gate must
+# identify every externally supplied program whose readings it uses.
 #
-# Admissibility is not acceptance. A record whose shape, commit, and manifest
-# binding are all correct can still say, in the fields the schema exists to
-# carry, that a mandatory step failed or an acceptance assertion does not
-# hold — and a release that reads only the shape checks would take that
-# record as a satisfied gate. So the outcomes themselves are the verdict
-# here, by the same ordering conclude_verdict uses: a failed step or a
-# refused assertion refutes the gate, a blocked step leaves it unrehearsed,
-# and only a record with none of the three is evidence a gate was satisfied.
-assess_evidence_acceptance() {
-  collect_evidence_records
-  if ((${#EVIDENCE_RECORDS[@]} == 0)); then
-    blocked "no evidence records found under ${EVIDENCE_DIR}; a rehearsal \
-run that produced no record cannot be accepted"
-  fi
+# This is deliberately stricter than JSON shape validation. JSON Schema can
+# type an array entry, but a typed entry named "preflight" is not a substitute
+# for the thirteen steps of the single-release gate, and a true assertion
+# linked to some other passing step proves neither property.
+evidence_acceptance_findings() {
+  local record="$1"
+  node -e '
+    const fs = require("fs");
+    const record = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+
+    const contracts = {
+      single_release: {
+        stages: [
+          "mixed prior/R1 pre-cutover compatibility controls",
+          "representative pre-cutover work including the longest wallet action",
+          "cross C without restart",
+          "pre-cutover legacy work survives C and completes",
+          "restart across C derives mode from the chain, not from process state",
+          "post-cutover straggler fails closed and enters the roster",
+          "90/10 DKG consequence is visible with the straggler eligible",
+          "quarantine the straggler",
+          "homogeneous security-v2 controls with no legacy sightings",
+          "clock failure quarantines work rather than guessing a mode",
+          "quiescence with an in-flight security-v2 permit",
+          "quiescence with an in-flight legacy permit",
+          "the cutover fleet leaves no release candidate running",
+        ],
+        assertions: [
+          {
+            name:
+              "the gate crosses C in-process, without a restart or a global toggle",
+            stage: "cross C without restart",
+          },
+          {
+            name:
+              "a restarted node derives its mode from the canonical anchor and the current chain",
+            stage:
+              "restart across C derives mode from the chain, not from process state",
+          },
+          {
+            name:
+              "old post-C behavior fails closed and becomes operator-identified blocking evidence",
+            stage:
+              "post-cutover straggler fails closed and enters the roster",
+          },
+          {
+            name:
+              "post-C ceremonies run security-v2 with no legacy sightings",
+            stage:
+              "homogeneous security-v2 controls with no legacy sightings",
+          },
+          {
+            name:
+              "a failed chain-clock read refuses new work instead of assuming a side of C",
+            stage:
+              "clock failure quarantines work rather than guessing a mode",
+          },
+          {
+            name:
+              "graceful quiescence starts no new work and lets held permits finish",
+            stage:
+              "quiescence with an in-flight security-v2 permit",
+          },
+          {
+            name:
+              "a finished cutover rehearsal leaves no candidate able to act",
+            stage:
+              "the cutover fleet leaves no release candidate running",
+          },
+        ],
+        inputs: ["work_driver_sha256"],
+      },
+      rollback: {
+        stages: [
+          "quiesce every R1 node with work represented",
+          "no prior binary starts during quiescence",
+          "a forced deadline quarantines rather than completing",
+          "every release candidate is stopped or network-quarantined",
+          "offline state audit produces a rollback-safe manifest",
+          "every in-flight permit reconciles to completion or quarantine",
+          "stage the prior digest behind the all-candidate-down barrier",
+          "homogeneous legacy ceremonies work with no R1 traffic left",
+          "a forbidden partial rollback is blocked",
+          "the prior binary loads and signs with a wallet created after C",
+        ],
+        assertions: [
+          {
+            name:
+              "every R1 node drains to a stop within the reviewed termination grace",
+            stage: "quiesce every R1 node with work represented",
+          },
+          {
+            name:
+              "no prior binary participates before every R1 node is down",
+            stage: "no prior binary starts during quiescence",
+          },
+          {
+            name:
+              "all R1 is down or quarantined before any prior binary participates",
+            stage:
+              "every release candidate is stopped or network-quarantined",
+          },
+          {
+            name: "the offline state audit passes before rollback",
+            stage:
+              "offline state audit produces a rollback-safe manifest",
+          },
+          {
+            name:
+              "every permit held at the stop completes or is audited into quarantine",
+            stage:
+              "every in-flight permit reconciles to completion or quarantine",
+          },
+          {
+            name: "a partial rollback cannot be performed",
+            stage: "a forbidden partial rollback is blocked",
+          },
+        ],
+        inputs: [
+          "work_driver_sha256",
+          "rollback_evidence_generator_sha256",
+        ],
+      },
+    };
+
+    const contract = contracts[record.gate];
+    if (!contract) {
+      process.stdout.write(
+        "unrehearsed\tunknown gate " + JSON.stringify(record.gate) + "\n"
+      );
+      process.exit(0);
+    }
+
+    const findings = [];
+    const add = (kind, what) => findings.push(kind + "\t" + what);
+    const stages = Array.isArray(record.stages) ? record.stages : [];
+    const assertions = Array.isArray(record.assertions)
+      ? record.assertions
+      : [];
+
+    const checkRoster = (kind, entries, required, key) => {
+      const actual = entries.map((entry) => String((entry || {})[key] || ""));
+      const requiredSet = new Set(required);
+      const counts = new Map();
+      for (const name of actual) {
+        counts.set(name, (counts.get(name) || 0) + 1);
+      }
+      for (const name of required) {
+        const count = counts.get(name) || 0;
+        if (count === 0) {
+          add("unrehearsed", "required " + kind + " " +
+            JSON.stringify(name) + " is absent");
+        } else if (count > 1) {
+          add("unrehearsed", kind + " " + JSON.stringify(name) +
+            " appears " + count + " times");
+        }
+      }
+      for (const [name, count] of counts) {
+        if (!requiredSet.has(name)) {
+          add("unrehearsed", "unknown " + kind + " " +
+            JSON.stringify(name) + " appears " + count + " time(s)");
+        }
+      }
+      if (
+        actual.length === required.length &&
+        actual.some((name, index) => name !== required[index])
+      ) {
+        add("unrehearsed", kind + " roster is not in execution order");
+      }
+    };
+
+    checkRoster("step", stages, contract.stages, "name");
+    checkRoster(
+      "assertion",
+      assertions,
+      contract.assertions.map((entry) => entry.name),
+      "assertion"
+    );
+
+    const stageByName = new Map();
+    for (const stage of stages) {
+      const name = String((stage || {}).name || "");
+      if (!stageByName.has(name)) {
+        stageByName.set(name, stage);
+      }
+      if (stage.outcome === "fail") {
+        add("refuted", "step " + JSON.stringify(name));
+      } else if (stage.outcome === "blocked") {
+        add("unrehearsed", "step " + JSON.stringify(name));
+      }
+    }
+
+    const expectedAssertion = new Map(
+      contract.assertions.map((entry) => [entry.name, entry.stage])
+    );
+    for (const entry of assertions) {
+      const name = String((entry || {}).assertion || "");
+      if (entry.holds !== true) {
+        add("refuted", "assertion " + JSON.stringify(name));
+      }
+
+      const expectedStage = expectedAssertion.get(name);
+      if (!expectedStage) {
+        continue;
+      }
+      if (entry.evidence_stage !== expectedStage) {
+        add(
+          "unrehearsed",
+          "assertion " + JSON.stringify(name) + " cites " +
+            JSON.stringify(entry.evidence_stage || "") + " instead of " +
+            JSON.stringify(expectedStage)
+        );
+        continue;
+      }
+      const stage = stageByName.get(expectedStage);
+      if (entry.holds === true && (!stage || stage.outcome !== "pass")) {
+        add(
+          "unrehearsed",
+          "assertion " + JSON.stringify(name) +
+            " claims to hold against non-passing step " +
+            JSON.stringify(expectedStage)
+        );
+      }
+    }
+
+    const inputs = record.chain_inputs || {};
+    for (const input of contract.inputs) {
+      if (typeof inputs[input] !== "string" || inputs[input].length === 0) {
+        add(
+          "unrehearsed",
+          "required reviewed instrument digest " + JSON.stringify(input) +
+            " is absent"
+        );
+      }
+    }
+
+    process.stdout.write(findings.join("\n"));
+  ' "${record}"
+}
+
+# Apply the acceptance contract to a caller-selected record set. The
+# in-process rehearsal passes only the record it just emitted; the archive
+# validator passes every top-level record it found.
+assess_evidence_record_set() {
+  (($# > 0)) ||
+    blocked "no evidence records were supplied for acceptance"
 
   local refutations=() unrehearsed=()
   local record outcomes kind what
-  for record in "${EVIDENCE_RECORDS[@]}"; do
-    # Every non-passing outcome the record carries, one per line, as the
-    # kind that decides the verdict and the human-readable thing it names.
-    outcomes="$(node -e '
-      const fs = require("fs");
-      const record = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-      const lines = [];
-      for (const stage of record.stages || []) {
-        if (stage.outcome === "fail") {
-          lines.push("refuted\tstep " + JSON.stringify(stage.name));
-        } else if (stage.outcome === "blocked") {
-          lines.push("unrehearsed\tstep " + JSON.stringify(stage.name));
-        }
-      }
-      for (const entry of record.assertions || []) {
-        if (entry.holds !== true) {
-          lines.push("refuted\tassertion " + JSON.stringify(entry.assertion));
-        }
-      }
-      process.stdout.write(lines.join("\n"));
-    ' "${record}")" ||
-      fail "cannot read the step and assertion outcomes of ${record}"
+  for record in "$@"; do
+    outcomes="$(evidence_acceptance_findings "${record}")" ||
+      fail "cannot assess the gate contract recorded in ${record}"
 
     [[ -n "${outcomes}" ]] || continue
     while IFS="$(printf '\t')" read -r kind what; do
@@ -7824,12 +8166,33 @@ failed step(s) or refused assertion(s): ${refutations[*]}; these records are \
 admissible evidence that the rehearsal did not hold, not a passing gate"
   fi
   if ((${#unrehearsed[@]} > 0)); then
-    blocked "${#unrehearsed[@]} mandatory step(s) across these records never \
-executed: ${unrehearsed[*]}; a gate whose steps did not all run has not been \
-rehearsed, whatever the records that do exist show"
+    blocked "${#unrehearsed[@]} acceptance requirement(s) across these \
+records were missing, duplicated, misbound, or never executed: \
+${unrehearsed[*]}; an incomplete gate contract has not been rehearsed, \
+whatever the records that do exist show"
   fi
 
-  note "every recorded step passed and every acceptance assertion holds"
+  note "every required step passed exactly once, every required assertion \
+holds against its designated passing step, and every required reviewed \
+instrument digest is present"
+}
+
+# Do the records show the gates held?
+#
+# Admissibility is not acceptance. A record whose shape, commit, and manifest
+# binding are all correct can still omit most of a gate, duplicate one passing
+# step in place of another, cite an unrelated passing step for an assertion,
+# omit the reviewed instrument that produced its readings, or state outright
+# that a mandatory property failed. Only the exact gate contract above can be
+# accepted.
+assess_evidence_acceptance() {
+  collect_evidence_records
+  if ((${#EVIDENCE_RECORDS[@]} == 0)); then
+    blocked "no evidence records found under ${EVIDENCE_DIR}; a rehearsal \
+run that produced no record cannot be accepted"
+  fi
+
+  assess_evidence_record_set "${EVIDENCE_RECORDS[@]}"
 }
 
 stage_validate_evidence() {

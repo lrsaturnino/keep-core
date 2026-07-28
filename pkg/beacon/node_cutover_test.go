@@ -3,6 +3,9 @@ package beacon
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math"
 	"math/big"
@@ -57,6 +60,7 @@ type cutoverRecordingPersistence struct {
 
 	mu    sync.Mutex
 	saves []string
+	data  map[string][]byte
 }
 
 func (p *cutoverRecordingPersistence) Save(
@@ -66,7 +70,12 @@ func (p *cutoverRecordingPersistence) Save(
 ) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.saves = append(p.saves, directory+name)
+	path := directory + name
+	p.saves = append(p.saves, path)
+	if p.data == nil {
+		p.data = make(map[string][]byte)
+	}
+	p.data[path] = append([]byte(nil), data...)
 	return nil
 }
 
@@ -81,6 +90,21 @@ func (p *cutoverRecordingPersistence) savesContaining(marker string) int {
 		}
 	}
 	return count
+}
+
+// savedDataContaining returns copies of the bytes saved to matching paths.
+func (p *cutoverRecordingPersistence) savedDataContaining(
+	marker string,
+) [][]byte {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	result := make([][]byte, 0)
+	for path, data := range p.data {
+		if strings.Contains(path, marker) {
+			result = append(result, append([]byte(nil), data...))
+		}
+	}
+	return result
 }
 
 // cutoverFailableBlockCounter delegates to the real local chain clock until a
@@ -721,7 +745,8 @@ func TestJoinDKGIfEligible_ForcedShutdownAfterKeyGenerationQuarantinesSigner(t *
 		harness.gate.Close()
 	}()
 
-	harness.node.JoinDKGIfEligible(cutoverRandomSeed(t), harness.anchorBlock)
+	seed := cutoverRandomSeed(t)
+	harness.node.JoinDKGIfEligible(seed, harness.anchorBlock)
 
 	<-shutdownDone
 	harness.waitForPermitRelease(t)
@@ -742,6 +767,21 @@ func TestJoinDKGIfEligible_ForcedShutdownAfterKeyGenerationQuarantinesSigner(t *
 			harness.groupSize,
 			got,
 		)
+	}
+	expectedSeedHash := sha256.Sum256(seed.Bytes())
+	for _, data := range harness.quarantinePersistence.savedDataContaining(
+		"/metadata_",
+	) {
+		metadata := &registry.QuarantinedSignerMetadata{}
+		if err := json.Unmarshal(data, metadata); err != nil {
+			t.Fatal(err)
+		}
+		if metadata.SeedHash != hex.EncodeToString(expectedSeedHash[:]) {
+			t.Errorf(
+				"unexpected quarantine seed hash [%s]",
+				metadata.SeedHash,
+			)
+		}
 	}
 	if got := harness.registryPersistence.savesContaining("/membership_"); got != 0 {
 		t.Errorf(

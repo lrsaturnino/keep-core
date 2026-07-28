@@ -87,6 +87,11 @@ as `<service> <identity-manifest> <output-directory>` and must write
 snapshot; and the second pass, over those records, is the one that authorizes
 anything. A generator that failed, that wrote only some of the four, or that
 cannot be run leaves the barrier unestablished rather than the audit refusing.
+Each `active_permits_at_quiescence` entry in the quiescence report names
+`work_id` and `permit_id` as well as ceremony, mode, anchor, and outcome.
+Quarantined DKG claims use the seed hash and member index respectively, so the
+audit matches the exact local permit rather than letting one output cover
+another event or membership at the same block.
 
 The identities the audit binds that evidence to — the release being rolled
 back: version, revision, epoch, and armed C — come from what the R1 fleet
@@ -227,31 +232,34 @@ succeeded: its stdout is a JSON object whose optional `transaction_hashes`
 array carries the chain transactions it submitted — those enter the step being
 recorded, so a reviewer can follow a step back to the transactions that caused
 it — and whose optional `ceremony_results` array carries `{ceremony,
-canonical_start_block, outcome, transaction_hash}` objects naming the terminal
-result of each ceremony those transactions started. The results are there
+canonical_start_block, work_id, outcome, transaction_hash}` objects naming the
+terminal result of each ceremony those transactions started. The results are there
 because no fleet counter carries them: a permit says a node was allowed to
 begin, and the positive control is about a ceremony finishing. An optional
 `originated_ceremonies` array carries `{ceremony, canonical_start_block,
-transaction_hash, holders}` objects naming what the driver put on the chain
-whatever became of it, for the phases whose subject is work still in flight —
-a drain, a forced deadline — which have no terminal outcome to read, since by
-the time one exists the work it was about is over. Every array is validated
-strictly, and a report that cannot be read stops the step — a driver whose
-account is unreadable has left the step unable to say what it drove, and
-recording that as "nothing happened" would enter silence as evidence.
+work_id, transaction_hash, holders}` objects naming what the driver put on the
+chain whatever became of it, for the phases whose subject is work still in
+flight — a drain, a forced deadline — which have no terminal outcome to read,
+since by the time one exists the work it was about is over. `holders` is an
+array of `{service, permit_id}` records, one for every local permit rather than
+a set of node names. Every array is validated strictly, and a report that
+cannot be read stops the step — a driver whose account is unreadable has left
+the step unable to say what it drove, and recording that as "nothing happened"
+would enter silence as evidence.
 
 Each outcome is bound to the work it belongs to, and controls are decided on
-the bound form rather than on the arrays beside it. The unit of that binding is
-one piece of work, identified by the canonical start block its permit pinned
-its mode from — `<ceremony>@<block>` — rather than by the ceremony name. Two
-runs of one ceremony are the same word and different work, and a threshold
-ceremony takes one permit on every node that joins it, so an account that names
-only ceremonies cannot say how many permits it is describing. `holders` names
-the R1 services that took a permit, because the population a drain reconciles
-is per (node, work) and only the party that originated the work can say which
-nodes it reached. A piece of work is originated once and ends once: a repeated
-identity, or one transaction claimed by two pieces of work, stops the step
-rather than being counted twice downstream.
+the bound form rather than on the arrays beside it. One chain work item is
+`<ceremony>@<block>@<work_id>`: the canonical start block pins the mode, while
+`work_id` is the chain-native request, group, wallet/action, or DKG-seed
+identity that distinguishes several events in one block. One local permit is
+that work identity plus `<service>~<permit_id>`. The permit ID is the local
+membership/member index or stable wallet/action identity, so one node
+controlling two members at the same anchor retains two permit records. A piece
+of chain work is originated once and ends once, while each local permit is
+also unique. A repeated identity, one transaction claimed by two pieces of
+work, or one work item changing transactions stops the step rather than being
+counted twice or rebound downstream. A later terminal phase must retain the
+exact transaction recorded by the originating phase.
 
 Everything above is the report checked against itself, and a report that is
 internally consistent and entirely invented passes all of it. So the chain is
@@ -356,16 +364,19 @@ reconciles no particular permit when the two accounts are of different sizes,
 which is how one reported result came to stand in for however many permits
 happened to be outstanding.
 
-The quarantine records are read the same way. They are matched by work identity
-rather than counted, so a record for a ceremony this drain never put on that
-node refutes the step instead of padding the count, and they are filtered by
-the instant the stop was issued, because a quarantine namespace accumulates:
-records an earlier interruption wrote are still in it, and a bare count lets
-state from a run nobody is reconciling stand in for permits this drain
-abandoned. The driver's own work classes are translated into the gate's
-ceremony vocabulary for that comparison — every non-heartbeat wallet action is
-gated as a signing ceremony, and the beacon's signing class is its relay
-signing — because otherwise work that has a record would appear to have none.
+The quarantine records are read the same way. DKG records retain the seed hash
+as their chain-work ID and the member index as their local permit ID, and are
+matched one-to-one rather than projected down to ceremony and block. Thus two
+memberships on one node at one anchor remain two records, and a record for a
+permit this drain never put on that node refutes the step instead of padding
+the count. Records are filtered by the instant the stop was issued because a
+quarantine namespace accumulates: records an earlier interruption wrote are
+still there, and a bare count lets state from a run nobody is reconciling stand
+in for permits this drain abandoned. The driver's own work classes are
+translated into the gate's ceremony vocabulary for that comparison — every
+non-heartbeat wallet action is gated as a signing ceremony, and the beacon's
+signing class is its relay signing — because otherwise work that has a record
+would appear to have none.
 
 Neither is a permit simply "completed" because the gauge holding it fell.
 Being gone is what a ceremony that finished and a process that exited holding
@@ -508,12 +519,20 @@ measured against the reviewed manifest — and says nothing about what it
 says. A record is precisely where a rehearsal reports that a mandatory step
 failed or an acceptance assertion does not hold, so a schema-valid,
 correctly bound record can be exactly the evidence that a gate must be
-refused. `validate-evidence` therefore asks the second question separately,
-by the same ordering the runs themselves use: any recorded failed step or
-refused assertion, in any record in the directory, exits `FAIL`; any step
-that never executed exits `BLOCKED`; only a directory with none of the three
-is evidence of satisfied gates. A passing record beside a failing one
-accepts nothing.
+refused. `validate-evidence` therefore asks the second question separately
+against the exact gate contract. The single-release record must carry its 13
+named stages and seven named assertions; rollback must carry its ten stages
+and six assertions. Every entry occurs exactly once and in execution order,
+unknown entries are rejected, and every assertion must cite its designated
+passing stage rather than any convenient passing step. Single-release must
+also name the reviewed work-driver digest; rollback must name both that digest
+and the reviewed rollback-evidence-generator digest. Any recorded failed step
+or refused assertion, in any record in the directory, exits `FAIL`; anything
+missing, duplicated, misbound, blocked, or produced without its required
+reviewed instrument exits `BLOCKED`. Only the complete exact contracts are
+evidence of satisfied gates. A passing record beside a failing one accepts
+nothing. The in-process emitter applies this same contract to the record it
+just wrote before a rehearsal is allowed to print success.
 
 Those comparisons only mean something while the checked-in manifest is
 still the compiled bounds' own manifest, so the stage refuses to measure
@@ -560,11 +579,14 @@ rules it judges by all come out of the tree it runs from.
 The validator proves itself before validating anything:
 `test-validate-evidence.sh` drives the stage over fixture records — correct
 binding, wrong hash, wrong grace, wrong source commit, missing binding
-fields, malformed timestamp, empty record set — over correctly bound records
-whose *outcomes* deny the gate — a failed step, a refused assertion with
-every step passing, a step that never executed, a failure alongside an
-unexecuted step, and a failing record sitting beside a passing one — over
-fixture attestations —
+fields, malformed timestamp, empty record set — over incomplete and malformed
+gate contracts — a one-stage passing subset, a duplicate stage replacing a
+required one, an unknown assertion, a true assertion borrowing an unrelated
+passing stage, missing required instrument digests, and an emitted one-stage
+run — over correctly bound records whose *outcomes* deny the gate — a failed
+step, a refused assertion with every step passing, a step that never executed,
+a failure alongside an unexecuted step, and a failing record sitting beside a
+passing one — over fixture attestations —
 absent, incomplete, a leftover staging directory, taken over other manifest
 bytes, contradicting the reviewed bounds, taken at another commit than the
 run is bound to, taken on a divergent tree, and one differing only in
@@ -922,13 +944,15 @@ program and compares it against `chain-inputs.sha256`, a reviewed control
 checked in beside this file, before any node is started; a mismatch, or a
 program the control does not name, stops the rehearsal. The digests are
 recorded into the evidence document under `chain_inputs`, and the acceptance
-stage refuses a record naming a digest the control does not pin, or one
-carrying chain transactions while naming no driver at all. That control
-currently pins the all-zero placeholder for both programs, which matches no
-file: no driver or generator has been written and reviewed, so every dispatch
-that supplies one blocks until a reviewed digest is recorded in a reviewed
-commit. An unpinned control that admitted anything would be worse than an
-absent one, because it would read as having been exercised.
+stage refuses a record naming a digest the control does not pin, one carrying
+chain transactions while naming no driver at all, or an otherwise complete
+gate omitting an instrument its contract uses. Single-release requires the
+driver; rollback requires the driver and generator. That control currently
+pins the all-zero placeholder for both programs, which matches no file: no
+driver or generator has been written and reviewed, so every dispatch that
+supplies one blocks until a reviewed digest is recorded in a reviewed commit.
+An unpinned control that admitted anything would be worse than an absent one,
+because it would read as having been exercised.
 
 Everything provisioned lands outside the checkout, under the runner's
 temporary directory. The container stages verify their own source binding

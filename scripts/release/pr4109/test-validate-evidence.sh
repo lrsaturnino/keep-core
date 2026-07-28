@@ -4,15 +4,16 @@
 #
 # Builds throwaway evidence records around the checked-in release manifest
 # and proves stage_validate_evidence accepts exactly a record whose schema
-# shape, manifest hash, and recorded termination grace are all correct —
-# and rejects a wrong hash, a wrong grace, missing binding fields, a
-# malformed timestamp, an empty record set, and a bad record hiding behind
-# a good one. It also drives the manifest attestation the stage requires
-# before it measures anything: absent, incomplete, taken over other manifest
-# bytes, recording bounds the reviewed manifest contradicts, taken at
-# another commit than the run is bound to, taken at no clean commit at all,
-# or vouching for a record built from other bytes — plus the tree binding the
-# stage verifies before it judges anything.
+# shape, manifest hash, recorded termination grace, complete gate roster,
+# assertion-to-stage bindings, and reviewed instrument identities are all
+# correct — and rejects a wrong hash, a wrong grace, missing binding fields,
+# an incomplete or duplicated roster, a malformed timestamp, an empty record
+# set, and a bad record hiding behind a good one. It also drives the manifest
+# attestation the stage requires before it measures anything: absent,
+# incomplete, taken over other manifest bytes, recording bounds the reviewed
+# manifest contradicts, taken at another commit than the run is bound to,
+# taken at no clean commit at all, or vouching for a record built from other
+# bytes — plus the tree binding the stage verifies before it judges anything.
 #
 # Admissibility is not acceptance, and the cases keep the two apart. A
 # separate set of records passes every binding check above and still denies
@@ -106,31 +107,80 @@ MANIFEST_GRACE="$(node -e '
   process.stdout.write(String(
     manifest.termination_grace.termination_grace_period_seconds));
 ' "${TEST_DIR}/release-manifest.json")"
+REVIEWED_WORK_DRIVER_DIGEST="$(reviewed_input_digest work-driver)"
+REVIEWED_ROLLBACK_GENERATOR_DIGEST="$(
+  reviewed_input_digest rollback-evidence-generator
+)"
 
 # A schema-complete record bound to the given manifest hash, grace,
 # generation timestamp, and source commit. The negative cases change exactly
 # one argument each, so a rejection can only come from that change.
 #
 # The last two arguments are the record's own stages and assertions. They
-# default to a rehearsal that held, and the acceptance cases override them
-# with the outcomes a record is allowed to carry and a release is not
-# allowed to accept — every one of which is schema-valid and correctly
-# bound, which is exactly why nothing before the acceptance check can see it.
-STAGE_PASSED='{ "name": "preflight", "outcome": "pass" }'
+# default to the complete single-release gate contract. Acceptance negatives
+# may replace them with a deliberately incomplete record, or mutate one
+# canonical entry, to prove an arbitrary passing subset cannot stand in for
+# the gate.
+SINGLE_RELEASE_STAGES='
+  { "name": "mixed prior/R1 pre-cutover compatibility controls", "outcome": "pass" },
+  { "name": "representative pre-cutover work including the longest wallet action", "outcome": "pass" },
+  { "name": "cross C without restart", "outcome": "pass" },
+  { "name": "pre-cutover legacy work survives C and completes", "outcome": "pass" },
+  { "name": "restart across C derives mode from the chain, not from process state", "outcome": "pass" },
+  { "name": "post-cutover straggler fails closed and enters the roster", "outcome": "pass" },
+  { "name": "90/10 DKG consequence is visible with the straggler eligible", "outcome": "pass" },
+  { "name": "quarantine the straggler", "outcome": "pass" },
+  { "name": "homogeneous security-v2 controls with no legacy sightings", "outcome": "pass" },
+  { "name": "clock failure quarantines work rather than guessing a mode", "outcome": "pass" },
+  { "name": "quiescence with an in-flight security-v2 permit", "outcome": "pass" },
+  { "name": "quiescence with an in-flight legacy permit", "outcome": "pass" },
+  { "name": "the cutover fleet leaves no release candidate running", "outcome": "pass" }'
+SINGLE_RELEASE_ASSERTIONS='
+  { "assertion": "the gate crosses C in-process, without a restart or a global toggle", "holds": true, "evidence_stage": "cross C without restart" },
+  { "assertion": "a restarted node derives its mode from the canonical anchor and the current chain", "holds": true, "evidence_stage": "restart across C derives mode from the chain, not from process state" },
+  { "assertion": "old post-C behavior fails closed and becomes operator-identified blocking evidence", "holds": true, "evidence_stage": "post-cutover straggler fails closed and enters the roster" },
+  { "assertion": "post-C ceremonies run security-v2 with no legacy sightings", "holds": true, "evidence_stage": "homogeneous security-v2 controls with no legacy sightings" },
+  { "assertion": "a failed chain-clock read refuses new work instead of assuming a side of C", "holds": true, "evidence_stage": "clock failure quarantines work rather than guessing a mode" },
+  { "assertion": "graceful quiescence starts no new work and lets held permits finish", "holds": true, "evidence_stage": "quiescence with an in-flight security-v2 permit" },
+  { "assertion": "a finished cutover rehearsal leaves no candidate able to act", "holds": true, "evidence_stage": "the cutover fleet leaves no release candidate running" }'
+ROLLBACK_STAGES='
+  { "name": "quiesce every R1 node with work represented", "outcome": "pass" },
+  { "name": "no prior binary starts during quiescence", "outcome": "pass" },
+  { "name": "a forced deadline quarantines rather than completing", "outcome": "pass" },
+  { "name": "every release candidate is stopped or network-quarantined", "outcome": "pass" },
+  { "name": "offline state audit produces a rollback-safe manifest", "outcome": "pass" },
+  { "name": "every in-flight permit reconciles to completion or quarantine", "outcome": "pass" },
+  { "name": "stage the prior digest behind the all-candidate-down barrier", "outcome": "pass" },
+  { "name": "homogeneous legacy ceremonies work with no R1 traffic left", "outcome": "pass" },
+  { "name": "a forbidden partial rollback is blocked", "outcome": "pass" },
+  { "name": "the prior binary loads and signs with a wallet created after C", "outcome": "pass" }'
+ROLLBACK_ASSERTIONS='
+  { "assertion": "every R1 node drains to a stop within the reviewed termination grace", "holds": true, "evidence_stage": "quiesce every R1 node with work represented" },
+  { "assertion": "no prior binary participates before every R1 node is down", "holds": true, "evidence_stage": "no prior binary starts during quiescence" },
+  { "assertion": "all R1 is down or quarantined before any prior binary participates", "holds": true, "evidence_stage": "every release candidate is stopped or network-quarantined" },
+  { "assertion": "the offline state audit passes before rollback", "holds": true, "evidence_stage": "offline state audit produces a rollback-safe manifest" },
+  { "assertion": "every permit held at the stop completes or is audited into quarantine", "holds": true, "evidence_stage": "every in-flight permit reconciles to completion or quarantine" },
+  { "assertion": "a partial rollback cannot be performed", "holds": true, "evidence_stage": "a forbidden partial rollback is blocked" }'
+STAGE_PASSED="${SINGLE_RELEASE_STAGES}"
 STAGE_FAILED='{ "name": "cross C without restart", "outcome": "fail" }'
-STAGE_BLOCKED='{ "name": "quiescence with a legacy permit", "outcome": "blocked" }'
-ASSERTION_HOLDS='{ "assertion": "self-test fixture", "holds": true }'
-ASSERTION_REFUSED='{ "assertion": "the gate crosses C in-process", "holds": false }'
+STAGE_BLOCKED='{ "name": "quiescence with an in-flight legacy permit", "outcome": "blocked" }'
+ASSERTION_HOLDS="${SINGLE_RELEASE_ASSERTIONS}"
+ASSERTION_REFUSED='{
+  "assertion": "the gate crosses C in-process, without a restart or a global toggle",
+  "holds": false,
+  "evidence_stage": "cross C without restart"
+}'
 
 write_record() {
   local path="$1" sha="$2" grace="$3" generated_at="$4"
   local source_sha="${5:-${FIXTURE_SHA}}"
   local stages="${6:-${STAGE_PASSED}}"
   local assertions="${7:-${ASSERTION_HOLDS}}"
+  local gate="${8:-single_release}"
   cat >"${path}" <<EOF
 {
   "schema_version": 1,
-  "gate": "single_release",
+  "gate": "${gate}",
   "generated_at": "${generated_at}",
   "source_sha": "${source_sha}",
   "artifacts": {
@@ -148,6 +198,9 @@ write_record() {
   "release_manifest": {
     "sha256": "${sha}",
     "termination_grace_period_seconds": ${grace}
+  },
+  "chain_inputs": {
+    "work_driver_sha256": "${REVIEWED_WORK_DRIVER_DIGEST}"
   },
   "stages": [ ${stages} ],
   "assertions": [ ${assertions} ]
@@ -249,6 +302,13 @@ mkdir -p "${D}"
 write_attestation "${D}"
 write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
   "2026-07-28T00:00:00Z" "${FIXTURE_SHA}" "${STAGE_DROVE}"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  delete record.chain_inputs;
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
 run_validator "${D}"
 check "chain transactions with no named driver name no instrument" 3 \
   "carries chain transactions but names no work driver digest"
@@ -503,6 +563,134 @@ check "one bad record is rejected even after a good one validated" 3 \
 # gate it evidences did not hold. A release that read only the checks above
 # would take all of them for satisfied gates.
 
+# The false-pass that prompted the gate-contract check: one arbitrary passing
+# step and one true assertion used to satisfy both schema and acceptance.
+D="${WORK}/accept-one-stage-subset"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z" "${FIXTURE_SHA}" \
+  '{ "name": "cross C without restart", "outcome": "pass" }' \
+  '{
+    "assertion": "the gate crosses C in-process, without a restart or a global toggle",
+    "holds": true,
+    "evidence_stage": "cross C without restart"
+  }'
+run_validator "${D}"
+check "one passing stage cannot stand in for the single-release gate" 3 \
+  "required step.*mixed prior/R1 pre-cutover compatibility controls.*absent" \
+  "required assertion.*restarted node derives its mode.*absent"
+
+# A complete-looking record still names no instrument if it omits the driver
+# digest. No transaction hash is needed to trigger this check: every accepted
+# single-release gate uses the driver for its positive and negative controls.
+D="${WORK}/accept-missing-required-driver"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  delete record.chain_inputs;
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "a complete single-release roster still requires its reviewed driver" 3 \
+  "required reviewed instrument digest.*work_driver_sha256.*absent"
+
+# Repetition and invention cannot manufacture a complete gate. These records
+# keep the canonical item count deliberately plausible so the decision cannot
+# be reduced to a length check.
+D="${WORK}/accept-duplicate-stage"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  record.stages[12] = { ...record.stages[2] };
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "a duplicated passing stage cannot replace another mandatory step" 3 \
+  "step.*cross C without restart.*appears 2 times" \
+  "required step.*cutover fleet leaves no release candidate running.*absent"
+
+D="${WORK}/accept-unknown-assertion"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  record.assertions[6] = {
+    assertion: "an invented release property",
+    holds: true,
+    evidence_stage: "the cutover fleet leaves no release candidate running",
+  };
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "an unknown true assertion cannot replace a required one" 3 \
+  "unknown assertion.*invented release property" \
+  "required assertion.*finished cutover rehearsal.*absent"
+
+# A true assertion must name its own designated passing step. Merely pointing
+# at any other passing step is not a chain of evidence for the property.
+D="${WORK}/accept-wrong-assertion-stage"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  record.assertions[0].evidence_stage =
+    "homogeneous security-v2 controls with no legacy sightings";
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "an assertion cannot borrow an unrelated passing stage" 3 \
+  "assertion.*gate crosses C.*cites.*homogeneous security-v2.*instead of.*cross C"
+
+# Rollback consumes both external programs: the work driver identifies the
+# permits being drained, and the evidence generator binds the offline audit
+# to the state that drain left. A complete rollback roster needs both.
+D="${WORK}/accept-rollback-missing-generator"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z" "${FIXTURE_SHA}" "${ROLLBACK_STAGES}" \
+  "${ROLLBACK_ASSERTIONS}" rollback
+run_validator "${D}"
+check "rollback requires the reviewed evidence generator as well as the driver" \
+  3 "required reviewed instrument digest.*rollback_evidence_generator_sha256"
+
+D="${WORK}/accept-complete-rollback"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z" "${FIXTURE_SHA}" "${ROLLBACK_STAGES}" \
+  "${ROLLBACK_ASSERTIONS}" rollback
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  record.chain_inputs.rollback_evidence_generator_sha256 = process.argv[2];
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json" "${REVIEWED_ROLLBACK_GENERATOR_DIGEST}"
+run_validator "${D}"
+check "the complete rollback contract with both reviewed instruments passes" 0 \
+  "every required step passed exactly once" \
+  "every required reviewed instrument digest is present"
+
 D="${WORK}/accept-failed-step"
 mkdir -p "${D}"
 write_attestation "${D}"
@@ -530,7 +718,7 @@ write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
   "${STAGE_PASSED}, ${STAGE_BLOCKED}"
 run_validator "${D}"
 check "a record with a step that never executed is not an accepted gate" 3 \
-  "never executed" "quiescence with a legacy permit"
+  "never executed" "quiescence with an in-flight legacy permit"
 
 # A failure outranks a step that never ran: the rehearsal reached that
 # property and watched it break, which is a refutation and not a gap.
@@ -708,6 +896,15 @@ run_rehearsal() {
       CUTOVER_BLOCK="9000000"
       # shellcheck disable=SC2030,SC2031,SC2034
       REHEARSAL_GATE="${gate}"
+      # The real preflight records the reviewed programs it was handed before
+      # the fleet starts. These emitter cases bypass preflight and install the
+      # same proven identities directly.
+      # shellcheck disable=SC2030,SC2031,SC2034
+      WORK_DRIVER_DIGEST="${REVIEWED_WORK_DRIVER_DIGEST}"
+      if [[ "${gate}" == "rollback" ]]; then
+        # shellcheck disable=SC2030,SC2031,SC2034
+        ROLLBACK_GENERATOR_DIGEST="${REVIEWED_ROLLBACK_GENERATOR_DIGEST}"
+      fi
       # The real capture, against the fixture diagnostics: both gates read the
       # release identity off the running fleet before they touch it, and the
       # record is built from what was captured there.
@@ -722,17 +919,68 @@ run_rehearsal() {
 
 # A rehearsal whose every mandatory step executed.
 complete_run() {
-  begin_step "cross C without restart"
-  # The observation slots the real probes fill; record_step drains them.
-  # shellcheck disable=SC2034
-  STEP_CANONICAL_BLOCKS="8999999,9000001"
-  # shellcheck disable=SC2034
-  STEP_PERMIT_MODES='"security_v2"'
-  # shellcheck disable=SC2034
-  STEP_GAUGES='"r1-node-1.participation_gate_state":2'
-  record_step "cross C without restart" pass "both gates crossed in process"
-  record_assertion "the gate crosses C in-process" true \
+  local stages=(
+    "mixed prior/R1 pre-cutover compatibility controls"
+    "representative pre-cutover work including the longest wallet action"
     "cross C without restart"
+    "pre-cutover legacy work survives C and completes"
+    "restart across C derives mode from the chain, not from process state"
+    "post-cutover straggler fails closed and enters the roster"
+    "90/10 DKG consequence is visible with the straggler eligible"
+    "quarantine the straggler"
+    "homogeneous security-v2 controls with no legacy sightings"
+    "clock failure quarantines work rather than guessing a mode"
+    "quiescence with an in-flight security-v2 permit"
+    "quiescence with an in-flight legacy permit"
+    "the cutover fleet leaves no release candidate running"
+  )
+  local stage
+  for stage in "${stages[@]}"; do
+    begin_step "${stage}"
+    if [[ "${stage}" == "cross C without restart" ]]; then
+      # The observation slots the real probes fill; record_step drains them.
+      # shellcheck disable=SC2034
+      STEP_CANONICAL_BLOCKS="8999999,9000001"
+      # shellcheck disable=SC2034
+      STEP_PERMIT_MODES='"security_v2"'
+      # shellcheck disable=SC2034
+      STEP_GAUGES='"r1-node-1.participation_gate_state":2'
+    fi
+    record_step "${stage}" pass "self-test observed the mandatory property"
+  done
+
+  record_assertion \
+    "the gate crosses C in-process, without a restart or a global toggle" \
+    true "cross C without restart"
+  record_assertion \
+    "a restarted node derives its mode from the canonical anchor and the current chain" \
+    true \
+    "restart across C derives mode from the chain, not from process state"
+  record_assertion \
+    "old post-C behavior fails closed and becomes operator-identified blocking evidence" \
+    true "post-cutover straggler fails closed and enters the roster"
+  record_assertion \
+    "post-C ceremonies run security-v2 with no legacy sightings" true \
+    "homogeneous security-v2 controls with no legacy sightings"
+  record_assertion \
+    "a failed chain-clock read refuses new work instead of assuming a side of C" \
+    true "clock failure quarantines work rather than guessing a mode"
+  record_assertion \
+    "graceful quiescence starts no new work and lets held permits finish" \
+    true "quiescence with an in-flight security-v2 permit"
+  record_assertion \
+    "a finished cutover rehearsal leaves no candidate able to act" true \
+    "the cutover fleet leaves no release candidate running"
+}
+
+# The old false-pass in the emitter itself: a hand-built run containing only
+# the crossing used to reach conclude_verdict's success line.
+one_stage_run() {
+  begin_step "cross C without restart"
+  record_step "cross C without restart" pass "only one property was observed"
+  record_assertion \
+    "the gate crosses C in-process, without a restart or a global toggle" \
+    true "cross C without restart"
 }
 
 # The same rehearsal with one step this release cannot execute.
@@ -781,6 +1029,14 @@ run_rehearsal "${E}" single_release complete_run
 check "a rehearsal record the emitter builds is accepted by the acceptance stage" \
   0 "rehearsal evidence record written" "hash and termination grace" \
   "every mandatory step executed"
+
+E="${WORK}/emitted-one-stage"
+mkdir -p "${E}"
+write_attestation "${E}"
+run_rehearsal "${E}" single_release one_stage_run
+check "the emitter cannot report success for a one-stage rehearsal" 3 \
+  "rehearsal evidence record written" \
+  "required step.*mixed prior/R1 pre-cutover compatibility controls.*absent"
 
 # The release identity in the record has to be the one the node published,
 # read from where it publishes it. Asserting the values — not merely that the
@@ -1696,6 +1952,7 @@ check "a driver that could not offer work is not a gate nobody asked" 3 \
 # each other.
 QUIESCE_TX1="0x3131313131313131313131313131313131313131313131313131313131313131"
 QUIESCE_TX2="0x3232323232323232323232323232323232323232323232323232323232323232"
+QUIESCE_TX3="0x3333333333333333333333333333333333333333333333333333333333333333"
 
 # The slots the verdict under test reads; shellcheck cannot follow them
 # across the source boundary into rehearse.sh.
@@ -1727,10 +1984,12 @@ beacon_dkg=0"
   # The work the node was holding when the stop was issued, named rather than
   # counted, and what the driver saw become of each piece once the drain was
   # over. Two permits, two pieces of work, two outcomes.
-  QUIESCE_INFLIGHT_WORK="tbtc_signing@840=${QUIESCE_TX1}=r1-node-1,r1-node-2 \
-beacon_dkg@841=${QUIESCE_TX2}=r1-node-2"
-  QUIESCE_TERMINAL="tbtc_signing@840=succeeded=${QUIESCE_TX1}=0xsigned840 \
-beacon_dkg@841=succeeded=${QUIESCE_TX2}=0xgroup841"
+  QUIESCE_INFLIGHT_WORK="\
+tbtc_signing@840@wallet840=${QUIESCE_TX1}=r1-node-2~member-1 \
+beacon_dkg@841@seed841=${QUIESCE_TX2}=r1-node-2~2"
+  QUIESCE_TERMINAL="\
+tbtc_signing@840@wallet840=succeeded=${QUIESCE_TX1}=0xsigned840 \
+beacon_dkg@841@seed841=succeeded=${QUIESCE_TX2}=0xgroup841"
   QUIESCE_TERMINAL_ASKED=1
   QUIESCE_TERMINAL_RC=0
 }
@@ -1746,7 +2005,7 @@ check "a quiescence that refused new work and drained its permits holds" 0 \
   "refused it on its own account \(tbtc_signing \+1" \
   "in-flight count observed at zero" \
   "every piece of work it was holding settled on chain" \
-  "tbtc_signing@840 \(${QUIESCE_TX1}, 0xsigned840\)"
+  "tbtc_signing@840@wallet840 \(${QUIESCE_TX1}, 0xsigned840\)"
 
 # The reading a gauge cannot carry, and the one this step used to stop at. The
 # permits are gone; a process that exited holding them produces exactly that.
@@ -1770,20 +2029,33 @@ run_verdict quiesce_case eval 'QUIESCE_TERMINAL_RC=7'
 check "a partial terminal report accounts for no held permit" 3 \
   "work driver exited \[7\] reporting what became of the work"
 
+# A terminal phase must preserve the transaction that the in-flight phase
+# recorded. The anchor and ceremony still match here; accepting them alone
+# would let an unrelated successful transaction become the held permit's end.
+run_verdict quiesce_case eval \
+  "QUIESCE_TERMINAL=\"\
+tbtc_signing@840@wallet840=succeeded=${QUIESCE_TX3}=0xunrelated \
+beacon_dkg@841@seed841=succeeded=${QUIESCE_TX2}=0xgroup841\""
+check "a terminal phase cannot replace the transaction that started work" 3 \
+  "tbtc_signing@840@wallet840 .* originated as ${QUIESCE_TX1}" \
+  "cannot replace the transaction that started held work"
+
 # The regression the whole rung exists for: one of the two held permits has no
 # outcome behind it at all, and the gauge fell to zero exactly the same way.
 run_verdict quiesce_case eval \
-  "QUIESCE_TERMINAL='tbtc_signing@840=succeeded=\${QUIESCE_TX1}=0xsigned840'"
+  "QUIESCE_TERMINAL=\"\
+tbtc_signing@840@wallet840=succeeded=${QUIESCE_TX1}=0xsigned840\""
 check "a permit whose work never ended went down with the process" 3 \
-  "no terminal outcome for beacon_dkg@841"
+  "no terminal outcome for beacon_dkg@841@seed841#2"
 
 # An end, but not the end this step claims. Nothing in this gate audits what a
 # ceremony that gave up left behind.
 run_verdict quiesce_case eval \
-  "QUIESCE_TERMINAL='tbtc_signing@840=succeeded=\${QUIESCE_TX1}=0xsigned840 \
-beacon_dkg@841=failed=\${QUIESCE_TX2}=retry_exhausted'"
+  "QUIESCE_TERMINAL=\"\
+tbtc_signing@840@wallet840=succeeded=${QUIESCE_TX1}=0xsigned840 \
+beacon_dkg@841@seed841=failed=${QUIESCE_TX2}=retry_exhausted\""
 check "work that gave up inside the grace is not work allowed to finish" 3 \
-  "beacon_dkg@841=failed \(retry_exhausted\) came to nothing"
+  "beacon_dkg@841@seed841#2=failed \(retry_exhausted\) came to nothing"
 
 run_verdict quiesce_case eval 'QUIESCE_ATTEMPTED=0'
 check "a quiescing node nobody asked evidences no refusal to start work" 3 \
@@ -2410,7 +2682,7 @@ reconcile_readings() {
 r1-node-2 3 1 0"
   # shellcheck disable=SC2034
   ROLLBACK_NODE_QUARANTINES="r1-node-1 none
-r1-node-2 beacon_dkg@1002"
+r1-node-2 beacon_dkg@1002@seed1002#3"
   # What this gate put in flight, which node took a permit for each piece of
   # it, and what the driver saw become of it once the drain was over. A permit
   # that was not force-canceled is completed only if the work behind that
@@ -2419,16 +2691,19 @@ r1-node-2 beacon_dkg@1002"
   ROLLBACK_ORIGINATED="tbtc_signing tbtc_wallet_action beacon_dkg"
   # shellcheck disable=SC2034
   ROLLBACK_ORIGINATED_WORK="\
-tbtc_signing@1000=${RECONCILE_TX}=r1-node-1,r1-node-2 \
-tbtc_wallet_action@1001=${RECONCILE_TX2}=r1-node-1,r1-node-2 \
-beacon_dkg@1002=${RECONCILE_TX3}=r1-node-2"
+tbtc_signing@1000@sign1000=${RECONCILE_TX}=r1-node-1~1 \
+tbtc_signing@1000@sign1000=${RECONCILE_TX}=r1-node-2~2 \
+tbtc_wallet_action@1001@action1001=${RECONCILE_TX2}=r1-node-1~wallet-a \
+tbtc_wallet_action@1001@action1001=${RECONCILE_TX2}=r1-node-2~wallet-b \
+beacon_dkg@1002@seed1002=${RECONCILE_TX3}=r1-node-2~3"
   # shellcheck disable=SC2034
   ROLLBACK_TERMINAL_ASKED=1
   # shellcheck disable=SC2034
   ROLLBACK_TERMINAL_RC=0
   # shellcheck disable=SC2034
-  ROLLBACK_TERMINAL="tbtc_signing@1000=succeeded=${RECONCILE_TX}=0xsigned \
-tbtc_wallet_action@1001=failed=${RECONCILE_TX2}=retry_exhausted"
+  ROLLBACK_TERMINAL="\
+tbtc_signing@1000@sign1000=succeeded=${RECONCILE_TX}=0xsigned \
+tbtc_wallet_action@1001@action1001=failed=${RECONCILE_TX2}=retry_exhausted"
 }
 
 reconcile_case() {
@@ -2441,8 +2716,8 @@ run_verdict reconcile_case :
 check "permits that completed or were audited into quarantine reconcile" 0 \
   "4 completed with the holding node observed without them and the driver \
 reporting an outcome for each one" \
-  "tbtc_signing@1000 \(${RECONCILE_TX}, 0xsigned\), tbtc_wallet_action@1001=\
-failed" \
+  "tbtc_signing@1000@sign1000 \(${RECONCILE_TX}, 0xsigned\), \
+tbtc_wallet_action@1001@action1001=failed" \
   "and 1 were force-canceled"
 
 # The regression this whole accounting exists for: the permits outnumber the
@@ -2462,18 +2737,29 @@ check "fewer permits than the work put on a node reconciles neither" 3 \
 # A quarantine record for work this drain never put on that node is state from
 # somewhere else standing in for the permits being followed.
 run_verdict reconcile_case eval 'ROLLBACK_NODE_QUARANTINES="r1-node-1 none
-r1-node-2 beacon_relay_signing@77"'
+r1-node-2 beacon_relay_signing@77@other#9"'
 check "a quarantine record for work the node never held accounts for none" 1 \
-  "r1-node-2 quarantined beacon_relay_signing@77"
+  "r1-node-2 quarantined beacon_relay_signing@77@other#9"
 
 # And its mirror: an outcome for a ceremony this gate never originated.
 run_verdict reconcile_case eval \
-  "ROLLBACK_TERMINAL='tbtc_signing@1000=succeeded=\${RECONCILE_TX}=0xsigned \
-tbtc_wallet_action@1001=failed=\${RECONCILE_TX2}=retry_exhausted \
-beacon_signing@9999=succeeded=\${RECONCILE_TX3}=0xelsewhere'"
+  "ROLLBACK_TERMINAL=\"\
+tbtc_signing@1000@sign1000=succeeded=${RECONCILE_TX}=0xsigned \
+tbtc_wallet_action@1001@action1001=failed=${RECONCILE_TX2}=retry_exhausted \
+beacon_signing@9999@elsewhere=succeeded=${RECONCILE_TX3}=0xelsewhere\""
 check "an outcome for work this drain never originated reconciles nothing" 3 \
-  "terminal outcomes for beacon_signing@9999, which this drain never \
-originated"
+  "terminal outcomes for beacon_signing@9999@elsewhere, which this drain never \
+originated with those transactions"
+
+# The same work identity on an unrelated transaction is somebody else's
+# outcome even when the ceremony and anchor happen to line up.
+run_verdict reconcile_case eval \
+  "ROLLBACK_TERMINAL=\"\
+tbtc_signing@1000@sign1000=succeeded=${RECONCILE_TX3}=0xother \
+tbtc_wallet_action@1001@action1001=failed=${RECONCILE_TX2}=retry_exhausted\""
+check "rollback preserves each originated transaction through settlement" 3 \
+  "tbtc_signing@1000@sign1000 .* originated as ${RECONCILE_TX}" \
+  "substituting a different transaction reconciles none"
 
 # A driver that printed a readable report and then failed has looked at part of
 # the chain; the permits it did not reach reconcile against nothing.
@@ -2512,18 +2798,21 @@ check_quarantine() {
 write_quarantine_manifest <<'EOF'
 {"beacon_quarantined_outputs":[
   {"ceremony":"beacon_dkg","canonical_start_block":1002,
+   "seed_hash":"seed1002","member_index":3,
    "preserved_at":"2026-07-28T12:04:10.500Z"}],
  "tbtc_quarantined_outputs":[
   {"ceremony":"tbtc_signing","canonical_start_block":1000,
+   "seed_hash":"sign1000","member_index":2,
    "preserved_at":"2026-07-28T12:04:11.000Z"}]}
 EOF
 check_quarantine "records this drain wrote are read with their work identity" \
-  "beacon_dkg@1002,tbtc_signing@1000"
+  "beacon_dkg@1002@seed1002#3,tbtc_signing@1000@sign1000#2"
 
 # The regression the instant exists for.
 write_quarantine_manifest <<'EOF'
 {"beacon_quarantined_outputs":[
   {"ceremony":"beacon_dkg","canonical_start_block":77,
+   "seed_hash":"stale77","member_index":1,
    "preserved_at":"2026-07-27T09:00:00.000Z"}]}
 EOF
 check_quarantine "a record an earlier interruption left behind is not this \
@@ -2532,12 +2821,14 @@ drain's" "none"
 write_quarantine_manifest <<'EOF'
 {"beacon_quarantined_outputs":[
   {"ceremony":"beacon_dkg","canonical_start_block":77,
+   "seed_hash":"stale77","member_index":1,
    "preserved_at":"2026-07-27T09:00:00.000Z"},
   {"ceremony":"beacon_dkg","canonical_start_block":1002,
+   "seed_hash":"seed1002","member_index":3,
    "preserved_at":"2026-07-28T12:04:10.500Z"}]}
 EOF
 check_quarantine "a stale record beside a fresh one accounts only for the \
-fresh one" "beacon_dkg@1002"
+fresh one" "beacon_dkg@1002@seed1002#3"
 
 # A record nobody could read authorizes nothing, and must not subtract like an
 # absence: an unreadable manifest is not a manifest holding no records.
@@ -2550,13 +2841,15 @@ check_quarantine "a record with no preservation time is unreadable" \
 
 write_quarantine_manifest <<'EOF'
 {"beacon_quarantined_outputs":[
-  {"canonical_start_block":1002,"preserved_at":"2026-07-28T12:04:10.500Z"}]}
+  {"canonical_start_block":1002,"seed_hash":"seed1002","member_index":3,
+   "preserved_at":"2026-07-28T12:04:10.500Z"}]}
 EOF
 check_quarantine "a record naming no ceremony is unreadable" "unreadable"
 
 write_quarantine_manifest <<'EOF'
 {"beacon_quarantined_outputs":[
-  {"ceremony":"beacon_dkg","preserved_at":"2026-07-28T12:04:10.500Z"}]}
+  {"ceremony":"beacon_dkg","seed_hash":"seed1002","member_index":3,
+   "preserved_at":"2026-07-28T12:04:10.500Z"}]}
 EOF
 check_quarantine "a record naming no anchor is unreadable" "unreadable"
 
@@ -2619,10 +2912,11 @@ check "a gauge that fell with nothing asked of the driver is not completion" \
 # one outcome came back: the permits behind the other two used to be counted as
 # completed because a ceremony *of that name* had ended somewhere.
 run_verdict reconcile_case eval \
-  "ROLLBACK_TERMINAL='tbtc_signing@1000=succeeded=\${RECONCILE_TX}=0xsigned'"
+  "ROLLBACK_TERMINAL=\"\
+tbtc_signing@1000@sign1000=succeeded=${RECONCILE_TX}=0xsigned\""
 check "work the driver never accounted for reconciles nothing" 3 \
-  "r1-node-1 held a permit for tbtc_wallet_action@1001" \
-  "r1-node-2 held a permit for tbtc_wallet_action@1001"
+  "r1-node-1 held a permit for tbtc_wallet_action@1001@action1001#wallet-a" \
+  "r1-node-2 held a permit for tbtc_wallet_action@1001@action1001#wallet-b"
 
 # An unreadable counter must not subtract like a zero; that is how a permit
 # nobody could account for disappears from a reconciliation.
@@ -2877,10 +3171,10 @@ write_driver <<EOF
 #!/usr/bin/env bash
 printf '{"transaction_hashes":["${HASH_A}","${HASH_B}"],"ceremony_results":['
 printf '{"ceremony":"tbtc_signing","outcome":"succeeded",'
-printf '"canonical_start_block":500,'
+printf '"canonical_start_block":500,"work_id":"sign500",'
 printf '"transaction_hash":"${HASH_A}","result":"0xsigned"},'
 printf '{"ceremony":"beacon_dkg","outcome":"failed",'
-printf '"canonical_start_block":501,'
+printf '"canonical_start_block":501,"work_id":"seed501",'
 printf '"transaction_hash":"${HASH_B}","termination":"no_threshold"}]}'
 EOF
 drive homogeneous-security-v2
@@ -2893,15 +3187,16 @@ check "a driver names the ceremonies it saw complete" 0 \
 # against a hash that had nothing to do with it, nor take one outcome for as
 # many runs of that ceremony as happen to be outstanding.
 check "each outcome is bound to its transaction and what it produced" 0 \
-  "bound:tbtc_signing@500=succeeded=${HASH_A}=0xsigned \
-beacon_dkg@501=failed=${HASH_B}=no_threshold"
+  "bound:tbtc_signing@500@sign500=succeeded=${HASH_A}=0xsigned \
+beacon_dkg@501@seed501=failed=${HASH_B}=no_threshold"
 # The reading the controls actually decide on, taken over the same parse: only
 # the ceremony that settled is a settlement, and it is named with the
 # transaction and the threshold output rather than on its own.
 SETTLED_OUT="$(bound_settlements \
-  "tbtc_signing@500=succeeded=${HASH_A}=0xsigned \
-beacon_dkg@501=failed=${HASH_B}=no_threshold")"
-if [[ "${SETTLED_OUT}" == "tbtc_signing@500 (${HASH_A}, 0xsigned)" ]]; then
+  "tbtc_signing@500@sign500=succeeded=${HASH_A}=0xsigned \
+beacon_dkg@501@seed501=failed=${HASH_B}=no_threshold")"
+if [[ "${SETTLED_OUT}" == \
+  "tbtc_signing@500@sign500 (${HASH_A}, 0xsigned)" ]]; then
   printf 'ok   only the ceremonies that settled are carried forward\n'
   PASS=$((PASS + 1))
 else
@@ -2914,10 +3209,10 @@ fi
 # ceremony that did not settle is named with the termination that says it
 # stopped trying.
 TERMINATED_OUT="$(bound_terminations \
-  "tbtc_signing@500=succeeded=${HASH_A}=0xsigned \
-beacon_dkg@501=failed=${HASH_B}=no_threshold")"
+  "tbtc_signing@500@sign500=succeeded=${HASH_A}=0xsigned \
+beacon_dkg@501@seed501=failed=${HASH_B}=no_threshold")"
 if [[ "${TERMINATED_OUT}" == \
-  "beacon_dkg@501=failed (${HASH_B}, no_threshold)" ]]; then
+  "beacon_dkg@501@seed501=failed (${HASH_B}, no_threshold)" ]]; then
   printf 'ok   an unsettled ceremony is named with why it stopped\n'
   PASS=$((PASS + 1))
 else
@@ -2943,16 +3238,22 @@ write_driver <<EOF
 #!/usr/bin/env bash
 printf '{"transaction_hashes":["${HASH_A}","${HASH_B}"],'
 printf '"originated_ceremonies":[{"ceremony":"tbtc_signing",'
-printf '"canonical_start_block":600,"transaction_hash":"${HASH_A}",'
-printf '"holders":["r1-node-1","r1-node-2"]},'
+printf '"canonical_start_block":600,"work_id":"sign600",'
+printf '"transaction_hash":"${HASH_A}","holders":['
+printf '{"service":"r1-node-1","permit_id":"1"},'
+printf '{"service":"r1-node-1","permit_id":"2"},'
+printf '{"service":"r1-node-2","permit_id":"1"}]},'
 printf '{"ceremony":"tbtc_wallet_action","canonical_start_block":601,'
-printf '"transaction_hash":"${HASH_B}","holders":["r1-node-2"]}]}'
+printf '"work_id":"action601","transaction_hash":"${HASH_B}",'
+printf '"holders":[{"service":"r1-node-2","permit_id":"wallet-a"}]}]}'
 EOF
 drive rollback-inflight
 check "a driver names the work it put on the chain before it settles" 0 \
   "originated:tbtc_signing tbtc_wallet_action" "results:" \
-  "work:tbtc_signing@600=${HASH_A}=r1-node-1,r1-node-2 \
-tbtc_wallet_action@601=${HASH_B}=r1-node-2"
+  "work:tbtc_signing@600@sign600=${HASH_A}=r1-node-1~1 \
+tbtc_signing@600@sign600=${HASH_A}=r1-node-1~2 \
+tbtc_signing@600@sign600=${HASH_A}=r1-node-2~1 \
+tbtc_wallet_action@601@action601=${HASH_B}=r1-node-2~wallet-a"
 
 write_driver <<EOF
 #!/usr/bin/env bash
@@ -2989,16 +3290,59 @@ drive rollback-inflight
 check "in-flight work no node holds stops the step" 3 \
   "names no holding node"
 
+# An anchor can contain several distinct chain events. Without the event,
+# request, wallet action, group, or seed identity, the report still cannot say
+# which work its local permits belong to.
+write_driver <<EOF
+#!/usr/bin/env bash
+printf '{"transaction_hashes":["${HASH_A}"],'
+printf '"originated_ceremonies":[{"ceremony":"tbtc_signing",'
+printf '"canonical_start_block":600,"transaction_hash":"${HASH_A}",'
+printf '"holders":[{"service":"r1-node-1","permit_id":"1"}]}]}'
+EOF
+drive rollback-inflight
+check "in-flight work naming no chain work identity stops the step" 3 \
+  "names no chain work id"
+
+# Holder names alone collapse two memberships on one node into one permit.
+write_driver <<EOF
+#!/usr/bin/env bash
+printf '{"transaction_hashes":["${HASH_A}"],'
+printf '"originated_ceremonies":[{"ceremony":"tbtc_signing",'
+printf '"canonical_start_block":600,"work_id":"sign600",'
+printf '"transaction_hash":"${HASH_A}","holders":["r1-node-1"]}]}'
+EOF
+drive rollback-inflight
+check "a holder naming no local permit identity stops the step" 3 \
+  "not a holding node"
+
+# The same local membership cannot account for two permits. Distinct permit
+# IDs on one holder are accepted by the positive fixture above.
+write_driver <<EOF
+#!/usr/bin/env bash
+printf '{"transaction_hashes":["${HASH_A}"],'
+printf '"originated_ceremonies":[{"ceremony":"tbtc_signing",'
+printf '"canonical_start_block":600,"work_id":"sign600",'
+printf '"transaction_hash":"${HASH_A}","holders":['
+printf '{"service":"r1-node-1","permit_id":"1"},'
+printf '{"service":"r1-node-1","permit_id":"1"}]}]}'
+EOF
+drive rollback-inflight
+check "one local permit originated twice stops the step" 3 \
+  "local permit originated twice"
+
 # The same piece of work reported twice is either a duplicate or two permits
 # claimed from one origination; both make a reconciliation count it twice.
 write_driver <<EOF
 #!/usr/bin/env bash
 printf '{"transaction_hashes":["${HASH_A}","${HASH_B}"],'
 printf '"originated_ceremonies":[{"ceremony":"tbtc_signing",'
-printf '"canonical_start_block":600,"transaction_hash":"${HASH_A}",'
-printf '"holders":["r1-node-1"]},'
+printf '"canonical_start_block":600,"work_id":"sign600",'
+printf '"transaction_hash":"${HASH_A}",'
+printf '"holders":[{"service":"r1-node-1","permit_id":"1"}]},'
 printf '{"ceremony":"tbtc_signing","canonical_start_block":600,'
-printf '"transaction_hash":"${HASH_B}","holders":["r1-node-2"]}]}'
+printf '"work_id":"sign600","transaction_hash":"${HASH_B}",'
+printf '"holders":[{"service":"r1-node-2","permit_id":"1"}]}]}'
 EOF
 drive rollback-inflight
 check "one piece of work originated twice stops the step" 3 \
@@ -3011,10 +3355,12 @@ write_driver <<EOF
 #!/usr/bin/env bash
 printf '{"transaction_hashes":["${HASH_A}"],'
 printf '"originated_ceremonies":[{"ceremony":"tbtc_signing",'
-printf '"canonical_start_block":600,"transaction_hash":"${HASH_A}",'
-printf '"holders":["r1-node-1"]},'
+printf '"canonical_start_block":600,"work_id":"sign600",'
+printf '"transaction_hash":"${HASH_A}",'
+printf '"holders":[{"service":"r1-node-1","permit_id":"1"}]},'
 printf '{"ceremony":"beacon_dkg","canonical_start_block":601,'
-printf '"transaction_hash":"${HASH_A}","holders":["r1-node-1"]}]}'
+printf '"work_id":"seed601","transaction_hash":"${HASH_A}",'
+printf '"holders":[{"service":"r1-node-1","permit_id":"1"}]}]}'
 EOF
 drive rollback-inflight
 check "one transaction claimed by two pieces of work stops the step" 3 \
@@ -3026,15 +3372,34 @@ write_driver <<EOF
 #!/usr/bin/env bash
 printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
 printf '{"ceremony":"tbtc_signing","outcome":"succeeded",'
-printf '"canonical_start_block":600,'
+printf '"canonical_start_block":600,"work_id":"sign600",'
 printf '"transaction_hash":"${HASH_A}","result":"0xs"},'
 printf '{"ceremony":"beacon_dkg","outcome":"succeeded",'
-printf '"canonical_start_block":601,'
+printf '"canonical_start_block":601,"work_id":"seed601",'
 printf '"transaction_hash":"${HASH_A}","result":"0xg"}]}'
 EOF
 drive homogeneous-security-v2
 check "one transaction reused across both halves stops the step" 3 \
   "transaction claimed by two pieces of work"
+
+# The inverse binding matters too. The ceremony and anchor identify the same
+# piece of work in both halves of this report, so changing only its transaction
+# must be refused rather than treated as an independent terminal observation.
+write_driver <<EOF
+#!/usr/bin/env bash
+printf '{"transaction_hashes":["${HASH_A}","${HASH_B}"],'
+printf '"originated_ceremonies":[{"ceremony":"tbtc_signing",'
+printf '"canonical_start_block":600,"work_id":"sign600",'
+printf '"transaction_hash":"${HASH_A}",'
+printf '"holders":[{"service":"r1-node-1","permit_id":"1"}]}],'
+printf '"ceremony_results":['
+printf '{"ceremony":"tbtc_signing","outcome":"succeeded",'
+printf '"canonical_start_block":600,"work_id":"sign600",'
+printf '"transaction_hash":"${HASH_B}","result":"0xs"}]}'
+EOF
+drive rollback-terminal
+check "one piece of work cannot change transactions at its terminal result" 3 \
+  "work claimed by two transactions"
 
 # One piece of work ends once. A second terminal record for it is an outcome
 # counted twice by everything downstream.
@@ -3042,10 +3407,10 @@ write_driver <<EOF
 #!/usr/bin/env bash
 printf '{"transaction_hashes":["${HASH_A}","${HASH_B}"],"ceremony_results":['
 printf '{"ceremony":"tbtc_signing","outcome":"succeeded",'
-printf '"canonical_start_block":600,'
+printf '"canonical_start_block":600,"work_id":"sign600",'
 printf '"transaction_hash":"${HASH_A}","result":"0xs"},'
 printf '{"ceremony":"tbtc_signing","outcome":"failed",'
-printf '"canonical_start_block":600,'
+printf '"canonical_start_block":600,"work_id":"sign600",'
 printf '"transaction_hash":"${HASH_B}","termination":"no_threshold"}]}'
 EOF
 drive homogeneous-security-v2
@@ -3090,7 +3455,7 @@ write_driver <<EOF
 #!/usr/bin/env bash
 printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
 printf '{"ceremony":"tbtc_signing","outcome":"succeeded",'
-printf '"canonical_start_block":600,"result":"0xs"}]}'
+printf '"canonical_start_block":600,"work_id":"sign600","result":"0xs"}]}'
 EOF
 drive homogeneous-security-v2
 check "an outcome naming no transaction stops the step" 3 \
@@ -3102,7 +3467,7 @@ write_driver <<EOF
 #!/usr/bin/env bash
 printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
 printf '{"ceremony":"tbtc_signing","outcome":"succeeded",'
-printf '"canonical_start_block":600,'
+printf '"canonical_start_block":600,"work_id":"sign600",'
 printf '"transaction_hash":"${HASH_B}","result":"0xs"}]}'
 EOF
 drive homogeneous-security-v2
@@ -3116,7 +3481,7 @@ write_driver <<EOF
 #!/usr/bin/env bash
 printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
 printf '{"ceremony":"tbtc_signing","outcome":"succeeded",'
-printf '"canonical_start_block":600,'
+printf '"canonical_start_block":600,"work_id":"sign600",'
 printf '"transaction_hash":"${HASH_A}"}]}'
 EOF
 drive homogeneous-security-v2
@@ -3130,7 +3495,7 @@ write_driver <<EOF
 #!/usr/bin/env bash
 printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
 printf '{"ceremony":"tbtc_signing","outcome":"failed",'
-printf '"canonical_start_block":600,'
+printf '"canonical_start_block":600,"work_id":"sign600",'
 printf '"transaction_hash":"${HASH_A}"}]}'
 EOF
 drive homogeneous-security-v2
@@ -3141,7 +3506,7 @@ write_driver <<EOF
 #!/usr/bin/env bash
 printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
 printf '{"ceremony":"tbtc_signing","outcome":"timed_out",'
-printf '"canonical_start_block":600,'
+printf '"canonical_start_block":600,"work_id":"sign600",'
 printf '"transaction_hash":"${HASH_A}","termination":"gave up I think"}]}'
 EOF
 drive homogeneous-security-v2
@@ -3155,21 +3520,22 @@ write_driver <<EOF
 #!/usr/bin/env bash
 printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
 printf '{"ceremony":"tbtc_signing","outcome":"succeeded",'
-printf '"canonical_start_block":600,'
+printf '"canonical_start_block":600,"work_id":"sign600",'
 printf '"transaction_hash":"${HASH_A}","result":"0xs"}]}'
 exit 9
 EOF
 drive rollback-terminal
 check "a readable report from a driver that failed still reports failure" 0 \
-  "offered:no rc:9" "bound:tbtc_signing@600=succeeded=${HASH_A}=0xs"
+  "offered:no rc:9" \
+  "bound:tbtc_signing@600@sign600=succeeded=${HASH_A}=0xs"
 
 # The chain itself, asked about what a report claims. Every other check on a
 # driver report is a check of the report against itself: the hashes look like
 # hashes, the outcomes name them, the anchors identify work. A report that is
 # internally consistent and entirely invented passes all of it, and only the
 # chain can tell the two apart.
-CONFIRM_WORK="tbtc_signing@600=${HASH_A}=r1-node-1"
-CONFIRM_BOUND="tbtc_signing@600=succeeded=${HASH_A}=0xsigned"
+CONFIRM_WORK="tbtc_signing@600@sign600=${HASH_A}=r1-node-1~1"
+CONFIRM_BOUND="tbtc_signing@600@sign600=succeeded=${HASH_A}=0xsigned"
 
 confirm_case() {
   set +e
@@ -3213,7 +3579,8 @@ check "an endpoint that answers with an error confirms nothing" 3 \
 # exactly what a report inventing anchors produces.
 confirm_case eval 'FIXTURE_RECEIPT_BLOCK="0x300"'
 check "work anchored before its own transaction is refused" 3 \
-  "anchors tbtc_signing@600 at block 600, but the transaction it names landed \
+  "anchors tbtc_signing@600@sign600 at block 600, but the transaction it names \
+landed \
 in block 768"
 
 # And a report naming nothing: there is nothing to confirm, and demanding an
@@ -3438,6 +3805,8 @@ run_emitter() {
       CHAIN_ID="11155111"
       # shellcheck disable=SC2030,SC2031,SC2034
       REHEARSAL_GATE="single_release"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      WORK_DRIVER_DIGEST="${REVIEWED_WORK_DRIVER_DIGEST}"
       # shellcheck disable=SC2030,SC2031,SC2034
       REHEARSAL_R1_IDENTITY="$(diagnostics_document |
         node -e '

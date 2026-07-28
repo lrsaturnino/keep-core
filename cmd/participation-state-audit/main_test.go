@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -106,6 +107,7 @@ func newTestStorage(t *testing.T) string {
 			CutoverBlock:        1_000,
 			CanonicalStartBlock: 900,
 			Ceremony:            "beacon_dkg",
+			SeedHash:            strings.Repeat("a", 64),
 			FailedOperation:     "beacon_dkg_result_publication",
 			LastObservedBlock:   950,
 		},
@@ -620,15 +622,12 @@ func TestRunAudit_QuarantinedClaimWithoutQuarantineStateIsBlocking(
 	}
 	record.ActivePermitsAtQuiescence = append(
 		record.ActivePermitsAtQuiescence,
-		struct {
-			Ceremony            string `json:"ceremony"`
-			Mode                string `json:"mode"`
-			CanonicalStartBlock uint64 `json:"canonical_start_block"`
-			Outcome             string `json:"outcome"`
-		}{
+		quiescencePermitEvidence{
 			Ceremony:            "tbtc_dkg",
 			Mode:                "security_v2",
 			CanonicalStartBlock: 1_000,
+			WorkID:              strings.Repeat("d", 64),
+			PermitID:            "1",
 			Outcome:             "quarantined",
 		},
 	)
@@ -869,6 +868,7 @@ func TestRunAudit_QuarantineMetadataCrossChecks(t *testing.T) {
 			CutoverBlock:        1_000,
 			CanonicalStartBlock: 900,
 			Ceremony:            "not_a_ceremony",
+			SeedHash:            strings.Repeat("b", 64),
 			FailedOperation:     "beacon_dkg_result_publication",
 			LastObservedBlock:   950,
 		},
@@ -933,6 +933,7 @@ func TestRunAudit_QuarantinedGroupAlsoActiveIsAFinding(t *testing.T) {
 			CutoverBlock:        1_000,
 			CanonicalStartBlock: 900,
 			Ceremony:            "beacon_dkg",
+			SeedHash:            strings.Repeat("c", 64),
 			FailedOperation:     "beacon_dkg_result_publication",
 			LastObservedBlock:   950,
 		},
@@ -1411,7 +1412,7 @@ func TestRunAudit_RegisteredQuarantinedOnlyShareIsBlocking(t *testing.T) {
 	}
 }
 
-func TestRunAudit_QuarantinedClaimWithMismatchedTripleIsBlocking(
+func TestRunAudit_QuarantinedClaimWithMismatchedWorkIdentityIsBlocking(
 	t *testing.T,
 ) {
 	storageDir := newTestStorage(t)
@@ -1428,9 +1429,10 @@ func TestRunAudit_QuarantinedClaimWithMismatchedTripleIsBlocking(
 
 	evidence := newValidEvidence(t, firstPass)
 
-	// The snapshot's only quarantined beacon output is a legacy ceremony
-	// anchored at block 900; the report claims a security-v2 one at the same
-	// anchor. Ceremony-level presence alone must not vouch for it.
+	// The snapshot's only quarantined beacon output has this ceremony, mode,
+	// anchor, and member index. The report substitutes another DKG seed hash;
+	// those classifications and local member alone must not vouch for work
+	// from another chain event.
 	record := &quiescenceReportEvidence{
 		evidenceEnvelope: evidenceEnvelope{
 			SchemaVersion:           evidenceSchemaVersion,
@@ -1442,16 +1444,15 @@ func TestRunAudit_QuarantinedClaimWithMismatchedTripleIsBlocking(
 	}
 	record.ActivePermitsAtQuiescence = append(
 		record.ActivePermitsAtQuiescence,
-		struct {
-			Ceremony            string `json:"ceremony"`
-			Mode                string `json:"mode"`
-			CanonicalStartBlock uint64 `json:"canonical_start_block"`
-			Outcome             string `json:"outcome"`
-		}{
+		quiescencePermitEvidence{
 			Ceremony:            "beacon_dkg",
-			Mode:                "security_v2",
+			Mode:                "legacy",
 			CanonicalStartBlock: 900,
-			Outcome:             "quarantined",
+			WorkID:              strings.Repeat("f", 64),
+			PermitID: fmt.Sprint(
+				firstPass.BeaconQuarantinedOutputs[0].MemberIndex,
+			),
+			Outcome: "quarantined",
 		},
 	)
 	content, err := json.MarshalIndent(record, "", "  ")
@@ -1478,7 +1479,7 @@ func TestRunAudit_QuarantinedClaimWithMismatchedTripleIsBlocking(
 
 	if auditManifest.RollbackBarrierReady {
 		t.Error(
-			"a triple-mismatched quarantined-output claim must not " +
+			"a work-mismatched quarantined-output claim must not " +
 				"authorize the barrier",
 		)
 	}
@@ -1487,7 +1488,7 @@ func TestRunAudit_QuarantinedClaimWithMismatchedTripleIsBlocking(
 		"the beacon quarantine namespace holds none matching",
 	) {
 		t.Errorf(
-			"expected a triple-matching blocker, blockers: %v",
+			"expected an exact-permit-matching blocker, blockers: %v",
 			auditManifest.RollbackBlockers,
 		)
 	}

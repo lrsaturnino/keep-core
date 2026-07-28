@@ -25,6 +25,7 @@ type QuarantinedSignerMetadata struct {
 	CutoverBlock        uint64    `json:"cutover_block"`
 	CanonicalStartBlock uint64    `json:"canonical_start_block"`
 	Ceremony            string    `json:"ceremony"`
+	SeedHash            string    `json:"seed_hash"`
 	MemberIndex         uint8     `json:"member_index"`
 	GroupPublicKey      string    `json:"group_public_key"`
 	FailedOperation     string    `json:"failed_operation"`

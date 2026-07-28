@@ -193,20 +193,24 @@ type bitcoinReconciliationEvidence struct {
 // exact artifact identity — release version and revision — and the compiled
 // epoch and armed cutover block it quiesced under, so the report cannot vouch
 // for the state of a different candidate build or cutover schedule.
+type quiescencePermitEvidence struct {
+	Ceremony            string `json:"ceremony"`
+	Mode                string `json:"mode"`
+	CanonicalStartBlock uint64 `json:"canonical_start_block"`
+	WorkID              string `json:"work_id"`
+	PermitID            string `json:"permit_id"`
+	Outcome             string `json:"outcome"`
+}
+
 type quiescenceReportEvidence struct {
 	evidenceEnvelope
 
-	ReleaseVersion            string `json:"release_version"`
-	ReleaseRevision           string `json:"release_revision"`
-	ReleaseEpoch              string `json:"release_epoch"`
-	CutoverBlock              uint64 `json:"cutover_block"`
-	QuiesceCause              string `json:"quiesce_cause"`
-	ActivePermitsAtQuiescence []struct {
-		Ceremony            string `json:"ceremony"`
-		Mode                string `json:"mode"`
-		CanonicalStartBlock uint64 `json:"canonical_start_block"`
-		Outcome             string `json:"outcome"`
-	} `json:"active_permits_at_quiescence"`
+	ReleaseVersion            string                     `json:"release_version"`
+	ReleaseRevision           string                     `json:"release_revision"`
+	ReleaseEpoch              string                     `json:"release_epoch"`
+	CutoverBlock              uint64                     `json:"cutover_block"`
+	QuiesceCause              string                     `json:"quiesce_cause"`
+	ActivePermitsAtQuiescence []quiescencePermitEvidence `json:"active_permits_at_quiescence"`
 }
 
 // priorReaderCompatibilityEvidence records the tested prior release and its
@@ -1512,13 +1516,16 @@ func (r *auditRun) validateBitcoinReconciliationEvidence(
 	return violations
 }
 
-// quarantineTriple identifies quarantined state by the immutable permit
-// identity it was preserved under: the ceremony, the pinned protocol mode,
-// and the canonical chain anchor.
-type quarantineTriple struct {
+// quarantineIdentity identifies one quarantined local permit. Several DKG
+// events can share an anchor and one node can control several members in one
+// event, so ceremony, mode, and block are only classifications. The seed hash
+// identifies the chain work; the member index identifies the local permit.
+type quarantineIdentity struct {
 	ceremony            string
 	mode                string
 	canonicalStartBlock uint64
+	workID              string
+	permitID            string
 }
 
 // validateQuiescenceReportEvidence checks the quiescence outcome record:
@@ -1526,8 +1533,9 @@ type quarantineTriple struct {
 // cutover schedule, a stated cause, and a known ceremony, mode, and terminal
 // outcome for every permit active at quiescence. Every quarantined DKG
 // outcome must be matched by preserved quarantine state carrying the same
-// ceremony, protocol mode, and canonical anchor — one preserved output per
-// claiming permit, so one real output cannot vouch for several claims.
+// ceremony, protocol mode, canonical anchor, chain-work ID, and local permit
+// ID — one preserved output per claiming permit, so one real output cannot
+// vouch for several claims.
 func (r *auditRun) validateQuiescenceReportEvidence(content []byte) []string {
 	record := &quiescenceReportEvidence{}
 	if err := strictUnmarshal(content, record); err != nil {
@@ -1580,20 +1588,24 @@ func (r *auditRun) validateQuiescenceReportEvidence(content []byte) []string {
 		knownCeremonies[string(ceremony)] = struct{}{}
 	}
 
-	beaconQuarantined := make(map[quarantineTriple]int)
+	beaconQuarantined := make(map[quarantineIdentity]int)
 	for _, quarantined := range r.manifest.BeaconQuarantinedOutputs {
-		beaconQuarantined[quarantineTriple{
+		beaconQuarantined[quarantineIdentity{
 			ceremony:            quarantined.Ceremony,
 			mode:                quarantined.ProtocolMode,
 			canonicalStartBlock: quarantined.CanonicalStartBlock,
+			workID:              quarantined.SeedHash,
+			permitID:            fmt.Sprint(quarantined.MemberIndex),
 		}]++
 	}
-	tbtcQuarantined := make(map[quarantineTriple]int)
+	tbtcQuarantined := make(map[quarantineIdentity]int)
 	for _, quarantined := range r.manifest.TBTCQuarantinedOutputs {
-		tbtcQuarantined[quarantineTriple{
+		tbtcQuarantined[quarantineIdentity{
 			ceremony:            quarantined.Ceremony,
 			mode:                quarantined.ProtocolMode,
 			canonicalStartBlock: quarantined.CanonicalStartBlock,
+			workID:              quarantined.SeedHash,
+			permitID:            fmt.Sprint(quarantined.MemberIndex),
 		}]++
 	}
 
@@ -1621,46 +1633,64 @@ func (r *auditRun) validateQuiescenceReportEvidence(content []byte) []string {
 			))
 			continue
 		}
+		if permit.WorkID == "" {
+			violations = append(violations, fmt.Sprintf(
+				"permit entry [%d] names no chain work identity",
+				i,
+			))
+		}
+		if permit.PermitID == "" {
+			violations = append(violations, fmt.Sprintf(
+				"permit entry [%d] names no local permit identity",
+				i,
+			))
+		}
 
 		if permit.Outcome != "quarantined" || !r.manifest.Interpreted {
 			continue
 		}
-		triple := quarantineTriple{
+		identity := quarantineIdentity{
 			ceremony:            permit.Ceremony,
 			mode:                permit.Mode,
 			canonicalStartBlock: permit.CanonicalStartBlock,
+			workID:              permit.WorkID,
+			permitID:            permit.PermitID,
 		}
 		switch permit.Ceremony {
 		case string(participation.BeaconDKG):
-			if beaconQuarantined[triple] == 0 {
+			if beaconQuarantined[identity] == 0 {
 				violations = append(violations, fmt.Sprintf(
 					"permit entry [%d] claims a quarantined [%s] output "+
-						"[mode=%s] [canonicalStartBlock=%d] but the beacon "+
-						"quarantine namespace holds none matching that "+
-						"ceremony, mode, and anchor",
+						"[mode=%s] [canonicalStartBlock=%d] [workID=%s] "+
+						"[permitID=%s] but the beacon quarantine namespace "+
+						"holds none matching that exact local permit",
 					i,
 					permit.Ceremony,
 					permit.Mode,
 					permit.CanonicalStartBlock,
+					permit.WorkID,
+					permit.PermitID,
 				))
 				continue
 			}
-			beaconQuarantined[triple]--
+			beaconQuarantined[identity]--
 		case string(participation.TBTCDKG):
-			if tbtcQuarantined[triple] == 0 {
+			if tbtcQuarantined[identity] == 0 {
 				violations = append(violations, fmt.Sprintf(
 					"permit entry [%d] claims a quarantined [%s] output "+
-						"[mode=%s] [canonicalStartBlock=%d] but the tbtc "+
-						"quarantine namespace holds none matching that "+
-						"ceremony, mode, and anchor",
+						"[mode=%s] [canonicalStartBlock=%d] [workID=%s] "+
+						"[permitID=%s] but the tbtc quarantine namespace "+
+						"holds none matching that exact local permit",
 					i,
 					permit.Ceremony,
 					permit.Mode,
 					permit.CanonicalStartBlock,
+					permit.WorkID,
+					permit.PermitID,
 				))
 				continue
 			}
-			tbtcQuarantined[triple]--
+			tbtcQuarantined[identity]--
 		}
 	}
 
@@ -2137,6 +2167,12 @@ func validateQuarantineEntry(
 			key,
 			metadata.Ceremony,
 			participation.BeaconDKG,
+		)
+	}
+	if metadata.SeedHash == "" {
+		run.finding(
+			"beacon quarantine metadata [%s] is missing the seed hash",
+			key,
 		)
 	}
 	if metadata.GroupPublicKey != entry.directory {
