@@ -520,6 +520,19 @@ image_digests_by_architecture() {
   printf '{"amd64":"%s","arm64":"%s"}' "$1" "$1"
 }
 
+# The exposition a node serves, in the shape keep-common's gauge writes it:
+# a TYPE line, then the prefixed name, the value, and the trailing timestamp.
+# Only the metrics under the application prefix are here, because the point of
+# the cases below is that the probe reads the exposed names and not the
+# internal ones the Go constants carry.
+probe_metrics() {
+  local metric
+  for metric in "${PARTICIPATION_METRICS[@]}"; do
+    printf '# TYPE %s_%s gauge\n' "${METRIC_APPLICATION_PREFIX}" "${metric}"
+    printf '%s_%s 7 1769040000000\n' "${METRIC_APPLICATION_PREFIX}" "${metric}"
+  done
+}
+
 # Drive a rehearsal to its conclusion in an isolated subshell: the ledger, the
 # emitter, and the acceptance verdict conclude_rehearsal derives from the
 # steps. The emitter validates its own output through the real
@@ -612,6 +625,65 @@ else
   printf 'FAIL the gate-state reader does not find the published fields\n'
   FAILED=$((FAILED + 1))
 fi
+
+# The metric names the probe asks for must be the exposed ones. The client
+# registers these through the "performance" application and that registration
+# prefixes what it exposes, so a probe asking for the internal name reads
+# nothing — silently, and in every step at once.
+if [[ "$(metric_value r1-node-1 participation_gate_state)" == "7" ]]; then
+  printf 'ok   the metric reader asks for the exposed, prefixed name\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL the metric reader does not ask for the exposed name\n'
+  FAILED=$((FAILED + 1))
+fi
+
+# The prefix the probe uses has to be the one the client actually registers
+# under, so it is compared against the tree rather than trusted. This is the
+# single restatement the probe cannot avoid — it reads a running container,
+# not the source — which is exactly why it is pinned here.
+if grep -q "ObserveApplicationSource(\"${METRIC_APPLICATION_PREFIX}\"" \
+  "${TEST_DIR}/../../../pkg/clientinfo/performance.go"; then
+  printf 'ok   the probe prefix is the application the client registers under\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL the probe prefix is not the client'"'"'s registration application\n'
+  FAILED=$((FAILED + 1))
+fi
+
+# Every internal name the probe snapshots must still be a metric the client
+# defines, or the step recorded a gauge nobody publishes.
+MISSING_METRICS=""
+for METRIC in "${PARTICIPATION_METRICS[@]}"; do
+  grep -q "= \"${METRIC}\"" \
+    "${TEST_DIR}/../../../pkg/clientinfo/performance.go" ||
+    MISSING_METRICS="${MISSING_METRICS} ${METRIC}"
+done
+if [[ -z "${MISSING_METRICS}" ]]; then
+  printf 'ok   every probed gate metric is one the client defines\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL probed metrics the client does not define:%s\n' \
+    "${MISSING_METRICS}"
+  FAILED=$((FAILED + 1))
+fi
+
+# Reading nothing is a broken instrument, not a fleet reporting zeros.
+set +e
+CASE_OUT="$(
+  (
+    # Serves only internal, unprefixed names — the exposition of a node the
+    # probe is asking the wrong questions of. Invoked through the reader
+    # under test, which shellcheck cannot see across.
+    # shellcheck disable=SC2329
+    probe_metrics() { printf 'participation_gate_state 7 1769040000000\n'; }
+    observe_gate_gauges r1-node-1
+  ) 2>&1
+)"
+CASE_RC=$?
+set -e
+check "a probe that reads no gate metric at all blocks instead of recording none" \
+  3 "reading the wrong names"
 
 # The property the whole per-step ledger exists for: a gate that cannot finish
 # still writes a reviewable record, and still refuses to report success.

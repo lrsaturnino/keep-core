@@ -2711,12 +2711,19 @@ participation_field() {
     ' "${field}"
 }
 
-# One counter from a node's Prometheus text exposition. The gauges recorded in
-# evidence come from here, so the parser reads the exposition's own shape: the
-# metric name, optional labels, the value, and the trailing timestamp the
-# client-info registry appends.
+# The client registers every one of these through ObserveApplicationSource
+# under the "performance" application, and that call prefixes the exposed name
+# with the application. So the names below are the internal ones and the
+# exposition carries performance_<name>; probing the internal name directly
+# finds nothing at all. pkg/clientinfo/performance.go is where the application
+# is chosen and pkg/clientinfo/metrics.go is where the prefix is applied.
+METRIC_APPLICATION_PREFIX="performance"
+
+# One counter from a node's Prometheus text exposition. The parser reads the
+# exposition's own shape: the metric name, optional labels, the value, and the
+# trailing timestamp the client-info registry appends.
 metric_value() {
-  local service="$1" metric="$2"
+  local service="$1" metric="${METRIC_APPLICATION_PREFIX}_$2"
   probe_metrics "${service}" |
     awk -v metric="${metric}" '
       $1 == metric || index($1, metric "{") == 1 { print $2; found = 1; exit }
@@ -2724,32 +2731,45 @@ metric_value() {
     '
 }
 
-# Snapshot the gate gauges of one node into the step being recorded. Every
-# name here is a metric the client registers, so a rename on the Go side
-# surfaces as a missing reading rather than as a silently absent gauge.
+# The gate metrics an evidence step snapshots, by their internal names.
+PARTICIPATION_METRICS=(
+  participation_gate_state
+  participation_current_block
+  participation_cutover_block
+  participation_allowed
+  participation_active_ceremonies
+  participation_active_legacy_ceremonies
+  participation_active_security_v2_ceremonies
+  participation_mode_legacy_total
+  participation_mode_security_v2_total
+  participation_legacy_completions_after_cutover_total
+  participation_refusals_total
+  participation_commit_refusals_total
+  participation_clock_errors_total
+  participation_clock_aborts_total
+  participation_quiesce_total
+  participation_quiesce_forced_aborts_total
+)
+
+# Snapshot the gate gauges of one node into the step being recorded. Reading
+# none of them is a broken instrument rather than an absent value — a renamed
+# application prefix or metric family would otherwise leave every step
+# carrying an empty gauge object, which reads in the record exactly like a
+# fleet that reported zeros.
 observe_gate_gauges() {
-  local service="$1" metric value
-  for metric in \
-    participation_gate_state \
-    participation_current_block \
-    participation_cutover_block \
-    participation_allowed \
-    participation_active_ceremonies \
-    participation_active_legacy_ceremonies \
-    participation_active_security_v2_ceremonies \
-    participation_mode_legacy_total \
-    participation_mode_security_v2_total \
-    participation_legacy_completions_after_cutover_total \
-    participation_refusals_total \
-    participation_commit_refusals_total \
-    participation_clock_errors_total \
-    participation_clock_aborts_total \
-    participation_quiesce_total \
-    participation_quiesce_forced_aborts_total; do
+  local service="$1" metric value read_count=0
+  for metric in "${PARTICIPATION_METRICS[@]}"; do
     if value="$(metric_value "${service}" "${metric}")"; then
+      read_count=$((read_count + 1))
       STEP_GAUGES="${STEP_GAUGES}${STEP_GAUGES:+,}\"${service}.${metric}\":${value}"
     fi
   done
+  if ((read_count == 0)); then
+    blocked "${service} exposed none of the ${#PARTICIPATION_METRICS[@]} \
+participation gate metrics under the ${METRIC_APPLICATION_PREFIX} prefix; the \
+probe is reading the wrong names and every gauge this rehearsal recorded \
+would be empty"
+  fi
 }
 
 # Record the block the gate is clocked to, as that node reads it.
