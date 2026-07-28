@@ -38,8 +38,13 @@
 # base branch, a narrowed activity type list — that let a change merge with
 # the gate never having run on it. And because none of that says the gate
 # does anything once reached, the last of them drop, duplicate, condition and
-# excuse the analysis run itself. Runs anywhere bash and git exist;
-# everything lives under mktemp and this repository is only ever read.
+# excuse the analysis run itself, then take away the thing a search for
+# matching text would have called a run and left standing: the invocation
+# named rather than executed, printed, captured, piped, excused in shell,
+# conditioned in shell, read without executing, outranked by a later command,
+# handed to another interpreter, or written by an expression the runner fills
+# in. Runs anywhere bash and git exist; everything lives under mktemp and
+# this repository is only ever read.
 
 set -euo pipefail
 
