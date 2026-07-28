@@ -177,14 +177,17 @@ rather than by hand-tuned deployment values.
 `release-manifest.json` records every input of the external grace — the tBTC
 and beacon completion bounds with the beacon chain configuration they came
 from, the reviewed quiesce margin, the upper block interval, the
-RPC/processing allowance, and the resulting in-process backstop — plus the one
-reviewed input that is not compiled into the client: the forced-cancellation
-allowance between the backstop firing and SIGKILL. The client consumes the
-same allowance from its compiled constant: after the forced cancellation the
-lifecycle controller keeps the run context alive until every canceled permit
-owner finishes its quarantine/audit cleanup and releases its permit, waiting
-at most this allowance (a `cmd` test pins the runtime wait to the manifest
-field). The service manager counts its grace from SIGTERM delivery, but the
+RPC/processing allowance, and the resulting in-process backstop — plus the
+forced-cancellation allowance between the backstop firing and SIGKILL,
+itself a compiled constant: after the forced cancellation the lifecycle
+controller keeps the run context alive until every canceled permit owner
+finishes its quarantine/audit cleanup and releases its permit, waiting at
+most exactly that constant. Validation checks the recorded allowance against
+the compiled value like every other number — never re-deriving around the
+manifest's own field — so a manifest whose allowance, grace, and scaffold
+values were all recomputed coherently around a different allowance is still
+rejected, and a `cmd` test additionally pins the runtime wait to the
+checked-in manifest's recorded allowance. The service manager counts its grace from SIGTERM delivery, but the
 backstop timer arms only after the controller has been scheduled and has
 quiesced the gate, the allowance timer only after the gate has closed, and
 the logging and teardown run after both — so the manifest adds the compiled
@@ -230,9 +233,9 @@ a draining node long before its backstop and no rollback rehearsal could
 ever evidence natural completion — the prior node deliberately keeps the
 default, having no drain semantics to protect. The grace is a ceiling, not a
 wait — a node whose drain completes exits immediately. Changing any compiled
-bound or the reviewed allowance requires regenerating the manifest with
-`derive`, re-reviewing it, and updating every scaffold site; the `cmd` tests
-refuse any shortcut through that sequence.
+bound — the cleanup allowance included — requires regenerating the manifest
+with `derive`, re-reviewing it, and updating every scaffold site; the `cmd`
+tests refuse any shortcut through that sequence.
 
 ## Hard external dependencies
 

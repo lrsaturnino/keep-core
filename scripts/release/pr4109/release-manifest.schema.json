@@ -73,7 +73,7 @@
           "minimum": 1
         },
         "forced_cancellation_allowance_seconds": {
-          "description": "Reviewed allowance for the audited forced-cancellation path after the backstop fires and before SIGKILL. Must be positive: the external grace must end strictly after the in-process backstop.",
+          "description": "Compiled allowance (compiledForcedCancellationAllowanceSeconds) the runtime's forced-cancellation cleanup wait consumes, covering the audited path between the backstop firing and SIGKILL. Compiled-bound validation rejects any recorded value other than that constant — a manifest can never grant a cleanup window the running process does not observe. Must be positive: the external grace must end strictly after the in-process backstop.",
           "type": "integer",
           "minimum": 1
         },
