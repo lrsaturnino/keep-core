@@ -72,14 +72,33 @@ release versions, revisions, and immutable image digests, the release epoch,
 the armed cutover block, and the evidence freshness bound. Its output never
 authorizes activating quarantined material by itself.
 
-The rollback rehearsal runs that audit with all of those inputs, and supplies
-the ones describing the release being rolled back — version, revision, epoch,
-and armed C — from what the R1 fleet itself reported while it was still up,
-so the rollback is authorized against what ran rather than against what
-anyone believed ran. It then reads `rollback_barrier_ready` out of the
-manifest the audit wrote, and that manifest is kept beside the rehearsal
-record whether it authorized the rollback or refused it: a refusal is the
-part of a rollback decision most worth reading.
+The rollback rehearsal runs that audit **twice over the same snapshot**, and
+the order is the whole point. Every external record must carry the audited
+snapshot's `snapshot_aggregate_sha256`, and the audit rejects any that names
+another — so that checksum is a fact about state this rehearsal has only just
+produced by draining the fleet and copying it out. Evidence handed in before
+the fleet drained could not have known it, and evidence that named it anyway
+would be describing a drain that had not happened. So the first pass runs with
+no evidence at all and exists to derive the snapshot identity and interpreted
+inventory; the supplied `PR4109_ROLLBACK_EVIDENCE_GENERATOR` is then executed
+as `<service> <identity-manifest> <output-directory>` and must write
+`chain-reconciliation.json`, `bitcoin-reconciliation.json`,
+`quiescence-report.json`, and `prior-reader-compatibility.json` for that
+snapshot; and the second pass, over those records, is the one that authorizes
+anything. A generator that failed, that wrote only some of the four, or that
+cannot be run leaves the barrier unestablished rather than the audit refusing.
+
+The identities the audit binds that evidence to — the release being rolled
+back: version, revision, epoch, and armed C — come from what the R1 fleet
+itself reported while it was still up, so the rollback is authorized against
+what ran rather than against what anyone believed ran. The stage then reads
+`rollback_barrier_ready` out of the manifest the authorizing pass wrote. Both
+manifests and the generated records are kept under `state-audit/` in the
+evidence directory whether the audit authorized the rollback or refused it —
+a refusal is the part of a rollback decision most worth reading — and one
+level down rather than beside the rehearsal record, because the acceptance
+stage validates every top-level JSON against the rehearsal record schema and
+an audit manifest is a different document.
 
 The two **container** rehearsals are mandatory release gates that cannot run
 from this repository alone: they need the immutable prior-production and R1
@@ -90,10 +109,11 @@ that originates protocol work on that chain, and (for rollback) a directory
 to capture each drained node's state into. `rehearse.sh preflight` validates
 those inputs and reports `BLOCKED` with the exact missing one. The rollback
 gate additionally needs the audit inputs no storage snapshot can supply — the
-chain and Bitcoin reconciliation records, one quiescence outcome record per
-node, the prior-reader compatibility record, and the prior artifact's version
-and revision — because without them the audit can classify namespaces and
-authorize nothing.
+rollback evidence generator that produces the chain and Bitcoin
+reconciliation, quiescence outcome, and prior-reader compatibility records for
+each captured snapshot, plus the Bitcoin network and the prior artifact's
+version and revision — because without them the audit can classify namespaces
+and authorize nothing.
 
 Once preflight passes, `single-release` and `rollback` **run**: each drives
 its gate as an explicit sequence of steps, starting the fleet from the
@@ -687,15 +707,18 @@ mutable probe tag would leave the reading instrument outside the record's
 provenance), the rehearsal chain's websocket endpoint and numeric chain id,
 the rehearsed `C`, and the Bitcoin network, prior version, and prior revision
 the rollback state audit binds its verdict to. The
-`REHEARSAL_CHAIN_INPUTS_BUNDLE_B64` secret carries the files: a
-base64-encoded tar.gz holding an executable `work-driver` — called with the
-phase name, because the fleet only reacts to chain events and without
-something originating deposits, DKG requests, and relay requests there is no
-ceremony to observe — plus `chain-reconciliation.json`,
-`bitcoin-reconciliation.json`, `prior-reader-compatibility.json`, and one
-`quiescence-reports/<service>.json` per R1 node. Each member is checked as it
-is unpacked, so a bundle missing one blocks before the fleet starts rather
-than halfway through a rehearsal.
+`REHEARSAL_CHAIN_INPUTS_BUNDLE_B64` secret carries two executables, not data:
+a base64-encoded tar.gz holding `work-driver` — called with the phase name,
+because the fleet only reacts to chain events and without something
+originating deposits, DKG requests, and relay requests there is no ceremony to
+observe — and `rollback-evidence-generator`, called once per drained node with
+that node's identity audit manifest and an output directory. The evidence is
+generated rather than shipped because each record must name the aggregate
+checksum of the snapshot it speaks for, and that snapshot does not exist until
+this run has drained the fleet; a bundle unpacked before the fleet started
+could not know a checksum computed later. Both members are checked as they are
+unpacked, so a bundle missing one blocks before the fleet starts rather than
+halfway through a rehearsal.
 
 Everything provisioned lands outside the checkout, under the runner's
 temporary directory. The container stages verify their own source binding
@@ -711,8 +734,9 @@ just stopped, into `STORAGE_SNAPSHOT_DIR`; a supplied snapshot is only a
 claim about what the fleet left behind, and an older capture or another
 node's audits exactly as cleanly as the real thing. Those captures hold live
 protocol state — key shares included — so they stay on the runner and are
-never archived. What a reviewer reads is the audit manifest each capture
-produces, written into the evidence directory beside the rehearsal record.
+never archived. What a reviewer reads is what each capture produces under
+`state-audit/` in the evidence directory: the identity manifest, the records
+the generator wrote for that snapshot, and the authorizing manifest over them.
 
 The container job is bound to the same commit as every other proof stage,
 and the receipt that binds it — the local-proofs stage's attestation of the

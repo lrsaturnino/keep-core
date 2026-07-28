@@ -1239,37 +1239,74 @@ FIXTURE_CP_RC=0
 
 # ----------------------------------------------------------------------------
 #
-# The audit's own verdict. It writes to one path per service, so the two ways
-# a stale or incomplete result can be read as an authorization are what the
-# cases below drive: a tool that refused this snapshot while an earlier ready
-# manifest sat at that path, and a tool that never wrote one at all.
+# The audit's own verdict, over the two passes it is made of. Every external
+# record has to name the audited snapshot's aggregate checksum, and that
+# checksum is a fact about state the drain has only just produced — so the
+# first pass derives it, the generator is run against that manifest, and the
+# second pass is the one that authorizes anything. The cases below drive both
+# the order and the ways each pass can fail to establish what the next one
+# needs, plus the two ways a stale or incomplete result can still be read as an
+# authorization: a tool that refused this snapshot while an earlier ready
+# manifest sat at its path, and one that never wrote a manifest at all.
 
 AUDIT_INPUTS="${WORK}/audit-inputs"
-mkdir -p "${AUDIT_INPUTS}/quiescence"
-printf '{}\n' >"${AUDIT_INPUTS}/chain.json"
-printf '{}\n' >"${AUDIT_INPUTS}/bitcoin.json"
-printf '{}\n' >"${AUDIT_INPUTS}/prior-reader.json"
-printf '{}\n' >"${AUDIT_INPUTS}/quiescence/r1-node-1.json"
+mkdir -p "${AUDIT_INPUTS}"
+GENERATOR="${AUDIT_INPUTS}/rollback-evidence-generator"
+GENERATOR_ARGUMENTS="${AUDIT_INPUTS}/generator-arguments"
+
+write_generator() {
+  cat >"${GENERATOR}"
+  chmod +x "${GENERATOR}"
+}
+
+# A generator that writes every record the audit reads back, and records the
+# arguments it was handed so a case can assert which manifest this run bound
+# its evidence to.
+generator_complete() {
+  write_generator <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >"${GENERATOR_ARGUMENTS}"
+for record in chain-reconciliation bitcoin-reconciliation \\
+  quiescence-report prior-reader-compatibility; do
+  printf '{}\n' >"\$3/\${record}.json"
+done
+EOF
+}
 
 # The audit tool, replaced at the seam the stage runs it through. The subshell
 # `go run` executes inherits this function, so the real invocation — its flags,
 # its output path, and what the caller makes of its exit status — is what runs.
-# The two knobs are globals because a nested function reads its enclosing
-# scope when it is called, not when it is defined, and by then the definer has
-# long returned.
+# Which pass it is answering is read off those flags, exactly as the tool
+# itself would: an invocation carrying no evidence is the identity pass. The
+# knobs are globals because a nested function reads its enclosing scope when it
+# is called, not when it is defined, and by then the definer has long returned.
 AUDIT_TOOL_STATUS=0
 AUDIT_TOOL_MANIFEST=""
+AUDIT_IDENTITY_STATUS=3
+AUDIT_IDENTITY_MANIFEST='{"consistent":true,"snapshot":{"aggregate_sha256":"deadbeef"}}'
 # shellcheck disable=SC2329
 go() {
-  if [[ -n "${AUDIT_TOOL_MANIFEST}" ]]; then
-    printf '%s\n' "${AUDIT_TOOL_MANIFEST}" \
-      >"${WORK}/audit-evidence/state-audit-r1-node-1.json"
+  local argument previous="" output="" authorizing=0
+  for argument in "$@"; do
+    [[ "${previous}" == "--output" ]] && output="${argument}"
+    [[ "${argument}" == "--quiescence-report" ]] && authorizing=1
+    previous="${argument}"
+  done
+  if ((authorizing == 0)); then
+    [[ -n "${AUDIT_IDENTITY_MANIFEST}" ]] &&
+      printf '%s\n' "${AUDIT_IDENTITY_MANIFEST}" >"${output}"
+    return "${AUDIT_IDENTITY_STATUS}"
   fi
+  [[ -n "${AUDIT_TOOL_MANIFEST}" ]] &&
+    printf '%s\n' "${AUDIT_TOOL_MANIFEST}" >"${output}"
   return "${AUDIT_TOOL_STATUS}"
 }
 audit_tool() {
   AUDIT_TOOL_STATUS="$1"
   AUDIT_TOOL_MANIFEST="$2"
+  AUDIT_IDENTITY_STATUS=3
+  AUDIT_IDENTITY_MANIFEST='{"consistent":true,"snapshot":{"aggregate_sha256":"deadbeef"}}'
+  generator_complete
 }
 
 run_audit_case() {
@@ -1293,13 +1330,7 @@ run_audit_case() {
       # shellcheck disable=SC2030,SC2031,SC2034
       REHEARSAL_R1_CUTOVER_BLOCK="9000000"
       # shellcheck disable=SC2030,SC2031,SC2034
-      PR4109_CHAIN_RECONCILIATION_EVIDENCE="${AUDIT_INPUTS}/chain.json"
-      # shellcheck disable=SC2030,SC2031,SC2034
-      PR4109_BITCOIN_RECONCILIATION_EVIDENCE="${AUDIT_INPUTS}/bitcoin.json"
-      # shellcheck disable=SC2030,SC2031,SC2034
-      PR4109_QUIESCENCE_REPORT_DIR="${AUDIT_INPUTS}/quiescence"
-      # shellcheck disable=SC2030,SC2031,SC2034
-      PR4109_PRIOR_READER_EVIDENCE="${AUDIT_INPUTS}/prior-reader.json"
+      PR4109_ROLLBACK_EVIDENCE_GENERATOR="${GENERATOR}"
       # shellcheck disable=SC2030,SC2031,SC2034
       PR4109_BITCOIN_NETWORK="testnet"
       # shellcheck disable=SC2030,SC2031,SC2034
@@ -1323,6 +1354,77 @@ run_audit_case audit_ready
 check "an audit that completed and authorized the rollback is accepted" 0 \
   "audit_rc:0" "rollback_barrier_ready"
 
+# The evidence has to be generated for the snapshot this run just derived, so
+# the generator is handed that run's identity manifest and nothing else.
+if grep -q 'r1-node-1 .*state-audit/r1-node-1-identity.json' \
+  "${GENERATOR_ARGUMENTS}"; then
+  printf 'ok   the generator is handed this run'"'"'s identity manifest\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL the generator was not handed this run'"'"'s identity manifest: %s\n' \
+    "$(cat "${GENERATOR_ARGUMENTS}")"
+  FAILED=$((FAILED + 1))
+fi
+
+# The identity pass is what the evidence binds to, so a pass that establishes
+# no snapshot leaves nothing for a record to speak for.
+audit_no_identity() {
+  audit_tool 0 '{"rollback_barrier_ready":true}'
+  AUDIT_IDENTITY_MANIFEST=""
+}
+run_audit_case audit_no_identity
+check "evidence cannot be generated for a snapshot never derived" 0 \
+  "audit_rc:1" "without writing a manifest to"
+
+audit_inconsistent_identity() {
+  audit_tool 0 '{"rollback_barrier_ready":true}'
+  AUDIT_IDENTITY_MANIFEST='{"consistent":false,"findings":["torn namespace"]}'
+}
+run_audit_case audit_inconsistent_identity
+check "an inconsistent snapshot establishes no identity to bind to" 0 \
+  "audit_rc:1" "torn namespace"
+
+audit_unchecksummed_identity() {
+  audit_tool 0 '{"rollback_barrier_ready":true}'
+  AUDIT_IDENTITY_MANIFEST='{"consistent":true,"snapshot":{}}'
+}
+run_audit_case audit_unchecksummed_identity
+check "a snapshot with no aggregate checksum binds no evidence" 0 \
+  "audit_rc:1" "derived no snapshot aggregate checksum"
+
+# A generator that failed leaves the rehearsal with no account of the drain it
+# was asked to describe, which is not the same as an audit that refused.
+audit_failing_generator() {
+  audit_tool 0 '{"rollback_barrier_ready":true}'
+  write_generator <<'EOF'
+#!/usr/bin/env bash
+exit 4
+EOF
+}
+run_audit_case audit_failing_generator
+check "a generator that failed authorizes nothing" 0 \
+  "audit_rc:1" "evidence generator exited \[4\]"
+
+audit_partial_generator() {
+  audit_tool 0 '{"rollback_barrier_ready":true}'
+  write_generator <<'EOF'
+#!/usr/bin/env bash
+printf '{}\n' >"$3/chain-reconciliation.json"
+printf '{}\n' >"$3/bitcoin-reconciliation.json"
+EOF
+}
+run_audit_case audit_partial_generator
+check "a generator that wrote only some records authorizes nothing" 0 \
+  "audit_rc:1" "wrote no quiescence-report.json prior-reader-compatibility.json"
+
+audit_absent_generator() {
+  audit_tool 0 '{"rollback_barrier_ready":true}'
+  rm -f "${GENERATOR}"
+}
+run_audit_case audit_absent_generator
+check "a generator that cannot be run authorizes nothing" 0 \
+  "audit_rc:1" "which is not executable"
+
 # The tool exits nonzero on an inconsistent namespace as well as on an unready
 # barrier, so a run that reads only the ready flag accepts a snapshot the tool
 # refused for a reason that flag does not carry.
@@ -1331,10 +1433,10 @@ run_audit_case audit_refused_but_ready
 check "a nonzero audit is not authorized by its own ready flag" 0 \
   "audit_rc:1" "exited \[3\]"
 
-# The stale case: this run's tool writes nothing, and an earlier run's ready
-# manifest is sitting at the path it would have written.
+# The stale case: this run's authorizing pass writes nothing, and an earlier
+# run's ready manifest is sitting at the path it would have written.
 printf '{"rollback_barrier_ready":true}\n' \
-  >"${WORK}/audit-evidence/state-audit-r1-node-1.json"
+  >"${WORK}/audit-evidence/state-audit/r1-node-1.json"
 audit_silent() { audit_tool 0 ""; }
 run_audit_case audit_silent
 check "an earlier run's manifest cannot authorize this run's rollback" 0 \

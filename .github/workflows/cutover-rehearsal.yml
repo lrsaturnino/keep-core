@@ -295,10 +295,13 @@ jobs:
             echo "KEYSTORE_DIR=$RUNNER_TEMP/rehearsal-keystore"
             echo "REHEARSAL_INPUTS_DIR=$RUNNER_TEMP/rehearsal-inputs"
             echo "PR4109_WORK_DRIVER=$RUNNER_TEMP/rehearsal-inputs/work-driver"
-            echo "PR4109_CHAIN_RECONCILIATION_EVIDENCE=$RUNNER_TEMP/rehearsal-inputs/chain-reconciliation.json"
-            echo "PR4109_BITCOIN_RECONCILIATION_EVIDENCE=$RUNNER_TEMP/rehearsal-inputs/bitcoin-reconciliation.json"
-            echo "PR4109_QUIESCENCE_REPORT_DIR=$RUNNER_TEMP/rehearsal-inputs/quiescence-reports"
-            echo "PR4109_PRIOR_READER_EVIDENCE=$RUNNER_TEMP/rehearsal-inputs/prior-reader-compatibility.json"
+            # An executable, not a bundle of records: every rollback evidence
+            # record must name the aggregate checksum of the snapshot it speaks
+            # for, and that snapshot does not exist until this run has drained
+            # the fleet and copied its state out. A bundle unpacked here could
+            # not know a checksum computed later, and one that carried it
+            # anyway would be describing a drain that had not happened.
+            echo "PR4109_ROLLBACK_EVIDENCE_GENERATOR=$RUNNER_TEMP/rehearsal-inputs/rollback-evidence-generator"
             # Written to, not read from: the rollback stage captures each
             # drained node's state here straight out of the container it
             # stopped. It holds live protocol state — key shares included —
@@ -332,14 +335,19 @@ jobs:
           echo "provisioned $(find "$KEYSTORE_DIR" -mindepth 1 -maxdepth 1 \
             -type d | wc -l | tr -d ' ') rehearsal node directories"
 
-      # The inputs that exist outside this repository entirely. The fleet only
-      # reacts to chain events, so without a driver no ceremony exists to
-      # observe; and the rollback audit reports namespace consistency and
-      # nothing about rollback safety unless it is given the live-chain and
-      # Bitcoin reconciliations, each node's own quiescence outcome, and the
-      # prior release's reader-compatibility result. Each member is checked
-      # here rather than at the point of use, so a bundle missing one blocks
-      # before the fleet is started instead of halfway through a rehearsal.
+      # The inputs that exist outside this repository entirely, and both of
+      # them are programs rather than data. The fleet only reacts to chain
+      # events, so without a driver no ceremony exists to observe. The rollback
+      # audit reports namespace consistency and nothing about rollback safety
+      # unless it is given the live-chain and Bitcoin reconciliations, the
+      # node's own quiescence outcome, and the prior release's
+      # reader-compatibility result — and each of those must name the exact
+      # snapshot it speaks for, which is state this run produces by draining
+      # the fleet. So the generator is provisioned and executed after each
+      # capture instead of a bundle of records being unpacked before the fleet
+      # starts. Both are checked here rather than at the point of use, so a
+      # bundle missing one blocks before the fleet is started instead of
+      # halfway through a rehearsal.
       - name: Provision the rehearsal chain inputs bundle
         env:
           REHEARSAL_CHAIN_INPUTS_BUNDLE_B64: ${{ secrets.REHEARSAL_CHAIN_INPUTS_BUNDLE_B64 }}
@@ -347,11 +355,11 @@ jobs:
           if [ -z "$REHEARSAL_CHAIN_INPUTS_BUNDLE_B64" ]; then
             echo "BLOCKED: the REHEARSAL_CHAIN_INPUTS_BUNDLE_B64 secret is" >&2
             echo "not provisioned; store a base64-encoded tar.gz holding" >&2
-            echo "work-driver (executable, called with the phase name)," >&2
-            echo "chain-reconciliation.json, bitcoin-reconciliation.json," >&2
-            echo "prior-reader-compatibility.json, and one" >&2
-            echo "quiescence-reports/<service>.json per R1 node, then" >&2
-            echo "re-dispatch" >&2
+            echo "work-driver (executable, called with the phase name) and" >&2
+            echo "rollback-evidence-generator (executable, called with the" >&2
+            echo "service name, that node's identity audit manifest, and an" >&2
+            echo "output directory to write the four rollback evidence" >&2
+            echo "records into), then re-dispatch" >&2
             exit 3
           fi
           mkdir -p "$REHEARSAL_INPUTS_DIR"
@@ -362,20 +370,15 @@ jobs:
 
           missing=""
           for member in \
-            "$PR4109_CHAIN_RECONCILIATION_EVIDENCE" \
-            "$PR4109_BITCOIN_RECONCILIATION_EVIDENCE" \
-            "$PR4109_PRIOR_READER_EVIDENCE"; do
-            [ -f "$member" ] || missing="$missing $member"
+            "$PR4109_WORK_DRIVER" \
+            "$PR4109_ROLLBACK_EVIDENCE_GENERATOR"; do
+            [ -x "$member" ] || missing="$missing $member(executable)"
           done
-          [ -d "$PR4109_QUIESCENCE_REPORT_DIR" ] \
-            || missing="$missing $PR4109_QUIESCENCE_REPORT_DIR"
-          [ -x "$PR4109_WORK_DRIVER" ] \
-            || missing="$missing $PR4109_WORK_DRIVER(executable)"
           if [ -n "$missing" ]; then
             echo "BLOCKED: the chain inputs bundle is missing:$missing" >&2
             exit 3
           fi
-          echo "provisioned the work driver and every rollback audit input"
+          echo "provisioned the work driver and the rollback evidence generator"
 
       # The records these stages emit are measured against the compiled bounds
       # the local-proofs stage attested at this same commit, and that receipt

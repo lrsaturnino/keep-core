@@ -37,22 +37,19 @@
 # missing one blocks the barrier that releases the prior binary rather than
 # being skipped:
 #
-#   PR4109_CHAIN_RECONCILIATION_EVIDENCE
-#                        Ethereum reconciliation record: wallet/group
-#                        registration and DKG settlement for every group
-#   PR4109_BITCOIN_RECONCILIATION_EVIDENCE
-#                        Bitcoin reconciliation record: every pending
-#                        transaction and whether it is signed, broadcast,
-#                        mined, or absent
-#   PR4109_QUIESCENCE_REPORT_DIR
-#                        directory holding <service>.json per R1 service: the
-#                        permits that node held at quiescence and how each
-#                        one ended. Per node by nature — one shared report
-#                        would bind every audit to one node's drain
-#   PR4109_PRIOR_READER_EVIDENCE
-#                        prior-release reader compatibility record: the
-#                        tested prior version against every schema this
-#                        release writes
+#   PR4109_ROLLBACK_EVIDENCE_GENERATOR
+#                        executable called once per drained node as
+#                        <service> <identity-manifest> <output-directory>,
+#                        after that node's state has been captured and
+#                        audited for identity. It must write
+#                        chain-reconciliation.json,
+#                        bitcoin-reconciliation.json, quiescence-report.json,
+#                        and prior-reader-compatibility.json into the output
+#                        directory, each naming the identity manifest's
+#                        snapshot_aggregate_sha256. It is run rather than
+#                        supplied as files because every record has to speak
+#                        for the exact snapshot this run captured, and that
+#                        snapshot does not exist until the fleet has drained
 #   PR4109_BITCOIN_NETWORK  the Bitcoin network the rollback targets
 #   PR4109_PRIOR_VERSION    exact version of the prior release restored
 #   PR4109_PRIOR_REVISION   exact revision of the prior release restored
@@ -283,15 +280,16 @@ environment (rollback, additionally):
   STORAGE_SNAPSHOT_DIR
                       where this stage captures each drained node's state
                       from the container it stopped, for the offline audit
-  PR4109_CHAIN_RECONCILIATION_EVIDENCE
-  PR4109_BITCOIN_RECONCILIATION_EVIDENCE
-  PR4109_PRIOR_READER_EVIDENCE
-                      the reconciliation and prior-reader results the audit
-                      binds its verdict to; from a snapshot alone it reports
-                      namespace consistency and nothing about rollback safety
-  PR4109_QUIESCENCE_REPORT_DIR
-                      one <service>.json per node: the permits it held when
-                      it drained and how each one ended
+  PR4109_ROLLBACK_EVIDENCE_GENERATOR
+                      executable run once per drained node as <service>
+                      <identity-manifest> <output-directory>, after that
+                      node's state is captured and audited for identity. It
+                      writes the reconciliation, quiescence, and prior-reader
+                      records the audit binds its verdict to, each naming the
+                      snapshot the manifest identifies. From a snapshot alone
+                      the audit reports namespace consistency and nothing
+                      about rollback safety, and a record produced before the
+                      drain could not name the snapshot the drain left
   PR4109_BITCOIN_NETWORK
   PR4109_PRIOR_VERSION
   PR4109_PRIOR_REVISION
@@ -3972,49 +3970,149 @@ stopped container failed, so there is no capture of the state the drain left"
   return 0
 }
 
-# The rollback inputs the offline audit cannot derive from a storage
-# snapshot. Everything the fleet can be asked for is read from the fleet; what
-# remains is genuinely outside this repository — reconciliation against the
-# live Ethereum and Bitcoin state, each node's own quiescence outcome record,
-# the prior release's reader-compatibility result, and the identity of the
-# prior artifact the rollback restores — so it arrives as supplied paths and
-# values. A missing one blocks the barrier rather than being skipped: an audit
-# run without them reports namespace consistency and nothing about whether
-# rolling back onto this state is safe, and unbound evidence would approve a
-# rollback of the wrong chain, network, or artifact just as readily.
+# The rollback inputs the offline audit cannot derive from a storage snapshot.
+# Everything the fleet can be asked for is read from the fleet; what remains is
+# genuinely outside this repository — reconciliation against the live Ethereum
+# and Bitcoin state, each node's own quiescence outcome record, the prior
+# release's reader-compatibility result, and the identity of the prior artifact
+# the rollback restores — so it arrives as a generator this run executes and a
+# handful of values. A missing one blocks the barrier rather than being
+# skipped: an audit run without them reports namespace consistency and nothing
+# about whether rolling back onto this state is safe, and unbound evidence
+# would approve a rollback of the wrong chain, network, or artifact just as
+# readily.
+#
+# The evidence is generated here rather than supplied because every record has
+# to name the exact snapshot it speaks for — the audit rejects a record whose
+# snapshot_aggregate_sha256 is anything but the audited snapshot's — and that
+# checksum does not exist until this run has drained the fleet and copied the
+# state out. A record handed in before the rehearsal started cannot know it,
+# and one that carried it anyway would be describing a drain that had not
+# happened yet.
 ROLLBACK_AUDIT_INPUTS=(
-  PR4109_CHAIN_RECONCILIATION_EVIDENCE
-  PR4109_BITCOIN_RECONCILIATION_EVIDENCE
-  PR4109_QUIESCENCE_REPORT_DIR
-  PR4109_PRIOR_READER_EVIDENCE
+  PR4109_ROLLBACK_EVIDENCE_GENERATOR
   PR4109_BITCOIN_NETWORK
   PR4109_PRIOR_VERSION
   PR4109_PRIOR_REVISION
+)
+
+# The records the generator must produce for one audited snapshot, named
+# exactly as the audit reads them back.
+ROLLBACK_EVIDENCE_RECORDS=(
+  chain-reconciliation.json
+  bitcoin-reconciliation.json
+  quiescence-report.json
+  prior-reader-compatibility.json
 )
 
 # Why the last audited snapshot is not rollback-safe, for the step that
 # records it. Set by run_state_audit whenever it returns nonzero.
 STATE_AUDIT_REASON=""
 
+# One invocation of the offline audit over one snapshot. With an evidence
+# directory it is the authorizing pass; without one it is the identity pass,
+# which reports every external input missing on purpose — that run exists to
+# derive the snapshot's checksum and interpreted inventory, which is what the
+# evidence must then be generated against.
+#
+# The identities the audit binds its evidence to are the ones already read off
+# the running fleet — release version, revision, epoch, and armed C — so the
+# rollback is authorized against what ran rather than against what the operator
+# believed ran.
+audit_snapshot() {
+  local snapshot="$1" output="$2" evidence="$3"
+  local arguments=(
+    --storage-snapshot "${snapshot}"
+    --output "${output}"
+    --expected-ethereum-chain-id "${CHAIN_ID}"
+    --expected-bitcoin-network "${PR4109_BITCOIN_NETWORK}"
+    --expected-prior-version "${PR4109_PRIOR_VERSION}"
+    --expected-prior-revision "${PR4109_PRIOR_REVISION}"
+    --expected-prior-image-digest "${PRIOR_IMAGE_DIGEST##*@}"
+    --expected-release-version
+    "$(json_field "${REHEARSAL_R1_IDENTITY}" version)"
+    --expected-release-revision
+    "$(json_field "${REHEARSAL_R1_IDENTITY}" revision)"
+    --expected-release-image-digest "${R1_IMAGE_DIGEST##*@}"
+    --expected-release-epoch "${REHEARSAL_R1_EPOCH}"
+    --expected-cutover-block "${REHEARSAL_R1_CUTOVER_BLOCK}"
+  )
+  if [[ -n "${evidence}" ]]; then
+    arguments+=(
+      --chain-reconciliation-evidence "${evidence}/chain-reconciliation.json"
+      --bitcoin-reconciliation-evidence
+      "${evidence}/bitcoin-reconciliation.json"
+      --quiescence-report "${evidence}/quiescence-report.json"
+      --prior-reader-compatibility-evidence
+      "${evidence}/prior-reader-compatibility.json"
+    )
+  fi
+  (cd "${REPO_ROOT}" && go run ./cmd/participation-state-audit "${arguments[@]}")
+}
+
+# The snapshot identity an identity pass derived, or empty when that pass
+# derived none. Every generated record has to name this exact value, and the
+# audit refuses any that names another.
+snapshot_identity() {
+  node -e '
+    const fs = require("fs");
+    const audit = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    if (audit.consistent !== true) {
+      console.error(
+        "the snapshot is not internally consistent: " +
+          (audit.findings || []).join("; ")
+      );
+      process.exit(1);
+    }
+    const aggregate = (audit.snapshot || {}).aggregate_sha256;
+    if (!aggregate) {
+      console.error("the manifest derived no snapshot aggregate checksum");
+      process.exit(1);
+    }
+    process.stdout.write(String(aggregate));
+  ' "$1"
+}
+
 # Audit one node's storage snapshot for rollback safety. Returns 0 only when
 # the tool itself reported rollback_barrier_ready over the full evidence set;
 # the manifest it wrote is left beside the rehearsal record either way, because
 # a refusal is the part of a rollback decision most worth reading.
 #
-# The identities the audit binds its evidence to are the ones already read off
-# the running fleet — release version, revision, epoch, and armed C — so the
-# rollback is authorized against what ran rather than against what the
-# operator believed ran.
+# The audit runs twice over the same snapshot, and the order is the whole
+# point. Every external record must carry the audited snapshot's aggregate
+# checksum, and that checksum is a fact about state this rehearsal has only
+# just produced — so the first pass derives it from the captured bytes, the
+# generator is then run against that manifest to produce records for this
+# snapshot and no other, and the second pass is the one that authorizes
+# anything. Evidence handed in before the fleet drained could not have named
+# this snapshot, and evidence that named it anyway would be describing a drain
+# that had not happened.
 run_state_audit() {
   local service="$1" snapshot="$2"
-  local output="${EVIDENCE_DIR}/state-audit-${service}.json"
+  # Both manifests and the generated records live one level down, beside the
+  # rehearsal record rather than among them: the acceptance stage validates
+  # every JSON at the top of the evidence directory against the rehearsal
+  # record schema, and an audit manifest is a different document that would
+  # fail that check for saying what it is rather than for anything wrong.
+  local audits="${EVIDENCE_DIR}/state-audit"
+  local identity="${audits}/${service}-identity.json"
+  local output="${audits}/${service}.json"
+  local evidence="${audits}/${service}-evidence"
   STATE_AUDIT_REASON=""
 
-  # The path is fixed per service, so a re-run that never reaches the tool —
+  if ! mkdir -p "${audits}"; then
+    STATE_AUDIT_REASON="cannot create ${audits} for ${service}'s audit \
+manifests"
+    return 1
+  fi
+
+  # The paths are fixed per service, so a re-run that never reaches the tool —
   # or one whose tool dies before writing — would otherwise be read through
-  # the manifest an earlier run left at it. Removing it first makes the
-  # presence of a manifest below evidence that this run produced one.
-  rm -f "${output}"
+  # the manifest an earlier run left at them. Removing them first makes the
+  # presence of a manifest below evidence that this run produced one, and the
+  # same holds for every record the generator is about to be asked for.
+  rm -f "${identity}" "${output}"
+  rm -rf "${evidence}"
 
   local missing=() name
   for name in "${ROLLBACK_AUDIT_INPUTS[@]}"; do
@@ -4022,16 +4120,6 @@ run_state_audit() {
       missing+=("${name}")
     fi
   done
-  # One quiescence outcome record per node: the permits each node held when it
-  # drained and how each one ended. It is per-node by nature, so a single
-  # shared path would bind every node's audit to one node's drain.
-  local quiescence=""
-  if [[ -n "${PR4109_QUIESCENCE_REPORT_DIR:-}" ]]; then
-    quiescence="${PR4109_QUIESCENCE_REPORT_DIR}/${service}.json"
-    if [[ ! -f "${quiescence}" ]]; then
-      missing+=("a quiescence outcome record for ${service} at ${quiescence}")
-    fi
-  fi
   if ((${#missing[@]} > 0)); then
     STATE_AUDIT_REASON="the audit cannot authorize a rollback without \
 ${missing[*]}; from a snapshot alone it reports namespace consistency and \
@@ -4039,32 +4127,63 @@ nothing about the live-chain reconciliation, this node's quiescence \
 outcomes, or the prior release's ability to read what this one wrote"
     return 1
   fi
+  if [[ ! -x "${PR4109_ROLLBACK_EVIDENCE_GENERATOR}" ]]; then
+    STATE_AUDIT_REASON="PR4109_ROLLBACK_EVIDENCE_GENERATOR names \
+[${PR4109_ROLLBACK_EVIDENCE_GENERATOR}], which is not executable; the records \
+that authorize a rollback are produced for the snapshot this run captured and \
+cannot be produced by anything else"
+    return 1
+  fi
+
+  note "deriving ${service}'s snapshot identity for the evidence to bind to"
+  local rc=0
+  audit_snapshot "${snapshot}" "${identity}" "" || rc=$?
+  if [[ ! -f "${identity}" ]]; then
+    STATE_AUDIT_REASON="the identity pass over ${service}'s snapshot exited \
+[${rc}] without writing a manifest to ${identity}, so this run derived no \
+snapshot for evidence to be generated against"
+    return 1
+  fi
+  # A nonzero exit is expected here and carries no information: the identity
+  # pass is deliberately run with no evidence at all, and every missing record
+  # is a rollback blocker. What must hold is that the snapshot read cleanly and
+  # produced a checksum, which is what the pass exists to establish.
+  local aggregate
+  if ! aggregate="$(snapshot_identity "${identity}" 2>&1)"; then
+    STATE_AUDIT_REASON="the identity pass over ${service}'s snapshot did not \
+establish one (manifest in ${identity}): ${aggregate}"
+    return 1
+  fi
+
+  note "${service}: generating rollback evidence for snapshot ${aggregate}"
+  if ! mkdir -p "${evidence}"; then
+    STATE_AUDIT_REASON="cannot create ${evidence} for ${service}'s generated \
+rollback evidence"
+    return 1
+  fi
+  rc=0
+  "${PR4109_ROLLBACK_EVIDENCE_GENERATOR}" "${service}" "${identity}" \
+    "${evidence}" || rc=$?
+  if ((rc != 0)); then
+    STATE_AUDIT_REASON="the rollback evidence generator exited [${rc}] for \
+${service}'s snapshot ${aggregate}, so this rehearsal has no reconciliation, \
+quiescence, or prior-reader result for the state the drain actually left"
+    return 1
+  fi
+  local absent=() record
+  for record in "${ROLLBACK_EVIDENCE_RECORDS[@]}"; do
+    [[ -f "${evidence}/${record}" ]] || absent+=("${record}")
+  done
+  if ((${#absent[@]} > 0)); then
+    STATE_AUDIT_REASON="the rollback evidence generator exited cleanly but \
+wrote no ${absent[*]} for ${service} into ${evidence}; every one of them is a \
+rollback blocker the audit cannot decide without"
+    return 1
+  fi
 
   note "auditing ${service}'s storage snapshot for rollback safety"
-  local rc=0
-  (
-    cd "${REPO_ROOT}" && go run ./cmd/participation-state-audit \
-      --storage-snapshot "${snapshot}" \
-      --output "${output}" \
-      --chain-reconciliation-evidence \
-      "${PR4109_CHAIN_RECONCILIATION_EVIDENCE}" \
-      --bitcoin-reconciliation-evidence \
-      "${PR4109_BITCOIN_RECONCILIATION_EVIDENCE}" \
-      --quiescence-report "${quiescence}" \
-      --prior-reader-compatibility-evidence "${PR4109_PRIOR_READER_EVIDENCE}" \
-      --expected-ethereum-chain-id "${CHAIN_ID}" \
-      --expected-bitcoin-network "${PR4109_BITCOIN_NETWORK}" \
-      --expected-prior-version "${PR4109_PRIOR_VERSION}" \
-      --expected-prior-revision "${PR4109_PRIOR_REVISION}" \
-      --expected-prior-image-digest "${PRIOR_IMAGE_DIGEST##*@}" \
-      --expected-release-version \
-      "$(json_field "${REHEARSAL_R1_IDENTITY}" version)" \
-      --expected-release-revision \
-      "$(json_field "${REHEARSAL_R1_IDENTITY}" revision)" \
-      --expected-release-image-digest "${R1_IMAGE_DIGEST##*@}" \
-      --expected-release-epoch "${REHEARSAL_R1_EPOCH}" \
-      --expected-cutover-block "${REHEARSAL_R1_CUTOVER_BLOCK}"
-  ) || rc=$?
+  rc=0
+  audit_snapshot "${snapshot}" "${output}" "${evidence}" || rc=$?
 
   if [[ ! -f "${output}" ]]; then
     STATE_AUDIT_REASON="the audit exited [${rc}] without writing a manifest \
