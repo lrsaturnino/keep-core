@@ -16,12 +16,17 @@ name: Cutover Scaffold Lint
 #
 # The path filters cover the scaffold plus the build inputs its trust model
 # is derived from, because those decide what it accepts just as directly as
-# its own code does: .dockerignore is what the verifier's context
-# classification mirrors, the ignore rules decide which working-tree paths
+# its own code does: the build's ignore rules are what the verifier's context
+# classification mirrors, the gitignore rules decide which working-tree paths
 # count as divergence at all, and the Dockerfile and Makefile define the
 # regeneration the verifier restores over rather than trusts. A change to any
 # of them can widen what an image tree is allowed to be missing without
 # touching a line under scripts/.
+#
+# Both ignore files the build could read are listed. Adding a
+# Dockerfile-specific one retires every rule in the root .dockerignore for
+# this build, which rewrites the whole context classification without
+# touching the file the classification used to be derived from.
 
 on:
   push:
@@ -34,6 +39,7 @@ on:
       - ".github/workflows/cutover-rehearsal.yml"
       - ".github/workflows/cutover-scaffold-lint.yml"
       - ".dockerignore"
+      - "Dockerfile.dockerignore"
       - ".gitignore"
       - "**/.gitignore"
       - "Dockerfile"
@@ -44,6 +50,7 @@ on:
       - ".github/workflows/cutover-rehearsal.yml"
       - ".github/workflows/cutover-scaffold-lint.yml"
       - ".dockerignore"
+      - "Dockerfile.dockerignore"
       - ".gitignore"
       - "**/.gitignore"
       - "Dockerfile"

@@ -14,12 +14,15 @@
 #
 # All of that rests on a classification of the build context written out in
 # rehearse.sh, so the last cases prove that classification still matches the
-# rules .dockerignore carries: they commit the checked-in file, and drifts of
-# it, into throwaway trees and require the mirror check to accept the first
-# and refuse a dropped rule, an added rule, a dropped re-inclusion, an absent
-# or ruleless file, and a pattern construct it does not model. Runs anywhere
-# bash and git exist; everything lives under mktemp and this repository is
-# only ever read.
+# rules the build's own ignore file carries. They commit the checked-in
+# rules, rewritings of them, and drifts of them into throwaway trees, and
+# require the mirror check to accept the rules as they stand and as spellings
+# only path cleaning resolves; to refuse a dropped rule, an added rule, a
+# dropped re-inclusion, an absent or ruleless file, and every pattern
+# construct it does not model; and to read its rules from the file the
+# builder itself would select, which a committed Dockerfile.dockerignore
+# takes over from the root .dockerignore entirely. Runs anywhere bash and git
+# exist; everything lives under mktemp and this repository is only ever read.
 
 set -euo pipefail
 
@@ -149,13 +152,21 @@ make_image_tree() {
 # tree, and plain source. The mirror cases commit the checked-in
 # .dockerignore or a deliberate drift of it, so what they compare against is
 # the real rule set.
+#
+# An optional third argument commits a Dockerfile-specific ignore file
+# alongside the root one. The builder reads that file instead of the root
+# .dockerignore whenever it exists, so the precedence cases hand the two
+# files different rules and require the verifier to follow the build.
 make_context_repo() {
-  local repo="$1" ignore="$2"
+  local repo="$1" ignore="$2" dockerfile_ignore="${3:-}"
   mkdir -p "${repo}"
   (
     cd "${repo}"
     git_q init -q
     cp "${ignore}" .dockerignore
+    if [[ -n "${dockerfile_ignore}" ]]; then
+      cp "${dockerfile_ignore}" Dockerfile.dockerignore
+    fi
     mkdir -p .github/workflows .clusterfuzzlite docs infrastructure scripts \
       config solidity/ecdsa pkg/tbtc/gen/pb \
       pkg/chain/ethereum/beacon/gen/abi \
@@ -196,6 +207,34 @@ drift_dockerignore() {
 on it would prove nothing\n' "${filter}"
     FAILED=$((FAILED + 1))
   fi
+}
+
+# Rewrite rules of the checked-in .dockerignore into an equivalent spelling —
+# the cases below use it for the forms that only survive path cleaning. Like
+# drift_dockerignore, a rewrite that matches nothing is a failure rather than
+# a case that passes for having changed nothing.
+rewrite_dockerignore() {
+  local out="$1"
+  shift
+  local expr args=()
+  for expr in "$@"; do args+=(-e "${expr}"); done
+  sed "${args[@]}" "${CHECKED_IN_DOCKERIGNORE}" >"${out}"
+  if cmp -s "${out}" "${CHECKED_IN_DOCKERIGNORE}"; then
+    printf 'FAIL fixture: the rewrite rewrites no .dockerignore line; the \
+case built on it would prove nothing\n'
+    FAILED=$((FAILED + 1))
+  fi
+}
+
+# Append extra rules to the checked-in .dockerignore. The cases use it for
+# constructs the verifier must refuse outright, so what precedes them has to
+# be the real rule set: a refusal reached before the real rules are read
+# would prove nothing about the file the build actually applies.
+extend_dockerignore() {
+  local out="$1"
+  shift
+  cat "${CHECKED_IN_DOCKERIGNORE}" >"${out}"
+  printf '%s\n' "$@" >>"${out}"
 }
 
 # Run verify_build_context_mirror against a throwaway repository in an
@@ -489,6 +528,36 @@ family" 0 \
   "9 kept out of the build context" \
   "3 excluded from the context but regenerated into the image by design"
 
+# The builder path-cleans every rule before compiling it. Uncleaned
+# spellings of rules already in the file must therefore keep classifying the
+# same paths: a verifier that compiled them literally would match nothing
+# under them and read every path they remove as still in the build context.
+T="${WORK}/ctx-uncleaned"
+rewrite_dockerignore "${WORK}/dockerignore-uncleaned" \
+  's|^scripts/$|./scripts/|' \
+  's|^tmp/$|//tmp/|' \
+  's|^solidity/$|solidity/ecdsa/../|'
+make_context_repo "${T}" "${WORK}/dockerignore-uncleaned"
+run_context_mirror "${T}"
+check "context mirror: uncleaned rule spellings classify as their cleaned \
+form" 0 \
+  "19 tracked path\(s\) classified identically" \
+  "9 kept out of the build context"
+
+# The same for the segment-spanning wildcard in the placements the file does
+# not currently carry: leading, where it has to match through the ancestor
+# directories of a path, and trailing, where it swallows the rest of one.
+T="${WORK}/ctx-globstar"
+rewrite_dockerignore "${WORK}/dockerignore-globstar" \
+  's|^infrastructure/$|infrastructure/**|' \
+  's|^solidity/$|**/solidity|'
+make_context_repo "${T}" "${WORK}/dockerignore-globstar"
+run_context_mirror "${T}"
+check "context mirror: leading and trailing ** placements classify \
+identically" 0 \
+  "19 tracked path\(s\) classified identically" \
+  "9 kept out of the build context"
+
 # The dangerous direction: the mirror keeps explaining an absence the build
 # context no longer produces, so build-image mode would accept a tree missing
 # a file the image really was given.
@@ -528,8 +597,8 @@ absorbed" 1 \
 T="${WORK}/ctx-absent"
 make_checkout "${T}"
 run_context_mirror "${T}"
-check "context mirror: a commit with no .dockerignore fails closed" 1 \
-  "carries no \.dockerignore"
+check "context mirror: a commit with no ignore file at all fails closed" 1 \
+  "carries neither Dockerfile\.dockerignore nor \.dockerignore"
 
 T="${WORK}/ctx-empty"
 printf '# every rule commented out\n\n' >"${WORK}/dockerignore-empty"
@@ -538,15 +607,80 @@ run_context_mirror "${T}"
 check "context mirror: a .dockerignore carrying no rule fails closed" 1 \
   "carries no pattern at all"
 
-# The one pattern construct this script does not model. Approximating it
-# would decide real absences on a guess, so it refuses instead.
+# The pattern constructs this script does not model. Every one of them reads
+# here as a literal and reaches the builder's expression engine carrying a
+# meaning instead, so approximating any of them would decide real absences on
+# a guess. Each is refused by name rather than compiled.
 T="${WORK}/ctx-escape"
-cat "${CHECKED_IN_DOCKERIGNORE}" >"${WORK}/dockerignore-escape"
-printf 'weird\\*name\n' >>"${WORK}/dockerignore-escape"
+extend_dockerignore "${WORK}/dockerignore-escape" 'weird\*name'
 make_context_repo "${T}" "${WORK}/dockerignore-escape"
 run_context_mirror "${T}"
 check "context mirror: an unmodelled backslash escape fails closed" 1 \
-  "uses a backslash escape"
+  "pattern \[weird\\\\\*name\] carries" \
+  "reads as a literal"
+
+T="${WORK}/ctx-class"
+extend_dockerignore "${WORK}/dockerignore-class" 'config/[cd]onfig.toml'
+make_context_repo "${T}" "${WORK}/dockerignore-class"
+run_context_mirror "${T}"
+check "context mirror: an unmodelled character class fails closed" 1 \
+  "pattern \[config/\[cd\]onfig\.toml\] carries"
+
+# The class form whose negation the builder's expression engine reads the
+# other way round from the glob grammar these rules are documented in: `[!x]`
+# is every character but `x` to the grammar and any of `!` or `x` to the
+# engine. A verifier guessing either reading would be wrong under the other.
+T="${WORK}/ctx-class-negation"
+extend_dockerignore "${WORK}/dockerignore-class-negation" 'config/[!x]onfig.toml'
+make_context_repo "${T}" "${WORK}/dockerignore-class-negation"
+run_context_mirror "${T}"
+check "context mirror: an unmodelled negated character class fails closed" 1 \
+  "pattern \[config/\[!x\]onfig\.toml\] carries"
+
+T="${WORK}/ctx-alternation"
+extend_dockerignore "${WORK}/dockerignore-alternation" 'docs|config'
+make_context_repo "${T}" "${WORK}/dockerignore-alternation"
+run_context_mirror "${T}"
+check "context mirror: an unmodelled alternation fails closed" 1 \
+  "pattern \[docs[|]config\] carries"
+
+# The builder refuses this one itself and fails the build with it, so a
+# verifier that skipped the line would be modelling a build that cannot run.
+T="${WORK}/ctx-bare-negation"
+extend_dockerignore "${WORK}/dockerignore-bare-negation" '!'
+make_context_repo "${T}" "${WORK}/dockerignore-bare-negation"
+run_context_mirror "${T}"
+check "context mirror: a bare negation line fails closed" 1 \
+  "carries a bare \[!\] line"
+
+# --- build-context mirror: which ignore file the build reads ----------------
+#
+# The builder picks its ignore rules by Dockerfile: a committed
+# Dockerfile.dockerignore takes the whole job over from the root
+# .dockerignore. Both directions are proved, because a verifier reading the
+# root file regardless would keep checking itself against rules the build has
+# stopped applying — and would say so in neither its verdict nor its output.
+
+T="${WORK}/ctx-dockerfile-ignore-read"
+drift_dockerignore "${WORK}/dockerignore-df-no-scripts" '^scripts/$'
+make_context_repo "${T}" "${CHECKED_IN_DOCKERIGNORE}" \
+  "${WORK}/dockerignore-df-no-scripts"
+run_context_mirror "${T}"
+check "context mirror: a drift in Dockerfile.dockerignore is caught even \
+though the root file is intact" 1 \
+  "the build reads from Dockerfile\.dockerignore" \
+  "scripts/helper\.sh: this script explains an absence here" \
+  "no longer mirrors Dockerfile\.dockerignore"
+
+T="${WORK}/ctx-dockerfile-ignore-precedence"
+make_context_repo "${T}" "${WORK}/dockerignore-df-no-scripts" \
+  "${CHECKED_IN_DOCKERIGNORE}"
+run_context_mirror "${T}"
+check "context mirror: a root .dockerignore the build no longer reads \
+decides nothing" 0 \
+  "the build reads from Dockerfile\.dockerignore" \
+  "20 tracked path\(s\) classified identically" \
+  "9 kept out of the build context"
 
 # ----------------------------------------------------------------------------
 

@@ -272,24 +272,93 @@ regenerated_by_design_path() {
   return 1
 }
 
-# The .dockerignore rules the two classifications above mirror, compiled once
-# per tree into one extended regular expression per pattern with a parallel
-# flag marking the negations. They are read from the commit, not from disk:
-# the build context of a dispatched commit is that commit's own tree, and
-# inside the build image the file itself is one of the paths its own `.*`
-# rule kept out.
+# The Dockerfile the rehearsal dispatch builds, relative to the build context
+# root: its build step passes `context: .` and no `file:`, so the action's
+# default — <context>/Dockerfile — is what the builder compiles. The name
+# matters beyond the build itself, because it is what selects the ignore
+# rules below.
+BUILD_DOCKERFILE="Dockerfile"
+
+# The ignore rules the two classifications above mirror, compiled once per
+# tree into one extended regular expression per pattern with a parallel flag
+# marking the negations, alongside the context-relative path they were read
+# from. They are read from the commit, not from disk: the build context of a
+# dispatched commit is that commit's own tree, and inside the build image the
+# file itself is one of the paths its own `.*` rule kept out.
+DOCKERIGNORE_SOURCE=""
 DOCKERIGNORE_REGEX=()
 DOCKERIGNORE_NEGATED=()
 
-# Translate one normalized .dockerignore pattern into an extended regular
-# expression over a whole context-relative path, following the build daemon's
-# own compilation: `*` stops at a path separator, `?` is a single
-# non-separator character, `**` spans any number of whole segments (`.*` when
-# it ends the pattern), and every other character is literal. Backslash
-# escapes are the one construct not modelled; load_dockerignore_patterns
-# rejects a pattern carrying one before this ever sees it, because a failure
-# raised here would run inside a command substitution and exit nothing but
-# its own subshell.
+# Go's path/filepath.Clean over a slash-separated path, which the builder
+# applies to every ignore line before compiling it: a `.` segment drops out,
+# a `..` pops the segment before it, repeated separators collapse, a rooted
+# path keeps exactly one leading separator, and a relative path cleaned away
+# to nothing becomes `.`.
+#
+# Without it, a rule written `./scripts` or `docs/../docs` would compile here
+# into an expression matching nothing at all, and every path the build really
+# removes under that rule would read as still in the build context — the
+# dangerous direction, where an absence gets explained away.
+dockerignore_clean_path() {
+  local path="$1"
+  if [[ -z "${path}" ]]; then
+    printf '.'
+    return
+  fi
+
+  local rooted=0
+  [[ "${path}" == /* ]] && rooted=1
+
+  local segments=() kept=() segment last cleaned="" i
+  IFS='/' read -r -a segments <<<"${path}"
+  for ((i = 0; i < ${#segments[@]}; i++)); do
+    segment="${segments[i]}"
+    case "${segment}" in
+    '' | '.') ;;
+    '..')
+      if ((${#kept[@]} > 0)); then
+        last="${kept[$((${#kept[@]} - 1))]}"
+        if [[ "${last}" != '..' ]]; then
+          unset "kept[$((${#kept[@]} - 1))]"
+          continue
+        fi
+      fi
+      # A rooted path has nothing above its root to climb to, so a `..` it
+      # cannot pop is dropped rather than kept.
+      ((rooted == 1)) || kept+=('..')
+      ;;
+    *) kept+=("${segment}") ;;
+    esac
+  done
+
+  for ((i = 0; i < ${#kept[@]}; i++)); do
+    [[ -n "${cleaned}" ]] && cleaned+='/'
+    cleaned+="${kept[i]}"
+  done
+
+  if ((rooted == 1)); then
+    printf '/%s' "${cleaned}"
+  elif [[ -z "${cleaned}" ]]; then
+    printf '.'
+  else
+    printf '%s' "${cleaned}"
+  fi
+}
+
+# Translate one normalized ignore pattern into an extended regular expression
+# over a whole context-relative path, following the build daemon's own
+# compilation: `*` stops at a path separator, `?` is a single non-separator
+# character, `**` spans any number of whole segments (`.*` when it ends the
+# pattern), and every other character is literal.
+#
+# The daemon compiles to a regular expression too, and escapes exactly the
+# five characters escaped below on the way — every other character reaches
+# its expression engine carrying whatever meaning that engine gives it. So
+# this translation is the daemon's only for patterns that carry none of the
+# remaining metacharacters, and load_dockerignore_patterns refuses those,
+# backslash escapes included, before this ever sees them: a refusal raised
+# here would run inside a command substitution and exit nothing but its own
+# subshell.
 dockerignore_pattern_regex() {
   local pattern="$1" out="^" i ch
   for ((i = 0; i < ${#pattern}; i++)); do
@@ -309,7 +378,7 @@ dockerignore_pattern_regex() {
       fi
     elif [[ "${ch}" == '?' ]]; then
       out+='[^/]'
-    elif [[ '.[](){}+|^$' == *"${ch}"* ]]; then
+    elif [[ '.+()$' == *"${ch}"* ]]; then
       out+="\\${ch}"
     else
       out+="${ch}"
@@ -318,21 +387,55 @@ dockerignore_pattern_regex() {
   printf '%s$' "${out}"
 }
 
-# Compile the committed .dockerignore the way the build daemon reads it:
-# lines opening with `#` are comments, surrounding whitespace is trimmed, a
-# leading `!` splits off as a negation, and the remainder is path-cleaned of
-# its leading and trailing separators.
+# The characters the daemon hands to its expression engine unescaped and this
+# script has no translation for: a character class (`[`…`]`, whose negation
+# form the engine reads back to front from the glob grammar the rules are
+# documented in), a repetition (`{`…`}`), an alternation (`|`), a class
+# negation (`^`), and a backslash escape. Naming them one by one keeps the
+# refusal specific enough to act on.
+dockerignore_unmodelled_construct() {
+  local pattern="$1" i ch
+  for ((i = 0; i < ${#pattern}; i++)); do
+    ch="${pattern:i:1}"
+    if [[ '[]{}|^' == *"${ch}"* || "${ch}" == $'\\' ]]; then
+      printf '%s' "${ch}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Compile the ignore rules the build itself reads, from the commit under
+# test. Which file that is, the builder decides by Dockerfile:
+# `<dockerfile>.dockerignore` beside the context root wins whenever the
+# commit carries one, and the root `.dockerignore` applies only otherwise. So
+# a commit adding the Dockerfile-specific file silently retires every rule in
+# the root one, and a mirror that read the root file regardless would go on
+# checking itself against rules the build has stopped applying.
+#
+# Each line is then normalized the way the builder normalizes it: a line
+# opening with `#` is a comment before anything else touches it, surrounding
+# whitespace is trimmed, a leading `!` splits off as a negation and what
+# follows it is trimmed again, and the remainder is path-cleaned and stripped
+# of a single leading separator.
 load_dockerignore_patterns() {
+  DOCKERIGNORE_SOURCE=""
   DOCKERIGNORE_REGEX=()
   DOCKERIGNORE_NEGATED=()
 
   local content
-  if ! content="$(git -C "${REPO_ROOT}" show HEAD:.dockerignore 2>/dev/null)"; then
-    fail "the commit under test carries no .dockerignore; the build-context \
+  if content="$(git -C "${REPO_ROOT}" show \
+    "HEAD:${BUILD_DOCKERFILE}.dockerignore" 2>/dev/null)"; then
+    DOCKERIGNORE_SOURCE="${BUILD_DOCKERFILE}.dockerignore"
+  elif content="$(git -C "${REPO_ROOT}" show HEAD:.dockerignore 2>/dev/null)"; then
+    DOCKERIGNORE_SOURCE=".dockerignore"
+  else
+    fail "the commit under test carries neither \
+${BUILD_DOCKERFILE}.dockerignore nor .dockerignore; the build-context \
 classification in this script has nothing left to be checked against"
   fi
 
-  local line negated
+  local line negated unmodelled
   while IFS= read -r line; do
     [[ "${line}" == '#'* ]] && continue
     line="${line#"${line%%[![:space:]]*}"}"
@@ -343,23 +446,31 @@ classification in this script has nothing left to be checked against"
       negated=1
       line="${line#!}"
       line="${line#"${line%%[![:space:]]*}"}"
+      line="${line%"${line##*[![:space:]]}"}"
+      # The builder refuses a bare `!` as an illegal exclusion pattern and
+      # fails the whole build with it, rather than carrying on with the
+      # rules around it.
+      [[ -n "${line}" ]] ||
+        fail "${DOCKERIGNORE_SOURCE} carries a bare [!] line, which the build \
+daemon refuses outright as an illegal exclusion pattern"
     fi
-    while [[ "${line}" == /* ]]; do line="${line#/}"; done
-    while [[ "${line}" == */ ]]; do line="${line%/}"; done
-    [[ -n "${line}" ]] || continue
+    line="$(dockerignore_clean_path "${line}")"
+    ((${#line} > 1)) && line="${line#/}"
     # Checked here, in the shell that can still stop the run: the compiler
     # below runs inside a command substitution, where refusing would exit
     # only the subshell and leave the unmodelled pattern silently empty.
-    [[ "${line}" != *$'\\'* ]] ||
-      fail "the committed .dockerignore pattern [${line}] uses a backslash \
-escape, which the build-context classification in this script does not model; \
-extend dockerignore_pattern_regex before relying on it"
+    if unmodelled="$(dockerignore_unmodelled_construct "${line}")"; then
+      fail "the ${DOCKERIGNORE_SOURCE} pattern [${line}] carries \
+[${unmodelled}], which the build daemon gives to its expression engine and \
+the build-context classification in this script reads as a literal; extend \
+dockerignore_pattern_regex before relying on it"
+    fi
     DOCKERIGNORE_REGEX+=("$(dockerignore_pattern_regex "${line}")")
     DOCKERIGNORE_NEGATED+=("${negated}")
   done <<<"${content}"
 
   ((${#DOCKERIGNORE_REGEX[@]} > 0)) ||
-    fail "the committed .dockerignore carries no pattern at all; the \
+    fail "${DOCKERIGNORE_SOURCE} carries no pattern at all; the \
 build-context classification in this script has nothing to be checked against"
 }
 
@@ -408,7 +519,7 @@ dockerignore_context_excluded() {
 # The two classifications above are hand-written mirrors of build inputs that
 # live elsewhere, and a mirror is only ever as good as its last
 # synchronization. This walks every path the commit tracks and compares each
-# mirror's verdict against the rules .dockerignore itself carries.
+# mirror's verdict against the rules the build's own ignore file carries.
 #
 # A path the mirror calls context-excluded while the context in fact holds it
 # is the dangerous direction: build-image mode would explain that file's
@@ -421,7 +532,8 @@ dockerignore_context_excluded() {
 verify_build_context_mirror() {
   load_dockerignore_patterns
   note "build-context mirror: checking this script's classification against \
-the ${#DOCKERIGNORE_REGEX[@]} committed .dockerignore pattern(s)"
+the ${#DOCKERIGNORE_REGEX[@]} pattern(s) the build reads from \
+${DOCKERIGNORE_SOURCE}"
 
   local path mirror context tracked=0 excluded=0 regenerated=0 drift=""
   while IFS= read -r -d '' path; do
@@ -434,13 +546,15 @@ the ${#DOCKERIGNORE_REGEX[@]} committed .dockerignore pattern(s)"
       excluded=$((excluded + 1))
     elif [[ "${mirror}" == 0 ]]; then
       drift+="${path}: this script explains an absence here as a \
-context-excluded path, but .dockerignore keeps it in the build context"$'\n'
+context-excluded path, but ${DOCKERIGNORE_SOURCE} keeps it in the build \
+context"$'\n'
     elif [[ "${context}" == 0 ]]; then
       if regenerated_by_design_path "${path}"; then
         regenerated=$((regenerated + 1))
       else
-        drift+="${path}: .dockerignore keeps this path out of the build \
-context, but this script neither excludes it nor treats it as regenerated"$'\n'
+        drift+="${path}: ${DOCKERIGNORE_SOURCE} keeps this path out of the \
+build context, but this script neither excludes it nor treats it as \
+regenerated"$'\n'
       fi
     fi
   done < <(git -C "${REPO_ROOT}" ls-tree -r -z --name-only HEAD)
@@ -448,15 +562,15 @@ context, but this script neither excludes it nor treats it as regenerated"$'\n'
   if [[ -n "${drift}" ]]; then
     printf '%s' "${drift}" >&2
     fail "the build-context classification in this script no longer mirrors \
-.dockerignore (listing above); re-derive dockerignore_excluded_path and \
-regenerated_by_design_path from the current build inputs before this scaffold \
-admits any further evidence"
+${DOCKERIGNORE_SOURCE} (listing above); re-derive dockerignore_excluded_path \
+and regenerated_by_design_path from the current build inputs before this \
+scaffold admits any further evidence"
   fi
 
   note "build-context mirror: ${tracked} tracked path(s) classified \
-identically by .dockerignore and this script (${excluded} kept out of the \
-build context; ${regenerated} excluded from the context but regenerated into \
-the image by design)"
+identically by ${DOCKERIGNORE_SOURCE} and this script (${excluded} kept out \
+of the build context; ${regenerated} excluded from the context but \
+regenerated into the image by design)"
 }
 
 # The artifact input identity behind the image build: get_artifacts leaves
