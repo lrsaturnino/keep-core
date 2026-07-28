@@ -555,6 +555,47 @@ attest_release_manifest() {
 $(tr -d '[:space:]' <"${dir}/source-commit.txt")"
 }
 
+# Everything stage_local_proofs proves, in one seam. The stage around it owns
+# the receipt lifecycle — destroy the inherited one, prove, publish this run's
+# — and that ordering is the whole reason a failed proof run cannot leave a
+# usable receipt behind, so the self-test drives the stage with this function
+# replaced by a failing stub to hold the ordering in place.
+run_local_proof_suite() {
+  # The verifier gates every piece of evidence below, so it proves itself
+  # first: the self-test builds throwaway repositories shaped like the
+  # dispatched checkout and like the build image's tree and checks the
+  # verifier accepts exactly the image's documented construction.
+  "${SCRIPT_DIR}/test-source-binding.sh"
+  # The evidence-record validator gates the acceptance of every rehearsal
+  # record the same way, so it proves itself on every proof run — not only
+  # on the dispatches that happen to produce records for validate-evidence
+  # — and its verdicts land in this stage's archived log.
+  "${SCRIPT_DIR}/test-validate-evidence.sh"
+  verify_source_binding
+  go test -count=1 -v \
+    -run 'TestJoinDKGIfEligible|TestMonitorRelayEntry|TestForwardSignatureShares' \
+    ./pkg/beacon/
+  go test -count=1 ./pkg/protocol/participation/... ./pkg/protocol/state/...
+  go test -count=1 -race \
+    ./pkg/protocol/participation/... ./pkg/protocol/state/...
+  go test -count=1 \
+    -run 'TestSubmitDKGResult|TestSyncExecute' \
+    ./pkg/beacon/dkg/result/ ./pkg/protocol/state/
+  go test -count=1 -race \
+    -run 'TestAwaitQuiesce|TestQuiesceBackstop|TestSignalLifecycle|TestMaximumLegacyCompletionBlocks|TestReleaseManifest' \
+    ./cmd/
+  go test -count=1 -race ./cmd/participation-state-audit/
+  go test -count=1 -run 'TestDecodeSignerAuditRecord' ./pkg/tbtc/
+  go test -count=1 -race -timeout 900s -v \
+    -run 'Cutover|HandleAnnouncerSessionMismatch' \
+    ./pkg/tbtc/
+  # The integration-tagged test files are not compiled by the ordinary
+  # suite; type-check them so a signature drift cannot hide behind the
+  # build tag. Their execution needs live Bitcoin/Ethereum endpoints and
+  # stays with the CI integration job.
+  go vet -tags=integration ./pkg/bitcoin/electrum/ ./pkg/chain/ethereum/
+}
+
 stage_local_proofs() {
   note "running the repository-local cutover gate proofs"
   mkdir -p "${EVIDENCE_DIR}"
@@ -568,39 +609,7 @@ stage_local_proofs() {
     invalidate_release_manifest_attestation
 
     cd "${REPO_ROOT}"
-    # The verifier gates every piece of evidence below, so it proves itself
-    # first: the self-test builds throwaway repositories shaped like the
-    # dispatched checkout and like the build image's tree and checks the
-    # verifier accepts exactly the image's documented construction.
-    "${SCRIPT_DIR}/test-source-binding.sh"
-    # The evidence-record validator gates the acceptance of every rehearsal
-    # record the same way, so it proves itself on every proof run — not only
-    # on the dispatches that happen to produce records for validate-evidence
-    # — and its verdicts land in this stage's archived log.
-    "${SCRIPT_DIR}/test-validate-evidence.sh"
-    verify_source_binding
-    go test -count=1 -v \
-      -run 'TestJoinDKGIfEligible|TestMonitorRelayEntry|TestForwardSignatureShares' \
-      ./pkg/beacon/
-    go test -count=1 ./pkg/protocol/participation/... ./pkg/protocol/state/...
-    go test -count=1 -race \
-      ./pkg/protocol/participation/... ./pkg/protocol/state/...
-    go test -count=1 \
-      -run 'TestSubmitDKGResult|TestSyncExecute' \
-      ./pkg/beacon/dkg/result/ ./pkg/protocol/state/
-    go test -count=1 -race \
-      -run 'TestAwaitQuiesce|TestQuiesceBackstop|TestSignalLifecycle|TestMaximumLegacyCompletionBlocks|TestReleaseManifest' \
-      ./cmd/
-    go test -count=1 -race ./cmd/participation-state-audit/
-    go test -count=1 -run 'TestDecodeSignerAuditRecord' ./pkg/tbtc/
-    go test -count=1 -race -timeout 900s -v \
-      -run 'Cutover|HandleAnnouncerSessionMismatch' \
-      ./pkg/tbtc/
-    # The integration-tagged test files are not compiled by the ordinary
-    # suite; type-check them so a signature drift cannot hide behind the
-    # build tag. Their execution needs live Bitcoin/Ethereum endpoints and
-    # stays with the CI integration job.
-    go vet -tags=integration ./pkg/bitcoin/electrum/ ./pkg/chain/ethereum/
+    run_local_proof_suite
 
     # Last, so the receipt exists only for a tree whose proofs all passed.
     attest_release_manifest

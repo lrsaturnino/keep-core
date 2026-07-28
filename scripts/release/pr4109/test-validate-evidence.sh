@@ -11,11 +11,16 @@
 # before it measures anything: absent, incomplete, taken over other manifest
 # bytes, recording bounds the reviewed manifest contradicts, taken at
 # another commit than the run is bound to, taken at no clean commit at all,
-# or vouching for a record built from other bytes — plus the invalidation
-# that keeps a run's failed proofs from inheriting its predecessor's
-# receipt, and the tree binding the stage verifies before it judges
-# anything. Needs node/npx and git like the stage it tests; everything lives
-# under mktemp and this repository is never touched.
+# or vouching for a record built from other bytes — plus the tree binding the
+# stage verifies before it judges anything.
+#
+# The receipt lifecycle is proved through stage_local_proofs itself and not
+# only through the invalidation function: the last cases give a reused
+# evidence directory a valid inherited receipt, fail the stage's proof seam,
+# and require that the receipt was already gone when the proofs started, that
+# none survives the failure, and that the acceptance stage is blocked
+# afterwards. Needs node/npx and git like the stage it tests; everything
+# lives under mktemp and this repository is never touched.
 
 set -euo pipefail
 
@@ -456,6 +461,74 @@ else
   printf 'ok   invalidation removes interrupted staging directories\n'
   PASS=$((PASS + 1))
 fi
+
+# The same lifecycle driven through stage_local_proofs itself rather than
+# through the invalidation function alone. Calling that function directly
+# proves only that it works when called; what a reused evidence directory
+# actually depends on is the stage calling it before the first proof, so that
+# a proof failing afterwards cannot leave its predecessor's receipt standing
+# for the acceptance stage to find. Moving or dropping that call anywhere in
+# the stage has to fail here.
+D="${WORK}/orchestrated-invalidation"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+run_validator "${D}"
+check "the inherited receipt is accepted before any proof run starts" 0 \
+  "attestation binds"
+
+# The seam the stage runs its proofs through, replaced by a stub that fails
+# the way any proof failure does and reports what it found on the way in.
+# Defined last in this file: everything above must run against the real one.
+run_local_proof_suite() {
+  if [[ -e "$(attestation_dir)" ]]; then
+    printf 'fixture: the inherited receipt was still present at proof time\n'
+  else
+    printf 'fixture: the inherited receipt was already gone at proof time\n'
+  fi
+  return 1
+}
+
+set +e
+CASE_OUT="$(
+  (
+    # The stage aborts on a failing proof through the shell options
+    # rehearse.sh runs under, so the fixture has to restore them: the
+    # capture below turns errexit off, and the whole point of this case is
+    # what a proof failure does to the stage around it.
+    set -eo pipefail
+    # shellcheck disable=SC2030,SC2031,SC2034
+    EVIDENCE_DIR="${D}"
+    # shellcheck disable=SC2030,SC2031,SC2034
+    REPO_ROOT="${WORK}/repo"
+    stage_local_proofs
+  ) 2>&1
+)"
+CASE_RC=$?
+set -e
+check "a proof run destroys the inherited receipt before it proves anything" \
+  1 "the inherited receipt was already gone at proof time"
+
+if grep -q 'already gone at proof time' "${D}/local-proofs.log"; then
+  printf 'ok   the archived proof log records the receipt lifecycle\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL the archived proof log does not record the receipt lifecycle\n'
+  FAILED=$((FAILED + 1))
+fi
+
+if [[ -e "${D}/attestation" ]]; then
+  printf 'FAIL a failed proof run left a release-manifest attestation behind\n'
+  FAILED=$((FAILED + 1))
+else
+  printf 'ok   a failed proof run leaves no release-manifest attestation\n'
+  PASS=$((PASS + 1))
+fi
+
+run_validator "${D}"
+check "records are no longer acceptable after a failed proof run" 3 \
+  "no complete release-manifest attestation"
 
 # ----------------------------------------------------------------------------
 

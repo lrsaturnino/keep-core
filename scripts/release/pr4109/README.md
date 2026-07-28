@@ -155,11 +155,18 @@ fields, malformed timestamp, empty record set — over fixture attestations —
 absent, incomplete, a leftover staging directory, taken over other manifest
 bytes, contradicting the reviewed bounds, taken at another commit than the
 run is bound to, taken on a divergent tree, and one differing only in
-notes, stamp, and key order — over a divergent tree the stage must refuse
-to judge from, and over the invalidation itself, and the stage runs that
-self-test first on every invocation. Its cases run against throwaway git
-checkouts it creates, not against the working tree, so every verdict is the
-same mid-edit on a workstation and on a bound CI dispatch. The
+notes, stamp, and key order — and over a divergent tree the stage must
+refuse to judge from, and the stage runs that self-test first on every
+invocation. The receipt lifecycle is proved through `stage_local_proofs`
+itself rather than through the invalidation function alone: a reused
+evidence directory is given a valid inherited receipt, the stage's proof
+seam is failed the way any proof failure fails it, and the case requires
+that the receipt was already gone when the proofs started, that none
+survives the failure, and that the acceptance stage is blocked afterwards.
+Moving the invalidation anywhere later in the stage, or dropping it, fails
+those cases. Its cases run against throwaway git checkouts it creates, not
+against the working tree, so every verdict is the same mid-edit on a
+workstation and on a bound CI dispatch. The
 `cutover-rehearsal` workflow (manually dispatched, in
 `.github/workflows/cutover-rehearsal.yml`) runs the local proofs, the
 static analyzers, and the contracts build/test on every dispatch — and the
