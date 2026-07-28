@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -25,7 +26,7 @@ const rehearsalEvidenceSchemaPath = "../scripts/release/pr4109/rehearsal-evidenc
 func validReleaseManifestForTests(t *testing.T) releaseManifest {
 	t.Helper()
 
-	grace, err := deriveTerminationGrace(defaultForcedCancellationAllowanceSeconds)
+	grace, err := deriveTerminationGrace(compiledForcedCancellationAllowanceSeconds)
 	if err != nil {
 		t.Fatalf("unexpected derivation error: [%v]", err)
 	}
@@ -44,7 +45,7 @@ func validReleaseManifestForTests(t *testing.T) releaseManifest {
 // documented arithmetic identity. It fails whenever a compiled bound moves
 // without the manifest chain being deliberately re-reviewed.
 func TestReleaseManifestDeriveMatchesCompiledBounds(t *testing.T) {
-	grace, err := deriveTerminationGrace(defaultForcedCancellationAllowanceSeconds)
+	grace, err := deriveTerminationGrace(compiledForcedCancellationAllowanceSeconds)
 	if err != nil {
 		t.Fatalf("unexpected derivation error: [%v]", err)
 	}
@@ -141,6 +142,16 @@ func TestReleaseManifestDeriveRejectsZeroAllowance(t *testing.T) {
 		t.Fatal("expected a zero allowance to be rejected")
 	}
 	if !strings.Contains(err.Error(), "must be positive") {
+		t.Errorf("unexpected rejection message: [%v]", err)
+	}
+}
+
+func TestReleaseManifestDeriveRejectsOverflowingAllowance(t *testing.T) {
+	_, err := deriveTerminationGrace(math.MaxUint64)
+	if err == nil {
+		t.Fatal("expected an overflowing allowance to be rejected")
+	}
+	if !strings.Contains(err.Error(), "termination grace overflows") {
 		t.Errorf("unexpected rejection message: [%v]", err)
 	}
 }
@@ -393,7 +404,13 @@ func TestReleaseManifestValidateFailsClosed(t *testing.T) {
 			func(m *releaseManifest) {
 				m.TerminationGrace.ForcedCancellationAllowanceSeconds = 0
 			},
-			"must be positive",
+			"forced_cancellation_allowance_seconds must be [300]",
+		},
+		"stale forced-cancellation allowance": {
+			func(m *releaseManifest) {
+				m.TerminationGrace.ForcedCancellationAllowanceSeconds++
+			},
+			"forced_cancellation_allowance_seconds must be [300]",
 		},
 		"stale exit headroom": {
 			func(m *releaseManifest) {
@@ -445,6 +462,65 @@ func TestReleaseManifestValidateFailsClosed(t *testing.T) {
 					test.expectedMessage,
 					err,
 				)
+			}
+		})
+	}
+}
+
+// TestReleaseManifestValidateRejectsCoherentlyChangedAllowance proves the
+// allowance identity cannot be bypassed by a self-consistent edit: a manifest
+// whose allowance, grace, and therefore scaffold-facing sum were all
+// recomputed coherently around a different allowance still names a cleanup
+// window the runtime does not wait, so validation must reject it against the
+// compiled constant — never re-derive around the manifest's own value.
+func TestReleaseManifestValidateRejectsCoherentlyChangedAllowance(t *testing.T) {
+	tests := map[string]struct {
+		allowanceSeconds  uint64
+		expectedRejection []string
+	}{
+		"allowance lowered below the runtime cleanup wait": {
+			120,
+			[]string{
+				"forced_cancellation_allowance_seconds must be [300] as " +
+					"derived from the compiled bounds, got [120]",
+				"termination_grace_period_seconds must be [20160] as " +
+					"derived from the compiled bounds, got [19980]",
+			},
+		},
+		"allowance raised above the runtime cleanup wait": {
+			600,
+			[]string{
+				"forced_cancellation_allowance_seconds must be [300] as " +
+					"derived from the compiled bounds, got [600]",
+				"termination_grace_period_seconds must be [20160] as " +
+					"derived from the compiled bounds, got [20460]",
+			},
+		},
+	}
+
+	for testName, test := range tests {
+		t.Run(testName, func(t *testing.T) {
+			manifest := validReleaseManifestForTests(t)
+			grace := &manifest.TerminationGrace
+			grace.ForcedCancellationAllowanceSeconds = test.allowanceSeconds
+			// Recompute the grace exactly as a coherent hand-edit would, so
+			// the only remaining inconsistency is with the compiled constant
+			// the runtime waits.
+			grace.TerminationGracePeriodSeconds = grace.InProcessBackstopSeconds +
+				test.allowanceSeconds + grace.ProcessExitHeadroomSeconds
+
+			err := validateReleaseManifest(manifest)
+			if err == nil {
+				t.Fatal("expected the coherently changed allowance to be rejected")
+			}
+			for _, expectedMessage := range test.expectedRejection {
+				if !strings.Contains(err.Error(), expectedMessage) {
+					t.Errorf(
+						"rejection must name the violation [%s], got:\n%v",
+						expectedMessage,
+						err,
+					)
+				}
 			}
 		})
 	}

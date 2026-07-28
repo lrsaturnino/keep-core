@@ -174,15 +174,18 @@ func TestAwaitForcedCancellationCleanup_AllowanceExceeded(t *testing.T) {
 }
 
 // TestForcedCancellationAllowance_BoundToManifestAllowance pins the runtime
-// phase-two wait to the reviewed allowance the release manifest adds on top
+// phase-two wait to the compiled allowance the release manifest adds on top
 // of the in-process backstop, and pins the manifest's grace to strictly
 // outlast that wait: the room the termination grace reserves after the
 // backstop must be the full cleanup allowance the controller actually waits
 // plus the positive exit headroom for the teardown running outside both
 // timers — never exactly the allowance, or SIGKILL can land inside teardown.
+// The same identity is then checked against the checked-in repository
+// manifest, so a reviewed document drifting away from the runtime wait fails
+// here even though its own numbers are internally coherent.
 func TestForcedCancellationAllowance_BoundToManifestAllowance(t *testing.T) {
 	grace, err := deriveTerminationGrace(
-		defaultForcedCancellationAllowanceSeconds,
+		compiledForcedCancellationAllowanceSeconds,
 	)
 	if err != nil {
 		t.Fatalf("unexpected derivation error: [%v]", err)
@@ -217,6 +220,27 @@ func TestForcedCancellationAllowance_BoundToManifestAllowance(t *testing.T) {
 				"[%d]s runtime cleanup wait after the backstop, got [%d]s",
 			runtimeWaitSeconds,
 			graceBeyondBackstop,
+		)
+	}
+
+	// The derivation above proves the arithmetic; the repository manifest
+	// must also record exactly the allowance the runtime consumes, otherwise
+	// the reviewed scaffolds derived from it budget a cleanup window the
+	// process does not observe. Loading the checked-in file makes this a
+	// drift test against the repository document, not only against the
+	// in-memory derivation.
+	repositoryManifest, err := loadReleaseManifest(releaseManifestRepositoryPath)
+	if err != nil {
+		t.Fatalf("cannot load the repository manifest: [%v]", err)
+	}
+	recordedAllowanceSeconds :=
+		repositoryManifest.TerminationGrace.ForcedCancellationAllowanceSeconds
+	if recordedAllowanceSeconds != runtimeWaitSeconds {
+		t.Errorf(
+			"the repository manifest records a cleanup allowance of [%d]s, "+
+				"but the runtime cleanup wait consumes [%d]s",
+			recordedAllowanceSeconds,
+			runtimeWaitSeconds,
 		)
 	}
 }
@@ -277,7 +301,7 @@ func TestSignalLifecycleController_TeardownFitsExitHeadroom(t *testing.T) {
 	)
 
 	grace, err := deriveTerminationGrace(
-		defaultForcedCancellationAllowanceSeconds,
+		compiledForcedCancellationAllowanceSeconds,
 	)
 	if err != nil {
 		t.Fatalf("unexpected derivation error: [%v]", err)

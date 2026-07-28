@@ -22,14 +22,18 @@ import (
 // instead of being partially interpreted.
 const releaseManifestSchemaVersion = uint64(1)
 
-// defaultForcedCancellationAllowanceSeconds is the reviewed wall-clock
+// compiledForcedCancellationAllowanceSeconds is the reviewed wall-clock
 // allowance between the in-process quiesce backstop firing and the service
 // manager escalating to SIGKILL. It covers the audited forced-cancellation
 // path that runs after the backstop: canceling the permits that outlived the
 // drain, persisting their audit records, closing the gate, and letting the
 // process exit. It deliberately mirrors the RPC/processing margin used inside
-// the backstop itself; both absorb the same order of local skew.
-const defaultForcedCancellationAllowanceSeconds = uint64(300)
+// the backstop itself; both absorb the same order of local skew. The runtime
+// cleanup wait consumes exactly this constant (forcedCancellationAllowance in
+// start.go), and manifest validation rejects a manifest recording any other
+// allowance, so no reviewed document can promise the service manager a
+// cleanup window the running process does not observe.
+const compiledForcedCancellationAllowanceSeconds = uint64(300)
 
 // processExitHeadroomSeconds is the reviewed headroom the external
 // termination grace adds on top of the two in-process waits. The service
@@ -55,10 +59,10 @@ type beaconCompletionInputs struct {
 
 // terminationGrace is the manifest section binding the service manager's
 // external termination grace to the in-process quiesce deadline. Every field
-// except the forced-cancellation allowance is derived from this binary's
-// compiled protocol bounds; the allowance is the one reviewed input recorded
-// only here, and the grace period is the checked sum of the backstop, the
-// allowance, and the compiled process-exit headroom.
+// is derived from this binary's compiled protocol bounds — the allowance is
+// the compiled constant the runtime cleanup wait consumes, recorded here so
+// the reviewed document names it — and the grace period is the checked sum
+// of the backstop, the allowance, and the compiled process-exit headroom.
 type terminationGrace struct {
 	TBTCCompletionBlocks               uint64                 `json:"tbtc_completion_blocks"`
 	BeaconCompletionBlocks             uint64                 `json:"beacon_completion_blocks"`
@@ -90,10 +94,12 @@ type releaseManifest struct {
 // binary's compiled protocol bounds: the tBTC and beacon completion bounds,
 // the reviewed quiesce margin, the upper block interval, the RPC/processing
 // allowance, and the in-process backstop produced by the same checked
-// arithmetic the node uses at startup. The forced-cancellation allowance is
-// the one reviewed input that is not compiled in; a zero allowance is
-// rejected because the external grace must end strictly after the in-process
-// backstop for the audited forced-cancellation path to run before SIGKILL.
+// arithmetic the node uses at startup. Every production caller passes the
+// compiled forced-cancellation allowance — the very value the runtime
+// cleanup wait consumes — and validation separately requires a manifest to
+// record exactly that value. A zero allowance is rejected because the
+// external grace must end strictly after the in-process backstop for the
+// audited forced-cancellation path to run before SIGKILL.
 func deriveTerminationGrace(
 	forcedCancellationAllowanceSeconds uint64,
 ) (terminationGrace, error) {
@@ -245,8 +251,15 @@ func validateReleaseManifest(manifest releaseManifest) error {
 		))
 	}
 
+	// Derivation must consume the compiled allowance, never the manifest's
+	// own recorded value: the runtime cleanup wait is bound to the compiled
+	// constant, so a manifest carrying any other allowance — even one whose
+	// grace and scaffold values were recomputed coherently around it — would
+	// grant the service manager a SIGKILL deadline the running process does
+	// not honor. The recorded allowance is checked like every other number,
+	// against the compiled value.
 	derived, err := deriveTerminationGrace(
-		manifest.TerminationGrace.ForcedCancellationAllowanceSeconds,
+		compiledForcedCancellationAllowanceSeconds,
 	)
 	if err != nil {
 		violations = append(violations, err)
@@ -275,6 +288,7 @@ func validateReleaseManifest(manifest releaseManifest) error {
 			{"upper_block_interval_seconds", recorded.UpperBlockIntervalSeconds, derived.UpperBlockIntervalSeconds},
 			{"rpc_processing_allowance_seconds", recorded.RPCProcessingAllowanceSeconds, derived.RPCProcessingAllowanceSeconds},
 			{"in_process_backstop_seconds", recorded.InProcessBackstopSeconds, derived.InProcessBackstopSeconds},
+			{"forced_cancellation_allowance_seconds", recorded.ForcedCancellationAllowanceSeconds, derived.ForcedCancellationAllowanceSeconds},
 			{"process_exit_headroom_seconds", recorded.ProcessExitHeadroomSeconds, derived.ProcessExitHeadroomSeconds},
 			{"termination_grace_period_seconds", recorded.TerminationGracePeriodSeconds, derived.TerminationGracePeriodSeconds},
 		} {
@@ -309,13 +323,18 @@ var ReleaseManifestCommand = &cobra.Command{
 }
 
 var releaseManifestPath string
-var releaseManifestAllowanceSeconds uint64
 
+// The derive subcommand deliberately takes no allowance flag: the runtime
+// cleanup wait consumes the compiled allowance, so the only manifest worth
+// deriving — and the only one validation accepts — is the one recording
+// exactly that constant.
 var releaseManifestDeriveCommand = &cobra.Command{
 	Use:   "derive",
 	Short: "Print the release manifest derived from the compiled bounds",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		grace, err := deriveTerminationGrace(releaseManifestAllowanceSeconds)
+		grace, err := deriveTerminationGrace(
+			compiledForcedCancellationAllowanceSeconds,
+		)
 		if err != nil {
 			return err
 		}
@@ -369,13 +388,6 @@ var releaseManifestValidateCommand = &cobra.Command{
 }
 
 func init() {
-	releaseManifestDeriveCommand.Flags().Uint64Var(
-		&releaseManifestAllowanceSeconds,
-		"forcedCancellationAllowanceSeconds",
-		defaultForcedCancellationAllowanceSeconds,
-		"Reviewed allowance between the in-process backstop and SIGKILL.",
-	)
-
 	releaseManifestValidateCommand.Flags().StringVar(
 		&releaseManifestPath,
 		"manifest",
