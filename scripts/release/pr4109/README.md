@@ -74,12 +74,25 @@ authorizes activating quarantined material by itself.
 
 The two **container** rehearsals are mandatory release gates that cannot run
 from this repository alone: they need the immutable prior-production and R1
-runtime image digests, a rehearsal chain with deployed beacon/tBTC contracts,
-per-node operator keys and configs, and (for rollback) storage snapshots plus
-an independent network vantage point. `rehearse.sh preflight` validates those
-inputs; `single-release` and `rollback` refuse to run — reporting `BLOCKED`
-with the exact missing input — until they are supplied and the stages are
-extended against the real fleet.
+runtime image digests, an equally immutable probe image digest, a rehearsal
+chain with deployed beacon/tBTC contracts and its chain id, per-node operator
+keys and configs each declaring a nonzero `clientInfo.port`, a work driver
+that originates protocol work on that chain, and (for rollback) one storage
+snapshot per R1 service. `rehearse.sh preflight` validates those inputs and
+reports `BLOCKED` with the exact missing one.
+
+Once preflight passes, `single-release` and `rollback` **run**: each drives
+its gate as an explicit sequence of steps, starting the fleet from the
+immutable digests, reading every number it records from the nodes' own
+client-info ports over the internal rehearsal network, and recording each
+step's own outcome. A step this release cannot execute is recorded `blocked`
+with the reason rather than aborting the run, because the steps after it are
+independent proofs and losing them tells a reviewer less than a record naming
+exactly which step could not run. Every run therefore ends with an evidence
+record on disk — validated by the acceptance stage's own validator — and the
+stage exits `BLOCKED` unless every mandatory step executed. A partial
+rehearsal can never read as a passed gate, and a blocked gate is never
+silent about what it did prove.
 
 `compose.rehearsal.yaml` is the fleet shell: one prior node (no gate — the
 deliberate straggler) and two R1 nodes with the non-mainnet
@@ -734,9 +747,15 @@ upstream, not merely unpinned here. Until the reviewed fork commit is pinned in 
   evidence. They are recorded as explicit skips in
   `pkg/tbtc/signing_cutover_integration_test.go` and
   `pkg/tbtc/dkg_cutover_integration_test.go`.
-- The `single-release` container rehearsal stays `BLOCKED` even with all
-  image/chain inputs supplied, because a mixed prior/R1 fleet cannot pass its
-  pre-cutover compatibility stages.
+- The `single-release` container rehearsal still exits `BLOCKED` with every
+  image/chain input supplied, because its mixed prior/R1 pre-cutover steps
+  cannot execute. It no longer refuses the whole sequence to say so: the run
+  starts the fleet, executes the steps that need no legacy capability —
+  crossing C in-process, restart-derives-mode-from-anchor, the straggler
+  negative control and its quarantine, clock failure, quiescence with a
+  security-v2 permit — and records the four legacy-dependent steps as
+  `blocked` against this same dependency. The emitted record is what shows
+  which half of the gate this release already satisfies.
 
 Unblocking requires the reviewed fork commit, its review record, transcript
 fixtures proving both modes reproduce their exact expected bytes, and the

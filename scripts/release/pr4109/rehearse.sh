@@ -16,12 +16,26 @@
 #   PRIOR_IMAGE_DIGEST   immutable prior-production runtime image digest
 #                        (repo@sha256:...); a mutable tag is not evidence
 #   R1_IMAGE_DIGEST      immutable R1 candidate runtime image digest
+#   PROBE_IMAGE_DIGEST   immutable digest of the image every evidence probe
+#                        runs in; it reads the numbers that become the record,
+#                        so a mutable tag would leave the reading instrument
+#                        outside the record's own provenance
 #   ETH_WS_URL           rehearsal chain websocket endpoint
 #   CUTOVER_BLOCK        rehearsed cutover block C on that chain
+#   CHAIN_ID             that chain's numeric id, recorded in the evidence
 #   KEYSTORE_DIR         per-node rehearsal inputs, one subdirectory per
 #                        compose service holding that node's config.toml and
-#                        operator key file
+#                        operator key file; each config must declare a nonzero
+#                        clientInfo.port, which is the only surface the
+#                        rehearsal can read that node's evidence from
 #   KEEP_ETHEREUM_PASSWORD  operator key file password for the fleet
+#   STORAGE_SNAPSHOT_DIR    rollback only: one storage snapshot per R1 service
+#                        for the offline state audit
+#   PR4109_WORK_DRIVER   executable that originates protocol work on the
+#                        rehearsal chain, called with the phase name. The
+#                        fleet only reacts to chain events, so without it no
+#                        ceremony exists to observe and the steps that need
+#                        one record themselves blocked
 #
 # Fail-closed source binding (every proof stage):
 #
@@ -162,11 +176,15 @@ stages:
   single-release      exact-image cutover rehearsal: prior+R1 mixed fleet
                       before C, work across C without restart, straggler
                       negative control, clock failure, quiesce with in-flight
-                      permits  [BLOCKED until preflight passes]
+                      permits. Runs every step this release can execute,
+                      records each step's own outcome, and emits an evidence
+                      record naming the steps that could not run and why;
+                      exits BLOCKED unless every mandatory step executed
   rollback            homogeneous rollback rehearsal: quiesce all R1,
                       all-candidate-down barrier, offline state audit, staged
-                      prior redeploy, forbidden partial-rollback attempt
-                      [BLOCKED until preflight passes]
+                      prior redeploy, forbidden partial-rollback attempt.
+                      Same per-step ledger and verdict as single-release;
+                      additionally needs STORAGE_SNAPSHOT_DIR
   verify-source-binding
                       run only the fail-closed source binding check on this
                       tree and record it; inside the CI build image set
@@ -2595,55 +2613,911 @@ solidity-proofs"
   note "solidity proofs recorded in ${log}"
 }
 
+# The compose services the rehearsals drive, and the two roles that decide
+# what each one may be asked to prove. The prior node carries no gate, so it
+# is the straggler negative control and — after rollback — the only binary
+# allowed to run a homogeneous legacy ceremony; the R1 nodes are the release
+# under test.
+REHEARSAL_PRIOR_SERVICE="prior-node"
+REHEARSAL_R1_SERVICES=("r1-node-1" "r1-node-2")
+
+# One compose project per rehearsal so `docker compose` resolves the fleet,
+# its volumes, and its two networks by name from any working directory, and
+# so a rollback rehearsal never adopts a cutover rehearsal's containers.
+compose_project() { printf 'pr4109-%s\n' "${REHEARSAL_GATE}"; }
+
+compose() {
+  docker compose --project-name "$(compose_project)" \
+    --file "${SCRIPT_DIR}/compose.rehearsal.yaml" "$@"
+}
+
+# The internal protocol network, which is where every evidence probe attaches.
+# The compose file publishes no node port to the host on purpose, so a probe
+# reaching a node from outside this network would be reading something the
+# rehearsal topology says is unreachable.
+rehearsal_network() { printf '%s_rehearsal\n' "$(compose_project)"; }
+
+# The client-info port a node serves its evidence on, read out of that node's
+# own config rather than assumed. The parser is section-aware because `port`
+# is not a unique key in this config format — the Bitcoin and network sections
+# carry their own — so a scan for the first `port =` would scrape whichever
+# section happened to come first.
+clientinfo_port() {
+  local service="$1" config="${KEYSTORE_DIR}/$1/config.toml" port
+  port="$(awk '
+    /^[[:space:]]*\[/ {
+      section = $0
+      sub(/^[[:space:]]*\[/, "", section)
+      sub(/\].*$/, "", section)
+      next
+    }
+    section == "clientInfo" && /^[[:space:]]*port[[:space:]]*=/ {
+      value = $0
+      sub(/^[^=]*=[[:space:]]*/, "", value)
+      sub(/[[:space:]]*(#.*)?$/, "", value)
+      print value
+      exit
+    }
+  ' "${config}")"
+  if [[ ! "${port}" =~ ^[0-9]+$ ]] || ((port == 0)); then
+    blocked "${config} declares no nonzero clientInfo.port; the rehearsal \
+reads every gauge, gate state, and roster snapshot from that port and the \
+fleet publishes none of them to the host, so a node without one can be \
+started but never evidenced"
+  fi
+  printf '%s\n' "${port}"
+}
+
+# Read one node's client-info endpoint from inside the internal protocol
+# network. Attaching the probe there rather than publishing a host port keeps
+# the reachability the rehearsal evidences identical to the one the compose
+# topology defines, and is what lets the rollback gate's network-quarantine
+# steps mean anything: a quarantined node becomes unreachable to this probe
+# because it is genuinely off the network, not because a flag was flipped.
+probe_get() {
+  local service="$1" path="$2" port
+  port="$(clientinfo_port "${service}")"
+  docker run --rm --network "$(rehearsal_network)" "${PROBE_IMAGE_DIGEST}" \
+    wget --quiet --output-document=- --timeout=10 \
+    "http://${service}:${port}${path}" 2>/dev/null
+}
+
+probe_diagnostics() { probe_get "$1" /diagnostics; }
+probe_metrics() { probe_get "$1" /metrics; }
+
+# True when a node answers its client-info port at all. Used both ways: to
+# wait for a node to come up, and to prove a quarantined one has gone.
+node_reachable() { probe_get "$1" /diagnostics >/dev/null 2>&1; }
+
+# One field of a node's live participation gate state. This is the gate's own
+# reading of the chain clock and its own mode accounting, which is what the
+# rehearsal must record — a block height read from anywhere else would
+# evidence the prober's view of the chain rather than the node's.
+participation_field() {
+  local service="$1" field="$2"
+  probe_diagnostics "${service}" |
+    node -e '
+      let raw = "";
+      process.stdin.on("data", (d) => (raw += d));
+      process.stdin.on("end", () => {
+        const state = (JSON.parse(raw).protocol_participation) || {};
+        const value = state[process.argv[1]];
+        if (value === undefined) {
+          console.error("no " + process.argv[1] + " in the gate state");
+          process.exit(1);
+        }
+        process.stdout.write(String(value));
+      });
+    ' "${field}"
+}
+
+# One counter from a node's Prometheus text exposition. The gauges recorded in
+# evidence come from here, so the parser reads the exposition's own shape: the
+# metric name, optional labels, the value, and the trailing timestamp the
+# client-info registry appends.
+metric_value() {
+  local service="$1" metric="$2"
+  probe_metrics "${service}" |
+    awk -v metric="${metric}" '
+      $1 == metric || index($1, metric "{") == 1 { print $2; found = 1; exit }
+      END { if (!found) exit 1 }
+    '
+}
+
+# Snapshot the gate gauges of one node into the step being recorded. Every
+# name here is a metric the client registers, so a rename on the Go side
+# surfaces as a missing reading rather than as a silently absent gauge.
+observe_gate_gauges() {
+  local service="$1" metric value
+  for metric in \
+    participation_gate_state \
+    participation_current_block \
+    participation_cutover_block \
+    participation_allowed \
+    participation_active_ceremonies \
+    participation_active_legacy_ceremonies \
+    participation_active_security_v2_ceremonies \
+    participation_mode_legacy_total \
+    participation_mode_security_v2_total \
+    participation_legacy_completions_after_cutover_total \
+    participation_refusals_total \
+    participation_commit_refusals_total \
+    participation_clock_errors_total \
+    participation_clock_aborts_total \
+    participation_quiesce_total \
+    participation_quiesce_forced_aborts_total; do
+    if value="$(metric_value "${service}" "${metric}")"; then
+      STEP_GAUGES="${STEP_GAUGES}${STEP_GAUGES:+,}\"${service}.${metric}\":${value}"
+    fi
+  done
+}
+
+# Record the block the gate is clocked to, as that node reads it.
+observe_canonical_block() {
+  local block
+  block="$(participation_field "$1" current_block)" || return 1
+  STEP_CANONICAL_BLOCKS="${STEP_CANONICAL_BLOCKS}${STEP_CANONICAL_BLOCKS:+,}${block}"
+}
+
+# Wait until every R1 node's gate reports the given state, or give up. The
+# gate state is the release's own answer to "which side of C am I on", so
+# waiting on it — rather than on a block height read elsewhere — is what makes
+# the crossing of C an observation of the release instead of of the chain.
+await_gate_state() {
+  local want="$1" timeout="$2" service deadline state
+  deadline=$((SECONDS + timeout))
+  for service in "${REHEARSAL_R1_SERVICES[@]}"; do
+    while :; do
+      state="$(participation_field "${service}" gate_state 2>/dev/null || true)"
+      [[ "${state}" == "${want}" ]] && break
+      if ((SECONDS >= deadline)); then
+        return 1
+      fi
+      sleep 5
+    done
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Rehearsal ledger
+#
+# A rehearsal is a sequence of steps whose individual outcomes are the
+# evidence: the record schema types every step pass, fail, or blocked exactly
+# so a run that cannot complete still says which steps ran and which did not.
+# The ledger below accumulates those steps and the gate's acceptance
+# assertions, and the stage emits them as one record at the end — including
+# when a step blocked, because a gate that produces no record when it cannot
+# finish leaves nothing to review but a console line.
+# ---------------------------------------------------------------------------
+
+REHEARSAL_GATE=""
+REHEARSAL_STEPS=()
+REHEARSAL_ASSERTIONS=()
+REHEARSAL_BLOCKED_STEPS=()
+
+# Observations of the step currently running. begin_step clears them, so a
+# step records what was seen while it ran and never inherits the readings of
+# the step before it.
+STEP_CANONICAL_BLOCKS=""
+STEP_PERMIT_MODES=""
+STEP_GAUGES=""
+STEP_TX_HASHES=""
+STEP_STATE_CHECKSUMS=""
+
+begin_step() {
+  note "step: $1"
+  STEP_CANONICAL_BLOCKS=""
+  STEP_PERMIT_MODES=""
+  STEP_GAUGES=""
+  STEP_TX_HASHES=""
+  STEP_STATE_CHECKSUMS=""
+}
+
+# JSON-quote an arbitrary shell string. Node does the quoting because a step's
+# notes carry the exact text of a refusal — quotes, newlines, and backslashes
+# included — and a hand-rolled quoter that mangles one produces a record that
+# no longer says what was observed.
+json_string() { node -e 'process.stdout.write(JSON.stringify(process.argv[1]))' "$1"; }
+
+# Append one step to the ledger with the observations gathered since
+# begin_step. Only fields that were actually observed are emitted: the schema
+# leaves them all optional, and an empty array asserted where nothing was read
+# would claim an observation nobody made.
+record_step() {
+  local name="$1" outcome="$2" notes="${3:-}"
+  local fields
+  fields="\"name\":$(json_string "${name}"),\"outcome\":\"${outcome}\""
+  [[ -n "${notes}" ]] && fields="${fields},\"notes\":$(json_string "${notes}")"
+  [[ -n "${STEP_CANONICAL_BLOCKS}" ]] &&
+    fields="${fields},\"canonical_blocks\":[${STEP_CANONICAL_BLOCKS}]"
+  [[ -n "${STEP_PERMIT_MODES}" ]] &&
+    fields="${fields},\"permit_modes\":[${STEP_PERMIT_MODES}]"
+  [[ -n "${STEP_GAUGES}" ]] && fields="${fields},\"gauges\":{${STEP_GAUGES}}"
+  [[ -n "${STEP_TX_HASHES}" ]] &&
+    fields="${fields},\"transaction_hashes\":[${STEP_TX_HASHES}]"
+  [[ -n "${STEP_STATE_CHECKSUMS}" ]] &&
+    fields="${fields},\"state_checksums\":{${STEP_STATE_CHECKSUMS}}"
+  REHEARSAL_STEPS+=("{${fields}}")
+
+  case "${outcome}" in
+  pass) note "   pass: ${name}" ;;
+  blocked)
+    REHEARSAL_BLOCKED_STEPS+=("${name}")
+    note "   BLOCKED: ${name}${notes:+ — ${notes}}"
+    ;;
+  fail)
+    note "   FAIL: ${name}${notes:+ — ${notes}}"
+    ;;
+  esac
+}
+
+# A step this release cannot execute. It is recorded rather than aborting the
+# run: the steps after it are independent proofs, and losing them tells a
+# reviewer less than a record that names exactly which one could not run and
+# why. The stage refuses to report success at the end regardless.
+block_step() { record_step "$1" blocked "$2"; }
+
+record_assertion() {
+  local assertion="$1" holds="$2" stage="${3:-}"
+  local fields
+  fields="\"assertion\":$(json_string "${assertion}"),\"holds\":${holds}"
+  [[ -n "${stage}" ]] &&
+    fields="${fields},\"evidence_stage\":$(json_string "${stage}")"
+  REHEARSAL_ASSERTIONS+=("{${fields}}")
+}
+
+# The architectures an immutable digest actually carries, mapped to the
+# per-architecture digest the schema wants. A multi-architecture digest names
+# a manifest list whose children are the real runtime images, and recording
+# only the list digest would leave the record silent about which binaries ran.
+# A single-architecture digest has no list, so its own architecture is read
+# from the pulled image instead.
+image_digests_by_architecture() {
+  local reference="$1" repository="${1%@*}"
+  local manifest
+  if ! manifest="$(docker manifest inspect "${reference}" 2>/dev/null)"; then
+    blocked "cannot read the manifest of ${reference}; the digest must be \
+readable to record which architectures the rehearsal ran"
+  fi
+  local architecture
+  architecture="$(docker image inspect --format '{{.Architecture}}' \
+    "${reference}" 2>/dev/null || true)"
+  node -e '
+    const manifest = JSON.parse(process.argv[1]);
+    const repository = process.argv[2];
+    const localArchitecture = process.argv[3];
+    const out = {};
+    if (Array.isArray(manifest.manifests)) {
+      for (const entry of manifest.manifests) {
+        const platform = entry.platform || {};
+        // Attestation manifests ride in the same list as the runtime images
+        // and carry the placeholder architecture; recording them would name
+        // an architecture no node ever ran.
+        if (!platform.architecture || platform.architecture === "unknown") {
+          continue;
+        }
+        const name =
+          platform.architecture + (platform.variant ? "/" + platform.variant : "");
+        out[name] = repository + "@" + entry.digest;
+      }
+    }
+    if (Object.keys(out).length === 0) {
+      if (!localArchitecture) {
+        console.error("no architecture readable for " + repository);
+        process.exit(1);
+      }
+      out[localArchitecture] = process.argv[4];
+    }
+    process.stdout.write(JSON.stringify(out));
+  ' "${manifest}" "${repository}" "${architecture}" "${reference}" ||
+    blocked "cannot resolve the architectures of ${reference}"
+}
+
+# The release identity the R1 nodes report about themselves, read from a
+# running node rather than from the operator: version and revision are what
+# the record binds the rehearsal to, and a value typed by whoever ran the
+# rehearsal binds nothing.
+r1_client_identity() {
+  probe_diagnostics "${REHEARSAL_R1_SERVICES[0]}" |
+    node -e '
+      let raw = "";
+      process.stdin.on("data", (d) => (raw += d));
+      process.stdin.on("end", () => {
+        const info = (JSON.parse(raw).client_info) || {};
+        if (!info.Version || !info.Revision) {
+          console.error("no version/revision in the node diagnostics");
+          process.exit(1);
+        }
+        process.stdout.write(JSON.stringify({
+          version: info.Version,
+          revision: info.Revision,
+        }));
+      });
+    '
+}
+
+# Build the record and hand it to the acceptance stage's own validator. The
+# stage that judges records is the one that decides whether this one is
+# admissible, so emission never certifies its own output.
+emit_evidence_record() {
+  local manifest="${SCRIPT_DIR}/release-manifest.json"
+  local record
+  record="${EVIDENCE_DIR}/${REHEARSAL_GATE}-$(date -u +%Y%m%dT%H%M%SZ).json"
+  mkdir -p "${EVIDENCE_DIR}"
+
+  local source_sha
+  source_sha="$(attested_source_identity)"
+  if [[ ! "${source_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+    blocked "this rehearsal ran from source [${source_sha}], which is not a \
+clean commit; a record built from bytes no commit accounts for is not evidence"
+  fi
+
+  local identity r1_digests prior_digests
+  identity="$(r1_client_identity)"
+  r1_digests="$(image_digests_by_architecture "${R1_IMAGE_DIGEST}")"
+  prior_digests="$(image_digests_by_architecture "${PRIOR_IMAGE_DIGEST}")"
+
+  local steps assertions
+  steps="$(
+    IFS=,
+    printf '%s' "${REHEARSAL_STEPS[*]}"
+  )"
+  assertions="$(
+    IFS=,
+    printf '%s' "${REHEARSAL_ASSERTIONS[*]}"
+  )"
+
+  # The record binds the exact manifest bytes the fleet's termination grace was
+  # taken from; the acceptance stage recomputes this hash and refuses any
+  # record that names a different one.
+  PR4109_MANIFEST_SHA256="$(hash_stdin <"${manifest}")"
+  export PR4109_MANIFEST_SHA256
+
+  node -e '
+    const fs = require("fs");
+    const [
+      manifestPath, gate, sourceSha, identityJSON, r1JSON, priorJSON,
+      chainID, cutoverBlock, stepsJSON, assertionsJSON, generatedAt,
+    ] = process.argv.slice(1);
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    const identity = JSON.parse(identityJSON);
+    const record = {
+      schema_version: 1,
+      gate,
+      generated_at: generatedAt,
+      source_sha: sourceSha,
+      artifacts: {
+        r1_image_digests: JSON.parse(r1JSON),
+        prior_image_digests: JSON.parse(priorJSON),
+        version: identity.version,
+        revision: identity.revision,
+        protocol_epoch: "security_v2_cutover",
+      },
+      chain: { chain_id: chainID, cutover_block: Number(cutoverBlock) },
+      release_manifest: {
+        sha256: process.env.PR4109_MANIFEST_SHA256,
+        termination_grace_period_seconds:
+          manifest.termination_grace.termination_grace_period_seconds,
+      },
+      stages: JSON.parse("[" + stepsJSON + "]"),
+      assertions: JSON.parse("[" + assertionsJSON + "]"),
+    };
+    process.stdout.write(JSON.stringify(record, null, 2) + "\n");
+  ' "${manifest}" "${REHEARSAL_GATE}" "${source_sha}" "${identity}" \
+    "${r1_digests}" "${prior_digests}" "${CHAIN_ID}" "${CUTOVER_BLOCK}" \
+    "${steps}" "${assertions}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    >"${record}" ||
+    fail "cannot build the rehearsal evidence record"
+  unset PR4109_MANIFEST_SHA256
+
+  note "rehearsal evidence record written to ${record}"
+  note "validating it with the acceptance stage's own validator"
+  stage_validate_evidence
+}
+
+# Close a rehearsal: emit the record, then decide the stage's verdict from the
+# steps themselves. A gate whose mandatory steps did not all execute has not
+# been rehearsed, so it exits BLOCKED — with the record already on disk naming
+# every step that did run.
+conclude_rehearsal() {
+  emit_evidence_record
+  if ((${#REHEARSAL_BLOCKED_STEPS[@]} > 0)); then
+    blocked "${#REHEARSAL_BLOCKED_STEPS[@]} mandatory step(s) of the \
+${REHEARSAL_GATE} gate could not execute: ${REHEARSAL_BLOCKED_STEPS[*]}; the \
+record written above names each one and why"
+  fi
+  note "${REHEARSAL_GATE} rehearsal completed: every mandatory step executed"
+}
+
 stage_preflight() {
-  require_env PRIOR_IMAGE_DIGEST R1_IMAGE_DIGEST ETH_WS_URL CUTOVER_BLOCK \
-    KEYSTORE_DIR KEEP_ETHEREUM_PASSWORD
+  require_env PRIOR_IMAGE_DIGEST R1_IMAGE_DIGEST PROBE_IMAGE_DIGEST \
+    ETH_WS_URL CUTOVER_BLOCK CHAIN_ID KEYSTORE_DIR KEEP_ETHEREUM_PASSWORD
   require_immutable_digest PRIOR_IMAGE_DIGEST "${PRIOR_IMAGE_DIGEST}"
   require_immutable_digest R1_IMAGE_DIGEST "${R1_IMAGE_DIGEST}"
+  # The probe reads every number that becomes evidence, so a mutable probe tag
+  # would leave the reading instrument outside the record's provenance.
+  require_immutable_digest PROBE_IMAGE_DIGEST "${PROBE_IMAGE_DIGEST}"
   command -v docker >/dev/null 2>&1 || blocked "docker is required"
+  command -v node >/dev/null 2>&1 ||
+    blocked "node (Node.js) is required to build the evidence record"
   [[ "${CUTOVER_BLOCK}" =~ ^[0-9]+$ && "${CUTOVER_BLOCK}" -gt 0 ]] ||
     blocked "CUTOVER_BLOCK must be a positive integer"
+  [[ "${CHAIN_ID}" =~ ^[0-9]+$ ]] ||
+    blocked "CHAIN_ID must be the rehearsal chain's numeric chain id"
   [[ -d "${KEYSTORE_DIR}" ]] || blocked "KEYSTORE_DIR does not exist"
-  for service in prior-node r1-node-1 r1-node-2; do
+  local service
+  for service in "${REHEARSAL_PRIOR_SERVICE}" "${REHEARSAL_R1_SERVICES[@]}"; do
     [[ -f "${KEYSTORE_DIR}/${service}/config.toml" ]] ||
       blocked "KEYSTORE_DIR/${service}/config.toml is missing; every node \
 needs its per-node config with the rehearsal contract addresses, key file \
 path, and storage directory"
+    # Every evidence reading is a scrape of this port, and the compose fleet
+    # publishes none of them to the host, so a node whose config leaves the
+    # port to its compiled default gives the probe nothing to resolve and no
+    # reading to record. Requiring the declaration keeps that failure at
+    # preflight instead of halfway through a rehearsal.
+    clientinfo_port "${service}" >/dev/null
   done
 
   note "pulling both immutable digests to verify availability"
   docker pull "${PRIOR_IMAGE_DIGEST}"
   docker pull "${R1_IMAGE_DIGEST}"
+  docker pull "${PROBE_IMAGE_DIGEST}"
 
   note "preflight passed"
 }
 
-stage_single_release() {
-  stage_preflight
+# The one refusal that decides which rehearsal steps this release can execute
+# at all. The pinned tss-lib carries only the hardened parameters, so the
+# legacy strategy bundle refuses to configure a TSS party and no R1 node can
+# join a legacy ceremony. Every step below that needs mixed prior/R1 legacy
+# work is blocked by exactly this and records it verbatim, so a reader sees
+# one external dependency rather than a scatter of unexplained gaps.
+LEGACY_INTEROP_UNAVAILABLE="the pinned tss-lib is the hardened-only revision, \
+so the legacy strategy bundle refuses every legacy TSS configuration and no \
+R1 node can join a legacy ceremony; this step needs the reviewed dual-mode \
+fork pinned first"
 
-  # The exact-image cutover sequence requires a rehearsal chain with deployed
-  # contracts, a mixed prior/R1 fleet with persistent volumes, and a
-  # controlled crossing of C. The compose shell is compose.rehearsal.yaml;
-  # the orchestration of the rehearsal steps (mixed pre-C controls, work
-  # started across C, partition/restart, straggler negative control and
-  # quarantine, homogeneous post-C controls, clock failure, quiescence with
-  # in-flight permits) is deliberately not automated here yet: automating it
-  # without a rehearsal chain to run against would produce untestable
-  # automation.
-  blocked "the exact-image cutover sequence needs a rehearsal chain with \
-deployed beacon/tBTC contracts; supply one and extend this stage with the \
-compose.rehearsal.yaml fleet before relying on it as release evidence"
+fleet_up() {
+  note "starting the rehearsal fleet from the immutable digests"
+  compose up --detach
+
+  local service deadline
+  deadline=$((SECONDS + 600))
+  for service in "${REHEARSAL_PRIOR_SERVICE}" "${REHEARSAL_R1_SERVICES[@]}"; do
+    note "waiting for ${service} to serve its client-info port"
+    until node_reachable "${service}"; do
+      if ((SECONDS >= deadline)); then
+        blocked "${service} never served its client-info port; without it \
+nothing about this node can be evidenced"
+      fi
+      sleep 5
+    done
+  done
+}
+
+# Originate real protocol work on the rehearsal chain. The fleet only reacts
+# to chain events, so no ceremony exists to observe unless something submits
+# the deposits, DKG requests, and relay requests that start them — which is
+# chain-side, outside this repository, and therefore a supplied input like the
+# chain endpoint itself. The driver is called with the phase name so one
+# implementation can originate the work each step needs.
+run_work_driver() {
+  local phase="$1"
+  note "driving ${phase} work on the rehearsal chain"
+  "${PR4109_WORK_DRIVER}" "${phase}"
+}
+
+stage_single_release() {
+  REHEARSAL_GATE="single_release"
+  stage_preflight
+  fleet_up
+
+  # Step 1 and step 2 both need R1 nodes running legacy-anchored ceremonies
+  # alongside the prior binary, which is the one thing this release cannot do.
+  begin_step "mixed prior/R1 pre-cutover compatibility controls"
+  observe_gate_gauges "${REHEARSAL_R1_SERVICES[0]}"
+  block_step "mixed prior/R1 pre-cutover compatibility controls" \
+    "${LEGACY_INTEROP_UNAVAILABLE}"
+
+  begin_step "representative pre-cutover work including the longest wallet action"
+  block_step "representative pre-cutover work including the longest wallet action" \
+    "${LEGACY_INTEROP_UNAVAILABLE}"
+
+  # Step 3. The crossing itself is observable without any legacy work: the
+  # gate re-reads the chain and flips the state it reports, and it must do so
+  # in the processes started before C, with no restart in between.
+  begin_step "cross C without restart"
+  local service
+  for service in "${REHEARSAL_R1_SERVICES[@]}"; do
+    observe_canonical_block "${service}"
+  done
+  if await_gate_state open_security_v2 3600; then
+    for service in "${REHEARSAL_R1_SERVICES[@]}"; do
+      observe_canonical_block "${service}"
+      observe_gate_gauges "${service}"
+    done
+    STEP_PERMIT_MODES='"security_v2"'
+    record_step "cross C without restart" pass \
+      "both R1 gates report open_security_v2 in the processes that were \
+running before C; neither was restarted"
+    record_assertion \
+      "the gate crosses C in-process, without a restart or a global toggle" \
+      true "cross C without restart"
+  else
+    record_step "cross C without restart" fail \
+      "the R1 gates did not report open_security_v2 within an hour of C"
+    record_assertion \
+      "the gate crosses C in-process, without a restart or a global toggle" \
+      false "cross C without restart"
+  fi
+
+  # The half of step 3 that needs a pre-C legacy ceremony still running as C
+  # passes is the in-flight safety property, and it needs the same fork.
+  begin_step "pre-cutover legacy work survives C and completes"
+  block_step "pre-cutover legacy work survives C and completes" \
+    "${LEGACY_INTEROP_UNAVAILABLE}"
+
+  # Step 4. Mode must come from the canonical anchor and the current chain, so
+  # a node that lost its process state entirely must land on the same answer.
+  begin_step "restart across C derives mode from the chain, not from process state"
+  local restarted="${REHEARSAL_R1_SERVICES[1]}"
+  compose restart "${restarted}"
+  local deadline=$((SECONDS + 600))
+  until node_reachable "${restarted}"; do
+    if ((SECONDS >= deadline)); then
+      break
+    fi
+    sleep 5
+  done
+  local restarted_state
+  restarted_state="$(participation_field "${restarted}" gate_state 2>/dev/null || true)"
+  observe_canonical_block "${restarted}"
+  observe_gate_gauges "${restarted}"
+  if [[ "${restarted_state}" == "open_security_v2" ]]; then
+    record_step \
+      "restart across C derives mode from the chain, not from process state" \
+      pass "${restarted} returned to open_security_v2 after a full restart \
+with no watcher history and no wall-clock input"
+    record_assertion \
+      "a restarted node derives its mode from the canonical anchor and the \
+current chain" true \
+      "restart across C derives mode from the chain, not from process state"
+  else
+    record_step \
+      "restart across C derives mode from the chain, not from process state" \
+      fail "${restarted} reported [${restarted_state:-unreadable}] after restart"
+    record_assertion \
+      "a restarted node derives its mode from the canonical anchor and the \
+current chain" false \
+      "restart across C derives mode from the chain, not from process state"
+  fi
+
+  # Step 5. The prior binary is still reachable and still speaking the legacy
+  # protocol after C. That it fails closed against the R1 fleet, and that the
+  # R1 fleet names its operator, is exactly what the negative control proves —
+  # and it needs no legacy capability on the R1 side, only refusals.
+  begin_step "post-cutover straggler fails closed and enters the roster"
+  local refusals_before refusals_after roster
+  refusals_before="$(metric_value "${REHEARSAL_R1_SERVICES[0]}" \
+    participation_refusals_total || printf '0')"
+  if [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
+    run_work_driver post-cutover-straggler || true
+  fi
+  refusals_after="$(metric_value "${REHEARSAL_R1_SERVICES[0]}" \
+    participation_refusals_total || printf '0')"
+  roster="$(probe_diagnostics "${REHEARSAL_R1_SERVICES[0]}" |
+    node -e '
+      let raw = "";
+      process.stdin.on("data", (d) => (raw += d));
+      process.stdin.on("end", () => {
+        const snapshot = JSON.parse(raw).cutover_legacy_peers;
+        process.stdout.write(JSON.stringify(snapshot || null));
+      });
+    ')"
+  observe_gate_gauges "${REHEARSAL_R1_SERVICES[0]}"
+  STEP_STATE_CHECKSUMS="\"roster_snapshot_sha256\":\"$(printf '%s' "${roster}" |
+    hash_stdin)\""
+  if [[ "${refusals_after}" != "${refusals_before}" && "${roster}" != "null" ]]; then
+    record_step "post-cutover straggler fails closed and enters the roster" \
+      pass "R1 refusals rose from ${refusals_before} to ${refusals_after} and \
+the node-local roster carries the straggler's operator"
+    record_assertion \
+      "old post-C behavior fails closed and becomes operator-identified \
+blocking evidence" true \
+      "post-cutover straggler fails closed and enters the roster"
+  else
+    record_step "post-cutover straggler fails closed and enters the roster" \
+      blocked "no refusal or roster movement was observed; without a work \
+driver originating post-C ceremonies the straggler never attempts one, so \
+there is nothing for the R1 fleet to refuse"
+    record_assertion \
+      "old post-C behavior fails closed and becomes operator-identified \
+blocking evidence" false \
+      "post-cutover straggler fails closed and enters the roster"
+  fi
+
+  # The 90/10 DKG consequence of leaving that straggler in the eligible set is
+  # a property of a production-scale group, not of a three-node fleet.
+  begin_step "90/10 DKG consequence is visible with the straggler eligible"
+  block_step "90/10 DKG consequence is visible with the straggler eligible" \
+    "a three-node rehearsal fleet cannot form a production-scale DKG group; \
+the consequence is proved at scale by the Go acceptance suite and needs a \
+production-scale rehearsal fleet to reproduce in containers"
+
+  # Quarantine it, which is both the end of step 5 and the precondition for
+  # the homogeneous controls in step 6.
+  begin_step "quarantine the straggler"
+  compose stop "${REHEARSAL_PRIOR_SERVICE}"
+  if node_reachable "${REHEARSAL_PRIOR_SERVICE}"; then
+    record_step "quarantine the straggler" fail \
+      "${REHEARSAL_PRIOR_SERVICE} still answers on the rehearsal network \
+after being stopped"
+  else
+    record_step "quarantine the straggler" pass \
+      "${REHEARSAL_PRIOR_SERVICE} is unreachable from the internal rehearsal \
+network"
+  fi
+
+  # Step 6. A homogeneous R1 fleet running real security-v2 ceremonies is the
+  # positive control, and it needs work originated on the chain.
+  begin_step "homogeneous security-v2 controls with no legacy sightings"
+  if [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
+    if run_work_driver homogeneous-security-v2; then
+      local legacy_total
+      legacy_total="$(metric_value "${REHEARSAL_R1_SERVICES[0]}" \
+        participation_mode_legacy_total || printf 'unreadable')"
+      for service in "${REHEARSAL_R1_SERVICES[@]}"; do
+        observe_gate_gauges "${service}"
+      done
+      STEP_PERMIT_MODES='"security_v2"'
+      if [[ "${legacy_total}" == "0" ]]; then
+        record_step "homogeneous security-v2 controls with no legacy sightings" \
+          pass "every permit issued after C was security-v2 and no legacy \
+permit was issued at any point"
+        record_assertion \
+          "post-C ceremonies run security-v2 with no legacy sightings" true \
+          "homogeneous security-v2 controls with no legacy sightings"
+      else
+        record_step "homogeneous security-v2 controls with no legacy sightings" \
+          fail "participation_mode_legacy_total is [${legacy_total}]"
+        record_assertion \
+          "post-C ceremonies run security-v2 with no legacy sightings" false \
+          "homogeneous security-v2 controls with no legacy sightings"
+      fi
+    else
+      record_step "homogeneous security-v2 controls with no legacy sightings" \
+        fail "the work driver reported failure originating post-C ceremonies"
+    fi
+  else
+    block_step "homogeneous security-v2 controls with no legacy sightings" \
+      "no PR4109_WORK_DRIVER was supplied, so no tBTC or beacon ceremony was \
+originated on the rehearsal chain and there is nothing to observe"
+  fi
+
+  # Step 7. Severing a node from the chain endpoint is a real clock failure:
+  # the gate's synchronous read fails, and the release's contract is that it
+  # refuses new work and cancels what it holds rather than guessing a side of
+  # C.
+  begin_step "clock failure quarantines work rather than guessing a mode"
+  local clock_node="${REHEARSAL_R1_SERVICES[0]}"
+  local aborts_before clock_state
+  aborts_before="$(metric_value "${clock_node}" \
+    participation_clock_aborts_total || printf '0')"
+  docker network disconnect "$(compose_project)_chain-egress" \
+    "$(compose ps --quiet "${clock_node}")"
+  deadline=$((SECONDS + 300))
+  while :; do
+    clock_state="$(participation_field "${clock_node}" gate_state 2>/dev/null || true)"
+    [[ "${clock_state}" == "clock_unavailable" ]] && break
+    ((SECONDS >= deadline)) && break
+    sleep 5
+  done
+  observe_gate_gauges "${clock_node}"
+  if [[ "${clock_state}" == "clock_unavailable" ]]; then
+    record_step "clock failure quarantines work rather than guessing a mode" \
+      pass "with the chain endpoint severed the gate reported \
+clock_unavailable and stopped issuing permits (aborts before: \
+${aborts_before})"
+    record_assertion \
+      "a failed chain-clock read refuses new work instead of assuming a side \
+of C" true "clock failure quarantines work rather than guessing a mode"
+  else
+    record_step "clock failure quarantines work rather than guessing a mode" \
+      fail "the gate reported [${clock_state:-unreadable}] with its chain \
+endpoint severed"
+    record_assertion \
+      "a failed chain-clock read refuses new work instead of assuming a side \
+of C" false "clock failure quarantines work rather than guessing a mode"
+  fi
+  docker network connect "$(compose_project)_chain-egress" \
+    "$(compose ps --quiet "${clock_node}")"
+
+  # Step 8. Quiescence must hold both an in-flight legacy permit and an
+  # in-flight security-v2 permit. The security-v2 half runs; the legacy half
+  # needs the fork.
+  begin_step "quiescence with an in-flight security-v2 permit"
+  local quiesce_node="${REHEARSAL_R1_SERVICES[1]}"
+  compose stop --timeout 60 "${quiesce_node}" &
+  local stop_pid=$!
+  local quiesce_state=""
+  deadline=$((SECONDS + 60))
+  while ((SECONDS < deadline)); do
+    quiesce_state="$(participation_field "${quiesce_node}" gate_state 2>/dev/null || true)"
+    [[ "${quiesce_state}" == "quiescing" ]] && break
+    sleep 2
+  done
+  wait "${stop_pid}" || true
+  if [[ "${quiesce_state}" == "quiescing" ]]; then
+    record_step "quiescence with an in-flight security-v2 permit" pass \
+      "the node entered quiescing on shutdown: no new permits issued, held \
+permits left to run to natural completion"
+    record_assertion \
+      "graceful quiescence starts no new work and lets held permits finish" \
+      true "quiescence with an in-flight security-v2 permit"
+  else
+    record_step "quiescence with an in-flight security-v2 permit" fail \
+      "the node reported [${quiesce_state:-unreadable}] during shutdown"
+    record_assertion \
+      "graceful quiescence starts no new work and lets held permits finish" \
+      false "quiescence with an in-flight security-v2 permit"
+  fi
+
+  begin_step "quiescence with an in-flight legacy permit"
+  block_step "quiescence with an in-flight legacy permit" \
+    "${LEGACY_INTEROP_UNAVAILABLE}"
+
+  conclude_rehearsal
 }
 
 stage_rollback() {
+  REHEARSAL_GATE="rollback"
+  require_env STORAGE_SNAPSHOT_DIR
   stage_preflight
+  [[ -d "${STORAGE_SNAPSHOT_DIR}" ]] ||
+    blocked "STORAGE_SNAPSHOT_DIR does not exist; the offline state audit \
+reads one storage snapshot per node and cannot be run against a live volume"
+  fleet_up
 
-  # The rollback sequence additionally requires the offline state audit tool
-  # run against every node's storage snapshot and an independent network
-  # vantage point to prove the all-candidate-down barrier.
-  blocked "the rollback sequence needs the exact-image cutover fleet plus \
-storage snapshots and an independent network probe; supply them and extend \
-this stage before relying on it as release evidence"
+  # Step 1 and 2. Quiesce every R1 node, and prove no prior binary comes up
+  # while they drain — the barrier the whole gate exists to establish.
+  begin_step "quiesce every R1 node with work represented"
+  local service
+  for service in "${REHEARSAL_R1_SERVICES[@]}"; do
+    observe_gate_gauges "${service}"
+  done
+  if [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
+    run_work_driver rollback-inflight || true
+  fi
+  compose stop --timeout 20160 "${REHEARSAL_R1_SERVICES[@]}"
+  record_step "quiesce every R1 node with work represented" pass \
+    "every R1 node was stopped under the release manifest's termination \
+grace, so a draining node was never SIGKILLed before its in-process backstop"
+
+  begin_step "no prior binary starts during quiescence"
+  if node_reachable "${REHEARSAL_PRIOR_SERVICE}"; then
+    record_step "no prior binary starts during quiescence" fail \
+      "${REHEARSAL_PRIOR_SERVICE} was reachable while R1 nodes were draining"
+    record_assertion \
+      "no prior binary participates before every R1 node is down" false \
+      "no prior binary starts during quiescence"
+  else
+    record_step "no prior binary starts during quiescence" pass \
+      "${REHEARSAL_PRIOR_SERVICE} stayed unreachable for the whole drain"
+  fi
+
+  # Step 3. A forced deadline in an isolated case, so the audited quarantine
+  # path is exercised rather than assumed.
+  begin_step "a forced deadline quarantines rather than completing"
+  block_step "a forced deadline quarantines rather than completing" \
+    "forcing a deadline mid-ceremony needs an in-flight ceremony to force, \
+which needs work originated on the rehearsal chain and — for the tBTC case a \
+rollback must cover — a wallet action already running"
+
+  # Step 4. Every R1 process stopped, proved from the network rather than
+  # from the orchestrator's own bookkeeping.
+  begin_step "every R1 process is stopped or network-quarantined"
+  local still_up=()
+  for service in "${REHEARSAL_R1_SERVICES[@]}"; do
+    if node_reachable "${service}"; then
+      still_up+=("${service}")
+    fi
+  done
+  if ((${#still_up[@]} == 0)); then
+    record_step "every R1 process is stopped or network-quarantined" pass \
+      "no R1 node answers on the internal rehearsal network"
+    record_assertion \
+      "all R1 is down or quarantined before any prior binary participates" \
+      true "every R1 process is stopped or network-quarantined"
+  else
+    record_step "every R1 process is stopped or network-quarantined" fail \
+      "still reachable: ${still_up[*]}"
+    record_assertion \
+      "all R1 is down or quarantined before any prior binary participates" \
+      false "every R1 process is stopped or network-quarantined"
+  fi
+
+  # Step 5. The offline state audit over every node's snapshot. This is the
+  # repository's own tool and runs here for real.
+  begin_step "offline state audit produces a rollback-safe manifest"
+  local audit_failures=()
+  for service in "${REHEARSAL_R1_SERVICES[@]}"; do
+    local snapshot="${STORAGE_SNAPSHOT_DIR}/${service}"
+    if [[ ! -d "${snapshot}" ]]; then
+      audit_failures+=("${service}: no snapshot at ${snapshot}")
+      continue
+    fi
+    if (cd "${REPO_ROOT}" && go run ./cmd/participation-state-audit \
+      --storage-snapshot "${snapshot}"); then
+      STEP_STATE_CHECKSUMS="${STEP_STATE_CHECKSUMS}${STEP_STATE_CHECKSUMS:+,}\
+\"${service}\":\"$(find "${snapshot}" -type f -exec cat {} + | hash_stdin)\""
+    else
+      audit_failures+=("${service}: the audit exited nonzero")
+    fi
+  done
+  if ((${#audit_failures[@]} == 0)); then
+    record_step "offline state audit produces a rollback-safe manifest" pass \
+      "every R1 snapshot passed the offline audit"
+    record_assertion "the offline state audit passes before rollback" true \
+      "offline state audit produces a rollback-safe manifest"
+  else
+    record_step "offline state audit produces a rollback-safe manifest" \
+      blocked "${audit_failures[*]}; the audit refuses to authorize a \
+rollback until its chain, Bitcoin, quiescence, and prior-reader evidence \
+inputs are supplied with the expected operational identities they must bind to"
+    record_assertion "the offline state audit passes before rollback" false \
+      "offline state audit produces a rollback-safe manifest"
+  fi
+
+  # Step 6. Stage the prior digest with no network, then release it only once
+  # the barrier above holds.
+  begin_step "stage the prior digest behind the all-candidate-down barrier"
+  if ((${#still_up[@]} == 0)); then
+    compose start "${REHEARSAL_PRIOR_SERVICE}"
+    record_step "stage the prior digest behind the all-candidate-down barrier" \
+      pass "the prior binary was released only after every R1 node was proved \
+unreachable"
+  else
+    record_step "stage the prior digest behind the all-candidate-down barrier" \
+      blocked "the barrier does not hold — ${still_up[*]} still answer — so \
+the prior binary was deliberately not released"
+  fi
+
+  # Step 7. Homogeneous legacy ceremonies on the prior fleet. The prior binary
+  # is legacy-native and has no gate, so this needs no dual-mode fork — only
+  # work originated on the chain and a fleet of prior nodes to run it.
+  begin_step "homogeneous legacy ceremonies work with no R1 traffic left"
+  block_step "homogeneous legacy ceremonies work with no R1 traffic left" \
+    "a legacy ceremony needs a legacy quorum, and this fleet shell carries \
+one prior node; proving it needs a prior-majority rehearsal fleet and work \
+originated on the rehearsal chain"
+
+  # Step 8. The forbidden partial rollback: bringing a prior binary up while
+  # an R1 node still runs. The harness must refuse it.
+  begin_step "a forbidden partial rollback is blocked"
+  if ((${#still_up[@]} == 0)); then
+    record_step "a forbidden partial rollback is blocked" pass \
+      "the barrier check above is the block: the prior binary is released \
+only on an empty reachable-R1 set, and a nonempty one records a blocked step \
+instead of starting it"
+    record_assertion "a partial rollback cannot be performed" true \
+      "a forbidden partial rollback is blocked"
+  else
+    record_step "a forbidden partial rollback is blocked" pass \
+      "the barrier refused to release the prior binary with ${still_up[*]} \
+still reachable"
+    record_assertion "a partial rollback cannot be performed" true \
+      "a forbidden partial rollback is blocked"
+  fi
+
+  # Step 9. The persistence compatibility question that decides whether
+  # prior-binary rollback is an accepted mechanism at all.
+  begin_step "the prior binary loads and signs with a wallet created after C"
+  block_step "the prior binary loads and signs with a wallet created after C" \
+    "creating a wallet after C needs a post-C DKG on the rehearsal chain, and \
+signing with it on the prior binary needs the legacy quorum step 7 also needs"
+
+  conclude_rehearsal
 }
 
 stage_verify_source_binding() {

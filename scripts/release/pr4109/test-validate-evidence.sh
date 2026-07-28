@@ -478,6 +478,133 @@ run_validator "${D}"
 check "the inherited receipt is accepted before any proof run starts" 0 \
   "attestation binds"
 
+# ----------------------------------------------------------------------------
+#
+# The other side of the same contract: the container rehearsals build the
+# records this validator judges, so the builder is proved against the judge
+# rather than against a restatement of the schema. Every case below drives the
+# real ledger and the real emitter, with only the two readings that need a
+# running fleet — the R1 nodes' self-reported identity and the architectures
+# behind an immutable digest — replaced by fixtures.
+
+r1_client_identity() {
+  printf '{"version":"v2.0.0-rehearsal","revision":"%s"}' "${FIXTURE_SHA}"
+}
+
+image_digests_by_architecture() {
+  printf '{"amd64":"%s","arm64":"%s"}' "$1" "$1"
+}
+
+# Drive a rehearsal to its conclusion in an isolated subshell: the ledger, the
+# emitter, and the acceptance verdict conclude_rehearsal derives from the
+# steps. The emitter validates its own output through the real
+# stage_validate_evidence, so a record this returns 0 for is a record the
+# release gate would accept.
+run_rehearsal() {
+  local dir="$1" gate="$2"
+  shift 2
+  set +e
+  CASE_OUT="$(
+    (
+      # shellcheck disable=SC2030,SC2031,SC2034
+      EVIDENCE_DIR="${dir}"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      REPO_ROOT="${WORK}/repo"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      PR4109_EXPECTED_SOURCE_COMMIT="${FIXTURE_SHA}"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      PR4109_SOURCE_BINDING_MODE="exact"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      R1_IMAGE_DIGEST="keep/keep-client@sha256:$(printf 'a%.0s' {1..64})"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      PRIOR_IMAGE_DIGEST="keep/keep-client@sha256:$(printf 'b%.0s' {1..64})"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      CHAIN_ID="11155111"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      CUTOVER_BLOCK="9000000"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      REHEARSAL_GATE="${gate}"
+      "$@"
+      conclude_rehearsal
+    ) 2>&1
+  )"
+  CASE_RC=$?
+  set -e
+}
+
+# A rehearsal whose every mandatory step executed.
+complete_run() {
+  begin_step "cross C without restart"
+  # The observation slots the real probes fill; record_step drains them.
+  # shellcheck disable=SC2034
+  STEP_CANONICAL_BLOCKS="8999999,9000001"
+  # shellcheck disable=SC2034
+  STEP_PERMIT_MODES='"security_v2"'
+  # shellcheck disable=SC2034
+  STEP_GAUGES='"r1-node-1.participation_gate_state":2'
+  record_step "cross C without restart" pass "both gates crossed in process"
+  record_assertion "the gate crosses C in-process" true \
+    "cross C without restart"
+}
+
+# The same rehearsal with one step this release cannot execute.
+blocked_run() {
+  complete_run
+  begin_step "quiescence with an in-flight legacy permit"
+  block_step "quiescence with an in-flight legacy permit" \
+    "the pinned tss-lib is hardened-only"
+}
+
+E="${WORK}/emitted"
+mkdir -p "${E}"
+write_attestation "${E}"
+run_rehearsal "${E}" single_release complete_run
+check "a rehearsal record the emitter builds is accepted by the acceptance stage" \
+  0 "rehearsal evidence record written" "hash and termination grace" \
+  "every mandatory step executed"
+
+# The property the whole per-step ledger exists for: a gate that cannot finish
+# still writes a reviewable record, and still refuses to report success.
+E="${WORK}/emitted-blocked"
+mkdir -p "${E}"
+write_attestation "${E}"
+run_rehearsal "${E}" single_release blocked_run
+check "a rehearsal with a blocked step still emits a record and still blocks" \
+  3 "rehearsal evidence record written" \
+  "1 mandatory step\(s\) of the single_release gate could not execute" \
+  "quiescence with an in-flight legacy permit"
+
+if ls "${E}"/single_release-*.json >/dev/null 2>&1; then
+  printf 'ok   the blocked rehearsal left its record on disk for review\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL the blocked rehearsal wrote no record\n'
+  FAILED=$((FAILED + 1))
+fi
+
+# A blocked step is recorded as such rather than being smoothed into a pass:
+# the record is the only place a reviewer can see which steps did not run.
+if grep -q '"outcome": "blocked"' "${E}"/single_release-*.json; then
+  printf 'ok   the record types the step that could not run as blocked\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL the record does not type the unexecuted step as blocked\n'
+  FAILED=$((FAILED + 1))
+fi
+
+# A rehearsal run from bytes no commit accounts for must not produce a record
+# at all: the emitter is where that is caught, before anything is written.
+E="${WORK}/emitted-dirty"
+mkdir -p "${E}"
+write_attestation "${E}"
+echo 'divergence' >"${WORK}/repo/untracked-during-rehearsal"
+run_rehearsal "${E}" single_release complete_run
+check "a rehearsal on a divergent tree produces no record" 3 \
+  "not a clean commit"
+rm -f "${WORK}/repo/untracked-during-rehearsal"
+
+# ----------------------------------------------------------------------------
+
 # The seam the stage runs its proofs through, replaced by a stub that fails
 # the way any proof failure does and reports what it found on the way in.
 # Defined last in this file: everything above must run against the real one.
