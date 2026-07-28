@@ -61,17 +61,18 @@ import (
 )
 
 // manifestSchemaVersion versions the audit manifest document.
-const manifestSchemaVersion = uint32(4)
+const manifestSchemaVersion = uint32(5)
 
 // The audited namespaces, relative to the storage root. The beacon quarantine
 // namespace is a sibling of the active beacon keystore precisely so the
 // active-group scan cannot read it; the audit re-verifies that separation.
 const (
-	beaconKeystoreNamespace   = "keystore/beacon"
-	beaconQuarantineNamespace = "keystore/beacon-quarantine"
-	tbtcKeystoreNamespace     = "keystore/tbtc"
-	tbtcQuarantineNamespace   = "keystore/tbtc-quarantine"
-	tbtcWorkNamespace         = "work/tbtc"
+	beaconKeystoreNamespace    = "keystore/beacon"
+	beaconQuarantineNamespace  = "keystore/beacon-quarantine"
+	tbtcKeystoreNamespace      = "keystore/tbtc"
+	tbtcQuarantineNamespace    = "keystore/tbtc-quarantine"
+	tbtcWorkNamespace          = "work/tbtc"
+	participationWorkNamespace = "work/participation"
 )
 
 // The expected storage layout at each level. Any other entry is a finding:
@@ -86,7 +87,7 @@ var (
 		"tbtc",
 		"tbtc-quarantine",
 	}
-	knownWorkEntries = []string{"tbtc"}
+	knownWorkEntries = []string{"participation", "tbtc"}
 )
 
 // tbtcWorkPreparamsMarker classifies tECDSA pre-parameter pool records inside
@@ -135,7 +136,7 @@ type evidenceRecord struct {
 
 // evidenceSchemaVersion versions the external rollback-evidence record
 // schemas this audit accepts.
-const evidenceSchemaVersion uint32 = 3
+const evidenceSchemaVersion uint32 = 4
 
 // evidenceFutureSkewAllowance bounds how far in the future an evidence
 // record's generation time may lie relative to this audit before it is a
@@ -204,40 +205,15 @@ type quiescencePermitEvidence struct {
 	Outcome             string `json:"outcome"`
 }
 
-// quiescencePermitInventoryEvidence is the immutable identity of one permit
-// captured directly from the gate at the quiescence transition. It is kept
-// separate from the later terminal-outcome list so omitting an active permit
-// from that list cannot make a drain appear complete.
-type quiescencePermitInventoryEvidence struct {
-	Ceremony            string `json:"ceremony"`
-	Mode                string `json:"mode"`
-	CanonicalStartBlock uint64 `json:"canonical_start_block"`
-	WorkID              string `json:"work_id"`
-	PermitID            string `json:"permit_id"`
-}
-
-// quiescenceGateSnapshotEvidence records the independently captured gate
-// inventory at the instant quiescence began. The declared aggregate counts
-// are checked both against this inventory and against the terminal outcomes.
-type quiescenceGateSnapshotEvidence struct {
-	CapturedAt                 time.Time                           `json:"captured_at"`
-	State                      string                              `json:"state"`
-	ActiveCeremonies           uint64                              `json:"active_ceremonies"`
-	ActiveLegacyCeremonies     uint64                              `json:"active_legacy_ceremonies"`
-	ActiveSecurityV2Ceremonies uint64                              `json:"active_security_v2_ceremonies"`
-	ActivePermits              []quiescencePermitInventoryEvidence `json:"active_permits"`
-}
-
 type quiescenceReportEvidence struct {
 	evidenceEnvelope
 
-	ReleaseVersion            string                         `json:"release_version"`
-	ReleaseRevision           string                         `json:"release_revision"`
-	ReleaseEpoch              string                         `json:"release_epoch"`
-	CutoverBlock              uint64                         `json:"cutover_block"`
-	QuiesceCause              string                         `json:"quiesce_cause"`
-	GateSnapshot              quiescenceGateSnapshotEvidence `json:"gate_snapshot"`
-	ActivePermitsAtQuiescence []quiescencePermitEvidence     `json:"active_permits_at_quiescence"`
+	ReleaseVersion            string                     `json:"release_version"`
+	ReleaseRevision           string                     `json:"release_revision"`
+	ReleaseEpoch              string                     `json:"release_epoch"`
+	CutoverBlock              uint64                     `json:"cutover_block"`
+	QuiesceCause              string                     `json:"quiesce_cause"`
+	ActivePermitsAtQuiescence []quiescencePermitEvidence `json:"active_permits_at_quiescence"`
 }
 
 // priorReaderCompatibilityEvidence records the tested prior release and its
@@ -358,6 +334,10 @@ type manifest struct {
 	// TBTCWorkClassification counts the tBTC work-namespace files by class;
 	// an unclassified work record is additionally a finding.
 	TBTCWorkClassification map[string]int `json:"tbtc_work_classification,omitempty"`
+	// QuiescenceSnapshot is decoded from the node-authored encrypted
+	// work/participation artifact. External evidence cannot replace this
+	// inventory; terminal outcomes reconcile against it.
+	QuiescenceSnapshot *participation.QuiescenceSnapshot `json:"quiescence_snapshot,omitempty"`
 
 	// Findings lists every inconsistency; an empty list with Interpreted true
 	// means the namespaces are internally consistent.
@@ -677,6 +657,7 @@ func runAudit(
 		tbtcKeystoreNamespace,
 		tbtcQuarantineNamespace,
 		tbtcWorkNamespace,
+		participationWorkNamespace,
 	} {
 		inventory, err := inventoryNamespace(storageDir, namespace)
 		if err != nil {
@@ -1625,6 +1606,14 @@ func cutoverModeViolation(
 	legacy := participation.ModeLegacy.String()
 	securityV2 := participation.ModeSecurityV2.String()
 
+	if cutoverBlock > 0 && canonicalStartBlock == 0 {
+		return fmt.Sprintf(
+			"%s has zero canonical anchor under armed cutover block [%d]",
+			subject,
+			cutoverBlock,
+		)
+	}
+
 	switch mode {
 	case legacy:
 		if cutoverBlock > 0 && canonicalStartBlock >= cutoverBlock {
@@ -1727,11 +1716,9 @@ func validateQuiescencePermitIdentity(
 	return violations
 }
 
-func inventoryIdentity(
-	permit quiescencePermitInventoryEvidence,
-) quarantineIdentity {
+func inventoryIdentity(permit participation.PermitSnapshot) quarantineIdentity {
 	return quarantineIdentity{
-		ceremony:            permit.Ceremony,
+		ceremony:            string(permit.Ceremony),
 		mode:                permit.Mode,
 		canonicalStartBlock: permit.CanonicalStartBlock,
 		workID:              permit.WorkID,
@@ -1810,105 +1797,58 @@ func (r *auditRun) validateQuiescenceReportEvidence(content []byte) []string {
 		knownCeremonies[string(ceremony)] = struct{}{}
 	}
 
-	snapshot := record.GateSnapshot
-	if snapshot.CapturedAt.IsZero() {
+	snapshot := r.manifest.QuiescenceSnapshot
+	if snapshot == nil {
 		violations = append(
 			violations,
-			"the at-quiescence gate snapshot capture time is missing",
+			"the audited storage snapshot contains no node-authored "+
+				"quiescence gate snapshot",
 		)
-	} else if !record.GeneratedAt.IsZero() &&
+		snapshot = &participation.QuiescenceSnapshot{}
+	}
+
+	violations = append(violations, exactIdentityViolations(
+		"node-authored quiescing release version",
+		snapshot.ReleaseVersion,
+		record.ReleaseVersion,
+	)...)
+	violations = append(violations, exactIdentityViolations(
+		"node-authored quiescing release revision",
+		snapshot.ReleaseRevision,
+		record.ReleaseRevision,
+	)...)
+	violations = append(violations, exactIdentityViolations(
+		"node-authored quiescing release epoch",
+		snapshot.ReleaseEpoch,
+		record.ReleaseEpoch,
+	)...)
+	if snapshot.CutoverBlock != record.CutoverBlock {
+		violations = append(violations, fmt.Sprintf(
+			"node-authored quiescence used cutover block [%d], but the "+
+				"terminal report names [%d]",
+			snapshot.CutoverBlock,
+			record.CutoverBlock,
+		))
+	}
+	if snapshot.QuiesceCause != record.QuiesceCause {
+		violations = append(violations, fmt.Sprintf(
+			"node-authored quiescence cause [%s] does not match the "+
+				"terminal report cause [%s]",
+			snapshot.QuiesceCause,
+			record.QuiesceCause,
+		))
+	}
+	if !record.GeneratedAt.IsZero() &&
 		snapshot.CapturedAt.After(record.GeneratedAt) {
 		violations = append(
 			violations,
-			"the at-quiescence gate snapshot was captured after the "+
+			"the node-authored quiescence gate snapshot was captured after the "+
 				"quiescence report was generated",
 		)
 	}
-	if snapshot.State != participation.StateQuiescing.String() {
-		violations = append(violations, fmt.Sprintf(
-			"the at-quiescence gate snapshot has state [%s], expected [%s]",
-			snapshot.State,
-			participation.StateQuiescing,
-		))
-	}
-	if snapshot.ActiveLegacyCeremonies >
-		snapshot.ActiveCeremonies ||
-		snapshot.ActiveSecurityV2Ceremonies >
-			snapshot.ActiveCeremonies-
-				snapshot.ActiveLegacyCeremonies {
-		violations = append(violations, fmt.Sprintf(
-			"the at-quiescence gate snapshot mode counts [%d legacy, "+
-				"%d security-v2] do not sum to total [%d]",
-			snapshot.ActiveLegacyCeremonies,
-			snapshot.ActiveSecurityV2Ceremonies,
-			snapshot.ActiveCeremonies,
-		))
-	} else if snapshot.ActiveLegacyCeremonies+
-		snapshot.ActiveSecurityV2Ceremonies != snapshot.ActiveCeremonies {
-		violations = append(violations, fmt.Sprintf(
-			"the at-quiescence gate snapshot mode counts [%d legacy, "+
-				"%d security-v2] do not sum to total [%d]",
-			snapshot.ActiveLegacyCeremonies,
-			snapshot.ActiveSecurityV2Ceremonies,
-			snapshot.ActiveCeremonies,
-		))
-	}
-	if snapshot.ActiveCeremonies != uint64(len(snapshot.ActivePermits)) {
-		violations = append(violations, fmt.Sprintf(
-			"the at-quiescence gate snapshot inventories [%d] permits, "+
-				"but declares total [%d]",
-			len(snapshot.ActivePermits),
-			snapshot.ActiveCeremonies,
-		))
-	}
 
 	inventoryPermits := make(map[quarantineIdentity]int)
-	var inventoryLegacy uint64
-	var inventorySecurityV2 uint64
 	for i, permit := range snapshot.ActivePermits {
-		if _, ok := knownCeremonies[permit.Ceremony]; !ok {
-			violations = append(violations, fmt.Sprintf(
-				"gate inventory entry [%d] names unknown ceremony [%s]",
-				i,
-				permit.Ceremony,
-			))
-		}
-		switch permit.Mode {
-		case participation.ModeLegacy.String():
-			inventoryLegacy++
-		case participation.ModeSecurityV2.String():
-			inventorySecurityV2++
-		default:
-			violations = append(violations, fmt.Sprintf(
-				"gate inventory entry [%d] names unknown protocol mode [%s]",
-				i,
-				permit.Mode,
-			))
-		}
-		if violation := cutoverModeViolation(
-			fmt.Sprintf("gate inventory entry [%d]", i),
-			permit.Mode,
-			permit.CanonicalStartBlock,
-			record.CutoverBlock,
-		); violation != "" &&
-			(permit.Mode == participation.ModeLegacy.String() ||
-				permit.Mode == participation.ModeSecurityV2.String()) {
-			violations = append(violations, violation)
-		}
-		violations = append(
-			violations,
-			validateQuiescencePermitIdentity(
-				i,
-				quiescencePermitEvidence{
-					Ceremony:            permit.Ceremony,
-					Mode:                permit.Mode,
-					CanonicalStartBlock: permit.CanonicalStartBlock,
-					WorkID:              permit.WorkID,
-					PermitID:            permit.PermitID,
-				},
-			)...,
-		)
-
 		identity := inventoryIdentity(permit)
 		if firstIndex, duplicate := inventoryPermits[identity]; duplicate {
 			violations = append(violations, fmt.Sprintf(
@@ -1920,22 +1860,6 @@ func (r *auditRun) validateQuiescenceReportEvidence(content []byte) []string {
 		} else {
 			inventoryPermits[identity] = i
 		}
-	}
-	if inventoryLegacy != snapshot.ActiveLegacyCeremonies {
-		violations = append(violations, fmt.Sprintf(
-			"the at-quiescence gate inventory contains [%d] legacy "+
-				"permits, but the snapshot declares [%d]",
-			inventoryLegacy,
-			snapshot.ActiveLegacyCeremonies,
-		))
-	}
-	if inventorySecurityV2 != snapshot.ActiveSecurityV2Ceremonies {
-		violations = append(violations, fmt.Sprintf(
-			"the at-quiescence gate inventory contains [%d] security-v2 "+
-				"permits, but the snapshot declares [%d]",
-			inventorySecurityV2,
-			snapshot.ActiveSecurityV2Ceremonies,
-		))
 	}
 
 	beaconQuarantined := make(map[quarantineIdentity]int)
@@ -2076,7 +2000,7 @@ func (r *auditRun) validateQuiescenceReportEvidence(content []byte) []string {
 		snapshot.ActiveCeremonies {
 		violations = append(violations, fmt.Sprintf(
 			"the terminal outcome list contains [%d] permits, but the "+
-				"at-quiescence gate snapshot declares total [%d]",
+				"node-authored gate snapshot declares total [%d]",
 			len(record.ActivePermitsAtQuiescence),
 			snapshot.ActiveCeremonies,
 		))
@@ -2084,7 +2008,7 @@ func (r *auditRun) validateQuiescenceReportEvidence(content []byte) []string {
 	if outcomeLegacy != snapshot.ActiveLegacyCeremonies {
 		violations = append(violations, fmt.Sprintf(
 			"the terminal outcome list contains [%d] legacy permits, but "+
-				"the at-quiescence gate snapshot declares [%d]",
+				"the node-authored gate snapshot declares [%d]",
 			outcomeLegacy,
 			snapshot.ActiveLegacyCeremonies,
 		))
@@ -2092,7 +2016,7 @@ func (r *auditRun) validateQuiescenceReportEvidence(content []byte) []string {
 	if outcomeSecurityV2 != snapshot.ActiveSecurityV2Ceremonies {
 		violations = append(violations, fmt.Sprintf(
 			"the terminal outcome list contains [%d] security-v2 permits, "+
-				"but the at-quiescence gate snapshot declares [%d]",
+				"but the node-authored gate snapshot declares [%d]",
 			outcomeSecurityV2,
 			snapshot.ActiveSecurityV2Ceremonies,
 		))
@@ -2100,7 +2024,7 @@ func (r *auditRun) validateQuiescenceReportEvidence(content []byte) []string {
 	for identity, inventoryIndex := range inventoryPermits {
 		if _, reported := seenPermits[identity]; !reported {
 			violations = append(violations, fmt.Sprintf(
-				"gate inventory entry [%d] has no terminal outcome "+
+				"node-authored gate inventory entry [%d] has no terminal outcome "+
 					"[ceremony=%s] [mode=%s] "+
 					"[canonicalStartBlock=%d] [workID=%s] [permitID=%s]",
 				inventoryIndex,
@@ -2262,10 +2186,315 @@ func interpretKeyStoreNamespaces(
 	); err != nil {
 		return err
 	}
+	if err := interpretParticipationQuiescenceSnapshot(
+		diskStorage,
+		run,
+	); err != nil {
+		return err
+	}
 
 	sortRecords(run.manifest)
 
 	return nil
+}
+
+// interpretParticipationQuiescenceSnapshot reads the node-authored gate
+// capture from encrypted work storage. This is the authoritative active-permit
+// inventory: the external quiescence report supplies only later terminal
+// outcomes and cannot replace or shorten this record.
+func interpretParticipationQuiescenceSnapshot(
+	diskStorage storage.Storage,
+	run *auditRun,
+) error {
+	handle, err := diskStorage.InitializeWorkPersistence("participation")
+	if err != nil {
+		return fmt.Errorf(
+			"cannot open the participation work namespace: [%w]",
+			err,
+		)
+	}
+
+	descriptors, descriptorErrors := handle.ReadAll()
+	errorsDone := make(chan struct{})
+	go func() {
+		defer close(errorsDone)
+		for err := range descriptorErrors {
+			run.finding(
+				"participation work namespace read error: [%v]",
+				err,
+			)
+		}
+	}()
+
+	count := 0
+	for descriptor := range descriptors {
+		count++
+		if descriptor.Directory() !=
+			participation.QuiescenceSnapshotStorageDirectory ||
+			descriptor.Name() !=
+				participation.QuiescenceSnapshotStorageFile {
+			run.finding(
+				"participation work record [%s/%s] is not the recognized "+
+					"node-authored quiescence snapshot",
+				descriptor.Directory(),
+				descriptor.Name(),
+			)
+			continue
+		}
+
+		content, err := descriptor.Content()
+		if err != nil {
+			run.finding(
+				"node-authored quiescence snapshot cannot be decrypted: [%v]",
+				err,
+			)
+			continue
+		}
+
+		snapshot := &participation.QuiescenceSnapshot{}
+		if err := strictUnmarshal(content, snapshot); err != nil {
+			run.finding(
+				"node-authored quiescence snapshot cannot be decoded: [%v]",
+				err,
+			)
+			continue
+		}
+		if run.manifest.QuiescenceSnapshot != nil {
+			run.finding(
+				"more than one node-authored quiescence snapshot is present",
+			)
+			continue
+		}
+
+		run.manifest.QuiescenceSnapshot = snapshot
+		for _, violation := range validateNodeQuiescenceSnapshot(snapshot) {
+			run.finding("%s", violation)
+		}
+		if snapshot.CapturedAt.After(run.manifest.GeneratedAt) {
+			run.finding(
+				"node-authored quiescence snapshot capture time is after " +
+					"the offline audit time",
+			)
+		} else if run.expected.maxEvidenceAge > 0 &&
+			run.manifest.GeneratedAt.Sub(snapshot.CapturedAt) >
+				run.expected.maxEvidenceAge {
+			run.finding(
+				"node-authored quiescence snapshot is older than the "+
+					"maximum evidence age [%s]",
+				run.expected.maxEvidenceAge,
+			)
+		}
+	}
+	<-errorsDone
+
+	if count == 0 {
+		run.finding(
+			"the node-authored participation quiescence snapshot is missing",
+		)
+	}
+
+	return nil
+}
+
+func validateNodeQuiescenceSnapshot(
+	snapshot *participation.QuiescenceSnapshot,
+) []string {
+	violations := make([]string, 0)
+
+	if snapshot.SchemaVersion != participation.QuiescenceSnapshotSchemaVersion {
+		violations = append(violations, fmt.Sprintf(
+			"node-authored quiescence snapshot schema [%d] is not [%d]",
+			snapshot.SchemaVersion,
+			participation.QuiescenceSnapshotSchemaVersion,
+		))
+	}
+	if snapshot.CapturedAt.IsZero() {
+		violations = append(
+			violations,
+			"node-authored quiescence snapshot capture time is missing",
+		)
+	}
+	if snapshot.ReleaseVersion == "" {
+		violations = append(
+			violations,
+			"node-authored quiescence snapshot release version is missing",
+		)
+	}
+	if snapshot.ReleaseRevision == "" {
+		violations = append(
+			violations,
+			"node-authored quiescence snapshot release revision is missing",
+		)
+	}
+	if snapshot.ReleaseEpoch != participation.CompiledEpoch.String() {
+		violations = append(violations, fmt.Sprintf(
+			"node-authored quiescence snapshot epoch [%s] is not the "+
+				"compiled epoch [%s]",
+			snapshot.ReleaseEpoch,
+			participation.CompiledEpoch,
+		))
+	}
+	if snapshot.CutoverBlock == 0 {
+		violations = append(
+			violations,
+			"node-authored quiescence snapshot cutover block is zero",
+		)
+	}
+	if snapshot.State != participation.StateQuiescing.String() {
+		violations = append(violations, fmt.Sprintf(
+			"node-authored quiescence snapshot state [%s] is not [%s]",
+			snapshot.State,
+			participation.StateQuiescing,
+		))
+	}
+	if snapshot.QuiesceCause == "" {
+		violations = append(
+			violations,
+			"node-authored quiescence snapshot cause is missing",
+		)
+	}
+
+	if snapshot.ActiveLegacyCeremonies >
+		snapshot.ActiveCeremonies ||
+		snapshot.ActiveSecurityV2Ceremonies >
+			snapshot.ActiveCeremonies-
+				snapshot.ActiveLegacyCeremonies ||
+		snapshot.ActiveLegacyCeremonies+
+			snapshot.ActiveSecurityV2Ceremonies !=
+			snapshot.ActiveCeremonies {
+		violations = append(violations, fmt.Sprintf(
+			"node-authored quiescence snapshot mode counts [%d legacy, "+
+				"%d security-v2] do not sum to total [%d]",
+			snapshot.ActiveLegacyCeremonies,
+			snapshot.ActiveSecurityV2Ceremonies,
+			snapshot.ActiveCeremonies,
+		))
+	}
+	if snapshot.ActiveCeremonies != uint64(len(snapshot.ActivePermits)) {
+		violations = append(violations, fmt.Sprintf(
+			"node-authored quiescence snapshot inventories [%d] permits, "+
+				"but declares total [%d]",
+			len(snapshot.ActivePermits),
+			snapshot.ActiveCeremonies,
+		))
+	}
+
+	knownCeremonies := make(map[string]struct{})
+	for _, ceremony := range participation.AllCeremonies() {
+		knownCeremonies[string(ceremony)] = struct{}{}
+	}
+
+	identities := make(map[quarantineIdentity]int)
+	var legacy uint64
+	var securityV2 uint64
+	for i, permit := range snapshot.ActivePermits {
+		if _, ok := knownCeremonies[string(permit.Ceremony)]; !ok {
+			violations = append(violations, fmt.Sprintf(
+				"node-authored gate inventory entry [%d] names unknown "+
+					"ceremony [%s]",
+				i,
+				permit.Ceremony,
+			))
+		}
+		switch permit.Mode {
+		case participation.ModeLegacy.String():
+			legacy++
+		case participation.ModeSecurityV2.String():
+			securityV2++
+		default:
+			violations = append(violations, fmt.Sprintf(
+				"node-authored gate inventory entry [%d] names unknown "+
+					"protocol mode [%s]",
+				i,
+				permit.Mode,
+			))
+		}
+		if !permit.IdentityBound {
+			violations = append(violations, fmt.Sprintf(
+				"node-authored gate inventory entry [%d] was issued "+
+					"without a stable work and permit identity",
+				i,
+			))
+		}
+		if violation := cutoverModeViolation(
+			fmt.Sprintf("node-authored gate inventory entry [%d]", i),
+			permit.Mode,
+			permit.CanonicalStartBlock,
+			snapshot.CutoverBlock,
+		); violation != "" {
+			violations = append(violations, violation)
+		}
+		violations = append(
+			violations,
+			validateQuiescencePermitIdentity(
+				i,
+				quiescencePermitEvidence{
+					Ceremony:            string(permit.Ceremony),
+					Mode:                permit.Mode,
+					CanonicalStartBlock: permit.CanonicalStartBlock,
+					WorkID:              permit.WorkID,
+					PermitID:            permit.PermitID,
+				},
+			)...,
+		)
+
+		identity := inventoryIdentity(permit)
+		if firstIndex, duplicate := identities[identity]; duplicate {
+			violations = append(violations, fmt.Sprintf(
+				"node-authored gate inventory entry [%d] duplicates the "+
+					"full permit identity first recorded by entry [%d]",
+				i,
+				firstIndex,
+			))
+		} else {
+			identities[identity] = i
+		}
+
+		if i > 0 {
+			previous := snapshot.ActivePermits[i-1]
+			if permitSnapshotLess(permit, previous) {
+				violations = append(
+					violations,
+					"node-authored gate inventory is not deterministically sorted",
+				)
+			}
+		}
+	}
+
+	if legacy != snapshot.ActiveLegacyCeremonies {
+		violations = append(violations, fmt.Sprintf(
+			"node-authored gate inventory contains [%d] legacy permits, "+
+				"but declares [%d]",
+			legacy,
+			snapshot.ActiveLegacyCeremonies,
+		))
+	}
+	if securityV2 != snapshot.ActiveSecurityV2Ceremonies {
+		violations = append(violations, fmt.Sprintf(
+			"node-authored gate inventory contains [%d] security-v2 "+
+				"permits, but declares [%d]",
+			securityV2,
+			snapshot.ActiveSecurityV2Ceremonies,
+		))
+	}
+
+	return violations
+}
+
+func permitSnapshotLess(
+	left participation.PermitSnapshot,
+	right participation.PermitSnapshot,
+) bool {
+	if left.Ceremony != right.Ceremony {
+		return left.Ceremony < right.Ceremony
+	}
+	if left.CanonicalStartBlock != right.CanonicalStartBlock {
+		return left.CanonicalStartBlock < right.CanonicalStartBlock
+	}
+	if left.WorkID != right.WorkID {
+		return left.WorkID < right.WorkID
+	}
+	return left.PermitID < right.PermitID
 }
 
 // interpretBeaconActiveNamespace decodes every active-namespace record as a

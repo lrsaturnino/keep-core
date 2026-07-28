@@ -27,6 +27,33 @@ type gateBlockCounter struct {
 	holdRelease chan struct{}
 }
 
+type recordingQuiescenceSnapshotRecorder struct {
+	mu        sync.Mutex
+	snapshots []QuiescenceSnapshot
+	err       error
+}
+
+func (r *recordingQuiescenceSnapshotRecorder) Record(
+	snapshot QuiescenceSnapshot,
+) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.snapshots = append(r.snapshots, cloneQuiescenceSnapshot(snapshot))
+	return r.err
+}
+
+func (r *recordingQuiescenceSnapshotRecorder) recorded() []QuiescenceSnapshot {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	result := make([]QuiescenceSnapshot, len(r.snapshots))
+	for i, snapshot := range r.snapshots {
+		result[i] = cloneQuiescenceSnapshot(snapshot)
+	}
+	return result
+}
+
 func newGateBlockCounter(block uint64) *gateBlockCounter {
 	return &gateBlockCounter{
 		block:   block,
@@ -979,6 +1006,146 @@ func TestGate_QuiesceLifecycle(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("quiesce channel did not close at zero active permits")
+	}
+}
+
+func TestGate_QuiescenceCapturesRealPermitInventoryAtomically(t *testing.T) {
+	const cutover = uint64(1000)
+	capturedAt := time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC)
+	blockCounter := newGateBlockCounter(cutover - 1)
+	recorder := &recordingQuiescenceSnapshotRecorder{}
+
+	gate, err := newGate(
+		context.Background(),
+		Schedule{CutoverBlock: cutover},
+		blockCounter,
+		newFakeMetrics(),
+		inertPollInterval,
+		WithArtifactIdentity("v2.1.0", "revision-test"),
+		WithQuiescenceSnapshotRecorder(recorder),
+		withGateTimeSource(func() time.Time { return capturedAt }),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(gate.Close)
+
+	if _, err := gate.Begin(
+		TBTCSigning,
+		cutover-1,
+	); !errors.Is(err, ErrInvalidPermitIdentity) {
+		t.Fatalf(
+			"expected production issuance without identity to fail, got [%v]",
+			err,
+		)
+	}
+
+	legacy, err := gate.Begin(
+		TBTCSigning,
+		cutover-1,
+		PermitIdentity{
+			WorkID:   "wallet-action-legacy",
+			PermitID: "wallet-legacy",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gate.Begin(
+		TBTCSigning,
+		cutover-1,
+		PermitIdentity{
+			WorkID:   "wallet-action-legacy",
+			PermitID: "wallet-legacy",
+		},
+	); !errors.Is(err, ErrInvalidPermitIdentity) {
+		t.Fatalf("expected duplicate permit identity rejection, got [%v]", err)
+	}
+	blockCounter.set(cutover, nil)
+	securityV2, err := gate.Begin(
+		BeaconRelaySigning,
+		cutover,
+		PermitIdentity{
+			WorkID:   "relay-request-security-v2",
+			PermitID: "2",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	before := gate.State()
+	if len(before.ActivePermits) != 2 {
+		t.Fatalf(
+			"expected the live gate snapshot to inventory two permits, got [%d]",
+			len(before.ActivePermits),
+		)
+	}
+
+	gate.Quiesce(fmt.Errorf("rollback drill"))
+	legacy.Close()
+	securityV2.Close()
+
+	snapshot, ok := gate.QuiescenceSnapshot()
+	if !ok {
+		t.Fatal("expected a quiescence snapshot")
+	}
+	if snapshot.CapturedAt != capturedAt {
+		t.Errorf(
+			"expected capture time [%s], got [%s]",
+			capturedAt,
+			snapshot.CapturedAt,
+		)
+	}
+	if snapshot.ReleaseVersion != "v2.1.0" ||
+		snapshot.ReleaseRevision != "revision-test" ||
+		snapshot.ReleaseEpoch != CompiledEpoch.String() {
+		t.Errorf("unexpected artifact identity: %+v", snapshot)
+	}
+	if snapshot.CutoverBlock != cutover ||
+		snapshot.State != StateQuiescing.String() ||
+		snapshot.QuiesceCause != "rollback drill" {
+		t.Errorf("unexpected quiescence binding: %+v", snapshot)
+	}
+	if snapshot.ActiveCeremonies != 2 ||
+		snapshot.ActiveLegacyCeremonies != 1 ||
+		snapshot.ActiveSecurityV2Ceremonies != 1 ||
+		len(snapshot.ActivePermits) != 2 {
+		t.Errorf("unexpected captured inventory: %+v", snapshot)
+	}
+	for _, permit := range snapshot.ActivePermits {
+		if !permit.IdentityBound {
+			t.Errorf("expected a bound permit identity: %+v", permit)
+		}
+	}
+
+	recorded := recorder.recorded()
+	if len(recorded) != 1 {
+		t.Fatalf("expected exactly one persisted snapshot, got [%d]", len(recorded))
+	}
+	if fmt.Sprint(recorded[0]) != fmt.Sprint(snapshot) {
+		t.Errorf(
+			"persisted snapshot differs from the gate capture\npersisted: %+v\n"+
+				"captured: %+v",
+			recorded[0],
+			snapshot,
+		)
+	}
+
+	// Closing permits after the transition cannot rewrite history.
+	if active := gate.State().ActiveCeremonies; active != 0 {
+		t.Fatalf("expected the live gate to drain, got [%d] permits", active)
+	}
+	again, ok := gate.QuiescenceSnapshot()
+	if !ok || again.ActiveCeremonies != 2 || len(again.ActivePermits) != 2 {
+		t.Errorf("quiescence inventory mutated after drain: %+v", again)
+	}
+
+	// Returned slices are defensive copies.
+	again.ActivePermits[0].WorkID = "mutated"
+	final, _ := gate.QuiescenceSnapshot()
+	if final.ActivePermits[0].WorkID == "mutated" {
+		t.Error("the caller mutated the gate's retained quiescence inventory")
 	}
 }
 

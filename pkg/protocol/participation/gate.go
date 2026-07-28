@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -107,6 +108,11 @@ var (
 	)
 	// ErrPermitClosed means the permit was already closed by its owner.
 	ErrPermitClosed = errors.New("participation permit is closed")
+	// ErrInvalidPermitIdentity means a caller supplied an empty, malformed,
+	// or ambiguous chain-work/local-permit identity.
+	ErrInvalidPermitIdentity = errors.New(
+		"invalid participation permit identity",
+	)
 )
 
 // IsGateRefusal reports whether the error is, or wraps, one of the gate's
@@ -125,6 +131,7 @@ func IsGateRefusal(err error) bool {
 		ErrPenaltySuppressed,
 		ErrCommitBeforeCutover,
 		ErrPermitClosed,
+		ErrInvalidPermitIdentity,
 	} {
 		if errors.Is(err, sentinel) {
 			return true
@@ -163,6 +170,12 @@ type Permit interface {
 	CanonicalStartBlock() uint64
 	// Mode returns the immutable protocol mode of the ceremony.
 	Mode() ProtocolMode
+	// WorkID returns the immutable chain-native work identity supplied when
+	// the permit was issued.
+	WorkID() string
+	// PermitID returns the immutable local membership/action identity supplied
+	// when the permit was issued.
+	PermitID() string
 	// Close releases the permit. It is idempotent.
 	Close()
 }
@@ -178,6 +191,7 @@ type Snapshot struct {
 	ActiveCeremonies           uint64
 	ActiveLegacyCeremonies     uint64
 	ActiveSecurityV2Ceremonies uint64
+	ActivePermits              []PermitSnapshot
 }
 
 // Gate issues per-ceremony participation permits with the protocol mode pinned
@@ -188,14 +202,24 @@ type Gate interface {
 	// Begin issues a permit for a new ceremony. It reads the chain clock
 	// synchronously, rejects a zero anchor while a cutover schedule is active,
 	// rejects an anchor ahead of the current height, and derives the mode only
-	// from the canonical start block. It returns ErrInvalidAnchor,
-	// ErrClockUnavailable, or ErrQuiescing.
-	Begin(ceremony Ceremony, canonicalStartBlock uint64) (Permit, error)
+	// from the canonical start block. A production gate with quiescence
+	// persistence also requires exactly one stable PermitIdentity. It returns
+	// ErrInvalidAnchor, ErrInvalidPermitIdentity, ErrClockUnavailable, or
+	// ErrQuiescing.
+	Begin(
+		ceremony Ceremony,
+		canonicalStartBlock uint64,
+		identity ...PermitIdentity,
+	) (Permit, error)
 	// Resume issues a permit for the beacon relay restart path only. The
 	// caller must have verified on chain that the relay request is still live
 	// and pass its on-chain start block; the mode pins from that block exactly
 	// as in Begin. Any other ceremony class returns ErrResumeUnsupported.
-	Resume(ceremony Ceremony, canonicalStartBlock uint64) (Permit, error)
+	Resume(
+		ceremony Ceremony,
+		canonicalStartBlock uint64,
+		identity ...PermitIdentity,
+	) (Permit, error)
 	// State returns a point-in-time observability snapshot.
 	State() Snapshot
 	// Quiesce atomically refuses all new permits, keeps existing permits
@@ -212,6 +236,10 @@ type Gate interface {
 	// quarantine and audit writes included — and release their permits. It
 	// always returns the same channel.
 	Drained() <-chan struct{}
+	// QuiescenceSnapshot returns the immutable node-authored inventory
+	// captured at the first quiescence transition. The boolean is false
+	// before that transition. Returned slices are defensive copies.
+	QuiescenceSnapshot() (QuiescenceSnapshot, bool)
 	// Close is the terminal shutdown: it force-cancels any remaining permits
 	// with ErrQuiesceDeadline, closes the quiesce channel, and stops the
 	// clock supervisor. Force-canceled permits remain counted until their
@@ -225,6 +253,57 @@ type Gate interface {
 type GateMetricsRecorder interface {
 	IncrementCounter(name string, value float64)
 	SetGauge(name string, value float64)
+}
+
+type gateOptions struct {
+	releaseVersion  string
+	releaseRevision string
+	recorder        QuiescenceSnapshotRecorder
+	now             func() time.Time
+}
+
+// GateOption configures node-artifact identity and quiescence persistence
+// without changing the required chain-clock and metrics inputs.
+type GateOption func(*gateOptions) error
+
+// WithArtifactIdentity binds the node-authored quiescence snapshot to the
+// exact release version and source revision of the running process.
+func WithArtifactIdentity(version string, revision string) GateOption {
+	return func(options *gateOptions) error {
+		if version == "" {
+			return fmt.Errorf("release version is required")
+		}
+		if revision == "" {
+			return fmt.Errorf("release revision is required")
+		}
+		options.releaseVersion = version
+		options.releaseRevision = revision
+		return nil
+	}
+}
+
+// WithQuiescenceSnapshotRecorder persists the node-authored snapshot into
+// storage as part of the first quiescence transition.
+func WithQuiescenceSnapshotRecorder(
+	recorder QuiescenceSnapshotRecorder,
+) GateOption {
+	return func(options *gateOptions) error {
+		if recorder == nil {
+			return fmt.Errorf("quiescence snapshot recorder is required")
+		}
+		options.recorder = recorder
+		return nil
+	}
+}
+
+func withGateTimeSource(now func() time.Time) GateOption {
+	return func(options *gateOptions) error {
+		if now == nil {
+			return fmt.Errorf("gate time source is required")
+		}
+		options.now = now
+		return nil
+	}
 }
 
 var gateLogger = log.Logger("keep-participation")
@@ -261,6 +340,9 @@ type permit struct {
 	ceremony            Ceremony
 	canonicalStartBlock uint64
 	mode                ProtocolMode
+	workID              string
+	permitID            string
+	identityBound       bool
 
 	ctx    context.Context
 	cancel context.CancelCauseFunc
@@ -272,6 +354,8 @@ func (p *permit) Context() context.Context    { return p.ctx }
 func (p *permit) Ceremony() Ceremony          { return p.ceremony }
 func (p *permit) CanonicalStartBlock() uint64 { return p.canonicalStartBlock }
 func (p *permit) Mode() ProtocolMode          { return p.mode }
+func (p *permit) WorkID() string              { return p.workID }
+func (p *permit) PermitID() string            { return p.permitID }
 
 // chainGate is the production Gate implementation, clocked exclusively by the
 // shared Ethereum block counter.
@@ -288,6 +372,10 @@ type chainGate struct {
 	// refusalLogLimiter covers refusal logs. Metrics retain every event.
 	modeLogLimiter    *rate.Limiter
 	refusalLogLimiter *rate.Limiter
+	releaseVersion    string
+	releaseRevision   string
+	recorder          QuiescenceSnapshotRecorder
+	now               func() time.Time
 
 	closeOnce sync.Once
 
@@ -297,20 +385,22 @@ type chainGate struct {
 	// responses arrive in.
 	clockSeq atomic.Uint64
 
-	mu                sync.Mutex
-	lastClockTicket   uint64
-	currentBlock      uint64
-	clockAvailable    bool
-	quiescing         bool
-	closed            bool
-	quiesceDone       chan struct{}
-	quiesceDoneClosed bool
-	drained           chan struct{}
-	drainedClosed     bool
-	permits           map[*permit]struct{}
-	activeLegacy      uint64
-	activeSecurityV2  uint64
-	lastState         State
+	mu                 sync.Mutex
+	lastClockTicket    uint64
+	currentBlock       uint64
+	clockAvailable     bool
+	quiescing          bool
+	closed             bool
+	quiesceDone        chan struct{}
+	quiesceDoneClosed  bool
+	drained            chan struct{}
+	drainedClosed      bool
+	permits            map[*permit]struct{}
+	activeLegacy       uint64
+	activeSecurityV2   uint64
+	lastState          State
+	nextPermitID       uint64
+	quiescenceSnapshot *QuiescenceSnapshot
 }
 
 // NewGate constructs the production gate from a resolved schedule and the
@@ -324,6 +414,7 @@ func NewGate(
 	schedule Schedule,
 	blockCounter chain.BlockCounter,
 	metrics GateMetricsRecorder,
+	options ...GateOption,
 ) (Gate, error) {
 	return newGate(
 		ctx,
@@ -331,6 +422,7 @@ func NewGate(
 		blockCounter,
 		metrics,
 		gateSupervisorPollInterval,
+		options...,
 	)
 }
 
@@ -341,7 +433,24 @@ func newGate(
 	blockCounter chain.BlockCounter,
 	metrics GateMetricsRecorder,
 	pollInterval time.Duration,
+	optionFunctions ...GateOption,
 ) (*chainGate, error) {
+	options := &gateOptions{now: time.Now}
+	for _, option := range optionFunctions {
+		if option == nil {
+			return nil, fmt.Errorf("nil gate option")
+		}
+		if err := option(options); err != nil {
+			return nil, fmt.Errorf("invalid gate option: [%w]", err)
+		}
+	}
+	if options.recorder != nil &&
+		(options.releaseVersion == "" || options.releaseRevision == "") {
+		return nil, fmt.Errorf(
+			"artifact identity is required when quiescence persistence is enabled",
+		)
+	}
+
 	if blockCounter == nil {
 		return nil, fmt.Errorf("block counter is required")
 	}
@@ -399,6 +508,10 @@ func newGate(
 		loopDone:          make(chan struct{}),
 		modeLogLimiter:    rate.NewLimiter(rate.Every(30*time.Second), 5),
 		refusalLogLimiter: rate.NewLimiter(rate.Every(30*time.Second), 5),
+		releaseVersion:    options.releaseVersion,
+		releaseRevision:   options.releaseRevision,
+		recorder:          options.recorder,
+		now:               options.now,
 		quiesceDone:       make(chan struct{}),
 		drained:           make(chan struct{}),
 		permits:           make(map[*permit]struct{}),
@@ -699,25 +812,54 @@ var knownCeremonies = func() map[Ceremony]struct{} {
 func (g *chainGate) Begin(
 	ceremony Ceremony,
 	canonicalStartBlock uint64,
+	identity ...PermitIdentity,
 ) (Permit, error) {
-	return g.issue(ceremony, canonicalStartBlock, false)
+	return g.issue(ceremony, canonicalStartBlock, false, identity...)
 }
 
 // Resume implements Gate.
 func (g *chainGate) Resume(
 	ceremony Ceremony,
 	canonicalStartBlock uint64,
+	identity ...PermitIdentity,
 ) (Permit, error) {
-	return g.issue(ceremony, canonicalStartBlock, true)
+	return g.issue(ceremony, canonicalStartBlock, true, identity...)
 }
 
 func (g *chainGate) issue(
 	ceremony Ceremony,
 	canonicalStartBlock uint64,
 	resume bool,
+	identities ...PermitIdentity,
 ) (Permit, error) {
 	if _, known := knownCeremonies[ceremony]; !known {
 		return nil, fmt.Errorf("unknown ceremony [%s]", ceremony)
+	}
+	if len(identities) > 1 {
+		return nil, fmt.Errorf(
+			"ceremony [%s] supplied [%d] permit identities: %w",
+			ceremony,
+			len(identities),
+			ErrInvalidPermitIdentity,
+		)
+	}
+	if g.recorder != nil && len(identities) == 0 {
+		return nil, fmt.Errorf(
+			"ceremony [%s] did not supply the permit identity required by "+
+				"the production quiescence recorder: %w",
+			ceremony,
+			ErrInvalidPermitIdentity,
+		)
+	}
+	if len(identities) == 1 {
+		if err := validatePermitIdentity(identities[0]); err != nil {
+			return nil, fmt.Errorf(
+				"ceremony [%s] permit identity rejected: [%v]: %w",
+				ceremony,
+				err,
+				ErrInvalidPermitIdentity,
+			)
+		}
 	}
 
 	// The synchronous, authoritative chain read happens outside the lock so a
@@ -786,6 +928,33 @@ func (g *chainGate) issue(
 	}
 
 	mode := g.schedule.ModeFor(canonicalStartBlock)
+	g.nextPermitID++
+	identity := PermitIdentity{
+		WorkID: fmt.Sprintf(
+			"unbound-%s-%d",
+			ceremony,
+			canonicalStartBlock,
+		),
+		PermitID: fmt.Sprintf("unbound-%d", g.nextPermitID),
+	}
+	identityBound := false
+	if len(identities) == 1 {
+		identity = identities[0]
+		identityBound = true
+	}
+	for existing := range g.permits {
+		if existing.ceremony == ceremony &&
+			existing.canonicalStartBlock == canonicalStartBlock &&
+			existing.workID == identity.WorkID &&
+			existing.permitID == identity.PermitID {
+			return nil, g.refuseLocked(
+				ceremony,
+				canonicalStartBlock,
+				"duplicate_permit_identity",
+				ErrInvalidPermitIdentity,
+			)
+		}
+	}
 
 	ctx, cancel := context.WithCancelCause(g.ctx)
 	p := &permit{
@@ -793,6 +962,9 @@ func (g *chainGate) issue(
 		ceremony:            ceremony,
 		canonicalStartBlock: canonicalStartBlock,
 		mode:                mode,
+		workID:              identity.WorkID,
+		permitID:            identity.PermitID,
+		identityBound:       identityBound,
 		ctx:                 ctx,
 		cancel:              cancel,
 	}
@@ -1038,7 +1210,63 @@ func (g *chainGate) State() Snapshot {
 		ActiveCeremonies:           g.activeLegacy + g.activeSecurityV2,
 		ActiveLegacyCeremonies:     g.activeLegacy,
 		ActiveSecurityV2Ceremonies: g.activeSecurityV2,
+		ActivePermits:              g.permitSnapshotsLocked(),
 	}
+}
+
+// permitSnapshotsLocked returns a deterministic copy of the real live-permit
+// registry. The caller must hold g.mu.
+func (g *chainGate) permitSnapshotsLocked() []PermitSnapshot {
+	snapshots := make([]PermitSnapshot, 0, len(g.permits))
+	for permit := range g.permits {
+		snapshots = append(snapshots, PermitSnapshot{
+			Ceremony:            permit.ceremony,
+			Mode:                permit.mode.String(),
+			CanonicalStartBlock: permit.canonicalStartBlock,
+			WorkID:              permit.workID,
+			PermitID:            permit.permitID,
+			IdentityBound:       permit.identityBound,
+		})
+	}
+
+	sort.Slice(snapshots, func(i, j int) bool {
+		left := snapshots[i]
+		right := snapshots[j]
+		if left.Ceremony != right.Ceremony {
+			return left.Ceremony < right.Ceremony
+		}
+		if left.CanonicalStartBlock != right.CanonicalStartBlock {
+			return left.CanonicalStartBlock < right.CanonicalStartBlock
+		}
+		if left.WorkID != right.WorkID {
+			return left.WorkID < right.WorkID
+		}
+		return left.PermitID < right.PermitID
+	})
+
+	return snapshots
+}
+
+func cloneQuiescenceSnapshot(
+	snapshot QuiescenceSnapshot,
+) QuiescenceSnapshot {
+	snapshot.ActivePermits = append(
+		[]PermitSnapshot(nil),
+		snapshot.ActivePermits...,
+	)
+	return snapshot
+}
+
+// QuiescenceSnapshot implements Gate.
+func (g *chainGate) QuiescenceSnapshot() (QuiescenceSnapshot, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.quiescenceSnapshot == nil {
+		return QuiescenceSnapshot{}, false
+	}
+
+	return cloneQuiescenceSnapshot(*g.quiescenceSnapshot), true
 }
 
 // Quiesce implements Gate.
@@ -1049,6 +1277,39 @@ func (g *chainGate) Quiesce(cause error) <-chan struct{} {
 	if !g.quiescing && !g.closed {
 		g.quiescing = true
 		g.metrics.IncrementCounter(metricQuiesceTotal, 1)
+
+		captured := QuiescenceSnapshot{
+			SchemaVersion:              QuiescenceSnapshotSchemaVersion,
+			CapturedAt:                 g.now().UTC(),
+			ReleaseVersion:             g.releaseVersion,
+			ReleaseRevision:            g.releaseRevision,
+			ReleaseEpoch:               CompiledEpoch.String(),
+			CutoverBlock:               g.schedule.CutoverBlock,
+			CurrentBlock:               g.currentBlock,
+			ClockAvailable:             g.clockAvailable,
+			State:                      StateQuiescing.String(),
+			QuiesceCause:               fmt.Sprint(cause),
+			ActiveCeremonies:           g.activeLegacy + g.activeSecurityV2,
+			ActiveLegacyCeremonies:     g.activeLegacy,
+			ActiveSecurityV2Ceremonies: g.activeSecurityV2,
+			ActivePermits:              g.permitSnapshotsLocked(),
+		}
+		g.quiescenceSnapshot = &captured
+
+		if g.recorder != nil {
+			if err := g.recorder.Record(
+				cloneQuiescenceSnapshot(captured),
+			); err != nil {
+				// The transition remains one-way and fail-closed. The stopped
+				// node's offline audit will refuse rollback when the required
+				// node-authored record is absent or malformed.
+				gateLogger.Warnf(
+					"protocol participation quiescence snapshot could not "+
+						"be persisted [error=%s]",
+					err,
+				)
+			}
+		}
 
 		gateLogger.Warnf(
 			"protocol participation quiescing [reason=%s] [currentBlock=%d] "+

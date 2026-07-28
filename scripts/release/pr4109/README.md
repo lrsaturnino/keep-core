@@ -87,21 +87,32 @@ as `<service> <identity-manifest> <output-directory>` and must write
 snapshot; and the second pass, over those records, is the one that authorizes
 anything. A generator that failed, that wrote only some of the four, or that
 cannot be run leaves the barrier unestablished rather than the audit refusing.
-The quiescence record contains a `gate_snapshot` captured when the gate entered
-`quiescing`, including its exact `active_permits` inventory and total,
-legacy, and security-v2 counts. The later
-`active_permits_at_quiescence` outcome list must cover that inventory
-one-to-one and reproduce all three counts; an empty or shortened outcome list
-over a nonempty snapshot blocks rollback. Both lists name `work_id` and
-`permit_id` as well as ceremony, mode, and anchor. DKG claims use the canonical
-SHA-256 seed hash (exactly 64 lowercase hexadecimal characters) and the
-canonical decimal member index (1 through 255) respectively. Beacon
-relay-signing permits likewise use the member index; other work and permit
-identities use the driver's stable identifier alphabet. The audit rejects a
-repeated full permit identity and checks every identity against the cutover
-arithmetic (`legacy` below C, `security_v2` at or above C), including completed
-outcomes. Quarantined claims additionally match the exact local permit rather
-than letting one output cover another event or membership at the same block.
+The node writes an encrypted
+`work/participation/quiescence/gate-snapshot.json` artifact while the gate
+holds the same lock that changes its state to `quiescing`. That node-authored
+artifact binds the exact active-permit registry and total, legacy, and
+security-v2 counts to the running version, revision, compiled epoch, C,
+current block, cause, and transition instant. It is part of the stopped
+storage snapshot and therefore of `snapshot_aggregate_sha256`; the external
+evidence generator cannot replace it with a second self-attested inventory.
+Each process run invalidates the prior artifact before constructing its gate,
+so a restart or failed new capture leaves the rollback audit fail-closed
+instead of exposing stale inventory.
+The schema-v4 quiescence record supplies only the later
+`active_permits_at_quiescence` terminal-outcome list, which must cover the
+node-authored inventory one-to-one and reproduce all three counts. An empty or
+shortened outcome list over a nonempty gate artifact blocks rollback. Both
+records name `work_id` and `permit_id` as well as ceremony, mode, and anchor.
+DKG claims use the canonical SHA-256 seed hash (exactly 64 lowercase
+hexadecimal characters) and the canonical decimal member index (1 through
+255) respectively. Beacon relay-signing permits likewise use the member
+index; other work and permit identities use the driver's stable identifier
+alphabet. The audit rejects an unbound or repeated full permit identity, a
+zero canonical anchor under an armed schedule, and any identity contradicting
+the cutover arithmetic (`legacy` below C, `security_v2` at or above C),
+including completed outcomes. Quarantined claims additionally match the exact
+local permit rather than letting one output cover another event or membership
+at the same block.
 
 The identities the audit binds that evidence to — the release being rolled
 back: version, revision, epoch, and armed C — come from what the R1 fleet

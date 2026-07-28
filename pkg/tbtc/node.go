@@ -142,6 +142,25 @@ type node struct {
 	participationGate participation.Gate
 }
 
+func walletPermitIdentity(
+	workClass string,
+	walletPublicKey *ecdsa.PublicKey,
+	canonicalStartBlock uint64,
+) participation.PermitIdentity {
+	walletPublicKeyHash := bitcoin.PublicKeyHash(walletPublicKey)
+	walletID := hex.EncodeToString(walletPublicKeyHash[:])
+
+	return participation.PermitIdentity{
+		WorkID: fmt.Sprintf(
+			"%s-%d-%s",
+			workClass,
+			canonicalStartBlock,
+			walletID,
+		),
+		PermitID: walletID,
+	}
+}
+
 func newNode(
 	groupParameters *GroupParameters,
 	chain Chain,
@@ -1272,6 +1291,11 @@ func executeCoordinationProcedure(
 	permit, err := node.participationGate.Begin(
 		participation.TBTCWalletCoordination,
 		window.coordinationBlock,
+		walletPermitIdentity(
+			"wallet-coordination",
+			walletPublicKey,
+			window.coordinationBlock,
+		),
 	)
 	if err != nil {
 		procedureLogger.Warnf(
@@ -1445,7 +1469,11 @@ func processCoordinationResult(
 	// the heartbeat ceremony additionally fences its derived inactivity work
 	// through it. The handlers hand the permit to the action, which owns it
 	// until its execution ends.
-	permit := node.beginWalletActionPermit(proposedAction, startBlock)
+	permit := node.beginWalletActionPermit(
+		proposedAction,
+		startBlock,
+		result.wallet.publicKey,
+	)
 	if permit == nil {
 		return
 	}
@@ -1522,6 +1550,7 @@ func processCoordinationResult(
 func (n *node) beginWalletActionPermit(
 	proposedAction WalletActionType,
 	startBlock uint64,
+	walletPublicKeys ...*ecdsa.PublicKey,
 ) participation.Permit {
 	if n.participationGate == nil {
 		logger.Errorf(
@@ -1538,7 +1567,38 @@ func (n *node) beginWalletActionPermit(
 		ceremony = participation.TBTCHeartbeat
 	}
 
-	permit, err := n.participationGate.Begin(ceremony, startBlock)
+	var identities []participation.PermitIdentity
+	if len(walletPublicKeys) > 1 {
+		logger.Errorf(
+			"refusing the [%s] wallet action: [%d] wallet identities supplied",
+			proposedAction,
+			len(walletPublicKeys),
+		)
+		return nil
+	}
+	if len(walletPublicKeys) == 1 {
+		if walletPublicKeys[0] == nil {
+			logger.Errorf(
+				"refusing the [%s] wallet action: nil wallet identity",
+				proposedAction,
+			)
+			return nil
+		}
+		identities = append(
+			identities,
+			walletPermitIdentity(
+				fmt.Sprintf("wallet-action-%d", proposedAction),
+				walletPublicKeys[0],
+				startBlock,
+			),
+		)
+	}
+
+	permit, err := n.participationGate.Begin(
+		ceremony,
+		startBlock,
+		identities...,
+	)
 	if err != nil {
 		logger.Warnf(
 			"[%s] wallet action refused by the participation gate: [%v]",

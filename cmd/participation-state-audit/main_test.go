@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +25,43 @@ import (
 )
 
 const testPassword = "audit-test-password"
+
+type auditGateBlockCounter struct {
+	block uint64
+}
+
+func (c *auditGateBlockCounter) CurrentBlock() (uint64, error) {
+	return c.block, nil
+}
+
+func (c *auditGateBlockCounter) WaitForBlockHeight(uint64) error {
+	return nil
+}
+
+func (c *auditGateBlockCounter) BlockHeightWaiter(
+	uint64,
+) (<-chan uint64, error) {
+	result := make(chan uint64, 1)
+	result <- c.block
+	close(result)
+	return result, nil
+}
+
+func (c *auditGateBlockCounter) WatchBlocks(
+	ctx context.Context,
+) <-chan uint64 {
+	result := make(chan uint64)
+	go func() {
+		<-ctx.Done()
+		close(result)
+	}()
+	return result
+}
+
+type auditGateMetrics struct{}
+
+func (auditGateMetrics) IncrementCounter(string, float64) {}
+func (auditGateMetrics) SetGauge(string, float64)         {}
 
 func newTestSigner(
 	t *testing.T,
@@ -54,6 +93,13 @@ func groupPublicKeyHex(membership *registry.Membership) string {
 // and one quarantined output of a different group, written through the
 // production persistence paths and layout, and returns its root directory.
 func newTestStorage(t *testing.T) string {
+	return newTestStorageWithQuiescencePermits(t, nil)
+}
+
+func newTestStorageWithQuiescencePermits(
+	t *testing.T,
+	permits []quiescencePermitEvidence,
+) string {
 	t.Helper()
 
 	storageDir := t.TempDir()
@@ -115,7 +161,131 @@ func newTestStorage(t *testing.T) string {
 		t.Fatal(err)
 	}
 
+	participationHandle, err :=
+		diskStorage.InitializeWorkPersistence("participation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder, err :=
+		participation.NewPersistenceQuiescenceSnapshotRecorder(
+			participationHandle,
+		)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot := participation.QuiescenceSnapshot{
+		SchemaVersion:    participation.QuiescenceSnapshotSchemaVersion,
+		CapturedAt:       time.Now().UTC().Add(-time.Minute),
+		ReleaseVersion:   "v2.1.0",
+		ReleaseRevision:  strings.Repeat("ef", 20),
+		ReleaseEpoch:     participation.CompiledEpoch.String(),
+		CutoverBlock:     1_000,
+		CurrentBlock:     1_100,
+		ClockAvailable:   true,
+		State:            participation.StateQuiescing.String(),
+		QuiesceCause:     "rollback drill",
+		ActiveCeremonies: uint64(len(permits)),
+	}
+	for _, permit := range permits {
+		snapshot.ActivePermits = append(
+			snapshot.ActivePermits,
+			participation.PermitSnapshot{
+				Ceremony:            participation.Ceremony(permit.Ceremony),
+				Mode:                permit.Mode,
+				CanonicalStartBlock: permit.CanonicalStartBlock,
+				WorkID:              permit.WorkID,
+				PermitID:            permit.PermitID,
+				IdentityBound:       true,
+			},
+		)
+		switch permit.Mode {
+		case participation.ModeLegacy.String():
+			snapshot.ActiveLegacyCeremonies++
+		case participation.ModeSecurityV2.String():
+			snapshot.ActiveSecurityV2Ceremonies++
+		}
+	}
+	sort.Slice(snapshot.ActivePermits, func(i, j int) bool {
+		return permitSnapshotLess(
+			snapshot.ActivePermits[i],
+			snapshot.ActivePermits[j],
+		)
+	})
+	if err := recorder.Record(snapshot); err != nil {
+		t.Fatal(err)
+	}
+
 	return storageDir
+}
+
+func persistRealGateQuiescenceSnapshot(
+	t *testing.T,
+	storageDir string,
+	permits []quiescencePermitEvidence,
+) {
+	t.Helper()
+
+	diskStorage, err := storage.Initialize(
+		storage.Config{Dir: storageDir},
+		testPassword,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := diskStorage.InitializeWorkPersistence("participation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder, err :=
+		participation.NewPersistenceQuiescenceSnapshotRecorder(handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gate, err := participation.NewGate(
+		context.Background(),
+		participation.Schedule{CutoverBlock: 1_000},
+		&auditGateBlockCounter{block: 1_100},
+		auditGateMetrics{},
+		participation.WithArtifactIdentity(
+			"v2.1.0",
+			strings.Repeat("ef", 20),
+		),
+		participation.WithQuiescenceSnapshotRecorder(recorder),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gate.Close()
+
+	active := make([]participation.Permit, 0, len(permits))
+	for _, expected := range permits {
+		permit, err := gate.Begin(
+			participation.Ceremony(expected.Ceremony),
+			expected.CanonicalStartBlock,
+			participation.PermitIdentity{
+				WorkID:   expected.WorkID,
+				PermitID: expected.PermitID,
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if permit.Mode().String() != expected.Mode {
+			t.Fatalf(
+				"test permit mode [%s] does not match gate-selected mode [%s]",
+				expected.Mode,
+				permit.Mode(),
+			)
+		}
+		active = append(active, permit)
+	}
+
+	gate.Quiesce(fmt.Errorf("rollback drill"))
+	for _, permit := range active {
+		permit.Close()
+	}
 }
 
 // newPlaceholderEvidence writes one placeholder text file per external
@@ -237,10 +407,21 @@ func newValidEvidence(t *testing.T, auditManifest *manifest) evidenceInputs {
 		ReleaseEpoch:     participation.CompiledEpoch.String(),
 		CutoverBlock:     1_000,
 		QuiesceCause:     "rollback drill",
-		GateSnapshot: quiescenceGateSnapshotEvidence{
-			CapturedAt: quiescenceEnvelope.GeneratedAt,
-			State:      participation.StateQuiescing.String(),
-		},
+	}
+	if auditManifest.QuiescenceSnapshot != nil {
+		for _, permit := range auditManifest.QuiescenceSnapshot.ActivePermits {
+			quiescenceRecord.ActivePermitsAtQuiescence = append(
+				quiescenceRecord.ActivePermitsAtQuiescence,
+				quiescencePermitEvidence{
+					Ceremony:            string(permit.Ceremony),
+					Mode:                permit.Mode,
+					CanonicalStartBlock: permit.CanonicalStartBlock,
+					WorkID:              permit.WorkID,
+					PermitID:            permit.PermitID,
+					Outcome:             "completed",
+				},
+			)
+		}
 	}
 
 	priorReaderRecord := &priorReaderCompatibilityEvidence{
@@ -345,29 +526,6 @@ func setQuiescencePermits(
 		[]quiescencePermitEvidence(nil),
 		permits...,
 	)
-	record.GateSnapshot = quiescenceGateSnapshotEvidence{
-		CapturedAt:       record.GeneratedAt,
-		State:            participation.StateQuiescing.String(),
-		ActiveCeremonies: uint64(len(permits)),
-	}
-	for _, permit := range permits {
-		record.GateSnapshot.ActivePermits = append(
-			record.GateSnapshot.ActivePermits,
-			quiescencePermitInventoryEvidence{
-				Ceremony:            permit.Ceremony,
-				Mode:                permit.Mode,
-				CanonicalStartBlock: permit.CanonicalStartBlock,
-				WorkID:              permit.WorkID,
-				PermitID:            permit.PermitID,
-			},
-		)
-		switch permit.Mode {
-		case participation.ModeLegacy.String():
-			record.GateSnapshot.ActiveLegacyCeremonies++
-		case participation.ModeSecurityV2.String():
-			record.GateSnapshot.ActiveSecurityV2Ceremonies++
-		}
-	}
 }
 
 func TestRunAudit_ConsistentSnapshot(t *testing.T) {
@@ -665,7 +823,15 @@ func TestRunAudit_IncompatiblePriorReaderIsBlocking(t *testing.T) {
 func TestRunAudit_QuarantinedClaimWithoutQuarantineStateIsBlocking(
 	t *testing.T,
 ) {
-	storageDir := newTestStorage(t)
+	permits := []quiescencePermitEvidence{{
+		Ceremony:            "tbtc_dkg",
+		Mode:                "security_v2",
+		CanonicalStartBlock: 1_000,
+		WorkID:              strings.Repeat("d", 64),
+		PermitID:            "1",
+		Outcome:             "quarantined",
+	}}
+	storageDir := newTestStorageWithQuiescencePermits(t, permits)
 
 	firstPass, err := runAudit(storageDir, testPassword, evidenceInputs{}, testExpectedIdentity())
 	if err != nil {
@@ -687,14 +853,7 @@ func TestRunAudit_QuarantinedClaimWithoutQuarantineStateIsBlocking(
 	}
 	setQuiescencePermits(
 		record,
-		[]quiescencePermitEvidence{{
-			Ceremony:            "tbtc_dkg",
-			Mode:                "security_v2",
-			CanonicalStartBlock: 1_000,
-			WorkID:              strings.Repeat("d", 64),
-			PermitID:            "1",
-			Outcome:             "quarantined",
-		}},
+		permits,
 	)
 	content, err := json.MarshalIndent(record, "", "  ")
 	if err != nil {
@@ -1490,7 +1649,15 @@ func TestRunAudit_RegisteredQuarantinedOnlyShareIsBlocking(t *testing.T) {
 func TestRunAudit_QuarantinedClaimWithMismatchedWorkIdentityIsBlocking(
 	t *testing.T,
 ) {
-	storageDir := newTestStorage(t)
+	permits := []quiescencePermitEvidence{{
+		Ceremony:            "beacon_dkg",
+		Mode:                "legacy",
+		CanonicalStartBlock: 900,
+		WorkID:              strings.Repeat("f", 64),
+		PermitID:            "2",
+		Outcome:             "quarantined",
+	}}
+	storageDir := newTestStorageWithQuiescencePermits(t, permits)
 
 	firstPass, err := runAudit(
 		storageDir,
@@ -1519,16 +1686,7 @@ func TestRunAudit_QuarantinedClaimWithMismatchedWorkIdentityIsBlocking(
 	}
 	setQuiescencePermits(
 		record,
-		[]quiescencePermitEvidence{{
-			Ceremony:            "beacon_dkg",
-			Mode:                "legacy",
-			CanonicalStartBlock: 900,
-			WorkID:              strings.Repeat("f", 64),
-			PermitID: fmt.Sprint(
-				firstPass.BeaconQuarantinedOutputs[0].MemberIndex,
-			),
-			Outcome: "quarantined",
-		}},
+		permits,
 	)
 	content, err := json.MarshalIndent(record, "", "  ")
 	if err != nil {
@@ -1574,7 +1732,18 @@ func TestRunAudit_QuarantinedClaimWithMismatchedWorkIdentityIsBlocking(
 // Otherwise a report with the expected entry count could repeat one completed
 // permit while omitting a different permit that was still active.
 func TestRunAudit_DuplicateCompletedPermitIdentityIsBlocking(t *testing.T) {
-	storageDir := newTestStorage(t)
+	completed := quiescencePermitEvidence{
+		Ceremony:            string(participation.TBTCSigning),
+		Mode:                participation.ModeLegacy.String(),
+		CanonicalStartBlock: 900,
+		WorkID:              "wallet-action-1",
+		PermitID:            "wallet-action-1",
+		Outcome:             "completed",
+	}
+	storageDir := newTestStorageWithQuiescencePermits(
+		t,
+		[]quiescencePermitEvidence{completed},
+	)
 
 	firstPass, err := runAudit(
 		storageDir,
@@ -1587,14 +1756,6 @@ func TestRunAudit_DuplicateCompletedPermitIdentityIsBlocking(t *testing.T) {
 	}
 
 	evidence := newValidEvidence(t, firstPass)
-	completed := quiescencePermitEvidence{
-		Ceremony:            string(participation.TBTCSigning),
-		Mode:                participation.ModeLegacy.String(),
-		CanonicalStartBlock: 900,
-		WorkID:              "wallet-action-1",
-		PermitID:            "wallet-action-1",
-		Outcome:             "completed",
-	}
 	updateQuiescenceReport(
 		t,
 		evidence,
@@ -1640,7 +1801,35 @@ func TestRunAudit_DuplicateCompletedPermitIdentityIsBlocking(t *testing.T) {
 // does not treat aliases, truncated seed hashes, or separator-bearing labels
 // as exact local permit identities.
 func TestRunAudit_MalformedQuiescencePermitIdentitiesAreBlocking(t *testing.T) {
-	storageDir := newTestStorage(t)
+	permits := []quiescencePermitEvidence{
+		{
+			Ceremony:            string(participation.TBTCDKG),
+			Mode:                participation.ModeLegacy.String(),
+			CanonicalStartBlock: 900,
+			WorkID:              strings.Repeat("A", 64),
+			PermitID:            "01",
+			Outcome:             "completed",
+		},
+		{
+			Ceremony: string(
+				participation.BeaconRelaySigning,
+			),
+			Mode:                participation.ModeSecurityV2.String(),
+			CanonicalStartBlock: 1_000,
+			WorkID:              "relay-request-1",
+			PermitID:            "member-1",
+			Outcome:             "completed",
+		},
+		{
+			Ceremony:            string(participation.TBTCSigning),
+			Mode:                participation.ModeLegacy.String(),
+			CanonicalStartBlock: 900,
+			WorkID:              "wallet/action",
+			PermitID:            "wallet~1",
+			Outcome:             "completed",
+		},
+	}
+	storageDir := newTestStorageWithQuiescencePermits(t, permits)
 
 	firstPass, err := runAudit(
 		storageDir,
@@ -1657,34 +1846,7 @@ func TestRunAudit_MalformedQuiescencePermitIdentitiesAreBlocking(t *testing.T) {
 		t,
 		evidence,
 		func(record *quiescenceReportEvidence) {
-			setQuiescencePermits(record, []quiescencePermitEvidence{
-				{
-					Ceremony:            string(participation.TBTCDKG),
-					Mode:                participation.ModeLegacy.String(),
-					CanonicalStartBlock: 900,
-					WorkID:              strings.Repeat("A", 64),
-					PermitID:            "01",
-					Outcome:             "completed",
-				},
-				{
-					Ceremony: string(
-						participation.BeaconRelaySigning,
-					),
-					Mode:                participation.ModeSecurityV2.String(),
-					CanonicalStartBlock: 1_000,
-					WorkID:              "relay-request-1",
-					PermitID:            "member-1",
-					Outcome:             "completed",
-				},
-				{
-					Ceremony:            string(participation.TBTCSigning),
-					Mode:                participation.ModeLegacy.String(),
-					CanonicalStartBlock: 900,
-					WorkID:              "wallet/action",
-					PermitID:            "wallet~1",
-					Outcome:             "completed",
-				},
-			})
+			setQuiescencePermits(record, permits)
 		},
 	)
 
@@ -1724,7 +1886,29 @@ func TestRunAudit_MalformedQuiescencePermitIdentitiesAreBlocking(t *testing.T) {
 func TestRunAudit_CompleteNonemptyQuiescenceInventorySatisfiesBarrier(
 	t *testing.T,
 ) {
-	storageDir := newTestStorage(t)
+	permits := []quiescencePermitEvidence{
+		{
+			Ceremony: string(
+				participation.TBTCSigning,
+			),
+			Mode:                participation.ModeLegacy.String(),
+			CanonicalStartBlock: 999,
+			WorkID:              "wallet-action-legacy",
+			PermitID:            "wallet-action-legacy",
+			Outcome:             "completed",
+		},
+		{
+			Ceremony: string(
+				participation.BeaconRelaySigning,
+			),
+			Mode:                participation.ModeSecurityV2.String(),
+			CanonicalStartBlock: 1_000,
+			WorkID:              "relay-request-security-v2",
+			PermitID:            "2",
+			Outcome:             "completed",
+		},
+	}
+	storageDir := newTestStorageWithQuiescencePermits(t, permits)
 
 	firstPass, err := runAudit(
 		storageDir,
@@ -1741,31 +1925,7 @@ func TestRunAudit_CompleteNonemptyQuiescenceInventorySatisfiesBarrier(
 		t,
 		evidence,
 		func(record *quiescenceReportEvidence) {
-			setQuiescencePermits(
-				record,
-				[]quiescencePermitEvidence{
-					{
-						Ceremony: string(
-							participation.TBTCSigning,
-						),
-						Mode:                participation.ModeLegacy.String(),
-						CanonicalStartBlock: 999,
-						WorkID:              "wallet-action-legacy",
-						PermitID:            "wallet-action-legacy",
-						Outcome:             "completed",
-					},
-					{
-						Ceremony: string(
-							participation.BeaconRelaySigning,
-						),
-						Mode:                participation.ModeSecurityV2.String(),
-						CanonicalStartBlock: 1_000,
-						WorkID:              "relay-request-security-v2",
-						PermitID:            "2",
-						Outcome:             "completed",
-					},
-				},
-			)
+			setQuiescencePermits(record, permits)
 		},
 	)
 
@@ -1792,18 +1952,6 @@ func TestRunAudit_CompleteNonemptyQuiescenceInventorySatisfiesBarrier(
 // outcomes cannot authorize the barrier when they omit permits independently
 // captured by the gate at the quiescence transition.
 func TestRunAudit_QuiescenceOutcomesMustCoverGateInventory(t *testing.T) {
-	storageDir := newTestStorage(t)
-
-	firstPass, err := runAudit(
-		storageDir,
-		testPassword,
-		evidenceInputs{},
-		testExpectedIdentity(),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	permits := []quiescencePermitEvidence{
 		{
 			Ceremony:            string(participation.TBTCSigning),
@@ -1822,6 +1970,17 @@ func TestRunAudit_QuiescenceOutcomesMustCoverGateInventory(t *testing.T) {
 			Outcome:             "completed",
 		},
 	}
+	storageDir := newTestStorageWithQuiescencePermits(t, permits)
+
+	firstPass, err := runAudit(
+		storageDir,
+		testPassword,
+		evidenceInputs{},
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	tests := map[string]struct {
 		outcomes         []quiescencePermitEvidence
@@ -1830,17 +1989,17 @@ func TestRunAudit_QuiescenceOutcomesMustCoverGateInventory(t *testing.T) {
 		"empty outcomes over nonempty inventory": {
 			outcomes: nil,
 			blockerFragments: []string{
-				"contains [0] permits, but the at-quiescence gate snapshot declares total [2]",
-				"contains [0] legacy permits, but the at-quiescence gate snapshot declares [1]",
-				"contains [0] security-v2 permits, but the at-quiescence gate snapshot declares [1]",
+				"contains [0] permits, but the node-authored gate snapshot declares total [2]",
+				"contains [0] legacy permits, but the node-authored gate snapshot declares [1]",
+				"contains [0] security-v2 permits, but the node-authored gate snapshot declares [1]",
 			},
 		},
 		"shortened outcomes without duplicates": {
 			outcomes: permits[:1],
 			blockerFragments: []string{
-				"contains [1] permits, but the at-quiescence gate snapshot declares total [2]",
-				"contains [0] security-v2 permits, but the at-quiescence gate snapshot declares [1]",
-				"gate inventory entry [1] has no terminal outcome",
+				"contains [1] permits, but the node-authored gate snapshot declares total [2]",
+				"contains [0] security-v2 permits, but the node-authored gate snapshot declares [1]",
+				"node-authored gate inventory entry [0] has no terminal outcome",
 			},
 		},
 	}
@@ -1889,11 +2048,35 @@ func TestRunAudit_QuiescenceOutcomesMustCoverGateInventory(t *testing.T) {
 	}
 }
 
-// TestRunAudit_QuiescencePermitModeMustMatchCutoverBoundary proves completed
-// permits are subject to the same canonical-anchor arithmetic as quarantined
-// outputs.
-func TestRunAudit_QuiescencePermitModeMustMatchCutoverBoundary(t *testing.T) {
+// TestRunAudit_SelfAttestedEqualOmissionCannotHideRealGatePermit proves the
+// prior report-only attack is closed: even if an external generator reports a
+// shortened outcome list and would have shortened its own duplicate counts
+// and inventory too, the audit reconciles against the independently persisted
+// registry captured by the production gate.
+func TestRunAudit_SelfAttestedEqualOmissionCannotHideRealGatePermit(
+	t *testing.T,
+) {
+	permits := []quiescencePermitEvidence{
+		{
+			Ceremony:            string(participation.TBTCSigning),
+			Mode:                participation.ModeLegacy.String(),
+			CanonicalStartBlock: 999,
+			WorkID:              "wallet-action-real-legacy",
+			PermitID:            "wallet-real-legacy",
+			Outcome:             "completed",
+		},
+		{
+			Ceremony:            string(participation.BeaconRelaySigning),
+			Mode:                participation.ModeSecurityV2.String(),
+			CanonicalStartBlock: 1_000,
+			WorkID:              "relay-request-real-security-v2",
+			PermitID:            "2",
+			Outcome:             "completed",
+		},
+	}
+
 	storageDir := newTestStorage(t)
+	persistRealGateQuiescenceSnapshot(t, storageDir, permits)
 
 	firstPass, err := runAudit(
 		storageDir,
@@ -1904,7 +2087,100 @@ func TestRunAudit_QuiescencePermitModeMustMatchCutoverBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	evidence := newValidEvidence(t, firstPass)
+	updateQuiescenceReport(
+		t,
+		evidence,
+		func(record *quiescenceReportEvidence) {
+			record.ActivePermitsAtQuiescence =
+				[]quiescencePermitEvidence{permits[0]}
+		},
+	)
 
+	auditManifest, err := runAudit(
+		storageDir,
+		testPassword,
+		evidence,
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if auditManifest.RollbackBarrierReady {
+		t.Error(
+			"an external equal omission must not hide a permit captured by " +
+				"the production gate",
+		)
+	}
+	for _, fragment := range []string{
+		"contains [1] permits, but the node-authored gate snapshot declares total [2]",
+		"node-authored gate inventory entry [0] has no terminal outcome",
+	} {
+		if !hasBlocker(auditManifest, fragment) {
+			t.Errorf(
+				"expected node-authored inventory blocker [%s], blockers: %v",
+				fragment,
+				auditManifest.RollbackBlockers,
+			)
+		}
+	}
+}
+
+func TestRunAudit_QuiescenceReportCannotPredateGateTransition(t *testing.T) {
+	storageDir := newTestStorage(t)
+	firstPass, err := runAudit(
+		storageDir,
+		testPassword,
+		evidenceInputs{},
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstPass.QuiescenceSnapshot == nil {
+		t.Fatal("test storage has no node-authored quiescence snapshot")
+	}
+
+	evidence := newValidEvidence(t, firstPass)
+	updateQuiescenceReport(
+		t,
+		evidence,
+		func(record *quiescenceReportEvidence) {
+			record.GeneratedAt =
+				firstPass.QuiescenceSnapshot.CapturedAt.Add(-time.Second)
+		},
+	)
+
+	auditManifest, err := runAudit(
+		storageDir,
+		testPassword,
+		evidence,
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if auditManifest.RollbackBarrierReady {
+		t.Error(
+			"a terminal report generated before the node quiesced must not " +
+				"authorize the barrier",
+		)
+	}
+	if !hasBlocker(
+		auditManifest,
+		"node-authored quiescence gate snapshot was captured after the quiescence report was generated",
+	) {
+		t.Errorf(
+			"expected transition-time blocker, blockers: %v",
+			auditManifest.RollbackBlockers,
+		)
+	}
+}
+
+// TestRunAudit_QuiescencePermitModeMustMatchCutoverBoundary proves completed
+// permits are subject to the same canonical-anchor arithmetic as quarantined
+// outputs.
+func TestRunAudit_QuiescencePermitModeMustMatchCutoverBoundary(t *testing.T) {
 	tests := map[string]struct {
 		mode            participation.ProtocolMode
 		anchor          uint64
@@ -1920,28 +2196,42 @@ func TestRunAudit_QuiescencePermitModeMustMatchCutoverBoundary(t *testing.T) {
 			anchor:          999,
 			blockerFragment: "permit entry [0] claims mode [security_v2] with canonical anchor [999] before cutover block [1000]",
 		},
+		"zero canonical anchor": {
+			mode:            participation.ModeLegacy,
+			anchor:          0,
+			blockerFragment: "permit entry [0] has zero canonical anchor under armed cutover block [1000]",
+		},
 	}
 
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
+			permits := []quiescencePermitEvidence{{
+				Ceremony: string(
+					participation.TBTCSigning,
+				),
+				Mode:                test.mode.String(),
+				CanonicalStartBlock: test.anchor,
+				WorkID:              "wallet-action-boundary",
+				PermitID:            "wallet-action-boundary",
+				Outcome:             "completed",
+			}}
+			storageDir := newTestStorageWithQuiescencePermits(t, permits)
+			firstPass, err := runAudit(
+				storageDir,
+				testPassword,
+				evidenceInputs{},
+				testExpectedIdentity(),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+
 			evidence := newValidEvidence(t, firstPass)
 			updateQuiescenceReport(
 				t,
 				evidence,
 				func(record *quiescenceReportEvidence) {
-					setQuiescencePermits(
-						record,
-						[]quiescencePermitEvidence{{
-							Ceremony: string(
-								participation.TBTCSigning,
-							),
-							Mode:                test.mode.String(),
-							CanonicalStartBlock: test.anchor,
-							WorkID:              "wallet-action-boundary",
-							PermitID:            "wallet-action-boundary",
-							Outcome:             "completed",
-						}},
-					)
+					setQuiescencePermits(record, permits)
 				},
 			)
 

@@ -93,6 +93,10 @@ func (tp *testPermit) CanonicalStartBlock() uint64 { return tp.anchor }
 
 func (tp *testPermit) Mode() participation.ProtocolMode { return tp.mode }
 
+func (tp *testPermit) WorkID() string { return "test-work" }
+
+func (tp *testPermit) PermitID() string { return "test-permit" }
+
 func (tp *testPermit) CheckCommit(
 	operation string,
 	class participation.CommitClass,

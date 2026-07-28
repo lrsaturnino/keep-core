@@ -151,11 +151,36 @@ func start(cmd *cobra.Command) error {
 	} else {
 		gateMetrics = &clientinfo.NoOpPerformanceMetrics{}
 	}
+
+	// The gate's quiescence capture is persisted in its own encrypted work
+	// namespace. Initialize it before constructing the gate so even a signal
+	// received during the rest of startup produces a node-authored inventory
+	// in the storage snapshot later handed to the rollback audit.
+	participationPersistence, err := initializeParticipationPersistence()
+	if err != nil {
+		return fmt.Errorf(
+			"cannot initialize participation persistence: [%w]",
+			err,
+		)
+	}
+	quiescenceRecorder, err :=
+		participation.NewPersistenceQuiescenceSnapshotRecorder(
+			participationPersistence,
+		)
+	if err != nil {
+		return fmt.Errorf(
+			"cannot construct the quiescence snapshot recorder: [%w]",
+			err,
+		)
+	}
+
 	participationGate, err := participation.NewGate(
 		ctx,
 		participationSchedule,
 		blockCounter,
 		gateMetrics,
+		participation.WithArtifactIdentity(build.Version, build.Revision),
+		participation.WithQuiescenceSnapshotRecorder(quiescenceRecorder),
 	)
 	if err != nil {
 		return fmt.Errorf("cannot construct the participation gate: [%v]", err)
@@ -781,4 +806,31 @@ func initializePersistence() (
 	}
 
 	return
+}
+
+func initializeParticipationPersistence() (
+	persistence.BasicHandle,
+	error,
+) {
+	diskStorage, err := storage.Initialize(
+		clientConfig.Storage,
+		clientConfig.Ethereum.KeyFilePassword,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"cannot initialize storage: [%w]",
+			err,
+		)
+	}
+
+	participationPersistence, err :=
+		diskStorage.InitializeWorkPersistence("participation")
+	if err != nil {
+		return nil, fmt.Errorf(
+			"cannot initialize participation work persistence: [%w]",
+			err,
+		)
+	}
+
+	return participationPersistence, nil
 }

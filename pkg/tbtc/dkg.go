@@ -103,6 +103,17 @@ type dkgExecutor struct {
 	announcerMismatchLogLimiter *rate.Limiter
 }
 
+func tbtcDKGPermitIdentity(
+	seed *big.Int,
+	memberIndex group.MemberIndex,
+) participation.PermitIdentity {
+	seedHash := sha256.Sum256(seed.Bytes())
+	return participation.PermitIdentity{
+		WorkID:   hex.EncodeToString(seedHash[:]),
+		PermitID: fmt.Sprint(memberIndex),
+	}
+}
+
 // newDkgExecutor creates a new instance of dkgExecutor struct. There should
 // be only one instance of dkgExecutor.
 func newDkgExecutor(
@@ -361,6 +372,7 @@ func (de *dkgExecutor) generateSigningGroup(
 		permit, err := de.participationGate.Begin(
 			participation.TBTCDKG,
 			startBlock,
+			tbtcDKGPermitIdentity(seed, memberIndex),
 		)
 		if err != nil {
 			dkgLogger.Warnf(

@@ -44,6 +44,27 @@ type node struct {
 	signerQuarantine *registry.Quarantine
 }
 
+func beaconDKGPermitIdentity(
+	seed *big.Int,
+	memberIndex group.MemberIndex,
+) participation.PermitIdentity {
+	seedHash := sha256.Sum256(seed.Bytes())
+	return participation.PermitIdentity{
+		WorkID:   hex.EncodeToString(seedHash[:]),
+		PermitID: fmt.Sprint(memberIndex),
+	}
+}
+
+func beaconRelayPermitIdentity(
+	requestStartBlock uint64,
+	localPermitID string,
+) participation.PermitIdentity {
+	return participation.PermitIdentity{
+		WorkID:   fmt.Sprintf("relay-request-%d", requestStartBlock),
+		PermitID: localPermitID,
+	}
+}
+
 // newNode returns an empty node with no group, zero group count, and a nil last
 // seen entry, tied to the given net.Provider.
 func newNode(
@@ -196,6 +217,7 @@ func (n *node) JoinDKGIfEligible(
 			permit, err := n.participationGate.Begin(
 				participation.BeaconDKG,
 				dkgStartBlockNumber,
+				beaconDKGPermitIdentity(dkgSeed, memberIndex),
 			)
 			if err != nil {
 				dkgLogger.Warnf(
@@ -417,6 +439,7 @@ func (n *node) ForwardSignatureShares(
 	permit, err := n.participationGate.Begin(
 		participation.BeaconRelayForwarding,
 		relayRequestBlockNumber,
+		beaconRelayPermitIdentity(relayRequestBlockNumber, "forwarder"),
 	)
 	if err != nil {
 		logger.Warnf(
@@ -533,6 +556,7 @@ func (n *node) MonitorRelayEntry(
 	permit, err := n.participationGate.Begin(
 		participation.BeaconTimeoutReport,
 		relayRequestBlockNumber,
+		beaconRelayPermitIdentity(relayRequestBlockNumber, "timeout-monitor"),
 	)
 	if err != nil {
 		logger.Warnf(
@@ -713,6 +737,10 @@ func (n *node) generateRelayEntry(
 		permit, err := issuePermit(
 			participation.BeaconRelaySigning,
 			startBlockHeight,
+			beaconRelayPermitIdentity(
+				startBlockHeight,
+				fmt.Sprint(member.Signer.MemberID()),
+			),
 		)
 		if err != nil {
 			relayLogger.Warnf(
