@@ -101,6 +101,13 @@ stages:
                       pin keeps this evidence reproducible), and
                       golangci-lint v2.12.2 (network needed on first run to
                       fetch the pinned tools)
+  shell-analysis      analyze the rehearsal scaffold itself: bash -n and
+                      ShellCheck over every script here, actionlint v1.7.12
+                      over the scaffold's own workflows, and both validator
+                      self-tests — the gate the scaffold's CI job runs on
+                      every change to these files, so the checkers that
+                      admit rehearsal evidence are never proved only by a
+                      manual dispatch
   solidity-proofs     build and test the changed ECDSA contracts surface
                       exactly as the contracts workflow does: Node 18.15.0,
                       the Corepack-managed yarn from packageManager, and a
@@ -657,6 +664,66 @@ stage_static_analysis() {
   note "static analysis recorded in ${log}"
 }
 
+# The scaffold's own workflow files. actionlint is deliberately not pointed
+# at the whole workflow directory: the unrelated workflows carry pre-existing
+# findings, and a gate that is red for reasons outside its scope stops being
+# read.
+cutover_workflow_files() {
+  printf '%s\n' \
+    "${REPO_ROOT}/.github/workflows/cutover-rehearsal.yml" \
+    "${REPO_ROOT}/.github/workflows/cutover-scaffold-lint.yml"
+}
+
+stage_shell_analysis() {
+  note "analyzing the rehearsal scaffold's shell scripts and workflows"
+  mkdir -p "${EVIDENCE_DIR}"
+  local log="${EVIDENCE_DIR}/shell-analysis.log"
+
+  command -v shellcheck >/dev/null 2>&1 ||
+    blocked "shellcheck is required to analyze the rehearsal scripts"
+  command -v node >/dev/null 2>&1 ||
+    blocked "node (Node.js) is required by the evidence-validator self-test"
+  command -v npx >/dev/null 2>&1 ||
+    blocked "npx (Node.js) is required by the evidence-validator self-test"
+  command -v git >/dev/null 2>&1 ||
+    blocked "git is required by both validator self-tests"
+
+  (
+    cd "${REPO_ROOT}"
+    verify_source_binding
+
+    local script
+    note "bash -n"
+    for script in "${SCRIPT_DIR}"/*.sh; do
+      bash -n "${script}"
+    done
+
+    note "shellcheck $(shellcheck --version | awk '/^version:/ {print $2}')"
+    for script in "${SCRIPT_DIR}"/*.sh; do
+      shellcheck "${script}"
+    done
+
+    # Pinned like every other analyzer here: a floating version must never
+    # change what this gate accepts.
+    note "actionlint v1.7.12"
+    local workflow
+    while IFS= read -r workflow; do
+      go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 "${workflow}"
+    done < <(cutover_workflow_files)
+
+    # The two validators gate every piece of rehearsal evidence, so the gate
+    # that runs on every change to them runs their self-tests too — without
+    # this they are proved only by the manually dispatched proof stages,
+    # which is to say only when somebody remembers.
+    note "source-binding verifier self-test"
+    "${SCRIPT_DIR}/test-source-binding.sh"
+    note "evidence-record validator self-test"
+    "${SCRIPT_DIR}/test-validate-evidence.sh"
+  ) 2>&1 | tee "${log}"
+
+  note "shell and workflow analysis recorded in ${log}"
+}
+
 stage_solidity_proofs() {
   note "building and testing the ECDSA contracts surface"
   mkdir -p "${EVIDENCE_DIR}"
@@ -999,6 +1066,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   case "${1:-}" in
   local-proofs) stage_local_proofs ;;
   static-analysis) stage_static_analysis ;;
+  shell-analysis) stage_shell_analysis ;;
   solidity-proofs) stage_solidity_proofs ;;
   preflight) stage_preflight ;;
   single-release) stage_single_release ;;

@@ -180,7 +180,9 @@ start_node_case() {
   local name="$1" config="$2"
   shift 2
   # NETWORK_MODE forces an explicit non-mainnet network so the node never
-  # resolves mainnet defaults.
+  # resolves mainnet defaults. It is a flag list, not one word — a caller can
+  # override it with several flags, so it is split deliberately.
+  # shellcheck disable=SC2086
   docker run -d --name "${name}" --network "${NETWORK}" \
     -e KEEP_ETHEREUM_PASSWORD="${KEY_PASSWORD}" \
     -v "${config}:/config/config.toml:ro" \

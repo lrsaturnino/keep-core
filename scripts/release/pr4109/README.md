@@ -29,16 +29,24 @@ Run those proofs, which need no Docker or chain, with:
 ./rehearse.sh local-proofs
 ```
 
-Two sibling stages cover the rest of the changed risk surface locally:
+Three sibling stages cover the rest of the changed risk surface locally:
 `./rehearse.sh static-analysis` runs the CI-enforced Go analyzers with
 every tool at an immutable version — gofmt, `go vet ./...` (strictly wider
 than CI's root-only vet), staticcheck 2025.1.1, gosec v2.28.0 (CI's own
 gosec action floats on `master`; the pin keeps the evidence reproducible),
-and golangci-lint v2.12.2 — and `./rehearse.sh solidity-proofs` builds and
+and golangci-lint v2.12.2 — `./rehearse.sh solidity-proofs` builds and
 tests the ECDSA contracts exactly as the contracts workflow does: Node
 18.15.0, the Corepack-managed yarn from `packageManager`, and a
 never-skipped `yarn install --immutable` before `yarn build` and
-`yarn test`. Every stage stamps the exact source commit into its log,
+`yarn test` — and `./rehearse.sh shell-analysis` analyzes this scaffold
+itself: `bash -n` and ShellCheck over every script here, actionlint v1.7.12
+over the scaffold's own workflows (scoped to them on purpose; the unrelated
+workflows carry pre-existing findings, and a gate that is red for reasons
+outside its scope stops being read), and both validator self-tests. That
+last stage is the one CI runs unconditionally — see
+`.github/workflows/cutover-scaffold-lint.yml` below — because the checkers
+that admit rehearsal evidence must never be proved only by a manual
+dispatch. Every stage stamps the exact source commit into its log,
 marking any divergence from `HEAD` — untracked files included — as
 `-dirty`. Setting `PR4109_EXPECTED_SOURCE_COMMIT` makes the stamp a
 fail-closed binding instead: the stage refuses to run at all unless the
@@ -207,6 +215,17 @@ tree that diverges from the dispatched commit — untracked files included —
 so `/rehearsal-evidence/` is an ignore rule the repository's root
 `.gitignore` carries alongside the script-local one. Without it a stage's
 own log would count as divergence and fail the stage that wrote it.
+
+Everything above runs only when somebody dispatches it, which is the wrong
+gate for the checkers that decide what may become release evidence. The
+`cutover-scaffold-lint` workflow
+(`.github/workflows/cutover-scaffold-lint.yml`) closes that: on every push
+and pull request touching `scripts/release/pr4109/**` or either cutover
+workflow it runs `./rehearse.sh shell-analysis`, so a change to
+`rehearse.sh`, to either self-test, or to the workflows themselves cannot
+merge without shell syntax, ShellCheck, actionlint, and both validator
+self-tests passing. It builds no image and runs no Go suite, so it is cheap
+enough to require.
 
 On a hosted runner the per-node keystore comes from the
 `REHEARSAL_KEYSTORE_BUNDLE_B64` repository secret: a base64-encoded tar.gz

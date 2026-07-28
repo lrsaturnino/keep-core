@@ -1,0 +1,59 @@
+name: Cutover Scaffold Lint
+
+# The unconditional gate on the cutover rehearsal scaffold itself.
+#
+# The scaffold's checkers — the source-binding verifier and the
+# evidence-record validator — decide what may be accepted as release
+# evidence, but everything that exercises them lives in a manually
+# dispatched workflow. Nothing therefore proved a change to them until
+# somebody remembered to dispatch a rehearsal. This job runs on every push
+# and pull request that touches those files: shell syntax, ShellCheck,
+# actionlint over the scaffold's own workflows, and both validator
+# self-tests. It is deliberately cheap — no Docker image build, no Go test
+# suite — so it can be required without slowing anything down.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "scripts/release/pr4109/**"
+      - ".github/workflows/cutover-rehearsal.yml"
+      - ".github/workflows/cutover-scaffold-lint.yml"
+  pull_request:
+    paths:
+      - "scripts/release/pr4109/**"
+      - ".github/workflows/cutover-rehearsal.yml"
+      - ".github/workflows/cutover-scaffold-lint.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scaffold-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The source-binding self-test builds throwaway repositories and reads
+      # this checkout's history; the evidence-validator self-test drives the
+      # real validation stage over fixture records.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Analyze the rehearsal scaffold
+        run: |
+          mkdir -p ${{ github.workspace }}/rehearsal-evidence
+          EVIDENCE_DIR=${{ github.workspace }}/rehearsal-evidence \
+            ./scripts/release/pr4109/rehearse.sh shell-analysis
+
+      - name: Upload scaffold-lint evidence
+        # A failing analyzer's log is the output most needed for diagnosis.
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cutover-scaffold-lint-${{ github.sha }}
+          path: rehearsal-evidence/
+          if-no-files-found: error
