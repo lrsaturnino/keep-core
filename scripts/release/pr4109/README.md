@@ -88,11 +88,21 @@ client-info ports over the internal rehearsal network, and recording each
 step's own outcome. A step this release cannot execute is recorded `blocked`
 with the reason rather than aborting the run, because the steps after it are
 independent proofs and losing them tells a reviewer less than a record naming
-exactly which step could not run. Every run therefore ends with an evidence
-record on disk — validated by the acceptance stage's own validator — and the
-stage exits `BLOCKED` unless every mandatory step executed. A partial
-rehearsal can never read as a passed gate, and a blocked gate is never
-silent about what it did prove.
+exactly which step could not run. A step that *did* run and observed the
+property violated is recorded `fail` the same way, and an acceptance
+assertion is written `true` only where the run watched the property hold, so
+an unobserved one reads as refused rather than as satisfied.
+
+Every run therefore ends with an evidence record on disk — shape-checked by
+the acceptance stage's own validator — and the stage's exit is decided from
+the recorded outcomes. A failed step is the strongest verdict and exits
+`FAIL`: the rehearsal reached the property, watched it, and watched it break,
+which outranks anything the run could not reach. A step that never executed
+exits `BLOCKED`: the gate is unproved rather than disproved. A refused
+acceptance assertion with no step behind it exits `FAIL` too. Only a run with
+none of the three reports success. A partial rehearsal can never read as a
+passed gate, a failed one can never read as either, and a refused gate is
+never silent about what it did prove.
 
 `compose.rehearsal.yaml` is the fleet shell: one prior node (no gate — the
 deliberate straggler) and two R1 nodes with the non-mainnet
@@ -117,8 +127,21 @@ insufficient. `./rehearse.sh validate-evidence` checks every record under
 requires the recorded manifest hash *and* the recorded termination grace to
 equal the checked-in manifest's — the hash alone would accept a record that
 names the right manifest while claiming the fleet ran under some other
-grace — so an accepted record links the termination-grace record to the
+grace — so an admissible record links the termination-grace record to the
 exact artifact and chain identity it carries.
+
+Admissible is not accepted. Everything above decides whether a record is one
+this release may read at all — well formed, from the attested commit,
+measured against the reviewed manifest — and says nothing about what it
+says. A record is precisely where a rehearsal reports that a mandatory step
+failed or an acceptance assertion does not hold, so a schema-valid,
+correctly bound record can be exactly the evidence that a gate must be
+refused. `validate-evidence` therefore asks the second question separately,
+by the same ordering the runs themselves use: any recorded failed step or
+refused assertion, in any record in the directory, exits `FAIL`; any step
+that never executed exits `BLOCKED`; only a directory with none of the three
+is evidence of satisfied gates. A passing record beside a failing one
+accepts nothing.
 
 Those comparisons only mean something while the checked-in manifest is
 still the compiled bounds' own manifest, so the stage refuses to measure
@@ -165,7 +188,11 @@ rules it judges by all come out of the tree it runs from.
 The validator proves itself before validating anything:
 `test-validate-evidence.sh` drives the stage over fixture records — correct
 binding, wrong hash, wrong grace, wrong source commit, missing binding
-fields, malformed timestamp, empty record set — over fixture attestations —
+fields, malformed timestamp, empty record set — over correctly bound records
+whose *outcomes* deny the gate — a failed step, a refused assertion with
+every step passing, a step that never executed, a failure alongside an
+unexecuted step, and a failing record sitting beside a passing one — over
+fixture attestations —
 absent, incomplete, a leftover staging directory, taken over other manifest
 bytes, contradicting the reviewed bounds, taken at another commit than the
 run is bound to, taken on a divergent tree, and one differing only in

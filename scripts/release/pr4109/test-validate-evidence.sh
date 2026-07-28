@@ -14,6 +14,15 @@
 # or vouching for a record built from other bytes — plus the tree binding the
 # stage verifies before it judges anything.
 #
+# Admissibility is not acceptance, and the cases keep the two apart. A
+# separate set of records passes every binding check above and still denies
+# the gate in its own outcomes — a failed step, a refused acceptance
+# assertion with every step passing, a step that never executed, a failure
+# beside an unexecuted step, and a failing record sitting beside a passing
+# one — because a validator that only checked the shape of those records
+# would hand a release a refuted gate as a satisfied one. The rehearsal
+# ledger is driven to the same verdicts through the real emitter.
+#
 # The receipt lifecycle is proved through stage_local_proofs itself and not
 # only through the invalidation function: the last cases give a reused
 # evidence directory a valid inherited receipt, fail the stage's proof seam,
@@ -101,9 +110,23 @@ MANIFEST_GRACE="$(node -e '
 # A schema-complete record bound to the given manifest hash, grace,
 # generation timestamp, and source commit. The negative cases change exactly
 # one argument each, so a rejection can only come from that change.
+#
+# The last two arguments are the record's own stages and assertions. They
+# default to a rehearsal that held, and the acceptance cases override them
+# with the outcomes a record is allowed to carry and a release is not
+# allowed to accept — every one of which is schema-valid and correctly
+# bound, which is exactly why nothing before the acceptance check can see it.
+STAGE_PASSED='{ "name": "preflight", "outcome": "pass" }'
+STAGE_FAILED='{ "name": "cross C without restart", "outcome": "fail" }'
+STAGE_BLOCKED='{ "name": "quiescence with a legacy permit", "outcome": "blocked" }'
+ASSERTION_HOLDS='{ "assertion": "self-test fixture", "holds": true }'
+ASSERTION_REFUSED='{ "assertion": "the gate crosses C in-process", "holds": false }'
+
 write_record() {
   local path="$1" sha="$2" grace="$3" generated_at="$4"
   local source_sha="${5:-${FIXTURE_SHA}}"
+  local stages="${6:-${STAGE_PASSED}}"
+  local assertions="${7:-${ASSERTION_HOLDS}}"
   cat >"${path}" <<EOF
 {
   "schema_version": 1,
@@ -126,8 +149,8 @@ write_record() {
     "sha256": "${sha}",
     "termination_grace_period_seconds": ${grace}
   },
-  "stages": [ { "name": "preflight", "outcome": "pass" } ],
-  "assertions": [ { "assertion": "self-test fixture", "holds": true } ]
+  "stages": [ ${stages} ],
+  "assertions": [ ${assertions} ]
 }
 EOF
 }
@@ -422,6 +445,69 @@ run_validator "${D}"
 check "one bad record is rejected even after a good one validated" 3 \
   "termination grace of \[1\] seconds"
 
+# ----------------------------------------------------------------------------
+#
+# Acceptance, which is a different question from admissibility. Every record
+# below is schema-valid, produced at the attested commit, and bound to the
+# reviewed manifest's exact hash and grace — so every check above it passes.
+# What each one says, in the fields the schema exists to carry, is that the
+# gate it evidences did not hold. A release that read only the checks above
+# would take all of them for satisfied gates.
+
+D="${WORK}/accept-failed-step"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z" "${FIXTURE_SHA}" "${STAGE_FAILED}"
+run_validator "${D}"
+check "a correctly bound record whose mandatory step failed is not accepted" 1 \
+  "the evidence refutes the gate it records" "cross C without restart"
+
+D="${WORK}/accept-refused-assertion"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z" "${FIXTURE_SHA}" "${STAGE_PASSED}" \
+  "${ASSERTION_REFUSED}"
+run_validator "${D}"
+check "every step passing does not accept a refused acceptance assertion" 1 \
+  "the evidence refutes the gate it records" "the gate crosses C in-process"
+
+D="${WORK}/accept-blocked-step"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z" "${FIXTURE_SHA}" \
+  "${STAGE_PASSED}, ${STAGE_BLOCKED}"
+run_validator "${D}"
+check "a record with a step that never executed is not an accepted gate" 3 \
+  "never executed" "quiescence with a legacy permit"
+
+# A failure outranks a step that never ran: the rehearsal reached that
+# property and watched it break, which is a refutation and not a gap.
+D="${WORK}/accept-failed-and-blocked"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z" "${FIXTURE_SHA}" \
+  "${STAGE_BLOCKED}, ${STAGE_FAILED}"
+run_validator "${D}"
+check "a failed step outranks a blocked one in the acceptance verdict" 1 \
+  "the evidence refutes the gate it records"
+
+# The gate a release actually reads is the whole directory, so a passing
+# record must never cover for a failing one beside it.
+D="${WORK}/accept-one-failed-among-good"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/a-good.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+write_record "${D}/b-failed.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z" "${FIXTURE_SHA}" "${STAGE_FAILED}"
+run_validator "${D}"
+check "a passing record does not cover for a failing one beside it" 1 \
+  "the evidence refutes the gate it records" "b-failed.json"
+
 # The lifecycle a reused evidence directory depends on. local-proofs runs
 # invalidate_release_manifest_attestation before it proves anything, so a run
 # that fails at any proof leaves no receipt behind: the acceptance stage then
@@ -593,6 +679,37 @@ blocked_run() {
     "the pinned tss-lib is hardened-only"
 }
 
+# A rehearsal that reached every mandatory property and watched one break.
+# Nothing here is missing: the steps all ran, the record is complete, and the
+# only thing separating it from the accepted run above is what was observed.
+failed_run() {
+  complete_run
+  begin_step "clock failure quarantines work rather than guessing a mode"
+  record_step "clock failure quarantines work rather than guessing a mode" \
+    fail "the gate reported open_security_v2 with its chain endpoint severed"
+  record_assertion \
+    "a failed chain-clock read refuses new work instead of assuming a side of C" \
+    false "clock failure quarantines work rather than guessing a mode"
+}
+
+# Every step passed, and an acceptance assertion still does not hold. The
+# assertions are only ever written true where the property was watched, so
+# this is the gate's own contract being refused with no step to point at.
+refused_assertion_run() {
+  complete_run
+  record_assertion "post-C ceremonies run security-v2 with no legacy sightings" \
+    false "cross C without restart"
+}
+
+# One step failed and another never ran. A verdict that reported this as
+# merely unrehearsed would lose the refutation entirely.
+failed_and_blocked_run() {
+  failed_run
+  begin_step "quiescence with an in-flight legacy permit"
+  block_step "quiescence with an in-flight legacy permit" \
+    "the pinned tss-lib is hardened-only"
+}
+
 E="${WORK}/emitted"
 mkdir -p "${E}"
 write_attestation "${E}"
@@ -713,6 +830,41 @@ else
   printf 'FAIL the record does not type the unexecuted step as blocked\n'
   FAILED=$((FAILED + 1))
 fi
+
+# The verdict a run reports when a mandatory property was watched and broke.
+# This is the harness's most important negative outcome and the one a ledger
+# read only for blocked steps reports as a success.
+E="${WORK}/emitted-failed"
+mkdir -p "${E}"
+write_attestation "${E}"
+run_rehearsal "${E}" single_release failed_run
+check "a rehearsal whose mandatory step failed refuses the gate" 1 \
+  "rehearsal evidence record written" \
+  "1 mandatory step\(s\) of the single_release gate failed" \
+  "clock failure quarantines work rather than guessing a mode"
+
+if grep -q '"outcome": "fail"' "${E}"/single_release-*.json; then
+  printf 'ok   the failed rehearsal left its record on disk for review\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL the failed rehearsal wrote no record of what broke\n'
+  FAILED=$((FAILED + 1))
+fi
+
+E="${WORK}/emitted-refused-assertion"
+mkdir -p "${E}"
+write_attestation "${E}"
+run_rehearsal "${E}" single_release refused_assertion_run
+check "every step passing does not carry a refused acceptance assertion" 1 \
+  "1 acceptance assertion\(s\) of the single_release gate do not hold" \
+  "post-C ceremonies run security-v2 with no legacy sightings"
+
+E="${WORK}/emitted-failed-and-blocked"
+mkdir -p "${E}"
+write_attestation "${E}"
+run_rehearsal "${E}" single_release failed_and_blocked_run
+check "a failure outranks an unexecuted step in the run's own verdict" 1 \
+  "of the single_release gate failed"
 
 # A rehearsal run from bytes no commit accounts for must not produce a record
 # at all: the emitter is where that is caught, before anything is written.

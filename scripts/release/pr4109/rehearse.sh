@@ -80,6 +80,15 @@
 # rename only after every proof passed, stamping the commit the binding
 # check proved, and validate-evidence requires that stamp to equal both its
 # own binding and every record's source_sha.
+#
+# All of that decides whether a record is admissible, which is not whether it
+# accepts anything. A record is where a rehearsal says a mandatory step
+# failed or an acceptance assertion does not hold, so a correctly bound,
+# schema-valid record can be exactly the evidence that a gate must not be
+# accepted. Both the rehearsal's own exit and validate-evidence therefore
+# read the recorded outcomes as the verdict: a failed step or a refused
+# assertion refuses the gate, a step that never executed leaves it
+# unrehearsed, and only a run with none of the three reports success.
 
 set -euo pipefail
 
@@ -179,7 +188,9 @@ stages:
                       permits. Runs every step this release can execute,
                       records each step's own outcome, and emits an evidence
                       record naming the steps that could not run and why;
-                      exits BLOCKED unless every mandatory step executed
+                      exits FAIL if any mandatory step failed or any
+                      acceptance assertion does not hold, and BLOCKED if any
+                      step could not execute
   rollback            homogeneous rollback rehearsal: quiesce all R1,
                       all-candidate-down barrier, offline state audit, staged
                       prior redeploy, forbidden partial-rollback attempt.
@@ -199,7 +210,11 @@ stages:
                       the attestation, every record, and this run's own
                       binding to name one commit, verifies its own source
                       binding like any proof stage, and self-tests its
-                      checker first
+                      checker first. Then asks the separate question the
+                      binding checks cannot: a correctly bound record still
+                      says whether its gate held, so the stage exits FAIL on
+                      any recorded failed step or refused acceptance
+                      assertion and BLOCKED on any step that never executed
 
 environment (every proof stage):
   PR4109_EXPECTED_SOURCE_COMMIT
@@ -2830,6 +2845,15 @@ REHEARSAL_GATE=""
 REHEARSAL_STEPS=()
 REHEARSAL_ASSERTIONS=()
 REHEARSAL_BLOCKED_STEPS=()
+# A step that ran and observed the property violated, and an acceptance
+# assertion observed not to hold, are each on their own enough to deny the
+# gate. They are tracked apart from the blocked steps because they mean
+# something different — the rehearsal reached the property and the property
+# was wrong, rather than the rehearsal never reaching it — and because a
+# verdict drawn from the blocked list alone reports a gate whose steps all
+# ran and one of which failed as a success.
+REHEARSAL_FAILED_STEPS=()
+REHEARSAL_REFUTED_ASSERTIONS=()
 
 # Observations of the step currently running. begin_step clears them, so a
 # step records what was seen while it ran and never inherits the readings of
@@ -2882,6 +2906,7 @@ record_step() {
     note "   BLOCKED: ${name}${notes:+ — ${notes}}"
     ;;
   fail)
+    REHEARSAL_FAILED_STEPS+=("${name}")
     note "   FAIL: ${name}${notes:+ — ${notes}}"
     ;;
   esac
@@ -2893,6 +2918,11 @@ record_step() {
 # why. The stage refuses to report success at the end regardless.
 block_step() { record_step "$1" blocked "$2"; }
 
+# Record one of the gate's acceptance assertions with what was observed.
+# Anything but a literal true is a refusal: an assertion is written true only
+# where the run actually watched the property hold, so an unobserved one and
+# a violated one both deny the gate rather than being waved through by a
+# verdict that never reads them.
 record_assertion() {
   local assertion="$1" holds="$2" stage="${3:-}"
   local fields
@@ -2900,6 +2930,7 @@ record_assertion() {
   [[ -n "${stage}" ]] &&
     fields="${fields},\"evidence_stage\":$(json_string "${stage}")"
   REHEARSAL_ASSERTIONS+=("{${fields}}")
+  [[ "${holds}" == "true" ]] || REHEARSAL_REFUTED_ASSERTIONS+=("${assertion}")
 }
 
 # The architectures an immutable digest actually carries, mapped to the
@@ -3048,21 +3079,52 @@ clean commit; a record built from bytes no commit accounts for is not evidence"
 
   note "rehearsal evidence record written to ${record}"
   note "validating it with the acceptance stage's own validator"
-  stage_validate_evidence
+  # Shape and binding only. This record is emitted by every rehearsal,
+  # including one that just watched a mandatory step fail, and the point of
+  # emitting it is that the refusal is reviewable — so the checks run here
+  # are the ones that say the record is admissible. Whether its contents
+  # accept the gate is conclude_verdict's decision on the way out, and the
+  # acceptance stage's when a reviewer reads the directory later.
+  validate_evidence_records
 }
 
-# Close a rehearsal: emit the record, then decide the stage's verdict from the
-# steps themselves. A gate whose mandatory steps did not all execute has not
-# been rehearsed, so it exits BLOCKED — with the record already on disk naming
-# every step that did run.
-conclude_rehearsal() {
-  emit_evidence_record
+# The verdict a ledger implies, with no emission and no I/O of its own, so
+# the decision can be exercised directly against a constructed ledger.
+#
+# The three outcomes are ordered by what they say about the release. A failed
+# step is the strongest: the rehearsal reached the property, watched it, and
+# watched it break — that is a refutation, and it outranks anything the run
+# could not reach. A blocked step is next: the gate was not rehearsed, so it
+# is unproved rather than disproved. A refused acceptance assertion with no
+# step behind it is a refutation too, because the assertions are only ever
+# written true where the property was observed. Only a ledger with none of
+# the three is a rehearsed, satisfied gate.
+conclude_verdict() {
+  if ((${#REHEARSAL_FAILED_STEPS[@]} > 0)); then
+    fail "${#REHEARSAL_FAILED_STEPS[@]} mandatory step(s) of the \
+${REHEARSAL_GATE} gate failed: ${REHEARSAL_FAILED_STEPS[*]}; the gate is \
+refused and the record written above names what each step observed"
+  fi
   if ((${#REHEARSAL_BLOCKED_STEPS[@]} > 0)); then
     blocked "${#REHEARSAL_BLOCKED_STEPS[@]} mandatory step(s) of the \
 ${REHEARSAL_GATE} gate could not execute: ${REHEARSAL_BLOCKED_STEPS[*]}; the \
 record written above names each one and why"
   fi
-  note "${REHEARSAL_GATE} rehearsal completed: every mandatory step executed"
+  if ((${#REHEARSAL_REFUTED_ASSERTIONS[@]} > 0)); then
+    fail "${#REHEARSAL_REFUTED_ASSERTIONS[@]} acceptance assertion(s) of the \
+${REHEARSAL_GATE} gate do not hold: ${REHEARSAL_REFUTED_ASSERTIONS[*]}; every \
+mandatory step ran, so this is the property itself being refused"
+  fi
+  note "${REHEARSAL_GATE} rehearsal completed: every mandatory step executed \
+and every acceptance assertion holds"
+}
+
+# Close a rehearsal: emit the record, then decide the stage's verdict from the
+# steps themselves. The record is written first either way — a gate that is
+# refused leaves the reviewable account of why, not just a console line.
+conclude_rehearsal() {
+  emit_evidence_record
+  conclude_verdict
 }
 
 stage_preflight() {
@@ -3685,7 +3747,22 @@ attestation_source_commit() {
   tr -d '[:space:]' <"$(attestation_dir)/source-commit.txt"
 }
 
-stage_validate_evidence() {
+# Every record in the evidence directory, as an array in the caller's
+# EVIDENCE_RECORDS. A top-level glob rather than a walk, so the attestation
+# receipt's own documents in the subdirectory are never mistaken for records.
+collect_evidence_records() {
+  shopt -s nullglob
+  EVIDENCE_RECORDS=("${EVIDENCE_DIR}"/*.json)
+  shopt -u nullglob
+}
+
+# Is each record admissible — well formed, produced at the attested commit,
+# and measured against the reviewed manifest? This decides nothing about
+# whether the gates the records evidence were satisfied; that is a separate
+# question, asked by assess_evidence_acceptance. Keeping the two apart is
+# what lets a refused rehearsal still write and shape-check the record that
+# says why it was refused, without the shape check reading as acceptance.
+validate_evidence_records() {
   local schema="${SCRIPT_DIR}/rehearsal-evidence.schema.json"
   local manifest="${SCRIPT_DIR}/release-manifest.json"
 
@@ -3706,10 +3783,8 @@ stage_validate_evidence() {
   # verdict means anything.
   verify_source_binding
 
-  shopt -s nullglob
-  local records=("${EVIDENCE_DIR}"/*.json)
-  shopt -u nullglob
-  if ((${#records[@]} == 0)); then
+  collect_evidence_records
+  if ((${#EVIDENCE_RECORDS[@]} == 0)); then
     blocked "no evidence records found under ${EVIDENCE_DIR}; a rehearsal \
 run that produced no record cannot be accepted"
   fi
@@ -3749,7 +3824,7 @@ run that produced no record cannot be accepted"
   ' "${manifest}")" ||
     fail "cannot read the termination grace from ${manifest}"
 
-  for record in "${records[@]}"; do
+  for record in "${EVIDENCE_RECORDS[@]}"; do
     note "validating ${record}"
     # ajv needs the formats plugin loaded explicitly or it rejects the
     # schema's own date-time format annotation before ever reading a
@@ -3805,6 +3880,76 @@ grace is not evidence for this release"
   note "all evidence records conform to the schema, were produced at \
 ${attested_source}, and bind the reviewed release manifest's hash and \
 termination grace"
+}
+
+# Do the records show the gates held?
+#
+# Admissibility is not acceptance. A record whose shape, commit, and manifest
+# binding are all correct can still say, in the fields the schema exists to
+# carry, that a mandatory step failed or an acceptance assertion does not
+# hold — and a release that reads only the shape checks would take that
+# record as a satisfied gate. So the outcomes themselves are the verdict
+# here, by the same ordering conclude_verdict uses: a failed step or a
+# refused assertion refutes the gate, a blocked step leaves it unrehearsed,
+# and only a record with none of the three is evidence a gate was satisfied.
+assess_evidence_acceptance() {
+  collect_evidence_records
+  if ((${#EVIDENCE_RECORDS[@]} == 0)); then
+    blocked "no evidence records found under ${EVIDENCE_DIR}; a rehearsal \
+run that produced no record cannot be accepted"
+  fi
+
+  local refutations=() unrehearsed=()
+  local record outcomes kind what
+  for record in "${EVIDENCE_RECORDS[@]}"; do
+    # Every non-passing outcome the record carries, one per line, as the
+    # kind that decides the verdict and the human-readable thing it names.
+    outcomes="$(node -e '
+      const fs = require("fs");
+      const record = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      const lines = [];
+      for (const stage of record.stages || []) {
+        if (stage.outcome === "fail") {
+          lines.push("refuted\tstep " + JSON.stringify(stage.name));
+        } else if (stage.outcome === "blocked") {
+          lines.push("unrehearsed\tstep " + JSON.stringify(stage.name));
+        }
+      }
+      for (const entry of record.assertions || []) {
+        if (entry.holds !== true) {
+          lines.push("refuted\tassertion " + JSON.stringify(entry.assertion));
+        }
+      }
+      process.stdout.write(lines.join("\n"));
+    ' "${record}")" ||
+      fail "cannot read the step and assertion outcomes of ${record}"
+
+    [[ -n "${outcomes}" ]] || continue
+    while IFS="$(printf '\t')" read -r kind what; do
+      case "${kind}" in
+      refuted) refutations+=("${record##*/}: ${what}") ;;
+      unrehearsed) unrehearsed+=("${record##*/}: ${what}") ;;
+      esac
+    done <<<"${outcomes}"
+  done
+
+  if ((${#refutations[@]} > 0)); then
+    fail "the evidence refutes the gate it records — ${#refutations[@]} \
+failed step(s) or refused assertion(s): ${refutations[*]}; these records are \
+admissible evidence that the rehearsal did not hold, not a passing gate"
+  fi
+  if ((${#unrehearsed[@]} > 0)); then
+    blocked "${#unrehearsed[@]} mandatory step(s) across these records never \
+executed: ${unrehearsed[*]}; a gate whose steps did not all run has not been \
+rehearsed, whatever the records that do exist show"
+  fi
+
+  note "every recorded step passed and every acceptance assertion holds"
+}
+
+stage_validate_evidence() {
+  validate_evidence_records
+  assess_evidence_acceptance
 }
 
 # Sourceable for the source-binding self-test: dispatch only when executed.
