@@ -134,7 +134,10 @@ jobs:
       # inside the local-proofs stage above (its verdicts are part of the
       # archived local-proofs.log), so a record-free dispatch still proves
       # the validator; this step validates whatever records a dispatch
-      # actually produced.
+      # actually produced. The manifest attestation this stage requires was
+      # written by local-proofs into the same bind-mounted evidence
+      # directory, one level down, so it is here and it does not make the
+      # top-level record probe below see a record that does not exist.
       - name: Validate evidence records against the schema
         run: |
           if compgen -G "${{ github.workspace }}/rehearsal-evidence/*.json" > /dev/null; then

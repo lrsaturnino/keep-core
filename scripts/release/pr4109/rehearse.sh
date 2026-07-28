@@ -47,7 +47,10 @@
 # Every accepted rehearsal run must produce a record conforming to
 # rehearsal-evidence.schema.json and binding the checked-in release
 # manifest — its exact hash and its termination grace; the validate-evidence
-# stage enforces both, self-testing its own checker first.
+# stage enforces both, self-testing its own checker first. Those comparisons
+# only speak for the release while that manifest still matches the compiled
+# bounds, so local-proofs attests it under EVIDENCE_DIR/attestation and
+# validate-evidence refuses to measure a record without that receipt.
 
 set -euo pipefail
 
@@ -71,8 +74,10 @@ stages:
                       roster wiring — under the race detector, plus the
                       integration-tag compile proof; self-tests the
                       source-binding and evidence-record validators first
-                      (the latter needs node/npx), and ends with an explicit
-                      report of every skipped case (runs today, no Docker)
+                      (the latter needs node/npx), reports every skipped
+                      case explicitly, and ends by attesting the checked-in
+                      release manifest against the compiled bounds under
+                      EVIDENCE_DIR/attestation (runs today, no Docker)
   static-analysis     run the static analyzers CI enforces on the Go tree,
                       every tool at an immutable version: gofmt, go vet
                       over ./... (strictly wider than CI's root-only vet),
@@ -105,7 +110,9 @@ stages:
                       each record's release-manifest binding — the exact
                       manifest hash and the termination grace the fleet ran
                       under — to match the checked-in reviewed manifest;
-                      the validator self-tests its own checker first
+                      requires the local-proofs attestation proving that
+                      manifest still matches the compiled bounds, and
+                      self-tests its own checker first
 
 environment (every proof stage):
   PR4109_EXPECTED_SOURCE_COMMIT
@@ -431,6 +438,42 @@ require_immutable_digest() {
   fi
 }
 
+# Directory holding the release-manifest attestation: the receipt proving the
+# checked-in manifest still matches the compiled bounds of the source under
+# test. It is a subdirectory on purpose. Both the record glob below and the
+# workflow's record probe look at EVIDENCE_DIR's top level only, so producing
+# this receipt never makes a record-free dispatch look like it produced a
+# rehearsal record.
+attestation_dir() { printf '%s\n' "${EVIDENCE_DIR}/attestation"; }
+
+# The acceptance stage judges a rehearsal record by comparing it against the
+# checked-in release manifest, but that manifest only speaks for the release
+# while it still matches this binary's compiled bounds. The Go proofs pin that
+# identity inside their own log; this turns it into a machine-checkable
+# receipt, produced here — inside the source-bound tree, where the Go
+# toolchain is — so the acceptance stage can require the proof without
+# carrying a toolchain of its own.
+attest_release_manifest() {
+  local manifest="${SCRIPT_DIR}/release-manifest.json"
+  local dir
+  dir="$(attestation_dir)"
+  mkdir -p "${dir}"
+
+  note "attesting the release manifest against the compiled bounds"
+  # validate is the binary's own reviewed check: it rejects a manifest whose
+  # numbers differ from the compiled derivation in any field, the cleanup
+  # allowance the runtime actually waits included.
+  go run . release-manifest validate --manifest "${manifest}"
+
+  # derive emits the manifest the compiled bounds produce, so the receipt
+  # carries those bounds themselves rather than an assertion about them, and
+  # the hash names the exact reviewed bytes validate just accepted.
+  go run . release-manifest derive >"${dir}/derived-manifest.json"
+  hash_stdin <"${manifest}" >"${dir}/reviewed-manifest.sha256"
+
+  note "release-manifest attestation written to ${dir}"
+}
+
 stage_local_proofs() {
   note "running the repository-local cutover gate proofs"
   mkdir -p "${EVIDENCE_DIR}"
@@ -471,6 +514,9 @@ stage_local_proofs() {
     # build tag. Their execution needs live Bitcoin/Ethereum endpoints and
     # stays with the CI integration job.
     go vet -tags=integration ./pkg/bitcoin/electrum/ ./pkg/chain/ethereum/
+
+    # Last, so the receipt exists only for a tree whose proofs all passed.
+    attest_release_manifest
   ) 2>&1 | tee "${log}"
 
   # Skips are part of the evidence, not noise: every mandatory acceptance
@@ -638,6 +684,79 @@ stage_verify_source_binding() {
   note "source binding recorded in ${log}"
 }
 
+# Every record comparison below measures a record against the checked-in
+# release manifest, so that manifest has to be the compiled bounds' own
+# manifest and not a document that has since drifted away from them. The
+# local proofs leave the receipt proving it; requiring the receipt here is
+# what keeps a record from being accepted against a manifest no binary of
+# this release would validate. Comparing the derived numbers as well as the
+# hash means the receipt cannot be satisfied by a stale attestation left
+# beside an edited manifest.
+require_manifest_attestation() {
+  local manifest="${SCRIPT_DIR}/release-manifest.json"
+  local dir derived reviewed_hash
+  dir="$(attestation_dir)"
+  derived="${dir}/derived-manifest.json"
+  reviewed_hash="${dir}/reviewed-manifest.sha256"
+
+  if [[ ! -f "${derived}" || ! -f "${reviewed_hash}" ]]; then
+    blocked "no release-manifest attestation under ${dir}; run the \
+local-proofs stage at the same commit first — without it nothing here \
+proves the manifest these records are measured against still matches the \
+compiled bounds"
+  fi
+
+  local attested_sha manifest_sha
+  attested_sha="$(tr -d '[:space:]' <"${reviewed_hash}")"
+  manifest_sha="$(hash_stdin <"${manifest}")"
+  if [[ "${attested_sha}" != "${manifest_sha}" ]]; then
+    blocked "the release-manifest attestation was taken over a manifest \
+hashing to [${attested_sha:-absent}], but ${manifest} now hashes to \
+[${manifest_sha}]; re-run the local-proofs stage against the current manifest"
+  fi
+
+  # The hash alone would let an attestation and a manifest be regenerated
+  # together around numbers no compiled binary produces, so the derived
+  # document's own bounds are compared field by field with the reviewed
+  # one's. Only the free-form notes and the generation timestamp differ by
+  # design; keys are canonically ordered so hand-reformatting a reviewed
+  # manifest cannot read as drift.
+  node -e '
+    const fs = require("fs");
+    const canon = (v) =>
+      Array.isArray(v)
+        ? v.map(canon)
+        : v && typeof v === "object"
+          ? Object.keys(v).sort().reduce((o, k) => {
+              o[k] = canon(v[k]);
+              return o;
+            }, {})
+          : v;
+    const bounds = (path) => {
+      const doc = JSON.parse(fs.readFileSync(path, "utf8"));
+      const grace = Object.assign({}, doc.termination_grace);
+      delete grace.notes;
+      return JSON.stringify(canon({
+        schema_version: doc.schema_version,
+        protocol_epoch: doc.protocol_epoch,
+        termination_grace: grace,
+      }));
+    };
+    const derived = bounds(process.argv[1]);
+    const reviewed = bounds(process.argv[2]);
+    if (derived !== reviewed) {
+      console.error("attested compiled bounds: " + derived);
+      console.error("reviewed manifest bounds: " + reviewed);
+      process.exit(1);
+    }
+  ' "${derived}" "${manifest}" ||
+    blocked "the reviewed release manifest disagrees with the compiled \
+bounds recorded in ${derived} (differences above); these records are \
+measured against a manifest this release would reject"
+
+  note "release-manifest attestation binds ${manifest} to the compiled bounds"
+}
+
 stage_validate_evidence() {
   local schema="${SCRIPT_DIR}/rehearsal-evidence.schema.json"
   local manifest="${SCRIPT_DIR}/release-manifest.json"
@@ -665,6 +784,8 @@ run that produced no record cannot be accepted"
     blocked "npx (Node.js) is required to validate evidence records"
   command -v node >/dev/null 2>&1 ||
     blocked "node (Node.js) is required to validate evidence records"
+
+  require_manifest_attestation
 
   # Schema conformance requires the record to name a manifest hash and the
   # grace the fleet ran under; this cross-check requires both to match the

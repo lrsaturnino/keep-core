@@ -95,13 +95,35 @@ insufficient. `./rehearse.sh validate-evidence` checks every record under
 requires the recorded manifest hash *and* the recorded termination grace to
 equal the checked-in manifest's — the hash alone would accept a record that
 names the right manifest while claiming the fleet ran under some other
-grace; the Go drift tests pin that manifest's numbers to the compiled
-bounds, so an accepted record links the termination-grace record to the
-exact artifact and chain identity it carries. The validator proves itself
-before validating anything: `test-validate-evidence.sh` drives the stage
-over fixture records — correct binding, wrong hash, wrong grace, missing
-binding fields, malformed timestamp, empty record set — and the stage runs
-that self-test first on every invocation. The
+grace — so an accepted record links the termination-grace record to the
+exact artifact and chain identity it carries.
+
+Those comparisons only mean something while the checked-in manifest is
+still the compiled bounds' own manifest, so the stage refuses to measure
+anything until it holds the receipt proving that. `local-proofs` writes it
+under `EVIDENCE_DIR/attestation` as its last step, after every proof has
+passed: `release-manifest validate` accepts the reviewed file against the
+compiled bounds, `release-manifest derive` records the bounds themselves in
+`derived-manifest.json`, and `reviewed-manifest.sha256` names the exact
+bytes that were validated. `validate-evidence` requires both files, the
+hash to match the manifest as it stands now, and the derived bounds to
+match the reviewed ones field by field — hash-matching alone would accept
+an attestation and a manifest regenerated together around numbers no
+compiled binary produces. Only the free-form notes and the generation
+stamp may differ, and keys are canonically ordered so reformatting a
+reviewed manifest cannot read as drift. The attestation lives in a
+subdirectory because the record glob and the workflow's record probe both
+look at the top level of `EVIDENCE_DIR` only: writing the receipt never
+makes a dispatch that produced no rehearsal record look like it produced
+one. Running `validate-evidence` without a matching attestation is
+BLOCKED, not accepted — regenerate it by re-running `local-proofs` at the
+same commit. The validator proves itself before validating anything:
+`test-validate-evidence.sh` drives the stage over fixture records —
+correct binding, wrong hash, wrong grace, missing binding fields,
+malformed timestamp, empty record set — and over fixture attestations —
+absent, taken over other manifest bytes, contradicting the reviewed
+bounds, and one differing only in notes, stamp, and key order — and the
+stage runs that self-test first on every invocation. The
 `cutover-rehearsal` workflow (manually dispatched, in
 `.github/workflows/cutover-rehearsal.yml`) runs the local proofs, the
 static analyzers, and the contracts build/test on every dispatch — and the

@@ -7,8 +7,11 @@
 # shape, manifest hash, and recorded termination grace are all correct —
 # and rejects a wrong hash, a wrong grace, missing binding fields, a
 # malformed timestamp, an empty record set, and a bad record hiding behind
-# a good one. Needs node/npx like the stage it tests; everything lives
-# under mktemp and this repository is never touched.
+# a good one. It also drives the manifest attestation the stage requires
+# before it measures anything: absent, taken over other manifest bytes, or
+# recording bounds the reviewed manifest contradicts. Needs node/npx like
+# the stage it tests; everything lives under mktemp and this repository is
+# never touched.
 
 set -euo pipefail
 
@@ -78,6 +81,21 @@ write_record() {
 EOF
 }
 
+# The attestation the stage demands before it measures any record against
+# the reviewed manifest. The derived document defaults to the reviewed
+# manifest's own bytes — the Go drift test pins those to the compiled bounds
+# — so the fixtures stay correct across manifest regenerations and this
+# script needs no Go toolchain. The negative cases override one argument
+# each.
+write_attestation() {
+  local dir="$1/attestation"
+  local sha="${2:-${MANIFEST_SHA}}"
+  local derived="${3:-${TEST_DIR}/release-manifest.json}"
+  mkdir -p "${dir}"
+  printf '%s\n' "${sha}" >"${dir}/reviewed-manifest.sha256"
+  cp "${derived}" "${dir}/derived-manifest.json"
+}
+
 # Run stage_validate_evidence against a fixture directory in an isolated
 # subshell so a blocked/fail exit inside the stage never kills the test
 # run; capture rc and combined output.
@@ -124,14 +142,74 @@ check() {
 
 D="${WORK}/bound"
 mkdir -p "${D}"
+write_attestation "${D}"
 write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
   "2026-07-28T00:00:00Z"
 run_validator "${D}"
 check "a record bound to the manifest's hash and grace passes" 0 \
-  "bind the reviewed" "hash and termination grace"
+  "attestation binds" "bind the reviewed" "hash and termination grace"
+
+D="${WORK}/no-attestation"
+mkdir -p "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+run_validator "${D}"
+check "a correct record without a manifest attestation is not accepted" 3 \
+  "no release-manifest attestation" "run the local-proofs stage"
+
+D="${WORK}/stale-attestation"
+mkdir -p "${D}"
+write_attestation "${D}" \
+  "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+run_validator "${D}"
+check "an attestation taken over other manifest bytes is rejected" 3 \
+  "attestation was taken over a manifest" "re-run the local-proofs stage"
+
+# The reviewed manifest and the attestation agree on the hash, but the
+# attested compiled bounds carry a different grace: the case a hash-only
+# check would wave through after both documents were regenerated together.
+D="${WORK}/attested-bounds-differ"
+mkdir -p "${D}"
+node -e '
+  const fs = require("fs");
+  const manifest = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  manifest.termination_grace.termination_grace_period_seconds += 1;
+  fs.writeFileSync(process.argv[2], JSON.stringify(manifest, null, 2));
+' "${TEST_DIR}/release-manifest.json" "${WORK}/other-bounds.json"
+write_attestation "${D}" "${MANIFEST_SHA}" "${WORK}/other-bounds.json"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+run_validator "${D}"
+check "attested bounds contradicting the reviewed manifest are rejected" 3 \
+  "disagrees with the compiled bounds"
+
+# Reformatting and re-stamping a reviewed manifest must not read as drift:
+# only the bounds are compared, canonically ordered.
+D="${WORK}/reformatted-attestation"
+mkdir -p "${D}"
+node -e '
+  const fs = require("fs");
+  const manifest = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  manifest.generated_at = "2000-01-01T00:00:00Z";
+  manifest.termination_grace.notes = "attestation-side note";
+  const reordered = Object.keys(manifest).sort().reduce((o, k) => {
+    o[k] = manifest[k];
+    return o;
+  }, {});
+  fs.writeFileSync(process.argv[2], JSON.stringify(reordered));
+' "${TEST_DIR}/release-manifest.json" "${WORK}/reformatted.json"
+write_attestation "${D}" "${MANIFEST_SHA}" "${WORK}/reformatted.json"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+run_validator "${D}"
+check "an attestation differing only in notes, stamp, and key order passes" 0 \
+  "attestation binds"
 
 D="${WORK}/wrong-sha"
 mkdir -p "${D}"
+write_attestation "${D}"
 write_record "${D}/record.json" \
   "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" \
   "${MANIFEST_GRACE}" "2026-07-28T00:00:00Z"
@@ -141,6 +219,7 @@ check "a schema-valid record naming another manifest's hash is rejected" 3 \
 
 D="${WORK}/wrong-grace"
 mkdir -p "${D}"
+write_attestation "${D}"
 write_record "${D}/record.json" "${MANIFEST_SHA}" 1 "2026-07-28T00:00:00Z"
 run_validator "${D}"
 check "the right hash with a false grace value is rejected" 3 \
@@ -149,6 +228,7 @@ check "the right hash with a false grace value is rejected" 3 \
 
 D="${WORK}/missing-grace"
 mkdir -p "${D}"
+write_attestation "${D}"
 write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
   "2026-07-28T00:00:00Z"
 node -e '
@@ -164,6 +244,7 @@ check "a record missing the grace binding field fails the schema" 3 \
 
 D="${WORK}/missing-binding"
 mkdir -p "${D}"
+write_attestation "${D}"
 write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
   "2026-07-28T00:00:00Z"
 node -e '
@@ -179,6 +260,7 @@ check "a record missing the release-manifest binding fails the schema" 3 \
 
 D="${WORK}/bad-timestamp"
 mkdir -p "${D}"
+write_attestation "${D}"
 write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
   "not-a-timestamp"
 run_validator "${D}"
@@ -193,6 +275,7 @@ check "an empty record set is rejected, never vacuously accepted" 3 \
 
 D="${WORK}/one-bad-among-good"
 mkdir -p "${D}"
+write_attestation "${D}"
 write_record "${D}/a-good.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
   "2026-07-28T00:00:00Z"
 write_record "${D}/b-bad.json" "${MANIFEST_SHA}" 1 "2026-07-28T00:00:00Z"
