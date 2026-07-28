@@ -2824,7 +2824,229 @@ probe_metrics() { probe_get "$1" /metrics; }
 
 # True when a node answers its client-info port at all. Used both ways: to
 # wait for a node to come up, and to prove a quarantined one has gone.
+#
+# This is one node's own HTTP surface and nothing more. It says a node answers
+# or does not answer, which is weaker than the barrier below needs: a candidate
+# whose client-info listener died while its protocol stack kept running answers
+# nothing and is still on the network.
 node_reachable() { probe_get "$1" /diagnostics >/dev/null 2>&1; }
+
+# The compose project prefix every rehearsal gate of this scaffold runs under.
+# A gate's own project name is compose_project; this is what makes another
+# gate's leftovers recognizable as this scaffold's rather than as some
+# unrelated container that happens to share the daemon.
+REHEARSAL_PROJECT_PREFIX="pr4109-"
+
+# Every container on this daemon that a rollback barrier has to account for,
+# one per line as "<label> <state> <networks>".
+#
+# The barrier is about release candidates that could still act, and they are
+# not all in the rehearsal project asking the question. A cutover rehearsal
+# that ran before this one leaves its fleet behind under its own project name,
+# and a distinct project name is not quarantine: two candidates on separate
+# compose networks still watch the same rehearsal chain and still submit
+# against the same contracts. So the inventory is taken daemon-wide and keyed
+# on what makes a container a candidate — created from the candidate image, or
+# belonging to a rehearsal project of any gate and not created from the prior
+# image, which is the artifact a rollback restores rather than one it fences.
+#
+# State and network attachment both come from the daemon, which is the
+# independent observation the per-node HTTP probe is not: a container that is
+# running is participating unless the daemon shows it attached to no network at
+# all, and a container attached to nothing can reach neither its peers nor the
+# chain. Anything else — a name, a project, a stopped sibling — is a claim
+# about quarantine rather than a reading of it.
+candidate_container_inventory() {
+  local candidate="$1" prior="$2" candidate_id prior_id ids raw
+  candidate_id="$(docker image inspect --format '{{.Id}}' "${candidate}" \
+    2>/dev/null)" || return 1
+  prior_id="$(docker image inspect --format '{{.Id}}' "${prior}" \
+    2>/dev/null)" || return 1
+  ids="$(docker ps --all --quiet --no-trunc 2>/dev/null)" || return 1
+  [[ -n "${ids//[[:space:]]/}" ]] || return 0
+
+  # One inspect over every container rather than one per container: a fleet
+  # being torn down under the enumeration would otherwise turn a container that
+  # vanished between the two calls into an inspect failure, and a failure to
+  # read is exactly what this must not confuse with an absence.
+  # shellcheck disable=SC2086
+  raw="$(docker inspect --format \
+    '{{.Image}}|{{.State.Running}}|{{with index .Config.Labels "com.docker.compose.project"}}{{.}}{{end}}|{{with index .Config.Labels "com.docker.compose.service"}}{{.}}{{end}}|{{range $name, $_ := .NetworkSettings.Networks}}{{$name}},{{end}}|{{.Name}}' \
+    ${ids} 2>/dev/null)" || return 1
+
+  local image running project service networks name label state
+  while IFS='|' read -r image running project service networks name; do
+    [[ -n "${image}" ]] || continue
+    if [[ "${image}" == "${prior_id}" ]]; then
+      continue
+    fi
+    if [[ "${image}" != "${candidate_id}" ]] &&
+      [[ "${project}" != "${REHEARSAL_PROJECT_PREFIX}"* ]]; then
+      continue
+    fi
+    if [[ -n "${project}" && -n "${service}" ]]; then
+      label="${project}/${service}"
+    else
+      label="${name#/}"
+    fi
+    case "${running}" in
+    true) state="running" ;;
+    false) state="stopped" ;;
+    *) state="unreadable" ;;
+    esac
+    networks="${networks%,}"
+    printf '%s %s %s\n' "${label}" "${state}" "${networks:--}"
+  done <<<"${raw}"
+}
+
+# What the barrier saw, and the verdict it implies. Both are separated from the
+# enumeration above for the same reason the clock and quiescence verdicts are:
+# a barrier decision is only worth as much as its behavior on the readings it
+# will never see in a passing rehearsal, and those readings cannot be produced
+# by starting containers.
+CANDIDATE_INVENTORY=()
+# The labels this run knows the enumeration must contain — its own candidates.
+# An enumeration that cannot see the containers this very stage created is an
+# instrument failure, and an empty active set drawn from it is the barrier
+# passing on nothing at all.
+CANDIDATE_EXPECTED=()
+# 1 when the daemon was enumerated at all; 0 when it could not be read.
+CANDIDATE_INVENTORY_READ=1
+# 1 once the barrier has been observed to hold, which is what the steps that
+# release the prior artifact key off.
+CANDIDATE_BARRIER_HOLDS=0
+
+# Split CANDIDATE_INVENTORY into what it means for the barrier.
+CANDIDATE_ACTIVE=()
+CANDIDATE_QUARANTINED=()
+CANDIDATE_UNREADABLE=()
+CANDIDATE_MISSING=()
+
+classify_candidate_inventory() {
+  CANDIDATE_ACTIVE=()
+  CANDIDATE_QUARANTINED=()
+  CANDIDATE_UNREADABLE=()
+  CANDIDATE_MISSING=()
+
+  local line label state networks expected found
+  for line in "${CANDIDATE_INVENTORY[@]+"${CANDIDATE_INVENTORY[@]}"}"; do
+    read -r label state networks <<<"${line}"
+    case "${state}" in
+    running)
+      if [[ "${networks}" == "-" ]]; then
+        CANDIDATE_QUARANTINED+=("${label}")
+      else
+        CANDIDATE_ACTIVE+=("${label} on ${networks}")
+      fi
+      ;;
+    stopped) ;;
+    *) CANDIDATE_UNREADABLE+=("${label} [${state:-unreadable}]") ;;
+    esac
+  done
+
+  for expected in "${CANDIDATE_EXPECTED[@]+"${CANDIDATE_EXPECTED[@]}"}"; do
+    found=0
+    for line in "${CANDIDATE_INVENTORY[@]+"${CANDIDATE_INVENTORY[@]}"}"; do
+      read -r label state networks <<<"${line}"
+      if [[ "${label}" == "${expected}" ]]; then
+        found=1
+        break
+      fi
+    done
+    ((found == 1)) || CANDIDATE_MISSING+=("${expected}")
+  done
+}
+
+# The barrier verdict over that classification, recorded as the named step.
+# Sets CANDIDATE_BARRIER_HOLDS, which is the single fact every later step that
+# would release or refuse the prior artifact reads.
+candidate_barrier_verdict() {
+  local step="$1" assertion="$2"
+  CANDIDATE_BARRIER_HOLDS=0
+  classify_candidate_inventory
+
+  if ((CANDIDATE_INVENTORY_READ == 0)); then
+    block_step "${step}" "the container daemon could not be enumerated, so \
+nothing here knows which release candidates are still running; a barrier that \
+cannot see the fleet it fences has not been established"
+    record_assertion "${assertion}" false "${step}"
+  elif ((${#CANDIDATE_MISSING[@]} > 0)); then
+    block_step "${step}" "the enumeration did not find this rehearsal's own \
+candidate(s) — ${CANDIDATE_MISSING[*]} — so it is not seeing the containers \
+this stage created; an empty active set read from it is the instrument \
+failing rather than the barrier holding"
+    record_assertion "${assertion}" false "${step}"
+  elif ((${#CANDIDATE_UNREADABLE[@]} > 0)); then
+    block_step "${step}" "the run state of ${CANDIDATE_UNREADABLE[*]} could \
+not be read; a candidate whose state is unknown is not a candidate known to \
+be down"
+    record_assertion "${assertion}" false "${step}"
+  elif ((${#CANDIDATE_ACTIVE[@]} > 0)); then
+    record_step "${step}" fail "still running and attached to a network: \
+${CANDIDATE_ACTIVE[*]}; a separate compose project is not quarantine — a \
+candidate left on any network still watches the same rehearsal chain and \
+still acts on it"
+    record_assertion "${assertion}" false "${step}"
+  else
+    local quarantined=""
+    if ((${#CANDIDATE_QUARANTINED[@]} > 0)); then
+      quarantined=" or attached to no network (${CANDIDATE_QUARANTINED[*]})"
+    fi
+    CANDIDATE_BARRIER_HOLDS=1
+    record_step "${step}" pass "every release candidate on the daemon — \
+${#CANDIDATE_INVENTORY[@]} container(s) across every rehearsal project, not \
+only this gate's own — is stopped${quarantined}"
+    record_assertion "${assertion}" true "${step}"
+  fi
+}
+
+# Fill CANDIDATE_INVENTORY from the daemon, then correct it with what this
+# gate's own nodes actually answer.
+#
+# The two readings are kept in this order on purpose. The daemon is the
+# independent instrument — it sees candidates in projects this gate never
+# started — but it reports the container's lifecycle, not the process's
+# behavior. A node still answering its client-info port is participating
+# whatever the daemon believes about it, so an answering service is promoted
+# back to running here rather than being taken as down on the daemon's word.
+read_candidate_inventory() {
+  local inventory service label found line other
+
+  CANDIDATE_INVENTORY=()
+  CANDIDATE_EXPECTED=()
+  CANDIDATE_INVENTORY_READ=1
+
+  if ! inventory="$(candidate_container_inventory "${R1_IMAGE_DIGEST}" \
+    "${PRIOR_IMAGE_DIGEST}")"; then
+    CANDIDATE_INVENTORY_READ=0
+    return 0
+  fi
+  while read -r line; do
+    [[ -n "${line}" ]] || continue
+    CANDIDATE_INVENTORY+=("${line}")
+  done <<<"${inventory}"
+
+  for service in "${REHEARSAL_R1_SERVICES[@]}"; do
+    label="$(compose_project)/${service}"
+    CANDIDATE_EXPECTED+=("${label}")
+    node_reachable "${service}" || continue
+    # Answering after the daemon called it stopped is the contradiction worth
+    # keeping: the barrier must read it as an active candidate, and the
+    # network it is answering on is the one thing observed about its reach.
+    found=0
+    other=()
+    for line in "${CANDIDATE_INVENTORY[@]+"${CANDIDATE_INVENTORY[@]}"}"; do
+      if [[ "${line}" == "${label} "* ]]; then
+        found=1
+        other+=("${label} running $(rehearsal_network)")
+      else
+        other+=("${line}")
+      fi
+    done
+    ((found == 1)) || other+=("${label} running $(rehearsal_network)")
+    CANDIDATE_INVENTORY=("${other[@]}")
+  done
+}
 
 # One field of a node's live participation gate state. This is the gate's own
 # reading of the chain clock and its own mode accounting, which is what the
@@ -4593,6 +4815,21 @@ originated on the rehearsal chain that is still running at shutdown"
   block_step "quiescence with an in-flight legacy permit" \
     "${LEGACY_INTEROP_UNAVAILABLE}"
 
+  # This gate ends where the next one begins. A rollback rehearsal's whole
+  # subject is that no prior binary participates while a release candidate can
+  # still act, and a cutover fleet left running is a release candidate that can
+  # still act — on the same rehearsal chain, whatever compose project it
+  # belongs to. Stopping it is part of this gate rather than of the orchestrator
+  # around it, because a stage that failed halfway must not leave the next one
+  # measuring a barrier against a fleet nobody accounted for.
+  begin_step "the cutover fleet leaves no release candidate running"
+  compose stop --timeout "$(manifest_termination_grace)" \
+    "${REHEARSAL_PRIOR_SERVICE}" "${REHEARSAL_R1_SERVICES[@]}" || true
+  read_candidate_inventory
+  candidate_barrier_verdict \
+    "the cutover fleet leaves no release candidate running" \
+    "a finished cutover rehearsal leaves no candidate able to act"
+
   conclude_rehearsal
 }
 
@@ -4728,28 +4965,21 @@ taken from before the drain started to after it finished"
 which needs work originated on the rehearsal chain and — for the tBTC case a \
 rollback must cover — a wallet action already running"
 
-  # Step 4. Every R1 process stopped, proved from the network rather than
-  # from the orchestrator's own bookkeeping.
-  begin_step "every R1 process is stopped or network-quarantined"
-  local still_up=()
-  for service in "${REHEARSAL_R1_SERVICES[@]}"; do
-    if node_reachable "${service}"; then
-      still_up+=("${service}")
-    fi
-  done
-  if ((${#still_up[@]} == 0)); then
-    record_step "every R1 process is stopped or network-quarantined" pass \
-      "no R1 node answers on the internal rehearsal network"
-    record_assertion \
-      "all R1 is down or quarantined before any prior binary participates" \
-      true "every R1 process is stopped or network-quarantined"
-  else
-    record_step "every R1 process is stopped or network-quarantined" fail \
-      "still reachable: ${still_up[*]}"
-    record_assertion \
-      "all R1 is down or quarantined before any prior binary participates" \
-      false "every R1 process is stopped or network-quarantined"
-  fi
+  # Step 4. Every release candidate stopped — every one on the daemon, not
+  # only the two this project started.
+  #
+  # A rollback rehearsal runs after a cutover rehearsal, and the cutover fleet
+  # is a fleet of the same candidate artifact watching the same chain. Asking
+  # only this project's services whether they answer would authorize releasing
+  # the prior binary alongside a candidate that a previous gate left running,
+  # which is precisely the concurrent-write hazard the barrier exists to
+  # forbid. Separate compose projects are separate namespaces, not separate
+  # chains.
+  begin_step "every release candidate is stopped or network-quarantined"
+  read_candidate_inventory
+  candidate_barrier_verdict \
+    "every release candidate is stopped or network-quarantined" \
+    "all R1 is down or quarantined before any prior binary participates"
 
   # Step 5. The offline state audit over every node's snapshot. This is the
   # repository's own tool and runs here for real, with the external evidence
@@ -4797,19 +5027,20 @@ reconciliation, quiescence, and prior-reader evidence"
   # binary on the first alone is a rollback performed without knowing whether
   # it is safe, which is the failure this gate exists to catch.
   begin_step "stage the prior digest behind the all-candidate-down barrier"
-  if ((${#still_up[@]} == 0 && audit_ready == 1)); then
+  if ((CANDIDATE_BARRIER_HOLDS == 1 && audit_ready == 1)); then
     compose start "${REHEARSAL_PRIOR_SERVICE}"
     # The binary that was released has to be the prior artifact the audit
     # authorized rolling back to, not whatever the compose file resolved.
     verify_running_images "${PRIOR_IMAGE_DIGEST}" "${REHEARSAL_PRIOR_SERVICE}"
     record_step "stage the prior digest behind the all-candidate-down barrier" \
-      pass "the prior binary was released only after every R1 node was proved \
-unreachable and every snapshot audited rollback-safe, and the container that \
-came up is the audited prior digest"
-  elif ((${#still_up[@]} > 0)); then
+      pass "the prior binary was released only after every release candidate \
+on the daemon was proved stopped or attached to no network and every snapshot \
+audited rollback-safe, and the container that came up is the audited prior \
+digest"
+  elif ((CANDIDATE_BARRIER_HOLDS == 0)); then
     record_step "stage the prior digest behind the all-candidate-down barrier" \
-      blocked "the barrier does not hold — ${still_up[*]} still answer — so \
-the prior binary was deliberately not released"
+      blocked "the all-candidate-down barrier does not hold, so the prior \
+binary was deliberately not released"
   else
     record_step "stage the prior digest behind the all-candidate-down barrier" \
       blocked "every R1 node is down, but the offline state audit did not \
@@ -4830,17 +5061,17 @@ originated on the rehearsal chain"
   # Step 8. The forbidden partial rollback: bringing a prior binary up while
   # an R1 node still runs. The harness must refuse it.
   begin_step "a forbidden partial rollback is blocked"
-  if ((${#still_up[@]} == 0)); then
+  if ((CANDIDATE_BARRIER_HOLDS == 1)); then
     record_step "a forbidden partial rollback is blocked" pass \
-      "the barrier check above is the block: the prior binary is released \
-only on an empty reachable-R1 set, and a nonempty one records a blocked step \
-instead of starting it"
+      "the barrier check above is the block: the prior binary is released only \
+on a daemon-wide candidate set that is entirely stopped or attached to no \
+network, and any other reading records a blocked step instead of starting it"
     record_assertion "a partial rollback cannot be performed" true \
       "a forbidden partial rollback is blocked"
   else
     record_step "a forbidden partial rollback is blocked" pass \
-      "the barrier refused to release the prior binary with ${still_up[*]} \
-still reachable"
+      "the barrier refused to release the prior binary with \
+${CANDIDATE_ACTIVE[*]:-an unestablished candidate inventory} outstanding"
     record_assertion "a partial rollback cannot be performed" true \
       "a forbidden partial rollback is blocked"
   fi

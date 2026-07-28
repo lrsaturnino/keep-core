@@ -1562,6 +1562,80 @@ run_verdict straggler_case eval \
 check "an unreadable cross-format counter observes no straggler at all" 3 \
   "announcer_cross_format_peer_total"
 
+# The all-candidate-down barrier, whose evidence used to be one probe of the
+# asking project's own two services. The readings below are the ones a passing
+# rehearsal never produces and no fleet can be arranged to produce on demand:
+# another gate's leftovers, a container the daemon cannot describe, and an
+# enumeration that cannot even see the containers the asking stage created.
+BARRIER_STEP="every release candidate is stopped or network-quarantined"
+BARRIER_ASSERTION="all R1 is down or quarantined before any prior binary \
+participates"
+
+barrier_readings() {
+  # shellcheck disable=SC2034
+  CANDIDATE_INVENTORY=(
+    "pr4109-rollback/r1-node-1 stopped -"
+    "pr4109-rollback/r1-node-2 stopped -"
+    "pr4109-single_release/r1-node-1 stopped -"
+  )
+  # shellcheck disable=SC2034
+  CANDIDATE_EXPECTED=(
+    "pr4109-rollback/r1-node-1"
+    "pr4109-rollback/r1-node-2"
+  )
+  # shellcheck disable=SC2034
+  CANDIDATE_INVENTORY_READ=1
+}
+
+barrier_case() {
+  barrier_readings
+  "$@"
+  candidate_barrier_verdict "${BARRIER_STEP}" "${BARRIER_ASSERTION}"
+  printf 'holds:%s\n' "${CANDIDATE_BARRIER_HOLDS}"
+}
+
+run_verdict barrier_case :
+check "a daemon whose every candidate is stopped establishes the barrier" 0 \
+  "3 container\(s\) across every rehearsal project" "holds:1"
+
+# The regression this seam exists for: the asking project is quiet and another
+# gate's fleet is not, and a distinct compose project is not a quarantine.
+run_verdict barrier_case eval \
+  'CANDIDATE_INVENTORY+=("pr4109-single_release/r1-node-2 running \
+pr4109-single_release_rehearsal,pr4109-single_release_chain-egress")'
+check "a candidate left running by another gate refutes the barrier" 1 \
+  "pr4109-single_release/r1-node-2 on pr4109-single_release_rehearsal" \
+  "separate compose project is not quarantine" "holds:0"
+
+# A candidate started outside any rehearsal project, recognized by the image it
+# was created from rather than by a label it need not carry.
+run_verdict barrier_case eval \
+  'CANDIDATE_INVENTORY+=("stray-candidate running bridge")'
+check "an unlabelled candidate on a network refutes the barrier" 1 \
+  "stray-candidate on bridge" "holds:0"
+
+# Attached to nothing is the one quarantine this script can read rather than
+# take on trust, so it holds — and the record names which container it was.
+run_verdict barrier_case eval \
+  'CANDIDATE_INVENTORY+=("pr4109-single_release/r1-node-2 running -")'
+check "a running candidate attached to no network is quarantined" 0 \
+  "attached to no network \(pr4109-single_release/r1-node-2\)" "holds:1"
+
+run_verdict barrier_case eval \
+  'CANDIDATE_INVENTORY+=("pr4109-single_release/r1-node-2 unreadable -")'
+check "a candidate whose state cannot be read is not a candidate known down" \
+  3 "run state of pr4109-single_release/r1-node-2" "holds:0"
+
+# The vacuous pass: an enumeration returning nothing has an empty active set
+# too, and an empty active set is what the barrier holding looks like.
+run_verdict barrier_case eval 'CANDIDATE_INVENTORY=()'
+check "an enumeration blind to this gate's own candidates blocks" 3 \
+  "did not find this rehearsal's own candidate" "holds:0"
+
+run_verdict barrier_case eval 'CANDIDATE_INVENTORY_READ=0'
+check "a daemon that could not be enumerated establishes no barrier" 3 \
+  "could not be enumerated" "holds:0"
+
 # Neither container stage can be executed anywhere but a real rehearsal — they
 # need the immutable images, a chain, and persistent volumes — so a call site
 # left pointing at a renamed helper survives every check in this file and

@@ -411,6 +411,22 @@ jobs:
         id: single_release
         run: ./scripts/release/pr4109/rehearse.sh single-release
 
+      # The cutover fleet stops before the rollback gate starts, and it stops
+      # here as well as inside the stage that owns it: a single-release stage
+      # that failed halfway never reached its own closing step, and the fleet
+      # it left behind is a release candidate watching the same rehearsal chain
+      # the rollback gate is about to declare quiet. The rollback stage
+      # enumerates the daemon and refuses to release the prior binary while any
+      # candidate is still attached to a network, so this step is what keeps
+      # that refusal from being the normal outcome rather than what establishes
+      # the barrier. Volumes stay: the state the drained fleet left is evidence.
+      - name: Stop the cutover fleet before the rollback gate
+        if: ${{ !cancelled() && steps.preflight.outcome == 'success' }}
+        run: |
+          docker compose --project-name pr4109-single_release \
+            --file ./scripts/release/pr4109/compose.rehearsal.yaml \
+            stop || true
+
       # A refused cutover rehearsal is exactly when the rollback gate's
       # evidence matters most, so it runs on the cutover's verdict being
       # anything at all. Only a failed preflight stops it: that means the

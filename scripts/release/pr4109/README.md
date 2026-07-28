@@ -204,14 +204,36 @@ acceptance conditions still rest on the fleet's own counters; the hashes are
 what let those counters be checked against the chain.
 
 The rollback gate's own barrier has two halves and neither substitutes for
-the other. The R1 fleet must be provably down, and the prior binary must have
-been absent for the whole of it — so the drain runs while the prior service
-is sampled repeatedly, from before the drain starts to after it finishes,
-rather than probed once at the end. A single closing probe is satisfied by a
-prior binary that participated for all of quiescence and stopped a second
-before the probe, which is exactly the sequence the barrier forbids. The
-second half is the offline state audit reporting `rollback_barrier_ready` for
-every snapshot: an all-down fleet says two releases cannot write the same
+the other. Every release candidate must be provably down, and the prior binary
+must have been absent for the whole of it — so the drain runs while the prior
+service is sampled repeatedly, from before the drain starts to after it
+finishes, rather than probed once at the end. A single closing probe is
+satisfied by a prior binary that participated for all of quiescence and stopped
+a second before the probe, which is exactly the sequence the barrier forbids.
+
+"Every release candidate" is daemon-wide, not this project's two services. A
+rollback rehearsal runs after a cutover rehearsal, and the cutover fleet is a
+fleet of the same candidate artifact watching the same rehearsal chain: a
+distinct compose project is a distinct namespace, not a distinct chain, so a
+candidate another gate left running would go on submitting against the same
+contracts while the prior binary was released beside it. The barrier therefore
+enumerates every container on the daemon that was created from the candidate
+image or belongs to any `pr4109-*` project, and requires each one to be stopped
+or attached to no network at all. Attachment comes from the daemon rather than
+from the node's own HTTP surface, because a candidate whose client-info
+listener died while its protocol stack kept running answers nothing and is
+still on the network; conversely a service that does answer is promoted back to
+active whatever the daemon believes, since a node serving requests is
+participating. An enumeration that cannot see the containers the asking stage
+itself created blocks rather than passing — an empty active set read from a
+blind instrument looks exactly like a barrier that holds. The cutover stage
+closes by stopping its own fleet and recording the same verdict, and the
+workflow stops that project again before dispatching the rollback gate, so a
+single-release stage that failed halfway cannot leave the next gate measuring
+a barrier against a fleet nobody accounted for.
+
+The second half is the offline state audit reporting `rollback_barrier_ready`
+for every snapshot: an all-down fleet says two releases cannot write the same
 state at once, not that the state they left is safe to roll back onto. Those
 snapshots are captured here, out of the containers the drain stopped, with
 the storage path read off each container rather than restated — a supplied
