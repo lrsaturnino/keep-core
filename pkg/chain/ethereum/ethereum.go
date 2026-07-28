@@ -495,6 +495,20 @@ func (bc *baseChain) AverageBlockTime() time.Duration {
 	return 12 * time.Second
 }
 
+// ChainID is the chain id the connected Ethereum endpoint reported when this
+// handle was constructed, checked there against the configured network.
+//
+// It is the chain this node actually reached rather than the one an operator
+// or a deployment record claims it reached, which is what makes it usable as
+// evidence: a cutover block is only meaningful together with the chain it
+// counts on, and a release decision taken over a record whose chain identity
+// was copied from its own inputs has verified nothing about where the blocks
+// came from. A copy is returned because the value is shared with every
+// transaction this handle submits.
+func (bc *baseChain) ChainID() *big.Int {
+	return new(big.Int).Set(bc.chainID)
+}
+
 // wrapClientAddons wraps the client instance with add-ons like logging, rate
 // limiting and so on.
 func wrapClientAddons(

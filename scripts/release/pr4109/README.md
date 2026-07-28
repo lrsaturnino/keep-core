@@ -409,13 +409,17 @@ node, a missing and a doubled volume, a failed copy, and an inherited capture
 — and the audit against a tool that refused while a ready manifest sat at its
 output path, and one that wrote nothing at all.
 
-One binding the harness still cannot make is the chain identity: the record's
-`chain_id` is the supplied `CHAIN_ID`, because a node publishes its chain
-address and gate state but not the chain it is connected to, and the fleet
-reaches that chain over a websocket no probe here can interrogate. Binding it
-needs an authenticated observation of the chain the fleet actually used, which
-is an outstanding gap and not a closed one. Every other identity in a record
-is an observation. The receipt lifecycle is proved through `stage_local_proofs`
+The chain identity is an observation too. The client publishes
+`protocol_participation.ethereum_chain_id` — the chain id its own endpoint
+returned when the chain handle was built, checked there against the configured
+network — and the identity capture requires every R1 node to report the chain
+the record is written against. A cutover block is a count on one chain, so a
+fleet pointed at another chain crossed a different schedule and every block,
+crossing, and reconciliation in the record would be attributed to a chain the
+fleet was never on. The supplied `CHAIN_ID` is now what the observation is
+checked against rather than what the record asserts, and a fleet that will not
+name its chain cannot be evidenced at all. The receipt lifecycle is proved
+through `stage_local_proofs`
 itself rather than through the invalidation function alone: a reused
 evidence directory is given a valid inherited receipt, the stage's proof
 seam is failed the way any proof failure fails it, and the case requires

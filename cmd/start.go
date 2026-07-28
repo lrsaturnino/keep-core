@@ -209,14 +209,22 @@ func start(cmd *cobra.Command) error {
 
 		// Expose the gate's identity and live state so a diagnostics scrape
 		// answers the readiness questions directly: which epoch this artifact
-		// is, which cutover block it compiled or resolved, and what the gate
-		// is doing right now.
+		// is, which chain it clocks itself against, which cutover block it
+		// compiled or resolved, and what the gate is doing right now.
+		//
+		// The chain id is read off the connected endpoint rather than off the
+		// configuration, because a cutover block means nothing without the
+		// chain it counts on: a node armed with the right C against the wrong
+		// chain is exactly the misconfiguration a readiness scrape has to be
+		// able to see, and a configured value would agree with itself.
+		ethereumChainID := beaconChain.ChainID().String()
 		clientInfoRegistry.RegisterDiagnosticSource(
 			"protocol_participation",
 			func() string {
 				snapshot := participationGate.State()
 				bytes, err := json.Marshal(map[string]interface{}{
 					"protocol_epoch":                participation.CompiledEpoch.String(),
+					"ethereum_chain_id":             ethereumChainID,
 					"cutover_block":                 snapshot.CutoverBlock,
 					"cutover_block_source":          cutoverBlockSource,
 					"gate_state":                    snapshot.State.String(),

@@ -586,6 +586,7 @@ diagnostics_document() {
   local epoch="${2:-security_v2_cutover}"
   local cutover="${3:-9000000}"
   local version="${4:-v2.0.0-rehearsal}"
+  local chain="${5-11155111}"
   cat <<EOF
 {
   "client_info": {
@@ -597,6 +598,7 @@ diagnostics_document() {
   "cutover_legacy_peers": { "revision": 0, "peers": [] },
   "protocol_participation": {
     "protocol_epoch": "${epoch}",
+    "ethereum_chain_id": "${chain}",
     "cutover_block": ${cutover},
     "gate_state": "open_security_v2",
     "current_block": 9000001,
@@ -894,6 +896,8 @@ run_capture() {
       REPO_ROOT="${WORK}/repo"
       # shellcheck disable=SC2030,SC2031,SC2034
       CUTOVER_BLOCK="9000000"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      CHAIN_ID="11155111"
       "$@"
       capture_r1_release_identity
     ) 2>&1
@@ -968,6 +972,34 @@ silent_revision_fleet() {
 run_capture silent_revision_fleet
 check "a fleet reporting no revision at all refuses the run" 3 \
   "does not report the version, revision"
+
+# The chain identity the record used to take from its own dispatch input,
+# which agrees with itself whichever chain the fleet was pointed at. A cutover
+# block is a count on one chain, so a fleet on another chain crossed a
+# different schedule.
+wrong_chain_fleet() {
+  # shellcheck disable=SC2329
+  probe_diagnostics() {
+    diagnostics_document "${FIXTURE_SHA}" security_v2_cutover 9000000 \
+      v2.0.0-rehearsal 1
+  }
+}
+
+run_capture wrong_chain_fleet
+check "a fleet connected to another chain refuses the run" 3 \
+  "connected to Ethereum chain \[1\]"
+
+silent_chain_fleet() {
+  # shellcheck disable=SC2329
+  probe_diagnostics() {
+    diagnostics_document "${FIXTURE_SHA}" security_v2_cutover 9000000 \
+      v2.0.0-rehearsal ""
+  }
+}
+
+run_capture silent_chain_fleet
+check "a fleet that will not name its chain cannot be evidenced" 3 \
+  "protocol_participation.ethereum_chain_id"
 
 run_capture wrong_cutover_fleet
 check "a fleet armed with another cutover block refuses the run" 3 \

@@ -3370,6 +3370,9 @@ node_release_identity() {
         if (!gate.protocol_epoch) {
           missing.push("protocol_participation.protocol_epoch");
         }
+        if (!gate.ethereum_chain_id) {
+          missing.push("protocol_participation.ethereum_chain_id");
+        }
         if (!Number.isInteger(gate.cutover_block)) {
           missing.push("protocol_participation.cutover_block");
         }
@@ -3381,6 +3384,7 @@ node_release_identity() {
           version: info.version,
           revision: info.revision,
           protocol_epoch: gate.protocol_epoch,
+          ethereum_chain_id: gate.ethereum_chain_id,
           cutover_block: gate.cutover_block,
         }));
       });
@@ -3510,6 +3514,7 @@ REHEARSAL_R1_CUTOVER_BLOCK=""
 
 capture_r1_release_identity() {
   local attested manifest_epoch service reported revision epoch cutover
+  local reported_chain
   local agreed=""
   attested="$(attested_source_identity)"
   manifest_epoch="$(manifest_protocol_epoch)"
@@ -3549,6 +3554,20 @@ release manifest this run measures everything against is for \
 bounds and this record describe"
     fi
 
+    # The chain the node actually reached, as it read it back from its own
+    # endpoint at startup. Until this comparison the record's chain identity
+    # was the dispatch input copied into it, which agrees with itself no
+    # matter which chain the fleet was pointed at — and a cutover block is a
+    # count on one chain, so a C observed on another chain is an observation
+    # about a different schedule entirely.
+    reported_chain="$(json_field "${reported}" ethereum_chain_id)"
+    if [[ "${reported_chain}" != "${CHAIN_ID}" ]]; then
+      blocked "${service} is connected to Ethereum chain [${reported_chain}], but \
+this rehearsal records its evidence against chain [${CHAIN_ID}]; every block, \
+crossing, and reconciliation below would be attributed to a chain the fleet \
+was never on"
+    fi
+
     if [[ -z "${agreed}" ]]; then
       agreed="${reported}"
     elif [[ "${reported}" != "${agreed}" ]]; then
@@ -3562,7 +3581,7 @@ fleet is not one release under test and one record cannot speak for both"
   REHEARSAL_R1_EPOCH="$(json_field "${agreed}" protocol_epoch)"
   REHEARSAL_R1_CUTOVER_BLOCK="$(json_field "${agreed}" cutover_block)"
   note "every R1 node reports ${agreed}, matching the attested source \
-${attested} and the rehearsed C"
+${attested}, the rehearsed C, and the chain the record is written against"
 }
 
 # Build the record and hand it to the acceptance stage's own validator. The
