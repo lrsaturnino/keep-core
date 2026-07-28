@@ -59,11 +59,22 @@ name: Cutover Scaffold Lint
 # a `shell:` naming another interpreter, or a step that merely prints this
 # command all fail the gate closed rather than quietly retiring it.
 #
-# What none of that can prove is that this workflow ran, because the check
-# lives behind the invocation it is checking. scaffold-lint MUST therefore be a
-# required status check on the protected branches; without that setting a
-# commit deleting this file deletes its own enforcement. See
-# scripts/release/pr4109/README.md.
+# What surrounds the step is read for the same reason, because the identical
+# command reaches something else entirely when the environment or the tree
+# changes under it: an env: block on the step, the job or the workflow, an
+# assignment other than EVIDENCE_DIR written onto the invocation, a
+# working-directory:, a job container:, and any run: step ahead of this one in
+# the job all fail closed. Keep the preceding steps to actions, and pass
+# EVIDENCE_DIR on the command line as below.
+#
+# What none of that can prove is that this workflow ran, or that the run
+# reporting success ran this file — the check lives behind the invocation it is
+# checking, and the job producing the check is defined by the same commit under
+# test. A branch-protection rule requiring the scaffold-lint check therefore
+# holds the job name, not this analysis. Closing that needs an
+# organisation-level required workflow defined outside this repository; until
+# one is configured this gate is advisory, and a commit deleting this file
+# deletes its own enforcement. See scripts/release/pr4109/README.md.
 
 on:
   push:

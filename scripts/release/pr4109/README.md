@@ -267,12 +267,16 @@ own log would count as divergence and fail the stage that wrote it.
 Everything above runs only when somebody dispatches it, which is the wrong
 gate for the checkers that decide what may become release evidence. The
 `cutover-scaffold-lint` workflow
-(`.github/workflows/cutover-scaffold-lint.yml`) closes that: on every push
-and pull request touching the scaffold it runs `./rehearse.sh
-shell-analysis`, so a change to `rehearse.sh`, to either self-test, or to
-the workflows themselves cannot merge without shell syntax, ShellCheck,
-actionlint, the build-context mirror check, and both validator self-tests
-passing. Its path filters cover the build inputs the trust model is derived
+(`.github/workflows/cutover-scaffold-lint.yml`) is what runs without being
+asked: on every push and pull request touching the scaffold it runs
+`./rehearse.sh shell-analysis`, which puts shell syntax, ShellCheck,
+actionlint, the build-context mirror check, and both validator self-tests over
+every change to `rehearse.sh`, to either self-test, and to the workflows
+themselves. Whether failing it also *blocks a merge* is a setting outside this
+repository, and one whose standing is recorded — not assumed — under "An
+immutable required workflow behind the scaffold gate" in **Hard external
+dependencies**. Its path filters cover the build inputs the trust model is
+derived
 from as well as the scaffold's own files — `.dockerignore`, both ignore files
 the build could select, the root and nested `.gitignore` rules, `Dockerfile`,
 and the root and per-package `Makefile`s — because each of them decides what
@@ -352,18 +356,56 @@ runner's own contexts (`github.workspace`, `runner.temp` and their siblings)
 are accepted, and an expression carrying pull-request text is refused, since
 its value is what would decide the command.
 
-What none of that proves is that a run happened. `shell-analysis` reads the
-head commit's workflow file, and the check that would notice the invocation
-being deleted lives *behind* that invocation: a commit that removes the step
-also removes the run that would have objected. The control that closes this
-is not in the repository and cannot be — **`scaffold-lint` MUST be configured
-as a required status check** on the protected branches (branch-protection
-rule, or an organisation-level required workflow), so that a pull request
-whose head commit produces no `scaffold-lint` conclusion cannot merge at all.
-Without that setting the workflow is advisory: deleting it deletes its own
-enforcement silently. `shell-analysis`'s own log says as much rather than
-claiming otherwise — it reports what the commit under test says, and names
-this paragraph for what says the rest.
+Reading the command is still not reading the run. The same invocation, spelled
+character for character as the checked-in one, reaches something else entirely
+when the environment or the tree around it changes, and none of that touches a
+line the paragraphs above read. So four more shapes are refused:
+
+- **`env:`**, on the step, the job or the workflow. The runner writes those
+  names into the step's shell before it parses anything, and a `BASH_ENV`
+  there names a file that shell sources first — where a function can be
+  defined under the entrypoint's own name. The accepted command word then
+  resolves to that function and returns whatever it says. An assignment
+  written onto the invocation itself (`BASH_ENV=… ./rehearse.sh
+  shell-analysis`) is the same interception with no key to hold it, so the
+  assignments ahead of the command are read rather than skipped: only
+  `EVIDENCE_DIR`, the one environment name this entrypoint documents itself as
+  reading, is accepted there.
+- **`working-directory:`**. The invocation is a relative path; resolved from
+  another directory it names another file, and what was proved to run is an
+  analysis somewhere else.
+- **`container:`** on the job. The image decides both what `bash` is and what
+  stands at the entrypoint's path, and nothing here reads images.
+- **a preceding `run:` step in the same job.** It needs no key on the analysis
+  step at all: it can write another file over the entrypoint in the checkout,
+  or append `BASH_ENV` to `$GITHUB_ENV` for every step after it.
+
+What none of that proves is that a run happened, or that a run reporting
+success ran this file. Everything `shell-analysis` reads is the head commit's —
+the workflow, the steps around the invocation, the entrypoint itself — and the
+check that would notice the invocation being deleted lives *behind* that
+invocation: a commit that removes the step also removes the run that would have
+objected.
+
+**A branch-protection rule requiring the `scaffold-lint` check does not close
+this**, and this scaffold does not claim it does. That rule requires a
+conclusion under a job name, and the job producing it is defined by the same
+head commit under test: a commit keeping the name while its job runs something
+else reports success and merges. The four refusals above narrow that to shapes
+this parser reads; they are a narrowing and not a closure, and shapes outside
+them remain — a preceding `uses:` step runs code from another repository and
+reaches `$GITHUB_ENV` and the checkout just as directly, and it is accepted
+here only because refusing it would refuse the checkout the analysis needs to
+read anything at all.
+
+The control that does close it has to be defined where the pull request cannot
+edit it: an **organisation-level required workflow**, whose text lives outside
+this repository, running this analysis against the head commit. It is tracked
+as an outstanding external dependency, with what was and was not checkable from
+here, under "An immutable required workflow behind the scaffold gate" in **Hard
+external dependencies** — and until it is confirmed, this gate is advisory.
+`shell-analysis`'s own log says exactly that rather than claiming otherwise: it
+reports what the commit under test says, and names this file for the rest.
 
 The same reasoning covers the other claim this scaffold makes about work it
 did not do itself. `solidity-proofs` says its evidence is
@@ -467,6 +509,44 @@ with `derive`, re-reviewing it, and updating every scaffold site; the `cmd`
 tests refuse any shortcut through that sequence.
 
 ## Hard external dependencies
+
+### An immutable required workflow behind the scaffold gate
+
+`shell-analysis` proves what the commit under test *says* about
+`cutover-scaffold-lint.yml`, and it cannot prove that a run of that workflow
+happened or that a run reporting success ran this analyzer — the check lives
+behind the invocation it checks, and the job producing the check is defined by
+the same head commit. The reading detailed under "Cutover rehearsal scaffold"
+narrows the shapes a green conclusion can hide (an `env:` at any level, an
+assignment on the invocation, a `working-directory:`, a job `container:`, a
+preceding `run:` step); it does not close the boundary, and a preceding `uses:`
+step is accepted while reaching `$GITHUB_ENV` and the checkout just as
+directly.
+
+Only a control defined where the pull request cannot edit it closes this: an
+**organisation-level required workflow** running this analysis against the head
+commit, its text living outside this repository. A branch-protection rule
+requiring the `scaffold-lint` check is *not* a substitute — it requires a
+conclusion under a job name that the commit under test defines.
+
+Standing, checked empirically on 2026-07-28:
+`GET /repos/threshold-network/keep-core/rulesets` returns an empty list, so no
+repository ruleset requires this or any other check;
+`GET /repos/threshold-network/keep-core/branches/main/protection` returns 404,
+which for that endpoint means either no protection or no admin rights and so
+settles nothing either way; and
+`GET /orgs/threshold-network/actions/required_workflows` returns 403 without
+`admin:org`, so the control cannot be confirmed or denied from outside the
+organisation at all.
+
+Until an organisation admin confirms such a workflow exists and names this
+analysis, **the gate is advisory**: a commit deleting
+`cutover-scaffold-lint.yml` deletes its own enforcement silently, and a green
+`scaffold-lint` conclusion is evidence that something under that name
+succeeded, not that this analyzer ran. Evidence that rests on the scaffold's
+own checkers having judged a change should be read with that in mind.
+Unblocking is a configuration change plus the confirmation record, not a code
+change here.
 
 ### Reviewed tss-lib fork with an immutable per-party legacy mode
 
