@@ -331,10 +331,15 @@ started directly under no compose project at all — is invisible to a probe
 keyed on this project's service name while watching the same rehearsal chain,
 and a process still answering its client-info port after the daemon called its
 container stopped is invisible to the enumeration. A prior container is counted
-as participating when it is running and attached to any network, quarantined
-when running and attached to none, and its unreadable state blocks rather than
-passes. As on the candidate side, an enumeration that cannot see this project's
-own staged prior container blocks: an empty active set read from a blind
+as participating when it is running and can still reach anything, quarantined
+when running and reaching nothing, and its unreadable state blocks rather than
+passes. Reachability is read from the container's network mode beside its
+network map, because the map alone answers it backwards in both directions: a
+container run with `container:`/`service:` mode owns no network entry precisely
+because it holds another container's stack, and Docker lists `none` in the map
+like any other network, so genuine isolation does not present as an empty map.
+As on the candidate side, an enumeration that cannot see this project's own
+staged prior container blocks: an empty active set read from a blind
 instrument looks exactly like a barrier that holds.
 
 "Every release candidate" is daemon-wide, not this project's two services. A
@@ -345,18 +350,18 @@ candidate another gate left running would go on submitting against the same
 contracts while the prior binary was released beside it. The barrier therefore
 enumerates every container on the daemon that was created from the candidate
 image or belongs to any `pr4109-*` project, and requires each one to be stopped
-or attached to no network at all. Attachment comes from the daemon rather than
-from the node's own HTTP surface, because a candidate whose client-info
-listener died while its protocol stack kept running answers nothing and is
-still on the network; conversely a service that does answer is promoted back to
-active whatever the daemon believes, since a node serving requests is
-participating. An enumeration that cannot see the containers the asking stage
-itself created blocks rather than passing — an empty active set read from a
-blind instrument looks exactly like a barrier that holds. The cutover stage
-closes by stopping its own fleet and recording the same verdict, and the
-workflow stops that project again before dispatching the rollback gate, so a
-single-release stage that failed halfway cannot leave the next gate measuring
-a barrier against a fleet nobody accounted for.
+or reaching nothing, read the same way. Attachment comes from the daemon
+rather than from the node's own HTTP surface, because a candidate whose
+client-info listener died while its protocol stack kept running answers
+nothing and is still on the network; conversely a service that does answer is
+promoted back to active whatever the daemon believes, since a node serving
+requests is participating. An enumeration that cannot see the containers the
+asking stage itself created blocks rather than passing — an empty active set
+read from a blind instrument looks exactly like a barrier that holds. The
+cutover stage closes by stopping its own fleet and recording the same verdict,
+and the workflow stops that project again before dispatching the rollback
+gate, so a single-release stage that failed halfway cannot leave the next gate
+measuring a barrier against a fleet nobody accounted for.
 
 The second half is the offline state audit reporting `rollback_barrier_ready`
 for every snapshot: an all-down fleet says two releases cannot write the same

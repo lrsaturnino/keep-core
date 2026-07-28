@@ -2855,10 +2855,15 @@ REHEARSAL_PROJECT_PREFIX="pr4109-"
 #
 # State and network attachment both come from the daemon, which is the
 # independent observation the per-node HTTP probe is not: a container that is
-# running is participating unless the daemon shows it attached to no network at
-# all, and a container attached to nothing can reach neither its peers nor the
-# chain. Anything else — a name, a project, a stopped sibling — is a claim
-# about quarantine rather than a reading of it.
+# running is participating unless the daemon shows it reaching nothing at all,
+# and a container reaching nothing can reach neither its peers nor the chain.
+# Anything else — a name, a project, a stopped sibling — is a claim about
+# quarantine rather than a reading of it.
+#
+# Reaching nothing is not the same as owning no network, which is why the mode
+# is read beside the map: a container run with `container:`/`service:` network
+# mode has no entry of its own precisely because it holds another container's
+# stack, and is on every network that container is on.
 #
 # Enumeration and inspection are factored out of the readings that filter them
 # so that every barrier on this daemon describes the same instrument. Two
@@ -2867,7 +2872,7 @@ REHEARSAL_PROJECT_PREFIX="pr4109-"
 # prior reading about which containers exist would fence neither artifact.
 #
 # Emits one raw record per container as
-# "<image>|<running>|<project>|<service>|<networks>|<name>".
+# "<image>|<running>|<project>|<service>|<networks>|<mode>|<name>".
 daemon_container_records() {
   local ids
   ids="$(docker ps --all --quiet --no-trunc 2>/dev/null)" || return 1
@@ -2879,15 +2884,43 @@ daemon_container_records() {
   # read is exactly what this must not confuse with an absence.
   # shellcheck disable=SC2086
   docker inspect --format \
-    '{{.Image}}|{{.State.Running}}|{{with index .Config.Labels "com.docker.compose.project"}}{{.}}{{end}}|{{with index .Config.Labels "com.docker.compose.service"}}{{.}}{{end}}|{{range $name, $_ := .NetworkSettings.Networks}}{{$name}},{{end}}|{{.Name}}' \
+    '{{.Image}}|{{.State.Running}}|{{with index .Config.Labels "com.docker.compose.project"}}{{.}}{{end}}|{{with index .Config.Labels "com.docker.compose.service"}}{{.}}{{end}}|{{range $name, $_ := .NetworkSettings.Networks}}{{$name}},{{end}}|{{.HostConfig.NetworkMode}}|{{.Name}}' \
     ${ids} 2>/dev/null || return 1
+}
+
+# What a running container can still reach, as the single token the barriers
+# classify. "-" is the one reading that means isolation.
+#
+# The network map alone cannot answer this. Docker lists `none` in the map like
+# any other network, so genuine isolation does not present as an empty map; and
+# a container sharing another's network stack presents as an empty map while
+# holding every connection the container it shares with holds. Reading the map
+# alone therefore refuses the one container that is quarantined and admits the
+# ones that are not.
+container_attachment() {
+  local networks="${1%,}" mode="$2"
+  case "${mode}" in
+  # The stack belongs to another container. Compose resolves `service:` to a
+  # `container:` mode before the daemon sees it; both are named here because
+  # this reading is also taken against records a rehearsal supplies directly.
+  container:* | service:*) printf '%s' "${mode}" ;;
+  # The daemon's own stack: every route the host has, nothing to enumerate.
+  host) printf '%s' 'host' ;;
+  # The only mode that is isolation, whatever the map says.
+  none) printf '%s' '-' ;;
+  # A mode that could not be read leaves reachability unknown, and an unknown
+  # must not spend the barrier's one passing reading. Naming it keeps it out
+  # of the quarantined set and says why in the record.
+  '') printf '%s' "${networks:-mode-unreadable}" ;;
+  *) printf '%s' "${networks:--}" ;;
+  esac
 }
 
 # The one place a raw record becomes the "<label> <state> <networks>" line a
 # barrier classifies, so the candidate and prior readings cannot drift into
 # describing running-ness or network attachment differently.
 emit_container_record() {
-  local running="$1" project="$2" service="$3" networks="$4" name="$5"
+  local running="$1" project="$2" service="$3" networks="$4" mode="$5" name="$6"
   local label state
   if [[ -n "${project}" && -n "${service}" ]]; then
     label="${project}/${service}"
@@ -2899,8 +2932,8 @@ emit_container_record() {
   false) state="stopped" ;;
   *) state="unreadable" ;;
   esac
-  networks="${networks%,}"
-  printf '%s %s %s\n' "${label}" "${state}" "${networks:--}"
+  printf '%s %s %s\n' "${label}" "${state}" \
+    "$(container_attachment "${networks}" "${mode}")"
 }
 
 candidate_container_inventory() {
@@ -2912,8 +2945,8 @@ candidate_container_inventory() {
   raw="$(daemon_container_records)" || return 1
   [[ -n "${raw//[[:space:]]/}" ]] || return 0
 
-  local image running project service networks name
-  while IFS='|' read -r image running project service networks name; do
+  local image running project service networks mode name
+  while IFS='|' read -r image running project service networks mode name; do
     [[ -n "${image}" ]] || continue
     if [[ "${image}" == "${prior_id}" ]]; then
       continue
@@ -2923,7 +2956,7 @@ candidate_container_inventory() {
       continue
     fi
     emit_container_record \
-      "${running}" "${project}" "${service}" "${networks}" "${name}"
+      "${running}" "${project}" "${service}" "${networks}" "${mode}" "${name}"
   done <<<"${raw}"
 }
 
@@ -2950,12 +2983,12 @@ prior_container_inventory() {
   raw="$(daemon_container_records)" || return 1
   [[ -n "${raw//[[:space:]]/}" ]] || return 0
 
-  local image running project service networks name
-  while IFS='|' read -r image running project service networks name; do
+  local image running project service networks mode name
+  while IFS='|' read -r image running project service networks mode name; do
     [[ -n "${image}" ]] || continue
     [[ "${image}" == "${prior_id}" ]] || continue
     emit_container_record \
-      "${running}" "${project}" "${service}" "${networks}" "${name}"
+      "${running}" "${project}" "${service}" "${networks}" "${mode}" "${name}"
   done <<<"${raw}"
 }
 

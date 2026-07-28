@@ -1914,6 +1914,15 @@ run_verdict barrier_case eval \
 check "a running candidate attached to no network is quarantined" 0 \
   "attached to no network \(pr4109-single_release/r1-node-2\)" "holds:1"
 
+# The candidate half of the shared-stack confusion: a release candidate holding
+# another container's network stack owns no entry of its own, and the barrier
+# that let it through would release the prior artifact while it still submits.
+run_verdict barrier_case eval \
+  'CANDIDATE_INVENTORY+=("pr4109-single_release/r1-node-2 running \
+container:9fce2a1b7c4d")'
+check "a candidate sharing another container's stack refutes the barrier" 1 \
+  "pr4109-single_release/r1-node-2 on container:9fce2a1b7c4d" "holds:0"
+
 run_verdict barrier_case eval \
   'CANDIDATE_INVENTORY+=("pr4109-single_release/r1-node-2 unreadable -")'
 check "a candidate whose state cannot be read is not a candidate known down" \
@@ -1928,6 +1937,53 @@ check "an enumeration blind to this gate's own candidates blocks" 3 \
 run_verdict barrier_case eval 'CANDIDATE_INVENTORY_READ=0'
 check "a daemon that could not be enumerated establishes no barrier" 3 \
   "could not be enumerated" "holds:0"
+
+# What both barriers rest on, before either of them classifies anything: the
+# single token that says whether a running container can still reach the
+# rehearsal chain and its peers. Every verdict below reads "-" as isolation, so
+# what does and does not produce that token decides what the barriers accept.
+check_attachment() {
+  local desc="$1" networks="$2" mode="$3" want="$4" got
+  got="$(container_attachment "${networks}" "${mode}")"
+  if [[ "${got}" != "${want}" ]]; then
+    printf 'FAIL %s: attachment "%s", want "%s"\n' "${desc}" "${got}" "${want}"
+    FAILED=$((FAILED + 1))
+    return
+  fi
+  printf 'ok   %s\n' "${desc}"
+  PASS=$((PASS + 1))
+}
+
+check_attachment "a container on a compose network reaches it" \
+  "pr4109-rollback_rehearsal," "pr4109-rollback_rehearsal" \
+  "pr4109-rollback_rehearsal"
+
+# The regression this rung exists for. A container run with `container:` or
+# compose `service:` network mode holds the stack of the container it names and
+# is on every network that one is on, while owning no `Networks` entry of its
+# own. Read off the map alone it is indistinguishable from quarantine, and a
+# prior or candidate left running that way would satisfy the barrier while
+# still submitting against the rehearsal contracts.
+check_attachment "a container sharing another's stack is not quarantined" \
+  "" "container:9fce2a1b7c4d" "container:9fce2a1b7c4d"
+check_attachment "a compose service-mode container is not quarantined" \
+  "" "service:candidate-node" "service:candidate-node"
+
+# The other half of the same confusion: Docker lists `none` in the map like any
+# network, so genuine isolation does not present as an empty map and would be
+# read as attachment.
+check_attachment "the none network is the isolation it names" \
+  "none," "none" "-"
+check_attachment "a host-network container holds every route the host has" \
+  "host," "host" "host"
+
+check_attachment "a container attached to nothing at all is quarantined" \
+  "" "bridge" "-"
+
+# A mode that could not be read leaves reachability unknown, and an unknown
+# must not spend the barrier's one passing reading.
+check_attachment "an unreadable network mode is not proof of isolation" \
+  "" "" "mode-unreadable"
 
 # The other half of that barrier, and the half the candidate inventory skips by
 # construction: no prior artifact executing anywhere while the fleet drains.
@@ -2017,6 +2073,25 @@ pr4109-rollback/prior-node running -"
    prior_sample_window'
 check "a running prior attached to no network is quarantined" 0 \
   "no container built from the prior image was running and network-attached"
+
+# And the reading that looks identical on the map alone: a prior holding
+# another container's network stack owns no entry of its own, yet watches the
+# same chain over the connections it borrowed.
+# shellcheck disable=SC2016
+run_verdict prior_case eval \
+  'PRIOR_SAMPLE_LISTING="${PRIOR_SAMPLE_LISTING}
+pr4109-rollback/prior-node running container:9fce2a1b7c4d"
+   prior_sample_window'
+check "a prior sharing another container's stack refutes the barrier" 1 \
+  "pr4109-rollback/prior-node on container:9fce2a1b7c4d"
+
+# shellcheck disable=SC2016
+run_verdict prior_case eval \
+  'PRIOR_SAMPLE_LISTING="${PRIOR_SAMPLE_LISTING}
+stray-prior running host"
+   prior_sample_window'
+check "a prior on the host network refutes the barrier" 1 \
+  "stray-prior on host"
 
 # shellcheck disable=SC2016
 run_verdict prior_case eval \
