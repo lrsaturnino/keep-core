@@ -45,7 +45,9 @@
 #
 # Evidence is written under EVIDENCE_DIR (default: ./rehearsal-evidence).
 # Every accepted rehearsal run must produce a record conforming to
-# rehearsal-evidence.schema.json; the validate-evidence stage enforces that.
+# rehearsal-evidence.schema.json and binding the checked-in release
+# manifest — its exact hash and its termination grace; the validate-evidence
+# stage enforces both, self-testing its own checker first.
 
 set -euo pipefail
 
@@ -97,7 +99,11 @@ stages:
                       tree and record it; inside the CI build image set
                       PR4109_SOURCE_BINDING_MODE=build-image
   validate-evidence   validate every evidence record under EVIDENCE_DIR
-                      against rehearsal-evidence.schema.json
+                      against rehearsal-evidence.schema.json and require
+                      each record's release-manifest binding — the exact
+                      manifest hash and the termination grace the fleet ran
+                      under — to match the checked-in reviewed manifest;
+                      the validator self-tests its own checker first
 
 environment (every proof stage):
   PR4109_EXPECTED_SOURCE_COMMIT
@@ -629,6 +635,17 @@ stage_validate_evidence() {
   local schema="${SCRIPT_DIR}/rehearsal-evidence.schema.json"
   local manifest="${SCRIPT_DIR}/release-manifest.json"
 
+  # The validator gates the acceptance of every rehearsal record, so it
+  # proves itself first: the self-test drives this same stage over fixture
+  # records — a correctly bound record, a wrong manifest hash, a wrong
+  # grace, missing binding fields, a malformed timestamp, an empty record
+  # set — and fails on any wrong verdict. The guard variable exists only so
+  # the self-test's own invocations of this stage do not recurse into the
+  # self-test.
+  if [[ -z "${PR4109_EVIDENCE_SELFTEST:-}" ]]; then
+    PR4109_EVIDENCE_SELFTEST=1 "${SCRIPT_DIR}/test-validate-evidence.sh"
+  fi
+
   shopt -s nullglob
   local records=("${EVIDENCE_DIR}"/*.json)
   shopt -u nullglob
@@ -642,23 +659,43 @@ run that produced no record cannot be accepted"
   command -v node >/dev/null 2>&1 ||
     blocked "node (Node.js) is required to validate evidence records"
 
-  # Schema conformance requires the record to name a manifest hash; this
-  # cross-check requires it to be the hash of the checked-in manifest, whose
-  # numbers the Go drift tests pin to the compiled bounds. Together they bind
-  # the termination grace the fleet ran under to the source SHA, image
-  # digests, and chain identity the record carries.
-  local manifest_sha
+  # Schema conformance requires the record to name a manifest hash and the
+  # grace the fleet ran under; this cross-check requires both to match the
+  # checked-in manifest, whose numbers the Go drift tests pin to the
+  # compiled bounds. The hash alone would accept a record that names the
+  # right manifest while claiming the fleet ran under some other grace, so
+  # the recorded grace is compared against the manifest's own value too.
+  # Together they bind the termination grace the fleet ran under to the
+  # source SHA, image digests, and chain identity the record carries.
+  local manifest_sha manifest_grace
   manifest_sha="$(hash_stdin <"${manifest}")"
+  manifest_grace="$(node -e '
+    const fs = require("fs");
+    const manifest = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    const grace = (manifest.termination_grace || {})
+      .termination_grace_period_seconds;
+    if (!Number.isInteger(grace) || grace < 1) {
+      console.error(
+        "no positive integer termination_grace_period_seconds in " +
+          process.argv[1]
+      );
+      process.exit(1);
+    }
+    process.stdout.write(String(grace));
+  ' "${manifest}")" ||
+    fail "cannot read the termination grace from ${manifest}"
 
   for record in "${records[@]}"; do
     note "validating ${record}"
     # ajv needs the formats plugin loaded explicitly or it rejects the
-    # schema's own date-time format annotation before ever reading a record.
-    npx --yes -p ajv-cli@5 -p ajv-formats@2 ajv validate --spec=draft2020 \
-      -c ajv-formats -s "${schema}" -d "${record}" ||
+    # schema's own date-time format annotation before ever reading a
+    # record. Both packages are pinned to exact versions: a floating major
+    # or minor release must never change what this stage accepts.
+    npx --yes -p ajv-cli@5.0.0 -p ajv-formats@2.1.1 ajv validate \
+      --spec=draft2020 -c ajv-formats -s "${schema}" -d "${record}" ||
       blocked "evidence record ${record} does not conform to ${schema}"
 
-    local recorded_sha
+    local recorded_sha recorded_grace
     recorded_sha="$(node -e '
       const fs = require("fs");
       const record = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
@@ -669,10 +706,24 @@ run that produced no record cannot be accepted"
 [${recorded_sha:-absent}], but the checked-in manifest hashes to \
 [${manifest_sha}]; regenerate the record against the reviewed manifest"
     fi
+
+    recorded_grace="$(node -e '
+      const fs = require("fs");
+      const record = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      const grace = (record.release_manifest || {})
+        .termination_grace_period_seconds;
+      process.stdout.write(Number.isInteger(grace) ? String(grace) : "");
+    ' "${record}")"
+    if [[ "${recorded_grace}" != "${manifest_grace}" ]]; then
+      blocked "evidence record ${record} claims the fleet ran under a \
+termination grace of [${recorded_grace:-absent}] seconds, but the reviewed \
+manifest it binds grants [${manifest_grace}]; a rehearsal under any other \
+grace is not evidence for this release"
+    fi
   done
 
   note "all evidence records conform to the schema and bind the reviewed \
-release manifest"
+release manifest's hash and termination grace"
 }
 
 # Sourceable for the source-binding self-test: dispatch only when executed.
