@@ -2924,13 +2924,13 @@ r1_client_identity() {
       process.stdin.on("data", (d) => (raw += d));
       process.stdin.on("end", () => {
         const info = (JSON.parse(raw).client_info) || {};
-        if (!info.Version || !info.Revision) {
+        if (!info.version || !info.revision) {
           console.error("no version/revision in the node diagnostics");
           process.exit(1);
         }
         process.stdout.write(JSON.stringify({
-          version: info.Version,
-          revision: info.Revision,
+          version: info.version,
+          revision: info.revision,
         }));
       });
     '

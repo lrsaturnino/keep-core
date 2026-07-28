@@ -483,12 +483,37 @@ check "the inherited receipt is accepted before any proof run starts" 0 \
 # The other side of the same contract: the container rehearsals build the
 # records this validator judges, so the builder is proved against the judge
 # rather than against a restatement of the schema. Every case below drives the
-# real ledger and the real emitter, with only the two readings that need a
-# running fleet — the R1 nodes' self-reported identity and the architectures
-# behind an immutable digest — replaced by fixtures.
-
-r1_client_identity() {
-  printf '{"version":"v2.0.0-rehearsal","revision":"%s"}' "${FIXTURE_SHA}"
+# real ledger and the real emitter; only the two things that need a running
+# fleet are replaced — the HTTP read of a node's client-info port and the
+# registry lookup behind an immutable digest.
+#
+# The substitute is the transport and not the parser above it, so the real
+# reader still has to find the identity where a node actually publishes it.
+# The document below is the shape keep-common composes: one key per registered
+# diagnostics source, each source's own JSON nested under it, with the client
+# identity carrying the field names the Client struct's tags produce.
+probe_diagnostics() {
+  cat <<EOF
+{
+  "client_info": {
+    "chain_address": "0x0000000000000000000000000000000000000001",
+    "network_id": "16Uiu2HAm000000000000000000000000000000000000000",
+    "version": "v2.0.0-rehearsal",
+    "revision": "${FIXTURE_SHA}"
+  },
+  "cutover_legacy_peers": { "revision": 0, "peers": [] },
+  "protocol_participation": {
+    "protocol_epoch": "security_v2_cutover",
+    "cutover_block": 9000000,
+    "gate_state": "open_security_v2",
+    "current_block": 9000001,
+    "clock_available": true,
+    "allowed": true,
+    "quiescing": false,
+    "active_ceremonies": 0
+  }
+}
+EOF
 }
 
 image_digests_by_architecture() {
@@ -562,6 +587,31 @@ run_rehearsal "${E}" single_release complete_run
 check "a rehearsal record the emitter builds is accepted by the acceptance stage" \
   0 "rehearsal evidence record written" "hash and termination grace" \
   "every mandatory step executed"
+
+# The release identity in the record has to be the one the node published,
+# read from where it publishes it. Asserting the values — not merely that the
+# schema's required fields are populated — is what makes a rename or a wrong
+# field name on the reader's side fail here instead of silently producing a
+# record that binds the rehearsal to an empty version.
+if grep -q '"version": "v2.0.0-rehearsal"' "${E}"/single_release-*.json &&
+  grep -q "\"revision\": \"${FIXTURE_SHA}\"" "${E}"/single_release-*.json; then
+  printf 'ok   the record carries the identity the node published\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL the record does not carry the node-published identity\n'
+  FAILED=$((FAILED + 1))
+fi
+
+# The same reader against the gate's own state object, which is what every
+# step of both rehearsals decides its outcome from.
+if [[ "$(participation_field r1-node-1 gate_state)" == "open_security_v2" &&
+  "$(participation_field r1-node-1 current_block)" == "9000001" ]]; then
+  printf 'ok   the gate-state reader finds the fields a node publishes\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL the gate-state reader does not find the published fields\n'
+  FAILED=$((FAILED + 1))
+fi
 
 # The property the whole per-step ledger exists for: a gate that cannot finish
 # still writes a reviewable record, and still refuses to report success.
