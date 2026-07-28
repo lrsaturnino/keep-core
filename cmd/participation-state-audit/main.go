@@ -47,12 +47,14 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/keep-network/keep-core/config"
 	"github.com/keep-network/keep-core/pkg/beacon/registry"
+	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/storage"
 	"github.com/keep-network/keep-core/pkg/tbtc"
@@ -881,6 +883,63 @@ func isImmutableImageDigest(reference string) bool {
 	return err == nil
 }
 
+// isCanonicalSHA256Hex reports whether value is the canonical textual form of
+// a SHA-256 digest: exactly 64 lowercase hexadecimal characters. DKG work
+// identities and quarantined seed hashes use this form so case aliases or
+// truncated values cannot make unrelated work compare equal during rollback
+// reconciliation.
+func isCanonicalSHA256Hex(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	for _, character := range value {
+		if (character < '0' || character > '9') &&
+			(character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// isStableEvidenceID reports whether value can be used as a stable
+// chain-work or local-permit identity without colliding with the separators
+// used by the rehearsal and audit evidence. The driver accepts the same
+// alphabet for non-membership identities.
+func isStableEvidenceID(value string) bool {
+	if value == "" || !isASCIIAlphaNumeric(value[0]) {
+		return false
+	}
+	for i := 1; i < len(value); i++ {
+		character := value[i]
+		if !isASCIIAlphaNumeric(character) &&
+			character != '_' &&
+			character != '.' &&
+			character != ':' &&
+			character != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func isASCIIAlphaNumeric(character byte) bool {
+	return (character >= '0' && character <= '9') ||
+		(character >= 'A' && character <= 'Z') ||
+		(character >= 'a' && character <= 'z')
+}
+
+// isCanonicalMemberIndex reports whether value is the canonical decimal
+// representation of a real protocol member index. Group indexes start at one;
+// leading zeroes and values beyond the one-byte MemberIndex range are aliases
+// or invalid memberships and therefore cannot identify a local permit.
+func isCanonicalMemberIndex(value string) bool {
+	memberIndex, err := strconv.ParseUint(value, 10, 8)
+	if err != nil || memberIndex == 0 || memberIndex > group.MaxMemberIndex {
+		return false
+	}
+	return strconv.FormatUint(memberIndex, 10) == value
+}
+
 // recordMissingExpectedIdentity turns every unsupplied expected-identity
 // input into a rollback blocker — evidence that is not bound to an explicit
 // operational target can approve a rollback of the wrong chain, network,
@@ -1528,14 +1587,77 @@ type quarantineIdentity struct {
 	permitID            string
 }
 
+// validateQuiescencePermitIdentity checks the chain-work and local-permit
+// portions of one quiescence entry. DKG work is identified by the SHA-256 hash
+// of its seed and each DKG or relay-signing permit belongs to one group member;
+// other ceremony classes use the stable chain-native/action identifiers
+// accepted by the rehearsal driver.
+func validateQuiescencePermitIdentity(
+	index int,
+	permit quiescencePermitEvidence,
+) []string {
+	violations := make([]string, 0)
+
+	switch permit.Ceremony {
+	case string(participation.TBTCDKG),
+		string(participation.BeaconDKG):
+		if !isCanonicalSHA256Hex(permit.WorkID) {
+			violations = append(violations, fmt.Sprintf(
+				"permit entry [%d] chain work identity [%s] is not a "+
+					"canonical SHA-256 seed hash of 64 lowercase "+
+					"hexadecimal characters",
+				index,
+				permit.WorkID,
+			))
+		}
+	default:
+		if !isStableEvidenceID(permit.WorkID) {
+			violations = append(violations, fmt.Sprintf(
+				"permit entry [%d] chain work identity [%s] is not a "+
+					"stable evidence identifier",
+				index,
+				permit.WorkID,
+			))
+		}
+	}
+
+	switch permit.Ceremony {
+	case string(participation.TBTCDKG),
+		string(participation.BeaconDKG),
+		string(participation.BeaconRelaySigning):
+		if !isCanonicalMemberIndex(permit.PermitID) {
+			violations = append(violations, fmt.Sprintf(
+				"permit entry [%d] local permit identity [%s] is not a "+
+					"canonical protocol member index from 1 through %d",
+				index,
+				permit.PermitID,
+				group.MaxMemberIndex,
+			))
+		}
+	default:
+		if !isStableEvidenceID(permit.PermitID) {
+			violations = append(violations, fmt.Sprintf(
+				"permit entry [%d] local permit identity [%s] is not a "+
+					"stable evidence identifier",
+				index,
+				permit.PermitID,
+			))
+		}
+	}
+
+	return violations
+}
+
 // validateQuiescenceReportEvidence checks the quiescence outcome record:
 // schema, snapshot binding, the quiescing node's exact artifact identity and
 // cutover schedule, a stated cause, and a known ceremony, mode, and terminal
-// outcome for every permit active at quiescence. Every quarantined DKG
-// outcome must be matched by preserved quarantine state carrying the same
-// ceremony, protocol mode, canonical anchor, chain-work ID, and local permit
-// ID — one preserved output per claiming permit, so one real output cannot
-// vouch for several claims.
+// outcome for every permit active at quiescence. Every full permit identity
+// must occur exactly once regardless of outcome, so repeating a completed
+// permit cannot conceal an omitted active permit. Every quarantined DKG outcome
+// must be matched by preserved quarantine state carrying the same ceremony,
+// protocol mode, canonical anchor, chain-work ID, and local permit ID — one
+// preserved output per claiming permit, so one real output cannot vouch for
+// several claims.
 func (r *auditRun) validateQuiescenceReportEvidence(content []byte) []string {
 	record := &quiescenceReportEvidence{}
 	if err := strictUnmarshal(content, record); err != nil {
@@ -1609,6 +1731,7 @@ func (r *auditRun) validateQuiescenceReportEvidence(content []byte) []string {
 		}]++
 	}
 
+	seenPermits := make(map[quarantineIdentity]int)
 	for i, permit := range record.ActivePermitsAtQuiescence {
 		if _, ok := knownCeremonies[permit.Ceremony]; !ok {
 			violations = append(violations, fmt.Sprintf(
@@ -1633,28 +1756,38 @@ func (r *auditRun) validateQuiescenceReportEvidence(content []byte) []string {
 			))
 			continue
 		}
-		if permit.WorkID == "" {
-			violations = append(violations, fmt.Sprintf(
-				"permit entry [%d] names no chain work identity",
-				i,
-			))
-		}
-		if permit.PermitID == "" {
-			violations = append(violations, fmt.Sprintf(
-				"permit entry [%d] names no local permit identity",
-				i,
-			))
-		}
 
-		if permit.Outcome != "quarantined" || !r.manifest.Interpreted {
-			continue
-		}
+		violations = append(
+			violations,
+			validateQuiescencePermitIdentity(i, permit)...,
+		)
+
 		identity := quarantineIdentity{
 			ceremony:            permit.Ceremony,
 			mode:                permit.Mode,
 			canonicalStartBlock: permit.CanonicalStartBlock,
 			workID:              permit.WorkID,
 			permitID:            permit.PermitID,
+		}
+		if firstIndex, duplicate := seenPermits[identity]; duplicate {
+			violations = append(violations, fmt.Sprintf(
+				"permit entry [%d] duplicates the full permit identity "+
+					"first recorded by entry [%d] [ceremony=%s] [mode=%s] "+
+					"[canonicalStartBlock=%d] [workID=%s] [permitID=%s]",
+				i,
+				firstIndex,
+				permit.Ceremony,
+				permit.Mode,
+				permit.CanonicalStartBlock,
+				permit.WorkID,
+				permit.PermitID,
+			))
+		} else {
+			seenPermits[identity] = i
+		}
+
+		if permit.Outcome != "quarantined" || !r.manifest.Interpreted {
+			continue
 		}
 		switch permit.Ceremony {
 		case string(participation.BeaconDKG):
@@ -2169,9 +2302,18 @@ func validateQuarantineEntry(
 			participation.BeaconDKG,
 		)
 	}
-	if metadata.SeedHash == "" {
+	if !isCanonicalSHA256Hex(metadata.SeedHash) {
 		run.finding(
-			"beacon quarantine metadata [%s] is missing the seed hash",
+			"beacon quarantine metadata [%s] seed hash [%s] is not a "+
+				"canonical SHA-256 digest of 64 lowercase hexadecimal "+
+				"characters",
+			key,
+			metadata.SeedHash,
+		)
+	}
+	if metadata.MemberIndex == 0 {
+		run.finding(
+			"beacon quarantine metadata [%s] names invalid member index [0]",
 			key,
 		)
 	}
@@ -2669,9 +2811,18 @@ func validateTBTCQuarantineEntry(
 			suffix,
 		)
 	}
-	if metadata.SeedHash == "" {
+	if !isCanonicalSHA256Hex(metadata.SeedHash) {
 		run.finding(
-			"tbtc quarantine metadata [%s] is missing the seed hash",
+			"tbtc quarantine metadata [%s] seed hash [%s] is not a "+
+				"canonical SHA-256 digest of 64 lowercase hexadecimal "+
+				"characters",
+			key,
+			metadata.SeedHash,
+		)
+	}
+	if metadata.MemberIndex == 0 {
+		run.finding(
+			"tbtc quarantine metadata [%s] names invalid member index [0]",
 			key,
 		)
 	}

@@ -305,6 +305,33 @@ func hasFinding(auditManifest *manifest, fragment string) bool {
 	return false
 }
 
+func updateQuiescenceReport(
+	t *testing.T,
+	evidence evidenceInputs,
+	update func(*quiescenceReportEvidence),
+) {
+	t.Helper()
+
+	content, err := os.ReadFile(evidence.quiescenceReport)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	record := &quiescenceReportEvidence{}
+	if err := json.Unmarshal(content, record); err != nil {
+		t.Fatal(err)
+	}
+	update(record)
+
+	content, err = json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(evidence.quiescenceReport, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRunAudit_ConsistentSnapshot(t *testing.T) {
 	storageDir := newTestStorage(t)
 
@@ -719,6 +746,16 @@ func TestRunAudit_TBTCQuarantineMetadataWithoutMembershipIsAFinding(
 	) {
 		t.Errorf(
 			"expected an orphaned-metadata finding, findings: %v",
+			auditManifest.Findings,
+		)
+	}
+	if !hasFinding(
+		auditManifest,
+		"seed hash [aa] is not a canonical SHA-256 digest of 64 lowercase "+
+			"hexadecimal characters",
+	) {
+		t.Errorf(
+			"expected a malformed seed-hash finding, findings: %v",
 			auditManifest.Findings,
 		)
 	}
@@ -1491,6 +1528,151 @@ func TestRunAudit_QuarantinedClaimWithMismatchedWorkIdentityIsBlocking(
 			"expected an exact-permit-matching blocker, blockers: %v",
 			auditManifest.RollbackBlockers,
 		)
+	}
+}
+
+// TestRunAudit_DuplicateCompletedPermitIdentityIsBlocking proves permit
+// uniqueness is enforced for completed outcomes as well as quarantined ones.
+// Otherwise a report with the expected entry count could repeat one completed
+// permit while omitting a different permit that was still active.
+func TestRunAudit_DuplicateCompletedPermitIdentityIsBlocking(t *testing.T) {
+	storageDir := newTestStorage(t)
+
+	firstPass, err := runAudit(
+		storageDir,
+		testPassword,
+		evidenceInputs{},
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	evidence := newValidEvidence(t, firstPass)
+	completed := quiescencePermitEvidence{
+		Ceremony:            string(participation.TBTCSigning),
+		Mode:                participation.ModeLegacy.String(),
+		CanonicalStartBlock: 900,
+		WorkID:              "wallet-action-1",
+		PermitID:            "wallet-action-1",
+		Outcome:             "completed",
+	}
+	updateQuiescenceReport(
+		t,
+		evidence,
+		func(record *quiescenceReportEvidence) {
+			record.ActivePermitsAtQuiescence = []quiescencePermitEvidence{
+				completed,
+				completed,
+			}
+		},
+	)
+
+	auditManifest, err := runAudit(
+		storageDir,
+		testPassword,
+		evidence,
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if auditManifest.RollbackBarrierReady {
+		t.Error(
+			"a duplicated completed permit must not authorize the barrier",
+		)
+	}
+	if !hasBlocker(
+		auditManifest,
+		"duplicates the full permit identity first recorded by entry [0]",
+	) {
+		t.Errorf(
+			"expected a duplicate-permit blocker, blockers: %v",
+			auditManifest.RollbackBlockers,
+		)
+	}
+}
+
+// TestRunAudit_MalformedQuiescencePermitIdentitiesAreBlocking proves the audit
+// does not treat aliases, truncated seed hashes, or separator-bearing labels
+// as exact local permit identities.
+func TestRunAudit_MalformedQuiescencePermitIdentitiesAreBlocking(t *testing.T) {
+	storageDir := newTestStorage(t)
+
+	firstPass, err := runAudit(
+		storageDir,
+		testPassword,
+		evidenceInputs{},
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	evidence := newValidEvidence(t, firstPass)
+	updateQuiescenceReport(
+		t,
+		evidence,
+		func(record *quiescenceReportEvidence) {
+			record.ActivePermitsAtQuiescence = []quiescencePermitEvidence{
+				{
+					Ceremony:            string(participation.TBTCDKG),
+					Mode:                participation.ModeLegacy.String(),
+					CanonicalStartBlock: 900,
+					WorkID:              strings.Repeat("A", 64),
+					PermitID:            "01",
+					Outcome:             "completed",
+				},
+				{
+					Ceremony: string(
+						participation.BeaconRelaySigning,
+					),
+					Mode:                participation.ModeSecurityV2.String(),
+					CanonicalStartBlock: 1_000,
+					WorkID:              "relay-request-1",
+					PermitID:            "member-1",
+					Outcome:             "completed",
+				},
+				{
+					Ceremony:            string(participation.TBTCSigning),
+					Mode:                participation.ModeLegacy.String(),
+					CanonicalStartBlock: 900,
+					WorkID:              "wallet/action",
+					PermitID:            "wallet~1",
+					Outcome:             "completed",
+				},
+			}
+		},
+	)
+
+	auditManifest, err := runAudit(
+		storageDir,
+		testPassword,
+		evidence,
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if auditManifest.RollbackBarrierReady {
+		t.Error("malformed permit identities must not authorize the barrier")
+	}
+	for _, fragment := range []string{
+		"is not a canonical SHA-256 seed hash",
+		"local permit identity [01] is not a canonical protocol member index",
+		"local permit identity [member-1] is not a canonical protocol member index",
+		"chain work identity [wallet/action] is not a stable evidence identifier",
+		"local permit identity [wallet~1] is not a stable evidence identifier",
+	} {
+		if !hasBlocker(auditManifest, fragment) {
+			t.Errorf(
+				"expected identity-format blocker [%s], blockers: %v",
+				fragment,
+				auditManifest.RollbackBlockers,
+			)
+		}
 	}
 }
 
