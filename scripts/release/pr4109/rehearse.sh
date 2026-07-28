@@ -4656,23 +4656,6 @@ ceremony_family() {
   esac
 }
 
-# Of the required families, the ones with no successful result behind them.
-# Space-joined, empty when the required set is covered.
-missing_required_families() {
-  local results="$1" required="$2" family result uncovered="" covered
-  for family in ${required}; do
-    covered=0
-    for result in ${results}; do
-      [[ "${result#*=}" == "succeeded" ]] || continue
-      [[ "$(ceremony_family "${result%%=*}")" == "${family}" ]] || continue
-      covered=1
-      break
-    done
-    ((covered == 1)) || uncovered="${uncovered}${uncovered:+ }${family}"
-  done
-  printf '%s' "${uncovered}"
-}
-
 # Every result the driver reported that did not succeed, comma-joined for the
 # record. A phase reads this so that one required ceremony failing beside a
 # passing one cannot be dropped on the way to a verdict.
@@ -4712,17 +4695,6 @@ missing_work_classes() {
     ((covered == 1)) || uncovered="${uncovered}${uncovered:+ }${class}"
   done
   printf '%s' "${uncovered}"
-}
-
-# Every result the driver reported that did succeed, comma-joined. The mirror
-# of the above, for the phases whose contract is that nothing settles.
-successful_results() {
-  local results="$1" result out=""
-  for result in ${results}; do
-    [[ "${result#*=}" == "succeeded" ]] || continue
-    out="${out}${out:+, }${result}"
-  done
-  printf '%s' "${out}"
 }
 
 # The fields of one bound result, "<ceremony>=<outcome>=<transaction>=<identity>".
