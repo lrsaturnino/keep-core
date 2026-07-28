@@ -2719,6 +2719,22 @@ participation_field() {
 # is chosen and pkg/clientinfo/metrics.go is where the prefix is applied.
 METRIC_APPLICATION_PREFIX="performance"
 
+# The termination grace the reviewed manifest grants, which is the ceiling the
+# fleet's service manager and this driver must both stop nodes under.
+manifest_termination_grace() {
+  node -e '
+    const fs = require("fs");
+    const manifest = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    const grace = (manifest.termination_grace || {})
+      .termination_grace_period_seconds;
+    if (!Number.isInteger(grace) || grace < 1) {
+      console.error("no positive termination grace in " + process.argv[1]);
+      process.exit(1);
+    }
+    process.stdout.write(String(grace));
+  ' "${SCRIPT_DIR}/release-manifest.json"
+}
+
 # One counter from a node's Prometheus text exposition. The parser reads the
 # exposition's own shape: the metric name, optional labels, the value, and the
 # trailing timestamp the client-info registry appends.
@@ -3409,10 +3425,18 @@ reads one storage snapshot per node and cannot be run against a live volume"
   if [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
     run_work_driver rollback-inflight || true
   fi
-  compose stop --timeout 20160 "${REHEARSAL_R1_SERVICES[@]}"
+  # The grace comes out of the reviewed manifest, which the Go drift test
+  # pins to the compiled bounds and the compose file's stop_grace_period to.
+  # A number restated here would go on stopping nodes under the old ceiling
+  # the first time those bounds moved, and a node SIGKILLed mid-drain cannot
+  # evidence natural completion.
+  local grace
+  grace="$(manifest_termination_grace)"
+  compose stop --timeout "${grace}" "${REHEARSAL_R1_SERVICES[@]}"
   record_step "quiesce every R1 node with work represented" pass \
-    "every R1 node was stopped under the release manifest's termination \
-grace, so a draining node was never SIGKILLed before its in-process backstop"
+    "every R1 node was stopped under the reviewed manifest's ${grace}s \
+termination grace, so a draining node was never SIGKILLed before its \
+in-process backstop"
 
   begin_step "no prior binary starts during quiescence"
   if node_reachable "${REHEARSAL_PRIOR_SERVICE}"; then
