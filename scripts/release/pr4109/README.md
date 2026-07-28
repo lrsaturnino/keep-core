@@ -239,6 +239,23 @@ carrying the checked-in rules and deliberate drifts of them, and refuses to
 build a drift case out of a filter that removes no line, so a case cannot
 pass because the rule it targets was renamed.
 
+Which ignore file the build reads is itself decided elsewhere: the builder
+selects `<dockerfile>.dockerignore` when the commit carries one and the root
+`.dockerignore` only otherwise, and which Dockerfile that is comes out of the
+rehearsal workflow's build step, not out of this scaffold. So the identity is
+read from that step rather than restated beside the classification — the
+single `docker/build-push-action` step's `context` and `file` inputs, taken
+from the commit under test. A constant restating them would go stale the
+moment the build step moved, silently and in the direction where the mirror
+keeps checking itself against rules the build has stopped applying. Every
+step shape the resolution cannot read the way the workflow parser does is
+refused by name rather than guessed at: a context that is not the repository
+root (the classification is written over repository-relative paths), an unset
+context (the action's default is the Git context, not this checkout), a
+Dockerfile named by a workflow expression or resolving outside the context or
+absent from the commit, inputs written as a flow mapping, and more or fewer
+than one build step.
+
 The rehearsal workflow writes its evidence into the workspace root rather
 than the script's own default, and every proof stage refuses to run on a
 tree that diverges from the dispatched commit — untracked files included —
@@ -255,12 +272,25 @@ shell-analysis`, so a change to `rehearse.sh`, to either self-test, or to
 the workflows themselves cannot merge without shell syntax, ShellCheck,
 actionlint, the build-context mirror check, and both validator self-tests
 passing. Its path filters cover the build inputs the trust model is derived
-from as well as the scaffold's own files — `.dockerignore`, the root and
-nested `.gitignore` rules, `Dockerfile`, and `Makefile` — because each of
-them decides what the verifier accepts just as directly as its own code
-does, and a change to any of them can widen what an image tree is allowed to
-be missing without touching a line under `scripts/`. It builds no image and
-runs no Go suite, so it is cheap enough to require.
+from as well as the scaffold's own files — `.dockerignore`, both ignore files
+the build could select, the root and nested `.gitignore` rules, `Dockerfile`,
+and `Makefile` — because each of them decides what the verifier accepts just
+as directly as its own code does, and a change to any of them can widen what
+an image tree is allowed to be missing without touching a line under
+`scripts/`. It builds no image and runs no Go suite, so it is cheap enough to
+require.
+
+Those filters decide when this gate runs at all, so they are held to the
+resolved build step rather than maintained by hand beside it: a build moved
+onto another Dockerfile takes its ignore file with it, and a filter list left
+behind would leave every later change to that file ungated while the mirror
+check went on passing, on a file nobody was told had changed. Each `push` and
+`pull_request` trigger must therefore cover both workflows, the resolved
+Dockerfile, the ignore file that Dockerfile selects, and the root
+`.dockerignore` — or carry no filter at all, which runs on everything and
+covers everything. A `paths-ignore` list, an empty filter list, and a
+workflow reachable only by dispatch each fail closed; the last is the state
+this workflow exists to end.
 
 On a hosted runner the per-node keystore comes from the
 `REHEARSAL_KEYSTORE_BUNDLE_B64` repository secret: a base64-encoded tar.gz

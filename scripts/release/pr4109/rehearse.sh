@@ -47,7 +47,11 @@
 # classification written out in this script, so it is held to the commit's
 # own .dockerignore rather than trusted: local-proofs and shell-analysis both
 # compare the two over every tracked path and refuse to go on once they
-# disagree in any direction the image build does not account for.
+# disagree in any direction the image build does not account for. Which
+# ignore file that is comes out of the rehearsal workflow's build step, read
+# from the commit rather than restated here, and the scaffold lint's path
+# filters are held to the same resolution — otherwise a build moved onto
+# another Dockerfile would take its ignore rules somewhere nothing checks.
 #
 # Evidence is written under EVIDENCE_DIR (default: ./rehearsal-evidence).
 # Every accepted rehearsal run must produce a record conforming to
@@ -113,8 +117,11 @@ stages:
                       ShellCheck over every script here, actionlint v1.7.12
                       over the scaffold's own workflows, the build-context
                       classification checked against the commit's own
-                      .dockerignore over every tracked path, and both
-                      validator self-tests — the gate the scaffold's CI job
+                      .dockerignore over every tracked path — the file
+                      selected by the Dockerfile the rehearsal workflow's
+                      build step really compiles, with that workflow's own
+                      path filters held to the same resolution — and both
+                      validator self-tests: the gate the scaffold's CI job
                       runs on every change to these files and to the build
                       inputs they mirror, so the checkers that admit
                       rehearsal evidence are never proved only by a manual
@@ -272,12 +279,23 @@ regenerated_by_design_path() {
   return 1
 }
 
-# The Dockerfile the rehearsal dispatch builds, relative to the build context
-# root: its build step passes `context: .` and no `file:`, so the action's
-# default — <context>/Dockerfile — is what the builder compiles. The name
-# matters beyond the build itself, because it is what selects the ignore
-# rules below.
-BUILD_DOCKERFILE="Dockerfile"
+# The workflow whose build step decides what the classification below has to
+# be checked against, and the unconditional lint that has to run whenever any
+# of those inputs changes. Both are paths inside the commit under test rather
+# than on disk: the build context of a dispatched commit is that commit's tree.
+REHEARSAL_WORKFLOW=".github/workflows/cutover-rehearsal.yml"
+SCAFFOLD_LINT_WORKFLOW=".github/workflows/cutover-scaffold-lint.yml"
+
+# The action that workflow builds the proof image with. Its `context` and
+# `file` inputs are the whole of what selects the build's ignore rules.
+BUILD_ACTION="docker/build-push-action"
+
+# Read out of that step by resolve_build_step_identity: the build context root,
+# and the Dockerfile the builder compiles relative to it. The Dockerfile name
+# matters beyond the build itself, because it is what selects the ignore rules
+# below — which is exactly why neither is restated here as a constant.
+BUILD_CONTEXT=""
+BUILD_DOCKERFILE=""
 
 # The ignore rules the two classifications above mirror, compiled once per
 # tree into one extended regular expression per pattern with a parallel flag
@@ -405,6 +423,441 @@ dockerignore_unmodelled_construct() {
   return 1
 }
 
+# The value a `key:` line carries, with one layer of matching quotes taken off
+# and a trailing comment dropped the way the workflow parser drops it. Refuses
+# — non-zero, no output — any quoting that would need escape processing to
+# read, because a value carrying its own escapes is a value this parser and the
+# workflow parser could disagree about.
+yaml_scalar_value() {
+  local raw="$1" quote body rest
+  raw="${raw#"${raw%%[![:space:]]*}"}"
+  raw="${raw%"${raw##*[![:space:]]}"}"
+  case "${raw}" in
+  '"'* | "'"*)
+    quote="${raw:0:1}"
+    body="${raw:1}"
+    [[ "${body}" == *"${quote}"* ]] || return 1
+    rest="${body#*"${quote}"}"
+    body="${body%%"${quote}"*}"
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    [[ -z "${rest}" || "${rest}" == '#'* ]] || return 1
+    [[ "${body}" == *$'\\'* ]] && return 1
+    printf '%s' "${body}"
+    ;;
+  *)
+    if [[ "${raw}" == *' #'* ]]; then
+      raw="${raw%% #*}"
+      raw="${raw%"${raw##*[![:space:]]}"}"
+    fi
+    printf '%s' "${raw}"
+    ;;
+  esac
+}
+
+# The raw spellings of a value this parser refuses rather than guesses at:
+# every one of them means something to the workflow parser that reading the
+# characters literally would get wrong. Returns the reason, like
+# dockerignore_unmodelled_construct, so the refusal is raised by a caller that
+# can still stop the run rather than inside a command substitution.
+#
+# The expression opener is matched as the literal characters the workflow
+# parser reads there, so it is deliberately never expanded here.
+# shellcheck disable=SC2016
+yaml_unmodelled_value() {
+  local raw="$1"
+  case "${raw}" in
+  '') printf 'no value at all' ;;
+  '|'* | '>'*) printf 'a block scalar' ;;
+  '&'*) printf 'an anchor' ;;
+  '*'*) printf 'an alias' ;;
+  '['* | '{'*) printf 'a flow collection' ;;
+  *'${{'*) printf 'a workflow expression' ;;
+  *) return 1 ;;
+  esac
+  return 0
+}
+
+# Split the workflow into per-line indentation widths and leading-whitespace-
+# stripped bodies, with -1 marking a line a parser has nothing to place — a
+# blank line, or a comment at any column. Populates YAML_INDENTS and
+# YAML_BODIES because a command substitution could not raise the tab refusal.
+YAML_INDENTS=()
+YAML_BODIES=()
+yaml_index_lines() {
+  local source="$1" content="$2" line trimmed i
+  YAML_INDENTS=()
+  YAML_BODIES=()
+
+  local -a lines=()
+  while IFS= read -r line; do lines+=("${line}"); done <<<"${content}"
+
+  for ((i = 0; i < ${#lines[@]}; i++)); do
+    line="${lines[i]}"
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    if [[ -z "${trimmed}" || "${trimmed}" == '#'* ]]; then
+      YAML_INDENTS+=(-1)
+      YAML_BODIES+=("")
+      continue
+    fi
+    # YAML forbids a tab in indentation outright, so a width measured over one
+    # would not be the width the workflow parser sees.
+    if [[ "${line%%[![:space:]]*}" == *$'\t'* ]]; then
+      fail "${source} line $((i + 1)) indents with a tab, which YAML does not \
+allow as indentation and this parser cannot place"
+    fi
+    YAML_INDENTS+=("$((${#line} - ${#trimmed}))")
+    YAML_BODIES+=("${trimmed}")
+  done
+}
+
+# The column a sequence item's own mapping keys sit at — past the dash and the
+# whitespace after it — or nothing when the line does not open one.
+yaml_item_key_indent() {
+  local index="$1" body value stripped
+  body="${YAML_BODIES[index]}"
+  [[ "${body}" == '-'[[:space:]]* ]] || return 1
+  value="${body#-}"
+  stripped="${value#"${value%%[![:space:]]*}"}"
+  printf '%s' "$((YAML_INDENTS[index] + 1 + ${#value} - ${#stripped}))"
+}
+
+# The index one past the last line belonging to a block whose content sits at
+# `indent`, starting the scan at `from`. A block ends at the first line placed
+# shallower than its own content, which is also how the next sequence item
+# ends the one before it.
+yaml_block_end() {
+  local from="$1" indent="$2" i
+  for ((i = from; i < ${#YAML_INDENTS[@]}; i++)); do
+    ((YAML_INDENTS[i] < 0)) && continue
+    if ((YAML_INDENTS[i] < indent)); then
+      printf '%s' "${i}"
+      return
+    fi
+  done
+  printf '%s' "${#YAML_INDENTS[@]}"
+}
+
+# The Dockerfile the rehearsal dispatch compiles and the context root it
+# compiles from, read out of the workflow that does the building rather than
+# restated here. The pair decides which ignore file the build applies, so a
+# constant restating it goes stale the moment the build step changes —
+# silently, and in the direction where this script keeps checking itself
+# against rules the build has stopped reading.
+#
+# The workflow is read from the commit under test, like the ignore rules
+# themselves. Every step shape this parser does not model is refused by name:
+# resolving a real build's Dockerfile on a guess is how the whole classification
+# below ends up measured against the wrong file.
+resolve_build_step_identity() {
+  BUILD_CONTEXT=""
+  BUILD_DOCKERFILE=""
+
+  local content
+  content="$(git -C "${REPO_ROOT}" show "HEAD:${REHEARSAL_WORKFLOW}" \
+    2>/dev/null)" ||
+    fail "the commit under test carries no ${REHEARSAL_WORKFLOW}; that \
+workflow's build step is what decides which Dockerfile the proof image is \
+compiled from, and so which ignore rules the build-context classification in \
+this script has to be checked against"
+
+  yaml_index_lines "${REHEARSAL_WORKFLOW}" "${content}"
+
+  # Every step using the build action, whichever of the two spellings its
+  # `uses:` line takes — opening the sequence item or following one.
+  local -a hits=()
+  local i body value
+  for ((i = 0; i < ${#YAML_BODIES[@]}; i++)); do
+    ((YAML_INDENTS[i] < 0)) && continue
+    body="${YAML_BODIES[i]}"
+    if [[ "${body}" == '-'[[:space:]]* ]]; then
+      body="${body#-}"
+      body="${body#"${body%%[![:space:]]*}"}"
+    fi
+    [[ "${body}" == 'uses:'* ]] || continue
+    value="$(yaml_scalar_value "${body#uses:}")" || continue
+    [[ "${value}" == "${BUILD_ACTION}@"* ]] || continue
+    hits+=("${i}")
+  done
+
+  ((${#hits[@]} != 0)) ||
+    fail "${REHEARSAL_WORKFLOW} has no ${BUILD_ACTION} step; the proof image's \
+Dockerfile and build context are read out of that step, and this script has \
+nothing left to derive them from"
+  ((${#hits[@]} == 1)) ||
+    fail "${REHEARSAL_WORKFLOW} has ${#hits[@]} ${BUILD_ACTION} steps; this \
+script cannot tell which one builds the proof image whose tree it verifies"
+
+  # The step's mapping keys sit at the sequence item's content column: on the
+  # `uses:` line itself when that line opens the item, and otherwise at the
+  # column the item's own dash line opened.
+  local hit="${hits[0]}" start key_indent opened
+  if key_indent="$(yaml_item_key_indent "${hit}")"; then
+    start="${hit}"
+  else
+    key_indent="${YAML_INDENTS[hit]}"
+    start=-1
+    for ((i = hit - 1; i >= 0; i--)); do
+      ((YAML_INDENTS[i] < 0)) && continue
+      ((YAML_INDENTS[i] < key_indent)) || continue
+      start="${i}"
+      break
+    done
+    ((start >= 0)) ||
+      fail "${REHEARSAL_WORKFLOW}: the ${BUILD_ACTION} step on line \
+$((hit + 1)) opens no sequence item this parser can place"
+    opened="$(yaml_item_key_indent "${start}")" || opened=""
+    [[ "${opened}" == "${key_indent}" ]] ||
+      fail "${REHEARSAL_WORKFLOW} line $((start + 1)) is not the sequence item \
+opening the ${BUILD_ACTION} step; this parser cannot place that step's inputs"
+  fi
+
+  local end
+  end="$(yaml_block_end "$((start + 1))" "${key_indent}")"
+
+  # The `with:` mapping, and nothing else read as one: a key line this parser
+  # cannot split is a step shape it is not reading the way the workflow parser
+  # does, wherever in the step it sits.
+  local with_line=-1
+  for ((i = start + 1; i < end; i++)); do
+    ((YAML_INDENTS[i] == key_indent)) || continue
+    body="${YAML_BODIES[i]}"
+    [[ "${body}" == *:* && "${body%%:*}" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]] ||
+      fail "${REHEARSAL_WORKFLOW} line $((i + 1)) is not a key this parser can \
+read inside the ${BUILD_ACTION} step"
+    [[ "${body%%:*}" == 'with' ]] || continue
+    value="${body#with:}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    [[ -z "${value}" || "${value}" == '#'* ]] ||
+      fail "${REHEARSAL_WORKFLOW} line $((i + 1)) writes the ${BUILD_ACTION} \
+step's inputs as [${value}]; this parser reads only a block mapping"
+    with_line="${i}"
+  done
+  ((with_line >= 0)) ||
+    fail "${REHEARSAL_WORKFLOW}: the ${BUILD_ACTION} step passes no inputs, so \
+it builds the default Git context rather than this commit's tree; the \
+build-context classification in this script describes a checkout"
+
+  local raw_context="" raw_file="" seen_context=0 seen_file=0
+  local input_indent=-1 unmodelled
+  for ((i = with_line + 1; i < end; i++)); do
+    ((YAML_INDENTS[i] < 0)) && continue
+    if ((input_indent < 0)); then
+      ((YAML_INDENTS[i] > key_indent)) ||
+        fail "${REHEARSAL_WORKFLOW} line $((i + 1)) is placed outside the \
+${BUILD_ACTION} step's inputs this parser opened on line $((with_line + 1))"
+      input_indent="${YAML_INDENTS[i]}"
+    fi
+    ((YAML_INDENTS[i] > input_indent)) && continue
+    ((YAML_INDENTS[i] == input_indent)) ||
+      fail "${REHEARSAL_WORKFLOW} line $((i + 1)) is indented under the \
+${BUILD_ACTION} step's inputs at a column this parser cannot place"
+    body="${YAML_BODIES[i]}"
+    [[ "${body}" == *:* && "${body%%:*}" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]] ||
+      fail "${REHEARSAL_WORKFLOW} line $((i + 1)) is not an input this parser \
+can read inside the ${BUILD_ACTION} step"
+    case "${body%%:*}" in
+    context)
+      seen_context=1
+      raw_context="${body#context:}"
+      ;;
+    file)
+      seen_file=1
+      raw_file="${body#file:}"
+      ;;
+    esac
+  done
+
+  # An unset `context` is the action's Git context — a build of the repository
+  # URL, not of this checkout — under which nothing the classification below
+  # says about a tracked path holds.
+  ((seen_context == 1)) ||
+    fail "the ${BUILD_ACTION} step in ${REHEARSAL_WORKFLOW} sets no context, \
+so it builds the default Git context rather than the dispatched checkout; the \
+build-context classification in this script describes the checkout's tree"
+
+  raw_context="${raw_context#"${raw_context%%[![:space:]]*}"}"
+  raw_context="${raw_context%"${raw_context##*[![:space:]]}"}"
+  if unmodelled="$(yaml_unmodelled_value "${raw_context}")"; then
+    fail "the ${BUILD_ACTION} step in ${REHEARSAL_WORKFLOW} writes its context \
+as ${unmodelled}, which this parser does not resolve; the build-context \
+classification below would be checked against a guess"
+  fi
+  local build_context
+  build_context="$(yaml_scalar_value "${raw_context}")" ||
+    fail "the ${BUILD_ACTION} step in ${REHEARSAL_WORKFLOW} quotes its context \
+in a form this parser does not read"
+  build_context="$(dockerignore_clean_path "${build_context}")"
+  [[ "${build_context}" == '.' ]] ||
+    fail "the ${BUILD_ACTION} step in ${REHEARSAL_WORKFLOW} builds from \
+context [${build_context}], but the build-context classification in this \
+script is written over repository-relative paths and holds only for a context \
+rooted at the repository; re-derive it before this scaffold admits any \
+further evidence"
+
+  # buildx defaults `file` to <context>/Dockerfile, and resolves a given one
+  # against the working directory — the same directory the context is rooted
+  # at, which is what makes the two readings agree here at all.
+  local build_dockerfile="Dockerfile"
+  if ((seen_file == 1)); then
+    raw_file="${raw_file#"${raw_file%%[![:space:]]*}"}"
+    raw_file="${raw_file%"${raw_file##*[![:space:]]}"}"
+    if unmodelled="$(yaml_unmodelled_value "${raw_file}")"; then
+      fail "the ${BUILD_ACTION} step in ${REHEARSAL_WORKFLOW} writes its \
+Dockerfile as ${unmodelled}, which this parser does not resolve; the ignore \
+rules the classification below is checked against are selected by that name"
+    fi
+    build_dockerfile="$(yaml_scalar_value "${raw_file}")" ||
+      fail "the ${BUILD_ACTION} step in ${REHEARSAL_WORKFLOW} quotes its \
+Dockerfile in a form this parser does not read"
+    build_dockerfile="$(dockerignore_clean_path "${build_dockerfile}")"
+    [[ "${build_dockerfile}" == /* || "${build_dockerfile}" == '.' ||
+      "${build_dockerfile}" == '..' || "${build_dockerfile}" == '../'* ]] &&
+      fail "the ${BUILD_ACTION} step in ${REHEARSAL_WORKFLOW} builds \
+Dockerfile [${build_dockerfile}], which does not resolve to a path inside the \
+build context; this script cannot name the ignore file that selects"
+  fi
+
+  git -C "${REPO_ROOT}" cat-file -e "HEAD:${build_dockerfile}" 2>/dev/null ||
+    fail "the ${BUILD_ACTION} step in ${REHEARSAL_WORKFLOW} builds Dockerfile \
+[${build_dockerfile}], which the commit under test does not carry"
+
+  BUILD_CONTEXT="${build_context}"
+  BUILD_DOCKERFILE="${build_dockerfile}"
+  note "build step: ${REHEARSAL_WORKFLOW} compiles ${BUILD_DOCKERFILE} from \
+context ${BUILD_CONTEXT}"
+}
+
+# The build inputs the ignore-file selection above depends on decide what this
+# scaffold accepts as evidence just as directly as its own code does, and the
+# gate holding the two together only ever runs on the events and paths its own
+# workflow names. So both are held to the resolved identity: a build step moved
+# to another Dockerfile takes its ignore file with it, and a filter list left
+# behind would leave every later change to that file ungated — the mirror check
+# would keep passing, on a file nobody was told had changed.
+#
+# A trigger carrying no filter at all runs on every change and so covers
+# everything; what this refuses is a gate reachable only by remembering to
+# dispatch it, which is the state this workflow exists to end.
+verify_scaffold_lint_path_filters() {
+  local content
+  content="$(git -C "${REPO_ROOT}" show "HEAD:${SCAFFOLD_LINT_WORKFLOW}" \
+    2>/dev/null)" ||
+    fail "the commit under test carries no ${SCAFFOLD_LINT_WORKFLOW}; nothing \
+holds the build-context classification in this script to the build inputs it \
+mirrors"
+
+  yaml_index_lines "${SCAFFOLD_LINT_WORKFLOW}" "${content}"
+
+  LINT_REQUIRED_INPUTS=(
+    "${REHEARSAL_WORKFLOW}"
+    "${SCAFFOLD_LINT_WORKFLOW}"
+    "${BUILD_DOCKERFILE}"
+    "${BUILD_DOCKERFILE}.dockerignore"
+    ".dockerignore"
+  )
+  LINT_FILTER_MISSING=""
+
+  local i on_line=-1
+  for ((i = 0; i < ${#YAML_BODIES[@]}; i++)); do
+    ((YAML_INDENTS[i] == 0)) || continue
+    [[ "${YAML_BODIES[i]}" == 'on:' ]] || continue
+    on_line="${i}"
+    break
+  done
+  ((on_line >= 0)) ||
+    fail "${SCAFFOLD_LINT_WORKFLOW} declares no triggers this parser can read, \
+so nothing says when the gate holding this script to the build inputs runs"
+
+  local on_end trigger_indent=-1 covered=0
+  on_end="$(yaml_block_end "$((on_line + 1))" 1)"
+  for ((i = on_line + 1; i < on_end; i++)); do
+    ((YAML_INDENTS[i] < 0)) && continue
+    ((trigger_indent < 0)) && trigger_indent="${YAML_INDENTS[i]}"
+    ((YAML_INDENTS[i] == trigger_indent)) || continue
+    case "${YAML_BODIES[i]}" in
+    'push:' | 'pull_request:')
+      verify_lint_trigger_filters "${i}" "${trigger_indent}"
+      covered=$((covered + 1))
+      ;;
+    esac
+  done
+
+  ((covered > 0)) ||
+    fail "${SCAFFOLD_LINT_WORKFLOW} runs on no push or pull request, so the \
+build-context classification in this script is only ever rechecked when \
+somebody remembers to dispatch it"
+
+  if [[ -n "${LINT_FILTER_MISSING}" ]]; then
+    printf '%s' "${LINT_FILTER_MISSING}" >&2
+    fail "${SCAFFOLD_LINT_WORKFLOW} no longer runs on every build input the \
+build-context classification in this script is derived from (listing above); \
+a change to an uncovered one would retire rules this scaffold never rechecks"
+  fi
+
+  note "scaffold lint: ${SCAFFOLD_LINT_WORKFLOW} runs on every change to the \
+${#LINT_REQUIRED_INPUTS[@]} build input(s) this classification is derived \
+from, on all ${covered} push/pull-request trigger(s)"
+}
+
+# The inputs a filter list has to cover and the ones a run found uncovered.
+# Globals rather than arguments because the check below appends to the second
+# from inside a loop, and reports every uncovered input at once rather than
+# failing on the first: a filter list left behind by a moved build step is
+# usually missing more than one entry, and the listing is what the fix needs.
+LINT_REQUIRED_INPUTS=()
+LINT_FILTER_MISSING=""
+
+# One push or pull_request trigger's path filter.
+verify_lint_trigger_filters() {
+  local line="$1" trigger_indent="$2"
+  local trigger="${YAML_BODIES[line]%:}" end key_indent=-1
+  local i j body listed paths_line=-1 entry entries=0
+  end="$(yaml_block_end "$((line + 1))" "$((trigger_indent + 1))")"
+
+  for ((i = line + 1; i < end; i++)); do
+    ((YAML_INDENTS[i] < 0)) && continue
+    ((key_indent < 0)) && key_indent="${YAML_INDENTS[i]}"
+    ((YAML_INDENTS[i] == key_indent)) || continue
+    body="${YAML_BODIES[i]}"
+    # An exclusion list says which changes are exempt rather than which are
+    # covered, so a trigger carrying one cannot be read as coverage at all.
+    [[ "${body}" == 'paths-ignore:'* ]] &&
+      fail "${SCAFFOLD_LINT_WORKFLOW} filters its ${trigger} trigger with \
+paths-ignore, which this check cannot read as coverage of the build inputs the \
+classification in this script mirrors"
+    [[ "${body}" == 'paths:' ]] && paths_line="${i}"
+  done
+
+  # No filter at all is the whole repository: every build input is covered.
+  ((paths_line >= 0)) || return 0
+
+  listed=""
+  end="$(yaml_block_end "$((paths_line + 1))" "$((key_indent + 1))")"
+  for ((j = paths_line + 1; j < end; j++)); do
+    ((YAML_INDENTS[j] < 0)) && continue
+    body="${YAML_BODIES[j]}"
+    [[ "${body}" == '-'[[:space:]]* ]] ||
+      fail "${SCAFFOLD_LINT_WORKFLOW} line $((j + 1)) is not a path filter \
+entry this parser can read"
+    entry="$(yaml_scalar_value "${body#-}")" ||
+      fail "${SCAFFOLD_LINT_WORKFLOW} line $((j + 1)) quotes its path filter \
+in a form this parser does not read"
+    listed+="${entry}"$'\n'
+    entries=$((entries + 1))
+  done
+
+  ((entries > 0)) ||
+    fail "${SCAFFOLD_LINT_WORKFLOW} filters its ${trigger} trigger to an empty \
+path list, which no change matches; the gate holding this script to the build \
+inputs would never run"
+
+  for entry in "${LINT_REQUIRED_INPUTS[@]}"; do
+    grep -qxF -- "${entry}" <<<"${listed}" ||
+      LINT_FILTER_MISSING+="${SCAFFOLD_LINT_WORKFLOW} line \
+$((paths_line + 1)): the ${trigger} filter list does not cover ${entry}"$'\n'
+  done
+}
+
 # Compile the ignore rules the build itself reads, from the commit under
 # test. Which file that is, the builder decides by Dockerfile:
 # `<dockerfile>.dockerignore` beside the context root wins whenever the
@@ -530,6 +983,13 @@ dockerignore_context_excluded() {
 # regenerates by design, which verify_build_image_tree restores byte-exact
 # rather than explains away.
 verify_build_context_mirror() {
+  # Which rules those are is itself a build input: the builder picks its
+  # ignore file by Dockerfile, and which Dockerfile it compiles is written in
+  # the workflow that does the building. So the identity is read from that
+  # workflow, and the gate that reruns this check is held to it, before a
+  # single pattern is compiled.
+  resolve_build_step_identity
+  verify_scaffold_lint_path_filters
   load_dockerignore_patterns
   note "build-context mirror: checking this script's classification against \
 the ${#DOCKERIGNORE_REGEX[@]} pattern(s) the build reads from \

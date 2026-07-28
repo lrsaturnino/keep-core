@@ -27,6 +27,13 @@ name: Cutover Scaffold Lint
 # Dockerfile-specific one retires every rule in the root .dockerignore for
 # this build, which rewrites the whole context classification without
 # touching the file the classification used to be derived from.
+#
+# These lists are not maintained by hand: shell-analysis resolves the
+# Dockerfile the rehearsal workflow's build step really compiles and requires
+# both lists below to cover it, the ignore file its name selects, the root
+# .dockerignore, and both workflows. Moving the build onto another Dockerfile
+# without moving these entries with it fails that check — the entries are
+# what makes this gate run when those files change at all.
 
 on:
   push:

@@ -21,8 +21,15 @@
 # dropped re-inclusion, an absent or ruleless file, and every pattern
 # construct it does not model; and to read its rules from the file the
 # builder itself would select, which a committed Dockerfile.dockerignore
-# takes over from the root .dockerignore entirely. Runs anywhere bash and git
-# exist; everything lives under mktemp and this repository is only ever read.
+# takes over from the root .dockerignore entirely.
+#
+# Which file that is, in turn, is selected by a Dockerfile named in a workflow
+# rather than in this scaffold, so the last cases move the real build step onto
+# another Dockerfile and another context and require the resolution to follow
+# it, the path filters that gate this whole check to be held to it, and every
+# step shape the resolution does not model to be refused rather than guessed
+# at. Runs anywhere bash and git exist; everything lives under mktemp and this
+# repository is only ever read.
 
 set -euo pipefail
 
@@ -55,6 +62,110 @@ CASE_OUT=""
 git_q() {
   git -c user.name=rehearsal -c user.email=rehearsal@invalid \
     -c commit.gpgsign=false -c init.defaultBranch=main "$@"
+}
+
+# The build step and the path filters a fixture carries unless a case is
+# proving a drift in one of them: the shape the checked-in workflows have,
+# reduced to what the resolution actually reads out of them.
+DEFAULT_BUILD_STEP="        uses: ${BUILD_ACTION}@v5
+        with:
+          target: build-docker
+          load: true
+          context: ."
+DEFAULT_PATH_FILTERS="scripts/release/pr4109/**
+${REHEARSAL_WORKFLOW}
+${SCAFFOLD_LINT_WORKFLOW}
+.dockerignore
+Dockerfile.dockerignore
+.gitignore
+Dockerfile
+Makefile"
+
+# The two scaffold workflows every fixture carries: the dispatch whose build
+# step names the Dockerfile and the context it is compiled from, and the lint
+# whose path filters have to cover every input that naming depends on. The
+# mirror check resolves both before it compiles a single ignore rule, so a
+# fixture without them would prove nothing about the rules it does carry.
+#
+# The build step's body and the filter entries are given whole so a case can
+# shape exactly the drift it means to prove. The step that follows the build
+# one carries a block scalar on purpose: its content is indented past the
+# step's own keys, and a parser that read it as structure would slice the
+# build step's inputs somewhere else entirely.
+write_scaffold_workflows() {
+  local repo="$1" step="$2" filters="$3" entry
+  mkdir -p "${repo}/$(dirname "${REHEARSAL_WORKFLOW}")"
+  {
+    printf 'name: Cutover Rehearsal\non:\n  workflow_dispatch:\njobs:\n'
+    printf '  local-proofs:\n    runs-on: ubuntu-latest\n    steps:\n'
+    printf '      - uses: actions/checkout@v4\n'
+    printf '      - name: Build Docker Build Image\n'
+    printf '%s\n' "${step}"
+    printf '      - name: Run cutover gate local proofs\n'
+    printf '        run: |\n'
+    printf '          docker run go-build-env \\\n'
+    printf '            ./scripts/release/pr4109/rehearse.sh local-proofs\n'
+  } >"${repo}/${REHEARSAL_WORKFLOW}"
+
+  {
+    printf 'name: Cutover Scaffold Lint\non:\n'
+    printf '  push:\n    branches:\n      - main\n    paths:\n'
+    while IFS= read -r entry; do
+      [[ -n "${entry}" ]] && printf '      - "%s"\n' "${entry}"
+    done <<<"${filters}"
+    printf '  pull_request:\n    paths:\n'
+    while IFS= read -r entry; do
+      [[ -n "${entry}" ]] && printf '      - "%s"\n' "${entry}"
+    done <<<"${filters}"
+    printf 'jobs:\n  scaffold-lint:\n    runs-on: ubuntu-latest\n    steps:\n'
+    printf '      - uses: actions/checkout@v4\n'
+  } >"${repo}/${SCAFFOLD_LINT_WORKFLOW}"
+}
+
+# The same build step and filters after the build has been moved onto another
+# Dockerfile in another directory: the ignore file that name selects moves with
+# it, and so does everything the gate has to run on.
+ALT_BUILD_STEP="        uses: ${BUILD_ACTION}@v5
+        with:
+          target: build-docker
+          context: .
+          file: build/Alt.Dockerfile"
+ALT_PATH_FILTERS="scripts/release/pr4109/**
+${REHEARSAL_WORKFLOW}
+${SCAFFOLD_LINT_WORKFLOW}
+.dockerignore
+build/Alt.Dockerfile.dockerignore
+.gitignore
+build/Alt.Dockerfile
+Makefile"
+
+# Commit whatever a case has written into a built fixture. The resolution
+# reads the workflows and the ignore rules from the commit, so an uncommitted
+# drift would not exist as far as it is concerned.
+commit_fixture() {
+  (
+    cd "$1"
+    git_q add -Af
+    git_q commit -q -m 'fixture drift'
+  )
+}
+
+# Rewrite a built fixture's scaffold workflows, and commit them together with
+# whatever else the case has staged.
+recommit_scaffold_workflows() {
+  local repo="$1" step="$2" filters="$3"
+  write_scaffold_workflows "${repo}" "${step}" "${filters}"
+  commit_fixture "${repo}"
+}
+
+# Lay down the alternate Dockerfile the cases move the build onto, beside the
+# ignore file its name selects — a copy of the given rules, so a case can prove
+# both that those rules are the ones read and that a drift in them is caught.
+plant_alternate_dockerfile() {
+  local repo="$1" ignore="$2"
+  mkdir -p "${repo}/build"
+  echo 'FROM scratch' >"${repo}/build/Alt.Dockerfile"
+  cp "${ignore}" "${repo}/build/Alt.Dockerfile.dockerignore"
 }
 
 # A miniature of the real tree holding one representative of every family
@@ -102,6 +213,8 @@ make_origin() {
     touch pkg/chain/ethereum/beacon/gen/_address/.keep
     : >pkg/chain/ethereum/beacon/gen/_address/RandomBeacon
     echo 'contract A {}' >solidity/ecdsa/WalletRegistry.sol
+    write_scaffold_workflows "${repo}" "${DEFAULT_BUILD_STEP}" \
+      "${DEFAULT_PATH_FILTERS}"
     git_q add -A
     git_q commit -q -m 'fixture'
   )
@@ -190,6 +303,8 @@ make_context_repo() {
     echo 'package cmd' >pkg/chain/ethereum/beacon/gen/cmd/RandomBeacon.go
     echo 'package abi' >pkg/chain/ethereum/beacon/gen/abi/RandomBeacon.go
     : >pkg/chain/ethereum/beacon/gen/_address/RandomBeacon
+    write_scaffold_workflows "${repo}" "${DEFAULT_BUILD_STEP}" \
+      "${DEFAULT_PATH_FILTERS}"
     git_q add -Af
     git_q commit -q -m 'context fixture'
   )
@@ -360,7 +475,7 @@ make_image_tree "${T}"
 run_verifier "${T}" "${ORIGIN_SHA}" build-image
 check "build-image: the image's designed divergence passes, restored" 0 \
   "verified against the dispatched SHA inside the build image" \
-  "7 context-excluded absence\(s\); 5 regenerated tracked file\(s\) restored" \
+  "9 context-excluded absence\(s\); 5 regenerated tracked file\(s\) restored" \
   "gen/contract/RandomBeacon\.go committed sha256 [0-9a-f]{64} \(pre-restore image sha256 [0-9a-f]{64}\)" \
   "gen/_address/RandomBeacon committed sha256 [0-9a-f]{64} \(pre-restore image sha256 [0-9a-f]{64}\)" \
   "gen/_address/\.keep committed sha256 [0-9a-f]{64} \(absent from the image\)" \
@@ -381,7 +496,7 @@ make_checkout "${T}"
   docs scripts solidity)
 run_verifier "${T}" "${ORIGIN_SHA}" build-image
 check "build-image: expected context-excluded absences alone pass" 0 \
-  "7 context-excluded absence\(s\); 0 regenerated tracked file\(s\) restored"
+  "9 context-excluded absence\(s\); 0 regenerated tracked file\(s\) restored"
 
 T="${WORK}/img-evil-bindings"
 make_image_tree "${T}"
@@ -524,8 +639,8 @@ make_context_repo "${T}" "${CHECKED_IN_DOCKERIGNORE}"
 run_context_mirror "${T}"
 check "context mirror: the checked-in rules and this script agree on every \
 family" 0 \
-  "19 tracked path\(s\) classified identically" \
-  "9 kept out of the build context" \
+  "21 tracked path\(s\) classified identically" \
+  "11 kept out of the build context" \
   "3 excluded from the context but regenerated into the image by design"
 
 # The builder path-cleans every rule before compiling it. Uncleaned
@@ -541,8 +656,8 @@ make_context_repo "${T}" "${WORK}/dockerignore-uncleaned"
 run_context_mirror "${T}"
 check "context mirror: uncleaned rule spellings classify as their cleaned \
 form" 0 \
-  "19 tracked path\(s\) classified identically" \
-  "9 kept out of the build context"
+  "21 tracked path\(s\) classified identically" \
+  "11 kept out of the build context"
 
 # The same for the segment-spanning wildcard in the placements the file does
 # not currently carry: leading, where it has to match through the ancestor
@@ -555,8 +670,8 @@ make_context_repo "${T}" "${WORK}/dockerignore-globstar"
 run_context_mirror "${T}"
 check "context mirror: leading and trailing ** placements classify \
 identically" 0 \
-  "19 tracked path\(s\) classified identically" \
-  "9 kept out of the build context"
+  "21 tracked path\(s\) classified identically" \
+  "11 kept out of the build context"
 
 # The dangerous direction: the mirror keeps explaining an absence the build
 # context no longer produces, so build-image mode would accept a tree missing
@@ -679,8 +794,251 @@ run_context_mirror "${T}"
 check "context mirror: a root .dockerignore the build no longer reads \
 decides nothing" 0 \
   "the build reads from Dockerfile\.dockerignore" \
-  "20 tracked path\(s\) classified identically" \
-  "9 kept out of the build context"
+  "22 tracked path\(s\) classified identically" \
+  "11 kept out of the build context"
+
+# --- build step: which Dockerfile the build compiles ------------------------
+#
+# And which Dockerfile that is, the workflow that does the building decides —
+# not this scaffold. So the cases move the real build step onto another
+# Dockerfile in another directory and require the resolution to follow it into
+# the ignore file that name selects, in both directions: the rules there have
+# to be the ones the mirror is measured against, and a drift in them has to
+# fail. A resolution that restated the Dockerfile as a constant would pass
+# every one of these while reading a file the build had stopped applying.
+
+T="${WORK}/step-alternate-dockerfile"
+make_context_repo "${T}" "${CHECKED_IN_DOCKERIGNORE}"
+plant_alternate_dockerfile "${T}" "${CHECKED_IN_DOCKERIGNORE}"
+recommit_scaffold_workflows "${T}" "${ALT_BUILD_STEP}" "${ALT_PATH_FILTERS}"
+run_context_mirror "${T}"
+check "build step: an alternate Dockerfile moves the ignore file the mirror \
+is measured against" 0 \
+  "compiles build/Alt\.Dockerfile from context \." \
+  "the build reads from build/Alt\.Dockerfile\.dockerignore" \
+  "23 tracked path\(s\) classified identically" \
+  "11 kept out of the build context"
+
+T="${WORK}/step-alternate-dockerfile-drift"
+make_context_repo "${T}" "${CHECKED_IN_DOCKERIGNORE}"
+drift_dockerignore "${WORK}/dockerignore-alt-no-scripts" '^scripts/$'
+plant_alternate_dockerfile "${T}" "${WORK}/dockerignore-alt-no-scripts"
+recommit_scaffold_workflows "${T}" "${ALT_BUILD_STEP}" "${ALT_PATH_FILTERS}"
+run_context_mirror "${T}"
+check "build step: a drift in the alternate Dockerfile's ignore file is \
+caught, with the root file intact" 1 \
+  "the build reads from build/Alt\.Dockerfile\.dockerignore" \
+  "scripts/helper\.sh: this script explains an absence here" \
+  "no longer mirrors build/Alt\.Dockerfile\.dockerignore"
+
+# The hole the resolution above closes only half of: moving the build onto
+# another Dockerfile also moves the ignore file that decides what an image
+# tree may be missing, and the gate holding the two together runs only on the
+# paths its own filters name. A filter list left behind would leave every
+# later change to those files ungated, and the mirror check would keep passing
+# on a file nobody was told had changed.
+T="${WORK}/step-alternate-unfiltered"
+make_context_repo "${T}" "${CHECKED_IN_DOCKERIGNORE}"
+plant_alternate_dockerfile "${T}" "${CHECKED_IN_DOCKERIGNORE}"
+recommit_scaffold_workflows "${T}" "${ALT_BUILD_STEP}" \
+  "${DEFAULT_PATH_FILTERS}"
+run_context_mirror "${T}"
+check "build step: an alternate Dockerfile the lint filters do not cover \
+fails closed" 1 \
+  "the push filter list does not cover build/Alt\.Dockerfile$" \
+  "the push filter list does not cover build/Alt\.Dockerfile\.dockerignore" \
+  "the pull_request filter list does not cover build/Alt\.Dockerfile$" \
+  "no longer runs on every build input"
+
+T="${WORK}/lint-root-ignore-unfiltered"
+make_context_repo "${T}" "${CHECKED_IN_DOCKERIGNORE}"
+recommit_scaffold_workflows "${T}" "${DEFAULT_BUILD_STEP}" \
+  "$(grep -vx '\.dockerignore' <<<"${DEFAULT_PATH_FILTERS}")"
+run_context_mirror "${T}"
+check "build step: a filter list that stops covering the root ignore file \
+fails closed" 1 \
+  "the push filter list does not cover \.dockerignore" \
+  "no longer runs on every build input"
+
+# The gate cannot hold the resolution to the build step if a change to the
+# build step does not run it.
+T="${WORK}/lint-workflow-unfiltered"
+make_context_repo "${T}" "${CHECKED_IN_DOCKERIGNORE}"
+recommit_scaffold_workflows "${T}" "${DEFAULT_BUILD_STEP}" \
+  "$(grep -vxF "${REHEARSAL_WORKFLOW}" <<<"${DEFAULT_PATH_FILTERS}")"
+run_context_mirror "${T}"
+check "build step: a filter list that stops covering the build workflow fails \
+closed" 1 \
+  "the push filter list does not cover \
+\.github/workflows/cutover-rehearsal\.yml" \
+  "no longer runs on every build input"
+
+# An exclusion list says which changes are exempt rather than which are
+# covered, so a trigger carrying one cannot be read as coverage at all.
+T="${WORK}/lint-paths-ignore"
+make_context_repo "${T}" "${CHECKED_IN_DOCKERIGNORE}"
+{
+  printf 'name: Cutover Scaffold Lint\non:\n  pull_request:\n'
+  printf '    paths-ignore:\n      - "docs/**"\n'
+  printf 'jobs:\n  scaffold-lint:\n    runs-on: ubuntu-latest\n    steps:\n'
+  printf '      - uses: actions/checkout@v4\n'
+} >"${T}/${SCAFFOLD_LINT_WORKFLOW}"
+commit_fixture "${T}"
+run_context_mirror "${T}"
+check "build step: a lint filtering with paths-ignore fails closed" 1 \
+  "filters its pull_request trigger with paths-ignore"
+
+# A filter list matching nothing is not a gate that runs on everything, it is
+# a gate that runs on nothing — the state carrying an empty list looks like.
+T="${WORK}/lint-empty-filter"
+make_context_repo "${T}" "${CHECKED_IN_DOCKERIGNORE}"
+recommit_scaffold_workflows "${T}" "${DEFAULT_BUILD_STEP}" ""
+run_context_mirror "${T}"
+check "build step: a lint filtered to an empty path list fails closed" 1 \
+  "filters its push trigger to an empty path list"
+
+# A trigger carrying no filter at all does run on every change, so it covers
+# every build input and is accepted — the check is coverage, not ceremony.
+T="${WORK}/lint-unfiltered-trigger"
+make_context_repo "${T}" "${CHECKED_IN_DOCKERIGNORE}"
+{
+  printf 'name: Cutover Scaffold Lint\non:\n  pull_request:\n'
+  printf 'jobs:\n  scaffold-lint:\n    runs-on: ubuntu-latest\n    steps:\n'
+  printf '      - uses: actions/checkout@v4\n'
+} >"${T}/${SCAFFOLD_LINT_WORKFLOW}"
+commit_fixture "${T}"
+run_context_mirror "${T}"
+check "build step: a lint running on every pull request covers every build \
+input" 0 \
+  "on all 1 push/pull-request trigger\(s\)" \
+  "21 tracked path\(s\) classified identically"
+
+# The state this workflow exists to end: a checker nothing runs until somebody
+# remembers to dispatch it.
+T="${WORK}/lint-dispatch-only"
+make_context_repo "${T}" "${CHECKED_IN_DOCKERIGNORE}"
+{
+  printf 'name: Cutover Scaffold Lint\non:\n  workflow_dispatch:\n'
+  printf 'jobs:\n  scaffold-lint:\n    runs-on: ubuntu-latest\n    steps:\n'
+  printf '      - uses: actions/checkout@v4\n'
+} >"${T}/${SCAFFOLD_LINT_WORKFLOW}"
+commit_fixture "${T}"
+run_context_mirror "${T}"
+check "build step: a lint reachable only by dispatch fails closed" 1 \
+  "runs on no push or pull request"
+
+T="${WORK}/lint-absent"
+make_context_repo "${T}" "${CHECKED_IN_DOCKERIGNORE}"
+(cd "${T}" && git_q rm -q "${SCAFFOLD_LINT_WORKFLOW}" &&
+  git_q commit -q -m 'drop the lint')
+run_context_mirror "${T}"
+check "build step: a commit carrying no scaffold lint fails closed" 1 \
+  "carries no \.github/workflows/cutover-scaffold-lint\.yml"
+
+# --- build step: the shapes the resolution refuses to guess at --------------
+#
+# Every one of these resolves to a Dockerfile only by guessing at what the
+# workflow parser reads, and a wrong guess picks the wrong ignore file — which
+# is the one direction where this scaffold explains a real absence away.
+
+T="${WORK}/step-absent-workflow"
+make_context_repo "${T}" "${CHECKED_IN_DOCKERIGNORE}"
+(cd "${T}" && git_q rm -q "${REHEARSAL_WORKFLOW}" &&
+  git_q commit -q -m 'drop the dispatch')
+run_context_mirror "${T}"
+check "build step: a commit carrying no rehearsal workflow fails closed" 1 \
+  "carries no \.github/workflows/cutover-rehearsal\.yml"
+
+T="${WORK}/step-nested-context"
+make_context_repo "${T}" "${CHECKED_IN_DOCKERIGNORE}"
+recommit_scaffold_workflows "${T}" "        uses: ${BUILD_ACTION}@v5
+        with:
+          context: ./solidity" "${DEFAULT_PATH_FILTERS}"
+run_context_mirror "${T}"
+check "build step: a context that is not the repository root fails closed" 1 \
+  "builds from context \[solidity\]" \
+  "written over repository-relative paths"
+
+T="${WORK}/step-git-context"
+make_context_repo "${T}" "${CHECKED_IN_DOCKERIGNORE}"
+recommit_scaffold_workflows "${T}" "        uses: ${BUILD_ACTION}@v5
+        with:
+          target: build-docker" "${DEFAULT_PATH_FILTERS}"
+run_context_mirror "${T}"
+check "build step: an unset context — the action's Git context — fails \
+closed" 1 \
+  "sets no context" \
+  "rather than the dispatched checkout"
+
+T="${WORK}/step-no-inputs"
+make_context_repo "${T}" "${CHECKED_IN_DOCKERIGNORE}"
+recommit_scaffold_workflows "${T}" "        uses: ${BUILD_ACTION}@v5" \
+  "${DEFAULT_PATH_FILTERS}"
+run_context_mirror "${T}"
+check "build step: a build action passing no inputs at all fails closed" 1 \
+  "passes no inputs"
+
+T="${WORK}/step-two-actions"
+make_context_repo "${T}" "${CHECKED_IN_DOCKERIGNORE}"
+recommit_scaffold_workflows "${T}" "${DEFAULT_BUILD_STEP}
+      - name: Build the runtime image
+        uses: ${BUILD_ACTION}@v5
+        with:
+          context: .
+          file: build/Alt.Dockerfile" "${DEFAULT_PATH_FILTERS}"
+run_context_mirror "${T}"
+check "build step: a second build action fails closed rather than picking \
+one" 1 \
+  "has 2 docker/build-push-action steps"
+
+T="${WORK}/step-no-action"
+make_context_repo "${T}" "${CHECKED_IN_DOCKERIGNORE}"
+recommit_scaffold_workflows "${T}" "        run: docker build ." \
+  "${DEFAULT_PATH_FILTERS}"
+run_context_mirror "${T}"
+check "build step: a workflow that no longer uses the build action fails \
+closed" 1 \
+  "has no docker/build-push-action step"
+
+# The value is decided at dispatch time, so no reading of the committed bytes
+# can say which Dockerfile the build compiled.
+T="${WORK}/step-expression"
+make_context_repo "${T}" "${CHECKED_IN_DOCKERIGNORE}"
+recommit_scaffold_workflows "${T}" "        uses: ${BUILD_ACTION}@v5
+        with:
+          context: .
+          file: \${{ inputs.dockerfile }}" "${DEFAULT_PATH_FILTERS}"
+run_context_mirror "${T}"
+check "build step: a Dockerfile decided by a workflow expression fails \
+closed" 1 \
+  "writes its Dockerfile as a workflow expression"
+
+T="${WORK}/step-flow-inputs"
+make_context_repo "${T}" "${CHECKED_IN_DOCKERIGNORE}"
+recommit_scaffold_workflows "${T}" "        uses: ${BUILD_ACTION}@v5
+        with: {context: ., file: build/Alt.Dockerfile}" \
+  "${DEFAULT_PATH_FILTERS}"
+run_context_mirror "${T}"
+check "build step: inputs written as a flow mapping fail closed" 1 \
+  "reads only a block mapping"
+
+T="${WORK}/step-missing-dockerfile"
+make_context_repo "${T}" "${CHECKED_IN_DOCKERIGNORE}"
+recommit_scaffold_workflows "${T}" "${ALT_BUILD_STEP}" "${ALT_PATH_FILTERS}"
+run_context_mirror "${T}"
+check "build step: a Dockerfile the commit does not carry fails closed" 1 \
+  "builds Dockerfile \[build/Alt\.Dockerfile\], which the commit under test \
+does not carry"
+
+T="${WORK}/step-escaping-dockerfile"
+make_context_repo "${T}" "${CHECKED_IN_DOCKERIGNORE}"
+recommit_scaffold_workflows "${T}" "        uses: ${BUILD_ACTION}@v5
+        with:
+          context: .
+          file: ../shared/Dockerfile" "${DEFAULT_PATH_FILTERS}"
+run_context_mirror "${T}"
+check "build step: a Dockerfile outside the build context fails closed" 1 \
+  "does not resolve to a path inside the build context"
 
 # ----------------------------------------------------------------------------
 
