@@ -6,11 +6,11 @@ name: Cutover Rehearsal
 # static analyzers, and the ECDSA contracts build/test, self-tests the
 # source-binding and evidence-record validators, validates any produced
 # evidence records against the evidence schema, and archives each stage's
-# log for the dispatched SHA. The container rehearsal stages run
-# only when explicitly requested with the immutable image digests and
-# rehearsal chain inputs; they report BLOCKED — a failed job — until the
-# rehearsal fleet inputs exist, because a rehearsal that cannot execute must
-# never look green.
+# log for the dispatched SHA. The container rehearsal stages run only when
+# explicitly requested with the immutable image digests and the rehearsal
+# chain inputs, and each one names the exact input it is missing and reports
+# BLOCKED — a failed job — rather than running partially, because a rehearsal
+# that cannot execute must never look green.
 #
 # Provenance is fail-closed: every proof stage receives the dispatched SHA
 # in PR4109_EXPECTED_SOURCE_COMMIT and refuses to produce evidence unless
@@ -39,11 +39,26 @@ on:
       r1_image_digest:
         description: "Immutable R1 candidate runtime digest (repo@sha256:...)"
         required: false
+      probe_image_digest:
+        description: "Immutable digest of the wget-carrying probe image every evidence reading is scraped with (repo@sha256:...); a mutable tag would leave the reading instrument outside the record's provenance"
+        required: false
       eth_ws_url:
         description: "Rehearsal chain websocket endpoint"
         required: false
       cutover_block:
         description: "Rehearsed cutover block C on that chain"
+        required: false
+      chain_id:
+        description: "Numeric chain id of that rehearsal chain"
+        required: false
+      bitcoin_network:
+        description: "Bitcoin network the rollback state audit reconciles against (e.g. testnet)"
+        required: false
+      prior_version:
+        description: "Release version the prior digest carries, as the rollback state audit must find it recorded"
+        required: false
+      prior_revision:
+        description: "Source revision the prior digest carries, as the rollback state audit must find it recorded"
         required: false
 
 permissions:
@@ -238,25 +253,60 @@ jobs:
           if-no-files-found: error
 
   container-rehearsal:
-    # The container stages need the immutable digests, a rehearsal chain, and
-    # per-node keys/configs provisioned on the runner; they BLOCK (exit 3)
-    # until the fleet orchestration is extended against a real rehearsal
-    # chain. A red run here means the mandatory rehearsal is still blocked,
-    # which is the truthful status.
+    # The container stages need the immutable digests, a rehearsal chain, the
+    # per-node keys/configs, and the chain-side inputs no repository can
+    # derive — the driver that originates protocol work, and the
+    # reconciliation, quiescence, and prior-reader evidence the rollback audit
+    # binds its verdict to. Everything the runner can be given is given below;
+    # anything still missing reports BLOCKED (exit 3) naming the exact input,
+    # which is the truthful status for a rehearsal that cannot execute.
     if: inputs.run_container_stages
     needs: local-proofs
     runs-on: ubuntu-latest
     env:
       PRIOR_IMAGE_DIGEST: ${{ inputs.prior_image_digest }}
       R1_IMAGE_DIGEST: ${{ inputs.r1_image_digest }}
+      PROBE_IMAGE_DIGEST: ${{ inputs.probe_image_digest }}
       ETH_WS_URL: ${{ inputs.eth_ws_url }}
       CUTOVER_BLOCK: ${{ inputs.cutover_block }}
-      KEYSTORE_DIR: ${{ github.workspace }}/rehearsal-keystore
+      CHAIN_ID: ${{ inputs.chain_id }}
       KEEP_ETHEREUM_PASSWORD: ${{ secrets.REHEARSAL_KEEP_ETHEREUM_PASSWORD }}
+      PR4109_BITCOIN_NETWORK: ${{ inputs.bitcoin_network }}
+      PR4109_PRIOR_VERSION: ${{ inputs.prior_version }}
+      PR4109_PRIOR_REVISION: ${{ inputs.prior_revision }}
+      # The container stages verify their own source binding before they emit
+      # or judge a record, exactly like every other proof stage.
+      PR4109_EXPECTED_SOURCE_COMMIT: ${{ github.sha }}
+      EVIDENCE_DIR: ${{ github.workspace }}/rehearsal-evidence
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
+
+      # Every provisioned input lands outside the checkout. The container
+      # stages refuse to produce evidence from a tree that diverges from the
+      # dispatched commit — untracked files included — so a keystore or an
+      # input bundle unpacked into the workspace would fail the very stage it
+      # exists to enable. The one exception is the evidence directory, which
+      # the commit's own .gitignore covers.
+      - name: Resolve the provisioning paths
+        run: |
+          {
+            echo "KEYSTORE_DIR=$RUNNER_TEMP/rehearsal-keystore"
+            echo "REHEARSAL_INPUTS_DIR=$RUNNER_TEMP/rehearsal-inputs"
+            echo "PR4109_WORK_DRIVER=$RUNNER_TEMP/rehearsal-inputs/work-driver"
+            echo "PR4109_CHAIN_RECONCILIATION_EVIDENCE=$RUNNER_TEMP/rehearsal-inputs/chain-reconciliation.json"
+            echo "PR4109_BITCOIN_RECONCILIATION_EVIDENCE=$RUNNER_TEMP/rehearsal-inputs/bitcoin-reconciliation.json"
+            echo "PR4109_QUIESCENCE_REPORT_DIR=$RUNNER_TEMP/rehearsal-inputs/quiescence-reports"
+            echo "PR4109_PRIOR_READER_EVIDENCE=$RUNNER_TEMP/rehearsal-inputs/prior-reader-compatibility.json"
+            # Written to, not read from: the rollback stage captures each
+            # drained node's state here straight out of the container it
+            # stopped. It holds live protocol state — key shares included —
+            # so it stays on the runner and is never archived. What a reviewer
+            # reads is the audit manifest each capture produces, which the
+            # stage writes into the evidence directory.
+            echo "STORAGE_SNAPSHOT_DIR=$RUNNER_TEMP/rehearsal-snapshots"
+          } >> "$GITHUB_ENV"
 
       # The per-node keys and configurations come from one repository secret
       # holding a base64-encoded tar.gz with a <service>/config.toml plus key
@@ -282,11 +332,114 @@ jobs:
           echo "provisioned $(find "$KEYSTORE_DIR" -mindepth 1 -maxdepth 1 \
             -type d | wc -l | tr -d ' ') rehearsal node directories"
 
+      # The inputs that exist outside this repository entirely. The fleet only
+      # reacts to chain events, so without a driver no ceremony exists to
+      # observe; and the rollback audit reports namespace consistency and
+      # nothing about rollback safety unless it is given the live-chain and
+      # Bitcoin reconciliations, each node's own quiescence outcome, and the
+      # prior release's reader-compatibility result. Each member is checked
+      # here rather than at the point of use, so a bundle missing one blocks
+      # before the fleet is started instead of halfway through a rehearsal.
+      - name: Provision the rehearsal chain inputs bundle
+        env:
+          REHEARSAL_CHAIN_INPUTS_BUNDLE_B64: ${{ secrets.REHEARSAL_CHAIN_INPUTS_BUNDLE_B64 }}
+        run: |
+          if [ -z "$REHEARSAL_CHAIN_INPUTS_BUNDLE_B64" ]; then
+            echo "BLOCKED: the REHEARSAL_CHAIN_INPUTS_BUNDLE_B64 secret is" >&2
+            echo "not provisioned; store a base64-encoded tar.gz holding" >&2
+            echo "work-driver (executable, called with the phase name)," >&2
+            echo "chain-reconciliation.json, bitcoin-reconciliation.json," >&2
+            echo "prior-reader-compatibility.json, and one" >&2
+            echo "quiescence-reports/<service>.json per R1 node, then" >&2
+            echo "re-dispatch" >&2
+            exit 3
+          fi
+          mkdir -p "$REHEARSAL_INPUTS_DIR"
+          printf '%s' "$REHEARSAL_CHAIN_INPUTS_BUNDLE_B64" \
+            | base64 -d \
+            | tar -xz -C "$REHEARSAL_INPUTS_DIR"
+          chmod -R go-rwx "$REHEARSAL_INPUTS_DIR"
+
+          missing=""
+          for member in \
+            "$PR4109_CHAIN_RECONCILIATION_EVIDENCE" \
+            "$PR4109_BITCOIN_RECONCILIATION_EVIDENCE" \
+            "$PR4109_PRIOR_READER_EVIDENCE"; do
+            [ -f "$member" ] || missing="$missing $member"
+          done
+          [ -d "$PR4109_QUIESCENCE_REPORT_DIR" ] \
+            || missing="$missing $PR4109_QUIESCENCE_REPORT_DIR"
+          [ -x "$PR4109_WORK_DRIVER" ] \
+            || missing="$missing $PR4109_WORK_DRIVER(executable)"
+          if [ -n "$missing" ]; then
+            echo "BLOCKED: the chain inputs bundle is missing:$missing" >&2
+            exit 3
+          fi
+          echo "provisioned the work driver and every rollback audit input"
+
+      # The records these stages emit are measured against the compiled bounds
+      # the local-proofs stage attested at this same commit, and that receipt
+      # lives in that job's evidence artifact. Without it here every rehearsal
+      # blocks at its own emitter, which is the one failure mode a dispatch
+      # cannot diagnose from the log it archives.
+      - name: Restore the release-manifest attestation
+        uses: actions/download-artifact@v4
+        with:
+          name: rehearsal-evidence-${{ github.sha }}
+          path: ${{ github.workspace }}/rehearsal-evidence
+
+      - name: Require the attestation these records are measured against
+        run: |
+          dir="$EVIDENCE_DIR/attestation"
+          for part in derived-manifest.json reviewed-manifest.sha256 \
+            source-commit.txt; do
+            if [ ! -f "$dir/$part" ]; then
+              echo "BLOCKED: the local-proofs attestation did not arrive:" >&2
+              echo "$dir/$part is absent, so nothing here proves the" >&2
+              echo "reviewed release manifest still matches the compiled" >&2
+              echo "bounds these records would be judged by" >&2
+              exit 3
+            fi
+          done
+          echo "attestation restored for source $(cat "$dir/source-commit.txt")"
+
       - name: Preflight the rehearsal inputs
+        id: preflight
         run: ./scripts/release/pr4109/rehearse.sh preflight
 
       - name: Exact-image single-release rehearsal
+        id: single_release
         run: ./scripts/release/pr4109/rehearse.sh single-release
 
+      # A refused cutover rehearsal is exactly when the rollback gate's
+      # evidence matters most, so it runs on the cutover's verdict being
+      # anything at all. Only a failed preflight stops it: that means the
+      # inputs never validated, and a rollback rehearsal on unvalidated inputs
+      # would produce a record about nothing.
       - name: Homogeneous rollback rehearsal
+        if: ${{ !cancelled() && steps.preflight.outcome == 'success' }}
         run: ./scripts/release/pr4109/rehearse.sh rollback
+
+      # Both projects, whatever happened above: a rehearsal that failed
+      # mid-fleet otherwise leaves nodes running and volumes holding live
+      # protocol state on the runner.
+      - name: Tear down the rehearsal fleets
+        if: ${{ always() }}
+        run: |
+          for gate in single_release rollback; do
+            docker compose --project-name "pr4109-$gate" \
+              --file ./scripts/release/pr4109/compose.rehearsal.yaml \
+              down --volumes --remove-orphans || true
+          done
+          rm -rf "$STORAGE_SNAPSHOT_DIR"
+
+      # The rehearsal records and the audit manifests, whatever the verdict:
+      # a refused gate's account of why it was refused is the evidence a
+      # release decision most needs to read.
+      - name: Upload container rehearsal evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-rehearsal-evidence-${{ github.sha }}
+          path: rehearsal-evidence/
+          if-no-files-found: error

@@ -259,6 +259,44 @@ environment (every proof stage):
                       build image's designed divergence: context-excluded
                       absences, with every regenerated gen/ file restored
                       byte-exact from the dispatched commit before testing)
+
+environment (preflight, single-release, rollback):
+  PRIOR_IMAGE_DIGEST  immutable prior-production runtime digest
+  R1_IMAGE_DIGEST     immutable R1 candidate runtime digest
+  PROBE_IMAGE_DIGEST  immutable digest of the wget-carrying image every
+                      evidence reading is scraped with
+  ETH_WS_URL          rehearsal chain websocket endpoint
+  CUTOVER_BLOCK       rehearsed cutover block C on that chain
+  CHAIN_ID            that chain's numeric chain id
+  KEYSTORE_DIR        per-node inputs, one <service>/ directory each holding
+                      that node's config.toml and key material
+  KEEP_ETHEREUM_PASSWORD
+                      the key files' password
+  PR4109_WORK_DRIVER  executable called with the phase name to originate
+                      protocol work on the rehearsal chain; may report the
+                      transactions it submitted as a JSON object with a
+                      transaction_hashes array. The fleet only reacts to
+                      chain events, so the steps that need a ceremony record
+                      themselves blocked without one
+
+environment (rollback, additionally):
+  STORAGE_SNAPSHOT_DIR
+                      where this stage captures each drained node's state
+                      from the container it stopped, for the offline audit
+  PR4109_CHAIN_RECONCILIATION_EVIDENCE
+  PR4109_BITCOIN_RECONCILIATION_EVIDENCE
+  PR4109_PRIOR_READER_EVIDENCE
+                      the reconciliation and prior-reader results the audit
+                      binds its verdict to; from a snapshot alone it reports
+                      namespace consistency and nothing about rollback safety
+  PR4109_QUIESCENCE_REPORT_DIR
+                      one <service>.json per node: the permits it held when
+                      it drained and how each one ended
+  PR4109_BITCOIN_NETWORK
+  PR4109_PRIOR_VERSION
+  PR4109_PRIOR_REVISION
+                      the operational identities the audit requires the
+                      snapshot and the restored artifact to agree with
 EOF
 }
 

@@ -575,6 +575,53 @@ operator keys — and the dispatch reports `BLOCKED` when the secret is not
 provisioned. The companion `REHEARSAL_KEEP_ETHEREUM_PASSWORD` secret carries
 the key files' password.
 
+The rest of what a container rehearsal needs is chain-side, which is to say
+outside this repository, and arrives the same way. The dispatch inputs name
+the artifacts and the chain: the prior, R1, and probe digests (all three
+immutable — every evidence reading is a scrape through the probe, so a
+mutable probe tag would leave the reading instrument outside the record's
+provenance), the rehearsal chain's websocket endpoint and numeric chain id,
+the rehearsed `C`, and the Bitcoin network, prior version, and prior revision
+the rollback state audit binds its verdict to. The
+`REHEARSAL_CHAIN_INPUTS_BUNDLE_B64` secret carries the files: a
+base64-encoded tar.gz holding an executable `work-driver` — called with the
+phase name, because the fleet only reacts to chain events and without
+something originating deposits, DKG requests, and relay requests there is no
+ceremony to observe — plus `chain-reconciliation.json`,
+`bitcoin-reconciliation.json`, `prior-reader-compatibility.json`, and one
+`quiescence-reports/<service>.json` per R1 node. Each member is checked as it
+is unpacked, so a bundle missing one blocks before the fleet starts rather
+than halfway through a rehearsal.
+
+Everything provisioned lands outside the checkout, under the runner's
+temporary directory. The container stages verify their own source binding
+before they emit or judge a record, and that check counts untracked files as
+divergence — so a keystore or an input bundle unpacked into the workspace
+would fail the very stage it was provisioned to enable. The evidence
+directory is the one exception, and only because the commit's own
+`.gitignore` covers it.
+
+Storage snapshots are not among the supplied inputs. The rollback stage
+captures each drained node's state itself, straight out of the container it
+just stopped, into `STORAGE_SNAPSHOT_DIR`; a supplied snapshot is only a
+claim about what the fleet left behind, and an older capture or another
+node's audits exactly as cleanly as the real thing. Those captures hold live
+protocol state — key shares included — so they stay on the runner and are
+never archived. What a reviewer reads is the audit manifest each capture
+produces, written into the evidence directory beside the rehearsal record.
+
+The container job is bound to the same commit as every other proof stage,
+and the receipt that binds it — the local-proofs stage's attestation of the
+reviewed manifest against the compiled bounds — is downloaded from that
+job's artifact before any rehearsal runs, because a rehearsal that reaches
+its emitter without one blocks there, in the one place a dispatch cannot
+diagnose from the log it archives. The rollback rehearsal runs on whatever
+verdict the cutover rehearsal reached: a refused cutover is exactly when the
+rollback gate's evidence matters most. Only a failed preflight stops it,
+since that means the inputs never validated and the record would be about
+nothing. Both fleets are torn down and both records are archived whatever
+happened.
+
 ## Release manifest: service-manager termination grace
 
 A terminating node drains instead of dying: the first SIGTERM quiesces the
