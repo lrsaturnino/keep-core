@@ -1492,11 +1492,14 @@ shell_invocation_shape() {
 # commit can drop the invocation along with this reading of it, and a commit
 # whose job keeps the name a branch-protection rule requires can report success
 # having run something else under it. A rule naming a job the head commit
-# defines therefore holds the name, not the analysis. Only a required workflow
-# defined outside this repository, whose text no pull request into it can edit,
-# makes the absence of a run of *this* analysis block a merge. That control and
-# its current standing are recorded beside this scaffold rather than claimed
-# here.
+# defines therefore holds the name, not the analysis. Nor is the reading below
+# a closure within the one body it reads: the commands ahead of the invocation
+# are read for the shell they open, so a `cp` over the entrypoint is accepted
+# and the accepted final command runs the copy. Only a ruleset requiring this
+# workflow, with the workflow and the analyzer it runs both pinned where no
+# pull request into this repository can edit them, makes the absence of a run
+# of *this* analysis block a merge. That control and its current standing are
+# recorded beside this scaffold rather than claimed here.
 verify_scaffold_lint_runs_analysis() {
   local content
   content="$(git -C "${REPO_ROOT}" show "HEAD:${SCAFFOLD_LINT_WORKFLOW}" \
@@ -1685,9 +1688,11 @@ ${SCAFFOLD_LINT_STAGE} unconditionally, on line $((run_line + 1)), as its \
 step's last command, under the runner's own shell, with no environment or \
 working directory written around it and no earlier step in its job running a \
 shell of its own; that this commit says so is the whole of what is proved here \
-— that a run happened at all, and that the run reporting success ran this \
-file, rests on a required workflow defined outside this repository, whose \
-standing is recorded in ${SCAFFOLD_DIR}/README.md"
+— a command ahead of the invocation in that same body is read for the shell it \
+opens and not for what it writes, and that a run happened at all, and that the \
+run reporting success ran this file, rests on a ruleset requiring this \
+workflow with its analyzer pinned outside this repository, whose standing is \
+recorded in ${SCAFFOLD_DIR}/README.md"
 }
 
 # The keys that turn a step or the job around it into something a change can

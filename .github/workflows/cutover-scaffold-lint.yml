@@ -67,14 +67,21 @@ name: Cutover Scaffold Lint
 # the job all fail closed. Keep the preceding steps to actions, and pass
 # EVIDENCE_DIR on the command line as below.
 #
+# A command ahead of the invocation in this step's own body is accepted, and is
+# the one shape of that kind that is: the words before it are read for the
+# shell they open, not for what they write, so a cp over the entrypoint passes
+# and the accepted final command then runs the copy. Keep this body to the
+# invocation alone.
+#
 # What none of that can prove is that this workflow ran, or that the run
 # reporting success ran this file — the check lives behind the invocation it is
 # checking, and the job producing the check is defined by the same commit under
 # test. A branch-protection rule requiring the scaffold-lint check therefore
-# holds the job name, not this analysis. Closing that needs an
-# organisation-level required workflow defined outside this repository; until
-# one is configured this gate is advisory, and a commit deleting this file
-# deletes its own enforcement. See scripts/release/pr4109/README.md.
+# holds the job name, not this analysis. Closing that needs a ruleset requiring
+# this workflow, with both the workflow and the analyzer it runs pinned outside
+# this repository; until one is configured this gate is advisory, and a commit
+# deleting this file deletes its own enforcement. See
+# scripts/release/pr4109/README.md.
 
 on:
   push:

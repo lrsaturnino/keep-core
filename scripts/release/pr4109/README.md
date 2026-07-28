@@ -274,9 +274,8 @@ actionlint, the build-context mirror check, and both validator self-tests over
 every change to `rehearse.sh`, to either self-test, and to the workflows
 themselves. Whether failing it also *blocks a merge* is a setting outside this
 repository, and one whose standing is recorded — not assumed — under "An
-immutable required workflow behind the scaffold gate" in **Hard external
-dependencies**. Its path filters cover the build inputs the trust model is
-derived
+enforcing ruleset behind the scaffold gate" in **Hard external dependencies**.
+Its path filters cover the build inputs the trust model is derived
 from as well as the scaffold's own files — `.dockerignore`, both ignore files
 the build could select, the root and nested `.gitignore` rules, `Dockerfile`,
 and the root and per-package `Makefile`s — because each of them decides what
@@ -393,17 +392,23 @@ conclusion under a job name, and the job producing it is defined by the same
 head commit under test: a commit keeping the name while its job runs something
 else reports success and merges. The four refusals above narrow that to shapes
 this parser reads; they are a narrowing and not a closure, and shapes outside
-them remain — a preceding `uses:` step runs code from another repository and
+them remain. A preceding `uses:` step runs code from another repository and
 reaches `$GITHUB_ENV` and the checkout just as directly, and it is accepted
 here only because refusing it would refuse the checkout the analysis needs to
-read anything at all.
+read anything at all. An ordinary command ahead of the invocation in the
+analysis step's own body is accepted for a narrower reason: the words ahead of
+the invocation are read for the shell they open and nothing else, and a `cp`
+over the entrypoint opens none — after which the accepted final command runs
+whatever the copy left at that path. Both are pinned as accepted cases in
+`test-source-binding.sh`, because a boundary a reader has to infer from the
+absence of a case is one the next rewording moves.
 
 The control that does close it has to be defined where the pull request cannot
-edit it: an **organisation-level required workflow**, whose text lives outside
-this repository, running this analysis against the head commit. It is tracked
-as an outstanding external dependency, with what was and was not checkable from
-here, under "An immutable required workflow behind the scaffold gate" in **Hard
-external dependencies** — and until it is confirmed, this gate is advisory.
+edit it: a **ruleset requiring this workflow**, its source and its analyzer
+both pinned outside this repository. It is tracked as an outstanding external
+dependency, with what was and was not checkable from here, under "An enforcing
+ruleset behind the scaffold gate" in **Hard external dependencies** — and
+until it is configured, this gate is advisory.
 `shell-analysis`'s own log says exactly that rather than claiming otherwise: it
 reports what the commit under test says, and names this file for the rest.
 
@@ -510,7 +515,7 @@ tests refuse any shortcut through that sequence.
 
 ## Hard external dependencies
 
-### An immutable required workflow behind the scaffold gate
+### An enforcing ruleset behind the scaffold gate
 
 `shell-analysis` proves what the commit under test *says* about
 `cutover-scaffold-lint.yml`, and it cannot prove that a run of that workflow
@@ -519,34 +524,67 @@ behind the invocation it checks, and the job producing the check is defined by
 the same head commit. The reading detailed under "Cutover rehearsal scaffold"
 narrows the shapes a green conclusion can hide (an `env:` at any level, an
 assignment on the invocation, a `working-directory:`, a job `container:`, a
-preceding `run:` step); it does not close the boundary, and a preceding `uses:`
+preceding `run:` step); it does not close the boundary. A preceding `uses:`
 step is accepted while reaching `$GITHUB_ENV` and the checkout just as
-directly.
+directly, and so is an ordinary command ahead of the invocation inside the
+analysis step's own body: a `cp` over the entrypoint is neither a shell
+construct nor a builtin, and that is all the words ahead of the invocation are
+read for. Both shapes are pinned as accepted in `test-source-binding.sh`, so a
+later reading of the refusals cannot quietly grow into a claim of closure.
 
-Only a control defined where the pull request cannot edit it closes this: an
-**organisation-level required workflow** running this analysis against the head
-commit, its text living outside this repository. A branch-protection rule
-requiring the `scaffold-lint` check is *not* a substitute — it requires a
-conclusion under a job name that the commit under test defines.
+Only a control defined where the pull request cannot edit it closes this.
+GitHub's is a **ruleset rule requiring a workflow** — "Require workflows to
+pass before merging", spelled `"type": "workflows"` in the API, settable at
+the organisation or enterprise level, each entry naming a `repository_id` and
+a `path` and optionally pinning a `ref` or `sha`. It replaced Actions Required
+Workflows, which stopped being configurable on 2023-09-20 and became
+unreachable on 2023-10-18: `/orgs/{org}/actions/required_workflows` is not the
+control to look for, and whatever it answers settles nothing about the present
+one. A branch-protection rule requiring the `scaffold-lint` check is not a
+substitute either — it requires a conclusion under a job name that the commit
+under test defines.
+
+Two properties of that ruleset are what close the boundary, and either one
+missing reopens it:
+
+- **The workflow source is pinned outside this repository.** The rule's
+  `repository_id` must name a repository no pull request into `keep-core` can
+  write to, with `ref` or `sha` deciding what runs.
+- **The checker implementation is pinned there too.** An immutable workflow
+  that merely invokes the head commit's `scripts/release/pr4109/rehearse.sh`
+  re-inherits everything above: the analyzer it runs is still the one the
+  commit under test supplies. The analysis has to be carried by the external
+  repository, or pinned by digest from it.
+
+Enforcement state belongs in the record rather than being assumed from the
+ruleset's existence: `enforcement` is one of `disabled`, `active` and
+`evaluate`, and `evaluate` is a dry run that reports without blocking a merge.
+Only `active` gates anything.
 
 Standing, checked empirically on 2026-07-28:
-`GET /repos/threshold-network/keep-core/rulesets` returns an empty list, so no
-repository ruleset requires this or any other check;
+`GET /repos/threshold-network/keep-core/rulesets?includes_parents=true`
+returns an empty list. That is the informative probe — `includes_parents`
+defaults to `true` and pulls in rulesets configured at higher levels that
+apply to this repository, and GitHub filters only `bypass_actors` by the
+caller's permission — so from outside the organisation this is the strongest
+available signal, and it is a negative one: no ruleset, repository-level or
+inherited, applies here. `GET /orgs/threshold-network/rulesets` returns 404
+without `admin:org`, and GitHub answers 404 rather than 403 for organisation
+resources a caller cannot see, so on its own it distinguishes an absent
+ruleset from an invisible one not at all.
 `GET /repos/threshold-network/keep-core/branches/main/protection` returns 404,
-which for that endpoint means either no protection or no admin rights and so
-settles nothing either way; and
-`GET /orgs/threshold-network/actions/required_workflows` returns 403 without
-`admin:org`, so the control cannot be confirmed or denied from outside the
-organisation at all.
+which for that endpoint likewise means either no protection or no admin rights
+and so settles nothing either way.
 
-Until an organisation admin confirms such a workflow exists and names this
-analysis, **the gate is advisory**: a commit deleting
-`cutover-scaffold-lint.yml` deletes its own enforcement silently, and a green
-`scaffold-lint` conclusion is evidence that something under that name
-succeeded, not that this analyzer ran. Evidence that rests on the scaffold's
-own checkers having judged a change should be read with that in mind.
-Unblocking is a configuration change plus the confirmation record, not a code
-change here.
+Until an organisation admin configures such a ruleset, **the gate is
+advisory**: a commit deleting `cutover-scaffold-lint.yml` deletes its own
+enforcement silently, and a green `scaffold-lint` conclusion is evidence that
+something under that name succeeded, not that this analyzer ran. Evidence that
+rests on the scaffold's own checkers having judged a change should be read
+with that in mind. Unblocking is a configuration change plus the record, not a
+code change here, and the record has to name the ruleset's id and name, its
+target, its `enforcement` — which must read `active` — and the `workflows`
+rule's `repository_id`, `path` and pinned `ref` or `sha`.
 
 ### Reviewed tss-lib fork with an immutable per-party legacy mode
 

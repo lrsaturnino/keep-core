@@ -60,8 +60,11 @@ unset PR4109_EXPECTED_SOURCE_COMMIT PR4109_SOURCE_BINDING_MODE
 # The build rules the mirror cases compare against, resolved once here: the
 # cases below reassign REPO_ROOT inside their subshells to point the verifier
 # at a throwaway tree, so the checked-in file has to be named before any of
-# them runs.
-CHECKED_IN_DOCKERIGNORE="${REPO_ROOT}/.dockerignore"
+# them runs. The tree those files are read from is named here for the same
+# reason — the cases that read the committed scaffold rather than a fixture
+# must not resolve it through a name a case has since pointed elsewhere.
+CHECKED_IN_ROOT="${REPO_ROOT}"
+CHECKED_IN_DOCKERIGNORE="${CHECKED_IN_ROOT}/.dockerignore"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pr4109-source-binding.XXXXXX")"
 trap 'rm -rf "${WORK}"' EXIT
@@ -522,6 +525,27 @@ assert_file_is() {
   if [[ "${got}" != "${want}" ]]; then
     printf 'FAIL %s: %s holds [%s], want [%s]\n' \
       "${desc}" "${file}" "${got}" "${want}"
+    FAILED=$((FAILED + 1))
+    return
+  fi
+  printf 'ok   %s\n' "${desc}"
+  PASS=$((PASS + 1))
+}
+
+# Assert that a checked-in file records something. The cases prove what the
+# parser does; these prove the scaffold says so. A boundary a reader has to
+# infer from the absence of a case is one the next rewording moves, and every
+# case here would go on passing while the prose around them claimed closure.
+# Both files are hard-wrapped prose, and one of them wraps it in `#`, so the
+# sentence a claim lives in is matched across its line breaks rather than
+# within one of them.
+assert_records() {
+  local desc="$1" file="$2" pattern="$3" text
+  text="$(sed 's/^[[:space:]]*#[[:space:]]\{0,1\}//' "${CHECKED_IN_ROOT}/${file}" |
+    tr '\n' ' ' | tr -s ' ')"
+  if ! printf '%s\n' "${text}" | grep -Eq -- "${pattern}"; then
+    printf 'FAIL %s: %s records nothing matching /%s/\n' \
+      "${desc}" "${file}" "${pattern}"
     FAILED=$((FAILED + 1))
     return
   fi
@@ -1961,6 +1985,54 @@ check "scaffold lint: a step writing the later steps' environment fails \
 closed" 1 \
   "runs shell in the job carrying ${SCAFFOLD_LINT_STAGE}, ahead of the step \
 that carries it"
+
+# The same replacement moved inside the analysis step's own body, where no key
+# holds it. The words ahead of the invocation are read only for the shell they
+# open, and a `cp` opens none, so this is accepted — and what the accepted
+# final command then runs is whatever the copy left at the entrypoint's path.
+# It is pinned here as accepted, rather than left for a later reading of the
+# refusals above to describe as closed: this is where the parser stops, and no
+# further case added to it moves that. The control that does close it is
+# recorded under "Hard external dependencies" in README.md.
+T="${WORK}/lint-preceding-command-same-step"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "${LINT_JOB_HEAD}
+      - name: Analyze the rehearsal scaffold
+        run: |
+          cp .github/decoy.sh ./${SCAFFOLD_DIR}/${SCAFFOLD_ENTRYPOINT}
+          ${LINT_INVOCATION}"
+run_lint_gate "${T}"
+check "scaffold lint: a command replacing the entrypoint inside the analysis \
+step is accepted" 0 \
+  "runs ${SCAFFOLD_ENTRYPOINT} ${SCAFFOLD_LINT_STAGE} unconditionally" \
+  "read for the shell it opens and not for what it writes"
+
+# The case above passes whether or not anything says so, so what the three
+# places that describe this reading say about it is held here too: the
+# analyzer's own header, the workflow that carries the invocation, and the
+# scaffold's prose. Silence in any of them reads as closure to everyone but
+# the reader who ran the case.
+assert_records "scaffold lint: the reading's own header names the accepted \
+same-body command" "${SCAFFOLD_DIR}/${SCAFFOLD_ENTRYPOINT}" \
+  "the commands ahead of the invocation are read for the shell they open"
+assert_records "scaffold lint: the gate workflow names the accepted \
+same-body command" "${SCAFFOLD_LINT_WORKFLOW}" \
+  "command ahead of the invocation in this step's own body is accepted"
+assert_records "scaffold lint: the scaffold's prose names the accepted \
+same-body command" "${SCAFFOLD_DIR}/README.md" \
+  "command ahead of the invocation in the analysis step's own body is accepted"
+
+# The control that does close it, named as the mechanism GitHub actually has
+# rather than the one it retired in 2023: a record naming the withdrawn
+# required-workflows API sends an administrator somewhere that cannot enforce
+# anything, and reads as unconfirmable when it is merely unbuilt.
+assert_records "scaffold lint: the external control is recorded as a ruleset \
+rule" "${SCAFFOLD_DIR}/README.md" \
+  "\"type\": \"workflows\""
+assert_records "scaffold lint: the external control's enforcement state is \
+part of the record" "${SCAFFOLD_DIR}/README.md" \
+  "\`evaluate\` is a dry run that reports without blocking a merge"
 
 # A step after the analysis cannot change what the analysis already read, and
 # the checked-in job's evidence upload is exactly that shape.
