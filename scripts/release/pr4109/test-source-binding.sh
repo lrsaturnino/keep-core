@@ -1564,6 +1564,259 @@ check "scaffold lint: a condition on a step beside the analysis is not a \
 condition on it" 0 \
   "runs ${SCAFFOLD_ENTRYPOINT} ${SCAFFOLD_LINT_STAGE} unconditionally"
 
+# Everything above establishes that the text is there and that neither the step
+# nor the job is excused. None of it says the text is a command: a workflow can
+# carry the invocation in a step name, print it, test it, or run it and throw
+# its exit status away, and every one of those satisfies the checks above while
+# gating exactly nothing. So the cases below are the false positives — the
+# shapes a search for matching text would have called a run.
+
+# A step runs its `run:` body and nothing else. Named in a step title, in an
+# `env:` value, or in an action's inputs, the invocation is a label on a step
+# that runs nothing at all.
+LINT_JOB_HEAD="  scaffold-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4"
+LINT_INVOCATION="./${SCAFFOLD_DIR}/${SCAFFOLD_ENTRYPOINT} ${SCAFFOLD_LINT_STAGE}"
+
+T="${WORK}/lint-named-not-run"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "${LINT_JOB_HEAD}
+      - name: ${LINT_INVOCATION}
+        run: true"
+run_lint_gate "${T}"
+check "scaffold lint: the invocation in a step name runs nothing" 1 \
+  "no longer runs ${SCAFFOLD_ENTRYPOINT} ${SCAFFOLD_LINT_STAGE}"
+
+T="${WORK}/lint-env-not-run"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "${LINT_JOB_HEAD}
+      - name: Analyze the rehearsal scaffold
+        env:
+          ANALYSIS: ${LINT_INVOCATION}
+        run: true"
+run_lint_gate "${T}"
+check "scaffold lint: the invocation in an environment value runs nothing" 1 \
+  "no longer runs ${SCAFFOLD_ENTRYPOINT} ${SCAFFOLD_LINT_STAGE}"
+
+# Printing the command is the cheapest way to leave the text in place while
+# retiring the gate, and the step then reports the printer's exit status.
+T="${WORK}/lint-echoed"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "${LINT_JOB_HEAD}
+      - name: Analyze the rehearsal scaffold
+        run: echo ${LINT_INVOCATION}"
+run_lint_gate "${T}"
+check "scaffold lint: an echoed invocation is not a run of it" 1 \
+  "does not run ${SCAFFOLD_LINT_STAGE} as a command of its own" \
+  "its command word is \[echo\]"
+
+# Captured rather than run: the status the step reports is the assignment's,
+# which succeeds however the analysis ends.
+T="${WORK}/lint-substituted"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "${LINT_JOB_HEAD}
+      - name: Analyze the rehearsal scaffold
+        run: OUT=\$(${LINT_INVOCATION})"
+run_lint_gate "${T}"
+check "scaffold lint: an invocation captured in a substitution fails closed" 1 \
+  "a command substitution"
+
+# The two spellings that leave the analysis running and discard what it says.
+T="${WORK}/lint-status-swallowed"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "${LINT_JOB_HEAD}
+      - name: Analyze the rehearsal scaffold
+        run: ${LINT_INVOCATION} || true"
+run_lint_gate "${T}"
+check "scaffold lint: an invocation whose failure is excused in shell fails \
+closed" 1 \
+  "a conditional chain"
+
+T="${WORK}/lint-piped"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "${LINT_JOB_HEAD}
+      - name: Analyze the rehearsal scaffold
+        run: ${LINT_INVOCATION} | tee analysis.log"
+run_lint_gate "${T}"
+check "scaffold lint: a piped invocation reports the pipeline's status" 1 \
+  "a pipeline"
+
+# A shell condition is the same hole as a step-level `if:`, one layer down
+# where the YAML keys this parser reads say nothing about it.
+T="${WORK}/lint-shell-conditioned"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "${LINT_JOB_HEAD}
+      - name: Analyze the rehearsal scaffold
+        run: |
+          if [ -n \"\${ANALYZE:-}\" ]
+          then
+            ${LINT_INVOCATION}
+          fi"
+run_lint_gate "${T}"
+check "scaffold lint: an invocation inside a shell condition fails closed" 1 \
+  "the compound-statement word \[if\]"
+
+# Read but never executed: the body runs to the end and the step succeeds
+# having analyzed nothing.
+T="${WORK}/lint-noexec"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "${LINT_JOB_HEAD}
+      - name: Analyze the rehearsal scaffold
+        run: |
+          set -n
+          ${LINT_INVOCATION}"
+run_lint_gate "${T}"
+check "scaffold lint: a shell option retiring the body fails closed" 1 \
+  "the shell builtin \[set\]"
+
+# A step reports its last command's status, so anything after the invocation
+# decides what a failing analysis is reported as.
+T="${WORK}/lint-trailing-command"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "${LINT_JOB_HEAD}
+      - name: Analyze the rehearsal scaffold
+        run: |
+          ${LINT_INVOCATION}
+          echo done"
+run_lint_gate "${T}"
+check "scaffold lint: a command after the invocation takes over its status" 1 \
+  "with 1 command\(s\) after it"
+
+# A stage argument the analysis does not take is a different run of a different
+# thing, whatever the matching text says.
+T="${WORK}/lint-extra-argument"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "${LINT_JOB_HEAD}
+      - name: Analyze the rehearsal scaffold
+        run: ${LINT_INVOCATION} --dry-run"
+run_lint_gate "${T}"
+check "scaffold lint: an invocation carrying a further argument fails \
+closed" 1 \
+  "it carries the further argument \[--dry-run\]"
+
+# A folded scalar hands the shell a joining of its lines that this parser does
+# not perform, so what would run there is not what the lines say.
+T="${WORK}/lint-folded"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "${LINT_JOB_HEAD}
+      - name: Analyze the rehearsal scaffold
+        run: >
+          ${LINT_INVOCATION}"
+run_lint_gate "${T}"
+check "scaffold lint: a folded run body is refused rather than read" 1 \
+  "the block scalar header \[>\]"
+
+# The runner writes an expression's value into this shell before the shell
+# parses it, so an expression carrying pull-request text writes the command.
+T="${WORK}/lint-expression-injected"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "${LINT_JOB_HEAD}
+      - name: Analyze the rehearsal scaffold
+        run: \${{ github.event.inputs.prefix }} ${LINT_INVOCATION}"
+run_lint_gate "${T}"
+check "scaffold lint: an invocation written by an untrusted expression fails \
+closed" 1 \
+  "the workflow expression \[github\.event\.inputs\.prefix\]"
+
+# The shape the checked-in step really has: a runner-owned expression in an
+# assignment ahead of the invocation, and work done before it. Refusing this
+# would be refusing the workflow this gate exists to hold.
+T="${WORK}/lint-runner-expression"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "${LINT_JOB_HEAD}
+      - name: Analyze the rehearsal scaffold
+        run: |
+          mkdir -p \${{ github.workspace }}/rehearsal-evidence
+          EVIDENCE_DIR=\${{ github.workspace }}/rehearsal-evidence \\
+            ${LINT_INVOCATION}"
+run_lint_gate "${T}"
+check "scaffold lint: a runner-owned expression ahead of the invocation is \
+accepted" 0 \
+  "runs ${SCAFFOLD_ENTRYPOINT} ${SCAFFOLD_LINT_STAGE} unconditionally"
+
+# The invocation continued across two lines is one command, so a reading that
+# counted raw lines would find neither the run nor its shape.
+T="${WORK}/lint-continued-invocation"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "${LINT_JOB_HEAD}
+      - name: Analyze the rehearsal scaffold
+        run: |
+          ./${SCAFFOLD_DIR}/${SCAFFOLD_ENTRYPOINT} \\
+            ${SCAFFOLD_LINT_STAGE}"
+run_lint_gate "${T}"
+check "scaffold lint: an invocation continued across lines is one run" 0 \
+  "runs ${SCAFFOLD_ENTRYPOINT} ${SCAFFOLD_LINT_STAGE} unconditionally"
+
+# Naming another interpreter leaves every line of the body exactly as it was
+# and retires all of it, which no reading of the shell alone would show.
+T="${WORK}/lint-shell-replaced"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "${LINT_JOB_HEAD}
+      - name: Analyze the rehearsal scaffold
+        shell: cat {0}
+        run: ${LINT_INVOCATION}"
+run_lint_gate "${T}"
+check "scaffold lint: a step handed to another interpreter fails closed" 1 \
+  "hands the step running ${SCAFFOLD_LINT_STAGE} to \[cat \{0\}\]"
+
+# Spelled as the runner's own default it changes nothing, so it is accepted;
+# refusing it would be refusing the shape rather than the hole.
+T="${WORK}/lint-shell-bash"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "${LINT_JOB_HEAD}
+      - name: Analyze the rehearsal scaffold
+        shell: bash
+        run: ${LINT_INVOCATION}"
+run_lint_gate "${T}"
+check "scaffold lint: a step naming the runner's own shell is accepted" 0 \
+  "runs ${SCAFFOLD_ENTRYPOINT} ${SCAFFOLD_LINT_STAGE} unconditionally"
+
+# The same substitution set a level or two away from the step it retires.
+T="${WORK}/lint-job-defaults"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "  scaffold-lint:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: cat {0}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Analyze the rehearsal scaffold
+        run: ${LINT_INVOCATION}"
+run_lint_gate "${T}"
+check "scaffold lint: job defaults deciding what runs the body fail closed" 1 \
+  "sets defaults on the job \[scaffold-lint\] running ${SCAFFOLD_LINT_STAGE}"
+
+T="${WORK}/lint-workflow-defaults"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)
+defaults:
+  run:
+    shell: cat {0}"
+run_lint_gate "${T}"
+check "scaffold lint: workflow-wide defaults deciding what runs the body fail \
+closed" 1 \
+  "sets workflow-wide defaults"
+
 # --- contracts toolchain: the parity the stage's evidence claims ------------
 #
 # The contracts stage's log says it reproduces one named CI job, and that claim

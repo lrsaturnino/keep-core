@@ -50,6 +50,20 @@ name: Cutover Scaffold Lint
 # already moved, so the pull_request event is the only one that can stop a
 # change to these inputs from merging unchecked, and every restriction of it
 # exempts some pull request from the gate.
+#
+# The analysis step below is likewise read rather than found. shell-analysis
+# requires it in a step's run: body — the only key that runs anything — as that
+# body's last command, unconditioned, unexcused, under the runner's own shell,
+# and with nothing around it that could swallow what it says. Keep the step's
+# shell to plain commands: a pipeline, a `|| true`, a shell `if`, a `set` line,
+# a `shell:` naming another interpreter, or a step that merely prints this
+# command all fail the gate closed rather than quietly retiring it.
+#
+# What none of that can prove is that this workflow ran, because the check
+# lives behind the invocation it is checking. scaffold-lint MUST therefore be a
+# required status check on the protected branches; without that setting a
+# commit deleting this file deletes its own enforcement. See
+# scripts/release/pr4109/README.md.
 
 on:
   push:

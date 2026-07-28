@@ -325,6 +325,46 @@ one this scaffold has proved reachable. A condition on some *other* step is
 untouched — the evidence upload runs under `if: always()` precisely so a
 failing analyzer's log survives.
 
+Matching text is not a run, so the invocation is read rather than found. It is
+looked for only in a step's `run:` body, because that is the only key that
+runs anything: the same text in a step name, an `env:` value or an action's
+inputs labels a step that can do nothing at all. Inside that body the shell is
+read as the shell takes it — lines joined across a trailing backslash, so an
+invocation continued over two of them is one command — and the command has to
+be the analysis itself and the *last* thing the body does, since a step reports
+its last command's exit status. Around it, the shapes that would leave the text
+running while the result went nowhere are refused by name: a pipeline, a `&&`
+or `||` chain, a `;` list, a background `&`, a redirection, a command
+substitution, a subshell, a compound-statement keyword, and the builtins that
+decide what the shell does with the lines after them — `set -n` reads a body
+without executing a line of it. Anything after the invocation is refused for
+the same reason: a trailing `echo` is what a failing analysis would then be
+reported as.
+
+The two ways a body runs under something other than the shell it was written
+for are held the same way. A step-level `shell:` is accepted only spelled
+`bash`, the runner's own default: `shell: cat {0}` leaves every line exactly
+as it was and executes none of them. `defaults:` — on the job or on the
+workflow — sets that same thing further out and is refused outright rather
+than followed. Workflow expressions inside the body are read too, because the
+runner substitutes their values before the shell parses the line: only the
+runner's own contexts (`github.workspace`, `runner.temp` and their siblings)
+are accepted, and an expression carrying pull-request text is refused, since
+its value is what would decide the command.
+
+What none of that proves is that a run happened. `shell-analysis` reads the
+head commit's workflow file, and the check that would notice the invocation
+being deleted lives *behind* that invocation: a commit that removes the step
+also removes the run that would have objected. The control that closes this
+is not in the repository and cannot be — **`scaffold-lint` MUST be configured
+as a required status check** on the protected branches (branch-protection
+rule, or an organisation-level required workflow), so that a pull request
+whose head commit produces no `scaffold-lint` conclusion cannot merge at all.
+Without that setting the workflow is advisory: deleting it deletes its own
+enforcement silently. `shell-analysis`'s own log says as much rather than
+claiming otherwise — it reports what the commit under test says, and names
+this paragraph for what says the rest.
+
 The same reasoning covers the other claim this scaffold makes about work it
 did not do itself. `solidity-proofs` says its evidence is
 `contracts-ecdsa.yml`'s `contracts-build-and-test` job's evidence, and that

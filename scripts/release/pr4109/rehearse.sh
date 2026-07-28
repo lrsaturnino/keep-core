@@ -1138,12 +1138,328 @@ $((paths_line + 1)): the ${trigger} filter list does not cover ${entry}"$'\n'
   done
 }
 
+# The lines a `run:` key hands to the shell, and the workflow line each of them
+# sits on, or nothing when the line opens no `run:` at all. Both spellings
+# these workflows use are read — the key on a sequence item's own line and the
+# key opening one — because a step runs what its `run:` carries and nothing
+# else: the same text in a step name, an `env:` value or a `with:` input names
+# something, and a step that only names a command runs none of it.
+#
+# A shape whose lines are not what the shell receives is reported in
+# YAML_RUN_UNMODELLED rather than read, with the lines still returned, so a
+# caller can tell whether the shape nothing here reads is the one it was
+# looking for. Refusing every folded scalar in the file would refuse steps this
+# gate has no interest in.
+YAML_RUN_LINES=()
+YAML_RUN_LINENOS=()
+YAML_RUN_UNMODELLED=""
+yaml_run_lines() {
+  local index="$1" body key_indent raw value end i
+  YAML_RUN_LINES=()
+  YAML_RUN_LINENOS=()
+  YAML_RUN_UNMODELLED=""
+
+  body="${YAML_BODIES[index]}"
+  if key_indent="$(yaml_item_key_indent "${index}")"; then
+    body="${body#-}"
+    body="${body#"${body%%[![:space:]]*}"}"
+  else
+    key_indent="${YAML_INDENTS[index]}"
+  fi
+  [[ "${body}" == 'run:'* ]] || return 1
+
+  raw="${body#run:}"
+  raw="${raw#"${raw%%[![:space:]]*}"}"
+  raw="${raw%"${raw##*[![:space:]]}"}"
+
+  case "${raw}" in
+  '') return 1 ;;
+  # The literal block scalar, whose lines are the shell's lines.
+  '|' | '|-' | '|+') ;;
+  # A folded scalar joins its lines before the shell ever sees them, and an
+  # explicit indentation indicator moves where its content begins; either way
+  # what runs is not what these lines say.
+  '|'* | '>'*)
+    YAML_RUN_UNMODELLED="the block scalar header [${raw}]"
+    ;;
+  *)
+    # Kept as written when the quoting is one yaml_scalar_value refuses, so the
+    # invocation is still found in it and refused for the reason it really has
+    # rather than reported missing.
+    if value="$(yaml_scalar_value "${raw}")"; then
+      raw="${value}"
+    else
+      YAML_RUN_UNMODELLED="a quoted value needing escape processing to read"
+    fi
+    YAML_RUN_LINES=("${raw}")
+    YAML_RUN_LINENOS=("${index}")
+    return 0
+    ;;
+  esac
+
+  end="$(yaml_block_end "$((index + 1))" "$((key_indent + 1))")"
+  for ((i = index + 1; i < end; i++)); do
+    ((YAML_INDENTS[i] < 0)) && continue
+    YAML_RUN_LINES+=("${YAML_BODIES[i]}")
+    YAML_RUN_LINENOS+=("${i}")
+  done
+}
+
+# One entry per logical command in the lines above: a line ending in a
+# backslash joins the one after it, which is the only shape here that spreads a
+# command across lines. SHELL_COMMAND_LINES keeps the workflow line each
+# command opened on, because that is the line a refusal has to name.
+SHELL_COMMANDS=()
+SHELL_COMMAND_LINES=()
+shell_logical_commands() {
+  local i line acc="" start=-1
+  local join=$'\\' joined=$'\\\\'
+  SHELL_COMMANDS=()
+  SHELL_COMMAND_LINES=()
+  for ((i = 0; i < ${#YAML_RUN_LINES[@]}; i++)); do
+    line="${YAML_RUN_LINES[i]}"
+    if ((start < 0)); then start="${YAML_RUN_LINENOS[i]}"; fi
+    if [[ "${line}" == *"${join}" && "${line}" != *"${joined}" ]]; then
+      acc+="${line%"${join}"} "
+      continue
+    fi
+    SHELL_COMMANDS+=("${acc}${line}")
+    SHELL_COMMAND_LINES+=("${start}")
+    acc=""
+    start=-1
+  done
+  if [[ -n "${acc}" ]]; then
+    SHELL_COMMANDS+=("${acc}")
+    SHELL_COMMAND_LINES+=("${start}")
+  fi
+}
+
+# The runner substitutes a workflow expression into this shell before the shell
+# parses it, so a value carrying an operator writes a command nothing here ever
+# saw. The contexts below are the runner's own — none of them can carry text
+# from a pull request — and every other one is refused by name rather than read
+# through, the way every other value this scaffold cannot model is.
+SHELL_RUNNER_CONTEXTS="github.workspace github.repository github.sha \
+github.run_id github.run_number github.run_attempt runner.temp \
+runner.workspace runner.os runner.arch"
+
+SHELL_EXPANDED=""
+SHELL_EXPRESSION_REFUSAL=""
+# The expression opener and closer are the literal characters the workflow
+# parser reads there, so they are deliberately never expanded here.
+# shellcheck disable=SC2016
+shell_expand_expressions() {
+  local raw="$1" head rest context
+  SHELL_EXPANDED=""
+  SHELL_EXPRESSION_REFUSAL=""
+  while [[ "${raw}" == *'${{'* ]]; do
+    head="${raw%%'${{'*}"
+    rest="${raw#*'${{'}"
+    if [[ "${rest}" != *'}}'* ]]; then
+      SHELL_EXPRESSION_REFUSAL="an unterminated workflow expression"
+      return 1
+    fi
+    context="${rest%%'}}'*}"
+    raw="${rest#*'}}'}"
+    context="${context#"${context%%[![:space:]]*}"}"
+    context="${context%"${context##*[![:space:]]}"}"
+    case " ${SHELL_RUNNER_CONTEXTS} " in
+    *" ${context} "*) ;;
+    *)
+      SHELL_EXPRESSION_REFUSAL="the workflow expression [${context}]"
+      return 1
+      ;;
+    esac
+    # A value with no operator in it, so the command around it reads the same
+    # before and after the runner writes the real one in.
+    SHELL_EXPANDED+="${head}RUNNER_VALUE"
+  done
+  SHELL_EXPANDED+="${raw}"
+}
+
+# The first thing in a command this parser has no reading for, named one by one
+# the way dockerignore_unmodelled_construct names one. Every entry decides
+# either whether the command runs or whose exit status the shell reports back,
+# which are the only two questions asked of this body; reading past one of them
+# would be answering both on a guess.
+#
+# Quoting is tracked because an operator inside quotes is not an operator, and
+# a word-initial `#` outside them ends the command the way the shell ends it.
+shell_unmodelled_construct() {
+  local cmd="$1" quote="" i ch next prev=""
+  for ((i = 0; i < ${#cmd}; i++)); do
+    ch="${cmd:i:1}"
+    next="${cmd:i+1:1}"
+    if [[ "${quote}" == "'" ]]; then
+      [[ "${ch}" == "'" ]] && quote=""
+      prev="${ch}"
+      continue
+    fi
+    if [[ "${ch}" == $'\\' ]]; then
+      i=$((i + 1))
+      prev=""
+      continue
+    fi
+    if [[ "${ch}" == '`' ]] || [[ "${ch}" == '$' && "${next}" == '(' ]]; then
+      printf 'a command substitution'
+      return 0
+    fi
+    if [[ "${quote}" == '"' ]]; then
+      [[ "${ch}" == '"' ]] && quote=""
+      prev="${ch}"
+      continue
+    fi
+    if [[ "${ch}" == '#' && -z "${prev}" ]]; then
+      return 1
+    fi
+    case "${ch}" in
+    "'" | '"') quote="${ch}" ;;
+    '|')
+      if [[ "${next}" == '|' ]]; then
+        printf 'a conditional chain'
+        return 0
+      fi
+      printf 'a pipeline'
+      return 0
+      ;;
+    '&')
+      if [[ "${next}" == '&' ]]; then
+        printf 'a conditional chain'
+        return 0
+      fi
+      printf 'a backgrounded command'
+      return 0
+      ;;
+    ';')
+      printf 'a command list'
+      return 0
+      ;;
+    '<' | '>')
+      printf 'a redirection'
+      return 0
+      ;;
+    '(' | ')')
+      printf 'a subshell'
+      return 0
+      ;;
+    esac
+    if [[ "${ch}" == [[:space:]] ]]; then prev=""; else prev="${ch}"; fi
+  done
+  if [[ -n "${quote}" ]]; then
+    printf 'an unterminated quote'
+    return 0
+  fi
+  return 1
+}
+
+# A command's words, with the leading `NAME=value` assignments dropped and
+# anything from a word-initial `#` onwards dropped with them. Placing the
+# command word is the same problem for the invocation and for everything beside
+# it, and both readings below start from it.
+SHELL_WORDS=()
+shell_command_words() {
+  local cmd="$1" word
+  local -a raw=()
+  SHELL_WORDS=()
+  read -ra raw <<<"${cmd}"
+  local i=0
+  while ((i < ${#raw[@]})); do
+    [[ "${raw[i]}" =~ ^[A-Za-z_][A-Za-z_0-9]*= ]] || break
+    i=$((i + 1))
+  done
+  for ((; i < ${#raw[@]}; i++)); do
+    word="${raw[i]}"
+    [[ "${word}" == '#'* ]] && break
+    SHELL_WORDS+=("${word}")
+  done
+}
+
+# The command words that decide something about the commands around them rather
+# than doing work of their own: a compound statement's keywords, and the
+# builtins that change what the shell does with the lines after them. One of
+# these ahead of the invocation can stop it running — `set -n` reads the rest
+# of the body without executing any of it — or replace the shell that would
+# have run it, and neither leaves a mark on the step's exit status.
+SHELL_COMPOUND_WORDS="if then elif else fi for while until do done case esac \
+select function coproc time in { } ! ["
+SHELL_EXECUTION_WORDS="set shopt eval exec exit return source . trap"
+shell_unmodelled_word() {
+  shell_command_words "$1"
+  ((${#SHELL_WORDS[@]} > 0)) || return 1
+  case " ${SHELL_COMPOUND_WORDS} " in
+  *" ${SHELL_WORDS[0]} "*)
+    printf 'the compound-statement word [%s]' "${SHELL_WORDS[0]}"
+    return 0
+    ;;
+  esac
+  case " ${SHELL_EXECUTION_WORDS} " in
+  *" ${SHELL_WORDS[0]} "*)
+    printf 'the shell builtin [%s]' "${SHELL_WORDS[0]}"
+    return 0
+    ;;
+  esac
+  return 1
+}
+
+# The one command shape read as running the analysis: any number of
+# `NAME=value` assignments, the entrypoint, the stage, and nothing after it.
+# The invocation as an argument to something else — an `echo`, a runner, a
+# command substitution's subject — is a mention of the analysis rather than a
+# run of it, and the exit status the step reports is that other command's.
+shell_invocation_shape() {
+  local entrypoint="${SCAFFOLD_DIR}/${SCAFFOLD_ENTRYPOINT}" word
+  shell_command_words "$1"
+  if ((${#SHELL_WORDS[@]} == 0)); then
+    printf 'it carries no command word at all'
+    return 0
+  fi
+
+  word="${SHELL_WORDS[0]//\"/}"
+  word="${word//\'/}"
+  case "${word}" in
+  "${entrypoint}" | */"${entrypoint}") ;;
+  *)
+    printf 'its command word is [%s]' "${SHELL_WORDS[0]}"
+    return 0
+    ;;
+  esac
+
+  if ((${#SHELL_WORDS[@]} < 2)); then
+    printf 'it names no stage to run'
+    return 0
+  fi
+  word="${SHELL_WORDS[1]//\"/}"
+  word="${word//\'/}"
+  if [[ "${word}" != "${SCAFFOLD_LINT_STAGE}" ]]; then
+    printf 'its argument is [%s] rather than %s' \
+      "${SHELL_WORDS[1]}" "${SCAFFOLD_LINT_STAGE}"
+    return 0
+  fi
+
+  if ((${#SHELL_WORDS[@]} > 2)); then
+    printf 'it carries the further argument [%s]' "${SHELL_WORDS[2]}"
+    return 0
+  fi
+  return 1
+}
+
 # Triggers and filters say when the gate runs. They say nothing about what it
 # runs, and a workflow firing on every change to every input while its job no
 # longer invokes this script — or invokes it behind a condition, or with its
 # failure declared survivable — is the same ungated state written a different
-# way. So the invocation is placed and read: exactly one of it, no condition
-# on the step or on the job around it, and no licence for either to fail.
+# way. So the invocation is placed and read.
+#
+# Placed in the only thing that runs anything, a step's `run:` body, and read
+# there down to the shape of the command: exactly one of it, the last command
+# of its body so that the step's exit status is the analysis's whatever the
+# shell's error handling is set to, nothing around it that could condition it
+# or swallow its status, and no condition on the step or the job holding it.
+#
+# What this cannot prove is that a run of that workflow happened. The file it
+# reads is the head commit's, and a head commit can drop the workflow along
+# with this reading of it; only a required status check configured outside the
+# repository makes the absence of a run block a merge. That control is recorded
+# beside this scaffold rather than claimed here.
 verify_scaffold_lint_runs_analysis() {
   local content
   content="$(git -C "${REPO_ROOT}" show "HEAD:${SCAFFOLD_LINT_WORKFLOW}" \
@@ -1153,43 +1469,110 @@ runs the analysis the evidence this scaffold admits rests on"
 
   yaml_index_lines "${SCAFFOLD_LINT_WORKFLOW}" "${content}"
 
-  # Anywhere in the file, because the invocation sits inside a block scalar
-  # whose lines are shell rather than structure. Where it sits is the next
-  # question; that there is exactly one of it is this one.
+  # The stage ends where a stage name can no longer continue, rather than at
+  # whitespace: an invocation the shell has wrapped in something — a
+  # substitution, a quote, a pipeline — is exactly the case the reading below
+  # exists to refuse, and one that never matched here would be refused for the
+  # wrong reason, as an invocation nobody could find.
   local invocation="${SCAFFOLD_DIR}/${SCAFFOLD_ENTRYPOINT//./\\.}"
-  invocation+="[[:space:]]+${SCAFFOLD_LINT_STAGE}([[:space:]]|$)"
-  local -a hits=()
-  local i
+  invocation+="[[:space:]]+${SCAFFOLD_LINT_STAGE}([^-.[:alnum:]_]|$)"
+
+  # Every `run:` body in the file, searched over the logical commands it hands
+  # the shell rather than over its raw lines, so an invocation continued across
+  # two of them counts once and counts here. That there is exactly one of it is
+  # this question; what shape it has is the next.
+  local -a run_keys=() hit_lines=()
+  local i j invocations=0 found
   for ((i = 0; i < ${#YAML_BODIES[@]}; i++)); do
     ((YAML_INDENTS[i] < 0)) && continue
-    [[ "${YAML_BODIES[i]}" =~ ${invocation} ]] && hits+=("${i}")
+    yaml_run_lines "${i}" || continue
+    shell_logical_commands
+    found=0
+    for ((j = 0; j < ${#SHELL_COMMANDS[@]}; j++)); do
+      [[ "${SHELL_COMMANDS[j]}" =~ ${invocation} ]] || continue
+      found=$((found + 1))
+      hit_lines+=("${SHELL_COMMAND_LINES[j]}")
+    done
+    if ((found > 0)); then
+      invocations=$((invocations + found))
+      run_keys+=("${i}")
+    fi
   done
 
-  ((${#hits[@]} != 0)) ||
+  ((invocations != 0)) ||
     fail "${SCAFFOLD_LINT_WORKFLOW} no longer runs ${SCAFFOLD_ENTRYPOINT} \
-${SCAFFOLD_LINT_STAGE}; it would go on firing on every change to the inputs \
-this scaffold's trust model is derived from and checking none of them"
-  ((${#hits[@]} == 1)) ||
+${SCAFFOLD_LINT_STAGE} from any step's run: body; it would go on firing on \
+every change to the inputs this scaffold's trust model is derived from and \
+checking none of them"
+  ((invocations == 1)) ||
     fail "${SCAFFOLD_LINT_WORKFLOW} runs ${SCAFFOLD_ENTRYPOINT} \
-${SCAFFOLD_LINT_STAGE} ${#hits[@]} times; this parser cannot tell which of \
+${SCAFFOLD_LINT_STAGE} ${invocations} times; this parser cannot tell which of \
 them the conditions it reads below belong to"
 
-  local run_line="${hits[0]}" step=-1 step_keys=""
-  if step_keys="$(yaml_item_key_indent "${run_line}")"; then
-    step="${run_line}"
+  # The shell that one body carries, read as the shell would take it: what the
+  # runner writes into it, what the commands around the invocation could do to
+  # it, and whether the status the step reports is the analysis's at all.
+  local run_key="${run_keys[0]}" run_line="${hit_lines[0]}"
+  yaml_run_lines "${run_key}"
+  [[ -z "${YAML_RUN_UNMODELLED}" ]] ||
+    fail "${SCAFFOLD_LINT_WORKFLOW} line $((run_key + 1)) hands the \
+${SCAFFOLD_LINT_STAGE} run to the shell through ${YAML_RUN_UNMODELLED}, which \
+this parser has no reading for; what would run there is not what these lines \
+say, and a run nothing here can read is not one this scaffold has proved"
+  shell_logical_commands
+
+  local k reason invocation_at=-1
+  for ((k = 0; k < ${#SHELL_COMMANDS[@]}; k++)); do
+    if ! shell_expand_expressions "${SHELL_COMMANDS[k]}"; then
+      fail "${SCAFFOLD_LINT_WORKFLOW} line $((SHELL_COMMAND_LINES[k] + 1)) \
+carries ${SHELL_EXPRESSION_REFUSAL} in the step running \
+${SCAFFOLD_LINT_STAGE}; the runner writes that value into this shell before \
+the shell parses it, so the command it would make is not one read here"
+    fi
+    SHELL_COMMANDS[k]="${SHELL_EXPANDED}"
+
+    if reason="$(shell_unmodelled_construct "${SHELL_COMMANDS[k]}")"; then
+      fail "${SCAFFOLD_LINT_WORKFLOW} line $((SHELL_COMMAND_LINES[k] + 1)) \
+runs ${SCAFFOLD_LINT_STAGE} in a body carrying ${reason}; the status the step \
+reports would be decided by something other than the analysis, and a check \
+nothing depends on gates nothing"
+    fi
+    if reason="$(shell_unmodelled_word "${SHELL_COMMANDS[k]}")"; then
+      fail "${SCAFFOLD_LINT_WORKFLOW} line $((SHELL_COMMAND_LINES[k] + 1)) \
+opens ${reason} in the step running ${SCAFFOLD_LINT_STAGE}; whether the \
+analysis runs at all then rests on shell this parser does not read"
+    fi
+    [[ "${SHELL_COMMANDS[k]}" =~ ${invocation} ]] && invocation_at="${k}"
+  done
+
+  ((invocation_at == ${#SHELL_COMMANDS[@]} - 1)) ||
+    fail "${SCAFFOLD_LINT_WORKFLOW} line $((run_line + 1)) runs \
+${SCAFFOLD_LINT_STAGE} with $((${#SHELL_COMMANDS[@]} - invocation_at - 1)) \
+command(s) after it; a step reports its last command's exit status, so a \
+failing analysis would be reported as whatever ran after it"
+
+  if reason="$(shell_invocation_shape "${SHELL_COMMANDS[invocation_at]}")"; then
+    fail "${SCAFFOLD_LINT_WORKFLOW} line $((run_line + 1)) does not run \
+${SCAFFOLD_LINT_STAGE} as a command of its own: ${reason}; a mention of the \
+analysis is not a run of it, and the step would report whatever did run"
+  fi
+
+  local step=-1 step_keys=""
+  if step_keys="$(yaml_item_key_indent "${run_key}")"; then
+    step="${run_key}"
   else
-    # The invocation's own line is shell inside a block scalar, so the step is
-    # the nearest sequence item opened shallower than it.
-    for ((i = run_line - 1; i >= 0; i--)); do
+    # A `run:` key that did not open its own step belongs to the nearest
+    # sequence item opened shallower than it.
+    for ((i = run_key - 1; i >= 0; i--)); do
       ((YAML_INDENTS[i] < 0)) && continue
-      ((YAML_INDENTS[i] < YAML_INDENTS[run_line])) || continue
+      ((YAML_INDENTS[i] < YAML_INDENTS[run_key])) || continue
       step_keys="$(yaml_item_key_indent "${i}")" || continue
       step="${i}"
       break
     done
   fi
   ((step >= 0)) ||
-    fail "${SCAFFOLD_LINT_WORKFLOW} line $((run_line + 1)) runs \
+    fail "${SCAFFOLD_LINT_WORKFLOW} line $((run_key + 1)) runs \
 ${SCAFFOLD_LINT_STAGE} outside any step this parser can place, so nothing \
 here can say whether that run is conditioned away"
 
@@ -1239,16 +1622,38 @@ ${SCAFFOLD_LINT_STAGE} run inside it is conditioned away"
   verify_scaffold_lint_unconditional "${job}" "${job_end}" "${job_keys}" \
     "job [${YAML_BODIES[job]%:}]"
 
+  # The same substitution one level further out, where neither block above
+  # would show it.
+  for ((i = 0; i < ${#YAML_BODIES[@]}; i++)); do
+    ((YAML_INDENTS[i] == 0)) || continue
+    [[ "${YAML_BODIES[i]}" == 'defaults:' ]] || continue
+    fail "${SCAFFOLD_LINT_WORKFLOW} line $((i + 1)) sets workflow-wide \
+defaults; what runs the ${SCAFFOLD_LINT_STAGE} body is then decided somewhere \
+this parser does not read, which is the same as not knowing"
+  done
+
   note "scaffold lint: ${SCAFFOLD_LINT_WORKFLOW} runs ${SCAFFOLD_ENTRYPOINT} \
-${SCAFFOLD_LINT_STAGE} unconditionally, on line $((hits[0] + 1))"
+${SCAFFOLD_LINT_STAGE} unconditionally, on line $((run_line + 1)), as its \
+step's last command; that this commit says so is the whole of what is proved \
+here — that a run of it happened is a required status check outside this \
+repository, recorded in ${SCAFFOLD_DIR}/README.md"
 }
 
-# The two keys that turn a step or the job around it into something a change
-# can get past without this analysis having judged it: one deciding whether it
-# runs at all, one deciding that its failure does not fail the run. A
-# condition is refused rather than evaluated — this parser cannot tell which
-# runs it would hold for, and a gate whose reachability rests on a condition
-# nothing here reads is not a gate this scaffold has proved reachable.
+# The keys that turn a step or the job around it into something a change can
+# get past without this analysis having judged it: one deciding whether it runs
+# at all, one deciding that its failure does not fail the run, and two deciding
+# what runs the body at all. A condition is refused rather than evaluated —
+# this parser cannot tell which runs it would hold for, and a gate whose
+# reachability rests on a condition nothing here reads is not a gate this
+# scaffold has proved reachable.
+#
+# `shell:` is the one that leaves no mark at all on the shell it retires: the
+# body reads exactly as it did while an interpreter that never runs a line of
+# it — or never reports what running it said — takes the step's place. Only the
+# runner's own default is accepted, spelled out or left out. `defaults:` sets
+# the same thing a level or two away, and is refused outright rather than
+# followed, because a body run by something this parser never saw named is the
+# same unread state either way.
 verify_scaffold_lint_unconditional() {
   local from="$1" to="$2" key_indent="$3" where="$4" i body value
   for ((i = from + 1; i < to; i++)); do
@@ -1266,6 +1671,19 @@ condition holds is not the unconditional one this scaffold's evidence rests on"
       fail "${SCAFFOLD_LINT_WORKFLOW} line $((i + 1)) lets the ${where} \
 running ${SCAFFOLD_LINT_STAGE} fail without failing the run; a check nothing \
 depends on gates nothing"
+      ;;
+    'shell:'*)
+      value="$(yaml_scalar_value "${body#shell:}")" || value=""
+      [[ "${value}" == 'bash' ]] && continue
+      fail "${SCAFFOLD_LINT_WORKFLOW} line $((i + 1)) hands the ${where} \
+running ${SCAFFOLD_LINT_STAGE} to [${value}]; the body would read the same \
+while an interpreter this parser never saw decided whether any of it runs and \
+what its failing said"
+      ;;
+    'defaults:')
+      fail "${SCAFFOLD_LINT_WORKFLOW} line $((i + 1)) sets defaults on the \
+${where} running ${SCAFFOLD_LINT_STAGE}; what runs that body is then decided \
+somewhere this parser does not read, which is the same as not knowing"
       ;;
     esac
   done
