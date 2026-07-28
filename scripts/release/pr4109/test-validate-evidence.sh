@@ -2504,6 +2504,27 @@ else
   FAILED=$((FAILED + 1))
 fi
 
+# The per-ceremony refusal counters are what turn "the node refused something"
+# into "the node refused this", and a ceremony the shell list omits is a
+# refusal the rehearsal reads as unattributed — a quiescence that really did
+# refuse would then block for naming nothing. So the list is held to the closed
+# set the client publishes, which is the same set the gate's own drift test
+# pins the metric names to.
+GO_CEREMONIES="$(sed -n '/func GetAllParticipationCeremonies/,/^}/p' \
+  "${TEST_DIR}/../../../pkg/clientinfo/performance.go" |
+  grep -oE '"[a-z_]+"' | tr -d '"' | sort)"
+SHELL_CEREMONIES="$(printf '%s\n' "${GATED_CEREMONIES[@]}" | sort)"
+if [[ -n "${GO_CEREMONIES}" ]] &&
+  [[ "${GO_CEREMONIES}" == "${SHELL_CEREMONIES}" ]]; then
+  printf 'ok   the refusal-counter list matches the gated ceremony set\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL the refusal-counter list drifted from the gated set: %s\n' \
+    "$(diff <(printf '%s\n' "${GO_CEREMONIES}") \
+      <(printf '%s\n' "${SHELL_CEREMONIES}") | tr '\n' ' ')"
+  FAILED=$((FAILED + 1))
+fi
+
 # A rehearsal run from bytes no commit accounts for must not produce a record
 # at all. The capture is the first refusal — no node can report a revision
 # equal to a -dirty stamp — and the emitter carries its own guard for a

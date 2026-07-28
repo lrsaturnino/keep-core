@@ -3375,8 +3375,9 @@ ANNOUNCER_CUTOVER_METRICS=(
 )
 
 # The gated ceremonies, whose per-ceremony refusal counters name what a node
-# refused rather than only that it refused something. A drift test in the Go
-# tree holds this list to the gate's own closed set.
+# refused rather than only that it refused something. A ceremony missing here
+# is a refusal this rehearsal would read as unattributed, so the self-test
+# holds this list to the closed set the Go tree publishes.
 GATED_CEREMONIES=(
   tbtc_dkg
   tbtc_wallet_coordination
