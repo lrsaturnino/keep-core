@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -188,63 +187,16 @@ func start(cmd *cobra.Command) error {
 	defer cutoverRoster.Close()
 
 	if clientInfoRegistry != nil {
-		// Expose the node-local cutover peer roster snapshot as a top-level
-		// diagnostics object so port-enabled nodes surface which operators
-		// are observed on the legacy release across the cutover.
-		clientInfoRegistry.RegisterDiagnosticSource(
-			"cutover_legacy_peers",
-			func() string {
-				snapshot := cutoverRoster.Snapshot()
-				bytes, err := json.Marshal(snapshot)
-				if err != nil {
-					logger.Errorf(
-						"error on serializing cutover peer roster to JSON: [%v]",
-						err,
-					)
-					return ""
-				}
-				return string(bytes)
-			},
-		)
-
-		// Expose the gate's identity and live state so a diagnostics scrape
-		// answers the readiness questions directly: which epoch this artifact
-		// is, which chain it clocks itself against, which cutover block it
-		// compiled or resolved, and what the gate is doing right now.
-		//
-		// The chain id is read off the connected endpoint rather than off the
-		// configuration, because a cutover block means nothing without the
-		// chain it counts on: a node armed with the right C against the wrong
-		// chain is exactly the misconfiguration a readiness scrape has to be
-		// able to see, and a configured value would agree with itself.
-		ethereumChainID := beaconChain.ChainID().String()
-		clientInfoRegistry.RegisterDiagnosticSource(
-			"protocol_participation",
-			func() string {
-				snapshot := participationGate.State()
-				bytes, err := json.Marshal(map[string]interface{}{
-					"protocol_epoch":                participation.CompiledEpoch.String(),
-					"ethereum_chain_id":             ethereumChainID,
-					"cutover_block":                 snapshot.CutoverBlock,
-					"cutover_block_source":          cutoverBlockSource,
-					"gate_state":                    snapshot.State.String(),
-					"current_block":                 snapshot.CurrentBlock,
-					"clock_available":               snapshot.ClockAvailable,
-					"allowed":                       snapshot.Allowed,
-					"quiescing":                     snapshot.Quiescing,
-					"active_ceremonies":             snapshot.ActiveCeremonies,
-					"active_legacy_ceremonies":      snapshot.ActiveLegacyCeremonies,
-					"active_security_v2_ceremonies": snapshot.ActiveSecurityV2Ceremonies,
-				})
-				if err != nil {
-					logger.Errorf(
-						"error on serializing participation state to JSON: [%v]",
-						err,
-					)
-					return ""
-				}
-				return string(bytes)
-			},
+		// The chain identity handed to the diagnostics contract is the
+		// connected beacon chain itself, so every scrape reports the chain
+		// this node actually reached rather than the one it was configured to
+		// reach.
+		participation.RegisterDiagnosticSources(
+			clientInfoRegistry,
+			participationGate,
+			cutoverRoster,
+			beaconChain,
+			cutoverBlockSource,
 		)
 	}
 
