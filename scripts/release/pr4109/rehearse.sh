@@ -910,6 +910,54 @@ on another toolchain is not its evidence"
 ${REHEARSAL_WORKFLOW}'s ${SOLIDITY_PROOFS_JOB} job both pin Node ${ci_version}"
 }
 
+# The workflow that builds the artifact a cutover record binds its identity to.
+RELEASE_WORKFLOW=".github/workflows/release.yml"
+
+# The released artifact must name its source commit exactly.
+#
+# capture_r1_release_identity requires every R1 node's reported revision to
+# equal the commit this run is bound to, and that requirement is only
+# satisfiable while the workflow that builds the artifact stamps the whole SHA
+# into it. An abbreviation names a commit only as far as it goes, and the
+# record would bind a rehearsal's every observation to a prefix. So the stamp
+# is read out of the release workflow rather than assumed: a bump back to
+# `--short` is caught by this lint, on the commit that makes it, instead of by
+# a rehearsal that refuses every artifact the release pipeline can produce.
+verify_release_revision_stamp() {
+  local content stamps abbreviated
+  content="$(git -C "${REPO_ROOT}" show "HEAD:${RELEASE_WORKFLOW}" \
+    2>/dev/null)" ||
+    fail "the commit under test carries no ${RELEASE_WORKFLOW}; the source \
+stamp every cutover record binds its artifact identity to is written there, \
+and this script has nothing left to read it from"
+
+  # Every assignment of the revision the build is stamped with, whatever job
+  # or step it sits in: a release building two images from two jobs stamps it
+  # twice, and one of them reverting is the whole failure this catches.
+  stamps="$(printf '%s\n' "${content}" |
+    { grep -nE '(^|[^[:alnum:]_])revision=\$\(' || true; })"
+  if [[ -z "${stamps}" ]]; then
+    fail "${RELEASE_WORKFLOW} assigns no revision from a command; the \
+artifact identity a cutover record is measured against comes from that \
+assignment, and a release that stopped making it stamps nothing this scaffold \
+can bind to"
+  fi
+
+  abbreviated="$(printf '%s\n' "${stamps}" |
+    { grep -vE 'git rev-parse HEAD\)' || true; })"
+  if [[ -n "${abbreviated}" ]]; then
+    printf '%s\n' "${abbreviated}" >&2
+    fail "${RELEASE_WORKFLOW} stamps the released artifact with a revision \
+this scaffold cannot bind to (lines above); every assignment must be \
+\$(git rev-parse HEAD), because a rehearsal record names one commit and an \
+abbreviation is not that commit"
+  fi
+
+  note "release stamp: ${RELEASE_WORKFLOW} writes the full source SHA into \
+every artifact it builds ($(printf '%s\n' "${stamps}" | wc -l | tr -d ' ') \
+assignment(s))"
+}
+
 # The Dockerfile the rehearsal dispatch compiles and the context root it
 # compiles from, read out of the workflow that does the building rather than
 # restated here. The pair decides which ignore file the build applies, so a
@@ -1117,6 +1165,7 @@ load_lint_required_inputs() {
         "${REHEARSAL_WORKFLOW}" \
         "${SCAFFOLD_LINT_WORKFLOW}" \
         "${CONTRACTS_WORKFLOW}" \
+        "${RELEASE_WORKFLOW}" \
         "${BUILD_DOCKERFILE}" \
         "${BUILD_DOCKERFILE}.dockerignore" \
         '.dockerignore'
@@ -2639,6 +2688,7 @@ stage_shell_analysis() {
     # both run the toolchain that job pins, and a bump there touches no line
     # of this scaffold. Same reason, same gate.
     verify_contracts_toolchain_pin
+    verify_release_revision_stamp
 
     # The two validators gate every piece of rehearsal evidence, so the gate
     # that runs on every change to them runs their self-tests too — without
@@ -3213,11 +3263,18 @@ epoch, and cutover block that identify what it is running; the record binds \
 the rehearsal to what the running nodes say they are, and a node that will \
 not say cannot be evidenced"
 
+    # The exact commit, not an abbreviation of it. A prefix comparison
+    # accepted a node reporting nothing at all — every string is a prefix of
+    # the attested SHA when the empty one is — and, short of that, accepted an
+    # abbreviation that names a commit only as far as it goes. The release
+    # workflow stamps the full SHA into the artifact for exactly this reason,
+    # and shell-analysis holds it to that.
     revision="$(json_field "${reported}" revision)"
-    if [[ "${attested}" != "${revision}"* ]]; then
-      blocked "${service} reports revision [${revision}], which is not the \
-commit this run is bound to [${attested}]; the running image was built from \
-other bytes than the ones every proof here measures"
+    if [[ "${revision}" != "${attested}" ]]; then
+      blocked "${service} reports revision [${revision:-absent}], but this run \
+is bound to [${attested}]; the record binds every observation to one commit, \
+and an artifact that does not name that commit exactly was built from bytes \
+no proof here measured"
     fi
 
     cutover="$(json_field "${reported}" cutover_block)"

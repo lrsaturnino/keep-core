@@ -79,7 +79,7 @@ jobs:
       - name: Resolve versions
         run: |
           echo "version=$(git describe --tags --match "v[0-9]*" HEAD)" >> "$GITHUB_ENV"
-          echo "revision=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
       # The binding verifier gates every piece of evidence this workflow
       # archives, so it proves itself before the expensive image build: the

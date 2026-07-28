@@ -94,6 +94,7 @@ DEFAULT_PATH_FILTERS="${SCAFFOLD_DIR}/**
 ${REHEARSAL_WORKFLOW}
 ${SCAFFOLD_LINT_WORKFLOW}
 ${CONTRACTS_WORKFLOW}
+${RELEASE_WORKFLOW}
 .dockerignore
 Dockerfile.dockerignore
 .gitignore
@@ -192,6 +193,7 @@ ALT_PATH_FILTERS="${SCAFFOLD_DIR}/**
 ${REHEARSAL_WORKFLOW}
 ${SCAFFOLD_LINT_WORKFLOW}
 ${CONTRACTS_WORKFLOW}
+${RELEASE_WORKFLOW}
 .dockerignore
 build/Alt.Dockerfile.dockerignore
 .gitignore
@@ -1312,7 +1314,7 @@ make_lint_repo "${T}"
 run_lint_gate "${T}"
 check "scaffold lint: the checked-in filter shape covers every input class \
 the commit carries" 0 \
-  "runs on every change to the 13 tracked input\(s\)" \
+  "runs on every change to the 14 tracked input\(s\)" \
   "on all 2 push/pull-request trigger\(s\)"
 
 # One removal per class the derivation reads out of the commit. Each one is a
@@ -1395,7 +1397,7 @@ ${SCAFFOLD_DIR}/**"
 run_lint_gate "${T}"
 check "scaffold lint: a negation a later entry re-includes over excludes \
 nothing" 0 \
-  "runs on every change to the 13 tracked input\(s\)"
+  "runs on every change to the 14 tracked input\(s\)"
 
 # A negation that misses every required input is not a hole, and reporting one
 # would make the check something a maintainer routes around.
@@ -1406,7 +1408,7 @@ recommit_scaffold_workflows "${T}" "${DEFAULT_BUILD_STEP}" \
 !docs/**"
 run_lint_gate "${T}"
 check "scaffold lint: a negation covering nothing required is accepted" 0 \
-  "runs on every change to the 13 tracked input\(s\)"
+  "runs on every change to the 14 tracked input\(s\)"
 
 # `?` and `+` quantify the character before them in this grammar rather than
 # standing for one of any character, so a required path measured against
@@ -1483,7 +1485,7 @@ recommit_lint_workflow "${T}" "$(
 run_lint_gate "${T}"
 check "scaffold lint: a pull_request trigger widened past the default types \
 is accepted" 0 \
-  "runs on every change to the 13 tracked input\(s\)"
+  "runs on every change to the 14 tracked input\(s\)"
 
 # A push trigger restricted to one branch is not a hole: the pull_request
 # trigger beside it is what holds the merge, and refusing this would only push
@@ -2416,6 +2418,110 @@ run_toolchain_pin "${T}"
 check "contracts toolchain: a commit carrying no contracts workflow fails \
 closed" 1 \
   "carries no \.github/workflows/contracts-ecdsa\.yml"
+
+# --- release stamp: the commit a released artifact names --------------------
+#
+# A cutover record binds every observation to one commit, and the identity
+# capture requires each R1 node to report exactly that commit. That is only
+# satisfiable while the workflow building the artifact stamps the whole SHA
+# into it, so the stamp is read out of that workflow rather than assumed: a
+# bump back to an abbreviation has to fail here, on the commit that makes it,
+# and not in a rehearsal that refuses every artifact the pipeline can build.
+
+# A release workflow stamping the given revision expressions, one per build
+# job. The real file builds two images from two jobs, which is exactly why a
+# case can make one of them right and the other wrong.
+write_release_workflow() {
+  local repo="$1"
+  shift
+  local expression index=0
+  mkdir -p "${repo}/$(dirname "${RELEASE_WORKFLOW}")"
+  {
+    printf 'name: Release\non:\n  push:\n    tags:\n      - "v*"\njobs:\n'
+    for expression in "$@"; do
+      index=$((index + 1))
+      printf '  build-%d:\n    runs-on: ubuntu-latest\n    steps:\n' "${index}"
+      printf '      - uses: actions/checkout@v4\n'
+      printf '      - name: Resolve versions\n        run: |\n'
+      # The workflow's own literal text, which is the thing being read back.
+      # shellcheck disable=SC2016
+      printf '          echo "version=$(git describe)" >> $GITHUB_ENV\n'
+      # shellcheck disable=SC2016
+      [[ -n "${expression}" ]] &&
+        printf '          echo "revision=%s" >> $GITHUB_ENV\n' "${expression}"
+    done
+  } >"${repo}/${RELEASE_WORKFLOW}"
+}
+
+make_release_repo() {
+  local repo="$1"
+  shift
+  mkdir -p "${repo}"
+  (
+    cd "${repo}"
+    git_q init -q
+    write_release_workflow "${repo}" "$@"
+    git_q add -Af
+    git_q commit -q -m 'release stamp fixture'
+  )
+}
+
+run_release_stamp() {
+  local root="$1"
+  set +e
+  CASE_OUT="$(
+    (
+      # shellcheck disable=SC2034
+      REPO_ROOT="${root}"
+      verify_release_revision_stamp
+    ) 2>&1
+  )"
+  CASE_RC=$?
+  set -e
+}
+
+# The two expressions a release workflow can carry, as its own bytes.
+# shellcheck disable=SC2016
+FULL_STAMP='$(git rev-parse HEAD)'
+# shellcheck disable=SC2016
+SHORT_STAMP='$(git rev-parse --short HEAD)'
+
+T="${WORK}/release-stamp-full"
+make_release_repo "${T}" "${FULL_STAMP}" "${FULL_STAMP}"
+run_release_stamp "${T}"
+check "release stamp: a workflow stamping the whole SHA everywhere passes" 0 \
+  "writes the full source SHA" "2 assignment\(s\)"
+
+# The failure a single-site check would miss entirely: one job kept the full
+# SHA and the other went back to an abbreviation, so half the artifacts a
+# release publishes cannot be bound to the commit that built them.
+T="${WORK}/release-stamp-one-short"
+make_release_repo "${T}" "${FULL_STAMP}" "${SHORT_STAMP}"
+run_release_stamp "${T}"
+check "release stamp: one job reverting to an abbreviation fails closed" 1 \
+  "cannot bind to" "rev-parse --short HEAD"
+
+T="${WORK}/release-stamp-all-short"
+make_release_repo "${T}" "${SHORT_STAMP}" "${SHORT_STAMP}"
+run_release_stamp "${T}"
+check "release stamp: an abbreviation everywhere fails closed" 1 \
+  "an abbreviation is not that commit"
+
+# A workflow that stopped stamping a revision at all: nothing to bind to, and
+# a check looking only for abbreviations would find none and pass.
+T="${WORK}/release-stamp-absent"
+make_release_repo "${T}" "" ""
+run_release_stamp "${T}"
+check "release stamp: a release that stamps no revision fails closed" 1 \
+  "assigns no revision from a command"
+
+T="${WORK}/release-stamp-workflow-gone"
+make_release_repo "${T}" "${FULL_STAMP}"
+(cd "${T}" && git_q rm -q "${RELEASE_WORKFLOW}" &&
+  git_q commit -q -m 'drop the release workflow')
+run_release_stamp "${T}"
+check "release stamp: a commit carrying no release workflow fails closed" 1 \
+  "carries no \.github/workflows/release\.yml"
 
 # ----------------------------------------------------------------------------
 
