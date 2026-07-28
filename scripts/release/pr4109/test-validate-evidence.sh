@@ -1915,6 +1915,92 @@ run_verdict drain_case eval 'ROLLBACK_DRAIN_RC="no exit status"'
 check "a drain whose exit status was never observed is not a quiescence" 1 \
   "exited \[no exit status\]"
 
+# The homogeneous positive control, which used to be decided by two permit
+# counters — neither of which is either half of the property it names. A permit
+# says a node was allowed to begin, not that a ceremony finished; and the
+# legacy permit counter is about work this fleet took on, not about whether it
+# saw a legacy peer.
+homogeneous_readings() {
+  # shellcheck disable=SC2034
+  HOMOGENEOUS_DRIVER_SUPPLIED=1
+  # shellcheck disable=SC2034
+  HOMOGENEOUS_DRIVER_RC=0
+  # shellcheck disable=SC2034
+  HOMOGENEOUS_TX=2
+  # shellcheck disable=SC2034
+  HOMOGENEOUS_CEREMONIES="tbtc_signing beacon_dkg"
+  # shellcheck disable=SC2034
+  HOMOGENEOUS_PERMITS_BEFORE="20"
+  # shellcheck disable=SC2034
+  HOMOGENEOUS_PERMITS_AFTER="24"
+  # shellcheck disable=SC2034
+  HOMOGENEOUS_LEGACY_BEFORE="3"
+  # shellcheck disable=SC2034
+  HOMOGENEOUS_LEGACY_AFTER="3"
+  # shellcheck disable=SC2034
+  HOMOGENEOUS_SIGHTINGS_BEFORE="5"
+  # shellcheck disable=SC2034
+  HOMOGENEOUS_SIGHTINGS_AFTER="5"
+  # shellcheck disable=SC2034
+  HOMOGENEOUS_NEW_OPERATORS=""
+}
+
+homogeneous_case() {
+  homogeneous_readings
+  "$@"
+  homogeneous_control_verdict
+}
+
+run_verdict homogeneous_case :
+check "post-C ceremonies that completed under security-v2 hold the control" 0 \
+  "saw tbtc_signing beacon_dkg complete successfully" \
+  "recognized no cross-format peer"
+
+# The half a permit counter cannot carry: work was allowed to start and
+# nothing was observed finishing.
+run_verdict homogeneous_case eval 'HOMOGENEOUS_CEREMONIES=""'
+check "permits without a completed ceremony are not a positive control" 3 \
+  "named no ceremony that completed successfully"
+
+# The half the legacy permit counter cannot carry: the fleet saw a legacy peer
+# while claiming to be homogeneous.
+run_verdict homogeneous_case eval 'HOMOGENEOUS_SIGHTINGS_AFTER="6"'
+check "a cross-format sighting refutes a control that denies them" 1 \
+  "recognized 1 cross-format peer\(s\)"
+
+run_verdict homogeneous_case eval 'HOMOGENEOUS_SIGHTINGS_AFTER=""'
+check "an unreadable sighting counter observes no absence of sightings" 3 \
+  "cross-format sighting counter could not be read"
+
+run_verdict homogeneous_case eval \
+  'HOMOGENEOUS_NEW_OPERATORS="0x1111111111111111111111111111111111111111"'
+check "a legacy roster entry refutes a control that denies them" 1 \
+  "cannot produce a legacy roster entry"
+
+run_verdict homogeneous_case eval 'HOMOGENEOUS_PERMITS_AFTER="20"'
+check "ceremonies that took no permit from this fleet are not its ceremonies" \
+  1 "issued no new security-v2 permit"
+
+run_verdict homogeneous_case eval 'HOMOGENEOUS_LEGACY_AFTER="4"'
+check "a legacy permit taken alongside refutes the control" 1 \
+  "1 new legacy permit"
+
+run_verdict homogeneous_case eval 'HOMOGENEOUS_TX=0'
+check "a driver that named no transaction attributes no permit activity" 3 \
+  "reported no transaction"
+
+run_verdict homogeneous_case eval 'HOMOGENEOUS_DRIVER_RC=2'
+check "a failed driver originates no post-C ceremony" 1 \
+  "work driver exited \[2\] originating post-C ceremonies"
+
+run_verdict homogeneous_case eval 'HOMOGENEOUS_DRIVER_SUPPLIED=0'
+check "no driver leaves the positive control with nothing to observe" 3 \
+  "no PR4109_WORK_DRIVER was supplied"
+
+run_verdict homogeneous_case eval 'HOMOGENEOUS_PERMITS_AFTER="unreadable"'
+check "unreadable permit counters observe no mode at all" 3 \
+  "fleet permit counters could not be read"
+
 # The accounting every "was work offered here" rung above reads. It comes off a
 # real driver invocation rather than a constructed reading, because what is
 # being tested is that the driver's own exit status and report reach those
@@ -1938,6 +2024,7 @@ drive() {
       # shellcheck disable=SC2030,SC2031,SC2034
       STEP_TX_HASHES=""
       run_work_driver "$1" || true
+      printf 'ceremonies:%s\n' "${WORK_DRIVER_SUCCEEDED_CEREMONIES}"
       if driver_offered_work; then
         printf 'offered:yes rc:%s tx:%s hashes:%s\n' \
           "${WORK_DRIVER_RC}" "${WORK_DRIVER_TX_COUNT}" "${STEP_TX_HASHES}"
@@ -1998,6 +2085,44 @@ EOF
 drive homogeneous-security-v2
 check "a driver whose report cannot be read stops the step" 3 \
   "in a form this rehearsal cannot read"
+
+# The terminal outcomes, which no fleet counter carries: a permit says a node
+# was allowed to begin and a positive control is about a ceremony finishing.
+write_driver <<EOF
+#!/usr/bin/env bash
+printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
+printf '{"ceremony":"tbtc_signing","outcome":"succeeded"},'
+printf '{"ceremony":"beacon_dkg","outcome":"failed"}]}'
+EOF
+drive homogeneous-security-v2
+check "a driver names the ceremonies it saw complete" 0 \
+  "offered:yes rc:0 tx:1"
+if [[ "${CASE_OUT}" == *"ceremonies:tbtc_signing"* ]]; then
+  printf 'ok   only the ceremonies that succeeded are carried forward\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL a failed ceremony was carried forward as a result: %s\n' \
+    "${CASE_OUT}"
+  FAILED=$((FAILED + 1))
+fi
+
+write_driver <<EOF
+#!/usr/bin/env bash
+printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
+printf '{"ceremony":"tbtc_signing","outcome":"probably fine"}]}'
+EOF
+drive homogeneous-security-v2
+check "an outcome this rehearsal does not know stops the step" 3 \
+  "not an outcome"
+
+write_driver <<EOF
+#!/usr/bin/env bash
+printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
+printf '{"ceremony":"something_else","outcome":"succeeded"}]}'
+EOF
+drive homogeneous-security-v2
+check "a ceremony this rehearsal does not know stops the step" 3 \
+  "not a ceremony"
 
 # Neither container stage can be executed anywhere but a real rehearsal — they
 # need the immutable images, a chain, and persistent volumes — so a call site

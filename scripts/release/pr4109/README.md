@@ -215,13 +215,25 @@ blocks rather than passes on a counter it could not read.
 
 The work driver reports what it originated rather than only whether it
 succeeded: its stdout is a JSON object whose optional `transaction_hashes`
-array carries the chain transactions it submitted, and those enter the step
-being recorded so a reviewer can follow a step back to the transactions that
-caused it. A report that cannot be read stops the step — a driver whose
-account is unreadable has left the step unable to say what it drove, and
-recording that as "no transactions" would enter silence as evidence. The
-acceptance conditions still rest on the fleet's own counters; the hashes are
-what let those counters be checked against the chain.
+array carries the chain transactions it submitted — those enter the step being
+recorded, so a reviewer can follow a step back to the transactions that caused
+it — and whose optional `ceremony_results` array carries `{ceremony, outcome}`
+objects naming the terminal result of each ceremony those transactions started.
+The results are there because no fleet counter carries them: a permit says a
+node was allowed to begin, and the positive control is about a ceremony
+finishing. Both arrays are validated strictly, and a report that cannot be read
+stops the step — a driver whose account is unreadable has left the step unable
+to say what it drove, and recording that as "nothing happened" would enter
+silence as evidence.
+
+The homogeneous control is decided against both halves of its own name.
+"security-v2 controls" needs a ceremony the driver watched complete, not only
+permits the fleet issued. "with no legacy sightings" is read where a sighting
+would appear — the announcer's cross-format recognition counter and the legacy
+roster, summed and unioned across the whole R1 fleet — because the legacy
+permit counter is about work this fleet took on, not about what it saw. The
+straggler is quarantined before this step runs, so a recognition or a roster
+entry during it means the fleet was not homogeneous.
 
 Both halves of that report are what a step reads to decide work was offered at
 all. A driver call that exited nonzero, that was never supplied, or that named

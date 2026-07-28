@@ -60,9 +60,14 @@
 #                        one record themselves blocked. On stdout it may
 #                        report what it originated, as a JSON object whose
 #                        optional transaction_hashes array carries
-#                        0x-prefixed 32-byte hashes; those enter the step
-#                        being recorded. A report that cannot be read stops
-#                        the step rather than passing for no transactions
+#                        0x-prefixed 32-byte hashes and whose optional
+#                        ceremony_results array carries {ceremony, outcome}
+#                        objects: the terminal result of each ceremony those
+#                        transactions started, which no fleet counter can
+#                        supply because a permit says a node was allowed to
+#                        begin and a positive control is about one finishing.
+#                        A report that cannot be read stops the step rather
+#                        than passing for nothing having happened
 #
 # Fail-closed source binding (every proof stage):
 #
@@ -3480,6 +3485,17 @@ roster_operators() {
     '
 }
 
+# Every operator any R1 node has attributed a legacy sighting to, sorted and
+# deduplicated so two readings can be differenced. A control that watched one
+# node's roster would miss a sighting the other node made, and one sighting
+# anywhere in the fleet is what "no legacy sightings" denies.
+fleet_roster_operators() {
+  local service
+  for service in "${REHEARSAL_R1_SERVICES[@]}"; do
+    roster_operators "${service}" 2>/dev/null || true
+  done | sort -u
+}
+
 # One field of a JSON document held in a shell variable.
 json_field() {
   printf '%s' "$1" | node -e '
@@ -4258,24 +4274,29 @@ on: ${verdict}"
 # implementation can originate the work each step needs.
 #
 # On stdout it may report what it originated, as a JSON object carrying a
-# transaction_hashes array. Those hashes go into the step being recorded, so a
-# reviewer can follow a step back to the chain transactions that caused it
-# rather than taking the fleet counters as the only account of what happened.
-# The output is either well formed or it is a broken instrument: a driver
-# whose report cannot be read has left the step unable to say what it drove,
-# and treating that as "no transactions" would record silence as evidence.
+# transaction_hashes array and a ceremony_results array. The hashes go into the
+# step being recorded, so a reviewer can follow a step back to the chain
+# transactions that caused it rather than taking the fleet counters as the only
+# account of what happened. The results are the terminal outcome of each
+# ceremony those transactions started, which is the one thing no fleet counter
+# can supply: a permit says a node was allowed to begin, and a positive control
+# is about a ceremony that finished. The output is either well formed or it is
+# a broken instrument: a driver whose report cannot be read has left the step
+# unable to say what it drove, and treating that as "nothing happened" would
+# record silence as evidence.
 
-# What the last run_work_driver call reported: its exit status, and how many
-# chain transactions it accounted for.
+# What the last run_work_driver call reported: its exit status, how many chain
+# transactions it accounted for, and which ceremonies it saw complete.
 #
-# Both are needed before a step may say work was offered. `|| true` around a
-# driver call turns a driver that failed, that was never installed, or that
-# originated nothing at all into "attempted", and every one of those leaves the
-# node in exactly the state a node nobody asked is in. A step whose contract is
-# that the gate refused something has to know something was actually put on the
-# chain for it to refuse.
+# The first two are needed before a step may say work was offered. `|| true`
+# around a driver call turns a driver that failed, that was never installed, or
+# that originated nothing at all into "attempted", and every one of those
+# leaves the node in exactly the state a node nobody asked is in. A step whose
+# contract is that the gate refused something has to know something was
+# actually put on the chain for it to refuse.
 WORK_DRIVER_RC=0
 WORK_DRIVER_TX_COUNT=0
+WORK_DRIVER_SUCCEEDED_CEREMONIES=""
 
 # True when the last driver call both exited cleanly and named what it put on
 # the chain, which is the whole of "work was offered here".
@@ -4288,38 +4309,73 @@ run_work_driver() {
   note "driving ${phase} work on the rehearsal chain"
   WORK_DRIVER_RC=0
   WORK_DRIVER_TX_COUNT=0
+  WORK_DRIVER_SUCCEEDED_CEREMONIES=""
   report="$("${PR4109_WORK_DRIVER}" "${phase}")" || rc=$?
   WORK_DRIVER_RC="${rc}"
 
   if [[ -n "${report//[[:space:]]/}" ]]; then
-    local hashes
-    hashes="$(printf '%s' "${report}" | node -e '
+    # Two lines out of one parse: the hashes, then the ceremonies that
+    # succeeded. Parsing twice would report a malformed object twice and, worse,
+    # could accept one half of a report whose other half is unreadable.
+    local parsed hashes ceremonies
+    parsed="$(printf '%s' "${report}" | node -e '
+      const CEREMONIES = ["beacon_dkg", "beacon_signing", "tbtc_dkg",
+        "tbtc_signing", "tbtc_wallet_action"];
+      const OUTCOMES = ["succeeded", "failed", "timed_out"];
       let raw = "";
       process.stdin.on("data", (d) => (raw += d));
       process.stdin.on("end", () => {
         const report = JSON.parse(raw);
         const hashes = report.transaction_hashes;
-        if (hashes === undefined) {
-          process.stdout.write("");
-          return;
-        }
-        if (!Array.isArray(hashes)) {
-          console.error("transaction_hashes is not an array");
-          process.exit(1);
-        }
-        for (const hash of hashes) {
-          if (typeof hash !== "string" || !/^0x[0-9a-f]{64}$/.test(hash)) {
-            console.error("not a transaction hash: " + JSON.stringify(hash));
+        const encoded = [];
+        if (hashes !== undefined) {
+          if (!Array.isArray(hashes)) {
+            console.error("transaction_hashes is not an array");
             process.exit(1);
           }
+          for (const hash of hashes) {
+            if (typeof hash !== "string" || !/^0x[0-9a-f]{64}$/.test(hash)) {
+              console.error("not a transaction hash: " + JSON.stringify(hash));
+              process.exit(1);
+            }
+            encoded.push(JSON.stringify(hash));
+          }
         }
-        process.stdout.write(hashes.map((h) => JSON.stringify(h)).join(","));
+        const results = report.ceremony_results;
+        const succeeded = [];
+        if (results !== undefined) {
+          if (!Array.isArray(results)) {
+            console.error("ceremony_results is not an array");
+            process.exit(1);
+          }
+          for (const result of results) {
+            const ceremony = (result || {}).ceremony;
+            const outcome = (result || {}).outcome;
+            if (!CEREMONIES.includes(ceremony)) {
+              console.error("not a ceremony: " + JSON.stringify(ceremony));
+              process.exit(1);
+            }
+            if (!OUTCOMES.includes(outcome)) {
+              console.error("not an outcome: " + JSON.stringify(outcome));
+              process.exit(1);
+            }
+            if (outcome === "succeeded") {
+              succeeded.push(ceremony);
+            }
+          }
+        }
+        process.stdout.write(encoded.join(",") + "\n" + succeeded.join(" "));
       });
     ')" ||
       blocked "the work driver reported the ${phase} phase in a form this \
 rehearsal cannot read; its stdout must be a JSON object whose optional \
-transaction_hashes array carries 0x-prefixed 32-byte hashes, and a report \
-that cannot be read leaves the step with no account of what it drove"
+transaction_hashes array carries 0x-prefixed 32-byte hashes and whose \
+optional ceremony_results array carries {ceremony, outcome} objects over the \
+known ceremonies and outcomes, and a report that cannot be read leaves the \
+step with no account of what it drove"
+
+    hashes="$(printf '%s\n' "${parsed}" | sed -n '1p')"
+    ceremonies="$(printf '%s\n' "${parsed}" | sed -n '2p')"
 
     if [[ -n "${hashes}" ]]; then
       STEP_TX_HASHES="${STEP_TX_HASHES}${STEP_TX_HASHES:+,}${hashes}"
@@ -4329,6 +4385,7 @@ that cannot be read leaves the step with no account of what it drove"
       WORK_DRIVER_TX_COUNT=$(($(printf '%s' "${hashes}" | tr -cd ',' |
         wc -c | tr -d '[:space:]') + 1))
     fi
+    WORK_DRIVER_SUCCEEDED_CEREMONIES="${ceremonies}"
   fi
 
   return "${rc}"
@@ -4677,6 +4734,113 @@ forced abort (${QUIESCE_FORCED_BEFORE} to ${QUIESCE_FORCED_AFTER})"
   fi
 }
 
+# What the homogeneous positive control observed.
+#
+# The step is named "security-v2 controls with no legacy sightings" and used to
+# be decided by two permit counters. Neither half of that name was actually
+# read: a permit says a node was allowed to begin, not that a ceremony
+# finished, and the legacy permit counter is about work this fleet took on, not
+# about whether it saw a legacy peer. So the terminal outcome comes from the
+# driver — the only party that can watch a DKG or a signing settle on chain —
+# and the no-sightings half is read from the announcer's own cross-format
+# counter and the roster, which is where a sighting would appear.
+HOMOGENEOUS_DRIVER_SUPPLIED=0
+HOMOGENEOUS_DRIVER_RC=0
+HOMOGENEOUS_TX=0
+HOMOGENEOUS_CEREMONIES=""
+HOMOGENEOUS_PERMITS_BEFORE=""
+HOMOGENEOUS_PERMITS_AFTER=""
+HOMOGENEOUS_LEGACY_BEFORE=""
+HOMOGENEOUS_LEGACY_AFTER=""
+HOMOGENEOUS_SIGHTINGS_BEFORE=""
+HOMOGENEOUS_SIGHTINGS_AFTER=""
+HOMOGENEOUS_NEW_OPERATORS=""
+
+homogeneous_control_verdict() {
+  local step="homogeneous security-v2 controls with no legacy sightings"
+  local assertion="post-C ceremonies run security-v2 with no legacy sightings"
+
+  if ((HOMOGENEOUS_DRIVER_SUPPLIED == 0)); then
+    block_step "${step}" "no PR4109_WORK_DRIVER was supplied, so no tBTC or \
+beacon ceremony was originated on the rehearsal chain and there is nothing to \
+observe"
+    record_assertion "${assertion}" false "${step}"
+  elif ((HOMOGENEOUS_DRIVER_RC != 0)); then
+    record_step "${step}" fail "the work driver exited \
+[${HOMOGENEOUS_DRIVER_RC}] originating post-C ceremonies"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ ! "${HOMOGENEOUS_PERMITS_BEFORE}" =~ ^[0-9]+$ ]] ||
+    [[ ! "${HOMOGENEOUS_PERMITS_AFTER}" =~ ^[0-9]+$ ]] ||
+    [[ ! "${HOMOGENEOUS_LEGACY_BEFORE}" =~ ^[0-9]+$ ]] ||
+    [[ ! "${HOMOGENEOUS_LEGACY_AFTER}" =~ ^[0-9]+$ ]]; then
+    block_step "${step}" "the fleet permit counters could not be read \
+(security-v2 [${HOMOGENEOUS_PERMITS_BEFORE}] to \
+[${HOMOGENEOUS_PERMITS_AFTER}], legacy [${HOMOGENEOUS_LEGACY_BEFORE}] to \
+[${HOMOGENEOUS_LEGACY_AFTER}]), so nothing here observed which mode the \
+ceremonies ran in"
+    record_assertion "${assertion}" false "${step}"
+  elif ((HOMOGENEOUS_TX == 0)); then
+    # The permits below are credited to this driver, and the only account of
+    # what it put on the chain is the account it gives. Without one, a counter
+    # that moved for some unrelated reason reads exactly like a driver that
+    # originated the ceremonies this control is about.
+    block_step "${step}" "the work driver exited cleanly but reported no \
+transaction, so nothing attributes the fleet's permit activity to the \
+ceremonies this control claims to have originated"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ -z "${HOMOGENEOUS_CEREMONIES}" ]]; then
+    block_step "${step}" "the work driver named no ceremony that completed \
+successfully, so this control observed work being allowed to start and \
+nothing about it finishing; a permit is not a result, and a positive control \
+that never sees one is not positive about anything"
+    record_assertion "${assertion}" false "${step}"
+  elif ((HOMOGENEOUS_PERMITS_AFTER <= HOMOGENEOUS_PERMITS_BEFORE)); then
+    record_step "${step}" fail "the work driver reported the ceremonies \
+${HOMOGENEOUS_CEREMONIES} completing, but the fleet issued no new security-v2 \
+permit (still ${HOMOGENEOUS_PERMITS_AFTER}); the ceremonies it named were not \
+run under this fleet's gate"
+    record_assertion "${assertion}" false "${step}"
+  elif ((HOMOGENEOUS_LEGACY_AFTER > HOMOGENEOUS_LEGACY_BEFORE)); then
+    record_step "${step}" fail "the fleet issued \
+$((HOMOGENEOUS_PERMITS_AFTER - HOMOGENEOUS_PERMITS_BEFORE)) new security-v2 \
+permits and also $((HOMOGENEOUS_LEGACY_AFTER - HOMOGENEOUS_LEGACY_BEFORE)) \
+new legacy permit(s) (participation_mode_legacy_total \
+[${HOMOGENEOUS_LEGACY_BEFORE}] to [${HOMOGENEOUS_LEGACY_AFTER}]) driving \
+post-C work"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ ! "${HOMOGENEOUS_SIGHTINGS_BEFORE}" =~ ^[0-9]+$ ]] ||
+    [[ ! "${HOMOGENEOUS_SIGHTINGS_AFTER}" =~ ^[0-9]+$ ]]; then
+    block_step "${step}" "the fleet's cross-format sighting counter could not \
+be read (${HOMOGENEOUS_SIGHTINGS_BEFORE:-unreadable} to \
+${HOMOGENEOUS_SIGHTINGS_AFTER:-unreadable}), so the no-legacy-sightings half \
+of this control was never observed; an unchanged legacy permit counter is \
+about work this fleet took on, not about what it saw"
+    record_assertion "${assertion}" false "${step}"
+  elif ((HOMOGENEOUS_SIGHTINGS_AFTER > HOMOGENEOUS_SIGHTINGS_BEFORE)); then
+    record_step "${step}" fail "the fleet recognized \
+$((HOMOGENEOUS_SIGHTINGS_AFTER - HOMOGENEOUS_SIGHTINGS_BEFORE)) cross-format \
+peer(s) while the homogeneous ceremonies ran (announcer cross-format total \
+[${HOMOGENEOUS_SIGHTINGS_BEFORE}] to [${HOMOGENEOUS_SIGHTINGS_AFTER}]); the \
+straggler was quarantined before this step, so the fleet was not homogeneous"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ -n "${HOMOGENEOUS_NEW_OPERATORS}" ]]; then
+    record_step "${step}" fail "the fleet's legacy roster newly named \
+operator(s) ${HOMOGENEOUS_NEW_OPERATORS} while the homogeneous ceremonies \
+ran; a control with no legacy sightings cannot produce a legacy roster entry"
+    record_assertion "${assertion}" false "${step}"
+  else
+    STEP_PERMIT_MODES='"security_v2"'
+    record_step "${step}" pass "the fleet issued \
+$((HOMOGENEOUS_PERMITS_AFTER - HOMOGENEOUS_PERMITS_BEFORE)) new security-v2 \
+permits driving the post-C ceremonies the driver originated, the driver saw \
+${HOMOGENEOUS_CEREMONIES} complete successfully, and the fleet took no legacy \
+permit (participation_mode_legacy_total unchanged at \
+[${HOMOGENEOUS_LEGACY_AFTER}]), recognized no cross-format peer (unchanged at \
+[${HOMOGENEOUS_SIGHTINGS_AFTER}]), and added no operator to its legacy roster"
+    record_assertion "${assertion}" true "${step}"
+  fi
+}
+
 # What the rollback gate's drain observed, and the verdict they imply.
 #
 # The step is named "with work represented" and used to record a pass on the
@@ -4944,93 +5108,62 @@ network"
   # Step 6. A homogeneous R1 fleet running real security-v2 ceremonies is the
   # positive control, and it needs work originated on the chain.
   begin_step "homogeneous security-v2 controls with no legacy sightings"
-  if [[ -z "${PR4109_WORK_DRIVER:-}" ]]; then
-    block_step "homogeneous security-v2 controls with no legacy sightings" \
-      "no PR4109_WORK_DRIVER was supplied, so no tBTC or beacon ceremony was \
-originated on the rehearsal chain and there is nothing to observe"
-  else
-    # A zero legacy counter is true of a fleet that ran nothing at all, so the
-    # positive control has to be positive about something: permits actually
-    # issued under security-v2 while the driver ran. The count is taken before
-    # and after so it is this step's ceremonies being counted rather than the
-    # crossing's, and it is summed across the fleet because a control that
-    # only watched one node would pass on a fleet where the others sat idle.
-    local permits_before permits_after legacy_before legacy_after
-    permits_before="$(fleet_metric_total participation_mode_security_v2_total)"
-    # Both counters are cumulative and both are read before as well as after.
-    # A legacy count compared against zero would be a statement about
-    # everything the fleet ever did, so the pre-C legacy controls this gate
-    # also requires would make this step fail the moment they start working —
-    # on their permits, taken before C, not on any sighting after it.
-    legacy_before="$(fleet_metric_total participation_mode_legacy_total)"
-    local driver_rc=0
-    run_work_driver homogeneous-security-v2 || driver_rc=$?
-    permits_after="$(fleet_metric_total participation_mode_security_v2_total)"
-    legacy_after="$(fleet_metric_total participation_mode_legacy_total)"
-    for service in "${REHEARSAL_R1_SERVICES[@]}"; do
-      observe_gate_gauges "${service}"
-    done
+  HOMOGENEOUS_DRIVER_SUPPLIED=0
+  HOMOGENEOUS_DRIVER_RC=0
+  HOMOGENEOUS_TX=0
+  HOMOGENEOUS_CEREMONIES=""
+  HOMOGENEOUS_NEW_OPERATORS=""
 
-    if ((driver_rc != 0)); then
-      record_step "homogeneous security-v2 controls with no legacy sightings" \
-        fail "the work driver exited [${driver_rc}] originating post-C \
-ceremonies"
-      record_assertion \
-        "post-C ceremonies run security-v2 with no legacy sightings" false \
-        "homogeneous security-v2 controls with no legacy sightings"
-    elif [[ ! "${permits_before}" =~ ^[0-9]+$ ]] ||
-      [[ ! "${permits_after}" =~ ^[0-9]+$ ]] ||
-      [[ ! "${legacy_before}" =~ ^[0-9]+$ ]] ||
-      [[ ! "${legacy_after}" =~ ^[0-9]+$ ]]; then
-      record_step "homogeneous security-v2 controls with no legacy sightings" \
-        blocked "the fleet permit counters could not be read \
-(security-v2 [${permits_before}] to [${permits_after}], legacy \
-[${legacy_before}] to [${legacy_after}]), so nothing here observed which mode \
-the ceremonies ran in"
-      record_assertion \
-        "post-C ceremonies run security-v2 with no legacy sightings" false \
-        "homogeneous security-v2 controls with no legacy sightings"
-    elif [[ -z "${STEP_TX_HASHES}" ]]; then
-      # The permits below are credited to this driver, and the only account of
-      # what it put on the chain is the account it gives. Without one, a
-      # counter that moved for some unrelated reason reads exactly like a
-      # driver that originated the ceremonies this control is about.
-      record_step "homogeneous security-v2 controls with no legacy sightings" \
-        blocked "the work driver exited cleanly but reported no transaction, \
-so nothing attributes the fleet's permit activity to the ceremonies this \
-control claims to have originated"
-      record_assertion \
-        "post-C ceremonies run security-v2 with no legacy sightings" false \
-        "homogeneous security-v2 controls with no legacy sightings"
-    elif ((permits_after <= permits_before)); then
-      record_step "homogeneous security-v2 controls with no legacy sightings" \
-        fail "the work driver reported success but the fleet issued no new \
-security-v2 permit (still ${permits_after}); a control that observes no \
-ceremony is not a positive control"
-      record_assertion \
-        "post-C ceremonies run security-v2 with no legacy sightings" false \
-        "homogeneous security-v2 controls with no legacy sightings"
-    elif ((legacy_after > legacy_before)); then
-      record_step "homogeneous security-v2 controls with no legacy sightings" \
-        fail "the fleet issued $((permits_after - permits_before)) new \
-security-v2 permits and also $((legacy_after - legacy_before)) new legacy \
-permit(s) (participation_mode_legacy_total [${legacy_before}] to \
-[${legacy_after}]) driving post-C work"
-      record_assertion \
-        "post-C ceremonies run security-v2 with no legacy sightings" false \
-        "homogeneous security-v2 controls with no legacy sightings"
-    else
-      STEP_PERMIT_MODES='"security_v2"'
-      record_step "homogeneous security-v2 controls with no legacy sightings" \
-        pass "the fleet issued $((permits_after - permits_before)) new \
-security-v2 permits driving the post-C ceremonies the driver originated, and \
-no new legacy permit (participation_mode_legacy_total unchanged at \
-[${legacy_after}])"
-      record_assertion \
-        "post-C ceremonies run security-v2 with no legacy sightings" true \
-        "homogeneous security-v2 controls with no legacy sightings"
-    fi
+  # A zero legacy counter is true of a fleet that ran nothing at all, so the
+  # positive control has to be positive about something: permits actually
+  # issued under security-v2 while the driver ran, and a ceremony the driver
+  # watched finish. Every count is taken before and after so it is this step's
+  # ceremonies being counted rather than the crossing's, and summed across the
+  # fleet because a control that only watched one node would pass on a fleet
+  # where the others sat idle.
+  #
+  # Both permit counters are cumulative and both are read before as well as
+  # after. A legacy count compared against zero would be a statement about
+  # everything the fleet ever did, so the pre-C legacy controls this gate also
+  # requires would make this step fail the moment they start working — on
+  # their permits, taken before C, not on any sighting after it.
+  HOMOGENEOUS_PERMITS_BEFORE="$(fleet_metric_total \
+    participation_mode_security_v2_total)"
+  HOMOGENEOUS_LEGACY_BEFORE="$(fleet_metric_total \
+    participation_mode_legacy_total)"
+  # The sighting half of the step's own name, read where a sighting would
+  # appear rather than inferred from a permit counter that is about what this
+  # fleet took on. The straggler was quarantined by the step above, so any
+  # recognition here is a legacy peer the control claims is not there.
+  HOMOGENEOUS_SIGHTINGS_BEFORE="$(fleet_metric_total \
+    announcer_cross_format_peer_total)"
+  local operators_before_homogeneous operators_after_homogeneous
+  operators_before_homogeneous="$(fleet_roster_operators)"
+
+  if [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
+    HOMOGENEOUS_DRIVER_SUPPLIED=1
+    run_work_driver homogeneous-security-v2 || true
+    HOMOGENEOUS_DRIVER_RC="${WORK_DRIVER_RC}"
+    HOMOGENEOUS_TX="${WORK_DRIVER_TX_COUNT}"
+    HOMOGENEOUS_CEREMONIES="${WORK_DRIVER_SUCCEEDED_CEREMONIES}"
   fi
+
+  HOMOGENEOUS_PERMITS_AFTER="$(fleet_metric_total \
+    participation_mode_security_v2_total)"
+  HOMOGENEOUS_LEGACY_AFTER="$(fleet_metric_total \
+    participation_mode_legacy_total)"
+  HOMOGENEOUS_SIGHTINGS_AFTER="$(fleet_metric_total \
+    announcer_cross_format_peer_total)"
+  operators_after_homogeneous="$(fleet_roster_operators)"
+  HOMOGENEOUS_NEW_OPERATORS="$(comm -13 \
+    <(printf '%s' "${operators_before_homogeneous}") \
+    <(printf '%s' "${operators_after_homogeneous}") | tr '\n' ' ')"
+  HOMOGENEOUS_NEW_OPERATORS="${HOMOGENEOUS_NEW_OPERATORS% }"
+  for service in "${REHEARSAL_R1_SERVICES[@]}"; do
+    observe_gate_gauges "${service}"
+  done
+
+  homogeneous_control_verdict
 
   # Step 7. Severing a node from the chain endpoint is a real clock failure:
   # the gate's synchronous read fails, and the release's contract is that it
