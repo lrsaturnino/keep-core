@@ -1685,6 +1685,10 @@ straggler_readings() {
   STRAGGLER_DRIVER_RC=0
   # shellcheck disable=SC2034
   STRAGGLER_DRIVER_TX=2
+  # The driven ceremony came to nothing, which is the outcome "fails closed"
+  # names. The fleet is sized so it needs the straggler to reach threshold.
+  # shellcheck disable=SC2034
+  STRAGGLER_RESULTS="tbtc_signing=failed"
 }
 
 straggler_case() {
@@ -1702,6 +1706,33 @@ run_verdict straggler_case eval \
 check "a straggler recognized, rostered, and named holds the control" 0 \
   "recognized 1 of them as cross-format" \
   "naming the straggler's own operator ${STRAGGLER_OPERATOR}"
+
+# The regression the counters could not carry: the straggler was seen, named,
+# and rostered — and the ceremony it joined settled anyway. Being named is not
+# being refused, and this control is about post-C legacy work coming to
+# nothing.
+run_verdict straggler_case eval \
+  "STRAGGLER_RESULTS='tbtc_signing=succeeded'
+   straggler_control_verdict '${STRAGGLER_OPERATOR}'"
+check "a rostered straggler whose ceremony settled has not failed closed" 1 \
+  "produced a threshold output \(tbtc_signing=succeeded\)"
+
+# The same, with the settled ceremony sitting beside one that did not: a report
+# is read whole here too.
+run_verdict straggler_case eval \
+  "STRAGGLER_RESULTS='tbtc_signing=failed beacon_dkg=succeeded'
+   straggler_control_verdict '${STRAGGLER_OPERATOR}'"
+check "one settled ceremony among the driven work refutes the control" 1 \
+  "beacon_dkg=succeeded"
+
+# Retry exhaustion is what makes the outcome terminal. A ceremony still running
+# has produced no threshold output yet, which is not the same as having failed
+# to produce one, and the sightings would be read off a ceremony mid-flight.
+run_verdict straggler_case eval \
+  "STRAGGLER_RESULTS=''
+   straggler_control_verdict '${STRAGGLER_OPERATOR}'"
+check "a ceremony with no terminal outcome cannot evidence failing closed" 3 \
+  "exhausted its retries or is still running"
 
 # The case the refusal counter could not tell apart from success: no legacy
 # announcement ever arrived, so there was nothing to fail closed against.
@@ -2046,6 +2077,8 @@ homogeneous_readings() {
   # shellcheck disable=SC2034
   HOMOGENEOUS_CEREMONIES="tbtc_signing beacon_dkg"
   # shellcheck disable=SC2034
+  HOMOGENEOUS_RESULTS="tbtc_signing=succeeded beacon_dkg=succeeded"
+  # shellcheck disable=SC2034
   HOMOGENEOUS_PERMITS_BEFORE="20"
   # shellcheck disable=SC2034
   HOMOGENEOUS_PERMITS_AFTER="24"
@@ -2074,9 +2107,41 @@ check "post-C ceremonies that completed under security-v2 hold the control" 0 \
 
 # The half a permit counter cannot carry: work was allowed to start and
 # nothing was observed finishing.
-run_verdict homogeneous_case eval 'HOMOGENEOUS_CEREMONIES=""'
+run_verdict homogeneous_case eval 'HOMOGENEOUS_CEREMONIES=""
+   HOMOGENEOUS_RESULTS=""'
 check "permits without a completed ceremony are not a positive control" 3 \
   "named no ceremony that completed successfully"
+
+# The regression this seam exists for: a report is taken whole. One half of the
+# release failing outright used to be dropped on the way to the verdict, and
+# the half that passed recorded the control on its own.
+run_verdict homogeneous_case eval \
+  'HOMOGENEOUS_CEREMONIES="tbtc_signing"
+   HOMOGENEOUS_RESULTS="tbtc_signing=succeeded beacon_dkg=failed"'
+check "a required ceremony failing beside a passing one refutes the control" \
+  1 "reported beacon_dkg=failed" "cannot be read off the subset"
+
+run_verdict homogeneous_case eval \
+  'HOMOGENEOUS_CEREMONIES="tbtc_signing beacon_dkg"
+   HOMOGENEOUS_RESULTS="tbtc_signing=succeeded beacon_dkg=succeeded \
+tbtc_wallet_action=timed_out"'
+check "a ceremony that timed out beside the controls refutes them" 1 \
+  "tbtc_wallet_action=timed_out"
+
+# Both halves of the release take their permits from the same gate through
+# different call paths, so a driver that only ever drove one of them leaves the
+# other unexercised however many times it succeeded.
+run_verdict homogeneous_case eval \
+  'HOMOGENEOUS_CEREMONIES="tbtc_signing tbtc_dkg"
+   HOMOGENEOUS_RESULTS="tbtc_signing=succeeded tbtc_dkg=succeeded"'
+check "a control that drove only tBTC says nothing about the beacon" 3 \
+  "nothing from the beacon half of the release"
+
+run_verdict homogeneous_case eval \
+  'HOMOGENEOUS_CEREMONIES="beacon_dkg beacon_signing"
+   HOMOGENEOUS_RESULTS="beacon_dkg=succeeded beacon_signing=succeeded"'
+check "a control that drove only the beacon says nothing about tBTC" 3 \
+  "nothing from the tbtc half of the release"
 
 # The half the legacy permit counter cannot carry: the fleet saw a legacy peer
 # while claiming to be homogeneous.
@@ -2141,6 +2206,7 @@ drive() {
       STEP_TX_HASHES=""
       run_work_driver "$1" || true
       printf 'ceremonies:%s\n' "${WORK_DRIVER_SUCCEEDED_CEREMONIES}"
+      printf 'results:%s\n' "${WORK_DRIVER_CEREMONY_RESULTS}"
       if driver_offered_work; then
         printf 'offered:yes rc:%s tx:%s hashes:%s\n' \
           "${WORK_DRIVER_RC}" "${WORK_DRIVER_TX_COUNT}" "${STEP_TX_HASHES}"
@@ -2213,12 +2279,21 @@ EOF
 drive homogeneous-security-v2
 check "a driver names the ceremonies it saw complete" 0 \
   "offered:yes rc:0 tx:1"
-if [[ "${CASE_OUT}" == *"ceremonies:tbtc_signing"* ]]; then
+if [[ "${CASE_OUT}" == *$'ceremonies:tbtc_signing\n'* ]]; then
   printf 'ok   only the ceremonies that succeeded are carried forward\n'
   PASS=$((PASS + 1))
 else
   printf 'FAIL a failed ceremony was carried forward as a result: %s\n' \
     "${CASE_OUT}"
+  FAILED=$((FAILED + 1))
+fi
+# And the one the successes alone could not carry: the failure is still there
+# for a phase to read, rather than having been dropped at the parse.
+if [[ "${CASE_OUT}" == *"results:tbtc_signing=succeeded beacon_dkg=failed"* ]]; then
+  printf 'ok   an outcome that was not a success survives the parse\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL a failed outcome was discarded at the parse: %s\n' "${CASE_OUT}"
   FAILED=$((FAILED + 1))
 fi
 

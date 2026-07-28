@@ -226,14 +226,26 @@ stops the step — a driver whose account is unreadable has left the step unable
 to say what it drove, and recording that as "nothing happened" would enter
 silence as evidence.
 
-The homogeneous control is decided against both halves of its own name.
-"security-v2 controls" needs a ceremony the driver watched complete, not only
-permits the fleet issued. "with no legacy sightings" is read where a sighting
-would appear — the announcer's cross-format recognition counter and the legacy
-roster, summed and unioned across the whole R1 fleet — because the legacy
-permit counter is about work this fleet took on, not about what it saw. The
-straggler is quarantined before this step runs, so a recognition or a roster
-entry during it means the fleet was not homogeneous.
+Every outcome the driver reports is carried forward, not only the successes.
+A phase that kept the successes alone cannot tell a clean run from one where a
+required ceremony failed beside a passing one, and cannot see a ceremony
+succeeding where the property under test is that it must not.
+
+The homogeneous control is decided against both halves of its own name, over
+the whole report. "security-v2 controls" needs a ceremony the driver watched
+complete, not only permits the fleet issued — and it needs one from each half
+of the release. tBTC and the beacon take their permits from the same gate
+through different call paths, so a driver that only ever drove tBTC leaves the
+beacon's path unexercised however many tBTC ceremonies settled; a control
+covering half the release cannot support a claim made about all of it, and the
+step blocks. Anything the driver reported as failed or timed out refutes the
+control outright: a report is taken whole, so the half that passed cannot
+record the control on its own. "with no legacy sightings" is read where a
+sighting would appear — the announcer's cross-format recognition counter and
+the legacy roster, summed and unioned across the whole R1 fleet — because the
+legacy permit counter is about work this fleet took on, not about what it saw.
+The straggler is quarantined before this step runs, so a recognition or a
+roster entry during it means the fleet was not homogeneous.
 
 Both halves of that report are what a step reads to decide work was offered at
 all. A driver call that exited nonzero, that was never supplied, or that named
@@ -257,6 +269,16 @@ spelling — against the operators the observing node's roster newly named. A
 roster that moved without naming that operator is the release attributing a
 legacy sighting to the wrong node, which is worse evidence than none: the name
 is what a release decision would act on.
+
+Being named is not being refused, so that control also reads what the ceremony
+it drove produced. The rehearsal fleet is sized so the driven post-C ceremony
+needs the straggler to reach threshold: a result that settled means either the
+straggler was not refused after all or the ceremony never depended on it, and
+a control that did not need the node it is about has not exercised the failure
+path it claims to. A ceremony with no terminal outcome at all blocks rather
+than passing — retry exhaustion is what makes "produced no threshold output"
+a statement about a ceremony that finished, and the roster deltas would
+otherwise be read off one still in flight.
 
 The rollback gate's own barrier has two halves and neither substitutes for
 the other. Every release candidate must be provably down, and the prior binary
