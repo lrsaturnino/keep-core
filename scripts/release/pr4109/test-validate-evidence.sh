@@ -578,19 +578,23 @@ check "the inherited receipt is accepted before any proof run starts" 0 \
 # The document below is the shape keep-common composes: one key per registered
 # diagnostics source, each source's own JSON nested under it, with the client
 # identity carrying the field names the Client struct's tags produce.
-probe_diagnostics() {
+diagnostics_document() {
+  local revision="${1:-${FIXTURE_SHA}}"
+  local epoch="${2:-security_v2_cutover}"
+  local cutover="${3:-9000000}"
+  local version="${4:-v2.0.0-rehearsal}"
   cat <<EOF
 {
   "client_info": {
     "chain_address": "0x0000000000000000000000000000000000000001",
     "network_id": "16Uiu2HAm000000000000000000000000000000000000000",
-    "version": "v2.0.0-rehearsal",
-    "revision": "${FIXTURE_SHA}"
+    "version": "${version}",
+    "revision": "${revision}"
   },
   "cutover_legacy_peers": { "revision": 0, "peers": [] },
   "protocol_participation": {
-    "protocol_epoch": "security_v2_cutover",
-    "cutover_block": 9000000,
+    "protocol_epoch": "${epoch}",
+    "cutover_block": ${cutover},
     "gate_state": "open_security_v2",
     "current_block": 9000001,
     "clock_available": true,
@@ -601,6 +605,8 @@ probe_diagnostics() {
 }
 EOF
 }
+
+probe_diagnostics() { diagnostics_document; }
 
 image_digests_by_architecture() {
   printf '{"amd64":"%s","arm64":"%s"}' "$1" "$1"
@@ -648,6 +654,10 @@ run_rehearsal() {
       CUTOVER_BLOCK="9000000"
       # shellcheck disable=SC2030,SC2031,SC2034
       REHEARSAL_GATE="${gate}"
+      # The real capture, against the fixture diagnostics: both gates read the
+      # release identity off the running fleet before they touch it, and the
+      # record is built from what was captured there.
+      capture_r1_release_identity
       "$@"
       conclude_rehearsal
     ) 2>&1
@@ -865,6 +875,79 @@ write_attestation "${E}"
 run_rehearsal "${E}" single_release failed_and_blocked_run
 check "a failure outranks an unexecuted step in the run's own verdict" 1 \
   "of the single_release gate failed"
+
+# ----------------------------------------------------------------------------
+#
+# What the record is allowed to say the fleet was. Every value below is read
+# off the running nodes, from all of them, and compared against what this run
+# is bound to — so the cases install fleets whose answers disagree and require
+# the capture to refuse rather than record the first node's version of events.
+
+run_capture() {
+  set +e
+  CASE_OUT="$(
+    (
+      # shellcheck disable=SC2030,SC2031,SC2034
+      REPO_ROOT="${WORK}/repo"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      CUTOVER_BLOCK="9000000"
+      "$@"
+      capture_r1_release_identity
+    ) 2>&1
+  )"
+  CASE_RC=$?
+  set -e
+}
+
+homogeneous_fleet() { :; }
+
+# The second node runs a different release of the same commit. Its revision
+# still binds to this run, so only asking every node — rather than the first
+# one — can see that the fleet is not one release under test.
+mixed_release_fleet() {
+  # Installed into the capture's subshell, which shellcheck cannot follow.
+  # shellcheck disable=SC2329
+  probe_diagnostics() {
+    if [[ "$1" == "r1-node-2" ]]; then
+      diagnostics_document "${FIXTURE_SHA}" security_v2_cutover 9000000 \
+        v1.9.0-rehearsal
+    else
+      diagnostics_document
+    fi
+  }
+}
+
+# A homogeneous fleet built from bytes this run is not bound to.
+foreign_revision_fleet() {
+  # shellcheck disable=SC2329
+  probe_diagnostics() { diagnostics_document "$(printf 'd%.0s' {1..40})"; }
+}
+
+# A homogeneous fleet armed with another schedule entirely: every crossing
+# and refusal it produces is evidence about a cutover this record does not
+# describe.
+wrong_cutover_fleet() {
+  # shellcheck disable=SC2329
+  probe_diagnostics() {
+    diagnostics_document "${FIXTURE_SHA}" security_v2_cutover 8000000
+  }
+}
+
+run_capture homogeneous_fleet
+check "a fleet agreeing on the bound revision and C is captured" 0 \
+  "every R1 node reports" "matching the attested source"
+
+run_capture mixed_release_fleet
+check "one node running another release refuses the run" 3 \
+  "the R1 fleet is not homogeneous" "r1-node-2"
+
+run_capture foreign_revision_fleet
+check "a fleet built from bytes this run is not bound to refuses the run" 3 \
+  "which is not the commit this run is bound to"
+
+run_capture wrong_cutover_fleet
+check "a fleet armed with another cutover block refuses the run" 3 \
+  "armed cutover block \[8000000\]" "bound to C=\[9000000\]"
 
 # A rehearsal run from bytes no commit accounts for must not produce a record
 # at all: the emitter is where that is caught, before anything is written.

@@ -31,6 +31,31 @@
 #   KEEP_ETHEREUM_PASSWORD  operator key file password for the fleet
 #   STORAGE_SNAPSHOT_DIR    rollback only: one storage snapshot per R1 service
 #                        for the offline state audit
+#
+# Rollback only — the audit inputs no storage snapshot can supply. Every one
+# is required before the offline state audit can authorize anything, and a
+# missing one blocks the barrier that releases the prior binary rather than
+# being skipped:
+#
+#   PR4109_CHAIN_RECONCILIATION_EVIDENCE
+#                        Ethereum reconciliation record: wallet/group
+#                        registration and DKG settlement for every group
+#   PR4109_BITCOIN_RECONCILIATION_EVIDENCE
+#                        Bitcoin reconciliation record: every pending
+#                        transaction and whether it is signed, broadcast,
+#                        mined, or absent
+#   PR4109_QUIESCENCE_REPORT_DIR
+#                        directory holding <service>.json per R1 service: the
+#                        permits that node held at quiescence and how each
+#                        one ended. Per node by nature — one shared report
+#                        would bind every audit to one node's drain
+#   PR4109_PRIOR_READER_EVIDENCE
+#                        prior-release reader compatibility record: the
+#                        tested prior version against every schema this
+#                        release writes
+#   PR4109_BITCOIN_NETWORK  the Bitcoin network the rollback targets
+#   PR4109_PRIOR_VERSION    exact version of the prior release restored
+#   PR4109_PRIOR_REVISION   exact revision of the prior release restored
 #   PR4109_WORK_DRIVER   executable that originates protocol work on the
 #                        rehearsal chain, called with the phase name. The
 #                        fleet only reacts to chain events, so without it no
@@ -2980,27 +3005,114 @@ readable to record which architectures the rehearsal ran"
     blocked "cannot resolve the architectures of ${reference}"
 }
 
-# The release identity the R1 nodes report about themselves, read from a
-# running node rather than from the operator: version and revision are what
-# the record binds the rehearsal to, and a value typed by whoever ran the
-# rehearsal binds nothing.
-r1_client_identity() {
-  probe_diagnostics "${REHEARSAL_R1_SERVICES[0]}" |
+# What one node says it is: the artifact it was built from, and the schedule
+# its gate was compiled and armed with. All four come from the node's own
+# diagnostics rather than from the operator, because a value typed by whoever
+# ran the rehearsal binds nothing. Keys are emitted in a fixed order so two
+# nodes' answers can be compared as strings.
+node_release_identity() {
+  probe_diagnostics "$1" |
     node -e '
       let raw = "";
       process.stdin.on("data", (d) => (raw += d));
       process.stdin.on("end", () => {
-        const info = (JSON.parse(raw).client_info) || {};
-        if (!info.version || !info.revision) {
-          console.error("no version/revision in the node diagnostics");
+        const document = JSON.parse(raw);
+        const info = document.client_info || {};
+        const gate = document.protocol_participation || {};
+        const missing = [];
+        if (!info.version) missing.push("client_info.version");
+        if (!info.revision) missing.push("client_info.revision");
+        if (!gate.protocol_epoch) {
+          missing.push("protocol_participation.protocol_epoch");
+        }
+        if (!Number.isInteger(gate.cutover_block)) {
+          missing.push("protocol_participation.cutover_block");
+        }
+        if (missing.length > 0) {
+          console.error("the node diagnostics carry no " + missing.join(", "));
           process.exit(1);
         }
         process.stdout.write(JSON.stringify({
           version: info.version,
           revision: info.revision,
+          protocol_epoch: gate.protocol_epoch,
+          cutover_block: gate.cutover_block,
         }));
       });
     '
+}
+
+# One field of a JSON document held in a shell variable.
+json_field() {
+  printf '%s' "$1" | node -e '
+    let raw = "";
+    process.stdin.on("data", (d) => (raw += d));
+    process.stdin.on("end", () =>
+      process.stdout.write(String(JSON.parse(raw)[process.argv[1]])));
+  ' "$2"
+}
+
+# The release the whole R1 fleet says it is running, captured while the fleet
+# is up and reused when the record is built.
+#
+# Everything here comes from the nodes rather than from the operator, and
+# from every node rather than from the first one. A record built from the
+# first node's answers is schema-valid evidence for a fleet whose other nodes
+# ran something else entirely, so each value is compared across the fleet and
+# any disagreement refuses the run. Two of them are compared against the run's
+# own inputs as well: the revision must be the commit this run is bound to —
+# the build stamps a short or a full SHA depending on how it was invoked, so a
+# prefix match is the comparison that holds for both — and the cutover block
+# the gates actually armed must be the C this rehearsal claims to be
+# rehearsing, because copying that number out of the environment into the
+# record would evidence what the operator typed rather than what ran.
+#
+# Capturing rather than reading on demand is also what lets the rollback gate
+# emit a record at all: by the time it concludes, every R1 node has been
+# stopped on purpose, and a reading taken then would be no reading at all.
+REHEARSAL_R1_IDENTITY=""
+REHEARSAL_R1_EPOCH=""
+REHEARSAL_R1_CUTOVER_BLOCK=""
+
+capture_r1_release_identity() {
+  local attested service reported revision epoch cutover agreed=""
+  attested="$(attested_source_identity)"
+  for service in "${REHEARSAL_R1_SERVICES[@]}"; do
+    reported="$(node_release_identity "${service}")" ||
+      blocked "${service} does not report the version, revision, protocol \
+epoch, and cutover block that identify what it is running; the record binds \
+the rehearsal to what the running nodes say they are, and a node that will \
+not say cannot be evidenced"
+
+    revision="$(json_field "${reported}" revision)"
+    if [[ "${attested}" != "${revision}"* ]]; then
+      blocked "${service} reports revision [${revision}], which is not the \
+commit this run is bound to [${attested}]; the running image was built from \
+other bytes than the ones every proof here measures"
+    fi
+
+    cutover="$(json_field "${reported}" cutover_block)"
+    if [[ "${cutover}" != "${CUTOVER_BLOCK}" ]]; then
+      blocked "${service} armed cutover block [${cutover}], but this \
+rehearsal is bound to C=[${CUTOVER_BLOCK}]; every crossing, refusal, and \
+straggler observation below would be evidence about a different schedule"
+    fi
+
+    if [[ -z "${agreed}" ]]; then
+      agreed="${reported}"
+    elif [[ "${reported}" != "${agreed}" ]]; then
+      blocked "the R1 fleet is not homogeneous: ${service} reports \
+${reported} while ${REHEARSAL_R1_SERVICES[0]} reports ${agreed}; a mixed \
+fleet is not one release under test and one record cannot speak for both"
+    fi
+  done
+
+  epoch="$(json_field "${agreed}" protocol_epoch)"
+  REHEARSAL_R1_IDENTITY="${agreed}"
+  REHEARSAL_R1_EPOCH="${epoch}"
+  REHEARSAL_R1_CUTOVER_BLOCK="$(json_field "${agreed}" cutover_block)"
+  note "every R1 node reports ${agreed}, matching the attested source \
+${attested} and the rehearsed C"
 }
 
 # Build the record and hand it to the acceptance stage's own validator. The
@@ -3020,7 +3132,12 @@ clean commit; a record built from bytes no commit accounts for is not evidence"
   fi
 
   local identity r1_digests prior_digests
-  identity="$(r1_client_identity)"
+  identity="${REHEARSAL_R1_IDENTITY}"
+  if [[ -z "${identity}" ]]; then
+    blocked "no R1 release identity was captured while the fleet was up; the \
+record binds the rehearsal to what the running nodes reported, and a gate \
+that never captured it has nothing to bind"
+  fi
   r1_digests="$(image_digests_by_architecture "${R1_IMAGE_DIGEST}")"
   prior_digests="$(image_digests_by_architecture "${PRIOR_IMAGE_DIGEST}")"
 
@@ -3044,7 +3161,7 @@ clean commit; a record built from bytes no commit accounts for is not evidence"
     const fs = require("fs");
     const [
       manifestPath, gate, sourceSha, identityJSON, r1JSON, priorJSON,
-      chainID, cutoverBlock, stepsJSON, assertionsJSON, generatedAt,
+      chainID, stepsJSON, assertionsJSON, generatedAt,
     ] = process.argv.slice(1);
     const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
     const identity = JSON.parse(identityJSON);
@@ -3058,9 +3175,13 @@ clean commit; a record built from bytes no commit accounts for is not evidence"
         prior_image_digests: JSON.parse(priorJSON),
         version: identity.version,
         revision: identity.revision,
-        protocol_epoch: "security_v2_cutover",
+        // The epoch and C the nodes reported, not the ones this driver was
+        // told. Restating them here would record what whoever ran the
+        // rehearsal intended and leave the record silent about what the
+        // fleet armed; the capture already refused the run on a disagreement.
+        protocol_epoch: identity.protocol_epoch,
       },
-      chain: { chain_id: chainID, cutover_block: Number(cutoverBlock) },
+      chain: { chain_id: chainID, cutover_block: identity.cutover_block },
       release_manifest: {
         sha256: process.env.PR4109_MANIFEST_SHA256,
         termination_grace_period_seconds:
@@ -3071,7 +3192,7 @@ clean commit; a record built from bytes no commit accounts for is not evidence"
     };
     process.stdout.write(JSON.stringify(record, null, 2) + "\n");
   ' "${manifest}" "${REHEARSAL_GATE}" "${source_sha}" "${identity}" \
-    "${r1_digests}" "${prior_digests}" "${CHAIN_ID}" "${CUTOVER_BLOCK}" \
+    "${r1_digests}" "${prior_digests}" "${CHAIN_ID}" \
     "${steps}" "${assertions}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     >"${record}" ||
     fail "cannot build the rehearsal evidence record"
@@ -3176,13 +3297,24 @@ so the legacy strategy bundle refuses every legacy TSS configuration and no \
 R1 node can join a legacy ceremony; this step needs the reviewed dual-mode \
 fork pinned first"
 
+# Start exactly the named services from the immutable digests and wait for
+# each to serve its evidence port.
+#
+# Which services a gate starts is part of what that gate proves, so the set is
+# the caller's and never the whole compose file. The cutover rehearsal needs
+# the prior binary on the network from the start — it is the straggler the
+# negative control is about. The rollback rehearsal must not have it there at
+# all: its entire subject is that no prior binary participates until every R1
+# node is down and the state audit has authorized the rollback, and a fleet
+# that started the prior service with everything else would have put the thing
+# under test on the network before the first step ran.
 fleet_up() {
-  note "starting the rehearsal fleet from the immutable digests"
-  compose up --detach
+  note "starting the rehearsal fleet from the immutable digests: $*"
+  compose up --detach "$@"
 
   local service deadline
   deadline=$((SECONDS + 600))
-  for service in "${REHEARSAL_PRIOR_SERVICE}" "${REHEARSAL_R1_SERVICES[@]}"; do
+  for service in "$@"; do
     note "waiting for ${service} to serve its client-info port"
     until node_reachable "${service}"; do
       if ((SECONDS >= deadline)); then
@@ -3192,6 +3324,129 @@ nothing about this node can be evidenced"
       sleep 5
     done
   done
+}
+
+# The rollback inputs the offline audit cannot derive from a storage
+# snapshot. Everything the fleet can be asked for is read from the fleet; what
+# remains is genuinely outside this repository — reconciliation against the
+# live Ethereum and Bitcoin state, each node's own quiescence outcome record,
+# the prior release's reader-compatibility result, and the identity of the
+# prior artifact the rollback restores — so it arrives as supplied paths and
+# values. A missing one blocks the barrier rather than being skipped: an audit
+# run without them reports namespace consistency and nothing about whether
+# rolling back onto this state is safe, and unbound evidence would approve a
+# rollback of the wrong chain, network, or artifact just as readily.
+ROLLBACK_AUDIT_INPUTS=(
+  PR4109_CHAIN_RECONCILIATION_EVIDENCE
+  PR4109_BITCOIN_RECONCILIATION_EVIDENCE
+  PR4109_QUIESCENCE_REPORT_DIR
+  PR4109_PRIOR_READER_EVIDENCE
+  PR4109_BITCOIN_NETWORK
+  PR4109_PRIOR_VERSION
+  PR4109_PRIOR_REVISION
+)
+
+# Why the last audited snapshot is not rollback-safe, for the step that
+# records it. Set by run_state_audit whenever it returns nonzero.
+STATE_AUDIT_REASON=""
+
+# Audit one node's storage snapshot for rollback safety. Returns 0 only when
+# the tool itself reported rollback_barrier_ready over the full evidence set;
+# the manifest it wrote is left beside the rehearsal record either way, because
+# a refusal is the part of a rollback decision most worth reading.
+#
+# The identities the audit binds its evidence to are the ones already read off
+# the running fleet — release version, revision, epoch, and armed C — so the
+# rollback is authorized against what ran rather than against what the
+# operator believed ran.
+run_state_audit() {
+  local service="$1" snapshot="$2"
+  local output="${EVIDENCE_DIR}/state-audit-${service}.json"
+  STATE_AUDIT_REASON=""
+
+  local missing=() name
+  for name in "${ROLLBACK_AUDIT_INPUTS[@]}"; do
+    if [[ -z "${!name:-}" ]]; then
+      missing+=("${name}")
+    fi
+  done
+  # One quiescence outcome record per node: the permits each node held when it
+  # drained and how each one ended. It is per-node by nature, so a single
+  # shared path would bind every node's audit to one node's drain.
+  local quiescence=""
+  if [[ -n "${PR4109_QUIESCENCE_REPORT_DIR:-}" ]]; then
+    quiescence="${PR4109_QUIESCENCE_REPORT_DIR}/${service}.json"
+    if [[ ! -f "${quiescence}" ]]; then
+      missing+=("a quiescence outcome record for ${service} at ${quiescence}")
+    fi
+  fi
+  if ((${#missing[@]} > 0)); then
+    STATE_AUDIT_REASON="the audit cannot authorize a rollback without \
+${missing[*]}; from a snapshot alone it reports namespace consistency and \
+nothing about the live-chain reconciliation, this node's quiescence \
+outcomes, or the prior release's ability to read what this one wrote"
+    return 1
+  fi
+
+  note "auditing ${service}'s storage snapshot for rollback safety"
+  local rc=0
+  (
+    cd "${REPO_ROOT}" && go run ./cmd/participation-state-audit \
+      --storage-snapshot "${snapshot}" \
+      --output "${output}" \
+      --chain-reconciliation-evidence \
+      "${PR4109_CHAIN_RECONCILIATION_EVIDENCE}" \
+      --bitcoin-reconciliation-evidence \
+      "${PR4109_BITCOIN_RECONCILIATION_EVIDENCE}" \
+      --quiescence-report "${quiescence}" \
+      --prior-reader-compatibility-evidence "${PR4109_PRIOR_READER_EVIDENCE}" \
+      --expected-ethereum-chain-id "${CHAIN_ID}" \
+      --expected-bitcoin-network "${PR4109_BITCOIN_NETWORK}" \
+      --expected-prior-version "${PR4109_PRIOR_VERSION}" \
+      --expected-prior-revision "${PR4109_PRIOR_REVISION}" \
+      --expected-prior-image-digest "${PRIOR_IMAGE_DIGEST##*@}" \
+      --expected-release-version \
+      "$(json_field "${REHEARSAL_R1_IDENTITY}" version)" \
+      --expected-release-revision \
+      "$(json_field "${REHEARSAL_R1_IDENTITY}" revision)" \
+      --expected-release-image-digest "${R1_IMAGE_DIGEST##*@}" \
+      --expected-release-epoch "${REHEARSAL_R1_EPOCH}" \
+      --expected-cutover-block "${REHEARSAL_R1_CUTOVER_BLOCK}"
+  ) || rc=$?
+
+  if [[ ! -f "${output}" ]]; then
+    STATE_AUDIT_REASON="the audit exited [${rc}] without writing a manifest \
+to ${output}, so it authorized nothing"
+    return 1
+  fi
+
+  local verdict
+  verdict="$(node -e '
+    const fs = require("fs");
+    const audit = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    if (audit.rollback_barrier_ready === true) {
+      process.stdout.write("ready");
+    } else {
+      const reasons = (audit.rollback_blockers || [])
+        .concat(audit.findings || []);
+      process.stdout.write(
+        reasons.length > 0
+          ? reasons.join("; ")
+          : "the manifest does not report rollback_barrier_ready"
+      );
+    }
+  ' "${output}")" || {
+    STATE_AUDIT_REASON="the audit manifest at ${output} could not be read"
+    return 1
+  }
+
+  if [[ "${verdict}" == "ready" ]]; then
+    note "${service}: rollback_barrier_ready, manifest in ${output}"
+    return 0
+  fi
+  STATE_AUDIT_REASON="the audit refused to authorize a rollback (exit \
+[${rc}], manifest in ${output}): ${verdict}"
+  return 1
 }
 
 # Originate real protocol work on the rehearsal chain. The fleet only reacts
@@ -3209,7 +3464,8 @@ run_work_driver() {
 stage_single_release() {
   REHEARSAL_GATE="single_release"
   stage_preflight
-  fleet_up
+  fleet_up "${REHEARSAL_PRIOR_SERVICE}" "${REHEARSAL_R1_SERVICES[@]}"
+  capture_r1_identity
 
   # Step 1 and step 2 both need R1 nodes running legacy-anchored ceremonies
   # alongside the prior binary, which is the one thing this release cannot do.
@@ -3475,10 +3731,20 @@ stage_rollback() {
   [[ -d "${STORAGE_SNAPSHOT_DIR}" ]] ||
     blocked "STORAGE_SNAPSHOT_DIR does not exist; the offline state audit \
 reads one storage snapshot per node and cannot be run against a live volume"
-  fleet_up
+  # Only the release under test. The prior binary is what this gate exists to
+  # keep off the network until the barrier holds, so it is started by the one
+  # step that is allowed to release it and by nothing else.
+  fleet_up "${REHEARSAL_R1_SERVICES[@]}"
+  # While there is still a fleet to ask. Every step below stops these nodes.
+  capture_r1_identity
 
   # Step 1 and 2. Quiesce every R1 node, and prove no prior binary comes up
   # while they drain — the barrier the whole gate exists to establish.
+  #
+  # The two are one operation, because absence has to be watched across the
+  # whole drain. A single probe taken after the drain would be satisfied by a
+  # prior binary that participated for all of quiescence and stopped a second
+  # before the probe ran, which is exactly the sequence the barrier forbids.
   begin_step "quiesce every R1 node with work represented"
   local service
   for service in "${REHEARSAL_R1_SERVICES[@]}"; do
@@ -3494,22 +3760,84 @@ reads one storage snapshot per node and cannot be run against a live volume"
   # evidence natural completion.
   local grace
   grace="$(manifest_termination_grace)"
-  compose stop --timeout "${grace}" "${REHEARSAL_R1_SERVICES[@]}"
-  record_step "quiesce every R1 node with work represented" pass \
-    "every R1 node was stopped under the reviewed manifest's ${grace}s \
+
+  local prior_samples=0 prior_sightings=0
+  if node_reachable "${REHEARSAL_PRIOR_SERVICE}"; then
+    prior_sightings=$((prior_sightings + 1))
+  fi
+  prior_samples=$((prior_samples + 1))
+
+  # The drain runs in the background so the prior service can be sampled
+  # while it is happening. The marker carries the drain's own exit status out
+  # of the subshell: a `wait` that raced the reaper would report nothing, and
+  # a drain that failed must not read as a completed quiescence.
+  local drain_marker drain_deadline
+  drain_marker="$(mktemp "${TMPDIR:-/tmp}/pr4109-drain.XXXXXX")"
+  (
+    drain_status=0
+    compose stop --timeout "${grace}" "${REHEARSAL_R1_SERVICES[@]}" ||
+      drain_status=$?
+    printf '%s' "${drain_status}" >"${drain_marker}"
+  ) &
+  # Twice the grace plus a minute: the drain is bounded by the grace itself,
+  # so a marker that has still not appeared by then means the writer died
+  # without writing one and the sampling loop would otherwise never end.
+  drain_deadline=$((SECONDS + 2 * grace + 60))
+  until [[ -s "${drain_marker}" ]]; do
+    if ((SECONDS >= drain_deadline)); then
+      break
+    fi
+    if node_reachable "${REHEARSAL_PRIOR_SERVICE}"; then
+      prior_sightings=$((prior_sightings + 1))
+    fi
+    prior_samples=$((prior_samples + 1))
+    sleep 2
+  done
+  wait
+  local drain_rc="no exit status"
+  if [[ -s "${drain_marker}" ]]; then
+    drain_rc="$(cat "${drain_marker}")"
+  fi
+  rm -f "${drain_marker}"
+
+  # One last sample once the drain is over, so the watched window ends where
+  # the barrier's precondition is finally established rather than a probe
+  # earlier.
+  if node_reachable "${REHEARSAL_PRIOR_SERVICE}"; then
+    prior_sightings=$((prior_sightings + 1))
+  fi
+  prior_samples=$((prior_samples + 1))
+
+  if [[ "${drain_rc}" == "0" ]]; then
+    record_step "quiesce every R1 node with work represented" pass \
+      "every R1 node was stopped under the reviewed manifest's ${grace}s \
 termination grace, so a draining node was never SIGKILLed before its \
 in-process backstop"
+  else
+    record_step "quiesce every R1 node with work represented" fail \
+      "stopping the R1 nodes under the reviewed manifest's ${grace}s \
+termination grace exited [${drain_rc}]; a drain that did not complete is not \
+a quiescence and the state it left is not what the audit below reads"
+    record_assertion \
+      "every R1 node drains to a stop within the reviewed termination grace" \
+      false "quiesce every R1 node with work represented"
+  fi
 
   begin_step "no prior binary starts during quiescence"
-  if node_reachable "${REHEARSAL_PRIOR_SERVICE}"; then
+  if ((prior_sightings > 0)); then
     record_step "no prior binary starts during quiescence" fail \
-      "${REHEARSAL_PRIOR_SERVICE} was reachable while R1 nodes were draining"
+      "${REHEARSAL_PRIOR_SERVICE} answered on the rehearsal network in \
+${prior_sightings} of ${prior_samples} samples taken across the drain"
     record_assertion \
       "no prior binary participates before every R1 node is down" false \
       "no prior binary starts during quiescence"
   else
     record_step "no prior binary starts during quiescence" pass \
-      "${REHEARSAL_PRIOR_SERVICE} stayed unreachable for the whole drain"
+      "${REHEARSAL_PRIOR_SERVICE} was absent in all ${prior_samples} samples \
+taken from before the drain started to after it finished"
+    record_assertion \
+      "no prior binary participates before every R1 node is down" true \
+      "no prior binary starts during quiescence"
   fi
 
   # Step 3. A forced deadline in an isolated case, so the audited quarantine
@@ -3544,49 +3872,62 @@ rollback must cover — a wallet action already running"
   fi
 
   # Step 5. The offline state audit over every node's snapshot. This is the
-  # repository's own tool and runs here for real.
+  # repository's own tool and runs here for real, with the external evidence
+  # and the operational identities it binds that evidence to.
   begin_step "offline state audit produces a rollback-safe manifest"
-  local audit_failures=()
+  local audit_failures=() audit_ready=1
   for service in "${REHEARSAL_R1_SERVICES[@]}"; do
     local snapshot="${STORAGE_SNAPSHOT_DIR}/${service}"
     if [[ ! -d "${snapshot}" ]]; then
       audit_failures+=("${service}: no snapshot at ${snapshot}")
+      audit_ready=0
       continue
     fi
-    if (cd "${REPO_ROOT}" && go run ./cmd/participation-state-audit \
-      --storage-snapshot "${snapshot}"); then
+    if run_state_audit "${service}" "${snapshot}"; then
       STEP_STATE_CHECKSUMS="${STEP_STATE_CHECKSUMS}${STEP_STATE_CHECKSUMS:+,}\
 \"${service}\":\"$(find "${snapshot}" -type f -exec cat {} + | hash_stdin)\""
     else
-      audit_failures+=("${service}: the audit exited nonzero")
+      audit_ready=0
+      audit_failures+=("${service}: ${STATE_AUDIT_REASON}")
     fi
   done
-  if ((${#audit_failures[@]} == 0)); then
+  if ((audit_ready == 1)); then
     record_step "offline state audit produces a rollback-safe manifest" pass \
-      "every R1 snapshot passed the offline audit"
+      "every R1 snapshot audited to rollback_barrier_ready=true against the \
+supplied reconciliation, quiescence, and prior-reader evidence"
     record_assertion "the offline state audit passes before rollback" true \
       "offline state audit produces a rollback-safe manifest"
   else
     record_step "offline state audit produces a rollback-safe manifest" \
-      blocked "${audit_failures[*]}; the audit refuses to authorize a \
-rollback until its chain, Bitcoin, quiescence, and prior-reader evidence \
-inputs are supplied with the expected operational identities they must bind to"
+      blocked "${audit_failures[*]}"
     record_assertion "the offline state audit passes before rollback" false \
       "offline state audit produces a rollback-safe manifest"
   fi
 
-  # Step 6. Stage the prior digest with no network, then release it only once
-  # the barrier above holds.
+  # Step 6. Release the prior digest, and only behind the whole barrier.
+  #
+  # Both halves are load-bearing and neither substitutes for the other. Every
+  # R1 node being unreachable stops two releases from writing the same state
+  # at once; the audit reporting rollback_barrier_ready is what says the state
+  # they left is state the prior binary can safely read. Starting the prior
+  # binary on the first alone is a rollback performed without knowing whether
+  # it is safe, which is the failure this gate exists to catch.
   begin_step "stage the prior digest behind the all-candidate-down barrier"
-  if ((${#still_up[@]} == 0)); then
+  if ((${#still_up[@]} == 0 && audit_ready == 1)); then
     compose start "${REHEARSAL_PRIOR_SERVICE}"
     record_step "stage the prior digest behind the all-candidate-down barrier" \
       pass "the prior binary was released only after every R1 node was proved \
-unreachable"
-  else
+unreachable and every snapshot audited rollback-safe"
+  elif ((${#still_up[@]} > 0)); then
     record_step "stage the prior digest behind the all-candidate-down barrier" \
       blocked "the barrier does not hold — ${still_up[*]} still answer — so \
 the prior binary was deliberately not released"
+  else
+    record_step "stage the prior digest behind the all-candidate-down barrier" \
+      blocked "every R1 node is down, but the offline state audit did not \
+report rollback_barrier_ready for every snapshot, so the prior binary was \
+deliberately not released; an all-down fleet says two releases cannot write \
+at once, not that the state left behind is safe to roll back onto"
   fi
 
   # Step 7. Homogeneous legacy ceremonies on the prior fleet. The prior binary

@@ -72,6 +72,15 @@ release versions, revisions, and immutable image digests, the release epoch,
 the armed cutover block, and the evidence freshness bound. Its output never
 authorizes activating quarantined material by itself.
 
+The rollback rehearsal runs that audit with all of those inputs, and supplies
+the ones describing the release being rolled back — version, revision, epoch,
+and armed C — from what the R1 fleet itself reported while it was still up,
+so the rollback is authorized against what ran rather than against what
+anyone believed ran. It then reads `rollback_barrier_ready` out of the
+manifest the audit wrote, and that manifest is kept beside the rehearsal
+record whether it authorized the rollback or refused it: a refusal is the
+part of a rollback decision most worth reading.
+
 The two **container** rehearsals are mandatory release gates that cannot run
 from this repository alone: they need the immutable prior-production and R1
 runtime image digests, an equally immutable probe image digest, a rehearsal
@@ -79,13 +88,35 @@ chain with deployed beacon/tBTC contracts and its chain id, per-node operator
 keys and configs each declaring a nonzero `clientInfo.port`, a work driver
 that originates protocol work on that chain, and (for rollback) one storage
 snapshot per R1 service. `rehearse.sh preflight` validates those inputs and
-reports `BLOCKED` with the exact missing one.
+reports `BLOCKED` with the exact missing one. The rollback gate additionally
+needs the audit inputs no storage snapshot can supply — the chain and Bitcoin
+reconciliation records, one quiescence outcome record per node, the
+prior-reader compatibility record, and the prior artifact's version and
+revision — because without them the audit can classify namespaces and
+authorize nothing.
 
 Once preflight passes, `single-release` and `rollback` **run**: each drives
 its gate as an explicit sequence of steps, starting the fleet from the
 immutable digests, reading every number it records from the nodes' own
 client-info ports over the internal rehearsal network, and recording each
-step's own outcome. A step this release cannot execute is recorded `blocked`
+step's own outcome. Which services a gate starts is part of what it proves:
+the cutover rehearsal needs the prior binary on the network from the start,
+because it *is* the straggler the negative control is about, while the
+rollback rehearsal starts only the R1 fleet — its whole subject is that no
+prior binary participates until the barrier holds, and a fleet that brought
+the prior service up with everything else would have put the thing under test
+on the network before the first step ran.
+
+Before either gate touches the fleet it captures what that fleet says it is —
+version, revision, compiled protocol epoch, and armed cutover block — from
+*every* R1 node, not the first. Any disagreement between nodes refuses the
+run, a revision that is not the commit the run is bound to refuses it, and an
+armed cutover block that is not the rehearsed C refuses it. The record is
+then built from what was captured rather than from what the driver was told,
+so its epoch and C are the fleet's own and not a restatement of the
+environment. Capturing up front is also what lets the rollback gate emit a
+record at all: by the time it concludes it has stopped every R1 node on
+purpose, and a reading taken then would be no reading. A step this release cannot execute is recorded `blocked`
 with the reason rather than aborting the run, because the steps after it are
 independent proofs and losing them tells a reviewer less than a record naming
 exactly which step could not run. A step that *did* run and observed the
@@ -103,6 +134,19 @@ acceptance assertion with no step behind it exits `FAIL` too. Only a run with
 none of the three reports success. A partial rehearsal can never read as a
 passed gate, a failed one can never read as either, and a refused gate is
 never silent about what it did prove.
+
+The rollback gate's own barrier has two halves and neither substitutes for
+the other. The R1 fleet must be provably down, and the prior binary must have
+been absent for the whole of it — so the drain runs while the prior service
+is sampled repeatedly, from before the drain starts to after it finishes,
+rather than probed once at the end. A single closing probe is satisfied by a
+prior binary that participated for all of quiescence and stopped a second
+before the probe, which is exactly the sequence the barrier forbids. The
+second half is the offline state audit reporting `rollback_barrier_ready` for
+every snapshot: an all-down fleet says two releases cannot write the same
+state at once, not that the state they left is safe to roll back onto. The
+prior binary is started only when both hold; every R1 node down with an audit
+that authorized nothing records a blocked step and starts nothing.
 
 `compose.rehearsal.yaml` is the fleet shell: one prior node (no gate — the
 deliberate straggler) and two R1 nodes with the non-mainnet
