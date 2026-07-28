@@ -2055,7 +2055,22 @@ part of the record" "${SCAFFOLD_DIR}/README.md" \
   "\`evaluate\` is a dry run that reports without blocking a merge"
 assert_records "scaffold lint: the external control's bypass carve-outs are \
 part of the record" "${SCAFFOLD_DIR}/README.md" \
-  "\`bypass_actors\` names actors the ruleset does not apply to"
+  "\`bypass_actors\` names actors holding permission to set the ruleset's \
+rules aside"
+# A bypass list is a grant of permission, and the modes differ in what an actor
+# has to do to spend it: `exempt` is not run at all, while `pull_request` is
+# available on a merge the actor still has to reach for. Describing the list as
+# actors "the ruleset does not apply to" collapses that difference into the
+# automatic reading, which is the same overstatement corrected below for
+# `pull_request` — pinned here at the general sentence so the correction cannot
+# be undone one mode up.
+assert_records "scaffold lint: the record ties each bypass mode to when the \
+permission is available" "${SCAFFOLD_DIR}/README.md" \
+  "governs when that permission is available and whether the actor has to \
+reach for it"
+assert_omits "scaffold lint: the record no longer reads a bypass list as \
+blanket non-application" "${SCAFFOLD_DIR}/README.md" \
+  "names actors the ruleset does not apply to"
 # `pull_request` is documented as meaning the actor can *only* bypass on pull
 # requests — a restriction on when the capability is available, not a standing
 # waiver applied to every merge that actor makes. Recording it as the latter

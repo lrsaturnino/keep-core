@@ -586,22 +586,23 @@ missing reopens it:
 Enforcement state belongs in the record rather than being assumed from the
 ruleset's existence: `enforcement` is one of `disabled`, `active` and
 `evaluate`, and `evaluate` is a dry run that reports without blocking a merge.
-Only `active` gates anything. The carve-out that leaves an `active` ruleset
+Only `active` gates anything. The carve-out that can leave an `active` ruleset
 gating nothing for the merge that matters is recorded with it:
-`bypass_actors` names actors the ruleset does not apply to, each under a
-`bypass_mode` of `always`, `exempt` or `pull_request`, and `pull_request` is
-not the narrow one it reads as. It confines that actor's bypass to pull
-requests, and a merge into `main` goes through one, so an actor listed that
-way can choose to bypass on exactly the event this gate exists for. What the
-record carries is that capability, not a prediction it gets exercised: a
-bypass declined on one merge is still available on the next, so each actor's
-type, identity and mode belong in the record whether or not one has ever been
-taken. `exempt` is the mode to read hardest — the rules are not run for that
-actor and no bypass audit entry is written, so it is the carve-out that leaves
-no trace on the merge it lets through. `pull_request` is applicable only to
-branch rulesets, which is why it cannot appear on the `tag` ruleset the pin
-above leans on: a bypass actor there holds `always` or `exempt`, and both are
-unconditional.
+`bypass_actors` names actors holding permission to set the ruleset's rules
+aside, each under a `bypass_mode` of `always`, `exempt` or `pull_request` that
+governs when that permission is available and whether the actor has to reach
+for it, and `pull_request` is not the narrow one it reads as. It confines that
+actor's bypass to pull requests, and a merge into `main` goes through one, so
+an actor listed that way can choose to bypass on exactly the event this gate
+exists for. What the record carries is that capability, not a prediction it
+gets exercised: a bypass declined on one merge is still available on the next,
+so each actor's type, identity and mode belong in the record whether or not
+one has ever been taken. `exempt` is the mode to read hardest — the rules are
+not run for that actor and no bypass audit entry is written, so it is the
+carve-out that leaves no trace on the merge it lets through. `pull_request` is
+applicable only to branch rulesets, which is why it cannot appear on the `tag`
+ruleset the pin above leans on: a bypass actor there holds `always` or
+`exempt`, and both are unconditional.
 The `workflows` rule's own `do_not_enforce_on_create` is recorded beside it
 but is not a second such carve-out, and reading it as one waives a gate that
 is in fact still standing: it is documented as allowing repositories and
