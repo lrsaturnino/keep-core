@@ -895,6 +895,24 @@ could not know a checksum computed later. Both members are checked as they are
 unpacked, so a bundle missing one blocks before the fleet starts rather than
 halfway through a rehearsal.
 
+An executable bit is not provenance, though, and that secret is mutable. Both
+programs produce readings that become release evidence — the driver's account
+of what it originated and what became of it is the terminal half of every
+control that watches work settle — so a stale, replaced, or simply wrong
+program manufactures an internally consistent passing account while every
+check in this repository stays green. Preflight therefore hashes each supplied
+program and compares it against `chain-inputs.sha256`, a reviewed control
+checked in beside this file, before any node is started; a mismatch, or a
+program the control does not name, stops the rehearsal. The digests are
+recorded into the evidence document under `chain_inputs`, and the acceptance
+stage refuses a record naming a digest the control does not pin, or one
+carrying chain transactions while naming no driver at all. That control
+currently pins the all-zero placeholder for both programs, which matches no
+file: no driver or generator has been written and reviewed, so every dispatch
+that supplies one blocks until a reviewed digest is recorded in a reviewed
+commit. An unpinned control that admitted anything would be worse than an
+absent one, because it would read as having been exercised.
+
 Everything provisioned lands outside the checkout, under the runner's
 temporary directory. The container stages verify their own source binding
 before they emit or judge a record, and that check counts untracked files as

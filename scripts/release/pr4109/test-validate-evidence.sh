@@ -236,6 +236,55 @@ check "a record bound to the manifest's hash, grace, and commit passes" 0 \
   "attestation binds" "were produced at ${FIXTURE_SHA}" \
   "hash and termination grace"
 
+# The instruments the record was produced with, held to the same standard as
+# the bounds it is measured against. A record carrying chain transactions was
+# produced by a work driver, and a record that cannot name which one attributes
+# its terminal readings to a program nobody can identify.
+STAGE_DROVE='{ "name": "post-C ceremony", "outcome": "pass",
+  "transaction_hashes": [
+    "0x9999999999999999999999999999999999999999999999999999999999999999" ] }'
+
+D="${WORK}/undriven-record"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z" "${FIXTURE_SHA}" "${STAGE_DROVE}"
+run_validator "${D}"
+check "chain transactions with no named driver name no instrument" 3 \
+  "carries chain transactions but names no work driver digest"
+
+D="${WORK}/unreviewed-driver"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const record = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  record.chain_inputs = { work_driver_sha256: "a".repeat(64) };
+  fs.writeFileSync(process.argv[1], JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "a record naming a driver the control does not pin is rejected" 3 \
+  "work driver hashing to \[a{64}\], which .*chain-inputs.sha256 does not pin"
+
+D="${WORK}/unreviewed-generator"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const record = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  record.chain_inputs = {
+    rollback_evidence_generator_sha256: "b".repeat(64),
+  };
+  fs.writeFileSync(process.argv[1], JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "a record naming a generator the control does not pin is rejected" 3 \
+  "evidence generator hashing to \[b{64}\]"
+
 D="${WORK}/no-attestation"
 mkdir -p "${D}"
 write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
@@ -3076,6 +3125,79 @@ EOF
 drive rollback-terminal
 check "a readable report from a driver that failed still reports failure" 0 \
   "offered:no rc:9" "bound:tbtc_signing@600=succeeded=${HASH_A}=0xs"
+
+# The two programs the rehearsal executes but does not contain. Both arrive
+# from a mutable secret bundle, and both produce readings that become release
+# evidence, so an executable bit is not enough: the bytes have to hash to a
+# digest reviewed in a commit before the rehearsal will run them.
+INPUT_CONTROL="${WORK}/chain-inputs.sha256"
+INPUT_PROGRAM="${WORK}/work-driver-fixture"
+
+printf '#!/usr/bin/env bash\nprintf "{}"\n' >"${INPUT_PROGRAM}"
+chmod +x "${INPUT_PROGRAM}"
+INPUT_DIGEST="$(hash_stdin <"${INPUT_PROGRAM}")"
+
+input_case() {
+  set +e
+  CASE_OUT="$(
+    (
+      require_reviewed_input PR4109_WORK_DRIVER work-driver "$1" \
+        "${INPUT_CONTROL}"
+    ) 2>&1
+  )"
+  CASE_RC=$?
+  set -e
+}
+
+cat >"${INPUT_CONTROL}" <<EOF
+# a reviewed control file
+${INPUT_DIGEST}  work-driver
+EOF
+input_case "${INPUT_PROGRAM}"
+check "a program hashing to its reviewed digest is recorded by that digest" \
+  0 "${INPUT_DIGEST}"
+
+input_case ""
+check "a rehearsal handed no program has none to bind" 0 "^$"
+
+input_case "${WORK}/no-such-program"
+check "a program that is not executable drives nothing" 3 \
+  "is not an executable program"
+
+# The regression this control exists for: the bundle is mutable, so the bytes
+# that arrive are not necessarily the bytes anybody read.
+printf '#!/usr/bin/env bash\nprintf "{}"\nexit 0\n' >"${INPUT_PROGRAM}"
+chmod +x "${INPUT_PROGRAM}"
+input_case "${INPUT_PROGRAM}"
+check "a program that is not the reviewed one stops the rehearsal" 3 \
+  "hashes to" "pins work-driver at ${INPUT_DIGEST}"
+
+cat >"${INPUT_CONTROL}" <<'EOF'
+# a control file pinning something else entirely
+0000000000000000000000000000000000000000000000000000000000000001  rollback-evidence-generator
+EOF
+input_case "${INPUT_PROGRAM}"
+check "a program no reviewed digest names at all is unbound" 3 \
+  "no reviewed SHA-256 for work-driver is recorded"
+
+rm -f "${INPUT_CONTROL}"
+input_case "${INPUT_PROGRAM}"
+check "a missing control file pins nothing and binds nothing" 3 \
+  "no reviewed SHA-256 for work-driver is recorded"
+
+# And the checked-in control itself: the placeholder must match no program, so
+# a rehearsal cannot be dispatched with an unreviewed driver until a reviewed
+# digest is recorded in a reviewed commit.
+CHECKED_IN_DRIVER="$(reviewed_input_digest work-driver)"
+if [[ "${CHECKED_IN_DRIVER}" == \
+  "0000000000000000000000000000000000000000000000000000000000000000" ]]; then
+  printf 'ok   the checked-in control pins no driver a rehearsal could run\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL the checked-in work-driver digest is [%s]; if a driver has \
+been reviewed this expectation moves with it\n' "${CHECKED_IN_DRIVER}"
+  FAILED=$((FAILED + 1))
+fi
 
 # Neither container stage can be executed anywhere but a real rehearsal — they
 # need the immutable images, a chain, and persistent volumes — so a call site

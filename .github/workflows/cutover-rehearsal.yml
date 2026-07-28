@@ -349,6 +349,15 @@ jobs:
       # starts. Both are checked here rather than at the point of use, so a
       # bundle missing one blocks before the fleet is started instead of
       # halfway through a rehearsal.
+      #
+      # The secret is mutable and both programs produce readings that become
+      # release evidence, so an executable bit is not provenance. The bytes are
+      # hashed against scripts/release/pr4109/chain-inputs.sha256 — a reviewed,
+      # checked-in control — in the rehearsal's own preflight, before any node
+      # is started, and the digests are recorded into the evidence document.
+      # This step therefore establishes only that the bundle arrived with both
+      # members; the binding is the rehearsal's, because it is the party that
+      # runs them.
       - name: Provision the rehearsal chain inputs bundle
         env:
           REHEARSAL_CHAIN_INPUTS_BUNDLE_B64: ${{ secrets.REHEARSAL_CHAIN_INPUTS_BUNDLE_B64 }}
@@ -360,7 +369,9 @@ jobs:
             echo "rollback-evidence-generator (executable, called with the" >&2
             echo "service name, that node's identity audit manifest, and an" >&2
             echo "output directory to write the four rollback evidence" >&2
-            echo "records into), then re-dispatch" >&2
+            echo "records into), record each program's reviewed SHA-256 in" >&2
+            echo "scripts/release/pr4109/chain-inputs.sha256, then" >&2
+            echo "re-dispatch" >&2
             exit 3
           fi
           mkdir -p "$REHEARSAL_INPUTS_DIR"

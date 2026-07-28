@@ -2426,6 +2426,66 @@ require_immutable_digest() {
   fi
 }
 
+# The reviewed digests of the programs this rehearsal executes but does not
+# contain, read out of the checked-in control file. Empty when the file names
+# no digest for that program.
+reviewed_input_digest() {
+  local program="$1" file digest="" hash name
+  file="${2:-${SCRIPT_DIR}/chain-inputs.sha256}"
+  [[ -f "${file}" ]] || {
+    printf ''
+    return 0
+  }
+  while read -r hash name; do
+    [[ -n "${hash}" && "${hash#\#}" == "${hash}" ]] || continue
+    [[ "${name}" == "${program}" ]] || continue
+    [[ "${hash}" =~ ^[0-9a-f]{64}$ ]] || continue
+    digest="${hash}"
+    break
+  done <"${file}"
+  printf '%s' "${digest}"
+}
+
+# The digests of the programs this run was actually handed, recorded so the
+# evidence names the instruments it was produced with.
+WORK_DRIVER_DIGEST=""
+ROLLBACK_GENERATOR_DIGEST=""
+
+# Bind one supplied program to its reviewed digest, or refuse to run it.
+#
+# Both of these arrive from a mutable secret bundle, and both produce readings
+# that become release evidence: the driver's account of what it originated and
+# what became of it is the entire terminal half of every control that watches
+# work settle. An executable bit is not provenance, and an internally
+# consistent report from the wrong program passes every check in this
+# repository. So the bytes are hashed here and compared against a digest
+# reviewed in a commit, and a mismatch stops the rehearsal rather than
+# producing a record naming an instrument nobody reviewed.
+require_reviewed_input() {
+  local variable="$1" program="$2" path="$3" control="${4:-}" reviewed actual
+  [[ -n "${path}" ]] || {
+    printf ''
+    return 0
+  }
+  [[ -x "${path}" ]] ||
+    blocked "${variable} points at ${path}, which is not an executable \
+program; the rehearsal cannot drive work with it and cannot record what it did"
+  reviewed="$(reviewed_input_digest "${program}" "${control}")"
+  [[ -n "${reviewed}" ]] ||
+    blocked "no reviewed SHA-256 for ${program} is recorded in \
+${SCAFFOLD_DIR}/chain-inputs.sha256, so the program supplied through \
+${variable} is unbound; its report is the terminal half of every control that \
+watches work settle, and an unreviewed program produces an internally \
+consistent passing account that every check in this repository accepts"
+  actual="$(hash_stdin <"${path}")"
+  [[ "${actual}" == "${reviewed}" ]] ||
+    blocked "the program supplied through ${variable} hashes to ${actual}, \
+and ${SCAFFOLD_DIR}/chain-inputs.sha256 pins ${program} at ${reviewed}; a \
+rehearsal cannot record evidence produced by a program other than the \
+reviewed one"
+  printf '%s' "${actual}"
+}
+
 # Directory holding the release-manifest attestation: the receipt proving the
 # checked-in manifest still matches the compiled bounds of the source under
 # test. It is a subdirectory on purpose. Both the record glob below and the
@@ -3959,6 +4019,9 @@ that never captured it has nothing to bind"
   # record that names a different one.
   PR4109_MANIFEST_SHA256="$(hash_stdin <"${manifest}")"
   export PR4109_MANIFEST_SHA256
+  PR4109_WORK_DRIVER_SHA256="${WORK_DRIVER_DIGEST}"
+  PR4109_ROLLBACK_GENERATOR_SHA256="${ROLLBACK_GENERATOR_DIGEST}"
+  export PR4109_WORK_DRIVER_SHA256 PR4109_ROLLBACK_GENERATOR_SHA256
 
   node -e '
     const fs = require("fs");
@@ -3990,6 +4053,15 @@ that never captured it has nothing to bind"
         termination_grace_period_seconds:
           manifest.termination_grace.termination_grace_period_seconds,
       },
+      // The programs this rehearsal executed but does not contain. Preflight
+      // has already refused any that did not hash to the reviewed digest, so
+      // what is recorded here is a name for the instrument the readings below
+      // were produced with rather than a claim the record makes about it.
+      chain_inputs: {
+        work_driver_sha256: process.env.PR4109_WORK_DRIVER_SHA256 || undefined,
+        rollback_evidence_generator_sha256:
+          process.env.PR4109_ROLLBACK_GENERATOR_SHA256 || undefined,
+      },
       stages: JSON.parse("[" + stepsJSON + "]"),
       assertions: JSON.parse("[" + assertionsJSON + "]"),
     };
@@ -3999,7 +4071,8 @@ that never captured it has nothing to bind"
     "${steps}" "${assertions}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     >"${record}" ||
     fail "cannot build the rehearsal evidence record"
-  unset PR4109_MANIFEST_SHA256
+  unset PR4109_MANIFEST_SHA256 PR4109_WORK_DRIVER_SHA256 \
+    PR4109_ROLLBACK_GENERATOR_SHA256
 
   note "rehearsal evidence record written to ${record}"
   note "validating it with the acceptance stage's own validator"
@@ -4080,6 +4153,14 @@ path, and storage directory"
     # preflight instead of halfway through a rehearsal.
     clientinfo_port "${service}" >/dev/null
   done
+
+  # Before anything is started, because a fleet driven by an unreviewed
+  # program has already produced the state every later reading is taken over.
+  WORK_DRIVER_DIGEST="$(require_reviewed_input PR4109_WORK_DRIVER \
+    work-driver "${PR4109_WORK_DRIVER:-}")"
+  ROLLBACK_GENERATOR_DIGEST="$(require_reviewed_input \
+    PR4109_ROLLBACK_EVIDENCE_GENERATOR rollback-evidence-generator \
+    "${PR4109_ROLLBACK_EVIDENCE_GENERATOR:-}")"
 
   note "pulling both immutable digests to verify availability"
   docker pull "${PRIOR_IMAGE_DIGEST}"
@@ -7407,6 +7488,55 @@ compiled bounds judging it must come from the same commit"
 termination grace of [${recorded_grace:-absent}] seconds, but the reviewed \
 manifest it binds grants [${manifest_grace}]; a rehearsal under any other \
 grace is not evidence for this release"
+    fi
+
+    # The instruments, held to the same standard as the bounds. A record's
+    # terminal readings are the driver's account of the chain, so a record
+    # that carries chain evidence and names no reviewed driver is a reading
+    # taken with an instrument nobody can identify; and one naming a digest
+    # the reviewed control does not pin is a program that was reviewed
+    # somewhere other than in this repository.
+    local recorded_driver recorded_generator drove
+    recorded_driver="$(node -e '
+      const fs = require("fs");
+      const record = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      process.stdout.write(
+        String((record.chain_inputs || {}).work_driver_sha256 || "")
+      );
+    ' "${record}")"
+    recorded_generator="$(node -e '
+      const fs = require("fs");
+      const record = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      process.stdout.write(String(
+        (record.chain_inputs || {}).rollback_evidence_generator_sha256 || ""
+      ));
+    ' "${record}")"
+    drove="$(node -e '
+      const fs = require("fs");
+      const record = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      const drove = (record.stages || []).some(
+        (stage) => (stage.transaction_hashes || []).length > 0
+      );
+      process.stdout.write(drove ? "yes" : "no");
+    ' "${record}")"
+    if [[ "${drove}" == "yes" && -z "${recorded_driver}" ]]; then
+      blocked "evidence record ${record} carries chain transactions but names \
+no work driver digest; the readings a driver produces are the terminal half \
+of every control that watches work settle, and a record cannot attribute them \
+to an instrument it does not identify"
+    fi
+    if [[ -n "${recorded_driver}" ]] &&
+      [[ "${recorded_driver}" != "$(reviewed_input_digest work-driver)" ]]; then
+      blocked "evidence record ${record} was produced with a work driver \
+hashing to [${recorded_driver}], which \
+${SCAFFOLD_DIR}/chain-inputs.sha256 does not pin"
+    fi
+    if [[ -n "${recorded_generator}" ]] &&
+      [[ "${recorded_generator}" != \
+      "$(reviewed_input_digest rollback-evidence-generator)" ]]; then
+      blocked "evidence record ${record} was produced with a rollback \
+evidence generator hashing to [${recorded_generator}], which \
+${SCAFFOLD_DIR}/chain-inputs.sha256 does not pin"
     fi
   done
 
