@@ -2056,9 +2056,38 @@ part of the record" "${SCAFFOLD_DIR}/README.md" \
 assert_records "scaffold lint: the external control's bypass carve-outs are \
 part of the record" "${SCAFFOLD_DIR}/README.md" \
   "\`bypass_actors\` names actors the ruleset does not apply to"
+# `pull_request` is documented as meaning the actor can *only* bypass on pull
+# requests — a restriction on when the capability is available, not a standing
+# waiver applied to every merge that actor makes. Recording it as the latter
+# overstates in the direction that reads as alarming rather than as safe, but
+# it still costs: an administrator who checks a listed actor's merges, finds
+# none bypassed, and concludes the record described something that did not
+# happen has been taught to discount the entry. The capability is what makes
+# the actor merge-relevant, so the record keeps the actor's full identity and
+# mode while describing the bypass as available rather than automatic.
 assert_records "scaffold lint: the record reads a pull-request bypass as \
 merge-relevant" "${SCAFFOLD_DIR}/README.md" \
-  "bypasses on exactly the event this gate exists for"
+  "can choose to bypass on exactly the event this gate exists for"
+assert_records "scaffold lint: the record reads a pull-request bypass as a \
+capability and not an event" "${SCAFFOLD_DIR}/README.md" \
+  "carries is that capability, not a prediction it gets exercised"
+assert_records "scaffold lint: the record keeps each bypass actor's identity \
+and mode" "${SCAFFOLD_DIR}/README.md" \
+  "each actor's type, identity and mode belong in the record"
+assert_omits "scaffold lint: the record no longer reads a pull-request bypass \
+as automatic" "${SCAFFOLD_DIR}/README.md" \
+  "bypasses on exactly the event"
+
+# `exempt` skips the rules *and* the bypass audit entry, so it is the mode
+# whose use leaves nothing behind to find later; and `pull_request` is
+# applicable only to branch rulesets, which is what makes the tag ruleset's
+# bypass list unconditional rather than merge-scoped.
+assert_records "scaffold lint: the record names the exempt mode as leaving no \
+audit entry" "${SCAFFOLD_DIR}/README.md" \
+  "no bypass audit entry is written"
+assert_records "scaffold lint: the record scopes the pull-request mode to \
+branch rulesets" "${SCAFFOLD_DIR}/README.md" \
+  "applicable only to branch rulesets"
 
 # `do_not_enforce_on_create` is documented as allowing repositories and
 # branches to be *created* when a check would otherwise prohibit it, so it
@@ -2093,18 +2122,60 @@ not an instance" "${SCAFFOLD_DIR}/README.md" \
 \`conditions\`"
 assert_records "scaffold lint: the record names the repository and ref \
 selectors" "${SCAFFOLD_DIR}/README.md" \
-  "a repository selector — \`repository_name\`, \`repository_id\` or \
-\`repository_property\` — together with \`ref_name\`"
-assert_records "scaffold lint: the record reads the selectors as \
-include/exclude pairs" "${SCAFFOLD_DIR}/README.md" \
+  "exactly one repository selector — \`repository_name\`, \`repository_id\` \
+or \`repository_property\`"
+
+# The three repository selectors are three different objects, and a record
+# calling them all `include`/`exclude` pairs is wrong about the one whose ID
+# the record elsewhere insists on resolving. `repository_name` is that pair
+# over patterns; `repository_property` is a pair over `{name, property_values,
+# source}` objects whose `include` is conjunctive rather than disjunctive; and
+# `repository_id` is neither — a `repository_ids` array with no repository
+# `exclude` beside it. Generalising over them tells an administrator to look
+# for a repository-level `exclude` that does not exist under `repository_id`,
+# and lets a `repository_property` record pass while naming no property, which
+# is the aim that can move without the ruleset being touched at all. Only
+# `ref_name` carries the `include`/`exclude` reading on all three.
+assert_records "scaffold lint: the record says the three selectors differ" \
+  "${SCAFFOLD_DIR}/README.md" "those three do not read alike"
+assert_records "scaffold lint: the record reads ref_name as an \
+include/exclude pair" "${SCAFFOLD_DIR}/README.md" \
+  "so it takes back what \`include\` matched"
+assert_records "scaffold lint: the record reads repository_id as an id array" \
+  "${SCAFFOLD_DIR}/README.md" "carries a \`repository_ids\` array of integers"
+assert_records "scaffold lint: the record denies repository_id a repository \
+exclude" "${SCAFFOLD_DIR}/README.md" \
+  "there is no repository-level \`exclude\` to take that back"
+assert_records "scaffold lint: the record requires the id resolved to this \
+repository" "${SCAFFOLD_DIR}/README.md" \
+  "the ID read back as \`threshold-network/keep-core\`"
+assert_records "scaffold lint: the record reads repository_property include \
+as conjunctive" "${SCAFFOLD_DIR}/README.md" \
+  "conjunctive where the others are disjunctive"
+assert_records "scaffold lint: the record requires the property names and \
+values" "${SCAFFOLD_DIR}/README.md" \
+  "name the properties and values, not merely which selector was used"
+assert_omits "scaffold lint: the record no longer reads every selector as an \
+include/exclude pair" "${SCAFFOLD_DIR}/README.md" \
+  "each selector is an \`include\`/\`exclude\` pair"
+assert_omits "scaffold lint: the record no longer generalises the exclude \
+over both selectors" "${SCAFFOLD_DIR}/README.md" \
   "either \`exclude\` takes back what its \`include\` matched"
+
 assert_records "scaffold lint: the record says a rule aimed elsewhere holds \
 the properties and gates nothing" "${SCAFFOLD_DIR}/README.md" \
   "aimed at another repository or at every branch except this one"
+assert_records "scaffold lint: the record requires the exact conditions \
+object" "${SCAFFOLD_DIR}/README.md" "the exact \`conditions\` object"
 assert_records "scaffold lint: the record requires the conditions resolved to \
-this repository and branch" "${SCAFFOLD_DIR}/README.md" \
-  "it resolves to \`threshold-network/keep-core\`, and that \`ref_name\` \
-matches \`refs/heads/main\`"
+this repository" "${SCAFFOLD_DIR}/README.md" \
+  "resolves it to \`threshold-network/keep-core\`"
+assert_records "scaffold lint: the record requires the ref pattern resolved \
+to main" "${SCAFFOLD_DIR}/README.md" \
+  "\`ref_name\` matches \`refs/heads/main\`"
+assert_records "scaffold lint: the record requires the ref exclude to leave \
+main matched" "${SCAFFOLD_DIR}/README.md" \
+  "with \`ref_name.exclude\` not removing it again"
 assert_records "scaffold lint: the record reads a default-branch alias as \
 conditional on main being it" "${SCAFFOLD_DIR}/README.md" \
   "by \`~DEFAULT_BRANCH\` while \`main\` is the default branch"

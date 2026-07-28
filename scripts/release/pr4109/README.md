@@ -590,8 +590,18 @@ Only `active` gates anything. The carve-out that leaves an `active` ruleset
 gating nothing for the merge that matters is recorded with it:
 `bypass_actors` names actors the ruleset does not apply to, each under a
 `bypass_mode` of `always`, `exempt` or `pull_request`, and `pull_request` is
-not the narrow one it reads as — it is the path a merge into `main` takes, so
-an actor listed that way bypasses on exactly the event this gate exists for.
+not the narrow one it reads as. It confines that actor's bypass to pull
+requests, and a merge into `main` goes through one, so an actor listed that
+way can choose to bypass on exactly the event this gate exists for. What the
+record carries is that capability, not a prediction it gets exercised: a
+bypass declined on one merge is still available on the next, so each actor's
+type, identity and mode belong in the record whether or not one has ever been
+taken. `exempt` is the mode to read hardest — the rules are not run for that
+actor and no bypass audit entry is written, so it is the carve-out that leaves
+no trace on the merge it lets through. `pull_request` is applicable only to
+branch rulesets, which is why it cannot appear on the `tag` ruleset the pin
+above leans on: a bypass actor there holds `always` or `exempt`, and both are
+unconditional.
 The `workflows` rule's own `do_not_enforce_on_create` is recorded beside it
 but is not a second such carve-out, and reading it as one waives a gate that
 is in fact still standing: it is documented as allowing repositories and
@@ -604,21 +614,43 @@ the record carries it rather than dropping it.
 `enforcement`, `target` and the entry's own three properties still say nothing
 about *what* the ruleset is aimed at. `target` is one of `branch`, `tag`,
 `push` and `repository`: it names a kind of ref, not an instance, and the
-instances come from `conditions`. An organisation-level branch ruleset carries
-a repository selector — `repository_name`, `repository_id` or
-`repository_property` — together with `ref_name`, and each selector is an
-`include`/`exclude` pair rather than a single value: `ref_name.include`
-accepts `~ALL` and `~DEFAULT_BRANCH` alongside an explicit `refs/heads/main`,
-`repository_name.include` accepts `~ALL` alongside patterns, and either
-`exclude` takes back what its `include` matched. So an `active`, unbypassed,
-externally SHA-pinned entry carrying its own analyzer can hold every property
-above and gate nothing here, by being aimed at another repository or at every
-branch except this one — and it reads, in a record naming only the target, as
-though it closed the boundary. The record therefore resolves the conditions
-instead of reproducing them: which of the three repository selectors is in
-use and that it resolves to `threshold-network/keep-core`, and that `ref_name`
-matches `refs/heads/main` — by pattern, by `~ALL`, or by `~DEFAULT_BRANCH`
-while `main` is the default branch — with neither `exclude` removing it again.
+instances come from `conditions`. An organisation-level branch ruleset pairs
+`ref_name` with exactly one repository selector — `repository_name`,
+`repository_id` or `repository_property` — and those three do not read alike,
+so a record resolving "the conditions" generically resolves nothing:
+
+- `ref_name` is an `include`/`exclude` pair of ref names or patterns, on all
+  three variants. `include` accepts `~ALL` and `~DEFAULT_BRANCH` alongside an
+  explicit `refs/heads/main` and one entry matching is enough; `exclude` fails
+  the condition when any entry matches, so it takes back what `include`
+  matched.
+- `repository_name` is that same shape over repository names and patterns,
+  `~ALL` accepted, plus a `protected` flag that governs renaming the targets
+  and says nothing about what the ruleset is aimed at.
+- `repository_id` is not that shape at all. It carries a `repository_ids`
+  array of integers and one of them matching is the entire test: there is no
+  repository-level `exclude` to take that back, and no `~ALL`. What it needs
+  is the resolution the integer withholds — the ID read back as
+  `threshold-network/keep-core`.
+- `repository_property` is an `include`/`exclude` pair over `name` /
+  `property_values` / `source` objects rather than strings, and its `include`
+  is conjunctive where the others are disjunctive: *all* listed properties
+  must match, while `exclude` still fails on any. It therefore aims at
+  whatever set of repositories currently carries those values — a set this
+  one can enter or leave without the ruleset changing — so the record has to
+  name the properties and values, not merely which selector was used.
+
+So an `active`, unbypassed, externally SHA-pinned entry carrying its own
+analyzer can hold every property above and gate nothing here, by being aimed
+at another repository or at every branch except this one — and it reads, in a
+record naming only the target, as though it closed the boundary. The record
+therefore resolves the conditions instead of reproducing them: the exact
+`conditions` object, the repository selector in use carrying the evidence that
+resolves it to `threshold-network/keep-core` — the ID read back to a
+repository, or the property names and values read back to this repository's —
+and that `ref_name` matches `refs/heads/main`, by pattern, by `~ALL`, or by
+`~DEFAULT_BRANCH` while `main` is the default branch, with `ref_name.exclude`
+not removing it again.
 
 Standing, checked empirically on 2026-07-28:
 `GET /repos/threshold-network/keep-core/rulesets?includes_parents=true`
@@ -642,10 +674,11 @@ something under that name succeeded, not that this analyzer ran. Evidence that
 rests on the scaffold's own checkers having judged a change should be read
 with that in mind. Unblocking is a configuration change plus the record, not a
 code change here, and the record has to name the ruleset's id and name, its
-target, the conditions resolving it to this repository and to
+target, its exact `conditions` object together with the evidence resolving
+that object's repository selector to this repository and its `ref_name` to
 `refs/heads/main`, its `enforcement` — which must read `active` — its
-`bypass_actors` with each actor's `bypass_mode`, and the rule's
-`do_not_enforce_on_create`, and, for the `workflows` entry, the
+`bypass_actors` with each actor's type, identity and `bypass_mode`, and the
+rule's `do_not_enforce_on_create`, and, for the `workflows` entry, the
 `repository_id` together with the repository it resolves to, the `path`, the
 `sha` pinning it — or, for a tag, the tag together with the ruleset holding
 that tag immutable — and the analyzer that pin binds. A record naming this
