@@ -86,13 +86,13 @@ from this repository alone: they need the immutable prior-production and R1
 runtime image digests, an equally immutable probe image digest, a rehearsal
 chain with deployed beacon/tBTC contracts and its chain id, per-node operator
 keys and configs each declaring a nonzero `clientInfo.port`, a work driver
-that originates protocol work on that chain, and (for rollback) one storage
-snapshot per R1 service. `rehearse.sh preflight` validates those inputs and
-reports `BLOCKED` with the exact missing one. The rollback gate additionally
-needs the audit inputs no storage snapshot can supply — the chain and Bitcoin
-reconciliation records, one quiescence outcome record per node, the
-prior-reader compatibility record, and the prior artifact's version and
-revision — because without them the audit can classify namespaces and
+that originates protocol work on that chain, and (for rollback) a directory
+to capture each drained node's state into. `rehearse.sh preflight` validates
+those inputs and reports `BLOCKED` with the exact missing one. The rollback
+gate additionally needs the audit inputs no storage snapshot can supply — the
+chain and Bitcoin reconciliation records, one quiescence outcome record per
+node, the prior-reader compatibility record, and the prior artifact's version
+and revision — because without them the audit can classify namespaces and
 authorize nothing.
 
 Once preflight passes, `single-release` and `rollback` **run**: each drives
@@ -105,7 +105,11 @@ because it *is* the straggler the negative control is about, while the
 rollback rehearsal starts only the R1 fleet — its whole subject is that no
 prior binary participates until the barrier holds, and a fleet that brought
 the prior service up with everything else would have put the thing under test
-on the network before the first step ran.
+on the network before the first step ran. It does *stage* the prior
+container: created from the audited digest, proved not running, and left off
+the network, because `compose start` can only start something that exists and
+a rollback project that created nothing would leave the release step
+recording a rollback it never performed.
 
 Before either gate touches the fleet it proves the containers are running the
 supplied digests — image IDs compared against what the daemon actually created
@@ -114,7 +118,9 @@ otherwise produces a fleet running other bytes under a record naming these
 ones — and then captures what that fleet says it is: version, revision,
 compiled protocol epoch, and armed cutover block, from *every* R1 node and not
 the first. Any disagreement between nodes refuses the run, as does a revision
-that is not the commit the run is bound to, an armed cutover block that is not
+that is not exactly the commit the run is bound to — an abbreviation names a
+commit only as far as it goes, which is why the release workflow stamps the
+whole SHA and `shell-analysis` holds it to that — an armed cutover block that is not
 the rehearsed C, or a protocol epoch that is not the one the reviewed manifest
 was derived for. The record is
 then built from what was captured rather than from what the driver was told,
@@ -148,20 +154,44 @@ without having crossed anything; it names a permit mode in the record only
 where security-v2 permits were actually observed. The homogeneous positive
 control requires the fleet's security-v2 permit total to *rise* while the
 work driver runs, since a zero legacy counter is equally true of a fleet that
-ran nothing. The straggler control differences the roster before and after
-the driven ceremony and requires an operator the node had not already seen:
-the roster object exists from startup with an empty peer list, so its
-presence proves nothing, and a refusal counter moving on its own could be any
-refusal at all. The clock-failure step reads the same
-contract as two halves and needs evidence for both: with the endpoint severed
-the gate must report `clock_unavailable`, must issue no new permit, and must
-have quarantined the ceremonies it was holding — a node that was idle when its
-clock failed exercises only the refusal half and records the step blocked
-rather than passing. Quiescence requires a security-v2 ceremony to be in
-flight when the stop is issued, stops the node under the reviewed manifest's
-grace rather than a restated number, and watches the whole drain — a node that
-issues a new permit while quiescing, or force-aborts a held one instead of
-letting it finish, fails the step rather than passing on the state string.
+ran nothing — and it compares the legacy counter as a delta across the step,
+because that counter is cumulative and the pre-C legacy controls this same
+gate requires would otherwise fail this step on permits taken before C. It
+also requires the driver to have reported the transactions it submitted, so a
+counter that moved for some unrelated reason is not credited to ceremonies
+nobody can show were originated.
+
+The straggler control reads the announcer's own account of the sighting
+rather than the gate's refusal counter, which counts a node declining its own
+`Begin` for reasons that need no legacy announcement behind them. It requires
+the whole chain: a session-ID mismatch arrived, this node recognized it as
+cross-format, that recognition became a legacy roster addition, and the
+roster names an operator it had not already seen. A mismatch nothing
+recognized as cross-format fails the step rather than leaving a gap — the
+release's premise is that a straggler is identified — and the roster object
+exists from startup with an empty peer list, so its presence proves nothing.
+
+The clock-failure step reads its contract as two halves and needs evidence
+for both. With the endpoint severed the gate must report `clock_unavailable`;
+it must have canceled every ceremony it was holding, counted from the
+clock-abort counter rather than from the active gauge, because permits stay
+counted until their owners close them and a falling gauge is the owners
+noticing rather than the gate acting; and it must refuse work *offered to it
+while it is blind*, which the step originates and then requires a refusal to
+be recorded against. A node nobody asked produces exactly the same unchanged
+permit counter as one that refused. A node that was idle when its clock
+failed exercises only the refusal half and records the step blocked rather
+than passing.
+
+Quiescence requires a security-v2 ceremony to be in flight when the stop is
+issued, stops the node under the reviewed manifest's grace rather than a
+restated number, and watches the whole drain. It offers new work once the
+node reports `quiescing` and decides issuance from the permit counter rather
+than from a peak of the active gauge, which a permit taken and closed between
+two samples never raises. It requires the in-flight count to have been *seen*
+at zero, because a node that stopped answering while still holding permits is
+indistinguishable in its last reading from one that finished them, and it
+blocks rather than passes on a counter it could not read.
 
 The work driver reports what it originated rather than only whether it
 succeeded: its stdout is a JSON object whose optional `transaction_hashes`
@@ -182,9 +212,18 @@ prior binary that participated for all of quiescence and stopped a second
 before the probe, which is exactly the sequence the barrier forbids. The
 second half is the offline state audit reporting `rollback_barrier_ready` for
 every snapshot: an all-down fleet says two releases cannot write the same
-state at once, not that the state they left is safe to roll back onto. The
-prior binary is started only when both hold; every R1 node down with an audit
-that authorized nothing records a blocked step and starts nothing.
+state at once, not that the state they left is safe to roll back onto. Those
+snapshots are captured here, out of the containers the drain stopped, with
+the storage path read off each container rather than restated — a supplied
+snapshot is only a claim about what the fleet left behind, and an older
+capture or another node's audits exactly as cleanly. The audit's result is
+taken as a whole: its output path is cleared before it runs, so an earlier
+manifest cannot stand in for one this run never produced, and a nonzero exit
+refuses regardless of what the manifest claims, because the tool also exits
+nonzero on an inconsistent namespace — a refusal its ready flag does not
+carry. The prior binary is started only when both halves hold; every R1 node
+down with an audit that authorized nothing records a blocked step and starts
+nothing.
 
 `compose.rehearsal.yaml` is the fleet shell: one prior node (no gate — the
 deliberate straggler) and two R1 nodes with the non-mainnet
@@ -282,16 +321,36 @@ notes, stamp, and key order — and over a divergent tree the stage must
 refuse to judge from, and the stage runs that self-test first on every
 invocation. It also drives the fleet-identity capture the container stages
 open with, over fleets whose nodes disagree with each other, whose revision
-is not the commit the run is bound to, and whose armed cutover block is not
-the rehearsed C; and it resolves every helper those stages name in command
-position, because neither stage runs anywhere but a real rehearsal and a call
-site left pointing at a renamed function otherwise surfaces there.
+is not the commit the run is bound to — foreign, abbreviated, or absent —
+and whose armed cutover block is not the rehearsed C; and it resolves every
+helper those stages name in command position, because neither stage runs
+anywhere but a real rehearsal and a call site left pointing at a renamed
+function otherwise surfaces there.
+
+The step verdicts those stages reach are proved the same way. The clock,
+quiescence, and straggler decisions are functions over their observation
+slots that touch no fleet, so the self-test drives them against constructed
+readings: an unchallenged permit counter, work that never reached the gate, a
+partial cancellation behind a drained and behind an unreadable active count,
+a permit issued and closed between two samples, permits never seen at zero, a
+mismatch nothing recognized as cross-format, a cross-format sighting that
+entered no roster, and unreadable refusal, issuance, and forced-abort
+counters. A ladder this layered is exactly the kind that goes on passing on a
+proxy for the property until something can exercise it directly. The daemon
+is a seam in the same way: the prior-container staging and the storage
+capture run against a fixture daemon, over a container that came up running,
+a create that produced nothing, a container built from other bytes, a live
+node, a missing and a doubled volume, a failed copy, and an inherited capture
+— and the audit against a tool that refused while a ready manifest sat at its
+output path, and one that wrote nothing at all.
 
 One binding the harness still cannot make is the chain identity: the record's
 `chain_id` is the supplied `CHAIN_ID`, because a node publishes its chain
 address and gate state but not the chain it is connected to, and the fleet
-reaches that chain over a websocket no probe here can interrogate. Every other
-identity in a record is now an observation. The receipt lifecycle is proved through `stage_local_proofs`
+reaches that chain over a websocket no probe here can interrogate. Binding it
+needs an authenticated observation of the chain the fleet actually used, which
+is an outstanding gap and not a closed one. Every other identity in a record
+is an observation. The receipt lifecycle is proved through `stage_local_proofs`
 itself rather than through the invalidation function alone: a reused
 evidence directory is given a valid inherited receipt, the stage's proof
 seam is failed the way any proof failure fails it, and the case requires
