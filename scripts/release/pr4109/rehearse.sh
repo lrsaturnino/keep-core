@@ -60,7 +60,12 @@
 #                        rehearsal chain, called with the phase name. The
 #                        fleet only reacts to chain events, so without it no
 #                        ceremony exists to observe and the steps that need
-#                        one record themselves blocked
+#                        one record themselves blocked. On stdout it may
+#                        report what it originated, as a JSON object whose
+#                        optional transaction_hashes array carries
+#                        0x-prefixed 32-byte hashes; those enter the step
+#                        being recorded. A report that cannot be read stops
+#                        the step rather than passing for no transactions
 #
 # Fail-closed source binding (every proof stage):
 #
@@ -3572,10 +3577,55 @@ to ${output}, so it authorized nothing"
 # chain-side, outside this repository, and therefore a supplied input like the
 # chain endpoint itself. The driver is called with the phase name so one
 # implementation can originate the work each step needs.
+#
+# On stdout it may report what it originated, as a JSON object carrying a
+# transaction_hashes array. Those hashes go into the step being recorded, so a
+# reviewer can follow a step back to the chain transactions that caused it
+# rather than taking the fleet counters as the only account of what happened.
+# The output is either well formed or it is a broken instrument: a driver
+# whose report cannot be read has left the step unable to say what it drove,
+# and treating that as "no transactions" would record silence as evidence.
 run_work_driver() {
-  local phase="$1"
+  local phase="$1" report rc=0
   note "driving ${phase} work on the rehearsal chain"
-  "${PR4109_WORK_DRIVER}" "${phase}"
+  report="$("${PR4109_WORK_DRIVER}" "${phase}")" || rc=$?
+
+  if [[ -n "${report//[[:space:]]/}" ]]; then
+    local hashes
+    hashes="$(printf '%s' "${report}" | node -e '
+      let raw = "";
+      process.stdin.on("data", (d) => (raw += d));
+      process.stdin.on("end", () => {
+        const report = JSON.parse(raw);
+        const hashes = report.transaction_hashes;
+        if (hashes === undefined) {
+          process.stdout.write("");
+          return;
+        }
+        if (!Array.isArray(hashes)) {
+          console.error("transaction_hashes is not an array");
+          process.exit(1);
+        }
+        for (const hash of hashes) {
+          if (typeof hash !== "string" || !/^0x[0-9a-f]{64}$/.test(hash)) {
+            console.error("not a transaction hash: " + JSON.stringify(hash));
+            process.exit(1);
+          }
+        }
+        process.stdout.write(hashes.map((h) => JSON.stringify(h)).join(","));
+      });
+    ')" ||
+      blocked "the work driver reported the ${phase} phase in a form this \
+rehearsal cannot read; its stdout must be a JSON object whose optional \
+transaction_hashes array carries 0x-prefixed 32-byte hashes, and a report \
+that cannot be read leaves the step with no account of what it drove"
+
+    if [[ -n "${hashes}" ]]; then
+      STEP_TX_HASHES="${STEP_TX_HASHES}${STEP_TX_HASHES:+,}${hashes}"
+    fi
+  fi
+
+  return "${rc}"
 }
 
 stage_single_release() {

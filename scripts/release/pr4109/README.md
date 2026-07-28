@@ -158,6 +158,16 @@ rather than a restated number, and watches the whole drain — a node that
 issues a new permit while quiescing, or force-aborts a held one instead of
 letting it finish, fails the step rather than passing on the state string.
 
+The work driver reports what it originated rather than only whether it
+succeeded: its stdout is a JSON object whose optional `transaction_hashes`
+array carries the chain transactions it submitted, and those enter the step
+being recorded so a reviewer can follow a step back to the transactions that
+caused it. A report that cannot be read stops the step — a driver whose
+account is unreadable has left the step unable to say what it drove, and
+recording that as "no transactions" would enter silence as evidence. The
+acceptance conditions still rest on the fleet's own counters; the hashes are
+what let those counters be checked against the chain.
+
 The rollback gate's own barrier has two halves and neither substitutes for
 the other. The R1 fleet must be provably down, and the prior binary must have
 been absent for the whole of it — so the drain runs while the prior service

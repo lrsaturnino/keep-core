@@ -960,6 +960,73 @@ run_capture wrong_epoch_fleet
 check "a fleet on another protocol epoch refuses the run" 3 \
   "reports protocol epoch \[legacy_epoch\]" "release manifest"
 
+# ----------------------------------------------------------------------------
+#
+# The work driver is what makes the fleet do anything at all, and what it
+# reports about the chain work it originated becomes part of the record. A
+# report that cannot be read is a broken instrument, not an absence of
+# transactions.
+
+DRIVER_HASH_A="0x$(printf 'a%.0s' {1..64})"
+DRIVER_HASH_B="0x$(printf 'b%.0s' {1..64})"
+
+make_driver() {
+  local path="$1" status="$2" report="$3"
+  cat >"${path}" <<DRIVER
+#!/usr/bin/env bash
+printf '%s' '${report}'
+exit ${status}
+DRIVER
+  chmod +x "${path}"
+}
+
+run_driver_case() {
+  set +e
+  CASE_OUT="$(
+    (
+      # shellcheck disable=SC2030,SC2031,SC2034
+      PR4109_WORK_DRIVER="$1"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      STEP_TX_HASHES=""
+      driver_rc=0
+      run_work_driver homogeneous-security-v2 || driver_rc=$?
+      printf 'driver_rc:%s hashes:[%s]\n' "${driver_rc}" "${STEP_TX_HASHES}"
+    ) 2>&1
+  )"
+  CASE_RC=$?
+  set -e
+}
+
+make_driver "${WORK}/driver-reporting" 0 \
+  "{\"transaction_hashes\":[\"${DRIVER_HASH_A}\",\"${DRIVER_HASH_B}\"]}"
+run_driver_case "${WORK}/driver-reporting"
+check "the transactions a driver reports enter the step being recorded" 0 \
+  "driver_rc:0" "hashes:\[\"${DRIVER_HASH_A}\",\"${DRIVER_HASH_B}\"\]"
+
+make_driver "${WORK}/driver-silent" 0 ""
+run_driver_case "${WORK}/driver-silent"
+check "a driver that reports nothing records no transactions" 0 \
+  "driver_rc:0" "hashes:\[\]"
+
+# The exit status has to survive the report parsing, or the steps that fail on
+# a driver failure would stop seeing it.
+make_driver "${WORK}/driver-failing" 4 \
+  "{\"transaction_hashes\":[\"${DRIVER_HASH_A}\"]}"
+run_driver_case "${WORK}/driver-failing"
+check "a failing driver still reports its exit status to the step" 0 \
+  "driver_rc:4" "hashes:\[\"${DRIVER_HASH_A}\"\]"
+
+make_driver "${WORK}/driver-unreadable" 0 "{not json"
+run_driver_case "${WORK}/driver-unreadable"
+check "a report this rehearsal cannot read stops the step" 3 \
+  "in a form this rehearsal cannot read"
+
+make_driver "${WORK}/driver-bad-hash" 0 \
+  '{"transaction_hashes":["0xnot-a-transaction-hash"]}'
+run_driver_case "${WORK}/driver-bad-hash"
+check "a reported value that is not a transaction hash stops the step" 3 \
+  "in a form this rehearsal cannot read"
+
 # Neither container stage can be executed anywhere but a real rehearsal — they
 # need the immutable images, a chain, and persistent volumes — so a call site
 # left pointing at a renamed helper survives every check in this file and
