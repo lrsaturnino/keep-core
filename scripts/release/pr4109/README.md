@@ -571,8 +571,12 @@ missing reopens it:
   without changing the rule, so a `ref`-only entry pins a name and not the
   bytes behind it. `sha` is what binds bytes, and is what the record carries. A
   tag is admissible only with evidence that it cannot move: an `active` ruleset
-  on the source repository whose `target` is `tag` and whose rules include
-  `deletion`, `update` and `non_fast_forward`, recorded the way this one is.
+  on the source repository whose `target` is `tag`, whose conditions select
+  that tag rather than some other one, whose `bypass_actors` do not hand it
+  back to the maintainers the pin exists to bind, and whose rules include
+  `deletion`, `update` and `non_fast_forward`, recorded the way this one is —
+  the same exact-condition reading the ruleset behind the gate gets below,
+  because a tag ruleset aimed elsewhere holds nothing here either.
 - **The analysis is carried by that pinned source.** A pinned workflow that
   merely invokes the head commit's `scripts/release/pr4109/rehearse.sh`
   re-inherits everything above: the analyzer it runs is still the one the
@@ -582,11 +586,39 @@ missing reopens it:
 Enforcement state belongs in the record rather than being assumed from the
 ruleset's existence: `enforcement` is one of `disabled`, `active` and
 `evaluate`, and `evaluate` is a dry run that reports without blocking a merge.
-Only `active` gates anything. Two carve-outs sit beside it and are recorded
-with it, because either one leaves an `active` ruleset gating nothing for the
-merge that matters: `bypass_actors` names actors the ruleset does not apply
-to, and the `workflows` rule's own `do_not_enforce_on_create` waives it for
-ref creation.
+Only `active` gates anything. The carve-out that leaves an `active` ruleset
+gating nothing for the merge that matters is recorded with it:
+`bypass_actors` names actors the ruleset does not apply to, each under a
+`bypass_mode` of `always`, `exempt` or `pull_request`, and `pull_request` is
+not the narrow one it reads as — it is the path a merge into `main` takes, so
+an actor listed that way bypasses on exactly the event this gate exists for.
+The `workflows` rule's own `do_not_enforce_on_create` is recorded beside it
+but is not a second such carve-out, and reading it as one waives a gate that
+is in fact still standing: it is documented as allowing repositories and
+branches to be *created* when a check would otherwise prohibit it, so it
+waives the rule for the creation of a ref and not for an update to one that
+exists. A merge into an existing `main` is an update, and this field leaves it
+gated. What it does reach is a `main` deleted and created again, which is why
+the record carries it rather than dropping it.
+
+`enforcement`, `target` and the entry's own three properties still say nothing
+about *what* the ruleset is aimed at. `target` is one of `branch`, `tag`,
+`push` and `repository`: it names a kind of ref, not an instance, and the
+instances come from `conditions`. An organisation-level branch ruleset carries
+a repository selector — `repository_name`, `repository_id` or
+`repository_property` — together with `ref_name`, and each selector is an
+`include`/`exclude` pair rather than a single value: `ref_name.include`
+accepts `~ALL` and `~DEFAULT_BRANCH` alongside an explicit `refs/heads/main`,
+`repository_name.include` accepts `~ALL` alongside patterns, and either
+`exclude` takes back what its `include` matched. So an `active`, unbypassed,
+externally SHA-pinned entry carrying its own analyzer can hold every property
+above and gate nothing here, by being aimed at another repository or at every
+branch except this one — and it reads, in a record naming only the target, as
+though it closed the boundary. The record therefore resolves the conditions
+instead of reproducing them: which of the three repository selectors is in
+use and that it resolves to `threshold-network/keep-core`, and that `ref_name`
+matches `refs/heads/main` — by pattern, by `~ALL`, or by `~DEFAULT_BRANCH`
+while `main` is the default branch — with neither `exclude` removing it again.
 
 Standing, checked empirically on 2026-07-28:
 `GET /repos/threshold-network/keep-core/rulesets?includes_parents=true`
@@ -610,13 +642,15 @@ something under that name succeeded, not that this analyzer ran. Evidence that
 rests on the scaffold's own checkers having judged a change should be read
 with that in mind. Unblocking is a configuration change plus the record, not a
 code change here, and the record has to name the ruleset's id and name, its
-target, its `enforcement` — which must read `active` — its `bypass_actors` and
-the rule's `do_not_enforce_on_create`, and, for the `workflows` entry, the
+target, the conditions resolving it to this repository and to
+`refs/heads/main`, its `enforcement` — which must read `active` — its
+`bypass_actors` with each actor's `bypass_mode`, and the rule's
+`do_not_enforce_on_create`, and, for the `workflows` entry, the
 `repository_id` together with the repository it resolves to, the `path`, the
 `sha` pinning it — or, for a tag, the tag together with the ruleset holding
 that tag immutable — and the analyzer that pin binds. A record naming this
-repository as the source, or carrying a `ref` where the `sha` belongs, records
-something that does not close the boundary.
+repository as the source, carrying a `ref` where the `sha` belongs, or leaving
+the conditions unresolved, records something that does not close the boundary.
 
 ### Reviewed tss-lib fork with an immutable per-party legacy mode
 

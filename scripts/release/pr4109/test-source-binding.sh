@@ -2056,6 +2056,74 @@ part of the record" "${SCAFFOLD_DIR}/README.md" \
 assert_records "scaffold lint: the external control's bypass carve-outs are \
 part of the record" "${SCAFFOLD_DIR}/README.md" \
   "\`bypass_actors\` names actors the ruleset does not apply to"
+assert_records "scaffold lint: the record reads a pull-request bypass as \
+merge-relevant" "${SCAFFOLD_DIR}/README.md" \
+  "bypasses on exactly the event this gate exists for"
+
+# `do_not_enforce_on_create` is documented as allowing repositories and
+# branches to be *created* when a check would otherwise prohibit it, so it
+# waives the rule for a ref that does not exist yet. Filing it beside
+# `bypass_actors` as a second way an `active` ruleset gates nothing "for the
+# merge that matters" overstates it in the direction that costs: it invites a
+# reader to write off a rule that is in fact still gating the merge into an
+# existing `main`, and the ruleset it sends them back to reconfigure is
+# already correct. The wording it replaced is held gone rather than left to
+# sit beside its correction.
+assert_records "scaffold lint: the record scopes the create waiver to ref \
+creation" "${SCAFFOLD_DIR}/README.md" \
+  "waives the rule for the creation of a ref and not for an update to one \
+that exists"
+assert_records "scaffold lint: the record says a merge into main stays gated \
+by it" "${SCAFFOLD_DIR}/README.md" \
+  "A merge into an existing \`main\` is an update, and this field leaves it \
+gated"
+assert_omits "scaffold lint: the record no longer reads the create waiver as \
+a merge carve-out" "${SCAFFOLD_DIR}/README.md" \
+  "either one leaves an \`active\` ruleset gating nothing"
+
+# Every property recorded above can hold of a ruleset aimed somewhere else.
+# `target` names a kind of ref and the instances come from `conditions`, so a
+# record carrying the target alone lets an administrator satisfy it with an
+# active, unbypassed, SHA-pinned rule covering another repository or every
+# branch but this one — the same shape of hole as sourcing the workflow from
+# here, and harder to see, because the record it satisfies looks complete.
+assert_records "scaffold lint: the record says the target names a kind and \
+not an instance" "${SCAFFOLD_DIR}/README.md" \
+  "names a kind of ref, not an instance, and the instances come from \
+\`conditions\`"
+assert_records "scaffold lint: the record names the repository and ref \
+selectors" "${SCAFFOLD_DIR}/README.md" \
+  "a repository selector — \`repository_name\`, \`repository_id\` or \
+\`repository_property\` — together with \`ref_name\`"
+assert_records "scaffold lint: the record reads the selectors as \
+include/exclude pairs" "${SCAFFOLD_DIR}/README.md" \
+  "either \`exclude\` takes back what its \`include\` matched"
+assert_records "scaffold lint: the record says a rule aimed elsewhere holds \
+the properties and gates nothing" "${SCAFFOLD_DIR}/README.md" \
+  "aimed at another repository or at every branch except this one"
+assert_records "scaffold lint: the record requires the conditions resolved to \
+this repository and branch" "${SCAFFOLD_DIR}/README.md" \
+  "it resolves to \`threshold-network/keep-core\`, and that \`ref_name\` \
+matches \`refs/heads/main\`"
+assert_records "scaffold lint: the record reads a default-branch alias as \
+conditional on main being it" "${SCAFFOLD_DIR}/README.md" \
+  "by \`~DEFAULT_BRANCH\` while \`main\` is the default branch"
+assert_records "scaffold lint: unresolved conditions are named as not closing \
+the boundary" "${SCAFFOLD_DIR}/README.md" \
+  "leaving the conditions unresolved, records something that does not close \
+the boundary"
+
+# The same reading has to reach the tag evidence, which is the one place the
+# record admits a moving pin: a `tag` ruleset whose conditions select some
+# other tag, or whose bypasses return the recorded one to the hands that
+# publish it, is evidence of immutability for a tag nobody pinned.
+assert_records "scaffold lint: tag-immutability evidence carries the same \
+condition requirement" "${SCAFFOLD_DIR}/README.md" \
+  "whose conditions select that tag rather than some other one"
+assert_records "scaffold lint: tag-immutability evidence carries the same \
+bypass requirement" "${SCAFFOLD_DIR}/README.md" \
+  "whose \`bypass_actors\` do not hand it back to the maintainers the pin \
+exists to bind"
 
 # A `workflows` entry names one repository and one path, so the rule cannot
 # require the gate checked in here *and* be out of this repository's reach: an
