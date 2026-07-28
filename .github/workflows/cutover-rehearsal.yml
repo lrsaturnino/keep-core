@@ -3,9 +3,10 @@ name: Cutover Rehearsal
 # Manually dispatched driver for the single-release cutover rehearsal
 # scaffold. Every dispatch runs the repository-local Go proofs of the cutover
 # gate inside the same build image the client CI uses, the immutable-version
-# static analyzers, and the ECDSA contracts build/test, validates any
-# produced evidence records against the evidence schema, and archives each
-# stage's log for the dispatched SHA. The container rehearsal stages run
+# static analyzers, and the ECDSA contracts build/test, self-tests the
+# source-binding and evidence-record validators, validates any produced
+# evidence records against the evidence schema, and archives each stage's
+# log for the dispatched SHA. The container rehearsal stages run
 # only when explicitly requested with the immutable image digests and
 # rehearsal chain inputs; they report BLOCKED — a failed job — until the
 # rehearsal fleet inputs exist, because a rehearsal that cannot execute must
@@ -129,13 +130,19 @@ jobs:
               /go/src/github.com/keep-network/keep-core && \
               exec ./scripts/release/pr4109/rehearse.sh local-proofs'
 
+      # The evidence validator's own self-test already ran unconditionally
+      # inside the local-proofs stage above (its verdicts are part of the
+      # archived local-proofs.log), so a record-free dispatch still proves
+      # the validator; this step validates whatever records a dispatch
+      # actually produced.
       - name: Validate evidence records against the schema
         run: |
           if compgen -G "${{ github.workspace }}/rehearsal-evidence/*.json" > /dev/null; then
             EVIDENCE_DIR=${{ github.workspace }}/rehearsal-evidence \
               ./scripts/release/pr4109/rehearse.sh validate-evidence
           else
-            echo "no JSON evidence records produced by this dispatch; nothing to validate"
+            echo "no JSON evidence records produced by this dispatch;" \
+              "the evidence-validator self-test ran inside the local-proofs stage"
           fi
 
       - name: Upload rehearsal evidence

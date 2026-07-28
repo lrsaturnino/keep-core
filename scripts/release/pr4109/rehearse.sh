@@ -69,7 +69,9 @@ stages:
                       transcripts, the ten-misbehaved-seat real result, the
                       production-scale 90/10 split, heartbeat bands, and
                       roster wiring — under the race detector, plus the
-                      integration-tag compile proof; ends with an explicit
+                      integration-tag compile proof; self-tests the
+                      source-binding and evidence-record validators first
+                      (the latter needs node/npx), and ends with an explicit
                       report of every skipped case (runs today, no Docker)
   static-analysis     run the static analyzers CI enforces on the Go tree,
                       every tool at an immutable version: gofmt, go vet
@@ -441,6 +443,11 @@ stage_local_proofs() {
     # dispatched checkout and like the build image's tree and checks the
     # verifier accepts exactly the image's documented construction.
     "${SCRIPT_DIR}/test-source-binding.sh"
+    # The evidence-record validator gates the acceptance of every rehearsal
+    # record the same way, so it proves itself on every proof run — not only
+    # on the dispatches that happen to produce records for validate-evidence
+    # — and its verdicts land in this stage's archived log.
+    "${SCRIPT_DIR}/test-validate-evidence.sh"
     verify_source_binding
     go test -count=1 -v \
       -run 'TestJoinDKGIfEligible|TestMonitorRelayEntry|TestForwardSignatureShares' \
