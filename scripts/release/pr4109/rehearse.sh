@@ -85,6 +85,18 @@ SCAFFOLD_ENTRYPOINT="$(basename "${BASH_SOURCE[0]}")"
 # is the one thing about the invocation it cannot read off its own identity.
 SCAFFOLD_LINT_STAGE="shell-analysis"
 
+# The environment names the invocation may carry, which is the one this
+# entrypoint documents itself as reading (EVIDENCE_DIR, above). Everything
+# else is refused rather than dropped, because what bash does with a script it
+# is handed is decided in that environment and not in the command line the
+# reading below can see: BASH_ENV names a file bash sources before the
+# script's first line, and a file that exits there ends the run at status zero
+# without a line of the analysis having run; SHELLOPTS carrying `noexec` has
+# bash parse the whole script and execute none of it. An assignment silently
+# dropped is a command word read out of a command that is not the one that
+# would run.
+SCAFFOLD_LINT_ENV_NAMES="EVIDENCE_DIR"
+
 # The commit verify_source_binding proved the tree under test to be, empty
 # until it has proved one. Only a caller-supplied binding can establish an
 # identity a stage may stamp into evidence; an unbound run leaves this empty
@@ -1352,19 +1364,24 @@ shell_unmodelled_construct() {
   return 1
 }
 
-# A command's words, with the leading `NAME=value` assignments dropped and
-# anything from a word-initial `#` onwards dropped with them. Placing the
-# command word is the same problem for the invocation and for everything beside
-# it, and both readings below start from it.
+# A command's words, with the leading `NAME=value` assignments taken off into
+# SHELL_ASSIGNMENTS and anything from a word-initial `#` onwards dropped.
+# Placing the command word is the same problem for the invocation and for
+# everything beside it, and both readings below start from it. The assignments
+# are kept rather than discarded because they are part of what would run: they
+# name the environment the command word resolves and executes under.
 SHELL_WORDS=()
+SHELL_ASSIGNMENTS=()
 shell_command_words() {
   local cmd="$1" word
   local -a raw=()
   SHELL_WORDS=()
+  SHELL_ASSIGNMENTS=()
   read -ra raw <<<"${cmd}"
   local i=0
   while ((i < ${#raw[@]})); do
     [[ "${raw[i]}" =~ ^[A-Za-z_][A-Za-z_0-9]*= ]] || break
+    SHELL_ASSIGNMENTS+=("${raw[i]}")
     i=$((i + 1))
   done
   for ((; i < ${#raw[@]}; i++)); do
@@ -1401,11 +1418,15 @@ shell_unmodelled_word() {
   return 1
 }
 
-# The one command shape read as running the analysis: any number of
-# `NAME=value` assignments, the entrypoint, the stage, and nothing after it.
-# The invocation as an argument to something else — an `echo`, a runner, a
-# command substitution's subject — is a mention of the analysis rather than a
-# run of it, and the exit status the step reports is that other command's.
+# The one command shape read as running the analysis: the entrypoint, the
+# stage, nothing after it, and no `NAME=value` assignment ahead of it beyond
+# the one name this entrypoint reads. The invocation as an argument to
+# something else — an `echo`, a runner, a command substitution's subject — is a
+# mention of the analysis rather than a run of it, and the exit status the step
+# reports is that other command's. An assignment is the same substitution made
+# without touching a character of the command: the words read here stay exactly
+# as they are while the environment they run under decides whether bash
+# executes a line of the file they name.
 shell_invocation_shape() {
   local entrypoint="${SCAFFOLD_DIR}/${SCAFFOLD_ENTRYPOINT}" word
   shell_command_words "$1"
@@ -1440,6 +1461,16 @@ shell_invocation_shape() {
     printf 'it carries the further argument [%s]' "${SHELL_WORDS[2]}"
     return 0
   fi
+
+  local name
+  for word in ${SHELL_ASSIGNMENTS[@]+"${SHELL_ASSIGNMENTS[@]}"}; do
+    name="${word%%=*}"
+    case " ${SCAFFOLD_LINT_ENV_NAMES} " in
+    *" ${name} "*) continue ;;
+    esac
+    printf 'it sets [%s] in the environment the entrypoint runs under' "${name}"
+    return 0
+  done
   return 1
 }
 
@@ -1455,11 +1486,17 @@ shell_invocation_shape() {
 # shell's error handling is set to, nothing around it that could condition it
 # or swallow its status, and no condition on the step or the job holding it.
 #
-# What this cannot prove is that a run of that workflow happened. The file it
-# reads is the head commit's, and a head commit can drop the workflow along
-# with this reading of it; only a required status check configured outside the
-# repository makes the absence of a run block a merge. That control is recorded
-# beside this scaffold rather than claimed here.
+# What this cannot prove is that a run of that workflow happened, or that a run
+# reporting success ran this file. Everything read here is the head commit's —
+# the workflow, the steps around the invocation, the entrypoint itself — so a
+# commit can drop the invocation along with this reading of it, and a commit
+# whose job keeps the name a branch-protection rule requires can report success
+# having run something else under it. A rule naming a job the head commit
+# defines therefore holds the name, not the analysis. Only a required workflow
+# defined outside this repository, whose text no pull request into it can edit,
+# makes the absence of a run of *this* analysis block a merge. That control and
+# its current standing are recorded beside this scaffold rather than claimed
+# here.
 verify_scaffold_lint_runs_analysis() {
   local content
   content="$(git -C "${REPO_ROOT}" show "HEAD:${SCAFFOLD_LINT_WORKFLOW}" \
@@ -1622,30 +1659,44 @@ ${SCAFFOLD_LINT_STAGE} run inside it is conditioned away"
   verify_scaffold_lint_unconditional "${job}" "${job_end}" "${job_keys}" \
     "job [${YAML_BODIES[job]%:}]"
 
-  # The same substitution one level further out, where neither block above
-  # would show it.
+  verify_scaffold_lint_preceding_steps "${job}" "${step}" "${step_keys}"
+
+  # The same two substitutions one level further out, where neither block above
+  # would show them.
   for ((i = 0; i < ${#YAML_BODIES[@]}; i++)); do
     ((YAML_INDENTS[i] == 0)) || continue
-    [[ "${YAML_BODIES[i]}" == 'defaults:' ]] || continue
-    fail "${SCAFFOLD_LINT_WORKFLOW} line $((i + 1)) sets workflow-wide \
+    case "${YAML_BODIES[i]}" in
+    'defaults:')
+      fail "${SCAFFOLD_LINT_WORKFLOW} line $((i + 1)) sets workflow-wide \
 defaults; what runs the ${SCAFFOLD_LINT_STAGE} body is then decided somewhere \
 this parser does not read, which is the same as not knowing"
+      ;;
+    'env:'*)
+      fail "${SCAFFOLD_LINT_WORKFLOW} line $((i + 1)) writes a workflow-wide \
+environment; every step inherits it, so the shell running \
+${SCAFFOLD_LINT_STAGE} would be handed names that decide what the entrypoint's \
+own name resolves to before it parses the command read here"
+      ;;
+    esac
   done
 
   note "scaffold lint: ${SCAFFOLD_LINT_WORKFLOW} runs ${SCAFFOLD_ENTRYPOINT} \
 ${SCAFFOLD_LINT_STAGE} unconditionally, on line $((run_line + 1)), as its \
-step's last command; that this commit says so is the whole of what is proved \
-here — that a run of it happened is a required status check outside this \
-repository, recorded in ${SCAFFOLD_DIR}/README.md"
+step's last command, under the runner's own shell, with no environment or \
+working directory written around it and no earlier step in its job running a \
+shell of its own; that this commit says so is the whole of what is proved here \
+— that a run happened at all, and that the run reporting success ran this \
+file, rests on a required workflow defined outside this repository, whose \
+standing is recorded in ${SCAFFOLD_DIR}/README.md"
 }
 
 # The keys that turn a step or the job around it into something a change can
 # get past without this analysis having judged it: one deciding whether it runs
-# at all, one deciding that its failure does not fail the run, and two deciding
-# what runs the body at all. A condition is refused rather than evaluated —
-# this parser cannot tell which runs it would hold for, and a gate whose
-# reachability rests on a condition nothing here reads is not a gate this
-# scaffold has proved reachable.
+# at all, one deciding that its failure does not fail the run, and the rest
+# deciding what the accepted command word would actually reach. A condition is
+# refused rather than evaluated — this parser cannot tell which runs it would
+# hold for, and a gate whose reachability rests on a condition nothing here
+# reads is not a gate this scaffold has proved reachable.
 #
 # `shell:` is the one that leaves no mark at all on the shell it retires: the
 # body reads exactly as it did while an interpreter that never runs a line of
@@ -1654,6 +1705,27 @@ repository, recorded in ${SCAFFOLD_DIR}/README.md"
 # the same thing a level or two away, and is refused outright rather than
 # followed, because a body run by something this parser never saw named is the
 # same unread state either way.
+#
+# The three added beside them retire the invocation without touching the line
+# that carries it, which is why reading the body alone was never enough:
+#
+#   `env:`               — the runner writes these names into the step's own
+#                          shell before it parses a line, and a `BASH_ENV`
+#                          there names a file that shell sources first. A
+#                          function defined in it can carry the entrypoint's
+#                          own name; the exact command word accepted above then
+#                          runs that function and returns whatever it says.
+#   `working-directory:` — the invocation is a relative path. Resolved from
+#                          another directory it names another file, and the
+#                          text proving the analysis runs proves it of
+#                          something else entirely.
+#   `container:`         — the job's steps run inside an image this parser
+#                          never reads, which decides both what bash is and
+#                          what stands at the entrypoint's path.
+#
+# All three are refused outright rather than followed: a value read here would
+# have to be resolved against a filesystem and an environment that exist only
+# on the runner, and a resolution guessed at is worse than a refusal.
 verify_scaffold_lint_unconditional() {
   local from="$1" to="$2" key_indent="$3" where="$4" i body value
   for ((i = from + 1; i < to; i++)); do
@@ -1685,7 +1757,75 @@ what its failing said"
 ${where} running ${SCAFFOLD_LINT_STAGE}; what runs that body is then decided \
 somewhere this parser does not read, which is the same as not knowing"
       ;;
+    'env:'*)
+      fail "${SCAFFOLD_LINT_WORKFLOW} line $((i + 1)) writes an environment \
+into the ${where} running ${SCAFFOLD_LINT_STAGE}; the runner sets those names \
+before the shell parses a line, and one of them naming a file that shell \
+sources first can define the entrypoint's own name as a function — the \
+command read here would then be exactly as written and run none of the analysis"
+      ;;
+    'working-directory:'*)
+      value="$(yaml_scalar_value "${body#working-directory:}")" || value=""
+      fail "${SCAFFOLD_LINT_WORKFLOW} line $((i + 1)) runs the ${where} \
+carrying ${SCAFFOLD_LINT_STAGE} from [${value}]; the invocation is a relative \
+path, so what it names is decided by a directory this parser cannot resolve, \
+and the analysis proved to run there is an analysis in some other file"
+      ;;
+    'container:'*)
+      fail "${SCAFFOLD_LINT_WORKFLOW} line $((i + 1)) runs the ${where} \
+carrying ${SCAFFOLD_LINT_STAGE} inside a container image; what bash is there \
+and what stands at the entrypoint's path are decided by an image this parser \
+never reads, which is the same as not knowing what ran"
+      ;;
     esac
+  done
+}
+
+# The steps the job runs before the analysis one.
+#
+# Everything above reads a single step, and a step's body is only as good as
+# the tree and the environment it meets. A step ahead of it can write over the
+# entrypoint in the checkout, or append a name to $GITHUB_ENV that every step
+# after it inherits. Either one leaves each line read above exactly as it was
+# while the run they describe becomes a different run entirely.
+#
+# So a preceding step carrying a `run:` body is refused rather than read: what
+# that shell would do is the whole question, and answering it would mean
+# modelling a filesystem and an environment that exist only on the runner.
+#
+# A preceding `uses:` step is not proved harmless by this — an action runs code
+# out of another repository and reaches $GITHUB_ENV and the checkout just as
+# directly. It is accepted because refusing it would refuse the checkout the
+# analysis needs in order to read anything at all. What that leaves open is not
+# closed here and is not claimed to be; it is recorded with the rest of this
+# reading's boundary in ${SCAFFOLD_DIR}/README.md.
+verify_scaffold_lint_preceding_steps() {
+  local job="$1" step="$2" step_keys="$3"
+  local i j item_end opened body first
+  for ((i = job + 1; i < step; i++)); do
+    ((YAML_INDENTS[i] < 0)) && continue
+    opened="$(yaml_item_key_indent "${i}")" || continue
+    [[ "${opened}" == "${step_keys}" ]] || continue
+
+    # A sequence item's first key sits on the dash line itself; the rest sit at
+    # the item's own key column, and the item ends where the next one opens.
+    item_end="$(yaml_block_end "$((i + 1))" "${step_keys}")"
+    first="${YAML_BODIES[i]#-}"
+    first="${first#"${first%%[![:space:]]*}"}"
+    for ((j = i; j < item_end; j++)); do
+      if ((j == i)); then
+        body="${first}"
+      else
+        ((YAML_INDENTS[j] == step_keys)) || continue
+        body="${YAML_BODIES[j]}"
+      fi
+      [[ "${body}" == 'run:'* ]] || continue
+      fail "${SCAFFOLD_LINT_WORKFLOW} line $((j + 1)) runs shell in the job \
+carrying ${SCAFFOLD_LINT_STAGE}, ahead of the step that carries it; what that \
+shell leaves behind — the entrypoint's own file in the checkout, a name \
+written into \$GITHUB_ENV for the steps after it — decides what the invocation \
+read here would reach, and this parser reads none of it"
+    done
   done
 }
 

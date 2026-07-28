@@ -1822,6 +1822,176 @@ check "scaffold lint: workflow-wide defaults deciding what runs the body fail \
 closed" 1 \
   "sets workflow-wide defaults"
 
+# Every case above reads the command and what is written around it in the
+# workflow. None of them touches the two things that decide what that exact
+# command reaches: the environment it runs under and the tree it runs against.
+# Each case below leaves the accepted invocation spelled character for
+# character as the checked-in one and retires the analysis anyway, so a reading
+# that stopped at the command's shape passes all of them.
+
+# BASH_ENV names a file the step's own bash sources before anything else, and a
+# function defined there can carry the entrypoint's own name. The command word
+# then resolves to that function, which returns whatever it likes.
+T="${WORK}/lint-step-env"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "${LINT_JOB_HEAD}
+      - name: Analyze the rehearsal scaffold
+        env:
+          BASH_ENV: .github/intercept.sh
+        run: ${LINT_INVOCATION}"
+run_lint_gate "${T}"
+check "scaffold lint: an environment written around the analysis step fails \
+closed" 1 \
+  "writes an environment into the step running ${SCAFFOLD_LINT_STAGE}"
+
+# The same name set where the step never mentions it, which a check reading
+# only the step would miss entirely.
+T="${WORK}/lint-job-env"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "  scaffold-lint:
+    runs-on: ubuntu-latest
+    env:
+      BASH_ENV: .github/intercept.sh
+    steps:
+      - uses: actions/checkout@v4
+      - name: Analyze the rehearsal scaffold
+        run: ${LINT_INVOCATION}"
+run_lint_gate "${T}"
+check "scaffold lint: an environment written around the analysis job fails \
+closed" 1 \
+  "writes an environment into the job \[scaffold-lint\] running \
+${SCAFFOLD_LINT_STAGE}"
+
+T="${WORK}/lint-workflow-env"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)
+env:
+  BASH_ENV: .github/intercept.sh"
+run_lint_gate "${T}"
+check "scaffold lint: a workflow-wide environment every step inherits fails \
+closed" 1 \
+  "writes a workflow-wide environment"
+
+# The same interception with no key to hold it: an assignment on the invocation
+# itself, which the word reading drops before it ever places a command word.
+T="${WORK}/lint-inline-env"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "${LINT_JOB_HEAD}
+      - name: Analyze the rehearsal scaffold
+        run: BASH_ENV=.github/intercept.sh ${LINT_INVOCATION}"
+run_lint_gate "${T}"
+check "scaffold lint: an assignment ahead of the invocation fails closed" 1 \
+  "it sets \[BASH_ENV\] in the environment the entrypoint runs under"
+
+# The one name this entrypoint documents itself as reading is what the
+# checked-in step passes, so refusing it would be refusing the shape rather
+# than the hole.
+T="${WORK}/lint-inline-evidence-dir"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "${LINT_JOB_HEAD}
+      - name: Analyze the rehearsal scaffold
+        run: EVIDENCE_DIR=/tmp/evidence ${LINT_INVOCATION}"
+run_lint_gate "${T}"
+check "scaffold lint: the entrypoint's own environment name is accepted" 0 \
+  "runs ${SCAFFOLD_ENTRYPOINT} ${SCAFFOLD_LINT_STAGE} unconditionally"
+
+# The invocation is a relative path, so the directory it is resolved from is
+# half of what it names.
+T="${WORK}/lint-working-directory"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "${LINT_JOB_HEAD}
+      - name: Analyze the rehearsal scaffold
+        working-directory: .github/decoy
+        run: ${LINT_INVOCATION}"
+run_lint_gate "${T}"
+check "scaffold lint: an analysis step run from another directory fails \
+closed" 1 \
+  "runs the step carrying ${SCAFFOLD_LINT_STAGE} from \[\.github/decoy\]"
+
+# An image decides both what bash is and what stands at the entrypoint's path.
+T="${WORK}/lint-job-container"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "  scaffold-lint:
+    runs-on: ubuntu-latest
+    container: ghcr.io/example/decoy:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Analyze the rehearsal scaffold
+        run: ${LINT_INVOCATION}"
+run_lint_gate "${T}"
+check "scaffold lint: an analysis job run inside a container image fails \
+closed" 1 \
+  "carrying ${SCAFFOLD_LINT_STAGE} inside a container image"
+
+# The tree the invocation names is written by everything that ran before it. A
+# step ahead of it needs no key on the analysis step at all: it can put another
+# file at the entrypoint's path, or write the interception above into the
+# environment every later step inherits.
+T="${WORK}/lint-preceding-run"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "${LINT_JOB_HEAD}
+      - name: Prepare
+        run: printf 'exit 0\\n' >./${SCAFFOLD_DIR}/${SCAFFOLD_ENTRYPOINT}
+      - name: Analyze the rehearsal scaffold
+        run: ${LINT_INVOCATION}"
+run_lint_gate "${T}"
+check "scaffold lint: a step replacing the entrypoint ahead of the analysis \
+fails closed" 1 \
+  "runs shell in the job carrying ${SCAFFOLD_LINT_STAGE}, ahead of the step \
+that carries it"
+
+# The same shell written into the environment rather than over the tree, and
+# spelled on the sequence item's own line rather than under a name.
+T="${WORK}/lint-preceding-run-bare"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "${LINT_JOB_HEAD}
+      - run: echo BASH_ENV=.github/intercept.sh >>\"\${GITHUB_ENV}\"
+      - name: Analyze the rehearsal scaffold
+        run: ${LINT_INVOCATION}"
+run_lint_gate "${T}"
+check "scaffold lint: a step writing the later steps' environment fails \
+closed" 1 \
+  "runs shell in the job carrying ${SCAFFOLD_LINT_STAGE}, ahead of the step \
+that carries it"
+
+# A step after the analysis cannot change what the analysis already read, and
+# the checked-in job's evidence upload is exactly that shape.
+T="${WORK}/lint-following-run"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "${LINT_JOB_HEAD}
+      - name: Analyze the rehearsal scaffold
+        run: ${LINT_INVOCATION}
+      - name: Report
+        run: echo done"
+run_lint_gate "${T}"
+check "scaffold lint: shell running after the analysis is not shell running \
+before it" 0 \
+  "runs ${SCAFFOLD_ENTRYPOINT} ${SCAFFOLD_LINT_STAGE} unconditionally"
+
+# A `run:` step in another job runs beside this one, not ahead of it, and
+# refusing it would refuse every workflow that does anything else at all.
+T="${WORK}/lint-other-job-run"
+make_lint_repo "${T}"
+recommit_lint_workflow "${T}" "$(lint_default_on)" \
+  "  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo unrelated
+${DEFAULT_LINT_JOB}"
+run_lint_gate "${T}"
+check "scaffold lint: shell in a job beside the analysis is not shell ahead of \
+it" 0 \
+  "runs ${SCAFFOLD_ENTRYPOINT} ${SCAFFOLD_LINT_STAGE} unconditionally"
+
 # --- contracts toolchain: the parity the stage's evidence claims ------------
 #
 # The contracts stage's log says it reproduces one named CI job, and that claim
