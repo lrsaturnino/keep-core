@@ -579,7 +579,10 @@ check "the inherited receipt is accepted before any proof run starts" 0 \
 # diagnostics source, each source's own JSON nested under it, with the client
 # identity carrying the field names the Client struct's tags produce.
 diagnostics_document() {
-  local revision="${1:-${FIXTURE_SHA}}"
+  # Unset-only defaults: a case passing an explicit empty value is describing
+  # a node that publishes nothing there, and a :- default would quietly hand
+  # it the correct value instead.
+  local revision="${1-${FIXTURE_SHA}}"
   local epoch="${2:-security_v2_cutover}"
   local cutover="${3:-9000000}"
   local version="${4:-v2.0.0-rehearsal}"
@@ -943,7 +946,28 @@ check "one node running another release refuses the run" 3 \
 
 run_capture foreign_revision_fleet
 check "a fleet built from bytes this run is not bound to refuses the run" 3 \
-  "which is not the commit this run is bound to"
+  "does not name that commit exactly"
+
+# An artifact naming the bound commit only as far as an abbreviation goes. It
+# used to pass, because the comparison asked whether the attested SHA started
+# with what the node reported — which the empty string also satisfies.
+abbreviated_revision_fleet() {
+  # shellcheck disable=SC2329
+  probe_diagnostics() { diagnostics_document "${FIXTURE_SHA:0:7}"; }
+}
+
+run_capture abbreviated_revision_fleet
+check "a fleet naming the bound commit only in abbreviation refuses the run" \
+  3 "does not name that commit exactly"
+
+silent_revision_fleet() {
+  # shellcheck disable=SC2329
+  probe_diagnostics() { diagnostics_document ""; }
+}
+
+run_capture silent_revision_fleet
+check "a fleet reporting no revision at all refuses the run" 3 \
+  "does not report the version, revision"
 
 run_capture wrong_cutover_fleet
 check "a fleet armed with another cutover block refuses the run" 3 \
@@ -1575,14 +1599,68 @@ else
 fi
 
 # A rehearsal run from bytes no commit accounts for must not produce a record
-# at all: the emitter is where that is caught, before anything is written.
+# at all. The capture is the first refusal — no node can report a revision
+# equal to a -dirty stamp — and the emitter carries its own guard for a
+# divergence that appears after the capture, so both are driven here and the
+# directory is required to stay empty either way.
 E="${WORK}/emitted-dirty"
 mkdir -p "${E}"
 write_attestation "${E}"
 echo 'divergence' >"${WORK}/repo/untracked-during-rehearsal"
 run_rehearsal "${E}" single_release complete_run
 check "a rehearsal on a divergent tree produces no record" 3 \
-  "not a clean commit"
+  "does not name that commit exactly"
+
+# The emitter alone, with the identity the capture would have produced already
+# in hand, so this case is about the guard the emitter carries and nothing
+# before it.
+run_emitter() {
+  local dir="$1"
+  set +e
+  CASE_OUT="$(
+    (
+      # shellcheck disable=SC2030,SC2031,SC2034
+      EVIDENCE_DIR="${dir}"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      REPO_ROOT="${WORK}/repo"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      R1_IMAGE_DIGEST="keep/keep-client@sha256:$(printf 'a%.0s' {1..64})"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      PRIOR_IMAGE_DIGEST="keep/keep-client@sha256:$(printf 'b%.0s' {1..64})"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      CHAIN_ID="11155111"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      REHEARSAL_GATE="single_release"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      REHEARSAL_R1_IDENTITY="$(diagnostics_document |
+        node -e '
+          let raw = "";
+          process.stdin.on("data", (d) => (raw += d));
+          process.stdin.on("end", () => {
+            const doc = JSON.parse(raw);
+            process.stdout.write(JSON.stringify(Object.assign(
+              {}, doc.client_info, doc.protocol_participation)));
+          });
+        ')"
+      complete_run
+      emit_evidence_record
+    ) 2>&1
+  )"
+  CASE_RC=$?
+  set -e
+}
+
+run_emitter "${E}"
+check "the emitter refuses a record built from bytes no commit accounts for" \
+  3 "not a clean commit"
+
+if compgen -G "${E}/*.json" >/dev/null; then
+  printf 'FAIL a divergent rehearsal left a record behind\n'
+  FAILED=$((FAILED + 1))
+else
+  printf 'ok   a divergent rehearsal leaves no record behind\n'
+  PASS=$((PASS + 1))
+fi
 rm -f "${WORK}/repo/untracked-during-rehearsal"
 
 # ----------------------------------------------------------------------------

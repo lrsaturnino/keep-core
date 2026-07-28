@@ -2446,9 +2446,13 @@ write_release_workflow() {
       # The workflow's own literal text, which is the thing being read back.
       # shellcheck disable=SC2016
       printf '          echo "version=$(git describe)" >> $GITHUB_ENV\n'
-      # shellcheck disable=SC2016
-      [[ -n "${expression}" ]] &&
+      # An `if` and not a `&&`: this is the last statement of the loop body,
+      # and a false test there would carry its status out of the function and
+      # abort the errexit subshell building the fixture.
+      if [[ -n "${expression}" ]]; then
+        # shellcheck disable=SC2016
         printf '          echo "revision=%s" >> $GITHUB_ENV\n' "${expression}"
+      fi
     done
   } >"${repo}/${RELEASE_WORKFLOW}"
 }
