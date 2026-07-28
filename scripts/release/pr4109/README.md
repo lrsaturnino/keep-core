@@ -404,11 +404,16 @@ whatever the copy left at that path. Both are pinned as accepted cases in
 absence of a case is one the next rewording moves.
 
 The control that does close it has to be defined where the pull request cannot
-edit it: a **ruleset requiring this workflow**, its source and its analyzer
-both pinned outside this repository. It is tracked as an outstanding external
-dependency, with what was and was not checkable from here, under "An enforcing
-ruleset behind the scaffold gate" in **Hard external dependencies** — and
-until it is configured, this gate is advisory.
+edit it, which is why it cannot be **this workflow under a rule**: a
+`workflows` ruleset entry names one source repository and one path, and an
+entry naming this file names something every pull request here can rewrite.
+What closes the boundary is a **separate workflow, sourced from a repository no
+pull request into `keep-core` can write to, pinned by commit SHA, and carrying
+its own copy of the analysis** rather than calling back into the commit under
+test for it. This file stays advisory however that is configured. The
+requirement is tracked as an outstanding external dependency, with what was and
+was not checkable from here, under "An enforcing ruleset behind the scaffold
+gate" in **Hard external dependencies**.
 `shell-analysis`'s own log says exactly that rather than claiming otherwise: it
 reports what the commit under test says, and names this file for the rest.
 
@@ -535,31 +540,53 @@ later reading of the refusals cannot quietly grow into a claim of closure.
 Only a control defined where the pull request cannot edit it closes this.
 GitHub's is a **ruleset rule requiring a workflow** — "Require workflows to
 pass before merging", spelled `"type": "workflows"` in the API, settable at
-the organisation or enterprise level, each entry naming a `repository_id` and
-a `path` and optionally pinning a `ref` or `sha`. It replaced Actions Required
-Workflows, which stopped being configurable on 2023-09-20 and became
-unreachable on 2023-10-18: `/orgs/{org}/actions/required_workflows` is not the
-control to look for, and whatever it answers settles nothing about the present
+the organisation or enterprise level. Its `parameters.workflows` is a list of
+entries, each requiring a `repository_id` and a `path`, and each carrying two
+optional pin fields: `ref`, documented as "the ref (branch or tag) of the
+workflow file to use", and `sha`, "the commit SHA of the workflow file to
+use". It replaced Actions Required Workflows, which stopped being configurable
+on 2023-09-20 and became unreachable on 2023-10-18:
+`/orgs/{org}/actions/required_workflows` is not the control to look for, and
+whatever it answers settles nothing about the present
 one. A branch-protection rule requiring the `scaffold-lint` check is not a
 substitute either — it requires a conclusion under a job name that the commit
 under test defines.
 
-Two properties of that ruleset are what close the boundary, and either one
+Because an entry names one repository and one path, the rule cannot be pointed
+at `cutover-scaffold-lint.yml` and be beyond this repository's reach at the
+same time: requiring that path requires a file every pull request here can
+rewrite, and the run it demands is the run the commit under test defines. **The
+required workflow is a different file from the gate checked in here**, and the
+gate checked in here stays advisory however the ruleset is configured.
+
+Three properties of that entry are what close the boundary, and any one
 missing reopens it:
 
-- **The workflow source is pinned outside this repository.** The rule's
-  `repository_id` must name a repository no pull request into `keep-core` can
-  write to, with `ref` or `sha` deciding what runs.
-- **The checker implementation is pinned there too.** An immutable workflow
-  that merely invokes the head commit's `scripts/release/pr4109/rehearse.sh`
+- **The source repository is not this one.** `repository_id` must resolve to a
+  repository no pull request into `keep-core` can write to. The integer alone
+  settles nothing a reader can check, so the record names the repository it
+  resolves to.
+- **The pin is immutable.** `ref` names a branch or a tag and both move — a
+  push to the branch, or a tag re-pointed at another commit, changes what runs
+  without changing the rule, so a `ref`-only entry pins a name and not the
+  bytes behind it. `sha` is what binds bytes, and is what the record carries. A
+  tag is admissible only with evidence that it cannot move: an `active` ruleset
+  on the source repository whose `target` is `tag` and whose rules include
+  `deletion`, `update` and `non_fast_forward`, recorded the way this one is.
+- **The analysis is carried by that pinned source.** A pinned workflow that
+  merely invokes the head commit's `scripts/release/pr4109/rehearse.sh`
   re-inherits everything above: the analyzer it runs is still the one the
-  commit under test supplies. The analysis has to be carried by the external
-  repository, or pinned by digest from it.
+  commit under test supplies. The SHA has to bind the checker implementation
+  too, and the record names the analyzer that SHA binds.
 
 Enforcement state belongs in the record rather than being assumed from the
 ruleset's existence: `enforcement` is one of `disabled`, `active` and
 `evaluate`, and `evaluate` is a dry run that reports without blocking a merge.
-Only `active` gates anything.
+Only `active` gates anything. Two carve-outs sit beside it and are recorded
+with it, because either one leaves an `active` ruleset gating nothing for the
+merge that matters: `bypass_actors` names actors the ruleset does not apply
+to, and the `workflows` rule's own `do_not_enforce_on_create` waives it for
+ref creation.
 
 Standing, checked empirically on 2026-07-28:
 `GET /repos/threshold-network/keep-core/rulesets?includes_parents=true`
@@ -583,8 +610,13 @@ something under that name succeeded, not that this analyzer ran. Evidence that
 rests on the scaffold's own checkers having judged a change should be read
 with that in mind. Unblocking is a configuration change plus the record, not a
 code change here, and the record has to name the ruleset's id and name, its
-target, its `enforcement` — which must read `active` — and the `workflows`
-rule's `repository_id`, `path` and pinned `ref` or `sha`.
+target, its `enforcement` — which must read `active` — its `bypass_actors` and
+the rule's `do_not_enforce_on_create`, and, for the `workflows` entry, the
+`repository_id` together with the repository it resolves to, the `path`, the
+`sha` pinning it — or, for a tag, the tag together with the ruleset holding
+that tag immutable — and the analyzer that pin binds. A record naming this
+repository as the source, or carrying a `ref` where the `sha` belongs, records
+something that does not close the boundary.
 
 ### Reviewed tss-lib fork with an immutable per-party legacy mode
 

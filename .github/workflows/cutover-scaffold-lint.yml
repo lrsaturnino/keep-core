@@ -78,10 +78,14 @@ name: Cutover Scaffold Lint
 # checking, and the job producing the check is defined by the same commit under
 # test. A branch-protection rule requiring the scaffold-lint check therefore
 # holds the job name, not this analysis. Closing that needs a ruleset requiring
-# this workflow, with both the workflow and the analyzer it runs pinned outside
-# this repository; until one is configured this gate is advisory, and a commit
-# deleting this file deletes its own enforcement. See
-# scripts/release/pr4109/README.md.
+# a workflow that is not this one: a `workflows` entry names one source
+# repository and one path, so an entry naming this file names something every
+# pull request here can rewrite. The entry has to name a repository no pull
+# request into keep-core can write to, pin it by commit SHA rather than by a
+# branch or tag ref, and that pinned source has to carry the analysis itself
+# rather than call back into this commit for it. This file stays advisory
+# however that is configured, and a commit deleting it deletes its own
+# enforcement. See scripts/release/pr4109/README.md.
 
 on:
   push:

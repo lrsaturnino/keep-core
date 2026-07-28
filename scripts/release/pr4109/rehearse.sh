@@ -1495,11 +1495,13 @@ shell_invocation_shape() {
 # defines therefore holds the name, not the analysis. Nor is the reading below
 # a closure within the one body it reads: the commands ahead of the invocation
 # are read for the shell they open, so a `cp` over the entrypoint is accepted
-# and the accepted final command runs the copy. Only a ruleset requiring this
-# workflow, with the workflow and the analyzer it runs both pinned where no
-# pull request into this repository can edit them, makes the absence of a run
-# of *this* analysis block a merge. That control and its current standing are
-# recorded beside this scaffold rather than claimed here.
+# and the accepted final command runs the copy. What makes the absence of a run
+# of *this* analysis block a merge is a ruleset requiring a workflow this
+# repository does not supply: an entry naming the gate checked in here names a
+# file every pull request here can rewrite, so the entry has to name an outside
+# repository, pin it by commit SHA rather than by a branch or tag ref, and have
+# that pinned source carry the analysis itself. That control and its current
+# standing are recorded beside this scaffold rather than claimed here.
 verify_scaffold_lint_runs_analysis() {
   local content
   content="$(git -C "${REPO_ROOT}" show "HEAD:${SCAFFOLD_LINT_WORKFLOW}" \
@@ -1690,9 +1692,9 @@ working directory written around it and no earlier step in its job running a \
 shell of its own; that this commit says so is the whole of what is proved here \
 — a command ahead of the invocation in that same body is read for the shell it \
 opens and not for what it writes, and that a run happened at all, and that the \
-run reporting success ran this file, rests on a ruleset requiring this \
-workflow with its analyzer pinned outside this repository, whose standing is \
-recorded in ${SCAFFOLD_DIR}/README.md"
+run reporting success ran this file, rests on a ruleset requiring a workflow \
+this repository does not supply, SHA-pinned outside it and carrying this \
+analysis itself, whose standing is recorded in ${SCAFFOLD_DIR}/README.md"
 }
 
 # The keys that turn a step or the job around it into something a change can

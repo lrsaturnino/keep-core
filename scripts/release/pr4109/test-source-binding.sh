@@ -532,19 +532,39 @@ assert_file_is() {
   PASS=$((PASS + 1))
 }
 
+# A checked-in file's prose, read the way a claim in it is read rather than the
+# way it is stored: comment markers dropped and lines joined, so a sentence a
+# hard wrap or a `#` split across lines is matched whole.
+recorded_text() {
+  sed 's/^[[:space:]]*#[[:space:]]\{0,1\}//' "${CHECKED_IN_ROOT}/$1" |
+    tr '\n' ' ' | tr -s ' '
+}
+
 # Assert that a checked-in file records something. The cases prove what the
 # parser does; these prove the scaffold says so. A boundary a reader has to
 # infer from the absence of a case is one the next rewording moves, and every
 # case here would go on passing while the prose around them claimed closure.
-# Both files are hard-wrapped prose, and one of them wraps it in `#`, so the
-# sentence a claim lives in is matched across its line breaks rather than
-# within one of them.
 assert_records() {
-  local desc="$1" file="$2" pattern="$3" text
-  text="$(sed 's/^[[:space:]]*#[[:space:]]\{0,1\}//' "${CHECKED_IN_ROOT}/${file}" |
-    tr '\n' ' ' | tr -s ' ')"
-  if ! printf '%s\n' "${text}" | grep -Eq -- "${pattern}"; then
+  local desc="$1" file="$2" pattern="$3"
+  if ! recorded_text "${file}" | grep -Eq -- "${pattern}"; then
     printf 'FAIL %s: %s records nothing matching /%s/\n' \
+      "${desc}" "${file}" "${pattern}"
+    FAILED=$((FAILED + 1))
+    return
+  fi
+  printf 'ok   %s\n' "${desc}"
+  PASS=$((PASS + 1))
+}
+
+# Assert that a checked-in file no longer records something. Requiring the
+# right sentence somewhere does not retire the wrong one: a record carrying
+# both is read by whoever stops at the first, and the wordings pinned here are
+# ones whose replacement was the whole point of writing the sentence beside
+# them.
+assert_omits() {
+  local desc="$1" file="$2" pattern="$3"
+  if recorded_text "${file}" | grep -Eq -- "${pattern}"; then
+    printf 'FAIL %s: %s still records /%s/\n' \
       "${desc}" "${file}" "${pattern}"
     FAILED=$((FAILED + 1))
     return
@@ -2033,6 +2053,58 @@ rule" "${SCAFFOLD_DIR}/README.md" \
 assert_records "scaffold lint: the external control's enforcement state is \
 part of the record" "${SCAFFOLD_DIR}/README.md" \
   "\`evaluate\` is a dry run that reports without blocking a merge"
+assert_records "scaffold lint: the external control's bypass carve-outs are \
+part of the record" "${SCAFFOLD_DIR}/README.md" \
+  "\`bypass_actors\` names actors the ruleset does not apply to"
+
+# A `workflows` entry names one repository and one path, so the rule cannot
+# require the gate checked in here *and* be out of this repository's reach: an
+# entry naming this file names a file every pull request here rewrites. A
+# record saying "a ruleset requiring this workflow" therefore describes a
+# control that does not close what it is written to close, and an administrator
+# following it configures the wrong one. The three places that describe the
+# control are held to the distinction, and to the wording it replaced being
+# gone rather than sitting beside it.
+assert_records "scaffold lint: the record says why the required workflow \
+cannot be this one" "${SCAFFOLD_DIR}/README.md" \
+  "entry names one repository and one path"
+assert_records "scaffold lint: the record names the required workflow as a \
+different file" "${SCAFFOLD_DIR}/README.md" \
+  "required workflow is a different file from the gate checked in here"
+assert_records "scaffold lint: the gate workflow disclaims being the required \
+one" "${SCAFFOLD_LINT_WORKFLOW}" \
+  "ruleset requiring a workflow that is not this one"
+assert_records "scaffold lint: the analyzer's own header disclaims being the \
+required one" "${SCAFFOLD_DIR}/${SCAFFOLD_ENTRYPOINT}" \
+  "ruleset requiring a workflow this repository does not supply"
+for f in "${SCAFFOLD_DIR}/README.md" "${SCAFFOLD_LINT_WORKFLOW}" \
+  "${SCAFFOLD_DIR}/${SCAFFOLD_ENTRYPOINT}"; do
+  assert_omits "scaffold lint: ${f} does not name this workflow as the one the \
+ruleset requires" "${f}" "requiring this workflow"
+done
+
+# `ref` is documented as a branch or a tag, and a rule pinned to either binds a
+# name whose bytes the source repository can move afterwards without touching
+# the rule. Recording the pin as "`ref` or `sha`" therefore lets an
+# administrator satisfy the record with a pin that closes nothing, which is the
+# same hole as sourcing the workflow from here.
+assert_records "scaffold lint: the record says a ref pin moves" \
+  "${SCAFFOLD_DIR}/README.md" \
+  "\`ref\` names a branch or a tag and both move"
+assert_records "scaffold lint: the record requires the sha as the pin" \
+  "${SCAFFOLD_DIR}/README.md" \
+  "\`sha\` is what binds bytes, and is what the record carries"
+assert_records "scaffold lint: a tag pin is admitted only against evidence it \
+cannot move" "${SCAFFOLD_DIR}/README.md" \
+  "tag is admissible only with evidence that it cannot move"
+assert_records "scaffold lint: the record requires the analyzer the pin binds" \
+  "${SCAFFOLD_DIR}/README.md" \
+  "the record names the analyzer that SHA binds"
+assert_records "scaffold lint: the gate workflow names the pin as a SHA" \
+  "${SCAFFOLD_LINT_WORKFLOW}" \
+  "pin it by commit SHA rather than by a branch or tag ref"
+assert_omits "scaffold lint: the record does not accept a ref where the sha \
+belongs" "${SCAFFOLD_DIR}/README.md" "\`ref\` or \`sha\`"
 
 # A step after the analysis cannot change what the analysis already read, and
 # the checked-in job's evidence upload is exactly that shape.
