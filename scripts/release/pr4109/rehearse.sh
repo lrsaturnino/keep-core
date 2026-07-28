@@ -225,7 +225,11 @@ stages:
                       all-candidate-down barrier, offline state audit, staged
                       prior redeploy, forbidden partial-rollback attempt.
                       Same per-step ledger and verdict as single-release;
-                      additionally needs STORAGE_SNAPSHOT_DIR
+                      additionally needs STORAGE_SNAPSHOT_DIR — the directory
+                      this stage captures each drained node's state into,
+                      straight out of the container the drain stopped, so the
+                      audit's verdict is over the state this fleet left and
+                      not over a tree supplied under the same name
   verify-source-binding
                       run only the fail-closed source binding check on this
                       tree and record it; inside the CI build image set
@@ -3448,6 +3452,159 @@ nothing about this node can be evidenced"
   done
 }
 
+# Create the prior node's container without starting it.
+#
+# `compose start` can only start a container that already exists, and the
+# rollback project deliberately never brings the prior service up — so on a
+# clean run the step that releases the prior binary behind the barrier would
+# have nothing to start, and would record a rollback that never happened. The
+# gate needs two facts kept apart rather than one: the prior artifact is staged
+# and ready to run, and it is not on the network. Creating the container
+# establishes the first; the checks below are what make the second an
+# observation instead of an assumption about what `compose create` does.
+stage_prior_container() {
+  note "staging ${REHEARSAL_PRIOR_SERVICE} from ${PRIOR_IMAGE_DIGEST} without \
+starting it"
+  compose create "${REHEARSAL_PRIOR_SERVICE}" ||
+    blocked "cannot create ${REHEARSAL_PRIOR_SERVICE}'s container; the step \
+that releases the prior binary behind the barrier would have nothing to start \
+and would record a rollback that was never performed"
+
+  local container
+  container="$(compose ps --all --quiet "${REHEARSAL_PRIOR_SERVICE}" \
+    2>/dev/null || true)"
+  [[ -n "${container}" ]] ||
+    blocked "${REHEARSAL_PRIOR_SERVICE} has no container after being created, \
+so the rollback has no staged prior artifact to release"
+
+  local running
+  running="$(docker inspect --format '{{.State.Running}}' "${container}" \
+    2>/dev/null)" ||
+    blocked "cannot read whether ${REHEARSAL_PRIOR_SERVICE}'s staged \
+container is running"
+  [[ "${running}" == "false" ]] ||
+    blocked "${REHEARSAL_PRIOR_SERVICE} is running immediately after being \
+staged; the barrier this gate exists to prove would already be broken before \
+its first step ran"
+
+  # Checked here and not only at release, because a container created from
+  # other bytes cannot be corrected once the barrier has authorized starting
+  # it: by then the wrong artifact is the running fleet.
+  local expected_id created_id
+  expected_id="$(docker image inspect --format '{{.Id}}' \
+    "${PRIOR_IMAGE_DIGEST}" 2>/dev/null)" ||
+    blocked "cannot resolve ${PRIOR_IMAGE_DIGEST} in the local image store; \
+the rehearsal cannot say what its staged prior container was supposed to be"
+  created_id="$(docker inspect --format '{{.Image}}' "${container}" \
+    2>/dev/null)" ||
+    blocked "cannot read the image ${REHEARSAL_PRIOR_SERVICE} was created from"
+  [[ "${created_id}" == "${expected_id}" ]] ||
+    blocked "${REHEARSAL_PRIOR_SERVICE} was created from image \
+[${created_id}] but this rehearsal supplied [${PRIOR_IMAGE_DIGEST}] \
+([${expected_id}]); the rollback would restore an artifact the state audit \
+never authorized"
+
+  note "${REHEARSAL_PRIOR_SERVICE} is staged from ${PRIOR_IMAGE_DIGEST} and \
+is not running"
+}
+
+# Why one node's state could not be captured, for the step that records it.
+# Set by capture_storage_snapshot whenever it returns nonzero.
+SNAPSHOT_CAPTURE_REASON=""
+
+# Copy one drained node's persistent state out of the container that just
+# stopped, into the directory the offline audit reads.
+#
+# The audit authorizes a rollback onto the state the fleet actually left
+# behind, so the bytes it reads have to be those bytes. A snapshot handed in
+# from outside is only a claim about them: an older capture, another node's, or
+# a hand-edited tree all audit exactly as cleanly as the real thing and
+# authorize the rollback just as readily. Taking the copy here — after the
+# drain, from the stopped container, before the audit — is what makes the
+# manifest the audit writes a statement about this rehearsal.
+#
+# Where a node's storage lives is read off the container rather than named
+# here: the compose file owns that path, and a constant restating it would go
+# on copying an empty directory the first time it moved. `docker cp` is the
+# daemon's own copy, so it needs nothing installed inside an image whose only
+# documented tool is the probe's wget, and it reads a stopped container as
+# readily as a running one.
+capture_storage_snapshot() {
+  local service="$1"
+  # Separate statements: bash expands every word of a `local` before it assigns
+  # any of them, so a destination built from ${service} in the same statement
+  # would read whatever the caller's scope happened to have under that name.
+  local destination="${STORAGE_SNAPSHOT_DIR}/${service}"
+  SNAPSHOT_CAPTURE_REASON=""
+
+  local container
+  container="$(compose ps --all --quiet "${service}" 2>/dev/null || true)"
+  if [[ -z "${container}" ]]; then
+    SNAPSHOT_CAPTURE_REASON="${service} has no container, so the state this \
+rollback would be audited against does not exist to be read"
+    return 1
+  fi
+
+  # A running node is still writing, so a copy taken from one is a torn read
+  # of a moving target and says nothing about what the drain left behind.
+  local running
+  if ! running="$(docker inspect --format '{{.State.Running}}' "${container}" \
+    2>/dev/null)"; then
+    SNAPSHOT_CAPTURE_REASON="cannot read whether ${service} is still running, \
+so nothing can say the state about to be copied is settled"
+    return 1
+  fi
+  if [[ "${running}" != "false" ]]; then
+    SNAPSHOT_CAPTURE_REASON="${service} is still running; a snapshot copied \
+out from under a live node is a torn read and the audit's verdict over it \
+would describe no moment the fleet was ever in"
+    return 1
+  fi
+
+  # The keystore arrives as a read-only bind mount and the persistent state as
+  # the service's named volume, so the volume mount is the one the audit reads.
+  local volumes count storage
+  if ! volumes="$(docker inspect --format \
+    '{{range .Mounts}}{{if eq .Type "volume"}}{{.Destination}}{{"\n"}}{{end}}{{end}}' \
+    "${container}" 2>/dev/null)"; then
+    SNAPSHOT_CAPTURE_REASON="cannot read ${service}'s mounts, so this run \
+cannot say where the state the audit reads lives"
+    return 1
+  fi
+  count="$(printf '%s' "${volumes}" | grep -c . || true)"
+  if [[ "${count}" != "1" ]]; then
+    SNAPSHOT_CAPTURE_REASON="${service} carries ${count} persistent volume \
+mount(s); the rehearsal fleet gives each node exactly one, so this run cannot \
+tell which bytes the audit should read"
+    return 1
+  fi
+  storage="$(printf '%s' "${volumes}" | grep . | head -1)"
+
+  # Any inherited directory goes first: a capture that failed halfway while an
+  # older one sat here would otherwise leave the audit reading a previous
+  # run's state under this run's name.
+  rm -rf "${destination}"
+  if ! mkdir -p "${destination}"; then
+    SNAPSHOT_CAPTURE_REASON="cannot create ${destination} to capture \
+${service}'s state into"
+    return 1
+  fi
+
+  note "capturing ${service}'s ${storage} into ${destination}"
+  if ! docker cp "${container}:${storage}/." "${destination}"; then
+    # Leave nothing behind: a partial copy is a snapshot of a state no node
+    # was ever in, and auditing it cleanly would authorize a rollback onto
+    # bytes that never existed.
+    rm -rf "${destination}"
+    SNAPSHOT_CAPTURE_REASON="copying ${service}'s ${storage} out of its \
+stopped container failed, so there is no capture of the state the drain left"
+    return 1
+  fi
+
+  note "${service}: state captured from the stopped container's ${storage}"
+  return 0
+}
+
 # The rollback inputs the offline audit cannot derive from a storage
 # snapshot. Everything the fleet can be asked for is read from the fleet; what
 # remains is genuinely outside this repository — reconciliation against the
@@ -3485,6 +3642,12 @@ run_state_audit() {
   local service="$1" snapshot="$2"
   local output="${EVIDENCE_DIR}/state-audit-${service}.json"
   STATE_AUDIT_REASON=""
+
+  # The path is fixed per service, so a re-run that never reaches the tool —
+  # or one whose tool dies before writing — would otherwise be read through
+  # the manifest an earlier run left at it. Removing it first makes the
+  # presence of a manifest below evidence that this run produced one.
+  rm -f "${output}"
 
   local missing=() name
   for name in "${ROLLBACK_AUDIT_INPUTS[@]}"; do
@@ -3562,6 +3725,17 @@ to ${output}, so it authorized nothing"
     return 1
   }
 
+  # Both halves, because they are not the same statement. The tool exits
+  # nonzero on an inconsistent namespace as well as on an unready barrier, so
+  # a manifest read alone would accept a snapshot the tool refused for a
+  # reason its ready flag does not carry — and a tool that died after writing
+  # a ready manifest would be read as having finished its checks.
+  if [[ "${rc}" -ne 0 ]]; then
+    STATE_AUDIT_REASON="the audit exited [${rc}] over ${service}'s snapshot \
+(manifest in ${output}), so it completed no verdict this rollback can rely \
+on: ${verdict}"
+    return 1
+  fi
   if [[ "${verdict}" == "ready" ]]; then
     note "${service}: rollback_barrier_ready, manifest in ${output}"
     return 0
@@ -4125,12 +4299,19 @@ stage_rollback() {
   REHEARSAL_GATE="rollback"
   require_env STORAGE_SNAPSHOT_DIR
   stage_preflight
-  [[ -d "${STORAGE_SNAPSHOT_DIR}" ]] ||
-    blocked "STORAGE_SNAPSHOT_DIR does not exist; the offline state audit \
-reads one storage snapshot per node and cannot be run against a live volume"
-  # Only the release under test. The prior binary is what this gate exists to
-  # keep off the network until the barrier holds, so it is started by the one
-  # step that is allowed to release it and by nothing else.
+  # Where this run writes each drained node's captured state, not where it
+  # reads someone else's: the audit below is only about the state this fleet
+  # left behind, so the snapshots are taken from the stopped containers rather
+  # than supplied. The operator still chooses the location, because the
+  # captures outlive the rehearsal as the evidence the audit's verdict is over.
+  mkdir -p "${STORAGE_SNAPSHOT_DIR}" ||
+    blocked "cannot create STORAGE_SNAPSHOT_DIR at ${STORAGE_SNAPSHOT_DIR}; \
+the offline state audit reads one captured snapshot per node and this run has \
+nowhere to capture them to"
+  # Only the release under test comes up. The prior binary is what this gate
+  # exists to keep off the network until the barrier holds, so it is staged
+  # without being started and released by the one step allowed to release it.
+  stage_prior_container
   fleet_up "${REHEARSAL_R1_SERVICES[@]}"
   verify_running_images "${R1_IMAGE_DIGEST}" "${REHEARSAL_R1_SERVICES[@]}"
   # While there is still a fleet to ask. Every step below stops these nodes.
@@ -4276,8 +4457,11 @@ rollback must cover — a wallet action already running"
   local audit_failures=() audit_ready=1
   for service in "${REHEARSAL_R1_SERVICES[@]}"; do
     local snapshot="${STORAGE_SNAPSHOT_DIR}/${service}"
-    if [[ ! -d "${snapshot}" ]]; then
-      audit_failures+=("${service}: no snapshot at ${snapshot}")
+    # Captured here, from the container the drain above stopped, so the audit's
+    # verdict is over the state this rehearsal produced rather than over a
+    # tree that merely arrived under the right name.
+    if ! capture_storage_snapshot "${service}"; then
+      audit_failures+=("${service}: ${SNAPSHOT_CAPTURE_REASON}")
       audit_ready=0
       continue
     fi
@@ -4291,8 +4475,9 @@ rollback must cover — a wallet action already running"
   done
   if ((audit_ready == 1)); then
     record_step "offline state audit produces a rollback-safe manifest" pass \
-      "every R1 snapshot audited to rollback_barrier_ready=true against the \
-supplied reconciliation, quiescence, and prior-reader evidence"
+      "every R1 node's state was captured from the container the drain \
+stopped and audited to rollback_barrier_ready=true against the supplied \
+reconciliation, quiescence, and prior-reader evidence"
     record_assertion "the offline state audit passes before rollback" true \
       "offline state audit produces a rollback-safe manifest"
   else

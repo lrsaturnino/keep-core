@@ -1027,6 +1027,297 @@ run_driver_case "${WORK}/driver-bad-hash"
 check "a reported value that is not a transaction hash stops the step" 3 \
   "in a form this rehearsal cannot read"
 
+# ----------------------------------------------------------------------------
+#
+# What the rollback gate stages, and what it audits.
+#
+# Both are decided by what the container daemon reports, so the daemon is the
+# seam: `compose` and `docker` are replaced by fixtures that answer the way one
+# would for a described container, and the real staging, capture, and audit
+# code runs over them. A case changes what the daemon says, never what the code
+# under test does.
+
+FIXTURE_PRIOR_ID="sha256:$(printf 'e%.0s' {1..64})"
+FIXTURE_OTHER_ID="sha256:$(printf 'f%.0s' {1..64})"
+
+# The container a fixture describes. Each case sets these before running the
+# code under test; the two command fixtures answer from nothing else.
+FIXTURE_CREATE_RC=0
+FIXTURE_CONTAINER="c0ffee"
+FIXTURE_RUNNING="false"
+FIXTURE_CONTAINER_IMAGE="${FIXTURE_PRIOR_ID}"
+FIXTURE_IMAGE_ID="${FIXTURE_PRIOR_ID}"
+FIXTURE_VOLUMES="/mnt/storage"
+FIXTURE_CP_RC=0
+FIXTURE_STORAGE="${WORK}/fixture-storage"
+
+# shellcheck disable=SC2329
+compose() {
+  case "$1" in
+  create) return "${FIXTURE_CREATE_RC}" ;;
+  ps) printf '%s\n' "${FIXTURE_CONTAINER}" ;;
+  *) return 0 ;;
+  esac
+}
+
+# The subset of the daemon the two functions under test speak to, dispatched
+# on the same shapes they call it with.
+# shellcheck disable=SC2329
+docker() {
+  case "$1" in
+  image)
+    # docker image inspect --format '{{.Id}}' <reference>
+    [[ -n "${FIXTURE_IMAGE_ID}" ]] || return 1
+    printf '%s\n' "${FIXTURE_IMAGE_ID}"
+    ;;
+  cp)
+    [[ "${FIXTURE_CP_RC}" -eq 0 ]] || return "${FIXTURE_CP_RC}"
+    # The real command copies the container path's contents into the
+    # destination, so the fixture does exactly that from a directory standing
+    # in for the volume.
+    cp -R "${FIXTURE_STORAGE}/." "${3}"
+    ;;
+  inspect)
+    case "$3" in
+    '{{.State.Running}}')
+      [[ -n "${FIXTURE_RUNNING}" ]] || return 1
+      printf '%s\n' "${FIXTURE_RUNNING}"
+      ;;
+    '{{.Image}}') printf '%s\n' "${FIXTURE_CONTAINER_IMAGE}" ;;
+    *Mounts*) printf '%s\n' "${FIXTURE_VOLUMES}" ;;
+    *) return 1 ;;
+    esac
+    ;;
+  *) return 1 ;;
+  esac
+}
+
+run_fixture() {
+  set +e
+  CASE_OUT="$(
+    (
+      # shellcheck disable=SC2030,SC2031,SC2034
+      PRIOR_IMAGE_DIGEST="keep/keep-client@sha256:$(printf 'b%.0s' {1..64})"
+      "$@"
+    ) 2>&1
+  )"
+  CASE_RC=$?
+  set -e
+}
+
+mkdir -p "${FIXTURE_STORAGE}"
+printf 'drained state\n' >"${FIXTURE_STORAGE}/participation.json"
+
+run_fixture stage_prior_container
+check "the prior artifact is staged without being put on the network" 0 \
+  "without starting it" "is not running"
+
+FIXTURE_RUNNING="true"
+run_fixture stage_prior_container
+check "a staged prior container that came up refuses the rehearsal" 3 \
+  "running immediately after being staged"
+FIXTURE_RUNNING="false"
+
+FIXTURE_CREATE_RC=1
+run_fixture stage_prior_container
+check "a prior container that cannot be created refuses the rehearsal" 3 \
+  "would have nothing to start"
+FIXTURE_CREATE_RC=0
+
+FIXTURE_CONTAINER=""
+run_fixture stage_prior_container
+check "a create that produced no container refuses the rehearsal" 3 \
+  "no staged prior artifact to release"
+FIXTURE_CONTAINER="c0ffee"
+
+FIXTURE_CONTAINER_IMAGE="${FIXTURE_OTHER_ID}"
+run_fixture stage_prior_container
+check "a prior container built from other bytes refuses the rehearsal" 3 \
+  "the state audit never authorized"
+FIXTURE_CONTAINER_IMAGE="${FIXTURE_PRIOR_ID}"
+
+# The capture is what makes the audit below a statement about this rehearsal,
+# so the cases are about which states it refuses to produce a snapshot from.
+run_capture_snapshot() {
+  set +e
+  CASE_OUT="$(
+    (
+      # shellcheck disable=SC2030,SC2031,SC2034
+      STORAGE_SNAPSHOT_DIR="${WORK}/snapshots"
+      capture_rc=0
+      capture_storage_snapshot r1-node-1 || capture_rc=$?
+      printf 'capture_rc:%s reason:[%s]\n' "${capture_rc}" \
+        "${SNAPSHOT_CAPTURE_REASON}"
+    ) 2>&1
+  )"
+  CASE_RC=$?
+  set -e
+}
+
+SNAP="${WORK}/snapshots/r1-node-1"
+mkdir -p "${WORK}/snapshots"
+
+run_capture_snapshot
+check "a drained node's state is captured from the container that stopped" 0 \
+  "capture_rc:0" "state captured from the stopped container"
+if [[ -f "${SNAP}/participation.json" ]]; then
+  printf 'ok   the capture holds the stopped container'"'"'s own bytes\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL the capture does not hold the stopped container bytes\n'
+  FAILED=$((FAILED + 1))
+fi
+
+# An inherited capture is the whole failure mode a fixed per-service path
+# invites: without removal the audit reads a previous run's state under this
+# run's name and authorizes a rollback nobody rehearsed.
+printf 'stale\n' >"${SNAP}/stale-from-an-earlier-run.json"
+run_capture_snapshot
+check "a capture replaces the one an earlier run left behind" 0 \
+  "capture_rc:0" "state captured from the stopped container"
+if [[ -f "${SNAP}/stale-from-an-earlier-run.json" ]]; then
+  printf 'FAIL an earlier run'"'"'s capture survived into this one\n'
+  FAILED=$((FAILED + 1))
+else
+  printf 'ok   an earlier run'"'"'s capture does not survive into this one\n'
+  PASS=$((PASS + 1))
+fi
+
+FIXTURE_RUNNING="true"
+run_capture_snapshot
+check "a still-running node is not captured out from under itself" 0 \
+  "capture_rc:1" "torn read"
+FIXTURE_RUNNING="false"
+
+FIXTURE_VOLUMES=""
+run_capture_snapshot
+check "a node with no persistent volume has no state to audit" 0 \
+  "capture_rc:1" "0 persistent volume mount"
+FIXTURE_VOLUMES="/mnt/storage
+/mnt/other"
+run_capture_snapshot
+check "a node with two persistent volumes is refused rather than guessed at" \
+  0 "capture_rc:1" "2 persistent volume mount"
+FIXTURE_VOLUMES="/mnt/storage"
+
+FIXTURE_CP_RC=1
+run_capture_snapshot
+check "a copy that failed leaves no snapshot to audit" 0 \
+  "capture_rc:1" "no capture of the state the drain left"
+if [[ -e "${SNAP}" ]]; then
+  printf 'FAIL a failed capture left a partial snapshot behind\n'
+  FAILED=$((FAILED + 1))
+else
+  printf 'ok   a failed capture leaves no partial snapshot behind\n'
+  PASS=$((PASS + 1))
+fi
+FIXTURE_CP_RC=0
+
+# ----------------------------------------------------------------------------
+#
+# The audit's own verdict. It writes to one path per service, so the two ways
+# a stale or incomplete result can be read as an authorization are what the
+# cases below drive: a tool that refused this snapshot while an earlier ready
+# manifest sat at that path, and a tool that never wrote one at all.
+
+AUDIT_INPUTS="${WORK}/audit-inputs"
+mkdir -p "${AUDIT_INPUTS}/quiescence"
+printf '{}\n' >"${AUDIT_INPUTS}/chain.json"
+printf '{}\n' >"${AUDIT_INPUTS}/bitcoin.json"
+printf '{}\n' >"${AUDIT_INPUTS}/prior-reader.json"
+printf '{}\n' >"${AUDIT_INPUTS}/quiescence/r1-node-1.json"
+
+# The audit tool, replaced at the seam the stage runs it through. The subshell
+# `go run` executes inherits this function, so the real invocation — its flags,
+# its output path, and what the caller makes of its exit status — is what runs.
+# The two knobs are globals because a nested function reads its enclosing
+# scope when it is called, not when it is defined, and by then the definer has
+# long returned.
+AUDIT_TOOL_STATUS=0
+AUDIT_TOOL_MANIFEST=""
+# shellcheck disable=SC2329
+go() {
+  if [[ -n "${AUDIT_TOOL_MANIFEST}" ]]; then
+    printf '%s\n' "${AUDIT_TOOL_MANIFEST}" \
+      >"${WORK}/audit-evidence/state-audit-r1-node-1.json"
+  fi
+  return "${AUDIT_TOOL_STATUS}"
+}
+audit_tool() {
+  AUDIT_TOOL_STATUS="$1"
+  AUDIT_TOOL_MANIFEST="$2"
+}
+
+run_audit_case() {
+  set +e
+  CASE_OUT="$(
+    (
+      # shellcheck disable=SC2030,SC2031,SC2034
+      EVIDENCE_DIR="${WORK}/audit-evidence"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      REPO_ROOT="${WORK}/repo"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      CHAIN_ID="11155111"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      PRIOR_IMAGE_DIGEST="keep/keep-client@sha256:$(printf 'b%.0s' {1..64})"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      R1_IMAGE_DIGEST="keep/keep-client@sha256:$(printf 'a%.0s' {1..64})"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      REHEARSAL_R1_IDENTITY='{"version":"v2.0.0-rehearsal","revision":"r"}'
+      # shellcheck disable=SC2030,SC2031,SC2034
+      REHEARSAL_R1_EPOCH="security_v2_cutover"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      REHEARSAL_R1_CUTOVER_BLOCK="9000000"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      PR4109_CHAIN_RECONCILIATION_EVIDENCE="${AUDIT_INPUTS}/chain.json"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      PR4109_BITCOIN_RECONCILIATION_EVIDENCE="${AUDIT_INPUTS}/bitcoin.json"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      PR4109_QUIESCENCE_REPORT_DIR="${AUDIT_INPUTS}/quiescence"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      PR4109_PRIOR_READER_EVIDENCE="${AUDIT_INPUTS}/prior-reader.json"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      PR4109_BITCOIN_NETWORK="testnet"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      PR4109_PRIOR_VERSION="v1.9.0"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      PR4109_PRIOR_REVISION="abc1234"
+      "$1"
+      audit_rc=0
+      run_state_audit r1-node-1 "${SNAP}" || audit_rc=$?
+      printf 'audit_rc:%s reason:[%s]\n' "${audit_rc}" "${STATE_AUDIT_REASON}"
+    ) 2>&1
+  )"
+  CASE_RC=$?
+  set -e
+}
+
+mkdir -p "${WORK}/audit-evidence" "${SNAP}"
+
+audit_ready() { audit_tool 0 '{"rollback_barrier_ready":true}'; }
+run_audit_case audit_ready
+check "an audit that completed and authorized the rollback is accepted" 0 \
+  "audit_rc:0" "rollback_barrier_ready"
+
+# The tool exits nonzero on an inconsistent namespace as well as on an unready
+# barrier, so a run that reads only the ready flag accepts a snapshot the tool
+# refused for a reason that flag does not carry.
+audit_refused_but_ready() { audit_tool 3 '{"rollback_barrier_ready":true}'; }
+run_audit_case audit_refused_but_ready
+check "a nonzero audit is not authorized by its own ready flag" 0 \
+  "audit_rc:1" "exited \[3\]"
+
+# The stale case: this run's tool writes nothing, and an earlier run's ready
+# manifest is sitting at the path it would have written.
+printf '{"rollback_barrier_ready":true}\n' \
+  >"${WORK}/audit-evidence/state-audit-r1-node-1.json"
+audit_silent() { audit_tool 0 ""; }
+run_audit_case audit_silent
+check "an earlier run's manifest cannot authorize this run's rollback" 0 \
+  "audit_rc:1" "without writing a manifest"
+
+unset -f compose docker go
+
 # Neither container stage can be executed anywhere but a real rehearsal — they
 # need the immutable images, a chain, and persistent volumes — so a call site
 # left pointing at a renamed helper survives every check in this file and
