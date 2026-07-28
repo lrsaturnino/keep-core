@@ -781,7 +781,7 @@ fi
 # Every internal name the probe snapshots must still be a metric the client
 # defines, or the step recorded a gauge nobody publishes.
 MISSING_METRICS=""
-for METRIC in "${PARTICIPATION_METRICS[@]}"; do
+for METRIC in "${PARTICIPATION_METRICS[@]}" "${ANNOUNCER_CUTOVER_METRICS[@]}"; do
   grep -q "= \"${METRIC}\"" \
     "${TEST_DIR}/../../../pkg/clientinfo/performance.go" ||
     MISSING_METRICS="${MISSING_METRICS} ${METRIC}"
@@ -1491,6 +1491,52 @@ check "an unreadable forced-abort counter is not read as none" 3 \
 run_verdict quiesce_case eval 'QUIESCE_STATE="open_security_v2"'
 check "a draining node that never reported quiescing refutes the gate" 1 \
   "never reported quiescing"
+
+# The straggler control, whose evidence used to be the gate's own refusal
+# counter — a counter that moves when a node declines its own Begin, for
+# reasons that need no legacy announcement behind them at all.
+straggler_readings() {
+  # shellcheck disable=SC2034
+  STRAGGLER_BEFORE=("10" "4" "2")
+  # shellcheck disable=SC2034
+  STRAGGLER_AFTER=("11" "5" "3")
+}
+
+straggler_case() {
+  straggler_readings
+  "$@"
+}
+
+run_verdict straggler_case eval \
+  'straggler_control_verdict "0xabc"'
+check "a straggler recognized, rostered, and named holds the control" 0 \
+  "recognized 1 of them as cross-format" "naming operator\(s\) 0xabc"
+
+# The case the refusal counter could not tell apart from success: no legacy
+# announcement ever arrived, so there was nothing to fail closed against.
+run_verdict straggler_case eval \
+  'STRAGGLER_AFTER=("10" "5" "3"); straggler_control_verdict "0xabc"'
+check "a roster entry with no session mismatch behind it is not the control" \
+  3 "no session-ID mismatch"
+
+run_verdict straggler_case eval \
+  'STRAGGLER_AFTER=("11" "4" "3"); straggler_control_verdict "0xabc"'
+check "a mismatch never recognized as cross-format refutes the control" 1 \
+  "recognized none of them as cross-format"
+
+run_verdict straggler_case eval \
+  'STRAGGLER_AFTER=("11" "5" "2"); straggler_control_verdict "0xabc"'
+check "a cross-format sighting that entered no roster refutes the control" 1 \
+  "added none to its legacy roster"
+
+run_verdict straggler_case eval 'straggler_control_verdict ""'
+check "a roster addition naming no new operator refutes the control" 1 \
+  "named no operator it had not already seen"
+
+run_verdict straggler_case eval \
+  'STRAGGLER_AFTER=("11" "" "3"); straggler_control_verdict "0xabc"'
+check "an unreadable cross-format counter observes no straggler at all" 3 \
+  "announcer_cross_format_peer_total"
 
 # Neither container stage can be executed anywhere but a real rehearsal — they
 # need the immutable images, a chain, and persistent volumes — so a call site

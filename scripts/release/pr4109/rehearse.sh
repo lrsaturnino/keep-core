@@ -2869,6 +2869,19 @@ PARTICIPATION_METRICS=(
   participation_quiesce_forced_aborts_total
 )
 
+# The announcer's own account of a cross-format sighting, which is a different
+# thing from the gate's refusal counter and the only thing that speaks to the
+# straggler control. The gate counts a node refusing its own Begin; these count
+# this node receiving a legacy session announcement where it expected a
+# hardened one, recognizing it as cross-format, and recording the operator
+# behind it. A refusal counter can move for reasons with no announcement behind
+# them at all, and a correct cross-format sighting need never touch it.
+ANNOUNCER_CUTOVER_METRICS=(
+  announcer_session_id_mismatch_total
+  announcer_cross_format_peer_total
+  announcer_legacy_peer_additions_total
+)
+
 # Snapshot the gate gauges of one node into the step being recorded. Reading
 # none of them is a broken instrument rather than an absent value — a renamed
 # application prefix or metric family would otherwise leave every step
@@ -3840,6 +3853,78 @@ that cannot be read leaves the step with no account of what it drove"
   return "${rc}"
 }
 
+# What the straggler control observed, in ANNOUNCER_CUTOVER_METRICS order:
+# the mismatch, the cross-format recognition, and the roster addition, each
+# before and after the driven post-C ceremony.
+STRAGGLER_BEFORE=()
+STRAGGLER_AFTER=()
+
+# The verdict those observations imply, over the same seam as the two below.
+#
+# The chain here is what the control is about and every link is required. A
+# session-ID mismatch alone is any two peers disagreeing on a session. A
+# mismatch this node did not recognize as cross-format is a straggler it
+# failed to identify — the release's whole premise is that it does. A
+# recognized cross-format peer that never entered the roster is a sighting
+# that produced no evidence. And a roster whose revision moved without naming
+# an operator this node had not already seen is not the specific operator
+# becoming blocking evidence.
+straggler_control_verdict() {
+  local new_operators="$1"
+  local step="post-cutover straggler fails closed and enters the roster"
+  local assertion="old post-C behavior fails closed and becomes \
+operator-identified blocking evidence"
+
+  local i deltas=() unreadable=()
+  for i in 0 1 2; do
+    local before="${STRAGGLER_BEFORE[${i}]:-}" after="${STRAGGLER_AFTER[${i}]:-}"
+    if [[ ! "${before}" =~ ^[0-9]+$ || ! "${after}" =~ ^[0-9]+$ ]]; then
+      unreadable+=("${ANNOUNCER_CUTOVER_METRICS[${i}]}")
+      deltas+=("unreadable")
+    else
+      deltas+=("$((after - before))")
+    fi
+  done
+
+  if ((${#unreadable[@]} > 0)); then
+    block_step "${step}" "the announcer's cross-format counters could not be \
+read on the observing node (${unreadable[*]}); the gate's own refusal counter \
+says nothing about whether a legacy announcement arrived, so nothing here \
+observed the straggler at all"
+    record_assertion "${assertion}" false "${step}"
+  elif ((deltas[0] == 0)); then
+    block_step "${step}" "the observing node saw no session-ID mismatch while \
+the post-C ceremony ran, so no legacy announcement reached it; without a work \
+driver originating post-C ceremonies the straggler never announces, and there \
+is nothing for the R1 fleet to fail closed against"
+    record_assertion "${assertion}" false "${step}"
+  elif ((deltas[1] == 0)); then
+    record_step "${step}" fail "the observing node saw ${deltas[0]} session-ID \
+mismatch(es) and recognized none of them as cross-format; a legacy \
+announcement the release cannot tell apart from an ordinary disagreement is a \
+straggler it never identified"
+    record_assertion "${assertion}" false "${step}"
+  elif ((deltas[2] == 0)); then
+    record_step "${step}" fail "the observing node recognized ${deltas[1]} \
+cross-format peer(s) and added none to its legacy roster; a sighting that \
+produces no roster entry produces no evidence"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ -z "${new_operators}" ]]; then
+    record_step "${step}" fail "the observing node recorded ${deltas[2]} \
+legacy roster addition(s) from ${deltas[1]} cross-format sighting(s), but its \
+roster named no operator it had not already seen; a refusal that does not \
+become operator-identified evidence is not what this control is about"
+    record_assertion "${assertion}" false "${step}"
+  else
+    record_step "${step}" pass "the observing node saw ${deltas[0]} \
+session-ID mismatch(es), recognized ${deltas[1]} of them as cross-format, and \
+turned them into ${deltas[2]} legacy roster addition(s) naming operator(s) \
+${new_operators}, so the straggler failed closed and was named rather than \
+merely refused"
+    record_assertion "${assertion}" true "${step}"
+  fi
+}
+
 # What the clock-failure step observed. The step fills these from the fleet;
 # the verdict below reads nothing else.
 CLOCK_STATE=""
@@ -4148,15 +4233,20 @@ current chain" false \
   # and it needs no legacy capability on the R1 side, only refusals.
   begin_step "post-cutover straggler fails closed and enters the roster"
   local observer="${REHEARSAL_R1_SERVICES[0]}"
-  local refusals_before refusals_after operators_before operators_after roster
-  refusals_before="$(metric_value "${observer}" \
-    participation_refusals_total || printf '0')"
+  local operators_before operators_after roster metric
+  STRAGGLER_BEFORE=()
+  STRAGGLER_AFTER=()
+  for metric in "${ANNOUNCER_CUTOVER_METRICS[@]}"; do
+    STRAGGLER_BEFORE+=("$(metric_value "${observer}" "${metric}" ||
+      printf '')")
+  done
   operators_before="$(roster_operators "${observer}")"
   if [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
     run_work_driver post-cutover-straggler || true
   fi
-  refusals_after="$(metric_value "${observer}" \
-    participation_refusals_total || printf '0')"
+  for metric in "${ANNOUNCER_CUTOVER_METRICS[@]}"; do
+    STRAGGLER_AFTER+=("$(metric_value "${observer}" "${metric}" || printf '')")
+  done
   operators_after="$(roster_operators "${observer}")"
   roster="$(roster_snapshot "${observer}")"
   observe_gate_gauges "${observer}"
@@ -4167,43 +4257,13 @@ current chain" false \
   # an empty peer list, so its presence proves nothing. What the negative
   # control is about is a specific operator becoming named blocking evidence,
   # so the two readings are differenced: an operator this node had not seen
-  # before the driven post-C ceremony, alongside the refusal that put it
-  # there. A generic refusal counter moving on its own could be any refusal at
-  # all, including one with no cross-format announcement behind it.
+  # before the driven post-C ceremony.
   local new_operators
   new_operators="$(comm -13 <(printf '%s' "${operators_before}") \
     <(printf '%s' "${operators_after}") | tr '\n' ' ')"
   new_operators="${new_operators% }"
 
-  if [[ "${refusals_after}" != "${refusals_before}" && -n "${new_operators}" ]]; then
-    record_step "post-cutover straggler fails closed and enters the roster" \
-      pass "R1 refusals rose from ${refusals_before} to ${refusals_after} and \
-the node-local roster gained operator(s) ${new_operators}, so the straggler \
-was refused and named rather than merely refused"
-    record_assertion \
-      "old post-C behavior fails closed and becomes operator-identified \
-blocking evidence" true \
-      "post-cutover straggler fails closed and enters the roster"
-  elif [[ "${refusals_after}" != "${refusals_before}" ]]; then
-    record_step "post-cutover straggler fails closed and enters the roster" \
-      fail "R1 refusals rose from ${refusals_before} to ${refusals_after}, but \
-the node-local roster named no operator it had not already seen; a refusal \
-that does not become operator-identified evidence is not what this control \
-is about"
-    record_assertion \
-      "old post-C behavior fails closed and becomes operator-identified \
-blocking evidence" false \
-      "post-cutover straggler fails closed and enters the roster"
-  else
-    record_step "post-cutover straggler fails closed and enters the roster" \
-      blocked "no refusal and no new roster operator was observed; without a \
-work driver originating post-C ceremonies the straggler never attempts one, \
-so there is nothing for the R1 fleet to refuse"
-    record_assertion \
-      "old post-C behavior fails closed and becomes operator-identified \
-blocking evidence" false \
-      "post-cutover straggler fails closed and enters the roster"
-  fi
+  straggler_control_verdict "${new_operators}"
 
   # The 90/10 DKG consequence of leaving that straggler in the eligible set is
   # a property of a production-scale group, not of a three-node fleet.
@@ -4241,8 +4301,14 @@ originated on the rehearsal chain and there is nothing to observe"
     # and after so it is this step's ceremonies being counted rather than the
     # crossing's, and it is summed across the fleet because a control that
     # only watched one node would pass on a fleet where the others sat idle.
-    local permits_before permits_after legacy_after
+    local permits_before permits_after legacy_before legacy_after
     permits_before="$(fleet_metric_total participation_mode_security_v2_total)"
+    # Both counters are cumulative and both are read before as well as after.
+    # A legacy count compared against zero would be a statement about
+    # everything the fleet ever did, so the pre-C legacy controls this gate
+    # also requires would make this step fail the moment they start working —
+    # on their permits, taken before C, not on any sighting after it.
+    legacy_before="$(fleet_metric_total participation_mode_legacy_total)"
     local driver_rc=0
     run_work_driver homogeneous-security-v2 || driver_rc=$?
     permits_after="$(fleet_metric_total participation_mode_security_v2_total)"
@@ -4260,11 +4326,25 @@ ceremonies"
         "homogeneous security-v2 controls with no legacy sightings"
     elif [[ ! "${permits_before}" =~ ^[0-9]+$ ]] ||
       [[ ! "${permits_after}" =~ ^[0-9]+$ ]] ||
+      [[ ! "${legacy_before}" =~ ^[0-9]+$ ]] ||
       [[ ! "${legacy_after}" =~ ^[0-9]+$ ]]; then
       record_step "homogeneous security-v2 controls with no legacy sightings" \
         blocked "the fleet permit counters could not be read \
 (security-v2 [${permits_before}] to [${permits_after}], legacy \
-[${legacy_after}]), so nothing here observed which mode the ceremonies ran in"
+[${legacy_before}] to [${legacy_after}]), so nothing here observed which mode \
+the ceremonies ran in"
+      record_assertion \
+        "post-C ceremonies run security-v2 with no legacy sightings" false \
+        "homogeneous security-v2 controls with no legacy sightings"
+    elif [[ -z "${STEP_TX_HASHES}" ]]; then
+      # The permits below are credited to this driver, and the only account of
+      # what it put on the chain is the account it gives. Without one, a
+      # counter that moved for some unrelated reason reads exactly like a
+      # driver that originated the ceremonies this control is about.
+      record_step "homogeneous security-v2 controls with no legacy sightings" \
+        blocked "the work driver exited cleanly but reported no transaction, \
+so nothing attributes the fleet's permit activity to the ceremonies this \
+control claims to have originated"
       record_assertion \
         "post-C ceremonies run security-v2 with no legacy sightings" false \
         "homogeneous security-v2 controls with no legacy sightings"
@@ -4276,10 +4356,12 @@ ceremony is not a positive control"
       record_assertion \
         "post-C ceremonies run security-v2 with no legacy sightings" false \
         "homogeneous security-v2 controls with no legacy sightings"
-    elif ((legacy_after > 0)); then
+    elif ((legacy_after > legacy_before)); then
       record_step "homogeneous security-v2 controls with no legacy sightings" \
         fail "the fleet issued $((permits_after - permits_before)) new \
-security-v2 permits but participation_mode_legacy_total is [${legacy_after}]"
+security-v2 permits and also $((legacy_after - legacy_before)) new legacy \
+permit(s) (participation_mode_legacy_total [${legacy_before}] to \
+[${legacy_after}]) driving post-C work"
       record_assertion \
         "post-C ceremonies run security-v2 with no legacy sightings" false \
         "homogeneous security-v2 controls with no legacy sightings"
@@ -4287,8 +4369,9 @@ security-v2 permits but participation_mode_legacy_total is [${legacy_after}]"
       STEP_PERMIT_MODES='"security_v2"'
       record_step "homogeneous security-v2 controls with no legacy sightings" \
         pass "the fleet issued $((permits_after - permits_before)) new \
-security-v2 permits driving post-C ceremonies and no legacy permit at any \
-point"
+security-v2 permits driving the post-C ceremonies the driver originated, and \
+no new legacy permit (participation_mode_legacy_total unchanged at \
+[${legacy_after}])"
       record_assertion \
         "post-C ceremonies run security-v2 with no legacy sightings" true \
         "homogeneous security-v2 controls with no legacy sightings"
