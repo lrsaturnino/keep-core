@@ -4256,6 +4256,25 @@ r1-node-2@beacon_dkg@845@bdkg845#2=completed=persisted_beacon_signer\
 check "holders naming different outputs for one ceremony are refused" 1 \
   "beacon_dkg@845@bdkg845 \(0xbdkg845/0xelsewhere\)"
 
+# The same disagreement from a holder the driver did not report. Its permit is
+# absent from the originated records, so a reading whose population came from the
+# driver's own account never looks at it — and that is the reading a node
+# recording a different output for the ceremony would want. The record is checked
+# because the node published it, not because the driver named it.
+#
+# One control covers both result rungs for an unreported holder. Any output it
+# names other than the one the reported holder recorded disagrees with that
+# holder first, so the disagreement rung is what an unreported record can be
+# caught by; reaching the settlement rung instead would need the reported
+# holder's own record to be missing, which blocks the control a rung earlier.
+# shellcheck disable=SC2016
+run_verdict precutover_case eval \
+  'PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS} \
+r1-node-2@beacon_dkg@845@bdkg845#2=completed=persisted_beacon_signer\
+=0xelsewhere=2=-=-=-"'
+check "an unreported holder naming another output is refused too" 1 \
+  "beacon_dkg@845@bdkg845 \(0xbdkg845/0xelsewhere\)"
+
 # And the seam between the two accounts: the driver reports a settlement the
 # holders never produced. Read separately both sides pass.
 # shellcheck disable=SC2016

@@ -6277,6 +6277,30 @@ disagreeing_authored_results() {
   printf '%s' "${out}"
 }
 
+# Every permit some node authored an ending for on one of the given pieces of
+# chain work, less the ones already named, space-joined.
+#
+# The result checks below run over a population the driver supplied: the permits
+# it reported holders for. A holder it did not report is invisible to them, and
+# invisibility is the whole evasion — that node can record a different result for
+# the same ceremony, or one the driver never settled, and answer to nothing,
+# because the population being checked came from the account its record would
+# contradict. Widening the population to every record on the same work closes it:
+# a holder is checked because it published a record, not because someone chose to
+# name it.
+authored_work_permits() {
+  local works="$1" named="$2" authored="$3" token permit out=""
+  for token in ${authored}; do
+    authored_record_complete "${token}" || continue
+    permit="$(authored_permit "${token}")"
+    contains_token "${works}" "$(identity_work "${permit}")" || continue
+    contains_token "${named}" "${permit}" && continue
+    contains_token "${out}" "${permit}" && continue
+    out="${out}${out:+ }${permit}"
+  done
+  printf '%s' "${out}"
+}
+
 # The results the holders of one piece of chain work recorded, "/"-joined and
 # deduplicated, so a single value means they agreed and anything else does not
 # compare equal to any one holder's record.
@@ -8204,7 +8228,7 @@ homogeneous_control_verdict() {
   # readings it adds are stated once.
   local failed_results missing_families settlements stray unended
   local named_permits unauthored duplicated unresolved misended authored
-  local malformed misevidenced disagreeing unclaimed
+  local malformed misevidenced disagreeing unclaimed result_population
   failed_results="$(unsuccessful_results "${HOMOGENEOUS_RESULTS}")"
   missing_families="$(missing_bound_families \
     "${HOMOGENEOUS_BOUND}" "${HOMOGENEOUS_REQUIRED_FAMILIES}")"
@@ -8236,9 +8260,16 @@ homogeneous_control_verdict() {
     "${HOMOGENEOUS_AUTHORED_ENDINGS}")"
   misevidenced="$(misevidenced_authored_permits "${named_permits}" \
     "${HOMOGENEOUS_AUTHORED_ENDINGS}")"
-  disagreeing="$(disagreeing_authored_results "${named_permits}" \
+  # Every holder of this work, not only the ones the driver named. A holder it
+  # omitted still published a record, and a result it recorded that disagrees
+  # with the rest — or that no settlement claims — is exactly what a population
+  # drawn from the driver's own report cannot see.
+  result_population="${named_permits} $(authored_work_permits \
+    "$(identity_works "${named_permits}")" "${named_permits}" \
     "${HOMOGENEOUS_AUTHORED_ENDINGS}")"
-  unclaimed="$(unclaimed_authored_results "${named_permits}" \
+  disagreeing="$(disagreeing_authored_results "${result_population}" \
+    "${HOMOGENEOUS_AUTHORED_ENDINGS}")"
+  unclaimed="$(unclaimed_authored_results "${result_population}" \
     "${HOMOGENEOUS_AUTHORED_ENDINGS}" "${HOMOGENEOUS_BOUND}")"
   authored="$(authored_endings "${named_permits}" \
     "${HOMOGENEOUS_AUTHORED_ENDINGS}")"
@@ -9144,7 +9175,7 @@ precutover_verdict() {
   local failed_results missing_ceremonies settlements
   local uninteroperated stray unended invented uncredited unrecognized
   local named_permits unauthored duplicated unresolved misended authored
-  local malformed misevidenced disagreeing unclaimed
+  local malformed misevidenced disagreeing unclaimed result_population
   failed_results="$(unsuccessful_results "${PRECUTOVER_RESULTS}")"
   missing_ceremonies="$(missing_bound_ceremonies \
     "${PRECUTOVER_BOUND}" "${required_ceremonies}")"
@@ -9182,9 +9213,16 @@ precutover_verdict() {
     "${PRECUTOVER_AUTHORED_ENDINGS}")"
   misevidenced="$(misevidenced_authored_permits "${named_permits}" \
     "${PRECUTOVER_AUTHORED_ENDINGS}")"
-  disagreeing="$(disagreeing_authored_results "${named_permits}" \
+  # Every holder of this work, not only the ones the driver named. A holder it
+  # omitted still published a record, and a result it recorded that disagrees
+  # with the rest — or that no settlement claims — is exactly what a population
+  # drawn from the driver's own report cannot see.
+  result_population="${named_permits} $(authored_work_permits \
+    "$(identity_works "${named_permits}")" "${named_permits}" \
     "${PRECUTOVER_AUTHORED_ENDINGS}")"
-  unclaimed="$(unclaimed_authored_results "${named_permits}" \
+  disagreeing="$(disagreeing_authored_results "${result_population}" \
+    "${PRECUTOVER_AUTHORED_ENDINGS}")"
+  unclaimed="$(unclaimed_authored_results "${result_population}" \
     "${PRECUTOVER_AUTHORED_ENDINGS}" "${PRECUTOVER_BOUND}")"
   authored="$(authored_endings "${named_permits}" \
     "${PRECUTOVER_AUTHORED_ENDINGS}")"
@@ -9462,7 +9500,7 @@ surviving_legacy_verdict() {
   local stray settlements failed unended originated_permits held_delta
   local named_permits unheld_before unnamed_before lost_at_c arrived_at_c
   local unauthored duplicated unresolved misended authored
-  local malformed misevidenced disagreeing unclaimed
+  local malformed misevidenced disagreeing unclaimed result_population
   named_permits="$(held_permit_identities "${SURVIVING_ORIGINATED}")"
   unheld_before="$(absent_tokens "${named_permits}" \
     "${SURVIVING_PERMITS_BEFORE}")"
@@ -9531,9 +9569,16 @@ surviving_legacy_verdict() {
     "${SURVIVING_AUTHORED_ENDINGS}")"
   misevidenced="$(misevidenced_authored_permits "${named_permits}" \
     "${SURVIVING_AUTHORED_ENDINGS}")"
-  disagreeing="$(disagreeing_authored_results "${named_permits}" \
+  # Every holder of this work, not only the ones the driver named. A holder it
+  # omitted still published a record, and a result it recorded that disagrees
+  # with the rest — or that no settlement claims — is exactly what a population
+  # drawn from the driver's own report cannot see.
+  result_population="${named_permits} $(authored_work_permits \
+    "$(identity_works "${named_permits}")" "${named_permits}" \
     "${SURVIVING_AUTHORED_ENDINGS}")"
-  unclaimed="$(unclaimed_authored_results "${named_permits}" \
+  disagreeing="$(disagreeing_authored_results "${result_population}" \
+    "${SURVIVING_AUTHORED_ENDINGS}")"
+  unclaimed="$(unclaimed_authored_results "${result_population}" \
     "${SURVIVING_AUTHORED_ENDINGS}" "${SURVIVING_TERMINAL}")"
   authored="$(authored_endings "${named_permits}" \
     "${SURVIVING_AUTHORED_ENDINGS}")"
