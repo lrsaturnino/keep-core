@@ -410,12 +410,23 @@ func (c *localChain) ReportRelayEntryTimeout() error {
 	return nil
 }
 
+// errNoRelayRequestState reports that this chain keeps no relay request
+// lifecycle. It is returned rather than panicked because the relay entry
+// timeout monitor reconciles a filed report against these reads on every run;
+// an error tells the monitor it cannot confirm the report and leaves the
+// penalty unclaimed, which is the honest reading. Answering "no request is in
+// progress" would be vacuously true here and would let a local run claim a
+// penalty no chain ever confirmed.
+var errNoRelayRequestState = fmt.Errorf(
+	"the local chain keeps no relay request state",
+)
+
 func (c *localChain) IsEntryInProgress() (bool, error) {
-	panic("not implemented")
+	return false, errNoRelayRequestState
 }
 
 func (c *localChain) CurrentRequestStartBlock() (*big.Int, error) {
-	panic("not implemented")
+	return nil, errNoRelayRequestState
 }
 
 func (c *localChain) CurrentRequestPreviousEntry() ([]byte, error) {

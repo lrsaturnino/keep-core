@@ -3,10 +3,10 @@ package beacon
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 
 	bn256 "github.com/ethereum/go-ethereum/crypto/bn256/cloudflare"
@@ -19,6 +19,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/beacon/entry"
 	"github.com/keep-network/keep-core/pkg/beacon/event"
 	"github.com/keep-network/keep-core/pkg/beacon/registry"
+	"github.com/keep-network/keep-core/pkg/chain"
 	"github.com/keep-network/keep-core/pkg/generator"
 	"github.com/keep-network/keep-core/pkg/net"
 	"github.com/keep-network/keep-core/pkg/protocol/compatibility"
@@ -481,25 +482,27 @@ func recordBeaconPermitNoThreshold(
 
 // recordRelayTimeoutTerminalOutcome reports the relay entry monitor's
 // node-owned final disposition. The monitor exists only to file the penalty
-// report, so a filed report is its durable result; a monitor that ended because
-// the group delivered on time, because the report failed, or because the
-// release gate canceled it created no penalty state and is recorded as
-// exhausted.
+// report, so a report the beacon accepted is its durable result; a monitor that
+// ended because the group delivered on time, because the report failed, or
+// because the release gate canceled it created no penalty state and is recorded
+// as exhausted.
+//
+// A report the node merely handed to a provider is not a result. The submitting
+// call returns before the transaction is mined and a transaction that reverts,
+// is dropped, or never lands leaves the beacon exactly as it was, so only a
+// report the beacon itself confirmed settles the permit as completed. Reading
+// the node's own submission as the penalty would let a failed report clear the
+// rollback barrier that exists to hold it.
 func recordRelayTimeoutTerminalOutcome(
 	monitorLogger log.StandardLogger,
 	permit participation.Permit,
 	relayRequestBlockNumber uint64,
-	timeoutReportedAtBlock uint64,
+	timeoutReportSettled bool,
 ) {
-	if timeoutReportedAtBlock == 0 {
+	if !timeoutReportSettled {
 		recordBeaconPermitNoThreshold(monitorLogger, permit)
 		return
 	}
-
-	requestBlock := make([]byte, 8)
-	binary.BigEndian.PutUint64(requestBlock, relayRequestBlockNumber)
-	reportBlock := make([]byte, 8)
-	binary.BigEndian.PutUint64(reportBlock, timeoutReportedAtBlock)
 
 	recordBeaconPermitTerminalOutcome(
 		monitorLogger,
@@ -507,13 +510,137 @@ func recordRelayTimeoutTerminalOutcome(
 		participation.TerminalOutcomeCompleted,
 		participation.TerminalEvidence{
 			Kind: participation.TerminalEvidenceProtocolResult,
-			Reference: participation.TerminalResultReference(
-				"beacon_relay_entry_timeout_report",
-				requestBlock,
-				reportBlock,
+			Reference: participation.BeaconRelayTimeoutReportReference(
+				relayRequestBlockNumber,
 			),
 		},
 	)
+}
+
+// relayEntryTimeoutReportResolutionBlocks bounds how long the monitor asks the
+// beacon whether the timeout report it filed was accepted. The submitting call
+// returns once the transaction reaches the provider and the transaction mines
+// afterwards, so the report's effect is not visible on the first read. The
+// bound is generous enough for an ordinary inclusion; the permit's context cuts
+// the wait short in any case.
+const relayEntryTimeoutReportResolutionBlocks = 12
+
+// relayTimeoutReportSettled asks the beacon whether the relay request this
+// monitor reported a timeout for actually left the in-flight slot, which is the
+// beacon's own record that the report was accepted rather than the node's.
+//
+// Every reading other than a confirmed departure is a refusal to claim the
+// penalty: an unreadable beacon, a chain that does not expose the request state
+// at all, and a request still holding the slot when the wait runs out all leave
+// the permit exhausted. That direction is the safe one — the rollback barrier
+// exists to hold a penalty nobody can account for, so an unproven report has to
+// keep holding it.
+func (n *node) relayTimeoutReportSettled(
+	ctx context.Context,
+	monitorLogger log.StandardLogger,
+	blockCounter chain.BlockCounter,
+	relayRequestBlockNumber uint64,
+) bool {
+	departed := func() (bool, error) {
+		inProgress, err := n.beaconChain.IsEntryInProgress()
+		if err != nil {
+			return false, fmt.Errorf(
+				"cannot read whether a relay entry is in progress: [%w]",
+				err,
+			)
+		}
+		if !inProgress {
+			return true, nil
+		}
+
+		startBlock, err := n.beaconChain.CurrentRequestStartBlock()
+		if err != nil {
+			return false, fmt.Errorf(
+				"cannot read the current relay request start block: [%w]",
+				err,
+			)
+		}
+		if startBlock == nil || !startBlock.IsUint64() {
+			return false, fmt.Errorf(
+				"the beacon reported no readable current relay request " +
+					"start block",
+			)
+		}
+
+		// A different request holding the slot means the one this monitor
+		// reported on is over; the same one still holding it means the report
+		// has not taken effect.
+		return startBlock.Uint64() != relayRequestBlockNumber, nil
+	}
+
+	currentBlock, err := blockCounter.CurrentBlock()
+	if err != nil {
+		monitorLogger.Warnf(
+			"cannot get the current block to resolve the relay entry "+
+				"timeout report; the report is not claimed as settled: [%v]",
+			err,
+		)
+		return false
+	}
+
+	deadline := currentBlock + relayEntryTimeoutReportResolutionBlocks
+	if deadline < currentBlock {
+		deadline = math.MaxUint64
+	}
+
+	for {
+		settled, err := departed()
+		if err != nil {
+			monitorLogger.Warnf(
+				"cannot reconcile the relay entry timeout report against the "+
+					"beacon; the report is not claimed as settled: [%v]",
+				err,
+			)
+			return false
+		}
+		if settled {
+			return true
+		}
+
+		height, err := blockCounter.CurrentBlock()
+		if err != nil {
+			monitorLogger.Warnf(
+				"cannot follow the chain while resolving the relay entry "+
+					"timeout report; the report is not claimed as "+
+					"settled: [%v]",
+				err,
+			)
+			return false
+		}
+		if height >= deadline {
+			monitorLogger.Warnf(
+				"the relay request of block [%v] still holds the beacon at "+
+					"block [%v]; the filed timeout report is not claimed as "+
+					"settled",
+				relayRequestBlockNumber,
+				height,
+			)
+			return false
+		}
+
+		if err := blockCounter.WaitForBlockHeight(height + 1); err != nil {
+			monitorLogger.Warnf(
+				"cannot wait for the next block while resolving the relay "+
+					"entry timeout report; the report is not claimed as "+
+					"settled: [%v]",
+				err,
+			)
+			return false
+		}
+		if ctx.Err() != nil {
+			monitorLogger.Warnf(
+				"relay entry timeout report resolution ended before the "+
+					"beacon confirmed it: [%v]",
+				context.Cause(ctx),
+			)
+			return false
+		}
+	}
 }
 
 // recordRelayEntryTerminalOutcome reports one relay signing membership's
@@ -749,10 +876,10 @@ func (n *node) MonitorRelayEntry(
 		)
 		return
 	}
-	// timeoutReportedAtBlock holds the block the monitor filed its timeout
-	// report at, which is the only durable state this ceremony can create. The
-	// deferred recorder below reads its final value.
-	var timeoutReportedAtBlock uint64
+	// timeoutReportSettled holds whether the beacon confirmed the timeout
+	// report this monitor filed, which is the only durable state this ceremony
+	// can create. The deferred recorder below reads its final value.
+	var timeoutReportSettled bool
 
 	// The terminal outcome is registered after the release so it runs first and
 	// reaches the permit while it is still open.
@@ -762,7 +889,7 @@ func (n *node) MonitorRelayEntry(
 			logger,
 			permit,
 			relayRequestBlockNumber,
-			timeoutReportedAtBlock,
+			timeoutReportSettled,
 		)
 	}()
 
@@ -821,7 +948,15 @@ func (n *node) MonitorRelayEntry(
 				logger.Errorf("could not report a relay entry timeout: [%v]", err)
 				return
 			}
-			timeoutReportedAtBlock = blockNumber
+			// The call returning only means a provider took the transaction.
+			// The beacon decides whether a penalty exists, so the monitor
+			// asks it before claiming one.
+			timeoutReportSettled = n.relayTimeoutReportSettled(
+				permit.Context(),
+				logger,
+				blockCounter,
+				relayRequestBlockNumber,
+			)
 			return
 		case entry := <-onEntrySubmittedChannel:
 			logger.Infof(

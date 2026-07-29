@@ -297,21 +297,29 @@ func TestTerminalResultReference_DomainSeparates(t *testing.T) {
 const testRelayRequestStartBlock = uint64(4_100_900)
 
 // testWorkID renders a work identity the given ceremony's permits would carry.
-// Only the beacon relay constrains it: its evidence names the request it
-// answers, and the validator holds that to the request the permit was issued
-// for.
+// Only the beacon relay ceremonies constrain it: their evidence names the
+// request it answers, and the validator holds that to the request the permit
+// was issued for.
 func testWorkID(ceremony Ceremony) string {
-	if ceremony == BeaconRelaySigning {
+	if isBeaconRelayCeremony(ceremony) {
 		return BeaconRelayWorkID(testRelayRequestStartBlock)
 	}
 	return "work-identity"
 }
 
+// isBeaconRelayCeremony reports whether a ceremony's permits are issued for an
+// on-chain relay request.
+func isBeaconRelayCeremony(ceremony Ceremony) bool {
+	return ceremony == BeaconRelaySigning ||
+		ceremony == BeaconTimeoutReport ||
+		ceremony == BeaconRelayForwarding
+}
+
 // testCompletedResultReference renders a protocol-result reference the given
-// ceremony accepts. Every ceremony but the beacon relay names a digest of its
-// own result; a relay entry names the request it answers, the group, the
-// previous entry and the entry itself so the offline audit can verify the
-// signature and bind it to one request, so no placeholder can stand in for one.
+// ceremony accepts. Most ceremonies name a digest of their own result; the two
+// relay ceremonies name the request they answer, so no placeholder can stand
+// in for one. A relay entry additionally names the group, the previous entry
+// and the entry itself so the offline audit can verify the signature.
 func testCompletedResultReference(
 	t *testing.T,
 	ceremony Ceremony,
@@ -319,6 +327,9 @@ func testCompletedResultReference(
 ) string {
 	t.Helper()
 
+	if ceremony == BeaconTimeoutReport {
+		return BeaconRelayTimeoutReportReference(testRelayRequestStartBlock)
+	}
 	if ceremony != BeaconRelaySigning {
 		return digest
 	}

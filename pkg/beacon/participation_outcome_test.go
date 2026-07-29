@@ -60,6 +60,17 @@ func newRecordingPermit(ceremony participation.Ceremony) *recordingPermit {
 	}
 }
 
+// newRecordingRelayPermit issues a relay-flavored permit for one named relay
+// request, so a test can vary the request its evidence has to answer.
+func newRecordingRelayPermit(
+	ceremony participation.Ceremony,
+	requestStartBlock uint64,
+) *recordingPermit {
+	permit := newRecordingPermit(ceremony)
+	permit.workID = participation.BeaconRelayWorkID(requestStartBlock)
+	return permit
+}
+
 func (rp *recordingPermit) Context() context.Context { return rp.ctx }
 
 func (rp *recordingPermit) Ceremony() participation.Ceremony { return rp.ceremony }
@@ -342,17 +353,23 @@ func TestRecordRelayEntryTerminalOutcome_ReferenceVerifies(t *testing.T) {
 }
 
 // TestRecordRelayTimeoutTerminalOutcome covers the relay entry monitor. The
-// monitor exists only to file the penalty report, so only a filed report is a
-// durable result; every other exit created no penalty state.
+// monitor exists only to file the penalty report, and only a report the beacon
+// confirmed is a durable result; a report the node merely handed to a provider
+// created no penalty state it can account for.
 func TestRecordRelayTimeoutTerminalOutcome(t *testing.T) {
+	const relayRequestBlock = uint64(100)
+
 	t.Run("no timeout reported", func(t *testing.T) {
-		permit := newRecordingPermit(participation.BeaconTimeoutReport)
+		permit := newRecordingRelayPermit(
+			participation.BeaconTimeoutReport,
+			relayRequestBlock,
+		)
 
 		recordRelayTimeoutTerminalOutcome(
 			&testutils.MockLogger{},
 			permit,
-			100,
-			0,
+			relayRequestBlock,
+			false,
 		)
 
 		evidence := assertRecordedTerminalOutcome(
@@ -370,34 +387,53 @@ func TestRecordRelayTimeoutTerminalOutcome(t *testing.T) {
 		}
 	})
 
-	t.Run("timeout reported", func(t *testing.T) {
-		permit := newRecordingPermit(participation.BeaconTimeoutReport)
+	t.Run("timeout report the beacon confirmed", func(t *testing.T) {
+		permit := newRecordingRelayPermit(
+			participation.BeaconTimeoutReport,
+			relayRequestBlock,
+		)
 
 		recordRelayTimeoutTerminalOutcome(
 			&testutils.MockLogger{},
 			permit,
-			100,
-			1000,
+			relayRequestBlock,
+			true,
 		)
 
-		assertRecordedTerminalOutcome(
+		evidence := assertRecordedTerminalOutcome(
 			t,
 			permit,
 			participation.TerminalOutcomeCompleted,
 			participation.TerminalEvidenceProtocolResult,
 		)
+
+		// The identity is fully determined by the request, so the node has no
+		// component left to choose.
+		expected := participation.BeaconRelayTimeoutReportReference(
+			relayRequestBlock,
+		)
+		if evidence.Reference != expected {
+			t.Errorf(
+				"unexpected evidence reference\nexpected: [%s]\nactual:   [%s]",
+				expected,
+				evidence.Reference,
+			)
+		}
 	})
 
 	t.Run("distinct requests produce distinct references", func(t *testing.T) {
 		references := make([]string, 0, 2)
-		for _, relayRequestBlock := range []uint64{100, 200} {
-			permit := newRecordingPermit(participation.BeaconTimeoutReport)
+		for _, requestBlock := range []uint64{100, 200} {
+			permit := newRecordingRelayPermit(
+				participation.BeaconTimeoutReport,
+				requestBlock,
+			)
 
 			recordRelayTimeoutTerminalOutcome(
 				&testutils.MockLogger{},
 				permit,
-				relayRequestBlock,
-				1000,
+				requestBlock,
+				true,
 			)
 
 			evidence := assertRecordedTerminalOutcome(
@@ -413,6 +449,39 @@ func TestRecordRelayTimeoutTerminalOutcome(t *testing.T) {
 			t.Errorf(
 				"two relay requests produced the same evidence reference [%s]",
 				references[0],
+			)
+		}
+	})
+
+	// The report a node filed for one request must not settle the permit it
+	// holds for another. A filed report has no offline proof at all, so the
+	// only thing standing between it and an arbitrary claim is that its
+	// identity is derived from the permit's own request.
+	t.Run("a report filed for another request", func(t *testing.T) {
+		permit := newRecordingRelayPermit(
+			participation.BeaconTimeoutReport,
+			relayRequestBlock,
+		)
+
+		recordRelayTimeoutTerminalOutcome(
+			&testutils.MockLogger{},
+			permit,
+			relayRequestBlock+1,
+			true,
+		)
+
+		recorded := permit.recorded()
+		if len(recorded) != 1 {
+			t.Fatalf("expected one terminal outcome, got [%d]", len(recorded))
+		}
+		if err := participation.ValidateTerminalOutcome(
+			permit.Ceremony(),
+			permit.WorkID(),
+			recorded[0].outcome,
+			recorded[0].evidence,
+		); err == nil {
+			t.Error(
+				"a timeout report naming another request settled this permit",
 			)
 		}
 	})

@@ -468,6 +468,31 @@ func ParseBeaconRelayWorkID(workID string) (uint64, error) {
 	return startBlock, nil
 }
 
+// beaconRelayTimeoutReportDomain labels the digest of a filed relay entry
+// timeout report.
+const beaconRelayTimeoutReportDomain = "beacon_relay_entry_timeout_report"
+
+// BeaconRelayTimeoutReportReference renders the canonical identity of a relay
+// entry timeout report filed for the request that started at the given block.
+//
+// Unlike a relay entry, a filed report leaves nothing this node can prove
+// offline: the penalty lives on the RandomBeacon and the node only knows it
+// handed a transaction to a provider. What the identity can do is stop the
+// node choosing it. Deriving it from the request alone means one request has
+// exactly one report identity, so the audit recomputes the reference from the
+// permit's own work identity rather than reading a value the node picked —
+// there is no free component left to vary a report onto a request it was never
+// filed for.
+func BeaconRelayTimeoutReportReference(relayRequestStartBlock uint64) string {
+	requestBlock := make([]byte, 8)
+	binary.BigEndian.PutUint64(requestBlock, relayRequestStartBlock)
+
+	return TerminalResultReference(
+		beaconRelayTimeoutReportDomain,
+		requestBlock,
+	)
+}
+
 // BeaconRelayEntryReference renders the canonical identity of a recovered
 // relay entry: the relay request it answers, the group that signed it, the
 // previous entry it signed over, and the entry itself.
@@ -813,6 +838,31 @@ func ValidateTerminalOutcome(
 						"but the permit was issued for request start block "+
 						"[%d]",
 					referenceStartBlock,
+					permitStartBlock,
+				)
+			}
+		}
+
+		// A filed timeout report has no offline proof, so the one thing its
+		// identity must not be is a value the node chose. Derived from the
+		// permit's own request it is fully determined, and a report claiming
+		// any other request cannot be rendered at all.
+		if ceremony == BeaconTimeoutReport {
+			permitStartBlock, err := ParseBeaconRelayWorkID(workID)
+			if err != nil {
+				return fmt.Errorf(
+					"relay timeout report evidence cannot be bound to its "+
+						"permit: [%w]",
+					err,
+				)
+			}
+			if expected := BeaconRelayTimeoutReportReference(
+				permitStartBlock,
+			); evidence.Reference != expected {
+				return fmt.Errorf(
+					"relay timeout report reference [%s] is not the report "+
+						"identity of request start block [%d]",
+					evidence.Reference,
 					permitStartBlock,
 				)
 			}
