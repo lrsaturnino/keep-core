@@ -300,11 +300,21 @@ and nothing else can answer the question they ask: that the prior binary's
 container was running says only that it was running. Unselected, partitioned,
 and cryptographically excluded all leave it up beside a ceremony that settled
 without it, which from outside is the same reading interoperation produces. The
-pre-cutover steps therefore require the prior service to appear among the
-contributors of a settled transcript in *each* required family — a prior binary
-in a tBTC signing says nothing about the beacon's separate path into the gate.
-A driver that cannot report who contributed cannot support a mixed-fleet claim,
-so the field is mandatory on success rather than optional.
+pre-cutover steps therefore require, in *each* required family, one settled
+transcript whose contributors include both the prior service and one of the
+rehearsed R1 services. Each half of that is load-bearing. Per family, because a
+prior binary in a tBTC signing says nothing about the beacon's separate path
+into the gate. Both services, because a release that settles a ceremony among
+its own kind is homogeneous whichever release it is, and a control that only
+looked for the prior share would read a prior-only ceremony as interoperation.
+Within one transcript, because a prior-only wallet action beside an R1-only
+signing is two homogeneous ceremonies, and what the control claims is that the
+two wire formats combined into a single threshold output — which only a
+transcript naming both parties ever witnesses. A service that is neither the
+prior binary nor a rehearsed R1 node satisfies neither side, so a stray
+container cannot stand in for either release. A driver that cannot report who
+contributed cannot support a mixed-fleet claim, so the field is mandatory on
+success rather than optional.
 
 Each outcome is bound to the work it belongs to, and controls are decided on
 the bound form rather than on the arrays beside it. One chain work item is

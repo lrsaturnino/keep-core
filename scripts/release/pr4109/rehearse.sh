@@ -5416,26 +5416,44 @@ missing_bound_families() {
   printf '%s' "${uncovered}"
 }
 
-# Of the required families, the ones where no settled transcript incorporated
-# the named service.
+# Of the required families, the ones where no one settled transcript
+# incorporated both the prior release and one of the named R1 services.
 #
 # A mixed-fleet claim needs this and cannot be read off a running container.
-# The prior binary can be up and never selected, up and partitioned, or up and
+# Either release can be up and never selected, up and partitioned, or up and
 # cryptographically excluded, and every one of those produces a settled
 # ceremony beside a running container — the same reading interoperation
 # produces. Asking which parties the transcript itself incorporated is the only
 # question that separates them, and it is asked per family because a prior
 # binary that contributed to a tBTC signing says nothing about the beacon path.
-families_without_contributor() {
-  local contributors="$1" required="$2" service="$3"
-  local family record work covered uncovered=""
+#
+# The two shares have to be in the same transcript. A prior share in one
+# ceremony and an R1 share in another is two homogeneous ceremonies however the
+# family totals read, and what a compatibility control claims is that the two
+# releases combined into a single threshold output — which only a transcript
+# naming both of them ever witnesses.
+families_without_mixed_transcript() {
+  local contributors="$1" required="$2" prior="$3" r1="$4"
+  local family record work holder covered priors others uncovered=""
   for family in ${required}; do
-    covered=0
+    priors=""
+    others=""
     for record in ${contributors}; do
-      [[ "$(permit_holder "${record##*=}")" == "${service}" ]] || continue
       work="$(work_id "${record}")"
       [[ "$(ceremony_family "$(work_ceremony "${work}")")" == "${family}" ]] ||
         continue
+      holder="$(permit_holder "${record##*=}")"
+      if [[ "${holder}" == "${prior}" ]]; then
+        contains_token "${priors}" "${work}" ||
+          priors="${priors}${priors:+ }${work}"
+      elif contains_token "${r1}" "${holder}"; then
+        contains_token "${others}" "${work}" ||
+          others="${others}${others:+ }${work}"
+      fi
+    done
+    covered=0
+    for work in ${priors}; do
+      contains_token "${others}" "${work}" || continue
       covered=1
       break
     done
@@ -7305,9 +7323,9 @@ precutover_verdict() {
   missing_classes="$(missing_bound_classes \
     "${PRECUTOVER_BOUND}" "${required_classes}")"
   settlements="$(bound_settlements "${PRECUTOVER_BOUND}")"
-  uninteroperated="$(families_without_contributor \
+  uninteroperated="$(families_without_mixed_transcript \
     "${PRECUTOVER_CONTRIBUTORS}" "${required_families}" \
-    "${REHEARSAL_PRIOR_SERVICE}")"
+    "${REHEARSAL_PRIOR_SERVICE}" "${REHEARSAL_R1_SERVICES[*]}")"
 
   if ((PRECUTOVER_DRIVER_SUPPLIED == 0)); then
     block_step "${step}" "no PR4109_WORK_DRIVER was supplied, so no \
@@ -7356,11 +7374,11 @@ ${missing_classes}; this step's claim is about ${what}, and the work classes \
 it names are what make it that claim rather than a repeat of the step before"
   elif [[ -n "${uninteroperated}" ]]; then
     block_step "${step}" "the work driver settled ${settlements}, but no \
-${uninteroperated} transcript incorporated a share from \
-${REHEARSAL_PRIOR_SERVICE}; the prior binary was running beside the R1 fleet \
-and took no part in the result, which is what an unselected, partitioned, or \
-excluded party looks like from outside — a homogeneous R1 ceremony cannot \
-stand for the two releases interoperating"
+${uninteroperated} transcript incorporated a share from both \
+${REHEARSAL_PRIOR_SERVICE} and the R1 fleet; one release was running beside \
+the other and took no part in the result, which is what an unselected, \
+partitioned, or excluded party looks like from outside — two homogeneous \
+ceremonies cannot stand for the two releases interoperating"
   elif ((PRECUTOVER_LEGACY_AFTER <= PRECUTOVER_LEGACY_BEFORE)); then
     record_step "${step}" fail "the work driver settled ${settlements}, but \
 the fleet issued no new legacy permit (participation_mode_legacy_total still \
@@ -7391,7 +7409,8 @@ $((PRECUTOVER_LEGACY_AFTER - PRECUTOVER_LEGACY_BEFORE)) new legacy permits \
 and no security-v2 permit (unchanged at [${PRECUTOVER_SECURITY_AFTER}]) \
 driving ${what} beside the running prior binary, the driver settled \
 ${settlements} with nothing failing beside them, every ${required_families} \
-transcript incorporated a share from ${REHEARSAL_PRIOR_SERVICE}, and the fleet \
+family settled a transcript incorporating shares from both \
+${REHEARSAL_PRIOR_SERVICE} and the R1 fleet, and the fleet \
 recognized no cross-format peer (unchanged at \
 [${PRECUTOVER_SIGHTINGS_AFTER}])"
     [[ -z "${assertion}" ]] || record_assertion "${assertion}" true "${step}"

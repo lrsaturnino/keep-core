@@ -3236,6 +3236,41 @@ beacon_signing@841@entry841=r1-node-2~2"'
 check "a homogeneous R1 transcript cannot stand for a mixed one" 3 \
   "took no part in the result"
 
+# The mirror on the other release. A prior binary settling a ceremony among
+# its own kind is exactly as unmixed as an R1 fleet doing so, and a control
+# that only ever looked for the prior share would call this interoperation.
+run_verdict precutover_case eval '
+  PRECUTOVER_CONTRIBUTORS="\
+tbtc_wallet_action@840@wallet840=prior-node~7 \
+beacon_signing@841@entry841=prior-node~7"'
+check "a homogeneous prior transcript cannot stand for a mixed one" 3 \
+  "no tbtc beacon transcript incorporated a share"
+
+# Two homogeneous ceremonies are not one mixed ceremony. Counted per family
+# rather than per transcript, a prior-only wallet action beside an R1-only
+# signing would read as the two releases combining into a threshold output
+# that neither of them witnessed.
+run_verdict precutover_case eval '
+  PRECUTOVER_CONTRIBUTORS="\
+tbtc_wallet_action@840@wallet840=prior-node~7 \
+tbtc_signing@842@sign842=r1-node-1~1 \
+beacon_signing@841@entry841=r1-node-1~1 \
+beacon_signing@841@entry841=prior-node~7"'
+check "shares in separate transcripts are not one mixed transcript" 3 \
+  "no tbtc transcript incorporated a share"
+
+# A service the rehearsal does not run is not the R1 fleet. Accepting any
+# non-prior holder would let a stray container satisfy the R1 half of the
+# claim without either rehearsed release having taken part.
+run_verdict precutover_case eval '
+  PRECUTOVER_CONTRIBUTORS="\
+tbtc_wallet_action@840@wallet840=prior-node~7 \
+tbtc_wallet_action@840@wallet840=bystander-node~3 \
+beacon_signing@841@entry841=r1-node-1~1 \
+beacon_signing@841@entry841=prior-node~7"'
+check "an unrecognized service does not stand in for the R1 fleet" 3 \
+  "no tbtc transcript incorporated a share"
+
 # Work driven by a fleet already past C is not pre-cutover work, whatever
 # mode counter moved.
 run_verdict precutover_case eval \
