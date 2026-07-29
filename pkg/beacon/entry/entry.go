@@ -114,7 +114,7 @@ func SignAndSubmit(
 	// change the point's value, so signature recovery is unaffected.
 	selfShareBytes := selfShare.Marshal()
 
-	sessionID := hex.EncodeToString(previousEntryBytes)
+	sessionID := shareSessionID(previousEntryBytes)
 
 	go broadcastShare(ctx, logger, signer.MemberID(), selfShareBytes, channel, sessionID)
 
@@ -239,6 +239,33 @@ func incorporatedMemberships(
 	slices.Sort(memberships)
 
 	return memberships
+}
+
+// shareSessionID renders the broadcast session a signature share belongs to.
+//
+// It is the previous entry and nothing else, and it cannot become anything else
+// while a release deriving it this way is on the network: the session ID travels
+// on the wire, and both sides of a mixed-release group have to arrive at the same
+// string for the same request or each silently filters the other's shares out as
+// belonging to some other session.
+//
+// So a session identifies the value being signed rather than the request that
+// asked for it, and the difference is visible in one place. A relay entry is
+// deterministic in the previous entry, so a request following one that timed out
+// without a submission carries the same previous entry as the request before it —
+// and a share produced for the earlier request is then indistinguishable from one
+// produced for the later one: same signing key share, same point, same session.
+//
+// Accepting it is sound, because the entry recovered from it is the same value
+// either way. What it means is that the population behind a recovered entry
+// attributes seats to that entry and not to the request an audit joined it to: a
+// seat in it held the private share behind its membership and put it into this
+// result, and a reader taking it for an account of which parties were live at a
+// given relay request start block is reading more than the wire carries. Binding
+// a share to its request would mean putting the request anchor in the message,
+// which is exactly the wire change a compatibility release cannot make.
+func shareSessionID(previousEntryBytes []byte) string {
+	return hex.EncodeToString(previousEntryBytes)
 }
 
 func broadcastShare(

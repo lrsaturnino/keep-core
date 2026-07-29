@@ -209,12 +209,24 @@ func (sdc *signingDoneCheck) signalDone(
 // and the only one this node has. Every done check counted here was
 // authenticated against the wallet's on-chain signing group, sent by a
 // membership this attempt selected, ended inside this attempt's own protocol
-// window, and carried a signature equal to every other — so a membership in
-// that list contributed to this exact result, and a membership absent from it
-// did not confirm anything about it. That distinction is what a reader
-// otherwise has to take from whichever party wrote the report: a completed
-// ceremony reads identically whether its shares came from several parties or
-// one party recovered the common result alone.
+// window, and carried a signature equal to every other — so a membership in that
+// list confirmed this exact result under an identity the chain accounts for, and
+// a membership absent from it confirmed nothing about it. That distinction is
+// what a reader otherwise has to take from whichever party wrote the report: a
+// completed ceremony reads identically whether its shares came from several
+// parties or one party recovered the common result alone.
+//
+// It is an attestation by each named membership rather than a proof that it
+// computed a share, and the difference is bounded by what the wire carries. A
+// done message names the message, the attempt number, the signature, and the
+// block its sender finished at; nothing in it is derived from this attempt's
+// protocol transcript. The window check is therefore what separates the runs: it
+// refuses the earlier run's messages, whose end blocks lie outside this attempt's
+// window, whether they were honestly retransmitted or replayed by anybody who
+// captured them. A selected membership choosing to assert an in-window end block
+// over an output it did not compute is not separated by it, and separating it
+// would mean binding the message to a session the prior release does not
+// compute — the wire change a compatibility release cannot make.
 func (sdc *signingDoneCheck) waitUntilAllDone(ctx context.Context) (
 	*signing.Result,
 	participation.MemberIndexes,

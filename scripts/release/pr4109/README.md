@@ -440,6 +440,38 @@ The R1 half of every mixed claim is therefore a seat the holder says was its own
 so an R1 node that only watched a prior-only result finish supplies neither half
 of the claim, and a driver naming it as a party is refused.
 
+What a seat in a transcript attests is bounded by the wire the two releases
+share, and the bound belongs in the evidence rather than in a reader's
+assumptions. A compatibility release cannot add a field to a message the prior
+binary already parses, so neither of the two signing populations can be bound to
+the protocol session it is joined to:
+
+- A **tBTC done check** carries the message, the attempt number, the signature,
+  and the block its sender finished at, and nothing derived from the attempt's
+  own transcript. Holding the end block to the attempt's window is what refuses
+  the earlier run's messages — the same message and attempt number recur when a
+  wallet is asked to sign again under a later anchor, with numbering restarting —
+  whether they were honestly retransmitted or replayed by anyone who captured
+  them. A membership the attempt selected that asserts an in-window end block
+  over an output it did not compute is not refused by it. A seat here therefore
+  says "this membership confirmed this result, under an identity the chain
+  accounts for, inside this attempt's window", which is an attestation and not a
+  proof of computation.
+- A **beacon relay share** is authenticated against the group public key share
+  published for the membership that sent it and against the previous entry being
+  signed, and names no request. A relay entry is deterministic in its previous
+  entry, so a request following one that timed out without a submission signs the
+  same previous entry and a share belonging to either is valid for both. A seat
+  here says "this membership held the private share behind its seat and put it
+  into this recovered entry" — the entry, not the request an audit joined it to.
+
+Both limits are load-bearing for how the mixed-release verdicts should be read:
+they say the prior release's shares combined with this fleet's into one threshold
+output, which is the compatibility claim, and they do not by themselves establish
+that a given party was live at a given anchor. That the prior binary was up and
+serving across each step is evidence the rehearsal collects separately, from the
+container it runs rather than from any transcript.
+
 The straggler control reads the announcer's own account of the sighting
 rather than the gate's refusal counter, which counts a node declining its own
 `Begin` for reasons that need no legacy announcement behind them. It requires

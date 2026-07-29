@@ -942,6 +942,18 @@ func recordRelayEntryTerminalOutcome(
 // leave the rest looking like shares some other party had to supply — which is
 // exactly the reading a fleet subtracting its own memberships from the
 // incorporated population draws to find the parties outside it.
+//
+// What the incorporated half attests is bounded by the wire, and the bound is
+// worth stating where the record is written. A share is authenticated against the
+// group public key share published for the membership that sent it and against
+// the previous entry being signed, and nothing in it names the request. A relay
+// entry is deterministic in its previous entry, so a request that follows one
+// which timed out without a submission signs the same previous entry, and a share
+// belonging to either is valid for both. A seat named here therefore held the
+// private share behind its membership and put it into this recovered entry; that
+// it was live at this request's start block is more than the share can say.
+// Binding the two would mean carrying the request anchor in the message, which is
+// the wire change this release cannot make.
 func relayTranscriptContribution(
 	incorporated participation.MemberIndexes,
 	memberships []*registry.Membership,
