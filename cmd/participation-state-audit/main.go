@@ -2882,11 +2882,13 @@ func authenticatedInactivityClaims(
 // selected group answered, and which ones an accepted timeout report
 // terminated.
 //
-// The three are indexed together because no one of them settles a permit's
-// result on its own. A timeout log proves a request was terminated but not
-// which request a permit was issued for; a request log supplies that binding;
-// a submission log contradicts a penalty outright and says which entry the
-// beacon accepted for the request a signing permit answered.
+// They are indexed together because no one of them settles a permit's result on
+// its own. A timeout log proves a request was terminated but not which request
+// a permit was issued for; a request log supplies that binding and names the
+// group the beacon selected; a group registration turns that group's registry
+// index into the key a record can be held to; and a submission log contradicts
+// a penalty outright and says which entry the beacon accepted for the request a
+// signing permit answered.
 type relayEntryLifecycleLogs struct {
 	// requestBlocks maps a beacon request identifier to the block its
 	// RelayEntryRequested log was mined in.
@@ -2904,6 +2906,28 @@ type relayEntryLifecycleLogs struct {
 	// ambiguousIdentities names every block-and-previous-entry identity the
 	// receipts place more than one request under.
 	ambiguousIdentities map[string]struct{}
+	// identityRequests is the reverse of requestIdentities, kept so a request
+	// identifier the receipts hand to two different identities can be named
+	// ambiguous. One request identifier answering two requests would let a
+	// permit be closed by the evidence of the other one.
+	identityRequests map[string]string
+	// requestGroups maps a beacon request identifier to the registry index of
+	// the group the beacon selected to answer it, in decimal. The selection is
+	// the beacon's, not the node's: it is what says which group's permit an
+	// accepted entry is allowed to close.
+	requestGroups map[string]string
+	// ambiguousRequestGroups names every request identifier the receipts place
+	// under more than one selected group.
+	ambiguousRequestGroups map[string]struct{}
+	// registeredGroupKeys maps a group's registry index to the hash of the
+	// public key it was registered under. GroupRegistered indexes that key, so
+	// the log carries its hash rather than its bytes; the hash is still the
+	// exact binding between the index a request names and the key a permit's
+	// record carries.
+	registeredGroupKeys map[string]string
+	// ambiguousGroupRegistrations names every registry index the receipts
+	// register more than one differing public key under.
+	ambiguousGroupRegistrations map[string]struct{}
 	// submittedEntries maps a request identifier to the entry a
 	// RelayEntrySubmitted log records the beacon accepting for it, normalized
 	// to the canonical point encoding. A request whose receipts carry more than
@@ -2956,11 +2980,12 @@ func authenticatedRelayEntryLogs(
 		)
 	}
 
-	events := make(map[string]abi.Event, 3)
+	events := make(map[string]abi.Event, 4)
 	for _, name := range []string{
 		"RelayEntryRequested",
 		"RelayEntrySubmitted",
 		"RelayEntryTimedOut",
+		"GroupRegistered",
 	} {
 		event, ok := parsed.Events[name]
 		if !ok {
@@ -2973,14 +2998,19 @@ func authenticatedRelayEntryLogs(
 	}
 
 	logs := &relayEntryLifecycleLogs{
-		requestBlocks:        make(map[string]uint64),
-		ambiguousRequests:    make(map[string]struct{}),
-		requestIdentities:    make(map[string]string),
-		ambiguousIdentities:  make(map[string]struct{}),
-		submittedEntries:     make(map[string][]byte),
-		ambiguousSubmissions: make(map[string]struct{}),
-		submittedRequests:    make(map[string]struct{}),
-		timeouts:             make(map[string]uint64),
+		requestBlocks:               make(map[string]uint64),
+		ambiguousRequests:           make(map[string]struct{}),
+		requestIdentities:           make(map[string]string),
+		ambiguousIdentities:         make(map[string]struct{}),
+		identityRequests:            make(map[string]string),
+		requestGroups:               make(map[string]string),
+		ambiguousRequestGroups:      make(map[string]struct{}),
+		registeredGroupKeys:         make(map[string]string),
+		ambiguousGroupRegistrations: make(map[string]struct{}),
+		submittedEntries:            make(map[string][]byte),
+		ambiguousSubmissions:        make(map[string]struct{}),
+		submittedRequests:           make(map[string]struct{}),
+		timeouts:                    make(map[string]uint64),
 	}
 
 	// The enclosing receipt validation already requires every log address and
@@ -2992,9 +3022,57 @@ func authenticatedRelayEntryLogs(
 			if rawLog.Address != record.RandomBeaconAddress {
 				continue
 			}
-			// The request identifier is the sole indexed input of all three
-			// events, so each log always has exactly the signature topic and
-			// the request topic.
+			if len(rawLog.Topics) == 0 {
+				continue
+			}
+
+			// GroupRegistered is the one event here with two indexed inputs:
+			// the registry index a request names a group by, and the hash of
+			// the public key that group signs under. It carries no request
+			// identifier, so it is read before the request-topic gate below.
+			if rawLog.Topics[0] == events["GroupRegistered"].ID.Hex() {
+				if len(rawLog.Topics) != 3 {
+					continue
+				}
+				groupIDBytes, err := decodeCanonicalEthereumBytes(
+					rawLog.Topics[1],
+					32,
+				)
+				if err != nil {
+					continue
+				}
+				groupIDValue := new(big.Int).SetBytes(groupIDBytes)
+				if !groupIDValue.IsUint64() {
+					continue
+				}
+				groupID := groupIDValue.String()
+
+				keyHash, err := decodeCanonicalEthereumBytes(
+					rawLog.Topics[2],
+					32,
+				)
+				if err != nil {
+					continue
+				}
+				registeredKey := hex.EncodeToString(keyHash)
+
+				if known, seen := logs.registeredGroupKeys[groupID]; seen &&
+					known != registeredKey {
+					logs.ambiguousGroupRegistrations[groupID] = struct{}{}
+					delete(logs.registeredGroupKeys, groupID)
+					continue
+				}
+				if _, ambiguous :=
+					logs.ambiguousGroupRegistrations[groupID]; ambiguous {
+					continue
+				}
+				logs.registeredGroupKeys[groupID] = registeredKey
+				continue
+			}
+
+			// The request identifier is the sole indexed input of the other
+			// three events, so each of their logs always has exactly the
+			// signature topic and the request topic.
 			if len(rawLog.Topics) != 2 {
 				continue
 			}
@@ -3016,10 +3094,11 @@ func authenticatedRelayEntryLogs(
 				}
 				logs.requestBlocks[requestID] = receipt.BlockNumber
 
-				// The previous entry is the request's second non-indexed
-				// value; the first is the group the beacon selected, which
-				// names a registry index rather than the key a permit's
-				// record carries and so joins nothing here.
+				// The request's two non-indexed values are the group the
+				// beacon selected to answer it and the previous entry it
+				// signs over. The selected group names a registry index
+				// rather than a public key, so it is joined to the key a
+				// permit's record carries through GroupRegistered.
 				event := events["RelayEntryRequested"]
 				data, err := decodeCanonicalEthereumDynamicBytes(rawLog.Data)
 				if err != nil {
@@ -3029,6 +3108,10 @@ func authenticatedRelayEntryLogs(
 				if err != nil || len(values) < 2 {
 					continue
 				}
+				selectedGroupID, ok := values[0].(uint64)
+				if !ok {
+					continue
+				}
 				previousEntry, ok := values[1].([]byte)
 				if !ok {
 					continue
@@ -3036,6 +3119,16 @@ func authenticatedRelayEntryLogs(
 				canonicalPreviousEntry, ok := canonicalRelayPoint(previousEntry)
 				if !ok {
 					continue
+				}
+
+				selectedGroup := strconv.FormatUint(selectedGroupID, 10)
+				if known, seen := logs.requestGroups[requestID]; seen &&
+					known != selectedGroup {
+					logs.ambiguousRequestGroups[requestID] = struct{}{}
+					delete(logs.requestGroups, requestID)
+				} else if _, ambiguous :=
+					logs.ambiguousRequestGroups[requestID]; !ambiguous {
+					logs.requestGroups[requestID] = selectedGroup
 				}
 
 				identity := relayEntryIdentity(
@@ -3048,6 +3141,16 @@ func authenticatedRelayEntryLogs(
 					continue
 				}
 				logs.requestIdentities[identity] = requestID
+
+				// One request identifier answering two different requests
+				// would let either one's evidence close the other's permit,
+				// so the identifier binds neither rather than binding both.
+				if known, seen := logs.identityRequests[requestID]; seen &&
+					known != identity {
+					logs.ambiguousRequests[requestID] = struct{}{}
+					continue
+				}
+				logs.identityRequests[requestID] = identity
 			case events["RelayEntrySubmitted"].ID.Hex():
 				logs.submittedRequests[requestID] = struct{}{}
 
@@ -3242,6 +3345,113 @@ func (r *auditRun) reconcileRelayTimeoutSettlements(
 	return violations
 }
 
+// relayGroupKeyHash renders the beacon's own identifier for a group public
+// key: the hash of the uncompressed point.
+//
+// The registry keys groups by that hash and GroupRegistered indexes the key,
+// so the hash — not the key bytes — is what an authenticated log carries and
+// what a record's compressed key has to be reduced to before the two can be
+// compared at all.
+func relayGroupKeyHash(compressedGroupPublicKey []byte) (string, error) {
+	groupPublicKey, err := altbn128.DecompressToG2(compressedGroupPublicKey)
+	if err != nil {
+		return "", err
+	}
+
+	return hex.EncodeToString(
+		ethereumCrypto.Keccak256(groupPublicKey.Marshal()),
+	), nil
+}
+
+// relayEntryGroupSelectionViolation reports why the group a completed relay
+// signing outcome names cannot be the group the beacon selected to answer the
+// request, or the empty string when the authenticated logs do not contradict
+// it.
+//
+// The recovered entry on its own proves only that some group this node holds
+// key material for signed the previous entry, which is all the pairing check in
+// the journal pass can establish. It does not say the group was the one this
+// request selected. Relay entries are deterministic, so an entry another
+// locally held group produced over the same previous entry is a real signature
+// that verifies — and without this join it would close the selected group's
+// permit, recording work the selected group never did.
+//
+// The beacon's own RelayEntryRequested log names the selected group by its
+// registry index, and GroupRegistered binds that index to the hash of the key
+// the group signs under. Together they turn the node's claim into one the chain
+// can refuse.
+//
+// Absence is not a contradiction. Evidence gathered around a request carries no
+// reason to include the receipt that registered a group blocks or months
+// earlier, and failing a completed ceremony over a log that is merely not in
+// the bundle would refuse honest nodes. What is refused is evidence that
+// contradicts itself or the record: a request selecting two groups, a group
+// registered under two keys, or a selected group whose registered key is not
+// the one the record names.
+func relayEntryGroupSelectionViolation(
+	logs *relayEntryLifecycleLogs,
+	outcomeIndex int,
+	reference string,
+	requestID string,
+	compressedGroupPublicKey []byte,
+) string {
+	if _, ambiguous := logs.ambiguousRequestGroups[requestID]; ambiguous {
+		return fmt.Sprintf(
+			"node-authored outcome [%d] reports relay entry [%s], but the "+
+				"authenticated logs select more than one group for request "+
+				"[%s], so the group the entry had to come from is ambiguous",
+			outcomeIndex,
+			reference,
+			requestID,
+		)
+	}
+	selectedGroup, selected := logs.requestGroups[requestID]
+	if !selected {
+		return ""
+	}
+
+	if _, ambiguous :=
+		logs.ambiguousGroupRegistrations[selectedGroup]; ambiguous {
+		return fmt.Sprintf(
+			"node-authored outcome [%d] reports relay entry [%s], but the "+
+				"authenticated logs register group [%s] — the group request "+
+				"[%s] selected — under more than one public key",
+			outcomeIndex,
+			reference,
+			selectedGroup,
+			requestID,
+		)
+	}
+	registeredKeyHash, registered := logs.registeredGroupKeys[selectedGroup]
+	if !registered {
+		return ""
+	}
+
+	namedKeyHash, err := relayGroupKeyHash(compressedGroupPublicKey)
+	if err != nil {
+		// A group key that is not a point on the curve is reported by the
+		// journal pass, which verifies the entry under it; there is nothing
+		// this join can add to that.
+		return ""
+	}
+
+	if namedKeyHash != registeredKeyHash {
+		return fmt.Sprintf(
+			"node-authored outcome [%d] reports relay entry [%s], but the "+
+				"authenticated logs have request [%s] answered by group [%s], "+
+				"registered under public key hash [%s] rather than the key "+
+				"the entry names",
+			outcomeIndex,
+			reference,
+			requestID,
+			selectedGroup,
+			registeredKeyHash,
+		)
+	}
+
+	return ""
+}
+
 // reconcileRelayEntryResults binds every relay entry a node recorded as its
 // signing permit's result to the beacon's own request, and refuses one the
 // beacon contradicts.
@@ -3262,6 +3472,13 @@ func (r *auditRun) reconcileRelayTimeoutSettlements(
 // emitted for this permit's block has to be the one signing over this record's
 // previous entry. An entry recovered for another request signs over that
 // request's previous entry and matches no request at this block.
+//
+// The same log names the group the beacon selected to answer the request, and
+// that group has to be the one the record names. A node holding memberships of
+// several groups can otherwise close a selected group's permit with an entry a
+// different one of its groups produced over the same previous entry, which
+// verifies and answers this very request but records work by a group that did
+// none.
 //
 // Where the beacon accepted an entry for that request, it must be the entry the
 // node named. A submission is not required, though: a group's threshold
@@ -3284,7 +3501,7 @@ func (r *auditRun) reconcileRelayEntryResults(
 			continue
 		}
 
-		referenceStartBlock, _, previousEntry, entry, err :=
+		referenceStartBlock, groupPublicKey, previousEntry, entry, err :=
 			participation.ParseBeaconRelayEntryReference(
 				outcome.Evidence.Reference,
 			)
@@ -3330,6 +3547,29 @@ func (r *auditRun) reconcileRelayEntryResults(
 				outcome.Evidence.Reference,
 				referenceStartBlock,
 			))
+			continue
+		}
+		if _, ambiguous := logs.ambiguousRequests[requestID]; ambiguous {
+			violations = append(violations, fmt.Sprintf(
+				"node-authored outcome [%d] reports relay entry [%s], but the "+
+					"authenticated logs answer more than one request under "+
+					"identifier [%s], so the request the entry answers cannot "+
+					"be bound to the permit",
+				i,
+				outcome.Evidence.Reference,
+				requestID,
+			))
+			continue
+		}
+
+		if selectionViolation := relayEntryGroupSelectionViolation(
+			logs,
+			i,
+			outcome.Evidence.Reference,
+			requestID,
+			groupPublicKey,
+		); selectionViolation != "" {
+			violations = append(violations, selectionViolation)
 			continue
 		}
 

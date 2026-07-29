@@ -5283,6 +5283,71 @@ func addTestRelayEntryReceipt(
 	var requestTopic [32]byte
 	requestID.FillBytes(requestTopic[:])
 
+	addTestBeaconLogReceipt(
+		t,
+		record,
+		address,
+		[]string{
+			strings.ToLower(event.ID.Hex()),
+			"0x" + hex.EncodeToString(requestTopic[:]),
+		},
+		data,
+		blockNumber,
+	)
+}
+
+// addTestGroupRegisteredReceipt appends an authenticated receipt carrying the
+// RandomBeacon's own registration of a group: the registry index a request
+// names the group by, and the hash of the public key it signs under. Both
+// inputs are indexed, so the log carries them as topics and no data.
+func addTestGroupRegisteredReceipt(
+	t *testing.T,
+	record *chainReconciliationEvidence,
+	address string,
+	groupID uint64,
+	groupPublicKey []byte,
+	blockNumber uint64,
+) {
+	t.Helper()
+
+	parsed, err := beaconabi.RandomBeaconMetaData.GetAbi()
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, ok := parsed.Events["GroupRegistered"]
+	if !ok {
+		t.Fatal("generated RandomBeacon ABI has no GroupRegistered event")
+	}
+
+	var groupTopic [32]byte
+	new(big.Int).SetUint64(groupID).FillBytes(groupTopic[:])
+
+	addTestBeaconLogReceipt(
+		t,
+		record,
+		address,
+		[]string{
+			strings.ToLower(event.ID.Hex()),
+			"0x" + hex.EncodeToString(groupTopic[:]),
+			"0x" + hex.EncodeToString(ethereumCrypto.Keccak256(groupPublicKey)),
+		},
+		nil,
+		blockNumber,
+	)
+}
+
+// addTestBeaconLogReceipt appends an authenticated receipt carrying one raw
+// RandomBeacon log, then re-attests and re-signs the record.
+func addTestBeaconLogReceipt(
+	t *testing.T,
+	record *chainReconciliationEvidence,
+	address string,
+	topics []string,
+	data []byte,
+	blockNumber uint64,
+) {
+	t.Helper()
+
 	transactionHash := fmt.Sprintf(
 		"0x%064x",
 		blockNumber*31+uint64(len(record.Receipts))+1,
@@ -5295,11 +5360,8 @@ func addTestRelayEntryReceipt(
 		Status:           1,
 		Logs: []ethereumRawLogEvidence{
 			{
-				Address: address,
-				Topics: []string{
-					strings.ToLower(event.ID.Hex()),
-					"0x" + hex.EncodeToString(requestTopic[:]),
-				},
+				Address:  address,
+				Topics:   topics,
 				Data:     "0x" + hex.EncodeToString(data),
 				LogIndex: 0,
 			},
@@ -5653,6 +5715,15 @@ func TestValidateChainReconciliationEvidence_RelayEntryResult(t *testing.T) {
 
 	const requestStartBlock = uint64(9_400)
 	const groupSecret = int64(0x5eed)
+	const otherGroupSecret = int64(0x5eee)
+	const selectedGroupID = uint64(1)
+	const otherGroupID = uint64(7)
+
+	// The uncompressed point is the form the registry stores and the beacon
+	// hashes a group's identity from; the reference carries the compressed one.
+	onChainGroupPublicKey := func(secret int64) []byte {
+		return new(bn256.G2).ScalarBaseMult(big.NewInt(secret)).Marshal()
+	}
 
 	reference := testRelayEntryReference(
 		requestStartBlock,
@@ -5729,11 +5800,12 @@ func TestValidateChainReconciliationEvidence_RelayEntryResult(t *testing.T) {
 		return run, chainRecord
 	}
 
-	addRequest := func(
+	addRequestFromGroup := func(
 		t *testing.T,
 		record *chainReconciliationEvidence,
 		id *big.Int,
 		blockNumber uint64,
+		selectedGroupID uint64,
 		requestPreviousEntry []byte,
 	) {
 		t.Helper()
@@ -5745,7 +5817,26 @@ func TestValidateChainReconciliationEvidence_RelayEntryResult(t *testing.T) {
 			"RelayEntryRequested",
 			id,
 			blockNumber,
-			uint64(1),
+			selectedGroupID,
+			requestPreviousEntry,
+		)
+	}
+
+	addRequest := func(
+		t *testing.T,
+		record *chainReconciliationEvidence,
+		id *big.Int,
+		blockNumber uint64,
+		requestPreviousEntry []byte,
+	) {
+		t.Helper()
+
+		addRequestFromGroup(
+			t,
+			record,
+			id,
+			blockNumber,
+			selectedGroupID,
 			requestPreviousEntry,
 		)
 	}
@@ -5860,6 +5951,126 @@ func TestValidateChainReconciliationEvidence_RelayEntryResult(t *testing.T) {
 			"no authenticated RandomBeacon RelayEntryRequested log makes a "+
 				"request over that previous entry",
 		)
+	})
+
+	// The beacon's request names the group it selected by a registry index, and
+	// the registration binds that index to the key the group signs under. Here
+	// the two agree with the record.
+	t.Run("registration binding the selected group's own key", func(t *testing.T) {
+		run, record := newRunAndRecord()
+		addRequest(t, record, requestID, requestStartBlock, previousEntry)
+		addTestGroupRegisteredReceipt(
+			t,
+			record,
+			testRandomBeaconAddress,
+			selectedGroupID,
+			onChainGroupPublicKey(groupSecret),
+			requestStartBlock-100,
+		)
+		assertSettles(t, validate(t, run, record))
+	})
+
+	// The entry is a real threshold signature over this very request's previous
+	// entry, and the pairing check passes, because the node holds a membership
+	// of the group that produced it. It is simply not the group the beacon
+	// selected, so the work it records is work the selected group never did.
+	t.Run("entry signed by a group the request did not select", func(t *testing.T) {
+		run, record := newRunAndRecord()
+		addRequest(t, record, requestID, requestStartBlock, previousEntry)
+		addTestGroupRegisteredReceipt(
+			t,
+			record,
+			testRandomBeaconAddress,
+			selectedGroupID,
+			onChainGroupPublicKey(otherGroupSecret),
+			requestStartBlock-100,
+		)
+		assertBlockedBy(
+			t,
+			validate(t, run, record),
+			"registered under public key hash",
+		)
+	})
+
+	t.Run("selected group registered under two keys", func(t *testing.T) {
+		run, record := newRunAndRecord()
+		addRequest(t, record, requestID, requestStartBlock, previousEntry)
+		addTestGroupRegisteredReceipt(
+			t,
+			record,
+			testRandomBeaconAddress,
+			selectedGroupID,
+			onChainGroupPublicKey(groupSecret),
+			requestStartBlock-100,
+		)
+		addTestGroupRegisteredReceipt(
+			t,
+			record,
+			testRandomBeaconAddress,
+			selectedGroupID,
+			onChainGroupPublicKey(otherGroupSecret),
+			requestStartBlock-99,
+		)
+		assertBlockedBy(
+			t,
+			validate(t, run, record),
+			"under more than one public key",
+		)
+	})
+
+	t.Run("one request selecting two groups", func(t *testing.T) {
+		run, record := newRunAndRecord()
+		addRequest(t, record, requestID, requestStartBlock, previousEntry)
+		addRequestFromGroup(
+			t,
+			record,
+			requestID,
+			requestStartBlock,
+			otherGroupID,
+			previousEntry,
+		)
+		assertBlockedBy(
+			t,
+			validate(t, run, record),
+			"select more than one group for request",
+		)
+	})
+
+	// One identifier answering two requests would let either request's evidence
+	// close the other's permit.
+	t.Run("one identifier answering two requests", func(t *testing.T) {
+		run, record := newRunAndRecord()
+		addRequest(t, record, requestID, requestStartBlock, previousEntry)
+		addRequest(
+			t,
+			record,
+			requestID,
+			requestStartBlock,
+			new(bn256.G1).ScalarBaseMult(big.NewInt(3)).Marshal(),
+		)
+		assertBlockedBy(
+			t,
+			validate(t, run, record),
+			"more than one request under identifier",
+		)
+	})
+
+	// Evidence gathered around a request has no reason to carry the receipt
+	// that registered its group, which may be blocks or months older. A group
+	// registration for some other group binds nothing here, and refusing the
+	// ceremony over a log that is merely absent would fail honest nodes.
+	t.Run("registration of an unrelated group", func(t *testing.T) {
+		run, record := newRunAndRecord()
+		addRequest(t, record, requestID, requestStartBlock, previousEntry)
+		addTestGroupRegisteredReceipt(
+			t,
+			record,
+			testRandomBeaconAddress,
+			otherGroupID,
+			onChainGroupPublicKey(otherGroupSecret),
+			requestStartBlock-100,
+		)
+		assertSettles(t, validate(t, run, record))
 	})
 
 	t.Run("two requests sharing one identity", func(t *testing.T) {
