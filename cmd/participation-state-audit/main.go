@@ -69,7 +69,7 @@ import (
 )
 
 // manifestSchemaVersion versions the audit manifest document.
-const manifestSchemaVersion = uint32(5)
+const manifestSchemaVersion = uint32(6)
 
 // The audited namespaces, relative to the storage root. The beacon quarantine
 // namespace is a sibling of the active beacon keystore precisely so the
@@ -442,9 +442,14 @@ type tbtcWalletRecord struct {
 	WalletStorageKey string `json:"wallet_storage_key"`
 	// WalletID is the ECDSA wallet ID derived from the decoded wallet public
 	// key — the identity chain reconciliation evidence must match exactly.
-	WalletID         string  `json:"wallet_id"`
-	MemberIndexes    []uint8 `json:"member_indexes"`
-	SigningGroupSize int     `json:"signing_group_size"`
+	WalletID string `json:"wallet_id"`
+	// WalletPublicKeyHash is the Bitcoin public key hash derived from the same
+	// decoded wallet public key. It is the identity a tBTC permit names itself
+	// with, so it is what binds a node-authored outcome to the registry wallet
+	// its chain settlement is allowed to name.
+	WalletPublicKeyHash string  `json:"wallet_public_key_hash"`
+	MemberIndexes       []uint8 `json:"member_indexes"`
+	SigningGroupSize    int     `json:"signing_group_size"`
 }
 
 type tbtcQuarantineRecord struct {
@@ -461,6 +466,11 @@ type tbtcQuarantineRecord struct {
 	// itself, so it stays the authoritative identity for chain
 	// reconciliation when the metadata half is incomplete.
 	SignerWalletID string `json:"signer_wallet_id,omitempty"`
+	// SignerWalletPublicKeyHash is the Bitcoin public key hash derived from
+	// the same preserved key material, and is authoritative for the same
+	// reason. Paired with SignerWalletID it tells the audit which registry
+	// wallet a permit naming this public key hash is about.
+	SignerWalletPublicKeyHash string `json:"signer_wallet_public_key_hash,omitempty"`
 	// HasMembershipRecord reports whether the preserved signer bytes
 	// accompany the metadata; metadata without the signer means the key
 	// material was lost and the record is evidence only.
@@ -2342,25 +2352,40 @@ func (r *auditRun) validateChainReconciliationEvidence(
 }
 
 // reconcileInactivityClaimSettlements joins every inactivity claim the node
-// recorded dispatching to the authenticated WalletRegistry logs.
+// recorded submitting to the authenticated WalletRegistry logs, and to the
+// wallet the punishing permit was actually about.
 //
 // A heartbeat that punishes members files that penalty on Ethereum, and the
-// node authors nothing about it beyond a digest of its own signature. Two
-// cases have to be told apart and neither may pass on the node's word. A
-// dispatch the node never saw settle is ambiguous: the claim may be on chain
-// under a nonce this node's rollback would then contradict, so the barrier
-// blocks. A dispatch the node reports as settled must be corroborated by a
-// canonical InactivityClaimed log for the exact wallet and nonce named,
-// emitted by the expected WalletRegistry inside an authenticated receipt. The
-// enclosing receipt validation has already bound every receipt to an attested
-// canonical block with successful status, so a matched log is chain state and
-// not a report the evidence generator wrote.
+// node authors nothing about it beyond a digest of its own signature. Three
+// cases have to be told apart and none may pass on the node's word.
+//
+// A submission the node could not resolve is ambiguous: the claim may be on
+// chain under a nonce this node's rollback would then contradict, so the
+// barrier blocks.
+//
+// A settlement the node reports must be corroborated by a canonical
+// InactivityClaimed log for the exact wallet and nonce named, emitted by the
+// expected WalletRegistry inside an authenticated receipt. The enclosing
+// receipt validation has already bound every receipt to an attested canonical
+// block with successful status, so a matched log is chain state and not a
+// report the evidence generator wrote.
+//
+// Corroboration alone would still let one wallet's outcome borrow another
+// wallet's penalty: every real claim log on the chain is equally real, and
+// asking only "does this claim exist" accepts any of them. The reported wallet
+// is therefore also bound to the wallet the permit names, through the
+// key-derived public-key-hash-to-wallet-ID mapping of the snapshot's own
+// signer material. An outcome the snapshot cannot bind names a penalty against
+// a wallet this node holds no key material for, which is not a claim its
+// heartbeat could have filed.
 func (r *auditRun) reconcileInactivityClaimSettlements(
 	record *chainReconciliationEvidence,
 ) []string {
 	if r.manifest.ParticipationTerminalOutcomes == nil {
 		return nil
 	}
+
+	permitWallets := r.permitWalletIDs()
 
 	var violations []string
 	var settled map[string]uint64
@@ -2373,9 +2398,9 @@ func (r *auditRun) reconcileInactivityClaimSettlements(
 		}
 		if settlement.Reference == "" {
 			violations = append(violations, fmt.Sprintf(
-				"node-authored outcome [%d] dispatched an inactivity claim it "+
-					"never observed settle; the penalty may or may not be on "+
-					"chain and cannot be reconciled",
+				"node-authored outcome [%d] submitted an inactivity claim "+
+					"whose settlement it could not resolve; the penalty may "+
+					"or may not be on chain and cannot be reconciled",
 				i,
 			))
 			continue
@@ -2389,6 +2414,34 @@ func (r *auditRun) reconcileInactivityClaimSettlements(
 				i,
 				settlement.Reference,
 				err,
+			))
+			continue
+		}
+
+		permitWalletID, bound := permitWallets[outcome.Permit.PermitID]
+		if !bound {
+			violations = append(violations, fmt.Sprintf(
+				"node-authored outcome [%d] reports an inactivity claim for "+
+					"permit [%s], but the snapshot holds no signer material "+
+					"identifying that wallet, so the reported penalty cannot "+
+					"be bound to the wallet it punished",
+				i,
+				outcome.Permit.PermitID,
+			))
+			continue
+		}
+		if claimedWalletID := hex.EncodeToString(
+			walletID,
+		); claimedWalletID != permitWalletID {
+			violations = append(violations, fmt.Sprintf(
+				"node-authored outcome [%d] runs under permit [%s], which is "+
+					"wallet [%s], but reports settling inactivity claim [%s] "+
+					"against wallet [%s]",
+				i,
+				outcome.Permit.PermitID,
+				permitWalletID,
+				settlement.Reference,
+				claimedWalletID,
 			))
 			continue
 		}
@@ -2418,6 +2471,36 @@ func (r *auditRun) reconcileInactivityClaimSettlements(
 	}
 
 	return violations
+}
+
+// permitWalletIDs maps the wallet public key hash a tBTC permit names itself
+// with to the ECDSA wallet identifier the registry knows that wallet by.
+//
+// Both halves are derived from the decoded key material rather than read from
+// a label the node wrote, and one public key yields exactly one of each, so the
+// mapping is the snapshot's own answer to which registry wallet a given permit
+// is about. Quarantined material counts: a heartbeat can punish a wallet whose
+// signer records the rollback later quarantined, and the wallet it punished is
+// no less identified for that.
+func (r *auditRun) permitWalletIDs() map[string]string {
+	walletIDs := make(map[string]string)
+
+	for _, wallet := range r.manifest.TBTCActiveWallets {
+		if wallet.WalletPublicKeyHash == "" || wallet.WalletID == "" {
+			continue
+		}
+		walletIDs[wallet.WalletPublicKeyHash] = wallet.WalletID
+	}
+	for _, quarantined := range r.manifest.TBTCQuarantinedOutputs {
+		if quarantined.SignerWalletPublicKeyHash == "" ||
+			quarantined.SignerWalletID == "" {
+			continue
+		}
+		walletIDs[quarantined.SignerWalletPublicKeyHash] =
+			quarantined.SignerWalletID
+	}
+
+	return walletIDs
 }
 
 // authenticatedInactivityClaims indexes every InactivityClaimed log the
@@ -5251,9 +5334,10 @@ func interpretTBTCActiveNamespace(
 		wallet, ok := wallets[record.WalletStorageKey]
 		if !ok {
 			wallet = &tbtcWalletRecord{
-				WalletStorageKey: record.WalletStorageKey,
-				WalletID:         record.WalletID,
-				SigningGroupSize: record.SigningGroupSize,
+				WalletStorageKey:    record.WalletStorageKey,
+				WalletID:            record.WalletID,
+				WalletPublicKeyHash: record.WalletPublicKeyHash,
+				SigningGroupSize:    record.SigningGroupSize,
 			}
 			wallets[record.WalletStorageKey] = wallet
 			seenMembers[record.WalletStorageKey] = make(map[uint8]struct{})
@@ -5425,8 +5509,10 @@ func interpretTBTCQuarantineNamespace(
 			continue
 		}
 		signerWalletID := ""
+		signerWalletPublicKeyHash := ""
 		if entry.signer != nil {
 			signerWalletID = entry.signer.WalletID
+			signerWalletPublicKeyHash = entry.signer.WalletPublicKeyHash
 		}
 		run.manifest.TBTCQuarantinedOutputs = append(
 			run.manifest.TBTCQuarantinedOutputs,
@@ -5434,6 +5520,7 @@ func interpretTBTCQuarantineNamespace(
 				QuarantinedSignerMetadata: *entry.metadata,
 				WalletStorageKey:          entry.directory,
 				SignerWalletID:            signerWalletID,
+				SignerWalletPublicKeyHash: signerWalletPublicKeyHash,
 				HasMembershipRecord:       entry.signer != nil,
 			},
 		)

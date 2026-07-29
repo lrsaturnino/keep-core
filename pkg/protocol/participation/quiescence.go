@@ -270,21 +270,27 @@ const (
 	ChainSettlementInactivityClaim ChainSettlementKind = "tbtc_inactivity_claim"
 )
 
-// ChainSettlementRecord reports a chain side effect the ceremony dispatched
-// and the canonical chain state it was observed to settle into.
+// ChainSettlementRecord reports a chain side effect the ceremony handed to a
+// chain and the canonical chain state it was resolved to settle into.
 //
-// Dispatching is not settling. The submitting call can fail, be suppressed by
-// the release gate, lose the race to another member's submission, or be
-// canceled mid-flight, and in none of those cases does the node know whether
-// the side effect reached the chain. A dispatch whose settlement was never
-// observed is therefore recorded with an empty Reference: the attempt is on
-// the record, its outcome is unknown, and the offline barrier must treat it as
-// unreconciled instead of letting a node-authored digest close the journal
-// over a penalty that may or may not exist on chain.
+// Submitting is not settling. The submitting call returns as soon as the
+// transaction reaches the provider and the transaction is mined afterwards, it
+// can lose the race to another member's submission, and it can be canceled
+// mid-flight; in none of those cases does the node know from the call alone
+// whether the side effect reached the chain. A submission whose settlement the
+// ceremony could not resolve is therefore recorded with an empty Reference: the
+// attempt is on the record, its outcome is unknown, and the offline barrier
+// must treat it as unreconciled instead of letting a node-authored digest close
+// the journal over a penalty that may or may not exist on chain.
+//
+// The record is absent entirely when the ceremony never reached the submitting
+// call. A suppressed, refused, or aborted dispatch left no transaction
+// anywhere, and reporting it as an unresolved submission would block a rollback
+// over chain state that provably cannot exist.
 type ChainSettlementRecord struct {
 	Kind ChainSettlementKind `json:"kind"`
-	// Reference is the canonical chain identity of the observed settlement.
-	// It is empty when the dispatch was never observed to settle.
+	// Reference is the canonical chain identity of the resolved settlement.
+	// It is empty when the submission's settlement could not be resolved.
 	Reference string `json:"reference,omitempty"`
 }
 
@@ -621,7 +627,7 @@ func validateChainSettlement(
 		)
 	}
 
-	// An empty reference is the deliberate unobserved-dispatch record; only a
+	// An empty reference is the deliberate unresolved-submission record; only a
 	// reference that claims a settlement has to name one canonically.
 	if settlement.Reference == "" {
 		return nil

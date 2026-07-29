@@ -4331,12 +4331,16 @@ func TestValidateChainReconciliationEvidence_InactivityClaimSettlement(
 		t.Fatal(err)
 	}
 
+	// A tBTC permit names itself with the wallet public key hash, which is what
+	// the snapshot's own signer material resolves to the registry wallet ID.
+	walletPublicKeyHash := strings.Repeat("ab", 20)
+
 	permit := participation.PermitSnapshot{
 		Ceremony:            participation.TBTCHeartbeat,
 		Mode:                participation.ModeSecurityV2.String(),
 		CanonicalStartBlock: 8_000,
 		WorkID:              strings.Repeat("d", 64),
-		PermitID:            "1",
+		PermitID:            walletPublicKeyHash,
 		IdentityBound:       true,
 	}
 
@@ -4347,6 +4351,15 @@ func TestValidateChainReconciliationEvidence_InactivityClaimSettlement(
 			GeneratedAt: time.Now().UTC(),
 			Snapshot: snapshotIdentity{
 				AggregateSHA256: strings.Repeat("c", 64),
+			},
+			TBTCActiveWallets: []tbtcWalletRecord{
+				{
+					WalletStorageKey:    strings.Repeat("f", 40),
+					WalletID:            hex.EncodeToString(walletID[:]),
+					WalletPublicKeyHash: walletPublicKeyHash,
+					MemberIndexes:       []uint8{1},
+					SigningGroupSize:    1,
+				},
 			},
 			QuiescenceSnapshot: &participation.QuiescenceSnapshot{
 				SchemaVersion: participation.QuiescenceSnapshotSchemaVersion,
@@ -4428,6 +4441,23 @@ func TestValidateChainReconciliationEvidence_InactivityClaimSettlement(
 		)
 	}
 
+	// The wallet these outcomes punish is present only to identify itself, not
+	// to be reconciled as persisted state, so the coverage that persisted
+	// wallets owe the chain evidence is another test's subject. The passing
+	// cases assert only that the settlement reconciliation itself is silent.
+	assertSettles := func(t *testing.T, violations []string) {
+		t.Helper()
+
+		for _, violation := range violations {
+			if strings.Contains(violation, "inactivity claim") {
+				t.Fatalf(
+					"expected a corroborated settlement to reconcile, got: %s",
+					violation,
+				)
+			}
+		}
+	}
+
 	t.Run("settlement corroborated by a canonical claim log", func(t *testing.T) {
 		run, record := newRunAndRecord(&participation.ChainSettlementRecord{
 			Kind:      participation.ChainSettlementInactivityClaim,
@@ -4441,15 +4471,10 @@ func TestValidateChainReconciliationEvidence_InactivityClaimSettlement(
 			nonce,
 			claimBlock,
 		)
-		if violations := validate(t, run, record); len(violations) != 0 {
-			t.Fatalf(
-				"expected a corroborated settlement to pass, got: %v",
-				violations,
-			)
-		}
+		assertSettles(t, validate(t, run, record))
 	})
 
-	t.Run("dispatch never observed to settle", func(t *testing.T) {
+	t.Run("submission whose settlement stayed unresolved", func(t *testing.T) {
 		run, record := newRunAndRecord(&participation.ChainSettlementRecord{
 			Kind: participation.ChainSettlementInactivityClaim,
 		})
@@ -4461,13 +4486,100 @@ func TestValidateChainReconciliationEvidence_InactivityClaimSettlement(
 			nonce,
 			claimBlock,
 		)
-		// Even with the claim present on chain, an unobserved dispatch is
-		// unreconciled: the node cannot say the log it never saw is its own.
+		// Even with the claim present on chain, an unresolved submission is
+		// unreconciled: the node cannot say the log it never resolved is its
+		// own.
 		assertBlockedBy(
 			t,
 			validate(t, run, record),
-			"never observed settle",
+			"could not resolve",
 		)
+	})
+
+	// The check that keeps a real penalty from being borrowed: the log is
+	// authentic, canonical, and emitted by the expected registry — it just
+	// punishes a different wallet than the permit is about. Corroboration
+	// alone cannot tell those apart, because every real claim on the chain
+	// corroborates equally.
+	t.Run("valid claim log belonging to another wallet", func(t *testing.T) {
+		otherWalletID := walletID
+		otherWalletID[0] ^= 0xff
+
+		borrowedReference, err := participation.
+			InactivityClaimSettlementReference(otherWalletID[:], nonce)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		run, record := newRunAndRecord(&participation.ChainSettlementRecord{
+			Kind:      participation.ChainSettlementInactivityClaim,
+			Reference: borrowedReference,
+		})
+		addTestInactivityClaimedReceipt(
+			t,
+			record,
+			testWalletRegistryAddress,
+			otherWalletID,
+			nonce,
+			claimBlock,
+		)
+		assertBlockedBy(
+			t,
+			validate(t, run, record),
+			"reports settling inactivity claim",
+		)
+	})
+
+	// A penalty against a wallet this node holds no key material for is not a
+	// claim its heartbeat could have filed, so it cannot be bound and must not
+	// pass on the corroborating log alone.
+	t.Run("permit naming a wallet the snapshot does not hold", func(t *testing.T) {
+		run, record := newRunAndRecord(&participation.ChainSettlementRecord{
+			Kind:      participation.ChainSettlementInactivityClaim,
+			Reference: settledReference,
+		})
+		run.manifest.TBTCActiveWallets = nil
+		addTestInactivityClaimedReceipt(
+			t,
+			record,
+			testWalletRegistryAddress,
+			walletID,
+			nonce,
+			claimBlock,
+		)
+		assertBlockedBy(
+			t,
+			validate(t, run, record),
+			"holds no signer material identifying that wallet",
+		)
+	})
+
+	// Quarantined material identifies the punished wallet just as well: a
+	// rollback that quarantines a signer does not unmake the penalty its
+	// heartbeat filed.
+	t.Run("permit bound through quarantined material", func(t *testing.T) {
+		run, record := newRunAndRecord(&participation.ChainSettlementRecord{
+			Kind:      participation.ChainSettlementInactivityClaim,
+			Reference: settledReference,
+		})
+		run.manifest.TBTCActiveWallets = nil
+		run.manifest.TBTCQuarantinedOutputs = []tbtcQuarantineRecord{
+			{
+				WalletStorageKey:          strings.Repeat("f", 40),
+				SignerWalletID:            hex.EncodeToString(walletID[:]),
+				SignerWalletPublicKeyHash: walletPublicKeyHash,
+				HasMembershipRecord:       true,
+			},
+		}
+		addTestInactivityClaimedReceipt(
+			t,
+			record,
+			testWalletRegistryAddress,
+			walletID,
+			nonce,
+			claimBlock,
+		)
+		assertSettles(t, validate(t, run, record))
 	})
 
 	t.Run("settlement with no matching claim log", func(t *testing.T) {
