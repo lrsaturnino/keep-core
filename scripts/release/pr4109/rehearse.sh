@@ -3767,8 +3767,70 @@ would be empty"
   fi
 }
 
+# The identity every gate reading renders a permit under, shared by the live
+# and the closed halves so one permit reads the same in both:
+#
+#   <service>@<ceremony>@<canonical start block>@<chain work>#<permit>
+#
+# The gate's own uniqueness key is the whole of it. Work IDs and local permit
+# IDs are only unique within a ceremony and an anchor — a beacon member index
+# is "1" for every group that node ever joins, and a wallet action's work ID
+# repeats at every window — so a reading that named the last two alone lets a
+# permit from one ceremony be answered by a record from another. The service
+# is inside the identity rather than beside it because two nodes legitimately
+# hold the same local permit id for the same chain work.
+#
+# This JS fragment is the one definition of that rendering and of what makes a
+# permit readable at all. It is shared rather than repeated so the live list,
+# the closed account, and the single-response drain snapshot cannot drift into
+# accepting different things.
+PERMIT_IDENTITY_JS='
+      // The gate emits only nonsecret identity tokens, whose charset excludes
+      // every separator this rendering uses. Checking it here is what keeps a
+      // permit from splitting into a different permit than the node meant.
+      const TOKEN = /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/;
+      const permitIdentity = (service, permit, what) => {
+        if (permit === null || typeof permit !== "object" ||
+          Array.isArray(permit)) {
+          console.error("not a permit: " + JSON.stringify(permit));
+          process.exit(1);
+        }
+        if (permit.identity_bound !== true) {
+          console.error(what + " is not identity-bound: " +
+            JSON.stringify(permit));
+          process.exit(1);
+        }
+        if (typeof permit.ceremony !== "string" ||
+          !TOKEN.test(permit.ceremony)) {
+          console.error(what + " names no gate ceremony: " +
+            JSON.stringify(permit));
+          process.exit(1);
+        }
+        // The anchor the permit pinned its mode from. Two runs of one ceremony
+        // are told apart by this and nothing else, so a reading that dropped
+        // it would let a pre-cutover permit be answered by a post-cutover one.
+        if (!Number.isInteger(permit.canonical_start_block) ||
+          permit.canonical_start_block < 0) {
+          console.error(what + " names no canonical start block: " +
+            JSON.stringify(permit));
+          process.exit(1);
+        }
+        if (typeof permit.work_id !== "string" ||
+          !TOKEN.test(permit.work_id) ||
+          typeof permit.permit_id !== "string" ||
+          !TOKEN.test(permit.permit_id)) {
+          console.error(what + " names no work or permit identity: " +
+            JSON.stringify(permit));
+          process.exit(1);
+        }
+        return service + "@" + permit.ceremony + "@" +
+          permit.canonical_start_block + "@" + permit.work_id + "#" +
+          permit.permit_id;
+      };
+'
+
 # The permits of one mode that one node's gate reports live at this instant,
-# rendered as "<service>=<chain work>#<permit>" tokens.
+# rendered as permit identity tokens.
 #
 # A count of active ceremonies answers "this node is holding two" and nothing
 # further, so a control watching work cross C or drain out of a quiescing node
@@ -3783,7 +3845,8 @@ would be empty"
 service_mode_permits() {
   local service="$1" mode="$2"
   probe_diagnostics "${service}" |
-    node -e '
+    node -e "
+      ${PERMIT_IDENTITY_JS}"'
       let raw = "";
       process.stdin.on("data", (d) => (raw += d));
       process.stdin.on("end", () => {
@@ -3805,20 +3868,7 @@ service_mode_permits() {
           if (permit.mode !== mode) {
             continue;
           }
-          if (permit.identity_bound !== true) {
-            console.error("a permit is not identity-bound: " +
-              JSON.stringify(permit));
-            process.exit(1);
-          }
-          if (typeof permit.work_id !== "string" ||
-            !/^\S+$/.test(permit.work_id) ||
-            typeof permit.permit_id !== "string" ||
-            !/^\S+$/.test(permit.permit_id)) {
-            console.error("a permit names no work or permit identity: " +
-              JSON.stringify(permit));
-            process.exit(1);
-          }
-          out.push(service + "=" + permit.work_id + "#" + permit.permit_id);
+          out.push(permitIdentity(service, permit, "a permit"));
         }
         process.stdout.write(out.join(" "));
       });
@@ -3841,10 +3891,156 @@ service_mode_permits() {
 # A record that names no work or permit identity is refused rather than
 # skipped. It would otherwise read exactly like a permit whose disposition the
 # node never recorded, which is the case the joins below have to block on.
+TERMINAL_OUTCOME_JS='
+      // "unresolved" is in this list deliberately. It is what a permit closed
+      // by an owner that recorded nothing is written as, and it has to arrive
+      // as a disposition a reader can see and refuse rather than as an absence
+      // indistinguishable from a permit still in flight.
+      const OUTCOMES = [
+        "completed", "quarantined", "exhausted", "unresolved",
+      ];
+      // The dispositions whose evidence names durable state the node produced,
+      // and the ones whose evidence is the explicit absence of any. A record
+      // carrying the wrong half for its ending is refused: the whole point of
+      // reading evidence is that "completed" alone is a word, and the identity
+      // of what was left behind is the thing that distinguishes a ceremony
+      // that produced a result from a record that says it did.
+      const REFERENCED_EVIDENCE = [
+        "persisted_tbtc_signer", "persisted_beacon_signer",
+        "bitcoin_transaction", "ethereum_transaction", "protocol_result",
+      ];
+      const UNREFERENCED_EVIDENCE = [
+        "quarantined_tbtc_signer", "quarantined_beacon_signer",
+        "no_threshold", "forwarder_closed",
+      ];
+      // A reference the gate never carries, so an absent one reads as absent
+      // rather than as an empty field a later split could swallow. The gate
+      // token charset opens on an alphanumeric, so this can never collide with
+      // a real reference.
+      const NONE = "-";
+      const evidenceOf = (record) => {
+        const evidence = record.evidence;
+        if (evidence === null || typeof evidence !== "object" ||
+          Array.isArray(evidence)) {
+          console.error("a closed permit names no terminal evidence: " +
+            JSON.stringify(record));
+          process.exit(1);
+        }
+        // The one ending with no evidence of its own. The gate writes it for a
+        // permit whose owner recorded nothing, so its record carries the empty
+        // evidence and reading it is how a control sees the disposition it has
+        // to refuse. An unresolved record that did name evidence would be some
+        // other party writing into the gate account.
+        if (record.outcome === "unresolved") {
+          if (evidence.kind !== undefined && evidence.kind !== "") {
+            console.error("an unresolved permit names terminal evidence: " +
+              JSON.stringify(record));
+            process.exit(1);
+          }
+          return NONE + "=" + NONE + "=" + NONE;
+        }
+        const kind = evidence.kind;
+        const referenced = REFERENCED_EVIDENCE.includes(kind);
+        if (!referenced && !UNREFERENCED_EVIDENCE.includes(kind)) {
+          console.error("not a terminal evidence kind: " +
+            JSON.stringify(kind));
+          process.exit(1);
+        }
+        let reference = NONE;
+        if (referenced) {
+          if (typeof evidence.reference !== "string" ||
+            !TOKEN.test(evidence.reference)) {
+            console.error("terminal evidence of kind " + JSON.stringify(kind) +
+              " names no durable result: " + JSON.stringify(evidence));
+            process.exit(1);
+          }
+          reference = evidence.reference;
+        } else if (evidence.reference !== undefined &&
+          evidence.reference !== "") {
+          console.error("terminal evidence of kind " + JSON.stringify(kind) +
+            " must name no durable result: " + JSON.stringify(evidence));
+          process.exit(1);
+        }
+        // A chain side effect the same permit dispatched beyond its own
+        // protocol result — an inactivity claim filed alongside a heartbeat,
+        // say. It is optional because most ceremonies dispatch none, and it
+        // travels separately from the result identity because it is chain
+        // state the audit reconciles rather than something the node computed.
+        let settlement = NONE;
+        const chain = evidence.chain_settlement;
+        if (chain !== undefined && chain !== null) {
+          if (typeof chain !== "object" || Array.isArray(chain) ||
+            typeof chain.kind !== "string" || !TOKEN.test(chain.kind)) {
+            console.error("not a chain settlement: " + JSON.stringify(chain));
+            process.exit(1);
+          }
+          // An unresolved settlement carries no reference; the kind alone is
+          // the node saying it dispatched something it could not resolve, and
+          // that has to stay visible rather than read as no settlement at all.
+          if (chain.reference === undefined || chain.reference === "") {
+            settlement = chain.kind;
+          } else if (typeof chain.reference !== "string" ||
+            !TOKEN.test(chain.reference)) {
+            console.error("a chain settlement names no canonical identity: " +
+              JSON.stringify(chain));
+            process.exit(1);
+          } else {
+            settlement = chain.kind + ":" + chain.reference;
+          }
+        }
+        return kind + "=" + reference + "=" + settlement;
+      };
+      const terminalOutcome = (service, record) => {
+        if (record === null || typeof record !== "object" ||
+          Array.isArray(record)) {
+          console.error("not a terminal outcome record: " +
+            JSON.stringify(record));
+          process.exit(1);
+        }
+        if (record.permit === null || record.permit === undefined) {
+          console.error("a terminal outcome names no permit: " +
+            JSON.stringify(record));
+          process.exit(1);
+        }
+        if (!OUTCOMES.includes(record.outcome)) {
+          console.error("not a terminal outcome: " +
+            JSON.stringify(record.outcome));
+          process.exit(1);
+        }
+        return permitIdentity(service, record.permit, "a closed permit") +
+          "=" + record.outcome + "=" + evidenceOf(record);
+      };
+'
+
+# What one node's gate says became of the permits it has closed, rendered as
+# "<permit identity>=<outcome>=<evidence kind>=<result>=<settlement>" tokens in
+# the order they closed.
+#
+# This is the other half of the live permit list, and the half the controls
+# were missing. The held list names work a node has; the moment that work ends
+# the permit leaves the list and nothing further is said about it, so a control
+# following work across the cutover saw a permit and then saw it gone, and had
+# to take the word of whatever drove the work for which of those two endings it
+# was. A report about a ceremony is not evidence about a ceremony. These
+# records are written by each ceremony's own owner at the moment it closed its
+# permit, under the same identities the held list carries, so a permit seen
+# held joins to the disposition its holder recorded for it.
+#
+# The evidence travels with the ending rather than being summarized away by it.
+# "completed" is a category, and every node that finished the same piece of
+# work writes the same category however little it agrees with the others about
+# what was produced; the result identity is what lets a control ask whether
+# they finished the same ceremony and whether it is the one the driver claims.
+#
+# A record that names no work or permit identity is refused rather than
+# skipped. It would otherwise read exactly like a permit whose disposition the
+# node never recorded, which is the case the joins below have to block on.
 service_terminal_outcomes() {
   local service="$1"
   probe_diagnostics "${service}" |
-    node -e '
+    node -e "
+      ${PERMIT_IDENTITY_JS}
+      ${TERMINAL_OUTCOME_JS}"'
       let raw = "";
       process.stdin.on("data", (d) => (raw += d));
       process.stdin.on("end", () => {
@@ -3855,52 +4051,9 @@ service_terminal_outcomes() {
           process.exit(1);
         }
         const service = process.argv[1];
-        // "unresolved" is in this list deliberately. It is what a permit
-        // closed by an owner that recorded nothing is written as, and it has
-        // to arrive as a disposition a reader can see and refuse rather than
-        // as an absence indistinguishable from a permit still in flight.
-        const OUTCOMES = [
-          "completed", "quarantined", "exhausted", "unresolved",
-        ];
         const out = [];
         for (const record of outcomes) {
-          if (record === null || typeof record !== "object" ||
-            Array.isArray(record)) {
-            console.error("not a terminal outcome record: " +
-              JSON.stringify(record));
-            process.exit(1);
-          }
-          const permit = record.permit;
-          if (permit === null || typeof permit !== "object" ||
-            Array.isArray(permit)) {
-            console.error("a terminal outcome names no permit: " +
-              JSON.stringify(record));
-            process.exit(1);
-          }
-          if (!OUTCOMES.includes(record.outcome)) {
-            console.error("not a terminal outcome: " +
-              JSON.stringify(record.outcome));
-            process.exit(1);
-          }
-          if (permit.identity_bound !== true) {
-            console.error("a closed permit is not identity-bound: " +
-              JSON.stringify(permit));
-            process.exit(1);
-          }
-          // The ending is appended to the identity with "=", so an identity
-          // carrying one of its own would split into a different permit and a
-          // different ending than the node meant — and the joins downstream
-          // decide which permit closed how by exactly that split.
-          if (typeof permit.work_id !== "string" ||
-            !/^[^\s=]+$/.test(permit.work_id) ||
-            typeof permit.permit_id !== "string" ||
-            !/^[^\s=]+$/.test(permit.permit_id)) {
-            console.error("a closed permit names no work or permit " +
-              "identity: " + JSON.stringify(permit));
-            process.exit(1);
-          }
-          out.push(service + "=" + permit.work_id + "#" + permit.permit_id +
-            "=" + record.outcome);
+          out.push(terminalOutcome(service, record));
         }
         process.stdout.write(out.join(" "));
       });
@@ -3928,7 +4081,9 @@ service_terminal_outcomes() {
 service_gate_snapshot() {
   local service="$1" field="$2"
   probe_diagnostics "${service}" |
-    node -e '
+    node -e "
+      ${PERMIT_IDENTITY_JS}
+      ${TERMINAL_OUTCOME_JS}"'
       let raw = "";
       process.stdin.on("data", (d) => (raw += d));
       process.stdin.on("end", () => {
@@ -3950,49 +4105,14 @@ service_gate_snapshot() {
           console.error("no recent_terminal_outcomes in the gate state");
           process.exit(1);
         }
-        // The same closed set, and the same refusal to skip an unreadable
-        // record, that the standalone outcome reading applies. A snapshot that
+        // The same reading of a closed permit the standalone account applies,
+        // and the same refusal to skip an unreadable record. A snapshot that
         // dropped a malformed record would present a shorter ending list as a
         // whole one, and this reading is the one a drain verdict treats as
         // complete.
-        const OUTCOMES = [
-          "completed", "quarantined", "exhausted", "unresolved",
-        ];
         const out = [];
         for (const record of outcomes) {
-          if (record === null || typeof record !== "object" ||
-            Array.isArray(record)) {
-            console.error("not a terminal outcome record: " +
-              JSON.stringify(record));
-            process.exit(1);
-          }
-          const permit = record.permit;
-          if (permit === null || typeof permit !== "object" ||
-            Array.isArray(permit)) {
-            console.error("a terminal outcome names no permit: " +
-              JSON.stringify(record));
-            process.exit(1);
-          }
-          if (!OUTCOMES.includes(record.outcome)) {
-            console.error("not a terminal outcome: " +
-              JSON.stringify(record.outcome));
-            process.exit(1);
-          }
-          if (permit.identity_bound !== true) {
-            console.error("a closed permit is not identity-bound: " +
-              JSON.stringify(permit));
-            process.exit(1);
-          }
-          if (typeof permit.work_id !== "string" ||
-            !/^[^\s=]+$/.test(permit.work_id) ||
-            typeof permit.permit_id !== "string" ||
-            !/^[^\s=]+$/.test(permit.permit_id)) {
-            console.error("a closed permit names no work or permit " +
-              "identity: " + JSON.stringify(permit));
-            process.exit(1);
-          }
-          out.push(service + "=" + permit.work_id + "#" + permit.permit_id +
-            "=" + record.outcome);
+          out.push(terminalOutcome(service, record));
         }
         process.stdout.write("state=" + gateState + "\n" +
           "active=" + String(active) + "\n" +
@@ -5596,14 +5716,6 @@ work_records_held_by() {
   printf '%s' "${out}"
 }
 
-# The chain-native work identity a work token names — the last component. The
-# ceremony and anchor in front of it are this rehearsal's own labelling; the
-# gate records only this part as a permit's work ID, so it is what a driver
-# account and a gate scrape have in common.
-work_chain_id() {
-  printf '%s' "${1##*@}"
-}
-
 # One permit record's identity, which retains the local permit after the chain
 # work it belongs to. This is the unit counted and matched to quarantine.
 permit_identity() {
@@ -5611,16 +5723,23 @@ permit_identity() {
     "$(permit_local_id "$(work_permit "$1")")"
 }
 
-# The same identity rendered the way a gate scrape renders its own live
-# permits: "<holder>=<chain work>#<permit>". Two nodes can issue permits with
-# the same local id for the same chain work, so the holder belongs inside the
-# identity rather than beside it, and the chain work is the one the gate itself
-# recorded rather than this rehearsal's labelled form of it.
+# The same identity rendered the way a gate scrape renders its own permits:
+# "<holder>@<gate ceremony>@<canonical start block>@<chain work>#<permit>".
+#
+# Every component is load-bearing. Two nodes can issue permits with the same
+# local id for the same chain work, so the holder belongs inside the identity
+# rather than beside it. Work ids and local permit ids repeat across ceremonies
+# and across runs of one ceremony — a beacon member index is "1" in every group
+# that node ever joins — so an identity that named only those two lets a permit
+# from one ceremony be answered by the record of another, and a pre-cutover
+# permit be answered by a post-cutover one at the same work id. The ceremony is
+# in the gate's own vocabulary rather than the driver's, because the record
+# this identity has to join to is the one the gate wrote.
 held_permit_identity() {
   local permit
   permit="$(work_permit "$1")"
-  printf '%s=%s#%s' "$(permit_holder "${permit}")" \
-    "$(work_chain_id "$(work_id "$1")")" "$(permit_local_id "${permit}")"
+  printf '%s@%s#%s' "$(permit_holder "${permit}")" \
+    "$(audited_work_id "$(work_id "$1")")" "$(permit_local_id "${permit}")"
 }
 
 held_permit_identities() {
@@ -5667,18 +5786,56 @@ present_tokens() {
 # node-authored record of permits that node closed, and the disposition read
 # there is the node's own rather than the driver's.
 #
-# The tokens on both sides are "<service>=<chain work>#<permit>" — the identity
-# a gate scrape renders — with the node-authored side carrying "=<outcome>"
-# after it.
+# The tokens on both sides open with the permit identity a gate scrape renders,
+# "<service>@<gate ceremony>@<anchor>@<chain work>#<permit>", which carries no
+# "=" of its own. The node-authored side appends what its holder recorded:
+# "=<outcome>=<evidence kind>=<result>=<settlement>", with "-" where the gate
+# carries no reference.
 # ---------------------------------------------------------------------------
 
 # The permit identity a node-authored outcome token names, without its ending.
 authored_permit() {
-  printf '%s' "${1%=*}"
+  printf '%s' "${1%%=*}"
 }
 
 # The ending it names.
 authored_outcome() {
+  local rest
+  rest="${1#*=}"
+  printf '%s' "${rest%%=*}"
+}
+
+# The kind of durable state the holder says the ending left behind.
+authored_evidence_kind() {
+  local rest
+  rest="${1#*=}"
+  rest="${rest#*=}"
+  printf '%s' "${rest%%=*}"
+}
+
+# The identity of that state — the wallet storage key, group public key, or
+# protocol result digest the ceremony produced — or "-" for the endings that
+# leave none.
+#
+# This is the field a categorical ending cannot substitute for. Every node that
+# finished the same piece of work writes "completed" whatever it actually
+# produced, so the word alone cannot distinguish a fleet that agreed on one
+# threshold output from one whose members each finished something else. The
+# result identity is node-authored and shared: it is derived from the durable
+# output itself, so two holders of the same ceremony write the same value and a
+# holder of a different one cannot.
+authored_result() {
+  local rest
+  rest="${1#*=}"
+  rest="${rest#*=}"
+  rest="${rest#*=}"
+  printf '%s' "${rest%%=*}"
+}
+
+# The chain side effect the same permit dispatched beyond its own protocol
+# result, "<kind>" or "<kind>:<canonical identity>", or "-" for the permits
+# that dispatched none.
+authored_settlement() {
   printf '%s' "${1##*=}"
 }
 
@@ -5775,6 +5932,216 @@ misended_authored_permits() {
     [[ -z "${ending}" || "${ending}" == "unresolved" ]] && continue
     contains_token "${allowed}" "${ending}" && continue
     out="${out}${out:+, }${permit}=${ending}"
+  done
+  printf '%s' "${out}"
+}
+
+# ---------------------------------------------------------------------------
+# Reconciling a categorical ending to what it actually left behind
+#
+# The joins above answer "did this permit's own holder say how it ended". They
+# stop at the word. Every holder of every ceremony that finished writes
+# "completed", so the word alone cannot separate a fleet that agreed on one
+# threshold output from one whose members each finished something else, nor
+# either of those from a driver claiming a settlement the nodes never produced.
+#
+# What separates them is the identity of the durable result. It is derived from
+# the output itself, so it is the same for every holder of one ceremony and
+# different for holders of different ones — which makes it the one field a
+# categorical ending cannot stand in for.
+# ---------------------------------------------------------------------------
+
+# The chain work a permit identity belongs to, "<gate ceremony>@<anchor>@<chain
+# work>", with the holder in front of it dropped. Two
+# holders of one ceremony share this; holders of different ceremonies, of
+# different runs of one ceremony, and of one work id under two anchors do not.
+identity_work() {
+  local rest
+  rest="${1#*@}"
+  printf '%s' "${rest%%#*}"
+}
+
+# The whole node-authored record for one named permit, empty when none names
+# it. Like authored_ending it reads the last match, so where a duplicate slips
+# past the check above the later record is the one that stands.
+authored_record() {
+  local permit="$1" authored="$2" token out=""
+  for token in ${authored}; do
+    [[ "$(authored_permit "${token}")" == "${permit}" ]] || continue
+    out="${token}"
+  done
+  printf '%s' "${out}"
+}
+
+# Whether one node-authored token carries the whole ending shape: an identity,
+# the disposition, and the three evidence fields behind it.
+authored_record_complete() {
+  local rest="$1" count=0
+  while [[ "${rest}" == *=* ]]; do
+    rest="${rest#*=}"
+    count=$((count + 1))
+  done
+  ((count == 4))
+}
+
+# Of the named permits, the ones whose node-authored record stops short of the
+# whole ending shape, comma-joined.
+#
+# A record that names a disposition and nothing else is what a release
+# publishing the older, categorical account produces, and every evidence check
+# below reads its missing fields as whatever the truncation happens to leave in
+# their place. It has to be refused as unreadable rather than filled in.
+malformed_authored_records() {
+  local wanted="$1" authored="$2" permit record out=""
+  for permit in ${wanted}; do
+    record="$(authored_record "${permit}" "${authored}")"
+    [[ -n "${record}" ]] || continue
+    authored_record_complete "${record}" && continue
+    out="${out}${out:+, }${record}"
+  done
+  printf '%s' "${out}"
+}
+
+# The single evidence kind the gate permits a ceremony to claim a durable
+# result with. This mirrors the gate's own table, which is deliberately
+# one-to-one: a ceremony whose real result is an external transaction must not
+# settle on a digest it authored entirely by itself. A rehearsal reading an
+# ending has to apply the same mapping, or a node serving a fabricated account
+# could claim any ceremony completed by naming the evidence class of another.
+#
+# The self-test holds this table to the gate's, so a ceremony added there
+# without one here is caught before a rehearsal decides anything on it.
+expected_completed_evidence() {
+  case "$1" in
+  tbtc_dkg) printf 'persisted_tbtc_signer' ;;
+  tbtc_wallet_coordination) printf 'protocol_result' ;;
+  tbtc_signing) printf 'bitcoin_transaction' ;;
+  tbtc_heartbeat) printf 'protocol_result' ;;
+  tbtc_inactivity_claim) printf 'ethereum_transaction' ;;
+  beacon_dkg) printf 'persisted_beacon_signer' ;;
+  beacon_relay_signing) printf 'protocol_result' ;;
+  beacon_relay_forwarding) printf 'forwarder_closed' ;;
+  beacon_timeout_report) printf 'ethereum_transaction' ;;
+  *) printf '' ;;
+  esac
+}
+
+# Of the named permits whose holder recorded a completion, the ones whose
+# evidence is not the class that ceremony's result actually lives in, rendered
+# with what was recorded instead, comma-joined.
+#
+# The forwarding ceremony is the one that legitimately completes with no result
+# identity: it relays other members' shares and produces nothing of its own, so
+# reaching its close is the whole of its disposition. Every other completion
+# names durable state, and one that does not is a categorical claim with
+# nothing behind it.
+misevidenced_authored_permits() {
+  local wanted="$1" authored="$2" permit record kind want out=""
+  for permit in ${wanted}; do
+    record="$(authored_record "${permit}" "${authored}")"
+    [[ -n "${record}" ]] || continue
+    [[ "$(authored_outcome "${record}")" == "completed" ]] || continue
+    want="$(expected_completed_evidence \
+      "$(work_ceremony "$(identity_work "${permit}")")")"
+    kind="$(authored_evidence_kind "${record}")"
+    [[ -n "${want}" ]] || {
+      out="${out}${out:+, }${permit} completed a ceremony with no declared \
+result class, claiming ${kind}"
+      continue
+    }
+    [[ "${kind}" == "${want}" ]] && continue
+    out="${out}${out:+, }${permit} claims ${kind} where a ${want} is the \
+result of that ceremony"
+  done
+  printf '%s' "${out}"
+}
+
+# Of the chain work the named permits belong to, the pieces whose holders
+# recorded completions naming different results, rendered with the results,
+# comma-joined.
+#
+# Two members of one ceremony hold separate permits and write separate records,
+# but a threshold ceremony has one output. Holders naming different ones did
+# not finish the same ceremony together however many completions are counted,
+# and a control reading only the count would record that as agreement.
+disagreeing_authored_results() {
+  local wanted="$1" authored="$2"
+  local permit record work result seen works="" out=""
+  for permit in ${wanted}; do
+    record="$(authored_record "${permit}" "${authored}")"
+    [[ -n "${record}" ]] || continue
+    [[ "$(authored_outcome "${record}")" == "completed" ]] || continue
+    result="$(authored_result "${record}")"
+    [[ "${result}" == "-" ]] && continue
+    work="$(identity_work "${permit}")"
+    seen="$(authored_work_result "${work}" "${wanted}" "${authored}")"
+    [[ "${seen}" == "${result}" ]] && continue
+    contains_token "${works}" "${work}" && continue
+    works="${works}${works:+ }${work}"
+    out="${out}${out:+, }${work} (${seen})"
+  done
+  printf '%s' "${out}"
+}
+
+# The results the holders of one piece of chain work recorded, "/"-joined and
+# deduplicated, so a single value means they agreed and anything else does not
+# compare equal to any one holder's record.
+authored_work_result() {
+  local work="$1" wanted="$2" authored="$3"
+  local permit record result out=""
+  for permit in ${wanted}; do
+    [[ "$(identity_work "${permit}")" == "${work}" ]] || continue
+    record="$(authored_record "${permit}" "${authored}")"
+    [[ -n "${record}" ]] || continue
+    [[ "$(authored_outcome "${record}")" == "completed" ]] || continue
+    result="$(authored_result "${record}")"
+    [[ "${result}" == "-" ]] && continue
+    contains_token "${out//\// }" "${result}" && continue
+    out="${out}${out:+/}${result}"
+  done
+  printf '%s' "${out}"
+}
+
+# What the driver claims one piece of chain work settled as, looked up in the
+# gate's vocabulary so a holder's own record of the same work can be compared
+# with it. Several claims for one piece of work are "/"-joined rather than
+# resolved, so an ambiguous account compares equal to no holder's record.
+claimed_work_result() {
+  local bound="$1" work="$2" record identity out=""
+  for record in ${bound}; do
+    [[ "$(bound_outcome "${record}")" == "succeeded" ]] || continue
+    [[ "$(audited_work_id "$(bound_work "${record}")")" == "${work}" ]] ||
+      continue
+    identity="$(bound_identity "${record}")"
+    contains_token "${out//\// }" "${identity}" && continue
+    out="${out}${out:+/}${identity}"
+  done
+  printf '%s' "${out}"
+}
+
+# Of the named permits whose holder recorded a completion naming a result, the
+# ones whose result is not the one the driver claims for the same chain work,
+# comma-joined.
+#
+# This is the seam the two accounts were never held across. The driver says a
+# ceremony settled and names what it produced; the holders say their permits
+# completed and name what they produced. Read separately, a driver reporting a
+# settlement the fleet never reached and a fleet completing work the driver
+# never originated both pass. Only comparing the two identities refuses them.
+unclaimed_authored_results() {
+  local wanted="$1" authored="$2" bound="$3"
+  local permit record result work claimed out=""
+  for permit in ${wanted}; do
+    record="$(authored_record "${permit}" "${authored}")"
+    [[ -n "${record}" ]] || continue
+    [[ "$(authored_outcome "${record}")" == "completed" ]] || continue
+    result="$(authored_result "${record}")"
+    [[ "${result}" == "-" ]] && continue
+    work="$(identity_work "${permit}")"
+    claimed="$(claimed_work_result "${bound}" "${work}")"
+    [[ "${claimed}" == "${result}" ]] && continue
+    out="${out}${out:+, }${permit} recorded ${result} where the driver claims \
+${claimed:-no settlement at all}"
   done
   printf '%s' "${out}"
 }
@@ -7396,6 +7763,7 @@ homogeneous_control_verdict() {
   # readings it adds are stated once.
   local failed_results missing_families settlements stray unended
   local named_permits unauthored duplicated unresolved misended authored
+  local malformed misevidenced disagreeing unclaimed
   failed_results="$(unsuccessful_results "${HOMOGENEOUS_RESULTS}")"
   missing_families="$(missing_bound_families \
     "${HOMOGENEOUS_BOUND}" "${HOMOGENEOUS_REQUIRED_FAMILIES}")"
@@ -7420,6 +7788,17 @@ homogeneous_control_verdict() {
   # cannot be satisfied by a permit that stopped.
   misended="$(misended_authored_permits "${named_permits}" \
     "${HOMOGENEOUS_AUTHORED_ENDINGS}" completed)"
+  # And what those completions produced, which is the half a category cannot
+  # carry: a positive control that reads only the word is equally satisfied by
+  # a fleet whose members each finished something else.
+  malformed="$(malformed_authored_records "${named_permits}" \
+    "${HOMOGENEOUS_AUTHORED_ENDINGS}")"
+  misevidenced="$(misevidenced_authored_permits "${named_permits}" \
+    "${HOMOGENEOUS_AUTHORED_ENDINGS}")"
+  disagreeing="$(disagreeing_authored_results "${named_permits}" \
+    "${HOMOGENEOUS_AUTHORED_ENDINGS}")"
+  unclaimed="$(unclaimed_authored_results "${named_permits}" \
+    "${HOMOGENEOUS_AUTHORED_ENDINGS}" "${HOMOGENEOUS_BOUND}")"
   authored="$(authored_endings "${named_permits}" \
     "${HOMOGENEOUS_AUTHORED_ENDINGS}")"
 
@@ -7518,6 +7897,31 @@ cannot say and the driver's settlement for it stands on nothing"
 the nodes holding the permits recorded ${misended}; a closing is not a \
 completion, and where the two accounts disagree it is the driver's that is \
 about its own work"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ -n "${malformed}" ]]; then
+    block_step "${step}" "the node-authored account of these post-C ceremonies stops \
+short of what a permit's holder records — ${malformed} — so the reading \
+names a disposition and nothing about what it left behind; a release \
+publishing only the category cannot be reconciled against what the driver \
+says settled"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ -n "${misevidenced}" ]]; then
+    record_step "${step}" fail "${misevidenced}; the gate pins each ceremony \
+to the evidence class its result actually lives in, and a completion carrying \
+another class is a categorical claim about a ceremony whose real output \
+nothing here has seen"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ -n "${disagreeing}" ]]; then
+    record_step "${step}" fail "the holders of ${disagreeing} each recorded a \
+completion naming a different result; a threshold ceremony has one output, so \
+this is separate work finishing separately on the same chain item rather than \
+the fleet completing it together"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ -n "${unclaimed}" ]]; then
+    record_step "${step}" fail "${unclaimed}; the driver's account of what \
+these ceremonies settled as and the holders' own records of what they produced \
+have to name the same threshold output, and where they do not, one of the two \
+is describing work the other never did"
     record_assertion "${assertion}" false "${step}"
   elif ((HOMOGENEOUS_PERMITS_AFTER <= HOMOGENEOUS_PERMITS_BEFORE)); then
     record_step "${step}" fail "the work driver settled ${settlements}, but \
@@ -8299,6 +8703,7 @@ precutover_verdict() {
   local failed_results missing_ceremonies settlements
   local uninteroperated stray unended
   local named_permits unauthored duplicated unresolved misended authored
+  local malformed misevidenced disagreeing unclaimed
   failed_results="$(unsuccessful_results "${PRECUTOVER_RESULTS}")"
   missing_ceremonies="$(missing_bound_ceremonies \
     "${PRECUTOVER_BOUND}" "${required_ceremonies}")"
@@ -8331,6 +8736,18 @@ precutover_verdict() {
   # rung exists to surface.
   misended="$(misended_authored_permits "${named_permits}" \
     "${PRECUTOVER_AUTHORED_ENDINGS}" completed)"
+  # What those completions actually left behind. "completed" is what every
+  # holder of every finished ceremony writes, so the rungs above it are
+  # satisfied by a fleet whose members each finished something different and by
+  # a driver claiming a settlement none of them produced.
+  malformed="$(malformed_authored_records "${named_permits}" \
+    "${PRECUTOVER_AUTHORED_ENDINGS}")"
+  misevidenced="$(misevidenced_authored_permits "${named_permits}" \
+    "${PRECUTOVER_AUTHORED_ENDINGS}")"
+  disagreeing="$(disagreeing_authored_results "${named_permits}" \
+    "${PRECUTOVER_AUTHORED_ENDINGS}")"
+  unclaimed="$(unclaimed_authored_results "${named_permits}" \
+    "${PRECUTOVER_AUTHORED_ENDINGS}" "${PRECUTOVER_BOUND}")"
   authored="$(authored_endings "${named_permits}" \
     "${PRECUTOVER_AUTHORED_ENDINGS}")"
 
@@ -8422,6 +8839,27 @@ cannot say and the driver's settlement for it stands on nothing"
 the nodes holding the permits recorded ${misended}; a closing is not a \
 completion, and where the two accounts disagree it is the driver's that is \
 about its own work"
+  elif [[ -n "${malformed}" ]]; then
+    block_step "${step}" "the node-authored account of ${what} stops \
+short of what a permit's holder records — ${malformed} — so the reading \
+names a disposition and nothing about what it left behind; a release \
+publishing only the category cannot be reconciled against what the driver \
+says settled"
+  elif [[ -n "${misevidenced}" ]]; then
+    record_step "${step}" fail "${misevidenced}; the gate pins each ceremony \
+to the evidence class its result actually lives in, and a completion carrying \
+another class is a categorical claim about a ceremony whose real output \
+nothing here has seen"
+  elif [[ -n "${disagreeing}" ]]; then
+    record_step "${step}" fail "the holders of ${disagreeing} each recorded a \
+completion naming a different result; a threshold ceremony has one output, so \
+this is separate work finishing separately on the same chain item rather than \
+a mixed fleet completing it together"
+  elif [[ -n "${unclaimed}" ]]; then
+    record_step "${step}" fail "${unclaimed}; the driver's account of what \
+${what} settled as and the holders' own records of what they produced have to \
+name the same threshold output, and where they do not, one of the two is \
+describing work the other never did"
   elif ((PRECUTOVER_LEGACY_AFTER <= PRECUTOVER_LEGACY_BEFORE)); then
     record_step "${step}" fail "the work driver settled ${settlements}, but \
 the fleet issued no new legacy permit (participation_mode_legacy_total still \
@@ -8552,6 +8990,7 @@ surviving_legacy_verdict() {
   local stray settlements failed unended originated_permits held_delta
   local named_permits unheld_before unnamed_before lost_at_c arrived_at_c
   local unauthored duplicated unresolved misended authored
+  local malformed misevidenced disagreeing unclaimed
   named_permits="$(held_permit_identities "${SURVIVING_ORIGINATED}")"
   unheld_before="$(absent_tokens "${named_permits}" \
     "${SURVIVING_PERMITS_BEFORE}")"
@@ -8613,6 +9052,17 @@ surviving_legacy_verdict() {
     "${SURVIVING_AUTHORED_ENDINGS}")"
   misended="$(misended_authored_permits "${named_permits}" \
     "${SURVIVING_AUTHORED_ENDINGS}" completed)"
+  # And what each completion left behind, which is the claim this control is
+  # really making: that the work in flight at C finished, producing the very
+  # threshold output the driver reports it settled as.
+  malformed="$(malformed_authored_records "${named_permits}" \
+    "${SURVIVING_AUTHORED_ENDINGS}")"
+  misevidenced="$(misevidenced_authored_permits "${named_permits}" \
+    "${SURVIVING_AUTHORED_ENDINGS}")"
+  disagreeing="$(disagreeing_authored_results "${named_permits}" \
+    "${SURVIVING_AUTHORED_ENDINGS}")"
+  unclaimed="$(unclaimed_authored_results "${named_permits}" \
+    "${SURVIVING_AUTHORED_ENDINGS}" "${SURVIVING_TERMINAL}")"
   authored="$(authored_endings "${named_permits}" \
     "${SURVIVING_AUTHORED_ENDINGS}")"
   originated_permits="$(count_tokens \
@@ -8736,6 +9186,26 @@ say where it went did not"
 this step held across C; a legacy permit taken before the crossing must be \
 allowed to complete on the far side of it, not end quarantined or exhausted \
 there"
+  elif [[ -n "${malformed}" ]]; then
+    block_step "${step}" "the node-authored account of the permits held across C stops \
+short of what a permit's holder records — ${malformed} — so the reading \
+names a disposition and nothing about what it left behind; a release \
+publishing only the category cannot be reconciled against what the driver \
+says settled"
+  elif [[ -n "${misevidenced}" ]]; then
+    record_step "${step}" fail "${misevidenced}; the gate pins each ceremony \
+to the evidence class its result actually lives in, and a permit that crossed \
+C and then claimed another class produced nothing this control can show for \
+the crossing"
+  elif [[ -n "${disagreeing}" ]]; then
+    record_step "${step}" fail "the holders of ${disagreeing} each recorded a \
+completion naming a different result after C; a threshold ceremony has one \
+output, so the work that crossed the cutover did not finish as one ceremony"
+  elif [[ -n "${unclaimed}" ]]; then
+    record_step "${step}" fail "${unclaimed}; work that survived C has to \
+finish as the same threshold output on both accounts, and where the driver's \
+settlement and the holder's own record name different ones, neither is \
+evidence that the permit in flight at C is the one that completed"
   elif [[ ! "${SURVIVING_LEGACY_COMPLETIONS_BEFORE}" =~ ^[0-9]+$ ]] ||
     [[ ! "${SURVIVING_LEGACY_COMPLETIONS_AFTER}" =~ ^[0-9]+$ ]]; then
     block_step "${step}" "the fleet post-cutover legacy completion counter \
