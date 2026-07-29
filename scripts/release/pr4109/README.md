@@ -1459,15 +1459,28 @@ The homogeneous suites say nothing about a committee that disagrees, which is
 the case the crossing actually creates. That case is held in keep-core rather
 than in the dependency, because what has to stay true is a property of whatever
 revision `go.mod` resolves:
-`pkg/protocol/compatibility/mixed_transcript_test.go` drives a real tECDSA
-signing ceremony over the key-share fixtures with each member's transcript
-configured by the bundle its mode selects, and requires that no signature is
-produced in either mixed direction — a member that has not crossed joining a
-hardened group, and a member that has crossed refusing to sign with a group
-that has not. Both homogeneous committees run through the same driver and are
-required to sign, so the refusals cannot be an artifact of a driver that never
-finishes anything. A replacement dependency revision that tolerated a mixed
-committee fails this test rather than surfacing during a rehearsal.
+`pkg/protocol/compatibility/mixed_transcript_test.go` drives real tECDSA
+key-generation *and* signing ceremonies with each member's transcript
+configured by the bundle its mode selects, and requires that no key share and
+no signature is produced in either mixed direction — a member that has not
+crossed joining a hardened group, and a member that has crossed refusing to
+work with a group that has not. Keygen is covered alongside signing because it
+is the half that leaves something behind: a refused signing ceremony costs an
+attempt, while a tolerated mixed keygen would mint a wallet whose members
+disagree about the transcript its shares were proved under, and that wallet
+then signs for as long as it exists.
+
+A refusal does not end either ceremony under test. The driver keeps routing and
+keeps watching the result channel until a refused ceremony has fallen silent,
+so what is asserted is that nothing was output — not merely that a complaint
+was raised, which a group that errored and then finished anyway would also
+satisfy. Partial output fails too: the crossing is all-or-nothing, so some
+members finishing what others refused is the split state the property exists to
+prevent. Both homogeneous committees run through the same driver and are
+required to output for every member, so the refusals cannot be an artifact of a
+driver that never finishes anything. A replacement dependency revision that
+tolerated a mixed committee fails these tests rather than surfacing during a
+rehearsal.
 
 Independent cryptographic review is still a release gate, and it is a gate on
 *evidence acceptance* rather than on execution. The commit is published on the
