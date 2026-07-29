@@ -2036,11 +2036,23 @@ beacon_dkg=0"
   QUIESCE_INFLIGHT_WORK="\
 tbtc_signing@840@wallet840=${QUIESCE_TX1}=r1-node-2~member-1 \
 beacon_dkg@841@seed841=${QUIESCE_TX2}=r1-node-2~2"
+  # The same two permits as the issuing gate itself named them, which is what
+  # makes the driver's account checkable rather than merely the right length.
+  QUIESCE_PERMITS_BEFORE="r1-node-2=wallet840#member-1 r1-node-2=seed841#2"
   QUIESCE_TERMINAL="\
 tbtc_signing@840@wallet840=succeeded=${QUIESCE_TX1}=0xsigned840 \
 beacon_dkg@841@seed841=succeeded=${QUIESCE_TX2}=0xgroup841"
   QUIESCE_TERMINAL_ASKED=1
   QUIESCE_TERMINAL_RC=0
+  # The security-v2 half is not seeded and drains one population, so neither
+  # the pre-C seeding rungs nor the co-live requirement apply to it.
+  QUIESCE_FROM_SEED=0
+  QUIESCE_COLIVE_REQUIRED=0
+  QUIESCE_COLIVE_PERMITS=""
+  QUIESCE_SEEDED_ASKED=0
+  QUIESCE_SEEDED_RC=0
+  QUIESCE_SEEDED_WORK=""
+  QUIESCE_SEEDED_PERMITS_BEFORE_C=""
 }
 
 quiesce_case() {
@@ -3593,6 +3605,22 @@ check "a held count above the named population leaves permits unidentified" 3 \
 # the security-v2 step.
 legacy_quiesce_case() {
   quiesce_readings
+  # The stage seeds this half before C and drains it beside the other mode, so
+  # the shared ladder is decided here with those rungs already satisfied rather
+  # than absent — otherwise these cases would keep passing after the seeded
+  # path stopped being taken.
+  # shellcheck disable=SC2034
+  QUIESCE_FROM_SEED=1
+  # shellcheck disable=SC2034
+  QUIESCE_SEEDED_ASKED=1
+  # shellcheck disable=SC2034
+  QUIESCE_SEEDED_WORK="${QUIESCE_INFLIGHT_WORK}"
+  # shellcheck disable=SC2034
+  QUIESCE_SEEDED_PERMITS_BEFORE_C="${QUIESCE_PERMITS_BEFORE}"
+  # shellcheck disable=SC2034
+  QUIESCE_COLIVE_REQUIRED=1
+  # shellcheck disable=SC2034
+  QUIESCE_COLIVE_PERMITS="r1-node-1=colive900#other-1"
   "$@"
   quiescence_verdict r1-node-1 \
     "quiescence with an in-flight legacy permit" "" legacy
@@ -3676,6 +3704,18 @@ quiesce_sequencing_stubs() {
   compose() { return 0; }
   node_reachable() { return 1; }
 
+  # The gate's own list of what it is holding, which the control reads beside
+  # the count. The mode under test names the work the stubbed driver put on the
+  # node; the other mode stands for a permit live beside it, which the seeded
+  # control requires and a mutation can take away.
+  QUIESCE_SEQ_COLIVE="r1-node-1=colive900#other-1"
+  node_mode_permits() {
+    case "$2" in
+    legacy) printf 'r1-node-1=wallet%s#member-1' "${QUIESCE_SEQ_ANCHOR}" ;;
+    *) printf '%s' "${QUIESCE_SEQ_COLIVE}" ;;
+    esac
+  }
+
   run_work_driver() {
     WORK_DRIVER_RC=0
     WORK_DRIVER_TX_COUNT=1
@@ -3706,6 +3746,73 @@ check "a legacy quiescence draining post-C work observed the other mode" 3 \
 run_verdict quiesce_sequencing_case 840
 check "a legacy quiescence draining pre-C work is about a legacy permit" 0 \
   "quiescence with an in-flight legacy permit"
+
+# The legacy half's real subject: a permit seeded before the fleet crossed C,
+# observed in the gate that issued it while it was still on the legacy side,
+# and drained beside a live permit of the other mode. Anything short of that is
+# the driver's claimed anchor standing in for the crossing.
+quiesce_seeded_case() {
+  # shellcheck disable=SC2034
+  REHEARSAL_R1_CUTOVER_BLOCK="1000"
+  # shellcheck disable=SC2034
+  PR4109_WORK_DRIVER="/nonexistent/driver-is-stubbed"
+  quiesce_sequencing_stubs 840
+  # shellcheck disable=SC2034
+  QUIESCE_SEEDED_ASKED=1
+  # shellcheck disable=SC2034
+  QUIESCE_SEEDED_RC=0
+  QUIESCE_SEEDED_WORK="tbtc_signing@840@wallet840=${QUIESCE_SEQ_TX}=r1-node-1~member-1"
+  # shellcheck disable=SC2034
+  QUIESCE_SEEDED_PERMITS_BEFORE_C="r1-node-1=wallet840#member-1"
+  "$@"
+  run_quiescence_control r1-node-1 \
+    "quiescence with an in-flight legacy permit" \
+    "" legacy active_legacy_ceremonies participation_mode_legacy_total \
+    quiesce-legacy "${QUIESCE_SEEDED_WORK}"
+}
+
+run_verdict quiesce_seeded_case :
+check "a legacy permit seeded before C and drained after it holds" 0 \
+  "seeded before C and live beside r1-node-1=colive900#other-1" \
+  "quiescence with an in-flight legacy permit"
+
+# Nothing was put on the legacy side of the crossing, so the permit drained
+# here would be one the driver anchored below C on its own say-so.
+run_verdict quiesce_seeded_case eval 'QUIESCE_SEEDED_ASKED=0'
+check "an unseeded legacy quiescence drains no pre-C permit" 3 \
+  "no legacy permit was seeded before the fleet crossed C"
+
+run_verdict quiesce_seeded_case eval 'QUIESCE_SEEDED_RC=9'
+check "a failed seeding puts nothing on the chain before C" 3 \
+  "exited \[9\] seeding the legacy permit"
+
+run_verdict quiesce_seeded_case eval 'QUIESCE_SEEDED_WORK=""'
+check "a seeding that named no work identifies no pre-C permit" 3 \
+  "named no legacy work it put on r1-node-1"
+
+# The reading the whole seeding exists for: the driver says it anchored the
+# work below C, and the gate that would have issued the permit never reported
+# holding it there.
+run_verdict quiesce_seeded_case eval \
+  'QUIESCE_SEEDED_PERMITS_BEFORE_C="r1-node-1=somethingelse#member-9"'
+check "a permit the gate never held below C is not pre-C legacy work" 3 \
+  "was not holding r1-node-1=wallet840#member-1"
+
+run_verdict quiesce_seeded_case eval \
+  'QUIESCE_SEEDED_PERMITS_BEFORE_C="unreadable on r1-node-1"'
+check "a gate unread below C cannot vouch for a seeded permit" 3 \
+  "could not be asked which legacy permits it held before C"
+
+# A gate draining one population never has to keep the two modes apart, which
+# is the fence quiescence is supposed to hold.
+run_verdict quiesce_seeded_case eval 'QUIESCE_SEQ_COLIVE=""'
+check "a legacy drain with no security-v2 permit beside it exercises no fence" 3 \
+  "held only legacy permits when the stop was issued"
+
+run_verdict quiesce_seeded_case eval \
+  'QUIESCE_SEQ_COLIVE="unreadable on r1-node-1"'
+check "an unread other-mode population leaves the fence unexercised" 3 \
+  "could not be asked whether it held a permit of the other mode"
 
 # The accounting every "was work offered here" rung above reads. It comes off a
 # real driver invocation rather than a constructed reading, because what is

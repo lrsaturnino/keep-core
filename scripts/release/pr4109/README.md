@@ -232,6 +232,18 @@ also requires the driver to have reported the transactions it submitted, so a
 counter that moved for some unrelated reason is not credited to ceremonies
 nobody can show were originated.
 
+The in-flight half of the crossing names the permits rather than counting
+them. The gate publishes its live permits at `/diagnostics`
+(`protocol_participation.active_permits`), so the control reads the fleet's own
+list of what it holds before C, again at the instant every gate reports
+`open_security_v2`, and requires both to be exactly the permits the driver said
+it put there — no named permit the gates never held, and no unnamed permit
+crossing beside them. A count that moves in step is satisfied by any two
+unrelated ceremonies, and a permit gone by the crossing now fails the step
+rather than being read off a completion counter that happened to move
+afterwards. Only identity-bound permits count: an unbound permit names no chain
+work, so matching one would be reading the count again under another name.
+
 The straggler control reads the announcer's own account of the sighting
 rather than the gate's refusal counter, which counts a node declining its own
 `Begin` for reasons that need no legacy announcement behind them. It requires
@@ -476,14 +488,26 @@ work this drain never originated all block rather than passing.
 
 The single-release quiescence gate is decided the same way, for the same
 reason. It retains the work the node was holding when the stop was issued —
-which pieces, and that the node's permit count matches how many there were —
-and asks the driver in a `quiesce-terminal` phase what became of each once the
-drain is over. A held permit whose work never reached an outcome is a permit
-the process took with it, and that is indistinguishable from completion in
-every counter the node publishes. Work that ended by giving up inside the grace
-blocks rather than passing: this gate audits no quarantined state, so a
-ceremony that exhausted its retries evidences neither that it was allowed to
-finish nor that what it left behind is accounted for.
+which pieces, that the node's permit count matches how many there were, and
+that the node's own gate named those same permits — and asks the driver in a
+`quiesce-terminal` phase what became of each once the drain is over. A held
+permit whose work never reached an outcome is a permit the process took with
+it, and that is indistinguishable from completion in every counter the node
+publishes. Work that ended by giving up inside the grace blocks rather than
+passing: this gate audits no quarantined state, so a ceremony that exhausted
+its retries evidences neither that it was allowed to finish nor that what it
+left behind is accounted for.
+
+Its legacy half needs a permit the gate issued on the legacy side of C and is
+still holding long after the crossing, which nothing originated at that point
+in the run can be. So the driver is asked for it in a `quiesce-legacy-seed`
+phase while the fleet is still below C, and the node's own gate is read there:
+the permits it reports holding must include the ones the driver named. A driver
+that merely claims a below-C anchor for work it originates after the crossing
+is claiming exactly the thing the control exists to observe. The drain is then
+required to happen while a permit of the other mode is live on the same node —
+a gate draining a single population never has to keep the two modes apart,
+which is the fence quiescence is for.
 
 The straggler control binds its roster entry to the straggler's own operator.
 The prior node publishes the address it signs as at `/diagnostics`

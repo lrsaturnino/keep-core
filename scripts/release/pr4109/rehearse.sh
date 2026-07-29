@@ -3761,20 +3761,21 @@ would be empty"
   fi
 }
 
-# The legacy permits one node's gate reports live at this instant, rendered as
-# "<service>=<chain work>#<permit>" tokens.
+# The permits of one mode that one node's gate reports live at this instant,
+# rendered as "<service>=<chain work>#<permit>" tokens.
 #
-# A count of active legacy ceremonies answers "this node is holding two" and
-# nothing further, so a control watching work cross C can only compare totals —
-# and any two unrelated ceremonies moving in step satisfy that. The gate
-# publishes the permits themselves; naming them is what lets the control say
-# the permit that was in flight before C is the one that finished after it.
+# A count of active ceremonies answers "this node is holding two" and nothing
+# further, so a control watching work cross C or drain out of a quiescing node
+# can only compare totals — and any two unrelated ceremonies moving in step
+# satisfy that. The gate publishes the permits themselves; naming them is what
+# lets a control say the permit that was in flight before the event is the one
+# that was still there after it.
 #
 # Only identity-bound permits are usable. An unbound permit names no chain
 # work, so nothing can match it to work a driver put on the chain, and reading
 # it as a match would be reading the count again under another name.
-service_legacy_permits() {
-  local service="$1"
+service_mode_permits() {
+  local service="$1" mode="$2"
   probe_diagnostics "${service}" |
     node -e '
       let raw = "";
@@ -3787,6 +3788,7 @@ service_legacy_permits() {
           process.exit(1);
         }
         const service = process.argv[1];
+        const mode = process.argv[2];
         const out = [];
         for (const permit of permits) {
           if (permit === null || typeof permit !== "object" ||
@@ -3794,11 +3796,11 @@ service_legacy_permits() {
             console.error("not a permit: " + JSON.stringify(permit));
             process.exit(1);
           }
-          if (permit.mode !== "legacy") {
+          if (permit.mode !== mode) {
             continue;
           }
           if (permit.identity_bound !== true) {
-            console.error("a legacy permit is not identity-bound: " +
+            console.error("a permit is not identity-bound: " +
               JSON.stringify(permit));
             process.exit(1);
           }
@@ -3806,15 +3808,25 @@ service_legacy_permits() {
             !/^\S+$/.test(permit.work_id) ||
             typeof permit.permit_id !== "string" ||
             !/^\S+$/.test(permit.permit_id)) {
-            console.error("a legacy permit names no work or permit " +
-              "identity: " + JSON.stringify(permit));
+            console.error("a permit names no work or permit identity: " +
+              JSON.stringify(permit));
             process.exit(1);
           }
           out.push(service + "=" + permit.work_id + "#" + permit.permit_id);
         }
         process.stdout.write(out.join(" "));
       });
-    ' "${service}"
+    ' "${service}" "${mode}"
+}
+
+# The gate's own spelling of the two permit modes, which is what a scrape
+# filters on. The rehearsal writes the security-v2 half with a hyphen in step
+# names and metric suffixes; the gate does not.
+gate_mode_name() {
+  case "$1" in
+  security-v2 | security_v2) printf 'security_v2' ;;
+  *) printf 'legacy' ;;
+  esac
 }
 
 # Every legacy permit the R1 fleet holds right now, in the form the originated
@@ -3824,13 +3836,25 @@ service_legacy_permits() {
 fleet_legacy_permits() {
   local service permits out=""
   for service in "${REHEARSAL_R1_SERVICES[@]}"; do
-    if ! permits="$(service_legacy_permits "${service}" 2>/dev/null)"; then
+    if ! permits="$(service_mode_permits "${service}" legacy 2>/dev/null)"; then
       printf 'unreadable on %s' "${service}"
       return 0
     fi
     [[ -z "${permits}" ]] || out="${out}${out:+ }${permits}"
   done
   printf '%s' "${out}"
+}
+
+# The same for one node and one mode, with the same unreadable-is-unusable
+# convention so a control can tell "held nothing" from "could not be asked".
+node_mode_permits() {
+  local node="$1" permits
+  if ! permits="$(service_mode_permits "${node}" \
+    "$(gate_mode_name "$2")" 2>/dev/null)"; then
+    printf 'unreadable on %s' "${node}"
+    return 0
+  fi
+  printf '%s' "${permits}"
 }
 
 # Record the block the gate is clocked to, as that node reads it.
@@ -6309,6 +6333,45 @@ QUIESCE_MISANCHORED=""
 QUIESCE_TERMINAL=""
 QUIESCE_TERMINAL_ASKED=0
 QUIESCE_TERMINAL_RC=0
+QUIESCE_PERMITS_BEFORE=""
+QUIESCE_COLIVE_PERMITS=""
+QUIESCE_COLIVE_REQUIRED=0
+QUIESCE_FROM_SEED=0
+
+# The legacy permit the quiescence control drains, put on the chain before the
+# fleet crossed C and observed in the gate that issued it while it was still on
+# the legacy side.
+#
+# The legacy half of quiescence runs after the crossing, so work originated
+# there is security-v2 work unless the driver deliberately anchors it below C —
+# and a driver-supplied anchor is the driver's word for the one thing the
+# control is about. A permit the gate itself reported holding before C is not.
+QUIESCE_SEEDED_WORK=""
+QUIESCE_SEEDED_ASKED=0
+QUIESCE_SEEDED_RC=0
+QUIESCE_SEEDED_PERMITS_BEFORE_C=""
+
+# Put the legacy quiescence control's subject on the chain while the fleet is
+# still below C, and record the permits the target node's own gate reported
+# holding for it.
+seed_legacy_quiescence_work() {
+  local node="$1"
+
+  QUIESCE_SEEDED_WORK=""
+  QUIESCE_SEEDED_ASKED=0
+  QUIESCE_SEEDED_RC=0
+  QUIESCE_SEEDED_PERMITS_BEFORE_C=""
+
+  [[ -n "${PR4109_WORK_DRIVER:-}" ]] || return 0
+  QUIESCE_SEEDED_ASKED=1
+  run_work_driver quiesce-legacy-seed || true
+  QUIESCE_SEEDED_RC="${WORK_DRIVER_RC}"
+  if driver_offered_work; then
+    QUIESCE_SEEDED_WORK="$(work_records_held_by \
+      "${WORK_DRIVER_ORIGINATED_WORK}" "${node}")"
+  fi
+  QUIESCE_SEEDED_PERMITS_BEFORE_C="$(node_mode_permits "${node}" legacy)"
+}
 
 # record_assertion, for the quiescence steps the gate contract records one
 # for. The contract names a single graceful-quiescence assertion and binds it
@@ -6330,7 +6393,47 @@ quiescence_assertion() {
 quiescence_verdict() {
   local node="$1" step="$2" assertion="$3" mode="$4"
 
-  if [[ "${QUIESCE_STATE}" != "quiescing" ]]; then
+  # A seeded control's subject was put on the chain before C and has to be
+  # shown to have been there. Everything below decides on the permits the node
+  # drained; these rungs decide whether those permits are the ones the crossing
+  # left behind or ones the driver merely says were anchored below it.
+  if ((QUIESCE_FROM_SEED == 1)) && ((QUIESCE_SEEDED_ASKED == 0)); then
+    block_step "${step}" "no ${mode} permit was seeded before the fleet \
+crossed C, so this step has no permit taken on the legacy side of the crossing \
+to drain; work originated here takes a security-v2 permit unless a driver \
+claims otherwise, and a claimed anchor is the driver's word for the one thing \
+this control is about"
+    quiescence_assertion "${assertion}" false "${step}"
+  elif ((QUIESCE_FROM_SEED == 1)) && ((QUIESCE_SEEDED_RC != 0)); then
+    block_step "${step}" "the work driver exited [${QUIESCE_SEEDED_RC}] \
+seeding the ${mode} permit this step was to drain, so nothing was put on the \
+chain before C for it to be about"
+    quiescence_assertion "${assertion}" false "${step}"
+  elif ((QUIESCE_FROM_SEED == 1)) &&
+    [[ -z "${QUIESCE_SEEDED_WORK//[[:space:]]/}" ]]; then
+    block_step "${step}" "the work driver exited cleanly before C but named no \
+${mode} work it put on ${node}, so this step has nothing it can follow from \
+the legacy side of the crossing into the drain"
+    quiescence_assertion "${assertion}" false "${step}"
+  elif ((QUIESCE_FROM_SEED == 1)) &&
+    [[ "${QUIESCE_SEEDED_PERMITS_BEFORE_C}" == "unreadable on "* ]]; then
+    block_step "${step}" "${node} could not be asked which ${mode} permits it \
+held before C (${QUIESCE_SEEDED_PERMITS_BEFORE_C}); without that reading the \
+permit drained below rests on the driver's claimed anchor rather than on the \
+gate having issued it on the legacy side of the crossing"
+    quiescence_assertion "${assertion}" false "${step}"
+  elif ((QUIESCE_FROM_SEED == 1)) &&
+    [[ -n "$(absent_tokens \
+      "$(held_permit_identities "${QUIESCE_SEEDED_WORK}")" \
+      "${QUIESCE_SEEDED_PERMITS_BEFORE_C}")" ]]; then
+    block_step "${step}" "${node} was not holding \
+$(absent_tokens "$(held_permit_identities "${QUIESCE_SEEDED_WORK}")" \
+      "${QUIESCE_SEEDED_PERMITS_BEFORE_C}") while the fleet was still below C, \
+though the driver named it as seeded there; a permit the gate did not report \
+issuing on the legacy side of the crossing is not one this control can drain \
+as legacy work"
+    quiescence_assertion "${assertion}" false "${step}"
+  elif [[ "${QUIESCE_STATE}" != "quiescing" ]]; then
     record_step "${step}" fail "${node} never reported quiescing while \
 draining with ${QUIESCE_HELD_BEFORE} ${mode} ceremonies in flight"
     quiescence_assertion "${assertion}" false "${step}"
@@ -6392,6 +6495,44 @@ permit(s) for $(count_tokens "$(permit_identities \
 ($(permit_identities "${QUIESCE_INFLIGHT_WORK}")); the permit counter and the \
 driver's account describe different populations, so an outcome for one piece \
 of work cannot be said to be the outcome of any particular held permit"
+    quiescence_assertion "${assertion}" false "${step}"
+  elif [[ "${QUIESCE_PERMITS_BEFORE}" == "unreadable on "* ]]; then
+    block_step "${step}" "${node} could not be asked which ${mode} permits it \
+was holding when the stop was issued (${QUIESCE_PERMITS_BEFORE}); the count it \
+did report says how many permits drained and never which, so the outcomes \
+below would be reconciled against the driver's account alone"
+    quiescence_assertion "${assertion}" false "${step}"
+  elif [[ -n "$(absent_tokens \
+    "$(held_permit_identities "${QUIESCE_INFLIGHT_WORK}")" \
+    "${QUIESCE_PERMITS_BEFORE}")" ]]; then
+    block_step "${step}" "${node} was drained holding \
+${QUIESCE_PERMITS_BEFORE:-nothing it named}, which does not include \
+$(absent_tokens "$(held_permit_identities "${QUIESCE_INFLIGHT_WORK}")" \
+      "${QUIESCE_PERMITS_BEFORE}") from the driver's account of the work it \
+put there; a permit the issuing gate never reported holding is one the driver \
+alone vouches for"
+    quiescence_assertion "${assertion}" false "${step}"
+  elif [[ -n "$(absent_tokens "${QUIESCE_PERMITS_BEFORE}" \
+    "$(held_permit_identities "${QUIESCE_INFLIGHT_WORK}")")" ]]; then
+    block_step "${step}" "${node} was drained holding \
+$(absent_tokens "${QUIESCE_PERMITS_BEFORE}" \
+      "$(held_permit_identities "${QUIESCE_INFLIGHT_WORK}")") beside the work \
+the driver named; an unidentified permit draining alongside the named ones is \
+one this step would speak for without ever having followed it"
+    quiescence_assertion "${assertion}" false "${step}"
+  elif ((QUIESCE_COLIVE_REQUIRED == 1)) &&
+    [[ "${QUIESCE_COLIVE_PERMITS}" == "unreadable on "* ]]; then
+    block_step "${step}" "${node} could not be asked whether it held a permit \
+of the other mode when the stop was issued (${QUIESCE_COLIVE_PERMITS}); the \
+fence a quiescing gate has to hold is the one where both modes are live at \
+once, and an unread node there leaves it unexercised"
+    quiescence_assertion "${assertion}" false "${step}"
+  elif ((QUIESCE_COLIVE_REQUIRED == 1)) &&
+    [[ -z "${QUIESCE_COLIVE_PERMITS}" ]]; then
+    block_step "${step}" "${node} held only ${mode} permits when the stop was \
+issued; a gate draining one population never has to keep the two modes apart, \
+so this needs a permit of the other mode live beside the ${mode} one it is \
+about"
     quiescence_assertion "${assertion}" false "${step}"
   elif ((QUIESCE_TERMINAL_ASKED == 0)); then
     block_step "${step}" "${node} let all ${QUIESCE_HELD_BEFORE} held permits \
@@ -6503,7 +6644,10 @@ offer being refused would"
       return
     fi
     record_step "${step}" pass "${node} entered quiescing holding \
-${QUIESCE_HELD_BEFORE} ${mode} ceremonies, was offered \
+${QUIESCE_HELD_BEFORE} ${mode} ceremonies its own gate named \
+(${QUIESCE_PERMITS_BEFORE})$( ((QUIESCE_COLIVE_REQUIRED == 1)) &&
+      printf ', seeded before C and live beside %s of the other mode' \
+        "${QUIESCE_COLIVE_PERMITS}"), was offered \
 ${QUIESCE_OFFERED} while quiescing and refused it on its own account \
 (${refused_offered}; refusals \
 ${QUIESCE_REFUSALS_BEFORE} to ${QUIESCE_REFUSALS_AFTER}) while issuing no \
@@ -6528,7 +6672,12 @@ chain ($(bound_settlements "${QUIESCE_TERMINAL}"))"
 # whole drain.
 run_quiescence_control() {
   local node="$1" step="$2" assertion="$3" mode="$4"
-  local active_field="$5" issued_metric="$6" phase="$7"
+  local active_field="$5" issued_metric="$6" phase="$7" seeded="${8:-}"
+  # Supplied-but-empty is the seeding having failed, which is a different
+  # reading from a control that was never seeded at all; the ladder has to be
+  # able to say which.
+  QUIESCE_FROM_SEED=0
+  (($# >= 8)) && QUIESCE_FROM_SEED=1
 
   # The property is about a permit the node is holding while it is told to
   # stop, so one has to be in flight before the stop is issued. A node with
@@ -6538,8 +6687,22 @@ run_quiescence_control() {
   # permits this node is about to be told to drain have to be followed to an
   # outcome afterwards, and only the driver's account names which piece of work
   # each one was issued for.
-  QUIESCE_INFLIGHT_WORK=""
-  if [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
+  #
+  # A control handed seeded work drains that instead. Its subject was put on
+  # the chain earlier — before C, where a legacy permit is the only kind a gate
+  # will issue — so originating more here would replace the permit under
+  # examination with one taken on the far side of the crossing.
+  QUIESCE_COLIVE_REQUIRED="${QUIESCE_FROM_SEED}"
+  QUIESCE_COLIVE_PERMITS=""
+  QUIESCE_INFLIGHT_WORK="${seeded}"
+  if ((QUIESCE_FROM_SEED == 1)); then
+    # The other mode is put in flight beside it deliberately. The fence a
+    # quiescing gate has to hold is the one where both modes are live at once,
+    # and a node draining a single population never exercises it.
+    if [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
+      run_work_driver "${phase}-inflight" || true
+    fi
+  elif [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
     run_work_driver "${phase}-inflight" || true
     if driver_offered_work; then
       QUIESCE_INFLIGHT_WORK="$(work_records_held_by \
@@ -6556,6 +6719,17 @@ run_quiescence_control() {
     "${mode}" "${REHEARSAL_R1_CUTOVER_BLOCK}")"
   QUIESCE_HELD_BEFORE="$(participation_field "${node}" \
     "${active_field}" 2>/dev/null || printf '')"
+  # What the node itself says it is holding, taken beside the count that says
+  # how much. The outcomes below are reconciled against the driver's account of
+  # the work; naming the permits is what makes that account checkable against
+  # the gate that issued them rather than merely consistent with a gauge.
+  QUIESCE_PERMITS_BEFORE="$(node_mode_permits "${node}" "${mode}")"
+  if ((QUIESCE_COLIVE_REQUIRED == 1)); then
+    case "${mode}" in
+    legacy) QUIESCE_COLIVE_PERMITS="$(node_mode_permits "${node}" security-v2)" ;;
+    *) QUIESCE_COLIVE_PERMITS="$(node_mode_permits "${node}" legacy)" ;;
+    esac
+  fi
   QUIESCE_FORCED_BEFORE="$(metric_value "${node}" \
     participation_quiesce_forced_aborts_total || printf '')"
   QUIESCE_ISSUED_BEFORE="$(metric_value "${node}" \
@@ -7795,6 +7969,12 @@ stage_single_release() {
   # once the crossing step has established that C passed in-process.
   originate_surviving_legacy_work
 
+  # So does step 8's legacy half, for the same reason and one step further on:
+  # its subject has to still be held when the node is told to stop, long after
+  # the crossing. Seeding it here is what makes it a permit the gate issued on
+  # the legacy side of C rather than one a driver says it anchored there.
+  seed_legacy_quiescence_work "${REHEARSAL_R1_SERVICES[0]}"
+
   # Step 3. The crossing itself is observable without any legacy work: the
   # gate re-reads the chain and flips the state it reports, and it must do so
   # in the processes started before C, with no restart in between.
@@ -8139,16 +8319,17 @@ network"
 
   # The legacy half needs a permit anchored below C still in flight after it,
   # which the gate issues on the anchor rather than on the current height. This
-  # step runs after the crossing, so the driver has to anchor the work it puts
-  # in flight below C deliberately; the control reads the anchors it was handed
-  # and refuses to decide when they are not legacy-anchored, rather than taking
-  # the phase name for the permit's mode. The node is the one the clock-failure
-  # step severed and reconnected; the other one is stopped.
+  # step runs after the crossing, so its subject is the permit seeded before it
+  # and observed in the issuing gate while the fleet was still on the legacy
+  # side; the control reads the anchors it was handed and refuses to decide
+  # when they are not legacy-anchored, rather than taking the phase name for
+  # the permit's mode. The node is the one the clock-failure step severed and
+  # reconnected; the other one is stopped.
   begin_step "quiescence with an in-flight legacy permit"
   run_quiescence_control "${REHEARSAL_R1_SERVICES[0]}" \
     "quiescence with an in-flight legacy permit" \
     "" legacy active_legacy_ceremonies \
-    participation_mode_legacy_total quiesce-legacy
+    participation_mode_legacy_total quiesce-legacy "${QUIESCE_SEEDED_WORK}"
 
   # This gate ends where the next one begins. A rollback rehearsal's whole
   # subject is that no prior binary participates while a release candidate can
