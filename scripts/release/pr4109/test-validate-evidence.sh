@@ -2968,6 +2968,15 @@ beacon_dkg@1002@seed1002=${RECONCILE_TX3}=r1-node-2~3"
   ROLLBACK_TERMINAL="\
 tbtc_signing@1000@sign1000=succeeded=${RECONCILE_TX}=0xsigned \
 tbtc_wallet_action@1001@action1001=failed=${RECONCILE_TX2}=retry_exhausted"
+  # What each node recorded about the permits it let go of, sampled inside the
+  # drain window. The wallet action ran out of retries, which its holders
+  # recorded as such; the beacon permit is the one force-canceled at the
+  # deadline, and its holder recorded the quarantine the audit also wrote.
+  # shellcheck disable=SC2034
+  ROLLBACK_NODE_ENDINGS="r1-node-1 r1-node-1=sign1000#1=completed \
+r1-node-1=action1001#wallet-a=exhausted
+r1-node-2 r1-node-2=sign1000#2=completed \
+r1-node-2=action1001#wallet-b=exhausted r1-node-2=seed1002#3=quarantined"
 }
 
 reconcile_case() {
@@ -2978,10 +2987,10 @@ reconcile_case() {
 
 run_verdict reconcile_case :
 check "permits that completed or were audited into quarantine reconcile" 0 \
-  "4 completed with the holding node observed without them and the driver \
-reporting an outcome for each one" \
+  "4 completed with the holding node observed without them" \
   "tbtc_signing@1000@sign1000 \(${RECONCILE_TX}, 0xsigned\), \
 tbtc_wallet_action@1001@action1001=failed" \
+  "holding node recording an ending of its own for every permit it let go of" \
   "and 1 were force-canceled"
 
 # The regression this whole accounting exists for: the permits outnumber the
@@ -3034,6 +3043,50 @@ check "a terminal report from a driver that failed accounts for no permit" 3 \
 run_verdict reconcile_case eval 'ROLLBACK_ORIGINATED_WORK=""'
 check "permits nobody identified the work for reconcile nothing" 3 \
   "the driver named no identified work for the drain"
+
+# The half of this reconciliation the driver cannot supply. Everything above
+# decides on the driver's account of ceremonies it started, and a permit whose
+# process went down holding it produces the same account as one that finished.
+run_verdict reconcile_case eval \
+  'ROLLBACK_NODE_ENDINGS="r1-node-1 unread
+r1-node-2 unread"'
+check "a node never asked about its own permits vouches for none of them" 3 \
+  "never asked what became of the permits"
+
+run_verdict reconcile_case eval \
+  'ROLLBACK_NODE_ENDINGS="r1-node-1 none
+r1-node-2 none"'
+check "a node that recorded no ending at all vouches for none of them" 3 \
+  "recorded no ending for r1-node-1=sign1000#1"
+
+# The partial population: a node accounts for one of the permits it held and
+# never mentions the other, which is also what eviction from a bounded account
+# looks like.
+run_verdict reconcile_case eval \
+  'ROLLBACK_NODE_ENDINGS="r1-node-1 r1-node-1=sign1000#1=completed
+r1-node-2 r1-node-2=sign1000#2=completed \
+r1-node-2=action1001#wallet-b=exhausted r1-node-2=seed1002#3=quarantined"'
+check "a permit its holder never accounted for is not reconciled" 3 \
+  "recorded no ending for r1-node-1=action1001#wallet-a"
+
+run_verdict reconcile_case eval \
+  'ROLLBACK_NODE_ENDINGS="r1-node-1 r1-node-1=sign1000#1=completed \
+r1-node-1=action1001#wallet-a=exhausted r1-node-1=sign1000#1=exhausted
+r1-node-2 r1-node-2=sign1000#2=completed \
+r1-node-2=action1001#wallet-b=exhausted r1-node-2=seed1002#3=quarantined"'
+check "a drained permit ending twice cannot be read as either ending" 3 \
+  "more than one ending for r1-node-1=sign1000#1"
+
+# The reading this whole rung exists for: the driver reports the ceremony
+# ending, and the node that held the permit says its owner recorded nothing —
+# which is what a process going down holding a permit writes.
+run_verdict reconcile_case eval \
+  'ROLLBACK_NODE_ENDINGS="r1-node-1 r1-node-1=sign1000#1=unresolved \
+r1-node-1=action1001#wallet-a=exhausted
+r1-node-2 r1-node-2=sign1000#2=completed \
+r1-node-2=action1001#wallet-b=exhausted r1-node-2=seed1002#3=quarantined"'
+check "a permit whose owner recorded nothing is not restorable state" 1 \
+  "r1-node-1=sign1000#1=unresolved"
 
 # What the reconciliation reads a quarantine record off, and the reason it is
 # read with an instant rather than counted. A quarantine namespace accumulates:

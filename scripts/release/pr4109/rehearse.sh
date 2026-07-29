@@ -7669,6 +7669,17 @@ ROLLBACK_NODE_ACCOUNTS=""
 # drain produced. "none" when the manifest holds no such record, "unreadable"
 # when it could not be read.
 ROLLBACK_NODE_QUARANTINES=""
+# What each node recorded about the permits it closed while draining,
+# "<service> <ending token>...", sampled inside the drain window because the
+# account goes away with the node. "unread" when that node could never be
+# asked, "none" when it answered having closed nothing.
+#
+# This is the half the driver cannot supply. A terminal outcome the driver
+# reports is its account of a ceremony it originated, and read alone it makes
+# the same claim whether the permit behind it completed or the process went
+# down holding it — which is the very distinction a rollback reconciliation
+# exists to draw.
+ROLLBACK_NODE_ENDINGS=""
 # What became of the work this gate originated, asked of the driver once the
 # drain is over. A permit that was not force-canceled is only "completed" if
 # the ceremony behind it actually reached an outcome; the fleet's own gauge
@@ -7714,10 +7725,11 @@ rollback_reconciliation_verdict() {
   local step="$1" assertion="$2"
   local line service held forced final quarantined
   local unread="" unreconciled="" unaudited="" impossible="" miscounted=""
-  local strayed="" orphaned=""
+  local strayed="" orphaned="" unvouched="" misvouched=""
   local completed_total=0 quarantined_total=0 nodes=0
   local node_records node_permits expected quarantine_ids quarantine_count
   local record permit audited
+  local endings node_held unauthored duplicated misended unresolved
 
   if [[ -z "${ROLLBACK_NODE_ACCOUNTS//[[:space:]]/}" ]]; then
     block_step "${step}" "no R1 node's permit accounting was captured across \
@@ -7868,6 +7880,56 @@ force-canceled, only ${quarantine_count} quarantine record(s))"
 $(permit_identity "${record}")"
     done
 
+    # The same permits again, asked of the node that held them. Everything
+    # above this point is the driver's account of ceremonies it originated, and
+    # a permit whose owner recorded nothing is exactly the one whose process
+    # went down holding it — which reads identically in a report that says the
+    # ceremony settled. The endings are the node's own, sampled while it was
+    # still draining.
+    endings="$(listing_value "${ROLLBACK_NODE_ENDINGS}" "${service}")"
+    if [[ -z "${endings}" || "${endings}" == "unread" ]]; then
+      unvouched="${unvouched}${unvouched:+, }${service} (never asked what \
+became of the permits it was draining)"
+      continue
+    fi
+    [[ "${endings}" == "none" ]] && endings=""
+    node_held="$(held_permit_identities "${node_records}")"
+    unauthored="$(unauthored_permits "${node_held}" "${endings}")"
+    if [[ -n "${unauthored}" ]]; then
+      unvouched="${unvouched}${unvouched:+, }${service} recorded no ending \
+for ${unauthored}"
+      continue
+    fi
+    duplicated="$(duplicated_authored_permits "${node_held}" "${endings}")"
+    if [[ -n "${duplicated}" ]]; then
+      unvouched="${unvouched}${unvouched:+, }${service} recorded more than \
+one ending for ${duplicated}"
+      continue
+    fi
+    # The endings a rollback can restore onto: the ceremony finished, its
+    # retries ran out, or its output was withdrawn into an audited quarantine
+    # record. Each is a permit the node let go of and can describe, which is
+    # what the restored fleet needs — the driver's side of this reconciliation
+    # accepts a ceremony that gave up for the same reason.
+    #
+    # `unresolved` is the one ending that cannot be here, and it is checked
+    # below rather than through this set: it is what the gate writes for a
+    # permit closed by an owner that recorded nothing, which is exactly the
+    # process that went down holding it.
+    misended="$(misended_authored_permits "${node_held}" "${endings}" \
+      "completed quarantined exhausted")"
+    if [[ -n "${misended}" ]]; then
+      misvouched="${misvouched}${misvouched:+, }${service} recorded \
+${misended}"
+      continue
+    fi
+    unresolved="$(unresolved_authored_permits "${node_held}" "${endings}")"
+    if [[ -n "${unresolved}" ]]; then
+      misvouched="${misvouched}${misvouched:+, }${service} recorded \
+${unresolved}"
+      continue
+    fi
+
     completed_total=$((completed_total + held - forced))
   done <<<"${ROLLBACK_NODE_ACCOUNTS}"
 
@@ -7909,6 +7971,18 @@ the driver watched nor was written into a quarantine record; that permit \
 reconciles to a gauge that fell rather than to work that ended, and the state \
 a rollback restores onto carries no account of it"
     record_assertion "${assertion}" false "${step}"
+  elif [[ -n "${unvouched}" ]]; then
+    block_step "${step}" "${unvouched}; the driver's terminal outcome is its \
+account of a ceremony it started, and read alone it says the same thing about \
+a permit that completed and one whose process went down holding it — only the \
+node that held it can tell those apart"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ -n "${misvouched}" ]]; then
+    record_step "${step}" fail "${misvouched}, though the driver reported the \
+work behind those permits ending; a rollback is authorized over permits their \
+own holders let go of and can describe, and an ending outside that is \
+in-flight state the restored fleet carries no account of"
+    record_assertion "${assertion}" false "${step}"
   elif [[ -n "$(unended_work "${ROLLBACK_ORIGINATED_WORK}" \
     "${ROLLBACK_TERMINAL}" "$(quarantined_identities)")" ]]; then
     block_step "${step}" "the driver reported no terminal outcome and no node \
@@ -7927,8 +8001,9 @@ with nothing describing it"
     fi
     record_step "${step}" pass "every permit the ${nodes} R1 node(s) held when \
 the stop was issued reconciles to the piece of work it was issued for: \
-${completed_total} completed with the holding node observed without them and \
-the driver reporting an outcome for each one (${accounted}), and \
+${completed_total} completed with the holding node observed without them, the \
+driver reporting an outcome for each one (${accounted}), and the holding node \
+recording an ending of its own for every permit it let go of; and \
 ${quarantined_total} were force-canceled at the quiesce deadline and written \
 into the audit's quarantine records for the work they held"
     record_assertion "${assertion}" true "${step}"
@@ -9246,8 +9321,13 @@ nowhere to capture them to"
   # node held to what became of them, and the reconciliation below is about
   # each permit rather than about the size of the population.
   local held_at_stop=() forced_before=() forced_after=() final_active=()
+  local authored_endings=()
   local svc reading
   for svc in "${REHEARSAL_R1_SERVICES[@]}"; do
+    # "unread" rather than empty, because a node that answered with nothing yet
+    # closed also has an empty list; the reconciliation has to tell a node it
+    # could not ask from one that ended nothing.
+    authored_endings+=("unread")
     reading="$(participation_field "${svc}" active_security_v2_ceremonies \
       2>/dev/null || printf 'unreadable')"
     [[ "${reading}" =~ ^[0-9]+$ ]] || reading="unreadable"
@@ -9310,12 +9390,25 @@ nowhere to capture them to"
     # readable value stands: a node that has stopped answering cannot report
     # that it finished, and its last reading is what it was holding when it
     # went.
-    local idx=0 active_now forced_now
+    #
+    # What it was holding and what it recorded about the permits it let go of
+    # come out of one response, because the interesting node is the one that
+    # closes its last permit and exits: asked separately it answers the count
+    # and not the endings, and the reconciliation would then read a drained
+    # node beside the ending list from before that permit closed.
+    local idx=0 snapshot_now active_now forced_now
     for svc in "${REHEARSAL_R1_SERVICES[@]}"; do
-      active_now="$(participation_field "${svc}" \
-        active_security_v2_ceremonies 2>/dev/null || printf '')"
-      if [[ "${active_now}" =~ ^[0-9]+$ ]]; then
-        final_active[idx]="${active_now}"
+      if snapshot_now="$(service_gate_snapshot "${svc}" \
+        active_security_v2_ceremonies 2>/dev/null)"; then
+        active_now="$(snapshot_field "${snapshot_now}" active)"
+        if [[ "${active_now}" =~ ^[0-9]+$ ]]; then
+          final_active[idx]="${active_now}"
+        fi
+        # Overwritten rather than accumulated: the account only grows as
+        # permits close, so the last whole reading has every permit that ended
+        # in this window.
+        snapshot_now="$(snapshot_field "${snapshot_now}" outcomes)"
+        authored_endings[idx]="${snapshot_now:-none}"
       fi
       forced_now="$(metric_value "${svc}" \
         participation_quiesce_forced_aborts_total 2>/dev/null || printf '')"
@@ -9343,6 +9436,7 @@ nowhere to capture them to"
   # node's lifetime total: aborts this rehearsal's earlier steps provoked are
   # not permits this drain force-canceled.
   ROLLBACK_NODE_ACCOUNTS=""
+  ROLLBACK_NODE_ENDINGS=""
   local pos=0 forced_delta
   for svc in "${REHEARSAL_R1_SERVICES[@]}"; do
     if [[ "${forced_before[${pos}]}" =~ ^[0-9]+$ ]] &&
@@ -9355,6 +9449,10 @@ nowhere to capture them to"
     ROLLBACK_NODE_ACCOUNTS="${ROLLBACK_NODE_ACCOUNTS}\
 ${ROLLBACK_NODE_ACCOUNTS:+$'\n'}${svc} ${held_at_stop[${pos}]} \
 ${forced_delta} ${final_active[${pos}]}"
+    # Kept as its own listing rather than appended to the accounting line: the
+    # endings carry spaces, and the accounting is read field by field.
+    ROLLBACK_NODE_ENDINGS="${ROLLBACK_NODE_ENDINGS}\
+${ROLLBACK_NODE_ENDINGS:+$'\n'}${svc} ${authored_endings[${pos}]}"
     pos=$((pos + 1))
   done
 

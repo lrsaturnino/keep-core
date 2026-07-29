@@ -354,25 +354,25 @@ that phase did not originate on the transaction that originated it, and
 originated work no outcome covers — a control that reads only the work its
 driver chose to report on is satisfied by the subset that went well.
 
-The seam is not closed, and the parts of it still open are named here rather
-than left to be inferred from which verdicts the list above happens to omit:
+The rollback reconciliation reads the same account, sampled per node inside its
+own drain window for the same reason the quiescence controls sample theirs.
+Every permit a node held at the stop must appear in that node's own record of
+what it let go of, exactly once, ending in a completion, an exhaustion, or a
+quarantine. `unresolved` — what the gate writes for a permit closed by an owner
+that recorded nothing — fails the step, because that is precisely what a process
+going down while holding a permit leaves behind, and a driver terminal record
+says the same thing about it as about a ceremony that finished.
 
-- The rollback drain and rollback reconciliation verdicts still treat a driver
-  terminal record as the proof that every nonquarantined permit completed. Gate
-  7's claim about a fleet being taken back off the release therefore rests on
-  the same single account.
-- The contributor set — which parties a settled transcript incorporated — is
-  the driver's word in every control that reads it, including the two
-  pre-cutover verdicts above. It is what the mixed-release steps distinguish a
-  mixed committee from a homogeneous one by, so gate 6's interoperability claim
-  is only as good as that report even though its terminal half is now joined to
-  the nodes.
-
-Each of those is an internally consistent driver report away from passing a
-mandatory gate. Deriving endings from the holders for the remaining verdicts,
-and contributor sets from authenticated protocol shares and artifacts rather
-than from the originating driver, is the work that closes the rest of this
-seam.
+The seam is not closed. What is still open is named here rather than left to be
+inferred from which verdicts the list above happens to omit: the contributor set
+— which parties a settled transcript incorporated — is the driver's word in
+every control that reads it, including the two pre-cutover verdicts. It is what
+the mixed-release steps distinguish a mixed committee from a homogeneous one by,
+so gate 6's interoperability claim is only as good as that report even though
+its terminal half is now joined to the nodes. That claim is an internally
+consistent driver report away from passing a mandatory gate, and deriving
+contributor sets from authenticated protocol shares and artifacts rather than
+from the originating driver is the work that closes the rest of this seam.
 
 The straggler control reads the announcer's own account of the sighting
 rather than the gate's refusal counter, which counts a node declining its own
