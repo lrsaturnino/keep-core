@@ -628,8 +628,8 @@ binding, wrong hash, wrong grace, wrong source commit, missing binding
 fields, malformed timestamp, empty record set — over incomplete and malformed
 gate contracts — a one-stage passing subset, a duplicate stage replacing a
 required one, an unknown assertion, a true assertion borrowing an unrelated
-passing stage, missing required instrument digests, and an emitted one-stage
-run — over correctly bound records whose *outcomes* deny the gate — a failed
+passing stage, missing required release inputs — the reviewed instruments and
+the archived dependency review alike — and an emitted one-stage run — over correctly bound records whose *outcomes* deny the gate — a failed
 step, a refused assertion with every step passing, a step that never executed,
 a failure alongside an unexecuted step, and a failing record sitting beside a
 passing one — over fixture attestations —
@@ -992,10 +992,11 @@ program the control does not name, stops the rehearsal. The digests are
 recorded into the evidence document under `chain_inputs`, and the acceptance
 stage refuses a record naming a digest the control does not pin, one carrying
 chain transactions while naming no driver at all, or an otherwise complete
-gate omitting an instrument its contract uses. Single-release requires the
-driver; rollback requires the driver and generator. That control currently
-pins the all-zero placeholder for both programs, which matches no file: no
-driver or generator has been written and reviewed, so every dispatch that
+gate omitting a release input its contract uses. Single-release requires the
+driver and the archived dependency review; rollback requires the driver and
+the generator. That control currently pins the all-zero placeholder for all
+three, which matches no file: no driver or generator has been written and
+reviewed and no dependency review has been archived, so every dispatch that
 supplies one blocks until a reviewed digest is recorded in a reviewed commit.
 An unpinned control that admitted anything would be worse than an absent one,
 because it would read as having been exercised.
