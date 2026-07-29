@@ -14,7 +14,7 @@ import {
 import ecdsaData from "./data/ecdsa"
 
 import type { IWalletOwner } from "../typechain/IWalletOwner"
-import type { FakeContract } from "@defi-wonderland/smock"
+import type { Mock } from "./helpers/mock"
 import type { DkgResult } from "./utils/dkg"
 import type { Operator } from "./utils/operators"
 import type {
@@ -49,13 +49,13 @@ describe("EcdsaDkgValidator", () => {
 
   let walletRegistry: WalletRegistry
   let sortitionPool: SortitionPool
-  let walletOwner: FakeContract<IWalletOwner>
+  let walletOwner: Mock<IWalletOwner>
   let validator: EcdsaDkgValidator
 
   before("load test fixture", async () => {
     // eslint-disable-next-line @typescript-eslint/no-extra-semi
     ;({ walletRegistry, sortitionPool, walletOwner } =
-      await walletRegistryFixture())
+      await walletRegistryFixture({ useAllowlist: true }))
 
     validator = await helpers.contracts.getContract("EcdsaDkgValidator")
 

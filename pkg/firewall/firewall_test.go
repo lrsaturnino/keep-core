@@ -2,12 +2,14 @@ package firewall
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/keep-network/keep-common/pkg/cache"
 	"github.com/keep-network/keep-core/internal/testutils"
 	"github.com/keep-network/keep-core/pkg/chain/local_v1"
+	"github.com/keep-network/keep-core/pkg/clientinfo"
 	"github.com/keep-network/keep-core/pkg/operator"
 )
 
@@ -16,7 +18,7 @@ const cachingPeriod = time.Second
 func TestValidate_PeerNotRecognized_NoApplications(t *testing.T) {
 	policy := &anyApplicationPolicy{
 		applications:        []Application{},
-		allowList:           EmptyAllowList,
+		allowList:           EmptyAllowList(),
 		negativeResultCache: cache.NewTimeCache(cachingPeriod),
 	}
 
@@ -28,7 +30,7 @@ func TestValidate_PeerNotRecognized_NoApplications(t *testing.T) {
 	}
 
 	err = policy.Validate(peerOperatorPublicKey)
-	testutils.AssertErrorsSame(t, errNotRecognized, err)
+	testutils.AssertErrorsSame(t, ErrNotRecognized, err)
 }
 
 func TestValidate_PeerNotRecognized_MultipleApplications(t *testing.T) {
@@ -43,12 +45,12 @@ func TestValidate_PeerNotRecognized_MultipleApplications(t *testing.T) {
 		applications: []Application{
 			newMockApplication(),
 			newMockApplication()},
-		allowList:           EmptyAllowList,
+		allowList:           EmptyAllowList(),
 		negativeResultCache: cache.NewTimeCache(cachingPeriod),
 	}
 
 	err = policy.Validate(peerOperatorPublicKey)
-	testutils.AssertErrorsSame(t, errNotRecognized, err)
+	testutils.AssertErrorsSame(t, ErrNotRecognized, err)
 }
 
 func TestValidate_PeerRecognized_FirstApplicationRecognizes(t *testing.T) {
@@ -69,7 +71,7 @@ func TestValidate_PeerRecognized_FirstApplicationRecognizes(t *testing.T) {
 		applications: []Application{
 			application,
 			newMockApplication()},
-		allowList:           EmptyAllowList,
+		allowList:           EmptyAllowList(),
 		negativeResultCache: cache.NewTimeCache(cachingPeriod),
 	}
 
@@ -97,7 +99,7 @@ func TestValidate_PeerRecognized_SecondApplicationRecognizes(t *testing.T) {
 		applications: []Application{
 			newMockApplication(),
 			application},
-		allowList:           EmptyAllowList,
+		allowList:           EmptyAllowList(),
 		negativeResultCache: cache.NewTimeCache(cachingPeriod),
 	}
 
@@ -135,7 +137,7 @@ func TestValidate_PeerNotRecognized_FirstApplicationReturnedError(t *testing.T) 
 		applications: []Application{
 			application1,
 			application2},
-		allowList:           EmptyAllowList,
+		allowList:           EmptyAllowList(),
 		negativeResultCache: cache.NewTimeCache(cachingPeriod),
 	}
 
@@ -159,7 +161,7 @@ func TestValidate_PeerRecognized_Rechecked(t *testing.T) {
 
 	policy := &anyApplicationPolicy{
 		applications:        []Application{application},
-		allowList:           EmptyAllowList,
+		allowList:           EmptyAllowList(),
 		negativeResultCache: cache.NewTimeCache(cachingPeriod),
 	}
 
@@ -177,7 +179,7 @@ func TestValidate_PeerRecognized_Rechecked(t *testing.T) {
 	})
 
 	err = policy.Validate(peerOperatorPublicKey)
-	testutils.AssertErrorsSame(t, errNotRecognized, err)
+	testutils.AssertErrorsSame(t, ErrNotRecognized, err)
 }
 
 func TestValidate_PeerNotRecognized_CacheEmptied(t *testing.T) {
@@ -196,7 +198,7 @@ func TestValidate_PeerNotRecognized_CacheEmptied(t *testing.T) {
 
 	policy := &anyApplicationPolicy{
 		applications:        []Application{application},
-		allowList:           EmptyAllowList,
+		allowList:           EmptyAllowList(),
 		negativeResultCache: cache.NewTimeCache(cachingPeriod),
 	}
 
@@ -216,7 +218,7 @@ func TestValidate_PeerNotRecognized_CacheEmptied(t *testing.T) {
 	time.Sleep(cachingPeriod)
 
 	err = policy.Validate(peerOperatorPublicKey)
-	testutils.AssertErrorsSame(t, errNotRecognized, err)
+	testutils.AssertErrorsSame(t, ErrNotRecognized, err)
 }
 
 func TestValidate_PeerNotRecognized_Cached(t *testing.T) {
@@ -230,12 +232,12 @@ func TestValidate_PeerNotRecognized_Cached(t *testing.T) {
 	application := newMockApplication()
 	policy := &anyApplicationPolicy{
 		applications:        []Application{application},
-		allowList:           EmptyAllowList,
+		allowList:           EmptyAllowList(),
 		negativeResultCache: cache.NewTimeCache(cachingPeriod),
 	}
 
 	err = policy.Validate(peerOperatorPublicKey)
-	testutils.AssertErrorsSame(t, errNotRecognized, err)
+	testutils.AssertErrorsSame(t, ErrNotRecognized, err)
 
 	// Ensure the application recognizes the operator, but the validation should
 	// fail since the result from the previous call has been cached.
@@ -245,7 +247,7 @@ func TestValidate_PeerNotRecognized_Cached(t *testing.T) {
 	})
 
 	err = policy.Validate(peerOperatorPublicKey)
-	testutils.AssertErrorsSame(t, errNotRecognized, err)
+	testutils.AssertErrorsSame(t, ErrNotRecognized, err)
 }
 
 func TestValidate_PeerRecognized_CacheEmptied(t *testing.T) {
@@ -264,12 +266,12 @@ func TestValidate_PeerRecognized_CacheEmptied(t *testing.T) {
 
 	policy := &anyApplicationPolicy{
 		applications:        []Application{application},
-		allowList:           EmptyAllowList,
+		allowList:           EmptyAllowList(),
 		negativeResultCache: cache.NewTimeCache(cachingPeriod),
 	}
 
 	err = policy.Validate(peerOperatorPublicKey)
-	testutils.AssertErrorsSame(t, errNotRecognized, err)
+	testutils.AssertErrorsSame(t, ErrNotRecognized, err)
 
 	// Ensure the application recognizes the operator. Wait for the caching
 	// period to elapse. The validation should pass since the result from the
@@ -295,8 +297,10 @@ func TestValidate_PeerIsAllowlistedNode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Mark the peer as an allowlisted node, so that it validated despite not
-	// being recognized by any application
+	// This test validates that the AllowList type mechanism still works
+	// correctly at the type level. In production, EmptyAllowList is used,
+	// so no peer receives this bypass. See the EmptyAllowList tests below
+	// for the production-relevant security behavior.
 	allowList := NewAllowList([]*operator.PublicKey{peerOperatorPublicKey})
 
 	policy := &anyApplicationPolicy{
@@ -308,6 +312,266 @@ func TestValidate_PeerIsAllowlistedNode(t *testing.T) {
 	err = policy.Validate(peerOperatorPublicKey)
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestValidate_EmptyAllowList_RecognizedPeerAccepted(t *testing.T) {
+	_, peerOperatorPublicKey, err := operator.GenerateKeyPair(
+		local_v1.DefaultCurve,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	application := newMockApplication()
+	application.setIsRecognized(peerOperatorPublicKey, result{
+		isRecognized: true,
+		err:          nil,
+	})
+
+	// With EmptyAllowList(), a recognized peer must pass validation through
+	// the IsRecognized path, not through an AllowList bypass.
+	policy := &anyApplicationPolicy{
+		applications:        []Application{application},
+		allowList:           EmptyAllowList(),
+		negativeResultCache: cache.NewTimeCache(cachingPeriod),
+	}
+
+	err = policy.Validate(peerOperatorPublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidate_EmptyAllowList_UnrecognizedPeerRejected(t *testing.T) {
+	_, peerOperatorPublicKey, err := operator.GenerateKeyPair(
+		local_v1.DefaultCurve,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// With EmptyAllowList(), a peer not recognized by any application must
+	// be rejected. No AllowList bypass is available.
+	policy := &anyApplicationPolicy{
+		applications:        []Application{newMockApplication()},
+		allowList:           EmptyAllowList(),
+		negativeResultCache: cache.NewTimeCache(cachingPeriod),
+	}
+
+	err = policy.Validate(peerOperatorPublicKey)
+	testutils.AssertErrorsSame(t, ErrNotRecognized, err)
+}
+
+func TestValidate_EmptyAllowList_PreviouslyAllowlistedPeerMustPassIsRecognized(t *testing.T) {
+	_, peerOperatorPublicKey, err := operator.GenerateKeyPair(
+		local_v1.DefaultCurve,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// This is the core security assertion: a peer that would have been on
+	// a populated AllowList (e.g., a bootstrap node) is now subject to
+	// standard IsRecognized staking checks when EmptyAllowList is used.
+	// The peer is not recognized by the application and must be rejected.
+	policy := &anyApplicationPolicy{
+		applications:        []Application{newMockApplication()},
+		allowList:           EmptyAllowList(),
+		negativeResultCache: cache.NewTimeCache(cachingPeriod),
+	}
+
+	err = policy.Validate(peerOperatorPublicKey)
+	testutils.AssertErrorsSame(t, ErrNotRecognized, err)
+}
+
+// --- on-chain IsRecognized call counter tests ---
+
+type fakeMetricsRecorder struct {
+	mutex    sync.Mutex
+	counters map[string]float64
+}
+
+func newFakeMetricsRecorder() *fakeMetricsRecorder {
+	return &fakeMetricsRecorder{
+		counters: make(map[string]float64),
+	}
+}
+
+func (f *fakeMetricsRecorder) IncrementCounter(name string, value float64) {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+	f.counters[name] += value
+}
+
+func (f *fakeMetricsRecorder) counterValue(name string) float64 {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+	return f.counters[name]
+}
+
+// setTestMetricsRecorder installs a fake metrics recorder for the duration
+// of the test and removes it on cleanup.
+func setTestMetricsRecorder(t *testing.T) *fakeMetricsRecorder {
+	t.Helper()
+
+	recorder := newFakeMetricsRecorder()
+	SetMetricsRecorder(recorder)
+	t.Cleanup(func() {
+		SetMetricsRecorder(nil)
+	})
+
+	return recorder
+}
+
+func TestValidate_OnChainCheckCounter_LiveCallCounted(t *testing.T) {
+	recorder := setTestMetricsRecorder(t)
+
+	_, peerOperatorPublicKey, err := operator.GenerateKeyPair(
+		local_v1.DefaultCurve,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	application := newMockApplication()
+	application.setIsRecognized(peerOperatorPublicKey, result{
+		isRecognized: true,
+		err:          nil,
+	})
+
+	policy := &anyApplicationPolicy{
+		applications:        []Application{application},
+		allowList:           EmptyAllowList(),
+		negativeResultCache: cache.NewTimeCache(cachingPeriod),
+	}
+
+	err = policy.Validate(peerOperatorPublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if count := recorder.counterValue(
+		clientinfo.MetricFirewallOnChainChecksTotal,
+	); count != 1 {
+		t.Errorf("expected 1 on-chain check counted, got %v", count)
+	}
+}
+
+func TestValidate_OnChainCheckCounter_NegativeCacheHitNotCounted(t *testing.T) {
+	recorder := setTestMetricsRecorder(t)
+
+	_, peerOperatorPublicKey, err := operator.GenerateKeyPair(
+		local_v1.DefaultCurve,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	policy := &anyApplicationPolicy{
+		applications:        []Application{newMockApplication()},
+		allowList:           EmptyAllowList(),
+		negativeResultCache: cache.NewTimeCache(cachingPeriod),
+	}
+
+	// First validation makes a live check and caches the negative result.
+	err = policy.Validate(peerOperatorPublicKey)
+	testutils.AssertErrorsSame(t, ErrNotRecognized, err)
+
+	if count := recorder.counterValue(
+		clientinfo.MetricFirewallOnChainChecksTotal,
+	); count != 1 {
+		t.Fatalf("expected 1 on-chain check after first validation, got %v", count)
+	}
+
+	// Second validation within the caching period is served from the
+	// negative result cache without a live check.
+	err = policy.Validate(peerOperatorPublicKey)
+	testutils.AssertErrorsSame(t, ErrNotRecognized, err)
+
+	if count := recorder.counterValue(
+		clientinfo.MetricFirewallOnChainChecksTotal,
+	); count != 1 {
+		t.Errorf(
+			"negative-cache hit should not be counted as an on-chain "+
+				"check, got %v",
+			count,
+		)
+	}
+}
+
+func TestValidate_OnChainCheckCounter_AllowlistBypassNotCounted(t *testing.T) {
+	recorder := setTestMetricsRecorder(t)
+
+	_, peerOperatorPublicKey, err := operator.GenerateKeyPair(
+		local_v1.DefaultCurve,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	policy := &anyApplicationPolicy{
+		applications:        []Application{newMockApplication()},
+		allowList:           NewAllowList([]*operator.PublicKey{peerOperatorPublicKey}),
+		negativeResultCache: cache.NewTimeCache(cachingPeriod),
+	}
+
+	err = policy.Validate(peerOperatorPublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if count := recorder.counterValue(
+		clientinfo.MetricFirewallOnChainChecksTotal,
+	); count != 0 {
+		t.Errorf(
+			"allowlist bypass should not be counted as an on-chain "+
+				"check, got %v",
+			count,
+		)
+	}
+}
+
+func TestValidate_OnChainCheckCounter_OneIncrementPerApplicationCall(t *testing.T) {
+	recorder := setTestMetricsRecorder(t)
+
+	_, peerOperatorPublicKey, err := operator.GenerateKeyPair(
+		local_v1.DefaultCurve,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// First application does not recognize the operator, second one does;
+	// both perform a live check.
+	application := newMockApplication()
+	application.setIsRecognized(peerOperatorPublicKey, result{
+		isRecognized: true,
+		err:          nil,
+	})
+
+	policy := &anyApplicationPolicy{
+		applications: []Application{
+			newMockApplication(),
+			application,
+		},
+		allowList:           EmptyAllowList(),
+		negativeResultCache: cache.NewTimeCache(cachingPeriod),
+	}
+
+	err = policy.Validate(peerOperatorPublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if count := recorder.counterValue(
+		clientinfo.MetricFirewallOnChainChecksTotal,
+	); count != 2 {
+		t.Errorf(
+			"expected one counted on-chain check per application call, "+
+				"got %v",
+			count,
+		)
 	}
 }
 

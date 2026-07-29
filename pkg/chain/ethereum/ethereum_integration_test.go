@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,27 +16,21 @@ import (
 	"github.com/keep-network/keep-core/internal/testutils"
 )
 
-// TODO: Include integration test in the CI.
-// To run the tests execute `go test -v -tags=integration ./...`
-
-// ethereumURLEnvVar is the name of the env variable holding the Ethereum
-// mainnet JSON-RPC endpoint used by this integration test. The test asserts
-// against well-known historical block numbers on mainnet, so the URL MUST
-// point to mainnet (not a testnet) or assertions will silently fail.
+// To run the tests execute:
+// ETHEREUM_MAINNET_RPC_URL=<url> go test -v -tags=integration ./...
 //
-// The previous hardcoded Infura URL was checked into the repository and
-// must be treated as compromised; rotate the key on the provider side and
-// inject the new URL via this env variable (matches the existing org
-// secret name).
-const ethereumURLEnvVar = "ETHEREUM_MAINNET_RPC_URL"
+// The URL MUST point to Ethereum mainnet (not a testnet): the test asserts
+// against well-known historical mainnet block numbers and will silently
+// fail against any other network.
+//
+// The Infura URL previously hardcoded here was checked into the repository
+// and must be treated as compromised; rotate the key on the provider side
+// before reusing it.
 
 func TestBaseChain_GetBlockNumberByTimestamp(t *testing.T) {
-	ethereumURL := os.Getenv(ethereumURLEnvVar)
+	ethereumURL := os.Getenv("ETHEREUM_MAINNET_RPC_URL")
 	if ethereumURL == "" {
-		t.Skipf(
-			"skipping: env variable [%s] with Ethereum mainnet JSON-RPC URL is not set",
-			ethereumURLEnvVar,
-		)
+		t.Skip("ETHEREUM_MAINNET_RPC_URL not set; skipping integration test")
 	}
 
 	client, err := ethclient.Dial(ethereumURL)
@@ -84,6 +79,9 @@ func TestBaseChain_GetBlockNumberByTimestamp(t *testing.T) {
 	for testName, test := range tests {
 		t.Run(testName, func(t *testing.T) {
 			blockNumber, err := bc.GetBlockNumberByTimestamp(test.timestamp)
+			if shouldSkipEthereumIntegrationError(err) {
+				t.Skipf("skipping due to transient Ethereum provider error: %v", err)
+			}
 
 			if !reflect.DeepEqual(err, test.expectedError) {
 				t.Errorf(
@@ -101,4 +99,15 @@ func TestBaseChain_GetBlockNumberByTimestamp(t *testing.T) {
 			)
 		})
 	}
+}
+
+func shouldSkipEthereumIntegrationError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errorMessage := err.Error()
+
+	return strings.Contains(errorMessage, "429 Too Many Requests") ||
+		strings.Contains(errorMessage, "\"message\":\"Too Many Requests\"")
 }

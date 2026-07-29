@@ -1,19 +1,20 @@
 /* eslint-disable @typescript-eslint/no-unused-expressions */
 import { deployments, ethers, getUnnamedAccounts, helpers } from "hardhat"
-import { smock } from "@defi-wonderland/smock"
 import { expect } from "chai"
 
+import { createMock } from "./helpers/mock"
 import {
   constants,
   params,
   walletRegistryFixture,
   initializeWalletOwner,
   updateWalletRegistryParams,
+  setupAllowlist,
 } from "./fixtures"
 
 import type { IWalletOwner } from "../typechain/IWalletOwner"
 import type { IRandomBeacon } from "../typechain/IRandomBeacon"
-import type { FakeContract } from "@defi-wonderland/smock"
+import type { Mock } from "./helpers/mock"
 import type { SignerWithAddress } from "@nomiclabs/hardhat-ethers/signers"
 import type {
   WalletRegistry,
@@ -73,8 +74,8 @@ describe("WalletRegistry - Custom Errors", () => {
   let operator: SignerWithAddress
   let authorizer: SignerWithAddress
   let beneficiary: SignerWithAddress
-  let walletOwner: FakeContract<IWalletOwner>
-  let randomBeacon: FakeContract<IRandomBeacon>
+  let walletOwner: Mock<IWalletOwner>
+  let randomBeacon: Mock<IRandomBeacon>
 
   const stakedAmount = to1e18(1000000) // 1M T
   let minimumAuthorization
@@ -109,33 +110,20 @@ describe("WalletRegistry - Custom Errors", () => {
 
     await updateWalletRegistryParams(walletRegistryGovernance, governance)
 
-    await t.connect(deployer).mint(owner.address, stakedAmount)
-    await t.connect(owner).approve(staking.address, stakedAmount)
-    await staking
-      .connect(owner)
-      .stake(
-        stakingProvider.address,
-        beneficiary.address,
-        authorizer.address,
-        stakedAmount
-      )
+    const allowlist = await setupAllowlist(walletRegistry, deployer)
+    await allowlist
+      .connect(deployer)
+      .addStakingProvider(stakingProvider.address, stakedAmount)
 
     minimumAuthorization = await walletRegistry.minimumAuthorization()
 
     // Authorize and register operator
-    await staking
-      .connect(authorizer)
-      .increaseAuthorization(
-        stakingProvider.address,
-        walletRegistry.address,
-        minimumAuthorization
-      )
     await walletRegistry
       .connect(stakingProvider)
       .registerOperator(operator.address)
 
     // Mock random beacon
-    randomBeacon = await smock.fake<IRandomBeacon>("IRandomBeacon")
+    randomBeacon = await createMock<IRandomBeacon>("IRandomBeacon")
   })
 
   describe("Authorization Errors", () => {
@@ -505,7 +493,9 @@ describe("WalletRegistry - Custom Errors", () => {
         // The error will be triggered by the inline gas check at the end of challengeDkgResult
         await expect(
           walletRegistry.connect(unauthorized).challengeDkgResult(dkgResult, {
-            gasLimit: 100000, // Intentionally low gas
+            // Above EIP-7623's intrinsic calldata floor, which hardhat 2.29
+            // enforces before execution, and far below what the call needs.
+            gasLimit: 170000,
           })
         ).to.be.reverted // May revert with out-of-gas or NotEnoughExtraGasLeft
       })

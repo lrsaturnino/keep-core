@@ -41,6 +41,21 @@ export const testConfig = {
   operatorsCount: 64,
 }
 
+// Optional gas price override (in gwei) used to avoid REPLACEMENT_UNDERPRICED
+// when retrying a failed deploy. Validated up-front so a malformed value fails
+// fast instead of silently producing a NaN gasPrice.
+const gasPriceGwei = process.env.GAS_PRICE_GWEI
+  ? Number(process.env.GAS_PRICE_GWEI)
+  : undefined
+if (
+  gasPriceGwei !== undefined &&
+  (!Number.isInteger(gasPriceGwei) || gasPriceGwei <= 0)
+) {
+  throw new Error(
+    `Invalid GAS_PRICE_GWEI "${process.env.GAS_PRICE_GWEI}": expected a positive integer (gwei)`
+  )
+}
+
 const config: HardhatUserConfig = {
   solidity: {
     compilers: [
@@ -71,6 +86,13 @@ const config: HardhatUserConfig = {
   },
   networks: {
     hardhat: {
+      // Configuring a `MockContract` is a transaction, and a transaction mines
+      // a block. Without this, Hardhat forces every block to be at least one
+      // second after its parent, so setting up a mock silently advances the
+      // chain clock and any test asserting on a deadline boundary inverts.
+      // `test/helpers/mock.ts` pins the next block's timestamp before each
+      // write; this option is what lets it reuse the current one.
+      allowBlocksWithSameTimestamp: true,
       forking: {
         // forking is enabled only if FORKING_URL env is provided
         enabled: !!process.env.FORKING_URL,
@@ -108,6 +130,10 @@ const config: HardhatUserConfig = {
         ? process.env.ACCOUNTS_PRIVATE_KEYS.split(",")
         : undefined,
       tags: ["etherscan", "tenderly"],
+      // Override gas to avoid REPLACEMENT_UNDERPRICED when retrying after a failed deploy
+      ...(gasPriceGwei !== undefined && {
+        gasPrice: gasPriceGwei * 1e9,
+      }),
     },
     mainnet: {
       url: process.env.CHAIN_API_URL || "",
@@ -165,7 +191,9 @@ const config: HardhatUserConfig = {
       development: [
         "node_modules/@threshold-network/solidity-contracts/deployments/development",
       ],
-      sepolia: ["node_modules/@threshold-network/solidity-contracts/artifacts"],
+      // Use local deployments/sepolia only - npm artifacts have transactionHash
+      // that causes "cannot get the transaction" errors with some RPC nodes.
+      sepolia: [],
       mainnet: ["./external/mainnet"],
     },
   },
