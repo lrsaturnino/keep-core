@@ -3907,10 +3907,17 @@ beacon_signing@841@entry841=prior-node~7"'
 check "a homogeneous prior transcript cannot stand for a mixed one" 3 \
   "took no part in those results"
 
-# Two homogeneous ceremonies are not one mixed ceremony. Counted across
-# transcripts rather than within one, a prior-only wallet action beside an
-# R1-only signing would read as the two releases combining into a threshold
-# output that neither of them witnessed.
+# Two homogeneous ceremonies are not one mixed ceremony, and the same ceremony
+# is not the same piece of work. The prior share here is claimed on the wallet
+# action while the R1 completion this fleet published is on the signing beside
+# it — one gate ceremony, two transcripts — so the signing requirement stays
+# uncovered however the totals for that ceremony read.
+#
+# The wallet action is covered, and by the half of the reading the driver does
+# not author: its own list credits no R1 party there at all, and r1-node-1's
+# published record of having completed that work is what puts one in it. A
+# contributor set that omits a holder no longer un-mixes a transcript the
+# holder itself vouched for.
 run_verdict precutover_case eval '
   PRECUTOVER_CONTRIBUTORS="\
 tbtc_wallet_action@840@wallet840=prior-node~7 \
@@ -3920,12 +3927,13 @@ beacon_signing@841@entry841=prior-node~7 \
 beacon_dkg@845@bdkg845=r1-node-1~1 \
 beacon_dkg@845@bdkg845=prior-node~7"'
 check "shares in separate transcripts are not one mixed transcript" 3 \
-  "no tbtc_dkg tbtc_signing tbtc_heartbeat tbtc_wallet_action transcript \
-incorporated a share"
+  "no tbtc_dkg tbtc_signing tbtc_heartbeat transcript incorporated a share"
 
-# A service the rehearsal does not run is not the R1 fleet. Accepting any
-# non-prior holder would let a stray container satisfy the R1 half of the
-# claim without either rehearsed release having taken part.
+# A service the rehearsal does not run is neither half of the claim. Reading a
+# third name as the R1 side would let a stray container supply a share no
+# rehearsed release was shown to have contributed; reading it as the prior side
+# would put the one unfalsifiable claim on a container that is not the prior
+# binary.
 run_verdict precutover_case eval '
   PRECUTOVER_CONTRIBUTORS="\
 tbtc_wallet_action@840@wallet840=r1-node-1~1 \
@@ -3941,7 +3949,62 @@ beacon_signing@841@entry841=prior-node~7 \
 beacon_dkg@845@bdkg845=r1-node-1~1 \
 beacon_dkg@845@bdkg845=prior-node~7"'
 check "an unrecognized service does not stand in for the R1 fleet" 3 \
-  "no tbtc_dkg transcript incorporated a share"
+  "bystander-node" "runs no such service"
+
+# The fabrication the mixed-transcript reading rested on for as long as the
+# contributor set was the driver's alone. r1-node-2 runs in this fleet and
+# published no completion for the DKG, so a report naming it as a party to that
+# transcript is the driver attesting to its own compatibility. It is caught at
+# the whole permit identity, so a real holder under a permit it never took is
+# caught with it.
+# shellcheck disable=SC2016
+run_verdict precutover_case eval '
+  PRECUTOVER_CONTRIBUTORS="${PRECUTOVER_CONTRIBUTORS} \
+tbtc_dkg@842@dkg842=r1-node-2~4"'
+check "a claimed R1 party the fleet never vouched for is refused" 1 \
+  "r1-node-2@tbtc_dkg@842@dkg842#4" "recorded no such completion"
+
+# The same node under a permit it did not hold. r1-node-1 published a completion
+# for the DKG under permit 1; a second entry for the same node at permit 9 is
+# one contribution reported twice, which is how a single share stands for the
+# several a threshold needs.
+# shellcheck disable=SC2016
+run_verdict precutover_case eval '
+  PRECUTOVER_CONTRIBUTORS="${PRECUTOVER_CONTRIBUTORS} \
+tbtc_dkg@842@dkg842=r1-node-1~9"'
+check "one contribution counted twice under a second permit is refused" 1 \
+  "r1-node-1@tbtc_dkg@842@dkg842#9" "recorded no such completion"
+
+# The other direction. A driver that reports a subset of the population as the
+# contributor set describes a smaller ceremony than the one the fleet published,
+# and the mixed reading would then be about a transcript nobody claims.
+run_verdict precutover_case eval '
+  PRECUTOVER_CONTRIBUTORS="\
+tbtc_wallet_action@840@wallet840=r1-node-1~1 \
+tbtc_wallet_action@840@wallet840=prior-node~7 \
+tbtc_dkg@842@dkg842=prior-node~7 \
+tbtc_signing@843@sign843=r1-node-1~1 \
+tbtc_signing@843@sign843=prior-node~7 \
+tbtc_heartbeat@844@beat844=r1-node-1~1 \
+tbtc_heartbeat@844@beat844=prior-node~7 \
+beacon_signing@841@entry841=r1-node-1~1 \
+beacon_signing@841@entry841=prior-node~7 \
+beacon_dkg@845@bdkg845=r1-node-1~1 \
+beacon_dkg@845@bdkg845=prior-node~7"'
+check "a holder the contributor set omits is not left uncounted" 3 \
+  "r1-node-1@tbtc_dkg@842@dkg842#1" "does not name them"
+
+# A completion is what a contributor set is derived from, so a holder that
+# closed its permit without producing anything is not a party to a transcript.
+# The exhausted record makes the ending disagree with the driver's settlement
+# first, which is the stronger refusal and the one that must come out.
+# shellcheck disable=SC2016
+run_verdict precutover_case eval '
+  PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS/\
+r1-node-1@tbtc_dkg@842@dkg842#1=completed=persisted_tbtc_signer=0xdkg842=-/\
+r1-node-1@tbtc_dkg@842@dkg842#1=exhausted=no_threshold=-=-}"'
+check "a permit that produced nothing is not a party to a transcript" 1 \
+  "tbtc_dkg@842@dkg842#1=exhausted"
 
 # Work driven by a fleet already past C is not pre-cutover work, whatever
 # mode counter moved.

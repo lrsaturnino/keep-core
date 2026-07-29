@@ -363,16 +363,39 @@ that recorded nothing — fails the step, because that is precisely what a proce
 going down while holding a permit leaves behind, and a driver terminal record
 says the same thing about it as about a ceremony that finished.
 
-The seam is not closed. What is still open is named here rather than left to be
-inferred from which verdicts the list above happens to omit: the contributor set
-— which parties a settled transcript incorporated — is the driver's word in
-every control that reads it, including the two pre-cutover verdicts. It is what
-the mixed-release steps distinguish a mixed committee from a homogeneous one by,
-so gate 6's interoperability claim is only as good as that report even though
-its terminal half is now joined to the nodes. That claim is an internally
-consistent driver report away from passing a mandatory gate, and deriving
-contributor sets from authenticated protocol shares and artifacts rather than
-from the originating driver is the work that closes the rest of this seam.
+The contributor set — which parties a settled transcript incorporated — is what
+the mixed-release steps distinguish a mixed committee from a homogeneous one by.
+Its R1 half is no longer the driver's word. Every R1 node publishes the permits
+it closed and the durable result each one produced, so "an R1 node was a party
+to this transcript" is answered out of that node's own record, at the whole
+permit identity and for the exact piece of chain work, with the driver taking no
+part in producing the answer. The driver's list is then reconciled against that
+derivation in both directions before any verdict reads it: a claimed R1 party
+the fleet published no completion for is refused, including a real holder named
+under a permit it never took — which is how one contribution would otherwise be
+counted as the several a threshold needs — and a completion the fleet did
+publish that the list omits is refused too, so the set is the population that
+ran rather than a subset of it. A holder that is neither the prior binary nor a
+node this rehearsal runs is refused outright, because a third name is neither
+half of the claim. The two releases are required to meet in one *piece of work*
+rather than in one ceremony, matched in the driver's vocabulary and not the
+gate's: the gate spells a wallet action and a signing alike, so a prior share on
+the wallet action and an R1 completion on the signing beside it stays two
+homogeneous transcripts.
+
+The seam is narrower but not closed, and what is still open is named here rather
+than left to be inferred from which verdicts the list above happens to omit. The
+prior release publishes no gate account at all — it predates the diagnostics
+object these joins read — so its own share remains the driver's word. What is
+now checked about that word is that it is attached to a piece of work the R1
+fleet's own holders recorded completing, under the result they recorded, rather
+than to a work identity the driver invented beside them; what cannot be checked
+from outside is whether the prior node's share was really incorporated into that
+transcript rather than merely claimed against it. Closing that last step needs
+evidence the prior binary does not emit, so it is a standing limit of this
+rehearsal against a pre-gate release rather than a repository-side gap: gate 6's
+interoperability claim rests on the driver for exactly one half of one
+proposition, and on the fleet's own records for everything else.
 
 The straggler control reads the announcer's own account of the sighting
 rather than the gate's refusal counter, which counts a node declining its own

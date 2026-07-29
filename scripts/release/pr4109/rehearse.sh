@@ -6146,6 +6146,145 @@ ${claimed:-no settlement at all}"
   printf '%s' "${out}"
 }
 
+# ---------------------------------------------------------------------------
+# Deriving who took part in a transcript from the holders rather than the driver
+#
+# The joins above hold the driver's account of a permit's ending against the
+# holder's own. Who contributed to a transcript was never held against anything:
+# the driver named the parties, and a control whose whole claim is that two
+# releases combined into one threshold output decided it on a list the party
+# under test wrote. A driver reporting a homogeneous run as mixed satisfies it,
+# because nothing else in the rehearsal ever asks a node whether it was there.
+#
+# The half that can be node-authored is authored here instead. Every R1 node
+# publishes the permits it closed and what each one produced, so the R1
+# contributors to a piece of chain work are derivable from the fleet without the
+# driver's participation, at the full permit identity rather than at a service
+# name. The driver's list is then a claim to reconcile against that derivation
+# in both directions — a claimed R1 party with no holder's record behind it is
+# invented, and a holder's completion the list omits is a contributor the driver
+# chose not to count.
+#
+# The prior release publishes no gate account at all, so its share cannot be
+# authored the same way. That is a standing limit of this rehearsal rather than
+# something these helpers close, and it is recorded as one.
+# ---------------------------------------------------------------------------
+
+# The permit identity a driver-claimed contributor names, rendered in the gate's
+# own vocabulary so the claim can be looked up in the node-authored account. The
+# claim arrives as "<ceremony>@<anchor>@<chain work>=<service>~<permit>", which
+# is the same identity the holders publish with its fields in another order and
+# the driver's ceremony spelling.
+contributor_permit_identity() {
+  local record="$1" party
+  party="${record##*=}"
+  printf '%s@%s#%s' "$(permit_holder "${party}")" \
+    "$(audited_work_id "$(work_id "${record}")")" \
+    "$(permit_local_id "${party}")"
+}
+
+# The permits on one piece of chain work whose own holders recorded completing
+# it and named what it produced, space-joined. Derived from the node-authored
+# account alone: this is the R1 half of a contributor set, and the driver has no
+# part in producing it.
+#
+# A completion naming no result is not counted. The forwarding ceremony
+# legitimately reaches its close having produced nothing of its own, so it is a
+# party to a relay rather than to a transcript, and a contributor set is about
+# the parties whose shares combined into one output.
+authored_work_contributors() {
+  local work="$1" authored="$2" token permit out=""
+  for token in ${authored}; do
+    authored_record_complete "${token}" || continue
+    [[ "$(authored_outcome "${token}")" == "completed" ]] || continue
+    [[ "$(authored_result "${token}")" == "-" ]] && continue
+    permit="$(authored_permit "${token}")"
+    [[ "$(identity_work "${permit}")" == "${work}" ]] || continue
+    contains_token "${out}" "${permit}" && continue
+    out="${out}${out:+ }${permit}"
+  done
+  printf '%s' "${out}"
+}
+
+# The distinct pieces of chain work a set of permit identities belongs to,
+# space-joined.
+identity_works() {
+  local permits="$1" permit work out=""
+  for permit in ${permits}; do
+    work="$(identity_work "${permit}")"
+    contains_token "${out}" "${work}" && continue
+    out="${out}${out:+ }${work}"
+  done
+  printf '%s' "${out}"
+}
+
+# Of the contributors the driver claims, the ones naming a node in the R1 fleet
+# that never recorded completing that exact permit, comma-joined.
+#
+# This is the fabrication the mixed-transcript control rested on. A driver can
+# write any party into its report, and a claim naming an R1 node is checkable
+# against that node's own account: the permit identity either appears among the
+# completions its holder published or the contribution did not happen. A claimed
+# party whose service is right and whose permit is not is caught here too, which
+# is what keeps one real contribution from standing for the several a threshold
+# needs.
+invented_contributors() {
+  local claimed="$1" authored="$2" r1="$3"
+  local record permit holder out=""
+  for record in ${claimed}; do
+    holder="$(permit_holder "${record##*=}")"
+    contains_token "${r1}" "${holder}" || continue
+    permit="$(contributor_permit_identity "${record}")"
+    contains_token "$(authored_work_contributors \
+      "$(identity_work "${permit}")" "${authored}")" "${permit}" && continue
+    out="${out}${out:+, }${permit}"
+  done
+  printf '%s' "${out}"
+}
+
+# Of the contributors the driver claims, the ones naming a service this
+# rehearsal does not run, comma-joined.
+#
+# Neither half of the fleet can account for these. A holder that is not the
+# prior binary is checked against its own published record, and a holder that is
+# the prior binary is the one claim nothing here can check — so a third name is
+# a party whose release is unknown, and reading it as either half would let a
+# stray container supply the side of the claim it was never shown to be on.
+unrecognized_contributors() {
+  local claimed="$1" prior="$2" r1="$3" record holder out=""
+  for record in ${claimed}; do
+    holder="$(permit_holder "${record##*=}")"
+    [[ "${holder}" == "${prior}" ]] && continue
+    contains_token "${r1}" "${holder}" && continue
+    contains_token "${out//, / }" "${holder}" && continue
+    out="${out}${out:+, }${holder}"
+  done
+  printf '%s' "${out}"
+}
+
+# The mirror: of the completions the holders authored on work this phase
+# originated, the ones the driver's contributor set does not name, comma-joined.
+#
+# Refusing only invented parties leaves the other direction open. A driver that
+# reports a subset of the fleet as the contributor set describes a smaller
+# ceremony than the one that ran, and the mixed reading is then about a
+# transcript nobody claims. Holding both directions makes the two accounts the
+# same population or no verdict at all.
+uncredited_contributors() {
+  local claimed="$1" authored="$2" works="$3"
+  local record work permit named="" out=""
+  for record in ${claimed}; do
+    named="${named}${named:+ }$(contributor_permit_identity "${record}")"
+  done
+  for work in ${works}; do
+    for permit in $(authored_work_contributors "${work}" "${authored}"); do
+      contains_token "${named}" "${permit}" && continue
+      out="${out}${out:+, }${permit}"
+    done
+  done
+  printf '%s' "${out}"
+}
+
 # Every permit identity a set of originated records names, space-joined. Work
 # may repeat here: two local permits for one chain work are two tokens.
 permit_identities() {
@@ -6287,27 +6426,37 @@ missing_bound_families() {
 # totals read, and what a compatibility control claims is that the two releases
 # combined into a single threshold output — which only a transcript naming both
 # of them ever witnesses.
+#
+# The R1 side of each transcript is read off the fleet rather than out of the
+# driver's report. A node that took part published the permit it closed and the
+# result it produced, so "an R1 node was in this transcript" is answerable
+# without the driver, and the driver's own list is held against that answer in
+# both directions before this runs. The prior release publishes no such account,
+# so its share remains the driver's word; what is checked here is that the word
+# is attached to a piece of work the fleet really finished, under the result the
+# holders really recorded, rather than to a work identity the driver invented
+# beside them.
 ceremonies_without_mixed_transcript() {
-  local contributors="$1" required="$2" prior="$3" r1="$4"
-  local ceremony record work holder covered priors others uncovered=""
+  local claimed="$1" authored="$2" required="$3" prior="$4"
+  local ceremony record work covered uncovered=""
   for ceremony in ${required}; do
-    priors=""
-    others=""
-    for record in ${contributors}; do
+    covered=0
+    for record in ${claimed}; do
+      [[ "$(permit_holder "${record##*=}")" == "${prior}" ]] || continue
+      # The requirement list is in the driver's vocabulary and the ceremony is
+      # matched in it, not in the gate's. The gate spells a wallet action and a
+      # signing the same way, so matching there would let a mixed wallet action
+      # satisfy the signing requirement and the reverse — collapsing two of the
+      # separate paths this control exists to cover one at a time.
       work="$(work_id "${record}")"
       [[ "$(work_ceremony "${work}")" == "${ceremony}" ]] || continue
-      holder="$(permit_holder "${record##*=}")"
-      if [[ "${holder}" == "${prior}" ]]; then
-        contains_token "${priors}" "${work}" ||
-          priors="${priors}${priors:+ }${work}"
-      elif contains_token "${r1}" "${holder}"; then
-        contains_token "${others}" "${work}" ||
-          others="${others}${others:+ }${work}"
-      fi
-    done
-    covered=0
-    for work in ${priors}; do
-      contains_token "${others}" "${work}" || continue
+      # The same piece of work, not merely the same ceremony. A prior share on
+      # one work and an R1 share on another are two homogeneous transcripts
+      # however the totals read, and the R1 half of this one is the fleet's own
+      # record of having completed exactly this work rather than the driver's
+      # account of who was in it.
+      [[ -n "$(authored_work_contributors \
+        "$(audited_work_id "${work}")" "${authored}")" ]] || continue
       covered=1
       break
     done
@@ -8701,16 +8850,13 @@ precutover_verdict() {
   local step="$1" assertion="$2" required_ceremonies="$3" what="$4"
 
   local failed_results missing_ceremonies settlements
-  local uninteroperated stray unended
+  local uninteroperated stray unended invented uncredited unrecognized
   local named_permits unauthored duplicated unresolved misended authored
   local malformed misevidenced disagreeing unclaimed
   failed_results="$(unsuccessful_results "${PRECUTOVER_RESULTS}")"
   missing_ceremonies="$(missing_bound_ceremonies \
     "${PRECUTOVER_BOUND}" "${required_ceremonies}")"
   settlements="$(bound_settlements "${PRECUTOVER_BOUND}")"
-  uninteroperated="$(ceremonies_without_mixed_transcript \
-    "${PRECUTOVER_CONTRIBUTORS}" "${required_ceremonies}" \
-    "${REHEARSAL_PRIOR_SERVICE}" "${REHEARSAL_R1_SERVICES[*]}")"
   # An outcome for work this phase did not originate on the transaction that
   # originated it is somebody else's ceremony, and originated work with no
   # outcome at all is how a partial population passes: five ceremonies driven,
@@ -8750,6 +8896,21 @@ precutover_verdict() {
     "${PRECUTOVER_AUTHORED_ENDINGS}" "${PRECUTOVER_BOUND}")"
   authored="$(authored_endings "${named_permits}" \
     "${PRECUTOVER_AUTHORED_ENDINGS}")"
+  # Who took part, reconciled before it decides anything. The driver names the
+  # contributors and the mixed-transcript rung below reads that list, so an
+  # unreconciled list makes the whole compatibility claim the driver's own
+  # account of itself. Both directions are held: a claimed R1 party the fleet
+  # never recorded is invented, and a completion the fleet did record but the
+  # list omits is a party the driver chose not to count.
+  invented="$(invented_contributors "${PRECUTOVER_CONTRIBUTORS}" \
+    "${PRECUTOVER_AUTHORED_ENDINGS}" "${REHEARSAL_R1_SERVICES[*]}")"
+  unrecognized="$(unrecognized_contributors "${PRECUTOVER_CONTRIBUTORS}" \
+    "${REHEARSAL_PRIOR_SERVICE}" "${REHEARSAL_R1_SERVICES[*]}")"
+  uncredited="$(uncredited_contributors "${PRECUTOVER_CONTRIBUTORS}" \
+    "${PRECUTOVER_AUTHORED_ENDINGS}" "$(identity_works "${named_permits}")")"
+  uninteroperated="$(ceremonies_without_mixed_transcript \
+    "${PRECUTOVER_CONTRIBUTORS}" "${PRECUTOVER_AUTHORED_ENDINGS}" \
+    "${required_ceremonies}" "${REHEARSAL_PRIOR_SERVICE}")"
 
   if ((PRECUTOVER_DRIVER_SUPPLIED == 0)); then
     block_step "${step}" "no PR4109_WORK_DRIVER was supplied, so no \
@@ -8808,14 +8969,6 @@ to cover ${required_ceremonies}"
 no outcome at all for ${unended}; a control that reads only the work its \
 driver chose to report on is satisfied by the subset that went well, which is \
 the reading a mixed-fleet claim must not be decided by"
-  elif [[ -n "${uninteroperated}" ]]; then
-    block_step "${step}" "the work driver settled ${settlements}, but no \
-${uninteroperated} transcript incorporated a share from both \
-${REHEARSAL_PRIOR_SERVICE} and the R1 fleet; one release was running beside \
-the other and took no part in those results, which is what an unselected, \
-partitioned, or excluded party looks like from outside — a ceremony the two \
-releases did interoperate on cannot stand for one they did not, and two \
-homogeneous ceremonies cannot stand for either"
   elif [[ "${PRECUTOVER_AUTHORED_ENDINGS}" == "unreadable on "* ]]; then
     block_step "${step}" "the R1 fleet could not be asked what became of the \
 permits it took for ${what} (${PRECUTOVER_AUTHORED_ENDINGS}); without that \
@@ -8860,6 +9013,32 @@ a mixed fleet completing it together"
 ${what} settled as and the holders' own records of what they produced have to \
 name the same threshold output, and where they do not, one of the two is \
 describing work the other never did"
+  elif [[ -n "${unrecognized}" ]]; then
+    block_step "${step}" "the work driver names ${unrecognized} among the \
+parties to the transcripts it settled, and this rehearsal runs no such \
+service; a holder whose release is unknown is neither half of a mixed \
+prior/R1 claim, and counting it as either would let a stray container supply \
+the side it was never shown to be on"
+  elif [[ -n "${uninteroperated}" ]]; then
+    block_step "${step}" "the work driver settled ${settlements}, but no \
+${uninteroperated} transcript incorporated a share from both \
+${REHEARSAL_PRIOR_SERVICE} and an R1 holder that recorded completing it; one \
+release was running beside the other and took no part in those results, which \
+is what an unselected, partitioned, or excluded party looks like from outside \
+— a ceremony the two releases did interoperate on cannot stand for one they \
+did not, and two homogeneous ceremonies cannot stand for either"
+  elif [[ -n "${invented}" ]]; then
+    record_step "${step}" fail "the work driver claims ${invented} took part \
+in the transcripts it settled, and those nodes recorded no such completion; a \
+party the fleet never vouched for is the driver attesting to its own \
+compatibility, and one real contribution reported under several identities is \
+how a single share stands for the many a threshold needs"
+  elif [[ -n "${uncredited}" ]]; then
+    block_step "${step}" "the holders of ${uncredited} recorded completing \
+work the driver settled, and its contributor set does not name them; the set \
+has to be the population that ran rather than a subset of it, or the account \
+of who interoperated is about a smaller transcript than the one this fleet \
+produced"
   elif ((PRECUTOVER_LEGACY_AFTER <= PRECUTOVER_LEGACY_BEFORE)); then
     record_step "${step}" fail "the work driver settled ${settlements}, but \
 the fleet issued no new legacy permit (participation_mode_legacy_total still \
@@ -8890,9 +9069,10 @@ $((PRECUTOVER_LEGACY_AFTER - PRECUTOVER_LEGACY_BEFORE)) new legacy permits \
 and no security-v2 permit (unchanged at [${PRECUTOVER_SECURITY_AFTER}]) \
 driving ${what} beside the running prior binary, the driver settled \
 ${settlements} with nothing failing beside them, the nodes holding the permits \
-issued for that work recorded ${authored}, each of \
-${required_ceremonies} settled a transcript incorporating shares from both \
-${REHEARSAL_PRIOR_SERVICE} and the R1 fleet, and the fleet \
+issued for that work recorded ${authored}, its contributor set named every \
+completion those holders recorded and no party they did not, each of \
+${required_ceremonies} joined a claimed ${REHEARSAL_PRIOR_SERVICE} share to \
+work the R1 fleet's own holders recorded completing, and the fleet \
 recognized no cross-format peer (unchanged at \
 [${PRECUTOVER_SIGHTINGS_AFTER}])"
     [[ -z "${assertion}" ]] || record_assertion "${assertion}" true "${step}"
