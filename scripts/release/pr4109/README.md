@@ -295,30 +295,66 @@ that merely turned up there between the samples; the driver's alone is the
 driver's word for a below-C anchor, which is what the seeding is checked for. A
 gate that could not be read below C agrees with nothing and excuses nothing.
 
-#### What a permit's ending still rests on
+#### What a permit's ending rests on
 
 The in-flight half above names permits from the gates' own live readings. What
-became of each named permit does not come from there: the crossing verdicts
-read terminal outcomes, contributor identities, and per-permit results out of
-the work driver's report, and check them against fleet-wide counters and the
-chain. The driver both originates the work and reports how it ended, so those
-two readings are not independent — a counter moving the expected amount beside
-a driver's claim that it moved for the named permits is satisfied by a report
-that simply says so. This is the remaining self-attested seam in the exact-image
-evidence and it is not closed.
+became of each named permit used to come from somewhere else entirely: the
+crossing verdicts read terminal outcomes, contributor identities, and
+per-permit results out of the work driver's report and checked them against
+fleet-wide counters and the chain. The driver both originates the work and
+reports how it ended, so those two readings were not independent — a counter
+moving the expected amount beside a driver's claim that it moved for the named
+permits is satisfied by a report that simply says so.
 
-What is now available to close it is the node's own answer. A permit used to
-disappear from `protocol_participation` the moment its ceremony finished, so
-before a quiescence transition there was no node-authored record of an ending to
-read at all. The gate now retains what its ceremony owners recorded for the
-permits it closed and emits it at `protocol_participation.
-recent_terminal_outcomes`, carrying the same `work_id`/`permit_id` identities
-the live list carries — so a permit the crossing control saw held can be
-followed to the disposition its own node recorded, and a permit whose owner
-recorded nothing appears as `unresolved` rather than as an absence. Wiring the
-crossing and surviving-work verdicts onto that reading, and reconciling every
-originated permit against it one-to-one instead of against the driver's
-account, is the work that closes the seam.
+The node's own answer now stands between them. A permit used to disappear from
+`protocol_participation` the moment its ceremony finished, so before a
+quiescence transition there was no node-authored record of an ending to read at
+all. The gate retains what its ceremony owners recorded for the permits it
+closed and emits it at
+`protocol_participation.recent_terminal_outcomes`, carrying the same
+`work_id`/`permit_id` identities the live list carries — so a permit the
+crossing control saw held is followed to the disposition its own node recorded.
+
+The surviving-work verdict and both quiescence verdicts decide on that reading.
+Every permit they named must appear in the closed-permit account exactly once,
+and the ending they require is the one the holder recorded, not the one the
+driver reported:
+
+- A gate that cannot be asked leaves the crossing unobserved rather than
+  shortening the account, since a node that answers nothing and a node whose
+  permits all ended unrecorded read the same otherwise.
+- A named permit with no record at all blocks. So does eviction — the gate's
+  account is bounded and forgets its oldest first — because to a reader those
+  are the same thing: no node will vouch for how this permit ended.
+- A permit with two records blocks. One permit ends once, so a second record is
+  either a duplicate or two dispositions for one ceremony, and neither can be
+  read as the answer.
+- A permit whose owner recorded nothing is written `unresolved` by the gate
+  itself and *fails* the control rather than blocking it. It is a real ending,
+  and a permit whose holder cannot say where its ceremony went is not one that
+  was allowed to finish across the crossing.
+- An ending outside what the control allows fails the same way, even where the
+  driver reports a settlement for it. Which endings those are is the control's
+  own question: the crossing requires work to complete, while a drain is
+  satisfied by completion or by audited quarantine.
+
+The quiescence controls take their reading *inside* the drain window rather
+than after it, for the same reason the refusal counter is sampled there — the
+node stops answering when the drain finishes, and its account of what it closed
+goes with it. The account only grows as permits close, so the last reading taken
+before the node goes away is the one carrying every permit that ended in the
+window.
+
+The driver's account is kept beside the verdicts rather than deciding them: it
+carries the settlement identities and transaction hashes the chain corroborates,
+neither of which a gate scrape knows. What it no longer does is say how a permit
+ended.
+
+The remaining self-attested reading is the contributor set — which parties a
+settled transcript incorporated — which is still the driver's word and is what
+the mixed-release steps distinguish a mixed committee from a homogeneous one
+by. Deriving it from authenticated protocol artifacts is the work that closes
+the rest of this seam.
 
 The straggler control reads the announcer's own account of the sighting
 rather than the gate's refusal counter, which counts a node declining its own

@@ -1170,6 +1170,144 @@ set -e
 check "a probe that reads no gate metric at all blocks instead of recording none" \
   3 "reading the wrong names"
 
+# ----------------------------------------------------------------------------
+# The node-authored account of permits a gate closed
+#
+# The controls that follow work across the cutover used to read the ending of
+# each permit off the same driver that originated it. These cases are about the
+# reading that replaces it: what a gate itself says became of the permits it
+# closed, and the joins that hold a named permit to exactly one such record.
+# ----------------------------------------------------------------------------
+
+# One gate state document, with the closed-permit account substituted in.
+gate_state_with_outcomes() {
+  printf '{"protocol_participation":{"active_permits":[],%s}}' "$1"
+}
+
+closed_permit() {
+  local outcome="$1" work="$2" permit="$3" bound="${4:-true}"
+  printf '{"recorded_at":"2026-07-28T00:00:00Z",'
+  printf '"permit":{"ceremony":"beacon_relay_signing","mode":"legacy",'
+  printf '"canonical_start_block":10,'
+  printf '"work_id":"%s","permit_id":"%s","identity_bound":%s},' \
+    "${work}" "${permit}" "${bound}"
+  printf '"outcome":"%s"}' "${outcome}"
+}
+
+read_terminal_outcomes() {
+  local state="$1"
+  set +e
+  CASE_OUT="$(
+    (
+      # Invoked through the reader under test, which shellcheck cannot see
+      # across the source boundary into rehearse.sh.
+      # shellcheck disable=SC2329
+      probe_diagnostics() { printf '%s' "${state}"; }
+      service_terminal_outcomes r1-node-1
+    ) 2>&1
+  )"
+  CASE_RC=$?
+  set -e
+}
+
+read_terminal_outcomes "$(gate_state_with_outcomes \
+  "\"recent_terminal_outcomes\":[$(closed_permit completed w-1 p-1)]")"
+check "a closed permit is rendered with the identity the held list carries" 0 \
+  "^r1-node-1=w-1#p-1=completed$"
+
+# The gate writes this itself when a permit is closed by an owner that recorded
+# nothing. It has to arrive as a disposition rather than as an absence, because
+# an absence reads exactly like a permit still in flight.
+read_terminal_outcomes "$(gate_state_with_outcomes \
+  "\"recent_terminal_outcomes\":[$(closed_permit unresolved w-1 p-1)]")"
+check "an owner that recorded nothing is read as a disposition, not a gap" 0 \
+  "^r1-node-1=w-1#p-1=unresolved$"
+
+# A release that stopped publishing the account would otherwise leave every
+# control reading an empty list, which is what a fleet that closed nothing
+# looks like.
+read_terminal_outcomes '{"protocol_participation":{"active_permits":[]}}'
+check "a gate publishing no closed-permit account cannot be read" 1 \
+  "no recent_terminal_outcomes"
+
+read_terminal_outcomes "$(gate_state_with_outcomes \
+  "\"recent_terminal_outcomes\":[$(closed_permit completed w-1 p-1 false)]")"
+check "an unbound closed permit names no work and is refused" 1 \
+  "not identity-bound"
+
+read_terminal_outcomes "$(gate_state_with_outcomes \
+  "\"recent_terminal_outcomes\":[$(closed_permit finished w-1 p-1)]")"
+check "an ending outside the gate's own vocabulary is refused" 1 \
+  "not a terminal outcome"
+
+# The ending is appended to the identity with "=", so a permit carrying one of
+# its own would split into a different permit and a different ending than the
+# node meant — and the joins decide which permit closed how by that split.
+read_terminal_outcomes "$(gate_state_with_outcomes \
+  "\"recent_terminal_outcomes\":[$(closed_permit completed w-1 'p=1')]")"
+check "an identity that would split into another permit is refused" 1 \
+  "names no work or permit identity"
+
+# The joins. Each is asked about a named population and an account that does or
+# does not answer for it.
+NAMED="r1-node-1=w-1#p-1 r1-node-1=w-2#p-2"
+BOTH="r1-node-1=w-1#p-1=completed r1-node-1=w-2#p-2=completed"
+
+check_join() {
+  local desc="$1" want="$2" got="$3"
+  if [[ "${got}" == "${want}" ]]; then
+    printf 'ok   %s\n' "${desc}"
+    PASS=$((PASS + 1))
+    return
+  fi
+  printf 'FAIL %s: got [%s], want [%s]\n' "${desc}" "${got}" "${want}"
+  FAILED=$((FAILED + 1))
+}
+
+check_join "a permit no gate recorded an ending for is named" \
+  "r1-node-1=w-2#p-2" \
+  "$(unauthored_permits "${NAMED}" "r1-node-1=w-1#p-1=completed")"
+check_join "a fully answered population leaves nothing unauthored" "" \
+  "$(unauthored_permits "${NAMED}" "${BOTH}")"
+check_join "one permit ending twice is named with its count" \
+  "r1-node-1=w-1#p-1 (2 records)" \
+  "$(duplicated_authored_permits "${NAMED}" \
+    "r1-node-1=w-1#p-1=completed r1-node-1=w-1#p-1=exhausted ${BOTH#* }")"
+check_join "an owner that recorded nothing is named with its ending" \
+  "r1-node-1=w-2#p-2=unresolved" \
+  "$(unresolved_authored_permits "${NAMED}" \
+    "r1-node-1=w-1#p-1=completed r1-node-1=w-2#p-2=unresolved")"
+check_join "a permit that ended some other way than required is named" \
+  "r1-node-1=w-2#p-2=exhausted" \
+  "$(misended_authored_permits "${NAMED}" \
+    "r1-node-1=w-1#p-1=completed r1-node-1=w-2#p-2=exhausted" completed)"
+# The unauthored and unresolved checks own those two cases; reporting them here
+# as well would have one permit fail two controls with two different reasons.
+check_join "a permit with no record is left to the unauthored check" "" \
+  "$(misended_authored_permits "${NAMED}" \
+    "r1-node-1=w-1#p-1=completed" completed)"
+check_join "the endings a passing verdict quotes are the holders' own" \
+  "r1-node-1=w-1#p-1=completed, r1-node-1=w-2#p-2=completed" \
+  "$(authored_endings "${NAMED}" "${BOTH}")"
+
+# A node that cannot be asked makes the whole reading unusable. A shorter list
+# would be indistinguishable from a fleet whose permits all ended unrecorded.
+SAVED_R1_SERVICES=("${REHEARSAL_R1_SERVICES[@]}")
+REHEARSAL_R1_SERVICES=("r1-node-1")
+set +e
+CASE_OUT="$(
+  (
+    # shellcheck disable=SC2329
+    probe_diagnostics() { return 1; }
+    fleet_terminal_outcomes
+  ) 2>&1
+)"
+CASE_RC=$?
+set -e
+REHEARSAL_R1_SERVICES=("${SAVED_R1_SERVICES[@]}")
+check "a gate that cannot be asked leaves the fleet reading unusable" 0 \
+  "^unreadable on r1-node-1$"
+
 # The property the whole per-step ledger exists for: a gate that cannot finish
 # still writes a reviewable record, and still refuses to report success.
 E="${WORK}/emitted-blocked"
@@ -2053,6 +2191,12 @@ tbtc_signing@840@wallet840=succeeded=${QUIESCE_TX1}=0xsigned840 \
 beacon_dkg@841@seed841=succeeded=${QUIESCE_TX2}=0xgroup841"
   QUIESCE_TERMINAL_ASKED=1
   QUIESCE_TERMINAL_RC=0
+  # And what the node itself recorded closing those two permits as, sampled
+  # while it was still answering. The driver's account above is the account of
+  # the party that also originated the work; this is the holder's.
+  QUIESCE_AUTHORED_READ=1
+  QUIESCE_AUTHORED_ENDINGS="\
+r1-node-2=wallet840#member-1=completed r1-node-2=seed841#2=completed"
   # The security-v2 half is not seeded and drains one population, so neither
   # the pre-C seeding rungs nor the co-live requirement apply to it.
   QUIESCE_FROM_SEED=0
@@ -2080,8 +2224,52 @@ run_verdict quiesce_case :
 check "a quiescence that refused new work and drained its permits holds" 0 \
   "refused it on its own account \(tbtc_signing \+1" \
   "in-flight count observed at zero" \
-  "every piece of work it was holding across the security-v2 mode settled on chain" \
+  "closed with the ending its own holder recorded" \
+  "r1-node-2=wallet840#member-1=completed" \
   "tbtc_signing@840@wallet840 \(${QUIESCE_TX1}, 0xsigned840\)"
+
+# The seam these rungs close. Every rung above them reads the ending off the
+# same driver that originated the work, so a drain that satisfied them all was
+# reported rather than observed.
+run_verdict quiesce_case eval 'QUIESCE_AUTHORED_READ=0'
+check "a node that cannot say how it closed its permits observed no drain" 3 \
+  "could not be asked what became of the permits it closed"
+
+run_verdict quiesce_case eval \
+  'QUIESCE_AUTHORED_ENDINGS="r1-node-2=wallet840#member-1=completed"'
+check "a drained permit only the driver vouches for is not accounted for" 3 \
+  "recorded no ending for r1-node-2=seed841#2"
+
+# Appends to the case's own reading, so it has to expand inside the case and
+# not out here where the fixture has not been laid down yet.
+# shellcheck disable=SC2016
+run_verdict quiesce_case eval \
+  'QUIESCE_AUTHORED_ENDINGS="${QUIESCE_AUTHORED_ENDINGS} r1-node-2=seed841#2=exhausted"'
+check "one drained permit ending twice cannot be read as either ending" 3 \
+  "more than one ending for r1-node-2=seed841#2 \(2 records\)"
+
+# The permit-taken-with-the-process reading, seen from the node's side: the
+# permit closed, and its own owner recorded nothing about where the ceremony
+# went. The driver still reports both settling.
+run_verdict quiesce_case eval \
+  'QUIESCE_AUTHORED_ENDINGS="\
+r1-node-2=wallet840#member-1=completed r1-node-2=seed841#2=unresolved"'
+check "a drained permit whose owner recorded nothing refutes the gate" 1 \
+  "without its ceremony owner recording any disposition"
+
+# This gate asks that held work finish or enter audited quarantine, so the one
+# is allowed where the other is not.
+run_verdict quiesce_case eval \
+  'QUIESCE_AUTHORED_ENDINGS="\
+r1-node-2=wallet840#member-1=completed r1-node-2=seed841#2=quarantined"'
+check "a drained permit whose key material was quarantined still holds" 0 \
+  "r1-node-2=seed841#2=quarantined"
+
+run_verdict quiesce_case eval \
+  'QUIESCE_AUTHORED_ENDINGS="\
+r1-node-2=wallet840#member-1=completed r1-node-2=seed841#2=exhausted"'
+check "a drained permit the holder recorded as exhausted refutes the gate" 1 \
+  "r1-node-2=seed841#2=exhausted"
 
 # The reading a gauge cannot carry, and the one this step used to stop at. The
 # permits are gone; a process that exited holding them produces exactly that.
@@ -3505,6 +3693,12 @@ surviving_readings() {
   SURVIVING_TERMINAL_RC=0
   # shellcheck disable=SC2034
   SURVIVING_TERMINAL="tbtc_signing@840@wallet840=succeeded=${SURVIVE_TX}=0xsigned840"
+  # What the gate that issued the permit says became of it. Everything above
+  # is the account of the party that also originated the work; this is the
+  # holder's own record of closing that very permit, and it is what the verdict
+  # decides the ending on.
+  # shellcheck disable=SC2034
+  SURVIVING_AUTHORED_ENDINGS="r1-node-1=wallet840#member-1=completed"
 }
 
 surviving_case() {
@@ -3516,7 +3710,49 @@ surviving_case() {
 run_verdict surviving_case :
 check "a legacy permit held across C and finished holds the control" 0 \
   "tbtc_signing@840@wallet840 \(${SURVIVE_TX}, 0xsigned840\)" \
+  "r1-node-1=wallet840#member-1=completed" \
   "recorded 1 legacy completion"
+
+# The seam these readings exist to close. Every check above them is satisfied
+# by an account the driver wrote about work the driver originated, so the
+# crossing was reported rather than observed; the gate that issued the permit
+# has to say the same thing about it.
+run_verdict surviving_case eval \
+  'SURVIVING_AUTHORED_ENDINGS="unreadable on r1-node-1"'
+check "gates that cannot say how they closed a permit leave it unobserved" 3 \
+  "could not be asked what became of"
+
+run_verdict surviving_case eval 'SURVIVING_AUTHORED_ENDINGS=""'
+check "a permit only the driver vouches for does not hold the control" 3 \
+  "no R1 gate recorded an ending for r1-node-1=wallet840#member-1"
+
+# A bounded account forgets its oldest first, and to a reader that is the same
+# thing as an ending nobody recorded: some other permit's record is present
+# and the named one's is not.
+run_verdict surviving_case eval \
+  'SURVIVING_AUTHORED_ENDINGS="r1-node-1=wallet999#member-9=completed"'
+check "a permit forgotten from the gate's own account is not vouched for" 3 \
+  "no R1 gate recorded an ending for r1-node-1=wallet840#member-1"
+
+run_verdict surviving_case eval \
+  'SURVIVING_AUTHORED_ENDINGS="r1-node-1=wallet840#member-1=completed r1-node-1=wallet840#member-1=exhausted"'
+check "one permit ending twice cannot be read as either ending" 3 \
+  "more than one ending for r1-node-1=wallet840#member-1 \(2 records\)"
+
+# The gate writes this itself when the ceremony owner recorded nothing. The
+# permit is gone and its holder cannot say where it went, which is not a permit
+# that was allowed to finish.
+run_verdict surviving_case eval \
+  'SURVIVING_AUTHORED_ENDINGS="r1-node-1=wallet840#member-1=unresolved"'
+check "a permit whose owner recorded nothing refutes the gate" 1 \
+  "without their ceremony owners recording any disposition"
+
+# The driver still reports a settlement here. A control that read the ending
+# off the driver alone would pass this.
+run_verdict surviving_case eval \
+  'SURVIVING_AUTHORED_ENDINGS="r1-node-1=wallet840#member-1=exhausted"'
+check "a holder recording an ending the driver contradicts refutes the gate" \
+  1 "r1-node-1=wallet840#member-1=exhausted"
 
 # The reading that separates surviving C from merely finishing before it.
 run_verdict surviving_case eval 'SURVIVING_LEGACY_COMPLETIONS_AFTER="0"'
@@ -3705,6 +3941,13 @@ legacy_quiesce_case() {
   # shellcheck disable=SC2034
   QUIESCE_TERMINAL="${QUIESCE_TERMINAL} \
 tbtc_signing@1200@colive900=succeeded=${QUIESCE_TX3}=0xsigned1200"
+  # The holder's own record of that permit closing, on the same footing: the
+  # co-live population is reconciled here exactly as the seeded one is, so a
+  # permit of the other mode cannot end unaccounted while the step still
+  # reports the gate let what it held finish.
+  # shellcheck disable=SC2034
+  QUIESCE_AUTHORED_ENDINGS="${QUIESCE_AUTHORED_ENDINGS} \
+r1-node-1=colive900#other-1=completed"
   "$@"
   quiescence_verdict r1-node-1 \
     "quiescence with an in-flight legacy permit" "" legacy
@@ -3799,6 +4042,22 @@ quiesce_sequencing_stubs() {
     legacy) printf 'r1-node-1=wallet%s#member-1' "${QUIESCE_SEQ_ANCHOR}" ;;
     *) printf '%s' "${QUIESCE_SEQ_COLIVE}" ;;
     esac
+  }
+
+  # The node's own record of the permits it closed, which the control samples
+  # inside the drain window rather than after it. It answers for both
+  # populations: the co-live permit is reconciled on the same footing as the
+  # drained one, so a seeded control that could not read its ending would block
+  # exactly as one that could not read the drained permit's.
+  #
+  # Invoked by the control under test, which shellcheck cannot see across the
+  # source boundary into rehearse.sh.
+  # shellcheck disable=SC2329
+  service_terminal_outcomes() {
+    printf 'r1-node-1=wallet%s#member-1=completed' "${QUIESCE_SEQ_ANCHOR}"
+    if ((QUIESCE_SEQ_SEEDED == 1)); then
+      printf ' r1-node-1=colive900#other-1=completed'
+    fi
   }
 
   # The other mode's work, which a seeded control puts in flight beside the

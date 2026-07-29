@@ -3825,6 +3825,104 @@ service_mode_permits() {
     ' "${service}" "${mode}"
 }
 
+# What one node's gate says became of the permits it has closed, rendered as
+# "<service>=<chain work>#<permit>=<outcome>" tokens in the order they closed.
+#
+# This is the other half of the live permit list, and the half the controls
+# were missing. The held list names work a node has; the moment that work ends
+# the permit leaves the list and nothing further is said about it, so a control
+# following work across the cutover saw a permit and then saw it gone, and had
+# to take the word of whatever drove the work for which of those two endings it
+# was. A report about a ceremony is not evidence about a ceremony. These
+# records are written by each ceremony's own owner at the moment it closed its
+# permit, under the same identities the held list carries, so a permit seen
+# held joins to the disposition its holder recorded for it.
+#
+# A record that names no work or permit identity is refused rather than
+# skipped. It would otherwise read exactly like a permit whose disposition the
+# node never recorded, which is the case the joins below have to block on.
+service_terminal_outcomes() {
+  local service="$1"
+  probe_diagnostics "${service}" |
+    node -e '
+      let raw = "";
+      process.stdin.on("data", (d) => (raw += d));
+      process.stdin.on("end", () => {
+        const state = (JSON.parse(raw).protocol_participation) || {};
+        const outcomes = state.recent_terminal_outcomes;
+        if (!Array.isArray(outcomes)) {
+          console.error("no recent_terminal_outcomes in the gate state");
+          process.exit(1);
+        }
+        const service = process.argv[1];
+        // "unresolved" is in this list deliberately. It is what a permit
+        // closed by an owner that recorded nothing is written as, and it has
+        // to arrive as a disposition a reader can see and refuse rather than
+        // as an absence indistinguishable from a permit still in flight.
+        const OUTCOMES = [
+          "completed", "quarantined", "exhausted", "unresolved",
+        ];
+        const out = [];
+        for (const record of outcomes) {
+          if (record === null || typeof record !== "object" ||
+            Array.isArray(record)) {
+            console.error("not a terminal outcome record: " +
+              JSON.stringify(record));
+            process.exit(1);
+          }
+          const permit = record.permit;
+          if (permit === null || typeof permit !== "object" ||
+            Array.isArray(permit)) {
+            console.error("a terminal outcome names no permit: " +
+              JSON.stringify(record));
+            process.exit(1);
+          }
+          if (!OUTCOMES.includes(record.outcome)) {
+            console.error("not a terminal outcome: " +
+              JSON.stringify(record.outcome));
+            process.exit(1);
+          }
+          if (permit.identity_bound !== true) {
+            console.error("a closed permit is not identity-bound: " +
+              JSON.stringify(permit));
+            process.exit(1);
+          }
+          // The ending is appended to the identity with "=", so an identity
+          // carrying one of its own would split into a different permit and a
+          // different ending than the node meant — and the joins downstream
+          // decide which permit closed how by exactly that split.
+          if (typeof permit.work_id !== "string" ||
+            !/^[^\s=]+$/.test(permit.work_id) ||
+            typeof permit.permit_id !== "string" ||
+            !/^[^\s=]+$/.test(permit.permit_id)) {
+            console.error("a closed permit names no work or permit " +
+              "identity: " + JSON.stringify(permit));
+            process.exit(1);
+          }
+          out.push(service + "=" + permit.work_id + "#" + permit.permit_id +
+            "=" + record.outcome);
+        }
+        process.stdout.write(out.join(" "));
+      });
+    ' "${service}"
+}
+
+# The same across the R1 fleet, with the unreadable-is-unusable convention the
+# held-permit readings use: a node that cannot be asked leaves the whole
+# reading unusable rather than a shorter list, which would otherwise be
+# indistinguishable from a node whose permits all ended without a record.
+fleet_terminal_outcomes() {
+  local service outcomes out=""
+  for service in "${REHEARSAL_R1_SERVICES[@]}"; do
+    if ! outcomes="$(service_terminal_outcomes "${service}" 2>/dev/null)"; then
+      printf 'unreadable on %s' "${service}"
+      return 0
+    fi
+    [[ -z "${outcomes}" ]] || out="${out}${out:+ }${outcomes}"
+  done
+  printf '%s' "${out}"
+}
+
 # The gate's own spelling of the two permit modes, which is what a scrape
 # filters on. The rehearsal writes the security-v2 half with a hyphen in step
 # names and metric suffixes; the gate does not.
@@ -5459,6 +5557,127 @@ present_tokens() {
   printf '%s' "${out}"
 }
 
+# ---------------------------------------------------------------------------
+# Joining an originated permit to the ending its own holder recorded
+#
+# The driver originates work and the driver reports what became of it, which
+# makes the whole account one party's. These helpers put the node between the
+# two: every permit a control names has to be found, exactly once, in the
+# node-authored record of permits that node closed, and the disposition read
+# there is the node's own rather than the driver's.
+#
+# The tokens on both sides are "<service>=<chain work>#<permit>" — the identity
+# a gate scrape renders — with the node-authored side carrying "=<outcome>"
+# after it.
+# ---------------------------------------------------------------------------
+
+# The permit identity a node-authored outcome token names, without its ending.
+authored_permit() {
+  printf '%s' "${1%=*}"
+}
+
+# The ending it names.
+authored_outcome() {
+  printf '%s' "${1##*=}"
+}
+
+# Of the permits a control named, the ones no node recorded an ending for,
+# comma-joined.
+#
+# This is the case that lets a partial population pass: two permits held across
+# the crossing, one of them closed with a record, the other simply never
+# mentioned by any node. It is also how eviction surfaces — the gate's account
+# is bounded and forgets its oldest first — and both endings are the same thing
+# to a reader, which is that no node will vouch for how this permit ended.
+unauthored_permits() {
+  local wanted="$1" authored="$2" token permits=""
+  for token in ${authored}; do
+    permits="${permits}${permits:+ }$(authored_permit "${token}")"
+  done
+  absent_tokens "${wanted}" "${permits}"
+}
+
+# Of the permits a control named, the ones more than one node-authored record
+# claims to be the ending of, comma-joined.
+#
+# One permit ends once. A second record for the same identity is either a
+# duplicate or two dispositions for one ceremony, and a control reading the
+# first match it finds would take whichever came first as the answer.
+duplicated_authored_permits() {
+  local wanted="$1" authored="$2" token permit seen count out=""
+  for permit in ${wanted}; do
+    count=0
+    for token in ${authored}; do
+      seen="$(authored_permit "${token}")"
+      [[ "${seen}" == "${permit}" ]] && count=$((count + 1))
+    done
+    ((count > 1)) || continue
+    out="${out}${out:+, }${permit} (${count} records)"
+  done
+  printf '%s' "${out}"
+}
+
+# The ending one named permit's holder recorded for it, empty when none did.
+# Reads the last record rather than the first: the account is in closing order,
+# so where a duplicate slipped past the check above the later disposition is
+# the one that stands.
+authored_ending() {
+  local permit="$1" authored="$2" token out=""
+  for token in ${authored}; do
+    [[ "$(authored_permit "${token}")" == "${permit}" ]] || continue
+    out="$(authored_outcome "${token}")"
+  done
+  printf '%s' "${out}"
+}
+
+# Of the permits a control named, the ones whose own holder recorded no
+# disposition, rendered with the ending, comma-joined.
+#
+# "unresolved" is what the gate writes when a permit is closed by an owner that
+# recorded nothing. It is a real ending and it is the one a reader must refuse:
+# the ceremony went somewhere the node cannot say, so nothing about it can be
+# read off the fact that its permit is gone.
+unresolved_authored_permits() {
+  local wanted="$1" authored="$2" permit ending out=""
+  for permit in ${wanted}; do
+    ending="$(authored_ending "${permit}" "${authored}")"
+    [[ "${ending}" == "unresolved" ]] || continue
+    out="${out}${out:+, }${permit}=${ending}"
+  done
+  printf '%s' "${out}"
+}
+
+# The named permits and the endings their holders recorded, comma-joined for
+# prose. This is what a passing verdict quotes instead of the driver's account
+# of the same permits.
+authored_endings() {
+  local wanted="$1" authored="$2" permit ending out=""
+  for permit in ${wanted}; do
+    ending="$(authored_ending "${permit}" "${authored}")"
+    out="${out}${out:+, }${permit}=${ending:-unrecorded}"
+  done
+  printf '%s' "${out}"
+}
+
+# Of the named permits, the ones whose holder recorded an ending outside the
+# allowed set, rendered with what was recorded instead, comma-joined.
+#
+# A control whose claim is that held work finished cannot read that off the
+# permit having closed: exhausted and quarantined are closings too. Which of
+# them a control allows is the control's own question — the crossing requires
+# work to complete, while a drain is satisfied by completion or audited
+# quarantine — so the set is the caller's rather than fixed here.
+misended_authored_permits() {
+  local wanted="$1" authored="$2" allowed="$3" permit ending out=""
+  for permit in ${wanted}; do
+    ending="$(authored_ending "${permit}" "${authored}")"
+    [[ -z "${ending}" || "${ending}" == "unresolved" ]] && continue
+    contains_token "${allowed}" "${ending}" && continue
+    out="${out}${out:+, }${permit}=${ending}"
+  done
+  printf '%s' "${out}"
+}
+
 # Every permit identity a set of originated records names, space-joined. Work
 # may repeat here: two local permits for one chain work are two tokens.
 permit_identities() {
@@ -6361,6 +6580,13 @@ QUIESCE_MISANCHORED=""
 QUIESCE_TERMINAL=""
 QUIESCE_TERMINAL_ASKED=0
 QUIESCE_TERMINAL_RC=0
+# The draining node's own account of the permits it closed, sampled inside the
+# drain window because it goes away with the node. This is what the terminal
+# rungs decide on; the driver's account above supplies the settlement
+# identities and transactions the chain corroborates, which a gate scrape
+# cannot know.
+QUIESCE_AUTHORED_ENDINGS=""
+QUIESCE_AUTHORED_READ=0
 QUIESCE_PERMITS_BEFORE=""
 QUIESCE_COLIVE_PERMITS=""
 QUIESCE_COLIVE_REQUIRED=0
@@ -6664,6 +6890,55 @@ this gate audits no quarantined state, so work that gave up inside the grace \
 evidences neither that it was allowed to finish nor that what it left behind \
 is accounted for"
     quiescence_assertion "${assertion}" false "${step}"
+  elif ((QUIESCE_AUTHORED_READ == 0)); then
+    block_step "${step}" "${node} could not be asked what became of the \
+permits it closed while it drained; every rung above this one reads the \
+ending off the same driver that originated the work, so without the node's \
+own record the drain is reported rather than observed"
+    quiescence_assertion "${assertion}" false "${step}"
+  elif [[ -n "$(unauthored_permits \
+    "$(held_permit_identities "${reconciled_work}")" \
+    "${QUIESCE_AUTHORED_ENDINGS}")" ]]; then
+    block_step "${step}" "${node} recorded no ending for \
+$(unauthored_permits "$(held_permit_identities "${reconciled_work}")" \
+      "${QUIESCE_AUTHORED_ENDINGS}") while it drained, though the driver \
+reported an outcome for it; a permit whose own holder will not say how it \
+closed is one only the driver vouches for, and that is the reading this step \
+exists to refuse"
+    quiescence_assertion "${assertion}" false "${step}"
+  elif [[ -n "$(duplicated_authored_permits \
+    "$(held_permit_identities "${reconciled_work}")" \
+    "${QUIESCE_AUTHORED_ENDINGS}")" ]]; then
+    block_step "${step}" "${node} recorded more than one ending for \
+$(duplicated_authored_permits \
+      "$(held_permit_identities "${reconciled_work}")" \
+      "${QUIESCE_AUTHORED_ENDINGS}"); one permit ends once, so neither record \
+can be read as what became of it"
+    quiescence_assertion "${assertion}" false "${step}"
+  elif [[ -n "$(unresolved_authored_permits \
+    "$(held_permit_identities "${reconciled_work}")" \
+    "${QUIESCE_AUTHORED_ENDINGS}")" ]]; then
+    # The gate writes this itself when a permit is closed by an owner that
+    # recorded nothing. It is exactly the permit-taken-with-the-process reading
+    # the rung above refuses, seen from the node's side rather than the
+    # driver's.
+    record_step "${step}" fail "${node} closed \
+$(unresolved_authored_permits \
+      "$(held_permit_identities "${reconciled_work}")" \
+      "${QUIESCE_AUTHORED_ENDINGS}") without its ceremony owner recording any \
+disposition; a permit whose holder cannot say where its ceremony went was not \
+let finish inside the grace"
+    quiescence_assertion "${assertion}" false "${step}"
+  elif [[ -n "$(misended_authored_permits \
+    "$(held_permit_identities "${reconciled_work}")" \
+    "${QUIESCE_AUTHORED_ENDINGS}" "completed quarantined")" ]]; then
+    record_step "${step}" fail "${node} recorded \
+$(misended_authored_permits \
+      "$(held_permit_identities "${reconciled_work}")" \
+      "${QUIESCE_AUTHORED_ENDINGS}" "completed quarantined") for permits it \
+was draining; this gate asks that held work finish or enter audited \
+quarantine, and an ending that is neither is work the grace did not carry"
+    quiescence_assertion "${assertion}" false "${step}"
   elif ((QUIESCE_OFFER_FAILED == 1)); then
     block_step "${step}" "${node} entered quiescing and let all \
 ${QUIESCE_HELD_BEFORE} held permits finish, but the work driver exited \
@@ -6744,7 +7019,10 @@ held permit finish inside the reviewed ${QUIESCE_GRACE}s grace — in-flight \
 count observed at zero, no forced abort (${QUIESCE_FORCED_BEFORE} to \
 ${QUIESCE_FORCED_AFTER}), and every piece of work it was holding across \
 $( ((QUIESCE_COLIVE_REQUIRED == 1)) && printf 'both modes' ||
-      printf 'the %s mode' "${mode}") settled on chain \
+      printf 'the %s mode' "${mode}") closed with the ending its own holder \
+recorded ($(authored_endings \
+      "$(held_permit_identities "${reconciled_work}")" \
+      "${QUIESCE_AUTHORED_ENDINGS}")) and settled on chain \
 ($(bound_settlements "${QUIESCE_TERMINAL}"))"
     quiescence_assertion "${assertion}" true "${step}"
   fi
@@ -6863,6 +7141,7 @@ on the rehearsal chain that is still running at shutdown"
   local stop_pid=$!
 
   local held_now forced_now issued_now state_now refusals_now deadline
+  local outcomes_now
   QUIESCE_STATE=""
   QUIESCE_ISSUED_AFTER="${QUIESCE_ISSUED_BEFORE}"
   QUIESCE_FORCED_AFTER="${QUIESCE_FORCED_BEFORE}"
@@ -6872,6 +7151,8 @@ on the rehearsal chain that is still running at shutdown"
   QUIESCE_OFFER_RC=""
   QUIESCE_REFUSALS_AFTER="${QUIESCE_REFUSALS_BEFORE}"
   QUIESCE_CEREMONY_REFUSALS_AFTER="${QUIESCE_CEREMONY_REFUSALS_BEFORE}"
+  QUIESCE_AUTHORED_ENDINGS=""
+  QUIESCE_AUTHORED_READ=0
   QUIESCE_OFFERED=""
   deadline=$((SECONDS + QUIESCE_GRACE))
   while ((SECONDS < deadline)); do
@@ -6919,6 +7200,16 @@ on the rehearsal chain that is still running at shutdown"
     if [[ "${refusals_now}" =~ ^[0-9]+$ ]]; then
       QUIESCE_REFUSALS_AFTER="${refusals_now}"
       QUIESCE_CEREMONY_REFUSALS_AFTER="$(ceremony_refusal_counters "${node}")"
+    fi
+    # The same reason again, and the case that needs it most: this is the
+    # node's own account of what became of the permits it is draining, and it
+    # goes away with the node. The account only grows as permits close, so the
+    # last reading taken before the node stops answering is the one that has
+    # every permit that ended in this window — which is why it is overwritten
+    # each pass rather than accumulated.
+    if outcomes_now="$(service_terminal_outcomes "${node}" 2>/dev/null)"; then
+      QUIESCE_AUTHORED_READ=1
+      QUIESCE_AUTHORED_ENDINGS="${outcomes_now}"
     fi
     # The node going unreachable is the drain finishing, not a failure.
     node_reachable "${node}" || break
@@ -7841,6 +8132,7 @@ SURVIVING_LEGACY_COMPLETIONS_AFTER=""
 SURVIVING_TERMINAL_ASKED=0
 SURVIVING_TERMINAL_RC=0
 SURVIVING_TERMINAL=""
+SURVIVING_AUTHORED_ENDINGS=""
 
 originate_surviving_legacy_work() {
   SURVIVING_DRIVER_SUPPLIED=0
@@ -7852,6 +8144,7 @@ originate_surviving_legacy_work() {
   SURVIVING_TERMINAL_ASKED=0
   SURVIVING_TERMINAL_RC=0
   SURVIVING_TERMINAL=""
+  SURVIVING_AUTHORED_ENDINGS=""
 
   SURVIVING_LEGACY_COMPLETIONS_BEFORE="$(fleet_metric_total \
     participation_legacy_completions_after_cutover_total)"
@@ -7891,6 +8184,12 @@ resolve_surviving_legacy_work() {
   run_work_driver precutover-inflight-terminal || true
   SURVIVING_TERMINAL_RC="${WORK_DRIVER_RC}"
   SURVIVING_TERMINAL="${WORK_DRIVER_BOUND_RESULTS}"
+  # Taken after the driver has reported, so every permit it says ended has had
+  # its holder's own record written before this reading is taken. This is the
+  # reading the verdict decides on; the driver's is kept beside it because it
+  # carries the settlement identities and transactions the chain corroborates,
+  # neither of which a gate scrape knows.
+  SURVIVING_AUTHORED_ENDINGS="$(fleet_terminal_outcomes)"
   SURVIVING_LEGACY_COMPLETIONS_AFTER="$(fleet_metric_total \
     participation_legacy_completions_after_cutover_total)"
 }
@@ -7900,6 +8199,7 @@ surviving_legacy_verdict() {
 
   local stray settlements failed unended originated_permits held_delta
   local named_permits unheld_before unnamed_before lost_at_c arrived_at_c
+  local unauthored duplicated unresolved misended authored
   named_permits="$(held_permit_identities "${SURVIVING_ORIGINATED}")"
   unheld_before="$(absent_tokens "${named_permits}" \
     "${SURVIVING_PERMITS_BEFORE}")"
@@ -7949,6 +8249,20 @@ surviving_legacy_verdict() {
   # — is what lets a partial population pass: two permits held across C, one
   # settled, and the unsettled one simply unmentioned.
   unended="$(unended_work "${SURVIVING_ORIGINATED}" "${SURVIVING_TERMINAL}" "")"
+  # The same population read off the nodes rather than off the driver. Every
+  # check above this line is about work the driver both originated and reported
+  # on, which leaves the ending of each permit as one party's account of its
+  # own work; these are the holders' own records of closing those very permits.
+  unauthored="$(unauthored_permits "${named_permits}" \
+    "${SURVIVING_AUTHORED_ENDINGS}")"
+  duplicated="$(duplicated_authored_permits "${named_permits}" \
+    "${SURVIVING_AUTHORED_ENDINGS}")"
+  unresolved="$(unresolved_authored_permits "${named_permits}" \
+    "${SURVIVING_AUTHORED_ENDINGS}")"
+  misended="$(misended_authored_permits "${named_permits}" \
+    "${SURVIVING_AUTHORED_ENDINGS}" completed)"
+  authored="$(authored_endings "${named_permits}" \
+    "${SURVIVING_AUTHORED_ENDINGS}")"
   originated_permits="$(count_tokens \
     "$(permit_identities "${SURVIVING_ORIGINATED}")")"
   held_delta=""
@@ -8045,6 +8359,31 @@ the settlements it did report cannot answer for it"
     block_step "${step}" "the driver named no terminal outcome at all for the \
 legacy work it originated before C, so nothing here says those permits \
 finished rather than went unreported"
+  elif [[ "${SURVIVING_AUTHORED_ENDINGS}" == "unreadable on "* ]]; then
+    block_step "${step}" "the fleet gates could not be asked what became of \
+the legacy permits they closed (${SURVIVING_AUTHORED_ENDINGS}); everything \
+above this line is the account of the party that also originated the work, and \
+without the holders' own records the crossing is reported rather than observed"
+  elif [[ -n "${unauthored}" ]]; then
+    block_step "${step}" "no R1 gate recorded an ending for ${unauthored}, \
+though the driver named it as put on the chain before C and reported an \
+outcome for it; a permit whose own holder will not say how it closed — never \
+recorded, or forgotten from a bounded account — is one only the driver \
+vouches for"
+  elif [[ -n "${duplicated}" ]]; then
+    block_step "${step}" "the R1 gates recorded more than one ending for \
+${duplicated}; one permit ends once, so a second record is either a duplicate \
+or two dispositions for one ceremony and neither can be read as the answer"
+  elif [[ -n "${unresolved}" ]]; then
+    record_step "${step}" fail "the R1 gates closed ${unresolved} without \
+their ceremony owners recording any disposition; a legacy permit taken before \
+C must be allowed to finish on the far side of it, and one whose holder cannot \
+say where it went did not"
+  elif [[ -n "${misended}" ]]; then
+    record_step "${step}" fail "the R1 gates recorded ${misended} for permits \
+this step held across C; a legacy permit taken before the crossing must be \
+allowed to complete on the far side of it, not end quarantined or exhausted \
+there"
   elif [[ ! "${SURVIVING_LEGACY_COMPLETIONS_BEFORE}" =~ ^[0-9]+$ ]] ||
     [[ ! "${SURVIVING_LEGACY_COMPLETIONS_AFTER}" =~ ^[0-9]+$ ]]; then
     block_step "${step}" "the fleet post-cutover legacy completion counter \
@@ -8072,11 +8411,12 @@ or missed ones it did"
     STEP_PERMIT_MODES='"legacy"'
     record_step "${step}" pass "the R1 gates held exactly the legacy permits \
 this step originated before C (${named_permits}), still held those same \
-permits when they reported open_security_v2, and settled them afterwards \
-(${settlements}); the fleet gates recorded ${held_delta} legacy completion(s) \
-at or after the cutover block — one for each permit held across the crossing. \
-A permit taken on the legacy side of C kept its identity and its mode across \
-the crossing and was allowed to finish"
+permits when they reported open_security_v2, and each holder then recorded \
+closing its own permit completed (${authored}); the driver's account of the \
+same permits settles them at ${settlements}, and the fleet gates recorded \
+${held_delta} legacy completion(s) at or after the cutover block — one for \
+each permit held across the crossing. A permit taken on the legacy side of C \
+kept its identity and its mode across the crossing and was allowed to finish"
   fi
 }
 
