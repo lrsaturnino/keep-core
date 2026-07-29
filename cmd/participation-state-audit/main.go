@@ -136,7 +136,7 @@ type evidenceRecord struct {
 
 // evidenceSchemaVersion versions the external rollback-evidence record
 // schemas this audit accepts.
-const evidenceSchemaVersion uint32 = 4
+const evidenceSchemaVersion uint32 = 5
 
 // evidenceFutureSkewAllowance bounds how far in the future an evidence
 // record's generation time may lie relative to this audit before it is a
@@ -155,22 +155,38 @@ type evidenceEnvelope struct {
 	SnapshotAggregateSHA256 string    `json:"snapshot_aggregate_sha256"`
 }
 
+// tbtcDKGResultEvidence identifies the canonical DKG result reconciled for a
+// tBTC wallet. For an approved wallet this is the accepted result that created
+// it. The original selected-group shape and misbehaved seats let the audit
+// derive the exact final signing-group membership belonging to each original
+// DKG permit.
+type tbtcDKGResultEvidence struct {
+	ResultHash              string  `json:"result_hash"`
+	SeedHash                string  `json:"seed_hash"`
+	StartBlock              uint64  `json:"start_block"`
+	OriginalGroupSize       uint16  `json:"original_group_size"`
+	MisbehavedMemberIndexes []uint8 `json:"misbehaved_member_indexes"`
+}
+
+type tbtcWalletChainEvidence struct {
+	WalletStorageKey string                 `json:"wallet_storage_key"`
+	WalletID         string                 `json:"wallet_id"`
+	Registered       bool                   `json:"registered"`
+	DKGSettlement    string                 `json:"dkg_settlement"`
+	DKGResult        *tbtcDKGResultEvidence `json:"dkg_result,omitempty"`
+}
+
 // chainReconciliationEvidence records the on-chain wallet/group registration
-// and DKG settlement state for every persisted group in the snapshot.
+// and DKG settlement state for every persisted group in the snapshot. An
+// accepted tBTC result is part of the wallet identity: a bare "approved"
+// assertion cannot prove which ceremony and original member produced a
+// persisted final membership.
 type chainReconciliationEvidence struct {
 	evidenceEnvelope
 
-	EthereumChainID string `json:"ethereum_chain_id"`
-	Wallets         []struct {
-		WalletStorageKey string `json:"wallet_storage_key"`
-		WalletID         string `json:"wallet_id"`
-		Registered       bool   `json:"registered"`
-		// DKGSettlement is the wallet's DKG settlement state on chain:
-		// "approved" is the only state that permits its persisted signers in
-		// the prior binary's active scan.
-		DKGSettlement string `json:"dkg_settlement"`
-	} `json:"wallets"`
-	BeaconGroups []struct {
+	EthereumChainID string                    `json:"ethereum_chain_id"`
+	Wallets         []tbtcWalletChainEvidence `json:"wallets"`
+	BeaconGroups    []struct {
 		GroupPublicKey string `json:"group_public_key"`
 		Registered     bool   `json:"registered"`
 	} `json:"beacon_groups"`
@@ -1309,6 +1325,7 @@ func (r *auditRun) validateChainReconciliationEvidence(
 
 	wallets := make(map[string]int)
 	walletIDs := make(map[string]string)
+	dkgResultHashes := make(map[string]string)
 	for i, wallet := range record.Wallets {
 		if wallet.WalletStorageKey == "" || wallet.WalletID == "" {
 			violations = append(violations, fmt.Sprintf(
@@ -1341,6 +1358,44 @@ func (r *auditRun) validateChainReconciliationEvidence(
 				wallet.WalletStorageKey,
 				wallet.DKGSettlement,
 			))
+		}
+		if wallet.DKGSettlement == "none" {
+			if wallet.DKGResult != nil {
+				violations = append(violations, fmt.Sprintf(
+					"tbtc wallet [%s] claims no DKG settlement but also "+
+						"names result [%s]",
+					wallet.WalletStorageKey,
+					wallet.DKGResult.ResultHash,
+				))
+			}
+		} else if wallet.DKGResult == nil {
+			violations = append(violations, fmt.Sprintf(
+				"tbtc wallet [%s] has DKG settlement [%s] without the "+
+					"canonical DKG result that produced it",
+				wallet.WalletStorageKey,
+				wallet.DKGSettlement,
+			))
+		} else {
+			violations = append(
+				violations,
+				validateTBTCDKGResultEvidence(
+					wallet.WalletStorageKey,
+					wallet.DKGResult,
+				)...,
+			)
+			if previous, duplicate :=
+				dkgResultHashes[wallet.DKGResult.ResultHash]; duplicate {
+				violations = append(violations, fmt.Sprintf(
+					"DKG result [%s] is claimed by both tbtc wallet [%s] "+
+						"and tbtc wallet [%s]",
+					wallet.DKGResult.ResultHash,
+					previous,
+					wallet.WalletStorageKey,
+				))
+			} else {
+				dkgResultHashes[wallet.DKGResult.ResultHash] =
+					wallet.WalletStorageKey
+			}
 		}
 		wallets[wallet.WalletStorageKey] = i
 		walletIDs[wallet.WalletID] = wallet.WalletStorageKey
@@ -1400,6 +1455,25 @@ func (r *auditRun) validateChainReconciliationEvidence(
 				record.Wallets[i].WalletID,
 				wallet.WalletID,
 			))
+		}
+		if result := record.Wallets[i].DKGResult; result != nil {
+			finalGroupSize :=
+				int(result.OriginalGroupSize) -
+					len(result.MisbehavedMemberIndexes)
+			if finalGroupSize != wallet.SigningGroupSize {
+				violations = append(violations, fmt.Sprintf(
+					"persisted tbtc wallet [%s] has signing group size "+
+						"[%d], but canonical DKG result [%s] derives [%d] "+
+						"members from original group size [%d] and [%d] "+
+						"misbehaved seats",
+					wallet.WalletStorageKey,
+					wallet.SigningGroupSize,
+					result.ResultHash,
+					finalGroupSize,
+					result.OriginalGroupSize,
+					len(result.MisbehavedMemberIndexes),
+				))
+			}
 		}
 	}
 	quarantinedWalletKeys := make(map[string]struct{})
@@ -1528,8 +1602,230 @@ func (r *auditRun) validateChainReconciliationEvidence(
 			))
 		}
 	}
+	violations = append(
+		violations,
+		validateTBTCDKGTerminalLineage(r.manifest, record, wallets)...,
+	)
 
 	return violations
+}
+
+func validateTBTCDKGResultEvidence(
+	walletStorageKey string,
+	result *tbtcDKGResultEvidence,
+) []string {
+	violations := make([]string, 0)
+	if !isCanonicalSHA256Hex(result.ResultHash) {
+		violations = append(violations, fmt.Sprintf(
+			"tbtc wallet [%s] DKG result hash [%s] is not a canonical "+
+				"SHA-256 value",
+			walletStorageKey,
+			result.ResultHash,
+		))
+	}
+	if !isCanonicalSHA256Hex(result.SeedHash) {
+		violations = append(violations, fmt.Sprintf(
+			"tbtc wallet [%s] DKG seed hash [%s] is not a canonical "+
+				"SHA-256 value",
+			walletStorageKey,
+			result.SeedHash,
+		))
+	}
+	if result.StartBlock == 0 {
+		violations = append(violations, fmt.Sprintf(
+			"tbtc wallet [%s] DKG result [%s] has zero canonical start block",
+			walletStorageKey,
+			result.ResultHash,
+		))
+	}
+	if result.OriginalGroupSize == 0 ||
+		result.OriginalGroupSize > uint16(group.MaxMemberIndex) {
+		violations = append(violations, fmt.Sprintf(
+			"tbtc wallet [%s] DKG result [%s] has invalid original group "+
+				"size [%d]",
+			walletStorageKey,
+			result.ResultHash,
+			result.OriginalGroupSize,
+		))
+	}
+	if result.MisbehavedMemberIndexes == nil {
+		violations = append(violations, fmt.Sprintf(
+			"tbtc wallet [%s] DKG result [%s] omits the complete "+
+				"misbehaved-member set",
+			walletStorageKey,
+			result.ResultHash,
+		))
+	}
+	var previous uint8
+	for i, memberIndex := range result.MisbehavedMemberIndexes {
+		if memberIndex == 0 ||
+			uint16(memberIndex) > result.OriginalGroupSize {
+			violations = append(violations, fmt.Sprintf(
+				"tbtc wallet [%s] DKG result [%s] has misbehaved member "+
+					"[%d] outside original group size [%d]",
+				walletStorageKey,
+				result.ResultHash,
+				memberIndex,
+				result.OriginalGroupSize,
+			))
+		}
+		if i > 0 && memberIndex <= previous {
+			violations = append(violations, fmt.Sprintf(
+				"tbtc wallet [%s] DKG result [%s] misbehaved members are "+
+					"not strictly increasing at [%d]",
+				walletStorageKey,
+				result.ResultHash,
+				memberIndex,
+			))
+		}
+		previous = memberIndex
+	}
+	if len(result.MisbehavedMemberIndexes) >=
+		int(result.OriginalGroupSize) {
+		violations = append(violations, fmt.Sprintf(
+			"tbtc wallet [%s] DKG result [%s] leaves no final signing-group "+
+				"member",
+			walletStorageKey,
+			result.ResultHash,
+		))
+	}
+
+	return violations
+}
+
+// validateTBTCDKGTerminalLineage binds a completed node-owned DKG permit to
+// the canonical accepted result for the persisted wallet it names. tBTC
+// permits use the original selected-group index while persisted memberships
+// use the compacted final signing-group index; the result's misbehaved seats
+// are the only authoritative mapping between those identities.
+func validateTBTCDKGTerminalLineage(
+	auditManifest *manifest,
+	record *chainReconciliationEvidence,
+	wallets map[string]int,
+) []string {
+	journal := auditManifest.ParticipationTerminalOutcomes
+	if journal == nil {
+		return nil
+	}
+
+	violations := make([]string, 0)
+	for i, outcome := range journal.Outcomes {
+		if outcome.Outcome != participation.TerminalOutcomeCompleted ||
+			outcome.Permit.Ceremony != participation.TBTCDKG ||
+			outcome.Evidence.Kind !=
+				participation.TerminalEvidencePersistedTBTCSinger {
+			continue
+		}
+
+		walletIndex, ok := wallets[outcome.Evidence.Reference]
+		if !ok {
+			continue
+		}
+		wallet := record.Wallets[walletIndex]
+		if wallet.DKGSettlement != "approved" || wallet.DKGResult == nil {
+			continue
+		}
+		result := wallet.DKGResult
+
+		if outcome.Permit.WorkID != result.SeedHash {
+			violations = append(violations, fmt.Sprintf(
+				"node-authored completed tbtc DKG outcome [%d] belongs to "+
+					"seed [%s], but persisted wallet [%s] was created by "+
+					"canonical result [%s] for seed [%s]",
+				i,
+				outcome.Permit.WorkID,
+				wallet.WalletStorageKey,
+				result.ResultHash,
+				result.SeedHash,
+			))
+		}
+		if outcome.Permit.CanonicalStartBlock != result.StartBlock {
+			violations = append(violations, fmt.Sprintf(
+				"node-authored completed tbtc DKG outcome [%d] has "+
+					"canonical start block [%d], but persisted wallet [%s] "+
+					"was created by result [%s] anchored at [%d]",
+				i,
+				outcome.Permit.CanonicalStartBlock,
+				wallet.WalletStorageKey,
+				result.ResultHash,
+				result.StartBlock,
+			))
+		}
+
+		originalMemberIndex, err := strconv.ParseUint(
+			outcome.Permit.PermitID,
+			10,
+			8,
+		)
+		if err != nil {
+			continue
+		}
+		finalMemberIndex, included := finalTBTCDKGMembership(
+			group.MemberIndex(originalMemberIndex),
+			result.OriginalGroupSize,
+			result.MisbehavedMemberIndexes,
+		)
+		if !included {
+			violations = append(violations, fmt.Sprintf(
+				"node-authored completed tbtc DKG outcome [%d] belongs to "+
+					"original member [%s], but canonical result [%s] does "+
+					"not include that member in its final signing group",
+				i,
+				outcome.Permit.PermitID,
+				result.ResultHash,
+			))
+		} else if outcome.Evidence.MembershipIndex != finalMemberIndex {
+			violations = append(violations, fmt.Sprintf(
+				"node-authored completed tbtc DKG outcome [%d] belongs to "+
+					"original member [%s], which canonical result [%s] maps "+
+					"to final membership [%d], but names persisted "+
+					"membership [%d]",
+				i,
+				outcome.Permit.PermitID,
+				result.ResultHash,
+				finalMemberIndex,
+				outcome.Evidence.MembershipIndex,
+			))
+		}
+	}
+
+	return violations
+}
+
+func finalTBTCDKGMembership(
+	originalMemberIndex group.MemberIndex,
+	originalGroupSize uint16,
+	misbehavedMemberIndexes []uint8,
+) (group.MemberIndex, bool) {
+	if originalMemberIndex == 0 ||
+		uint16(originalMemberIndex) > originalGroupSize {
+		return 0, false
+	}
+
+	misbehavedBefore := uint16(0)
+	seen := make(map[uint8]struct{}, len(misbehavedMemberIndexes))
+	for _, rawMisbehaved := range misbehavedMemberIndexes {
+		if rawMisbehaved == 0 ||
+			uint16(rawMisbehaved) > originalGroupSize {
+			continue
+		}
+		if _, duplicate := seen[rawMisbehaved]; duplicate {
+			continue
+		}
+		seen[rawMisbehaved] = struct{}{}
+
+		misbehaved := group.MemberIndex(rawMisbehaved)
+		if misbehaved == originalMemberIndex {
+			return 0, false
+		}
+		if misbehaved < originalMemberIndex {
+			misbehavedBefore++
+		}
+	}
+
+	return group.MemberIndex(
+		uint16(originalMemberIndex) - misbehavedBefore,
+	), true
 }
 
 // validateBitcoinReconciliationEvidence checks the Bitcoin reconciliation

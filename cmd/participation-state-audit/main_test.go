@@ -429,17 +429,33 @@ func newValidEvidence(t *testing.T, auditManifest *manifest) evidenceInputs {
 		evidenceEnvelope: envelope("chain_reconciliation"),
 		EthereumChainID:  "1",
 	}
-	for _, wallet := range auditManifest.TBTCActiveWallets {
-		chainRecord.Wallets = append(chainRecord.Wallets, struct {
-			WalletStorageKey string `json:"wallet_storage_key"`
-			WalletID         string `json:"wallet_id"`
-			Registered       bool   `json:"registered"`
-			DKGSettlement    string `json:"dkg_settlement"`
-		}{
+	for walletIndex, wallet := range auditManifest.TBTCActiveWallets {
+		dkgResult := &tbtcDKGResultEvidence{
+			ResultHash:              fmt.Sprintf("%064x", walletIndex+1),
+			SeedHash:                strings.Repeat("a", 64),
+			StartBlock:              1,
+			OriginalGroupSize:       uint16(wallet.SigningGroupSize),
+			MisbehavedMemberIndexes: []uint8{},
+		}
+		if auditManifest.ParticipationTerminalOutcomes != nil {
+			for _, outcome := range auditManifest.ParticipationTerminalOutcomes.Outcomes {
+				if outcome.Outcome ==
+					participation.TerminalOutcomeCompleted &&
+					outcome.Permit.Ceremony == participation.TBTCDKG &&
+					outcome.Evidence.Reference == wallet.WalletStorageKey {
+					dkgResult.SeedHash = outcome.Permit.WorkID
+					dkgResult.StartBlock =
+						outcome.Permit.CanonicalStartBlock
+					break
+				}
+			}
+		}
+		chainRecord.Wallets = append(chainRecord.Wallets, tbtcWalletChainEvidence{
 			WalletStorageKey: wallet.WalletStorageKey,
 			WalletID:         wallet.WalletID,
 			Registered:       true,
 			DKGSettlement:    "approved",
+			DKGResult:        dkgResult,
 		})
 	}
 	for _, quarantined := range auditManifest.TBTCQuarantinedOutputs {
@@ -447,12 +463,7 @@ func newValidEvidence(t *testing.T, auditManifest *manifest) evidenceInputs {
 		if walletID == "" {
 			walletID = quarantined.WalletID
 		}
-		chainRecord.Wallets = append(chainRecord.Wallets, struct {
-			WalletStorageKey string `json:"wallet_storage_key"`
-			WalletID         string `json:"wallet_id"`
-			Registered       bool   `json:"registered"`
-			DKGSettlement    string `json:"dkg_settlement"`
-		}{
+		chainRecord.Wallets = append(chainRecord.Wallets, tbtcWalletChainEvidence{
 			WalletStorageKey: quarantined.WalletStorageKey,
 			WalletID:         walletID,
 			Registered:       false,
@@ -579,6 +590,15 @@ func hasBlocker(auditManifest *manifest, fragment string) bool {
 func hasFinding(auditManifest *manifest, fragment string) bool {
 	for _, finding := range auditManifest.Findings {
 		if strings.Contains(finding, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsSubstring(values []string, fragment string) bool {
+	for _, value := range values {
+		if strings.Contains(value, fragment) {
 			return true
 		}
 	}
@@ -2299,6 +2319,191 @@ func TestValidateNodeTerminalOutcomes_DKGCompletionIsMembershipExact(
 	}
 }
 
+func TestValidateChainReconciliationEvidence_TBTCDKGPermitLineage(
+	t *testing.T,
+) {
+	capturedAt := time.Now().UTC().Add(-time.Minute)
+	seedHash := strings.Repeat("a", 64)
+	resultHash := strings.Repeat("b", 64)
+	permits := []participation.PermitSnapshot{
+		{
+			Ceremony:            participation.TBTCDKG,
+			Mode:                participation.ModeSecurityV2.String(),
+			CanonicalStartBlock: 1_000,
+			WorkID:              seedHash,
+			PermitID:            "2",
+			IdentityBound:       true,
+		},
+		{
+			Ceremony:            participation.TBTCDKG,
+			Mode:                participation.ModeSecurityV2.String(),
+			CanonicalStartBlock: 1_000,
+			WorkID:              seedHash,
+			PermitID:            "3",
+			IdentityBound:       true,
+		},
+	}
+
+	newRunAndRecord := func(
+		firstMembership group.MemberIndex,
+		secondMembership group.MemberIndex,
+		resultSeedHash string,
+	) (*auditRun, *chainReconciliationEvidence) {
+		auditManifest := &manifest{
+			GeneratedAt: time.Now().UTC(),
+			Snapshot: snapshotIdentity{
+				AggregateSHA256: strings.Repeat("c", 64),
+			},
+			QuiescenceSnapshot: &participation.QuiescenceSnapshot{
+				SchemaVersion: participation.QuiescenceSnapshotSchemaVersion,
+				CapturedAt:    capturedAt,
+				ActivePermits: permits,
+			},
+			ParticipationTerminalOutcomes: &participation.TerminalOutcomeJournal{
+				SchemaVersion:      participation.TerminalOutcomeJournalSchemaVersion,
+				SnapshotCapturedAt: capturedAt,
+				Outcomes: []participation.TerminalOutcomeRecord{
+					{
+						RecordedAt: time.Now().UTC(),
+						Permit:     permits[0],
+						Outcome:    participation.TerminalOutcomeCompleted,
+						Evidence: participation.TerminalEvidence{
+							Kind:            participation.TerminalEvidencePersistedTBTCSinger,
+							Reference:       "wallet-storage-key",
+							MembershipIndex: firstMembership,
+						},
+					},
+					{
+						RecordedAt: time.Now().UTC(),
+						Permit:     permits[1],
+						Outcome:    participation.TerminalOutcomeCompleted,
+						Evidence: participation.TerminalEvidence{
+							Kind:            participation.TerminalEvidencePersistedTBTCSinger,
+							Reference:       "wallet-storage-key",
+							MembershipIndex: secondMembership,
+						},
+					},
+				},
+			},
+			TBTCActiveWallets: []tbtcWalletRecord{
+				{
+					WalletStorageKey: "wallet-storage-key",
+					WalletID:         "wallet-id",
+					MemberIndexes: []uint8{
+						uint8(firstMembership),
+						uint8(secondMembership),
+					},
+					SigningGroupSize: 3,
+				},
+			},
+		}
+		run := &auditRun{
+			manifest: auditManifest,
+			expected: expectedIdentityInputs{
+				ethereumChainID: "1",
+				maxEvidenceAge:  time.Hour,
+			},
+		}
+		record := &chainReconciliationEvidence{
+			evidenceEnvelope: evidenceEnvelope{
+				SchemaVersion:           evidenceSchemaVersion,
+				EvidenceType:            "chain_reconciliation",
+				GeneratedAt:             auditManifest.GeneratedAt,
+				SnapshotAggregateSHA256: auditManifest.Snapshot.AggregateSHA256,
+			},
+			EthereumChainID: "1",
+			Wallets: []tbtcWalletChainEvidence{
+				{
+					WalletStorageKey: "wallet-storage-key",
+					WalletID:         "wallet-id",
+					Registered:       true,
+					DKGSettlement:    "approved",
+					DKGResult: &tbtcDKGResultEvidence{
+						ResultHash:              resultHash,
+						SeedHash:                resultSeedHash,
+						StartBlock:              1_000,
+						OriginalGroupSize:       4,
+						MisbehavedMemberIndexes: []uint8{1},
+					},
+				},
+			},
+		}
+		return run, record
+	}
+
+	t.Run("canonical original-to-final mapping", func(t *testing.T) {
+		run, record := newRunAndRecord(
+			group.MemberIndex(1),
+			group.MemberIndex(2),
+			seedHash,
+		)
+		content, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if violations := run.validateChainReconciliationEvidence(content); len(violations) != 0 {
+			t.Fatalf("expected exact DKG lineage to pass, got: %v", violations)
+		}
+	})
+
+	t.Run("swapped persisted memberships", func(t *testing.T) {
+		run, record := newRunAndRecord(
+			group.MemberIndex(2),
+			group.MemberIndex(1),
+			seedHash,
+		)
+		// Storage existence and one-to-one claims alone accept this swap:
+		// both final memberships really exist and neither is reused.
+		if violations := validateNodeTerminalOutcomes(run.manifest); len(violations) != 0 {
+			t.Fatalf(
+				"expected node-local membership existence to be insufficient, got: %v",
+				violations,
+			)
+		}
+
+		content, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		violations := run.validateChainReconciliationEvidence(content)
+		for _, expected := range []string{
+			"maps to final membership [1], but names persisted membership [2]",
+			"maps to final membership [2], but names persisted membership [1]",
+		} {
+			if !containsSubstring(violations, expected) {
+				t.Errorf(
+					"expected swapped-membership violation containing [%s], got: %v",
+					expected,
+					violations,
+				)
+			}
+		}
+	})
+
+	t.Run("unrelated approved wallet", func(t *testing.T) {
+		run, record := newRunAndRecord(
+			group.MemberIndex(1),
+			group.MemberIndex(2),
+			strings.Repeat("d", 64),
+		)
+		content, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		violations := run.validateChainReconciliationEvidence(content)
+		if !containsSubstring(
+			violations,
+			"persisted wallet [wallet-storage-key] was created by canonical "+
+				"result ["+resultHash+"] for seed ["+strings.Repeat("d", 64)+"]",
+		) {
+			t.Fatalf(
+				"expected unrelated-approved-wallet violation, got: %v",
+				violations,
+			)
+		}
+	})
+}
+
 func TestValidateNodeTerminalOutcomes_DKGExhaustionNeedsChainProof(
 	t *testing.T,
 ) {
@@ -2932,12 +3137,7 @@ func TestRunAudit_DuplicateReconciliationEntriesAreBlocking(t *testing.T) {
 		chainRecord.BeaconGroups,
 		chainRecord.BeaconGroups[0],
 	)
-	walletEntry := struct {
-		WalletStorageKey string `json:"wallet_storage_key"`
-		WalletID         string `json:"wallet_id"`
-		Registered       bool   `json:"registered"`
-		DKGSettlement    string `json:"dkg_settlement"`
-	}{
+	walletEntry := tbtcWalletChainEvidence{
 		WalletStorageKey: "duplicated-wallet",
 		WalletID:         strings.Repeat("aa", 32),
 		Registered:       false,
