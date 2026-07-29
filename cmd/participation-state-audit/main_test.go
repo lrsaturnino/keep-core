@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
@@ -21,8 +22,10 @@ import (
 	bn256 "github.com/ethereum/go-ethereum/crypto/bn256/cloudflare"
 
 	"github.com/keep-network/keep-core/internal/testutils"
+	"github.com/keep-network/keep-core/pkg/altbn128"
 	"github.com/keep-network/keep-core/pkg/beacon/dkg"
 	"github.com/keep-network/keep-core/pkg/beacon/registry"
+	"github.com/keep-network/keep-core/pkg/bls"
 	"github.com/keep-network/keep-core/pkg/chain"
 	ecdsaabi "github.com/keep-network/keep-core/pkg/chain/ethereum/ecdsa/gen/abi"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
@@ -146,7 +149,7 @@ func newTestStorageWithQuiescencePermits(
 		t.Fatal(err)
 	}
 	activeMembership := &registry.Membership{
-		Signer:      newTestSigner(t, group.MemberIndex(1), 42),
+		Signer:      newTestSigner(t, group.MemberIndex(1), testActiveGroupSecret),
 		ChannelName: "test-channel",
 	}
 	activeBytes, err := activeMembership.Marshal()
@@ -305,6 +308,14 @@ func testTerminalOutcomeRecord(
 				Kind:      participation.TerminalEvidenceEthereumTransaction,
 				Reference: resultReference,
 			}
+		case participation.BeaconRelaySigning:
+			evidence = participation.TerminalEvidence{
+				Kind: participation.TerminalEvidenceProtocolResult,
+				Reference: testRelayEntryReference(
+					testActiveGroupSecret,
+					resultReference,
+				),
+			}
 		case participation.BeaconRelayForwarding:
 			evidence = participation.TerminalEvidence{
 				Kind: participation.TerminalEvidenceForwarderClosed,
@@ -330,6 +341,35 @@ func testTerminalOutcomeRecord(
 		Outcome:    participation.TerminalOutcome(permit.Outcome),
 		Evidence:   evidence,
 	}
+}
+
+// testActiveGroupSecret is the scalar behind the active beacon membership every
+// test storage holds. The fixture group's public key is its base multiple, so a
+// test can produce entries that genuinely verify under the group the snapshot
+// decoded rather than merely well-formed ones.
+const testActiveGroupSecret = int64(42)
+
+// testRelayEntryReference derives a relay entry identity from a fixture label,
+// signed for real by the given group. Passing the group's own secret is what
+// makes the reference survive the audit's signature verification: the check is
+// a pairing over actual curve points, so a shaped-but-fabricated identity is
+// exactly what it exists to reject.
+func testRelayEntryReference(groupSecret int64, label string) string {
+	secret := big.NewInt(groupSecret)
+	previousEntry := altbn128.G1HashToPoint([]byte(label))
+
+	reference, err := participation.BeaconRelayEntryReference(
+		altbn128.G2Point{
+			G2: new(bn256.G2).ScalarBaseMult(secret),
+		}.Compress(),
+		previousEntry.Marshal(),
+		bls.SignG1(secret, previousEntry).Marshal(),
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	return reference
 }
 
 // testBitcoinTransactionHash derives a canonical, unprefixed lowercase
@@ -3630,6 +3670,159 @@ func TestRunAudit_QuiescenceOutcomesMustCoverGateInventory(t *testing.T) {
 						auditManifest.RollbackBlockers,
 					)
 				}
+			}
+		})
+	}
+}
+
+// TestValidateRelayEntryTerminalResult asserts a beacon relay outcome is
+// checked rather than believed.
+//
+// This is the one node-authored protocol result the offline audit can verify
+// outright: a relay entry is a threshold BLS signature by the group over the
+// previous entry, so the pairing itself decides. Anything a node could author
+// alone — an entry it invented, an entry lifted from another group, an entry
+// re-pointed at a different previous entry — fails that check, and a group the
+// snapshot holds no membership of says nothing about what this node did even
+// when its signature is genuine.
+func TestValidateRelayEntryTerminalResult(t *testing.T) {
+	const (
+		heldGroupSecret    = int64(42)
+		foreignGroupSecret = int64(77)
+	)
+
+	heldGroupKey := hex.EncodeToString(
+		altbn128.G2Point{
+			G2: new(bn256.G2).ScalarBaseMult(big.NewInt(heldGroupSecret)),
+		}.Compress(),
+	)
+	beaconGroupKeys := map[string]struct{}{heldGroupKey: {}}
+
+	// reference renders an entry the given group really signed over the given
+	// previous entry, so only the deliberate mismatches below are wrong.
+	reference := func(
+		t *testing.T,
+		groupSecret int64,
+		signingSecret int64,
+		previousEntryLabel string,
+		namedPreviousEntryLabel string,
+	) string {
+		t.Helper()
+
+		signed := altbn128.G1HashToPoint([]byte(previousEntryLabel))
+		named := altbn128.G1HashToPoint([]byte(namedPreviousEntryLabel))
+
+		rendered, err := participation.BeaconRelayEntryReference(
+			altbn128.G2Point{
+				G2: new(bn256.G2).ScalarBaseMult(big.NewInt(groupSecret)),
+			}.Compress(),
+			named.Marshal(),
+			bls.SignG1(big.NewInt(signingSecret), signed).Marshal(),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		return rendered
+	}
+
+	tests := map[string]struct {
+		reference func(t *testing.T) string
+		valid     bool
+	}{
+		"an entry the named group signed over the named previous entry": {
+			reference: func(t *testing.T) string {
+				return reference(t, heldGroupSecret, heldGroupSecret, "seed", "seed")
+			},
+			valid: true,
+		},
+		// The forgery the check exists for: a node naming a group it belongs
+		// to and an entry that group never produced.
+		"an entry signed by nobody's threshold key": {
+			reference: func(t *testing.T) string {
+				return reference(t, heldGroupSecret, foreignGroupSecret, "seed", "seed")
+			},
+		},
+		// A genuine signature re-pointed at a previous entry it was not made
+		// over would let one relay round's result settle another's permit.
+		"a genuine entry over a different previous entry": {
+			reference: func(t *testing.T) string {
+				return reference(t, heldGroupSecret, heldGroupSecret, "seed", "other-seed")
+			},
+		},
+		// Genuine and self-consistent, but produced by a group this snapshot
+		// has no membership of, so it reports nothing about this node.
+		"a genuine entry of a group the snapshot does not hold": {
+			reference: func(t *testing.T) string {
+				return reference(
+					t,
+					foreignGroupSecret,
+					foreignGroupSecret,
+					"seed",
+					"seed",
+				)
+			},
+		},
+		"a reference that is not a canonical entry identity": {
+			reference: func(*testing.T) string { return "relay-entry-1" },
+		},
+		"a well-formed reference whose components are not curve points": {
+			reference: func(t *testing.T) string {
+				notAPoint := bytes.Repeat([]byte{0xff}, 64)
+				rendered, err := participation.BeaconRelayEntryReference(
+					altbn128.G2Point{
+						G2: new(bn256.G2).ScalarBaseMult(
+							big.NewInt(heldGroupSecret),
+						),
+					}.Compress(),
+					notAPoint,
+					notAPoint,
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return rendered
+			},
+		},
+		// The degenerate forgery: the point at infinity pairs trivially, so an
+		// entry and previous entry of all zeros would verify under any group
+		// key without knowing anything about it.
+		"the point at infinity, which verifies under any group": {
+			reference: func(t *testing.T) string {
+				infinity := make([]byte, 64)
+				rendered, err := participation.BeaconRelayEntryReference(
+					altbn128.G2Point{
+						G2: new(bn256.G2).ScalarBaseMult(
+							big.NewInt(heldGroupSecret),
+						),
+					}.Compress(),
+					infinity,
+					infinity,
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return rendered
+			},
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			violations := validateRelayEntryTerminalResult(
+				0,
+				test.reference(t),
+				beaconGroupKeys,
+			)
+
+			if test.valid && len(violations) != 0 {
+				t.Fatalf(
+					"expected a verifiable relay entry to pass, got: %v",
+					violations,
+				)
+			}
+			if !test.valid && len(violations) == 0 {
+				t.Fatal("expected the relay entry to be rejected")
 			}
 		})
 	}

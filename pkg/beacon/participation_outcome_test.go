@@ -1,10 +1,16 @@
 package beacon
 
 import (
+	"bytes"
 	"context"
-	"encoding/hex"
+	"math/big"
 	"sync"
 	"testing"
+
+	bn256 "github.com/ethereum/go-ethereum/crypto/bn256/cloudflare"
+
+	"github.com/keep-network/keep-core/pkg/altbn128"
+	"github.com/keep-network/keep-core/pkg/bls"
 
 	"github.com/keep-network/keep-core/internal/testutils"
 	"github.com/keep-network/keep-core/pkg/protocol/participation"
@@ -128,13 +134,29 @@ func assertRecordedTerminalOutcome(
 
 // TestRecordRelayEntryTerminalOutcome covers one relay signing membership's
 // disposition. A relay entry is deterministic for a given previous entry, so
-// the recovered entry is the ceremony's durable result and stays reconcilable
-// against the chain whichever member published it.
+// the recovered entry is the ceremony's durable result whichever member
+// published it, and it is named together with the group and previous entry
+// that make it verifiable rather than merely asserted.
 func TestRecordRelayEntryTerminalOutcome(t *testing.T) {
+	groupSecret := big.NewInt(42)
+
+	groupPublicKey := altbn128.G2Point{
+		G2: new(bn256.G2).ScalarBaseMult(groupSecret),
+	}.Compress()
+	previousEntryPoint := altbn128.G1HashToPoint([]byte("previous-entry"))
+	previousEntry := previousEntryPoint.Marshal()
+	relayEntry := bls.SignG1(groupSecret, previousEntryPoint).Marshal()
+
 	t.Run("no threshold reached", func(t *testing.T) {
 		permit := newRecordingPermit(participation.BeaconRelaySigning)
 
-		recordRelayEntryTerminalOutcome(&testutils.MockLogger{}, permit, nil)
+		recordRelayEntryTerminalOutcome(
+			&testutils.MockLogger{},
+			permit,
+			groupPublicKey,
+			previousEntry,
+			nil,
+		)
 
 		evidence := assertRecordedTerminalOutcome(
 			t,
@@ -153,11 +175,12 @@ func TestRecordRelayEntryTerminalOutcome(t *testing.T) {
 
 	t.Run("entry recovered", func(t *testing.T) {
 		permit := newRecordingPermit(participation.BeaconRelaySigning)
-		relayEntry := []byte{0x01, 0x02, 0x03, 0x04}
 
 		recordRelayEntryTerminalOutcome(
 			&testutils.MockLogger{},
 			permit,
+			groupPublicKey,
+			previousEntry,
 			relayEntry,
 		)
 
@@ -168,7 +191,14 @@ func TestRecordRelayEntryTerminalOutcome(t *testing.T) {
 			participation.TerminalEvidenceProtocolResult,
 		)
 
-		expectedReference := hex.EncodeToString(relayEntry)
+		expectedReference, err := participation.BeaconRelayEntryReference(
+			groupPublicKey,
+			previousEntry,
+			relayEntry,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if evidence.Reference != expectedReference {
 			t.Errorf(
 				"unexpected evidence reference\nexpected: [%s]\nactual:   [%s]",
@@ -176,22 +206,75 @@ func TestRecordRelayEntryTerminalOutcome(t *testing.T) {
 				evidence.Reference,
 			)
 		}
+
+		// Three 64-byte components in hex, separated by two colons.
+		if len(evidence.Reference) != 3*128+2 {
+			t.Errorf(
+				"expected a %d character reference, got [%d] characters",
+				3*128+2,
+				len(evidence.Reference),
+			)
+		}
 	})
+
+	// A result the node cannot name verifiably must not reach the journal as
+	// an unverifiable one. Leaving the permit unresolved blocks the offline
+	// barrier, which is the safe reading of a result nobody can check.
+	for name, test := range map[string]struct {
+		previousEntry []byte
+		relayEntry    []byte
+	}{
+		"entry that is not a full-width point": {
+			previousEntry: previousEntry,
+			relayEntry:    []byte{0x01, 0x02, 0x03, 0x04},
+		},
+		"previous entry that is not a curve point": {
+			previousEntry: bytes.Repeat([]byte{0xff}, 64),
+			relayEntry:    relayEntry,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			permit := newRecordingPermit(participation.BeaconRelaySigning)
+
+			recordRelayEntryTerminalOutcome(
+				&testutils.MockLogger{},
+				permit,
+				groupPublicKey,
+				test.previousEntry,
+				test.relayEntry,
+			)
+
+			if recorded := permit.recorded(); len(recorded) != 0 {
+				t.Errorf(
+					"expected an unnameable entry to record no outcome, "+
+						"got [%+v]",
+					recorded,
+				)
+			}
+		})
+	}
 }
 
-// TestRecordRelayEntryTerminalOutcome_FullWidthEntryFitsTheJournal asserts a
-// real marshaled relay entry survives the journal's identity rules. A
-// bn256.G1 point marshals to 64 bytes, so the hex reference is 128 characters
-// and must not be rejected as an oversized or malformed token.
-func TestRecordRelayEntryTerminalOutcome_FullWidthEntryFitsTheJournal(t *testing.T) {
+// TestRecordRelayEntryTerminalOutcome_ReferenceVerifies asserts the recorded
+// reference is not merely well formed but actually checks out: the entry it
+// names verifies as the group's threshold signature over the previous entry it
+// names. That pairing is the whole reason the reference carries points rather
+// than a digest, so a record that could not be verified would defeat it.
+func TestRecordRelayEntryTerminalOutcome_ReferenceVerifies(t *testing.T) {
+	groupSecret := big.NewInt(42)
+	previousEntryPoint := altbn128.G1HashToPoint([]byte("previous-entry"))
+
 	permit := newRecordingPermit(participation.BeaconRelaySigning)
 
-	relayEntry := make([]byte, 64)
-	for i := range relayEntry {
-		relayEntry[i] = byte(i + 1)
-	}
-
-	recordRelayEntryTerminalOutcome(&testutils.MockLogger{}, permit, relayEntry)
+	recordRelayEntryTerminalOutcome(
+		&testutils.MockLogger{},
+		permit,
+		altbn128.G2Point{
+			G2: new(bn256.G2).ScalarBaseMult(groupSecret),
+		}.Compress(),
+		previousEntryPoint.Marshal(),
+		bls.SignG1(groupSecret, previousEntryPoint).Marshal(),
+	)
 
 	evidence := assertRecordedTerminalOutcome(
 		t,
@@ -200,10 +283,29 @@ func TestRecordRelayEntryTerminalOutcome_FullWidthEntryFitsTheJournal(t *testing
 		participation.TerminalEvidenceProtocolResult,
 	)
 
-	if len(evidence.Reference) != 128 {
-		t.Errorf(
-			"expected a 128 character reference, got [%d] characters",
-			len(evidence.Reference),
+	groupPublicKeyBytes, previousEntryBytes, entryBytes, err :=
+		participation.ParseBeaconRelayEntryReference(evidence.Reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	publicKey, err := altbn128.DecompressToG2(groupPublicKeyBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousEntry := new(bn256.G1)
+	if _, err := previousEntry.Unmarshal(previousEntryBytes); err != nil {
+		t.Fatal(err)
+	}
+	entry := new(bn256.G1)
+	if _, err := entry.Unmarshal(entryBytes); err != nil {
+		t.Fatal(err)
+	}
+
+	if !bls.VerifyG1(publicKey, previousEntry, entry) {
+		t.Error(
+			"the recorded relay entry does not verify as the named group's " +
+				"signature over the named previous entry",
 		)
 	}
 }

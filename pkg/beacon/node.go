@@ -519,15 +519,54 @@ func recordRelayTimeoutTerminalOutcome(
 // recordRelayEntryTerminalOutcome reports one relay signing membership's
 // node-owned final disposition. A relay entry is deterministic for a given
 // previous entry, so the recovered entry itself is the ceremony's durable
-// result and remains reconcilable against the chain regardless of which member
-// published it.
+// result regardless of which member published it.
+//
+// The record names the group and the previous entry alongside it, because the
+// entry alone is a bare byte string the node asserts. Named together they are a
+// threshold BLS signature the offline audit can verify against a group public
+// key it decoded from the snapshot's own key material, which no node can
+// produce without that group's threshold key.
 func recordRelayEntryTerminalOutcome(
 	relayLogger log.StandardLogger,
 	permit participation.Permit,
+	groupPublicKey []byte,
+	previousEntry []byte,
 	relayEntry []byte,
 ) {
 	if len(relayEntry) == 0 {
 		recordBeaconPermitNoThreshold(relayLogger, permit)
+		return
+	}
+
+	// The previous entry arrives from the chain, so it is normalized to the
+	// canonical point encoding the audit compares against rather than trusted
+	// to already be one. Signing has already parsed it as a point, so this
+	// cannot fail for an entry that was actually signed.
+	canonicalPreviousEntry := new(bn256.G1)
+	if _, err := canonicalPreviousEntry.Unmarshal(previousEntry); err != nil {
+		relayLogger.Errorf(
+			"the previous entry this relay signed is not a curve point; the "+
+				"membership's terminal outcome is left unresolved: [%v]",
+			err,
+		)
+		return
+	}
+
+	reference, err := participation.BeaconRelayEntryReference(
+		groupPublicKey,
+		canonicalPreviousEntry.Marshal(),
+		relayEntry,
+	)
+	if err != nil {
+		// An entry that cannot be named verifiably is worth less than no
+		// claim of a result at all: recording it would put an unverifiable
+		// digest where the audit expects a checkable one. The permit closes
+		// unresolved and the offline barrier blocks on it.
+		relayLogger.Errorf(
+			"cannot name the recovered relay entry canonically; the "+
+				"membership's terminal outcome is left unresolved: [%v]",
+			err,
+		)
 		return
 	}
 
@@ -537,7 +576,7 @@ func recordRelayEntryTerminalOutcome(
 		participation.TerminalOutcomeCompleted,
 		participation.TerminalEvidence{
 			Kind:      participation.TerminalEvidenceProtocolResult,
-			Reference: hex.EncodeToString(relayEntry),
+			Reference: reference,
 		},
 	)
 }
@@ -928,7 +967,13 @@ func (n *node) generateRelayEntry(
 			// The recovered entry, not the submission's fate, is this
 			// ceremony's node-owned terminal disposition: a member that never
 			// reached the honest threshold left no result behind.
-			recordRelayEntryTerminalOutcome(relayLogger, permit, relayEntry)
+			recordRelayEntryTerminalOutcome(
+				relayLogger,
+				permit,
+				member.Signer.GroupPublicKeyBytesCompressed(),
+				previousEntry,
+				relayEntry,
+			)
 			if err != nil {
 				if participation.IsGateRefusal(err) {
 					relayLogger.Warnf(

@@ -57,10 +57,13 @@ import (
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	ethereumCrypto "github.com/ethereum/go-ethereum/crypto"
+	bn256 "github.com/ethereum/go-ethereum/crypto/bn256/cloudflare"
 
 	"github.com/keep-network/keep-core/config"
+	"github.com/keep-network/keep-core/pkg/altbn128"
 	"github.com/keep-network/keep-core/pkg/beacon/registry"
 	"github.com/keep-network/keep-core/pkg/bitcoin"
+	"github.com/keep-network/keep-core/pkg/bls"
 	ecdsaabi "github.com/keep-network/keep-core/pkg/chain/ethereum/ecdsa/gen/abi"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/protocol/participation"
@@ -2473,6 +2476,114 @@ func (r *auditRun) reconcileInactivityClaimSettlements(
 	return violations
 }
 
+// validateRelayEntryTerminalResult verifies the relay entry a completed beacon
+// relay signing outcome names.
+//
+// This is the one node-authored protocol result the offline audit can check
+// outright rather than reconcile. A relay entry is a threshold BLS signature by
+// the group over the previous entry, so verifying the pairing proves the entry
+// came from the group's threshold key, which no single node — and no evidence
+// generator — can produce. The group is required to be one the snapshot itself
+// decoded key material for, because an entry verified under a group this node
+// never belonged to says nothing about what this node did.
+func validateRelayEntryTerminalResult(
+	outcomeIndex int,
+	reference string,
+	beaconGroupKeys map[string]struct{},
+) []string {
+	groupPublicKeyBytes, previousEntryBytes, entryBytes, err := participation.
+		ParseBeaconRelayEntryReference(reference)
+	if err != nil {
+		return []string{fmt.Sprintf(
+			"node-authored completed beacon relay outcome [%d] names relay "+
+				"entry [%s], which is not a canonical entry identity: [%v]",
+			outcomeIndex,
+			reference,
+			err,
+		)}
+	}
+
+	groupPublicKey := hex.EncodeToString(groupPublicKeyBytes)
+	if _, held := beaconGroupKeys[groupPublicKey]; !held {
+		return []string{fmt.Sprintf(
+			"node-authored completed beacon relay outcome [%d] names an "+
+				"entry signed by group [%s], which the snapshot holds no "+
+				"membership of",
+			outcomeIndex,
+			groupPublicKey,
+		)}
+	}
+
+	publicKey, err := altbn128.DecompressToG2(groupPublicKeyBytes)
+	if err != nil {
+		return []string{fmt.Sprintf(
+			"node-authored completed beacon relay outcome [%d] names group "+
+				"[%s], which is not a compressed bn256 public key: [%v]",
+			outcomeIndex,
+			groupPublicKey,
+			err,
+		)}
+	}
+
+	// The point at infinity pairs trivially, so naming it for both the
+	// previous entry and the entry would satisfy the verification below
+	// without any knowledge of the group's threshold key. It is also not a
+	// relay entry any beacon round ever produced.
+	if isInfinityG1(previousEntryBytes) || isInfinityG1(entryBytes) {
+		return []string{fmt.Sprintf(
+			"node-authored completed beacon relay outcome [%d] names the "+
+				"point at infinity, which no relay round produces and which "+
+				"verifies under any group",
+			outcomeIndex,
+		)}
+	}
+
+	previousEntry := new(bn256.G1)
+	if _, err := previousEntry.Unmarshal(previousEntryBytes); err != nil {
+		return []string{fmt.Sprintf(
+			"node-authored completed beacon relay outcome [%d] names a "+
+				"previous entry that is not a bn256 point: [%v]",
+			outcomeIndex,
+			err,
+		)}
+	}
+
+	entry := new(bn256.G1)
+	if _, err := entry.Unmarshal(entryBytes); err != nil {
+		return []string{fmt.Sprintf(
+			"node-authored completed beacon relay outcome [%d] names an "+
+				"entry that is not a bn256 point: [%v]",
+			outcomeIndex,
+			err,
+		)}
+	}
+
+	// The beacon signs the previous entry as a curve point, so the pairing
+	// check is over the point itself rather than a hash of its bytes.
+	if !bls.VerifyG1(publicKey, previousEntry, entry) {
+		return []string{fmt.Sprintf(
+			"node-authored completed beacon relay outcome [%d] names an "+
+				"entry that group [%s] did not sign over the previous entry "+
+				"it names",
+			outcomeIndex,
+			groupPublicKey,
+		)}
+	}
+
+	return nil
+}
+
+// isInfinityG1 reports whether marshaled bn256 G1 bytes are the point at
+// infinity, which the curve encodes as all zeros.
+func isInfinityG1(point []byte) bool {
+	for _, b := range point {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // permitWalletIDs maps the wallet public key hash a tBTC permit names itself
 // with to the ECDSA wallet identifier the registry knows that wallet by.
 //
@@ -4508,11 +4619,22 @@ func validateNodeTerminalOutcomes(
 		}
 	}
 	activeBeaconSigners := make(map[persistedSignerIdentity]struct{})
+	beaconGroupKeys := make(map[string]struct{})
 	for _, membership := range auditManifest.BeaconActiveMemberships {
 		activeBeaconSigners[persistedSignerIdentity{
 			reference:       membership.GroupPublicKey,
 			membershipIndex: group.MemberIndex(membership.MemberIndex),
 		}] = struct{}{}
+		beaconGroupKeys[membership.GroupPublicKey] = struct{}{}
+	}
+	// A relay entry can be signed by a group whose signer the rollback later
+	// quarantined; quarantining the key material does not unmake the entry the
+	// group already produced.
+	for _, quarantined := range auditManifest.BeaconQuarantinedOutputs {
+		if quarantined.GroupPublicKey == "" {
+			continue
+		}
+		beaconGroupKeys[quarantined.GroupPublicKey] = struct{}{}
 	}
 	claimedTBTCSigners := make(map[persistedSignerIdentity]int)
 	claimedBeaconSigners := make(map[persistedSignerIdentity]int)
@@ -4687,6 +4809,15 @@ func validateNodeTerminalOutcomes(
 						outcome.Evidence.MembershipIndex,
 					))
 				}
+			case participation.BeaconRelaySigning:
+				violations = append(
+					violations,
+					validateRelayEntryTerminalResult(
+						i,
+						outcome.Evidence.Reference,
+						beaconGroupKeys,
+					)...,
+				)
 			default:
 				if outcome.Evidence.Kind ==
 					participation.TerminalEvidenceNoThreshold ||

@@ -55,7 +55,48 @@ type PermitIdentity struct {
 	PermitID string `json:"permit_id"`
 }
 
-const maxPermitIdentityComponentLength = 256
+const (
+	maxPermitIdentityComponentLength = 256
+	// maxTerminalEvidenceReferenceLength bounds a terminal evidence reference.
+	// It is wider than a permit identity component because one evidence class
+	// is verifiable rather than merely nameable: a beacon relay entry carries
+	// the group public key, the previous entry and the entry as public curve
+	// points precisely so the offline audit can check the signature instead of
+	// taking the node's word for the result. Three 64-byte components in hex
+	// with their separators is the widest reference any ceremony produces.
+	maxTerminalEvidenceReferenceLength = 3*2*beaconRelayEntryComponentLength + 2
+)
+
+// validateNonsecretToken applies the shared shape of every identity and
+// reference the journal carries: nonempty, bounded, and drawn from an alphabet
+// that cannot smuggle raw seeds, keys, hostnames, or network addresses past a
+// reader.
+func validateNonsecretToken(name string, value string, maxLength int) error {
+	if value == "" {
+		return fmt.Errorf("%s is empty", name)
+	}
+	if len(value) > maxLength {
+		return fmt.Errorf("%s exceeds [%d] bytes", name, maxLength)
+	}
+	for i, character := range []byte(value) {
+		if (character >= 'a' && character <= 'z') ||
+			(character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') ||
+			(i > 0 && (character == '_' ||
+				character == '.' ||
+				character == ':' ||
+				character == '-')) {
+			continue
+		}
+		return fmt.Errorf(
+			"%s contains an unsupported character at byte [%d]",
+			name,
+			i,
+		)
+	}
+
+	return nil
+}
 
 func validatePermitIdentity(identity PermitIdentity) error {
 	for _, component := range []struct {
@@ -65,33 +106,12 @@ func validatePermitIdentity(identity PermitIdentity) error {
 		{name: "work ID", value: identity.WorkID},
 		{name: "permit ID", value: identity.PermitID},
 	} {
-		name := component.name
-		value := component.value
-		if value == "" {
-			return fmt.Errorf("%s is empty", name)
-		}
-		if len(value) > maxPermitIdentityComponentLength {
-			return fmt.Errorf(
-				"%s exceeds [%d] bytes",
-				name,
-				maxPermitIdentityComponentLength,
-			)
-		}
-		for i, character := range []byte(value) {
-			if (character >= 'a' && character <= 'z') ||
-				(character >= 'A' && character <= 'Z') ||
-				(character >= '0' && character <= '9') ||
-				(i > 0 && (character == '_' ||
-					character == '.' ||
-					character == ':' ||
-					character == '-')) {
-				continue
-			}
-			return fmt.Errorf(
-				"%s contains an unsupported character at byte [%d]",
-				name,
-				i,
-			)
+		if err := validateNonsecretToken(
+			component.name,
+			component.value,
+			maxPermitIdentityComponentLength,
+		); err != nil {
+			return err
 		}
 	}
 
@@ -391,6 +411,105 @@ func ParseInactivityClaimSettlementReference(
 	return walletID, nonce, nil
 }
 
+// beaconRelayEntryComponentLength is the byte length of each component of a
+// relay entry identity. A compressed bn256 group public key, a marshaled
+// previous entry, and a marshaled recovered entry are all 64 bytes.
+const beaconRelayEntryComponentLength = 64
+
+// BeaconRelayEntryReference renders the canonical identity of a recovered
+// relay entry: the group that signed it, the previous entry it signed over,
+// and the entry itself.
+//
+// Unlike every other protocol result, this identity is not a digest. A relay
+// entry is a threshold BLS signature by the group over the previous entry, and
+// all three components are public beacon state that the chain publishes
+// anyway. Carrying them in the clear is what lets the offline audit verify the
+// pairing itself: an entry that verifies under a group public key the snapshot
+// holds cannot have been authored by anything but that group's threshold key,
+// so the node's word is not what makes the record true. A digest would prove
+// only that the node was consistent with itself.
+func BeaconRelayEntryReference(
+	groupPublicKey []byte,
+	previousEntry []byte,
+	entry []byte,
+) (string, error) {
+	for _, component := range []struct {
+		name  string
+		value []byte
+	}{
+		{name: "group public key", value: groupPublicKey},
+		{name: "previous entry", value: previousEntry},
+		{name: "entry", value: entry},
+	} {
+		if len(component.value) != beaconRelayEntryComponentLength {
+			return "", fmt.Errorf(
+				"relay entry %s must be %d bytes, got [%d]",
+				component.name,
+				beaconRelayEntryComponentLength,
+				len(component.value),
+			)
+		}
+	}
+
+	return hex.EncodeToString(groupPublicKey) + ":" +
+		hex.EncodeToString(previousEntry) + ":" +
+		hex.EncodeToString(entry), nil
+}
+
+// ParseBeaconRelayEntryReference recovers the group public key, previous entry
+// and recovered entry from a reference produced by BeaconRelayEntryReference.
+// Only that exact rendering is accepted: an uppercase or prefixed alias would
+// name the same entry while failing every comparison the audit makes against
+// the group identities it decoded, which is indistinguishable from naming no
+// group at all.
+func ParseBeaconRelayEntryReference(
+	reference string,
+) (groupPublicKey []byte, previousEntry []byte, entry []byte, err error) {
+	parts := strings.Split(reference, ":")
+	if len(parts) != 3 {
+		return nil, nil, nil, fmt.Errorf(
+			"relay entry reference [%s] is not a group, previous entry and "+
+				"entry triple",
+			reference,
+		)
+	}
+
+	decoded := make([][]byte, 0, len(parts))
+	for i, name := range []string{
+		"group public key",
+		"previous entry",
+		"entry",
+	} {
+		value, err := hex.DecodeString(parts[i])
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf(
+				"relay entry reference %s [%s] is not hex: [%v]",
+				name,
+				parts[i],
+				err,
+			)
+		}
+		if len(value) != beaconRelayEntryComponentLength {
+			return nil, nil, nil, fmt.Errorf(
+				"relay entry reference %s [%s] is not %d bytes",
+				name,
+				parts[i],
+				beaconRelayEntryComponentLength,
+			)
+		}
+		if hex.EncodeToString(value) != parts[i] {
+			return nil, nil, nil, fmt.Errorf(
+				"relay entry reference %s [%s] is not canonically encoded",
+				name,
+				parts[i],
+			)
+		}
+		decoded = append(decoded, value)
+	}
+
+	return decoded[0], decoded[1], decoded[2], nil
+}
+
 // TerminalResultReference derives the nonsecret, stable identity of a protocol
 // result for a terminal evidence record. Components are length-prefixed under a
 // domain label, so no two ceremonies can derive the same digest from different
@@ -480,10 +599,11 @@ func ValidateTerminalOutcome(
 	}
 
 	if referenceRequired {
-		if err := validatePermitIdentity(PermitIdentity{
-			WorkID:   evidence.Reference,
-			PermitID: "evidence",
-		}); err != nil {
+		if err := validateNonsecretToken(
+			"terminal evidence reference",
+			evidence.Reference,
+			maxTerminalEvidenceReferenceLength,
+		); err != nil {
 			return fmt.Errorf("invalid terminal evidence reference: [%w]", err)
 		}
 	} else if evidence.Reference != "" {
@@ -576,6 +696,16 @@ func ValidateTerminalOutcome(
 				expected,
 				evidence.Kind,
 			)
+		}
+		// A relay entry is the one protocol result whose reference is
+		// verifiable rather than merely well formed, so a malformed one is
+		// rejected here instead of reaching an audit that could not check it.
+		if ceremony == BeaconRelaySigning {
+			if _, _, _, err := ParseBeaconRelayEntryReference(
+				evidence.Reference,
+			); err != nil {
+				return fmt.Errorf("invalid relay entry reference: [%w]", err)
+			}
 		}
 	}
 

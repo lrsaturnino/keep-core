@@ -284,6 +284,34 @@ func TestTerminalResultReference_DomainSeparates(t *testing.T) {
 	}
 }
 
+// testCompletedResultReference renders a protocol-result reference the given
+// ceremony accepts. Every ceremony but the beacon relay names a digest of its
+// own result; a relay entry names the group, the previous entry and the entry
+// itself so the offline audit can verify the signature, so no placeholder can
+// stand in for one.
+func testCompletedResultReference(
+	t *testing.T,
+	ceremony Ceremony,
+	digest string,
+) string {
+	t.Helper()
+
+	if ceremony != BeaconRelaySigning {
+		return digest
+	}
+
+	reference, err := BeaconRelayEntryReference(
+		bytes.Repeat([]byte{0x01}, beaconRelayEntryComponentLength),
+		bytes.Repeat([]byte{0x02}, beaconRelayEntryComponentLength),
+		bytes.Repeat([]byte{0x03}, beaconRelayEntryComponentLength),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return reference
+}
+
 // TestTerminalResultReference_IsAcceptedAsEvidence asserts a derived reference
 // passes the journal's own identity rules, so a ceremony that authors one can
 // actually record it.
@@ -298,8 +326,12 @@ func TestTerminalResultReference_IsAcceptedAsEvidence(t *testing.T) {
 			ceremony,
 			TerminalOutcomeCompleted,
 			TerminalEvidence{
-				Kind:      TerminalEvidenceProtocolResult,
-				Reference: TerminalResultReference("domain", []byte("result")),
+				Kind: TerminalEvidenceProtocolResult,
+				Reference: testCompletedResultReference(
+					t,
+					ceremony,
+					TerminalResultReference("domain", []byte("result")),
+				),
 			},
 		); err != nil {
 			t.Errorf(
@@ -307,6 +339,89 @@ func TestTerminalResultReference_IsAcceptedAsEvidence(t *testing.T) {
 				ceremony,
 				err,
 			)
+		}
+	}
+}
+
+// TestBeaconRelayEntryReference_RoundTrips asserts the relay entry identity
+// survives rendering and parsing unchanged, and that only its exact canonical
+// rendering is accepted. An alias that names the same entry while failing every
+// comparison the audit makes against it is indistinguishable from naming no
+// entry at all.
+func TestBeaconRelayEntryReference_RoundTrips(t *testing.T) {
+	groupPublicKey := bytes.Repeat([]byte{0xa1}, beaconRelayEntryComponentLength)
+	previousEntry := bytes.Repeat([]byte{0xb2}, beaconRelayEntryComponentLength)
+	entry := bytes.Repeat([]byte{0xc3}, beaconRelayEntryComponentLength)
+
+	reference, err := BeaconRelayEntryReference(
+		groupPublicKey,
+		previousEntry,
+		entry,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parsedGroup, parsedPrevious, parsedEntry, err :=
+		ParseBeaconRelayEntryReference(reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, component := range []struct {
+		name     string
+		expected []byte
+		actual   []byte
+	}{
+		{name: "group public key", expected: groupPublicKey, actual: parsedGroup},
+		{name: "previous entry", expected: previousEntry, actual: parsedPrevious},
+		{name: "entry", expected: entry, actual: parsedEntry},
+	} {
+		if !bytes.Equal(component.expected, component.actual) {
+			t.Errorf(
+				"%s did not round-trip\nexpected: [%x]\nactual:   [%x]",
+				component.name,
+				component.expected,
+				component.actual,
+			)
+		}
+	}
+
+	short := bytes.Repeat([]byte{0x01}, beaconRelayEntryComponentLength-1)
+	for _, test := range []struct {
+		name           string
+		groupPublicKey []byte
+		previousEntry  []byte
+		entry          []byte
+	}{
+		{name: "short group public key", groupPublicKey: short, previousEntry: previousEntry, entry: entry},
+		{name: "short previous entry", groupPublicKey: groupPublicKey, previousEntry: short, entry: entry},
+		{name: "short entry", groupPublicKey: groupPublicKey, previousEntry: previousEntry, entry: short},
+	} {
+		if _, err := BeaconRelayEntryReference(
+			test.groupPublicKey,
+			test.previousEntry,
+			test.entry,
+		); err == nil {
+			t.Errorf("expected [%s] to be rejected", test.name)
+		}
+	}
+
+	for _, test := range []struct {
+		name      string
+		reference string
+	}{
+		{name: "no components", reference: ""},
+		{name: "two components", reference: hex.EncodeToString(groupPublicKey) +
+			":" + hex.EncodeToString(entry)},
+		{name: "four components", reference: reference + ":" +
+			hex.EncodeToString(entry)},
+		{name: "uppercase alias", reference: strings.ToUpper(reference)},
+		{name: "prefixed alias", reference: "0x" + reference},
+	} {
+		if _, _, _, err := ParseBeaconRelayEntryReference(
+			test.reference,
+		); err == nil {
+			t.Errorf("expected [%s] to be rejected", test.name)
 		}
 	}
 }
@@ -349,7 +464,11 @@ func TestValidateTerminalOutcome_CompletedEvidenceKindIsPinnedPerCeremony(
 				evidence.Reference = "persisted-signer-identity"
 			case TerminalEvidenceForwarderClosed:
 			default:
-				evidence.Reference = "durable-result-identity"
+				evidence.Reference = testCompletedResultReference(
+					t,
+					ceremony,
+					"durable-result-identity",
+				)
 			}
 
 			err := ValidateTerminalOutcome(
