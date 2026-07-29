@@ -244,6 +244,17 @@ rather than being read off a completion counter that happened to move
 afterwards. Only identity-bound permits count: an unbound permit names no chain
 work, so matching one would be reading the count again under another name.
 
+One permit legitimately arrives between the two readings — the quiescence
+control's seed, put on the chain after this work was originated and before the
+crossing — and it is excused by identity, not by node. What is excused is the
+intersection of the two independent readings of that seeding: the identities
+the driver said it originated on the seed node, and the identities that node's
+own gate reported holding below C. The gate's reading alone is that node's
+whole legacy population, so excusing it wholesale would wave through any permit
+that merely turned up there between the samples; the driver's alone is the
+driver's word for a below-C anchor, which is what the seeding is checked for. A
+gate that could not be read below C agrees with nothing and excuses nothing.
+
 The straggler control reads the announcer's own account of the sighting
 rather than the gate's refusal counter, which counts a node declining its own
 `Begin` for reasons that need no legacy announcement behind them. It requires

@@ -5436,6 +5436,20 @@ absent_tokens() {
   printf '%s' "${out}"
 }
 
+# The tokens of the first list the second also contains, space-joined for use
+# as a list rather than as prose. Where absent_tokens names a disagreement
+# between two readings, this names what both of them account for — which is
+# what a control needs when it may excuse only the identities two independent
+# readings agree on, and neither reading alone is allowed to decide.
+present_tokens() {
+  local wanted="$1" have="$2" token out=""
+  for token in ${wanted}; do
+    contains_token "${have}" "${token}" || continue
+    out="${out}${out:+ }${token}"
+  done
+  printf '%s' "${out}"
+}
+
 # Every permit identity a set of originated records names, space-joined. Work
 # may repeat here: two local permits for one chain work are two tokens.
 permit_identities() {
@@ -7894,14 +7908,27 @@ surviving_legacy_verdict() {
   # One legacy permit is deliberately added between the two samples: the
   # quiescence control's seed, put on the chain after this work was originated
   # and before the crossing. It is named here rather than left to look like a
-  # stray, and only when the seeding gate could actually be read — an
-  # unreadable seed reading cannot exclude anything, so it leaves whatever
-  # arrived unaccounted for.
+  # stray, but only by the identities two independent readings of the seeding
+  # agree on: the ones the seeding driver said it originated on that node, and
+  # the ones that node's own gate reported holding below C.
+  #
+  # Neither reading may excuse a permit alone. The gate's is the whole legacy
+  # population of the seed node, so any permit that merely turned up there
+  # between the two samples would be waved through under the seed's name — and
+  # the completion fence at the bottom of this ladder is a fleet-wide counter,
+  # so an excused arrival can supply the very increment the named permit is
+  # meant to. The driver's is the driver's word for an anchor below C, which is
+  # the one thing the seeding control exists to check. An unreadable gate
+  # reading agrees with nothing and so excuses nothing.
   local accounted_at_c="${SURVIVING_PERMITS_BEFORE}"
+  local seeded_before_c=""
   if [[ -n "${QUIESCE_SEEDED_PERMITS_BEFORE_C}" &&
     "${QUIESCE_SEEDED_PERMITS_BEFORE_C}" != "unreadable on "* ]]; then
-    accounted_at_c="${accounted_at_c} ${QUIESCE_SEEDED_PERMITS_BEFORE_C}"
+    seeded_before_c="$(present_tokens \
+      "$(held_permit_identities "${QUIESCE_SEEDED_WORK}")" \
+      "${QUIESCE_SEEDED_PERMITS_BEFORE_C}")"
   fi
+  accounted_at_c="${accounted_at_c}${seeded_before_c:+ ${seeded_before_c}}"
   arrived_at_c="$(absent_tokens "${SURVIVING_PERMITS_AT_C}" \
     "${accounted_at_c}")"
   stray="$(unoriginated_terminals "${SURVIVING_TERMINAL}" \

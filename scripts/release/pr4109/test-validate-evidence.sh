@@ -3486,7 +3486,11 @@ surviving_readings() {
   SURVIVING_PERMITS_AT_C_READ=1
   # The quiescence control's seed goes on the chain between those two
   # readings, so it is the one legacy permit that legitimately appears at C
-  # without having been named here. The base case seeds nothing.
+  # without having been named here — and only where the driver that seeded it
+  # and the gate that issued it name the same identity. The base case seeds
+  # nothing, so both readings are empty.
+  # shellcheck disable=SC2034
+  QUIESCE_SEEDED_WORK=""
   # shellcheck disable=SC2034
   QUIESCE_SEEDED_PERMITS_BEFORE_C=""
   # shellcheck disable=SC2034
@@ -3597,19 +3601,42 @@ check "a legacy permit appearing only at the crossing is caught" 3 \
 # The one permit that legitimately arrives between the two readings: the
 # quiescence control's seed, put on the chain after this work was originated
 # and observed in the gate that issued it while the fleet was still below C.
-run_verdict surviving_case eval \
-  'SURVIVING_PERMITS_AT_C="r1-node-1=wallet840#member-1 r1-node-1=quiesce900#member-7"
+# Both readings of the seeding name it, which is what the exclusion rests on.
+# shellcheck disable=SC2034
+QUIESCE_SEED_TX="0xee66666666666666666666666666666666666666666666666666666666666666"
+SEEDED_AT_C='SURVIVING_PERMITS_AT_C="r1-node-1=wallet840#member-1 r1-node-1=quiesce900#member-7"
+  QUIESCE_SEEDED_WORK="beacon_dkg@900@quiesce900=${QUIESCE_SEED_TX}=r1-node-1~member-7"
   QUIESCE_SEEDED_PERMITS_BEFORE_C="r1-node-1=quiesce900#member-7"'
+
+run_verdict surviving_case eval "${SEEDED_AT_C}"
 check "the quiescence seed arriving before C is not an unaccounted permit" 0 \
   "recorded 1 legacy completion"
 
 # A seed the issuing gate could not be asked about excludes nothing, so a
 # permit that looks like it stays unaccounted for rather than being waved
 # through on the strength of a reading that was never taken.
-run_verdict surviving_case eval \
-  'SURVIVING_PERMITS_AT_C="r1-node-1=wallet840#member-1 r1-node-1=quiesce900#member-7"
+run_verdict surviving_case eval "${SEEDED_AT_C}"'
   QUIESCE_SEEDED_PERMITS_BEFORE_C="unreadable on r1-node-1"'
 check "an unreadable seed reading accounts for no arrival at C" 3 \
+  "neither in flight when this step named what it originated nor seeded"
+
+# The gate's reading of the seed node is that node's whole legacy population,
+# not the seeding's product. A permit that merely turned up there between the
+# two samples is in it, and excusing the reading wholesale would wave that
+# permit through C under the seed's name — where it can supply the fleet-wide
+# completion increment the named permit is supposed to.
+run_verdict surviving_case eval "${SEEDED_AT_C}"'
+  SURVIVING_PERMITS_AT_C="${SURVIVING_PERMITS_AT_C} r1-node-1=bystander#member-8"
+  QUIESCE_SEEDED_PERMITS_BEFORE_C="${QUIESCE_SEEDED_PERMITS_BEFORE_C} r1-node-1=bystander#member-8"'
+check "a permit beside the seed on the seed node is not excused as one" 3 \
+  "neither in flight when this step named what it originated nor seeded"
+
+# The mirror reading: the driver names a seed the gate never reported holding
+# below C. That is the driver's word for an anchor on the legacy side of the
+# crossing, which is the one thing the seeding is checked for.
+run_verdict surviving_case eval "${SEEDED_AT_C}"'
+  QUIESCE_SEEDED_PERMITS_BEFORE_C="r1-node-1=somethingelse#member-9"'
+check "a seed only the driver names accounts for no arrival at C" 3 \
   "neither in flight when this step named what it originated nor seeded"
 
 # A crossing that never happened observed nothing, which is not the same as
