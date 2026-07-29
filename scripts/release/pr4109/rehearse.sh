@@ -5202,6 +5202,43 @@ work_transaction() {
   printf '%s' "${rest%%=*}"
 }
 
+# The canonical start block a work identity is anchored at. The gate pins a
+# permit's mode from this block and not from the current height, so it is the
+# only field that says which side of C a permit belongs to.
+work_anchor() {
+  local remainder
+  remainder="${1#*@}"
+  printf '%s' "${remainder%%@*}"
+}
+
+# Of a set of originated records, the ones whose anchor puts them on the wrong
+# side of C for the mode named. A control that drains "legacy" permits is about
+# work anchored below the cutover block; work anchored at or above it takes a
+# security-v2 permit however the control is labelled, and an unreadable anchor
+# says nothing either way.
+misanchored_for_mode() {
+  local records="$1" mode="$2" cutover="$3" record anchor out=""
+  [[ "${cutover}" =~ ^[0-9]+$ ]] || {
+    printf '%s' "${records}"
+    return 0
+  }
+  for record in ${records}; do
+    anchor="$(work_anchor "$(work_id "${record}")")"
+    if [[ ! "${anchor}" =~ ^[0-9]+$ ]]; then
+      out="${out}${out:+, }$(permit_identity "${record}") (anchor unreadable)"
+      continue
+    fi
+    case "${mode}" in
+    legacy) ((anchor < cutover)) && continue ;;
+    security-v2) ((anchor >= cutover)) && continue ;;
+    *) continue ;;
+    esac
+    out="${out}${out:+, }$(permit_identity "${record}") (anchored at \
+${anchor}, C is ${cutover})"
+  done
+  printf '%s' "${out}"
+}
+
 work_permit() {
   printf '%s' "${1##*=}"
 }
@@ -6040,6 +6077,7 @@ QUIESCE_OFFERED=""
 # stand in for it — a permit dropped when the process went is not a permit the
 # gate force-canceled, and neither is it one that finished.
 QUIESCE_INFLIGHT_WORK=""
+QUIESCE_MISANCHORED=""
 QUIESCE_TERMINAL=""
 QUIESCE_TERMINAL_ASKED=0
 QUIESCE_TERMINAL_RC=0
@@ -6110,6 +6148,13 @@ ${QUIESCE_HELD_BEFORE} ${mode} ceremonies it held, but the driver named no \
 identified work it was holding; an in-flight count says how many permits there \
 were and not which work each one was issued for, and a count that fell to zero \
 cannot be followed to anything"
+    quiescence_assertion "${assertion}" false "${step}"
+  elif [[ -n "${QUIESCE_MISANCHORED}" ]]; then
+    block_step "${step}" "${node} drained ${QUIESCE_MISANCHORED}, which is not \
+${mode}-anchored work; the gate pins a permit's mode from the work's canonical \
+start block, so a control labelled ${mode} that drained work anchored on the \
+other side of C observed a permit of the other mode and says nothing about \
+this one"
     quiescence_assertion "${assertion}" false "${step}"
   elif ((QUIESCE_HELD_BEFORE != $(count_tokens \
     "$(permit_identities "${QUIESCE_INFLIGHT_WORK}")"))); then
@@ -6273,6 +6318,14 @@ run_quiescence_control() {
         "${WORK_DRIVER_ORIGINATED_WORK}" "${node}")"
     fi
   fi
+  # This work is originated when the control starts, which for the legacy half
+  # is after the fleet has already crossed C. The gate pins a permit's mode
+  # from the work's anchor rather than the current height, so a driver can
+  # still put a legacy-anchored permit in flight here — but nothing in the
+  # readings above says it did, and fresh chain work at this point is
+  # security-v2. Naming the population's anchors is what tells the two apart.
+  QUIESCE_MISANCHORED="$(misanchored_for_mode "${QUIESCE_INFLIGHT_WORK}" \
+    "${mode}" "${REHEARSAL_R1_CUTOVER_BLOCK}")"
   QUIESCE_HELD_BEFORE="$(participation_field "${node}" \
     "${active_field}" 2>/dev/null || printf '')"
   QUIESCE_FORCED_BEFORE="$(metric_value "${node}" \
@@ -7782,9 +7835,12 @@ network"
     participation_mode_security_v2_total quiesce
 
   # The legacy half needs a permit anchored below C still in flight after it,
-  # which the gate issues on the anchor rather than on the current height. The
-  # node is the one the clock-failure step severed and reconnected; the other
-  # one is stopped.
+  # which the gate issues on the anchor rather than on the current height. This
+  # step runs after the crossing, so the driver has to anchor the work it puts
+  # in flight below C deliberately; the control reads the anchors it was handed
+  # and refuses to decide when they are not legacy-anchored, rather than taking
+  # the phase name for the permit's mode. The node is the one the clock-failure
+  # step severed and reconnected; the other one is stopped.
   begin_step "quiescence with an in-flight legacy permit"
   run_quiescence_control "${REHEARSAL_R1_SERVICES[0]}" \
     "quiescence with an in-flight legacy permit" \

@@ -3355,6 +3355,106 @@ run_verdict legacy_quiesce_case eval 'QUIESCE_STATE=""'
 check "a draining node that never quiesced refutes the legacy half too" 1 \
   "never reported quiescing" "legacy ceremonies in flight"
 
+# The legacy half runs after the fleet has crossed C, so the work it originates
+# when the control starts is fresh chain work — security-v2 unless the driver
+# deliberately anchors it below the cutover block. The cases above inject the
+# in-flight population directly and so cannot see that; these drive
+# run_quiescence_control itself, which is where the population is collected.
+QUIESCE_SEQ_TX="0xff88888888888888888888888888888888888888888888888888888888888888"
+
+# Everything run_quiescence_control reaches outside its own logic. The drain is
+# stubbed to succeed on its first sample so the ladder reaches the rung that
+# reads the anchors rather than stopping at an earlier reading.
+quiesce_sequencing_stubs() {
+  QUIESCE_SEQ_ANCHOR="$1"
+  # The control reads its gauge through command substitution, so a shell
+  # variable counting the samples is incremented in a subshell and lost. The
+  # marker is what makes the first read — the one taken before the stop — report
+  # a held permit and every read inside the drain report none.
+  QUIESCE_SEQ_MARKER="${WORK}/quiesce-seq-sampled"
+  rm -f "${QUIESCE_SEQ_MARKER}"
+
+  participation_field() {
+    case "$2" in
+    gate_state) printf 'quiescing' ;;
+    *)
+      if [[ -f "${QUIESCE_SEQ_MARKER}" ]]; then
+        printf '0'
+      else
+        : >"${QUIESCE_SEQ_MARKER}"
+        printf '1'
+      fi
+      ;;
+    esac
+  }
+  # A node that drained cleanly: it refused the work offered while quiescing,
+  # issued no permit for it, and force-aborted nothing. The refusal is recorded
+  # between the read taken before the stop and the reads taken during the
+  # drain, so it needs the same marker treatment as the gauge.
+  # Each reading gets its own marker: the total and the per-ceremony breakdown
+  # are sampled one after the other, so a shared marker would have the second
+  # read of the pair already reporting the refusal the first one had not yet
+  # seen, and the two would never move together.
+  QUIESCE_SEQ_REFUSED="${WORK}/quiesce-seq-refused"
+  QUIESCE_SEQ_REFUSED_BY_CEREMONY="${WORK}/quiesce-seq-refused-ceremony"
+  rm -f "${QUIESCE_SEQ_REFUSED}" "${QUIESCE_SEQ_REFUSED_BY_CEREMONY}"
+
+  metric_value() {
+    case "$2" in
+    participation_refusals_total)
+      if [[ -f "${QUIESCE_SEQ_REFUSED}" ]]; then
+        printf '1'
+      else
+        : >"${QUIESCE_SEQ_REFUSED}"
+        printf '0'
+      fi
+      ;;
+    *) printf '0' ;;
+    esac
+  }
+  ceremony_refusal_counters() {
+    if [[ -f "${QUIESCE_SEQ_REFUSED_BY_CEREMONY}" ]]; then
+      printf 'tbtc_signing=1'
+    else
+      : >"${QUIESCE_SEQ_REFUSED_BY_CEREMONY}"
+      printf 'tbtc_signing=0'
+    fi
+  }
+  manifest_termination_grace() { printf '4'; }
+  compose() { return 0; }
+  node_reachable() { return 1; }
+
+  run_work_driver() {
+    WORK_DRIVER_RC=0
+    WORK_DRIVER_TX_COUNT=1
+    WORK_DRIVER_ORIGINATED="tbtc_signing"
+    WORK_DRIVER_ORIGINATED_WORK="tbtc_signing@${QUIESCE_SEQ_ANCHOR}\
+@wallet${QUIESCE_SEQ_ANCHOR}=${QUIESCE_SEQ_TX}=r1-node-1~member-1"
+    WORK_DRIVER_BOUND_RESULTS="tbtc_signing@${QUIESCE_SEQ_ANCHOR}\
+@wallet${QUIESCE_SEQ_ANCHOR}=succeeded=${QUIESCE_SEQ_TX}=0xsigned"
+  }
+}
+
+quiesce_sequencing_case() {
+  # shellcheck disable=SC2034
+  REHEARSAL_R1_CUTOVER_BLOCK="1000"
+  # shellcheck disable=SC2034
+  PR4109_WORK_DRIVER="/nonexistent/driver-is-stubbed"
+  quiesce_sequencing_stubs "$1"
+  run_quiescence_control r1-node-1 \
+    "quiescence with an in-flight legacy permit" \
+    "" legacy active_legacy_ceremonies participation_mode_legacy_total \
+    quiesce-legacy
+}
+
+run_verdict quiesce_sequencing_case 1000
+check "a legacy quiescence draining post-C work observed the other mode" 3 \
+  "is not legacy-anchored work" "anchored at 1000, C is 1000"
+
+run_verdict quiesce_sequencing_case 840
+check "a legacy quiescence draining pre-C work is about a legacy permit" 0 \
+  "quiescence with an in-flight legacy permit"
+
 # The accounting every "was work offered here" rung above reads. It comes off a
 # real driver invocation rather than a constructed reading, because what is
 # being tested is that the driver's own exit status and report reach those
