@@ -6375,13 +6375,14 @@ ${claimed:-no settlement at all}"
 # because nothing else in the rehearsal ever asks a node whether it was there.
 #
 # The half that can be node-authored is authored here instead. Every R1 node
-# publishes the permits it closed and what each one produced, so the R1
-# contributors to a piece of chain work are derivable from the fleet without the
-# driver's participation, at the full permit identity rather than at a service
-# name. The driver's list is then a claim to reconcile against that derivation
-# in both directions — a claimed R1 party with no holder's record behind it is
-# invented, and a holder's completion the list omits is a contributor the driver
-# chose not to count.
+# publishes the permits it closed, what each one produced, and — where its
+# ceremony authenticates the population behind a result — which of the seats that
+# produced it were its own, so the R1 contributors to a piece of chain work are
+# derivable from the fleet without the driver's participation, at the full permit
+# identity rather than at a service name. The driver's list is then a claim to
+# reconcile against that derivation in both directions — a claimed R1 party with
+# no contribution of its own behind it is invented, and a holder's contribution
+# the list omits is a party the driver chose not to count.
 #
 # The prior release publishes no gate account at all, so its share cannot be
 # authored the same way. That is a standing limit of this rehearsal rather than
@@ -6401,8 +6402,8 @@ contributor_permit_identity() {
     "$(permit_local_id "${party}")"
 }
 
-# The permits on one piece of chain work whose own holders recorded completing
-# it and named what it produced, space-joined. Derived from the node-authored
+# The permits on one piece of chain work whose own holders recorded contributing
+# to it and named what it produced, space-joined. Derived from the node-authored
 # account alone: this is the R1 half of a contributor set, and the driver has no
 # part in producing it.
 #
@@ -6410,12 +6411,33 @@ contributor_permit_identity() {
 # legitimately reaches its close having produced nothing of its own, so it is a
 # party to a relay rather than to a transcript, and a contributor set is about
 # the parties whose shares combined into one output.
+#
+# Neither is a completion whose own transcript places this holder outside the
+# result. Observing a threshold output and producing one are different facts,
+# and a permit is entitled to record the first: a wallet action owns its permit
+# and writes down the signature it saw settle even when the attempt that
+# produced it selected none of the memberships this node operates, which the
+# gate spells as a transcript naming incorporated seats and no local ones.
+# Reading that record as a contribution is the whole gap a contributor set is
+# supposed to close — an R1 observer of a prior-only transcript would supply the
+# R1 half of a mixed claim while no R1 share ever entered the ceremony. Where
+# the holder publishes a transcript, it is counted as a contributor exactly when
+# it says one of the seats that produced the result was its own.
+#
+# A holder whose ceremony publishes no transcript at all is still counted on its
+# completion. That is the beacon families, whose owners do not yet author the
+# population behind their result, and it is the standing limit named at the
+# mixed-transcript control rather than a reading this helper can improve.
 authored_work_contributors() {
   local work="$1" authored="$2" token permit out=""
   for token in ${authored}; do
     authored_record_complete "${token}" || continue
     [[ "$(authored_outcome "${token}")" == "completed" ]] || continue
     [[ "$(authored_result "${token}")" == "-" ]] && continue
+    if [[ "$(authored_incorporated "${token}")" != "-" ]] &&
+      [[ "$(authored_local "${token}")" == "-" ]]; then
+      continue
+    fi
     permit="$(authored_permit "${token}")"
     [[ "$(identity_work "${permit}")" == "${work}" ]] || continue
     contains_token "${out}" "${permit}" && continue
@@ -6437,15 +6459,20 @@ identity_works() {
 }
 
 # Of the contributors the driver claims, the ones naming a node in the R1 fleet
-# that never recorded completing that exact permit, comma-joined.
+# that never recorded contributing to that exact permit, comma-joined.
 #
 # This is the fabrication the mixed-transcript control rested on. A driver can
 # write any party into its report, and a claim naming an R1 node is checkable
 # against that node's own account: the permit identity either appears among the
-# completions its holder published or the contribution did not happen. A claimed
-# party whose service is right and whose permit is not is caught here too, which
-# is what keeps one real contribution from standing for the several a threshold
-# needs.
+# contributions its holder published or the contribution did not happen. A
+# claimed party whose service is right and whose permit is not is caught here
+# too, which is what keeps one real contribution from standing for the several a
+# threshold needs.
+#
+# The population a claim is held to is the one the holders authored, so a driver
+# naming a holder that merely observed the result — a permit whose transcript
+# names incorporated seats and no local ones — is naming a party to that
+# transcript that its own record does not claim to have been.
 invented_contributors() {
   local claimed="$1" authored="$2" r1="$3"
   local record permit holder out=""
@@ -6744,8 +6771,15 @@ ceremonies_without_mixed_transcript() {
       # The same piece of work, not merely the same ceremony. A prior share on
       # one work and an R1 share on another are two homogeneous transcripts
       # however the totals read, and the R1 half of this one is the fleet's own
-      # record of having completed exactly this work rather than the driver's
-      # account of who was in it.
+      # record of having contributed to exactly this work rather than the
+      # driver's account of who was in it.
+      #
+      # Where the holders publish a transcript, contributing means one of the
+      # seats that produced the result was theirs. An R1 node that merely
+      # observed a prior-only result completes its permit honestly and is not a
+      # party to it, so it cannot supply this half; where they publish none — the
+      # beacon families — the completion is still all there is, which is the
+      # limit named below.
       [[ -n "$(authored_work_contributors "${audited}" "${authored}")" ]] ||
         continue
       # And the half that used to be taken on trust: a seat in the transcript
@@ -9352,20 +9386,23 @@ the side it was never shown to be on"
   elif [[ -n "${uninteroperated}" ]]; then
     block_step "${step}" "the work driver settled ${settlements}, but no \
 ${uninteroperated} transcript incorporated a share from both \
-${REHEARSAL_PRIOR_SERVICE} and an R1 holder that recorded completing it; one \
-release was running beside the other and took no part in those results, which \
-is what an unselected, partitioned, or excluded party looks like from outside \
-— a ceremony the two releases did interoperate on cannot stand for one they \
-did not, and two homogeneous ceremonies cannot stand for either"
+${REHEARSAL_PRIOR_SERVICE} and an R1 holder whose own record puts a share of \
+its own in that result; one release was running beside the other and took no \
+part in those results, which is what an unselected, partitioned, or excluded \
+party looks like from outside — a ceremony the two releases did interoperate on \
+cannot stand for one they did not, two homogeneous ceremonies cannot stand for \
+either, and an R1 node that only watched a prior-only result finish is not a \
+party to it"
   elif [[ -n "${invented}" ]]; then
     record_step "${step}" fail "the work driver claims ${invented} took part \
-in the transcripts it settled, and those nodes recorded no such completion; a \
+in the transcripts it settled, and those nodes recorded no such contribution; a \
 party the fleet never vouched for is the driver attesting to its own \
-compatibility, and one real contribution reported under several identities is \
-how a single share stands for the many a threshold needs"
+compatibility, one real contribution reported under several identities is how a \
+single share stands for the many a threshold needs, and a holder that recorded \
+watching a result it had no seat in never claimed to be a party to it"
   elif [[ -n "${uncredited}" ]]; then
-    block_step "${step}" "the holders of ${uncredited} recorded completing \
-work the driver settled, and its contributor set does not name them; the set \
+    block_step "${step}" "the holders of ${uncredited} recorded contributing \
+to work the driver settled, and its contributor set does not name them; the set \
 has to be the population that ran rather than a subset of it, or the account \
 of who interoperated is about a smaller transcript than the one this fleet \
 produced"
@@ -9400,9 +9437,9 @@ and no security-v2 permit (unchanged at [${PRECUTOVER_SECURITY_AFTER}]) \
 driving ${what} beside the running prior binary, the driver settled \
 ${settlements} with nothing failing beside them, the nodes holding the permits \
 issued for that work recorded ${authored}, its contributor set named every \
-completion those holders recorded and no party they did not, each of \
+contribution those holders recorded and no party they did not, each of \
 ${required_ceremonies} joined a claimed ${REHEARSAL_PRIOR_SERVICE} share to \
-work the R1 fleet's own holders recorded completing, and the fleet \
+work an R1 holder's own record puts a share of its own in, and the fleet \
 recognized no cross-format peer (unchanged at \
 [${PRECUTOVER_SIGHTINGS_AFTER}])"
     [[ -z "${assertion}" ]] || record_assertion "${assertion}" true "${step}"

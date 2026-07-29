@@ -3942,6 +3942,40 @@ check "a fleet claiming every seat authored no mixed transcript" 3 \
   "no tbtc_dkg tbtc_signing tbtc_heartbeat tbtc_wallet_action transcript \
 incorporated a share"
 
+# The seat sets read the other way round: every seat that produced the signing
+# result belongs to the prior binary and the R1 holder claims none of them.
+#
+# The gate permits exactly this record. A wallet action owns its permit and
+# records the signature it saw settle even when the attempt that produced it
+# selected none of the memberships it operates, so "completed, incorporating
+# seats, none of them mine" is the honest ending of a permit whose ceremony ran
+# without it. What it is not is a contribution: the transcript is prior-only,
+# and an R1 node watching one finish supplies no R1 share to it. Read as a
+# contribution — which is all a completion could ever say — this fixture is a
+# homogeneous prior ceremony passing as interoperation, with the prior half of
+# the claim genuinely present and the R1 half supplied by an observer.
+run_verdict precutover_case eval '
+  PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS/\
+0xsign843=-=1,7=1=-/0xsign843=-=7=-=-}"'
+check "an R1 holder that only watched a result is not a party to it" 3 \
+  "no tbtc_signing transcript incorporated a share"
+
+# The same distinction where the driver's list is what reaches for it. Here the
+# signing transcript is genuinely mixed — r1-node-1 holds a seat in it — and the
+# driver additionally names r1-node-2, whose own record for that work claims no
+# seat of its own. A contributor set has to be the parties whose shares combined
+# into the result, so a holder that recorded watching it is refused the same way
+# a party the fleet never mentioned is.
+# shellcheck disable=SC2016
+run_verdict precutover_case eval '
+  PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS} \
+r1-node-2@tbtc_signing@843@sign843#4=completed=bitcoin_transaction=0xsign843\
+=-=7=-=-"
+  PRECUTOVER_CONTRIBUTORS="${PRECUTOVER_CONTRIBUTORS} \
+tbtc_signing@843@sign843=r1-node-2~4"'
+check "a claimed party that only watched the result is refused" 1 \
+  "r1-node-2@tbtc_signing@843@sign843#4" "recorded no such contribution"
+
 # The mirror on the other release. A prior binary settling a ceremony among
 # its own kind is exactly as unmixed as an R1 fleet doing so, and a control
 # that only ever looked for the prior share would call this interoperation.
@@ -4007,7 +4041,7 @@ run_verdict precutover_case eval '
   PRECUTOVER_CONTRIBUTORS="${PRECUTOVER_CONTRIBUTORS} \
 tbtc_dkg@842@dkg842=r1-node-2~4"'
 check "a claimed R1 party the fleet never vouched for is refused" 1 \
-  "r1-node-2@tbtc_dkg@842@dkg842#4" "recorded no such completion"
+  "r1-node-2@tbtc_dkg@842@dkg842#4" "recorded no such contribution"
 
 # The same node under a permit it did not hold. r1-node-1 published a completion
 # for the DKG under permit 1; a second entry for the same node at permit 9 is
@@ -4018,7 +4052,7 @@ run_verdict precutover_case eval '
   PRECUTOVER_CONTRIBUTORS="${PRECUTOVER_CONTRIBUTORS} \
 tbtc_dkg@842@dkg842=r1-node-1~9"'
 check "one contribution counted twice under a second permit is refused" 1 \
-  "r1-node-1@tbtc_dkg@842@dkg842#9" "recorded no such completion"
+  "r1-node-1@tbtc_dkg@842@dkg842#9" "recorded no such contribution"
 
 # The other direction. A driver that reports a subset of the population as the
 # contributor set describes a smaller ceremony than the one the fleet published,
