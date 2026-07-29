@@ -3158,14 +3158,24 @@ tbtc_dkg@842@dkg842=succeeded=${PRE_TX1}=0xdkg842 \
 tbtc_signing@843@sign843=succeeded=${PRE_TX1}=0xsign843 \
 tbtc_heartbeat@844@beat844=succeeded=${PRE_TX1}=0xbeat844 \
 beacon_dkg@845@bdkg845=succeeded=${PRE_TX2}=0xbdkg845"
-  # Who each settled transcript incorporated. Both releases took part in both
-  # halves, which is the whole subject of a mixed prior/R1 control.
+  # Who each settled transcript incorporated. Both releases took part in every
+  # required ceremony, which is the whole subject of a mixed prior/R1 control:
+  # each ceremony is its own path into the gate, so interoperation on one of
+  # them is not interoperation on the next.
   # shellcheck disable=SC2034
   PRECUTOVER_CONTRIBUTORS="\
 tbtc_wallet_action@840@wallet840=r1-node-1~1 \
 tbtc_wallet_action@840@wallet840=prior-node~7 \
 beacon_signing@841@entry841=r1-node-1~1 \
-beacon_signing@841@entry841=prior-node~7"
+beacon_signing@841@entry841=prior-node~7 \
+tbtc_dkg@842@dkg842=r1-node-1~1 \
+tbtc_dkg@842@dkg842=prior-node~7 \
+tbtc_signing@843@sign843=r1-node-1~1 \
+tbtc_signing@843@sign843=prior-node~7 \
+tbtc_heartbeat@844@beat844=r1-node-1~1 \
+tbtc_heartbeat@844@beat844=prior-node~7 \
+beacon_dkg@845@bdkg845=r1-node-1~1 \
+beacon_dkg@845@bdkg845=prior-node~7"
   # shellcheck disable=SC2034
   PRECUTOVER_PRIOR_RUNNING=1
   # shellcheck disable=SC2034
@@ -3213,27 +3223,79 @@ check "R1 working alone is not a mixed prior/R1 control" 3 \
 # that settled without it, which is the reading interoperation produces too.
 run_verdict precutover_case eval 'PRECUTOVER_CONTRIBUTORS=""'
 check "a running prior binary that contributed nothing is not interop" 3 \
-  "took no part in the result"
+  "took no part in those results"
 
 # Half the release interoperating is not the release interoperating: a prior
-# binary in the tBTC transcript says nothing about the beacon path into the
+# binary in the tBTC transcripts says nothing about the beacon path into the
 # gate, which is a separate call path with its own wire format.
 run_verdict precutover_case eval '
   PRECUTOVER_CONTRIBUTORS="\
 tbtc_wallet_action@840@wallet840=r1-node-1~1 \
 tbtc_wallet_action@840@wallet840=prior-node~7 \
-beacon_signing@841@entry841=r1-node-1~1"'
+tbtc_dkg@842@dkg842=r1-node-1~1 \
+tbtc_dkg@842@dkg842=prior-node~7 \
+tbtc_signing@843@sign843=r1-node-1~1 \
+tbtc_signing@843@sign843=prior-node~7 \
+tbtc_heartbeat@844@beat844=r1-node-1~1 \
+tbtc_heartbeat@844@beat844=prior-node~7 \
+beacon_signing@841@entry841=r1-node-1~1 \
+beacon_dkg@845@bdkg845=r1-node-1~1"'
 check "a prior binary in one family alone does not cover the release" 3 \
-  "no beacon transcript incorporated a share"
+  "no beacon_dkg beacon_signing transcript incorporated a share"
 
 # The mirror on the other half, so neither family is covered by accident.
 run_verdict precutover_case eval '
   PRECUTOVER_CONTRIBUTORS="\
 tbtc_wallet_action@840@wallet840=r1-node-1~1 \
+tbtc_dkg@842@dkg842=r1-node-1~1 \
+tbtc_signing@843@sign843=r1-node-1~1 \
+tbtc_heartbeat@844@beat844=r1-node-1~1 \
 beacon_signing@841@entry841=r1-node-1~1 \
-beacon_signing@841@entry841=prior-node~7"'
-check "a prior binary absent from the tBTC transcript is caught too" 3 \
-  "no tbtc transcript incorporated a share"
+beacon_signing@841@entry841=prior-node~7 \
+beacon_dkg@845@bdkg845=r1-node-1~1 \
+beacon_dkg@845@bdkg845=prior-node~7"'
+check "a prior binary absent from the tBTC transcripts is caught too" 3 \
+  "no tbtc_dkg tbtc_signing tbtc_heartbeat tbtc_wallet_action transcript \
+incorporated a share"
+
+# The reading this check exists to refuse: a family is a set of separate call
+# paths, not one. A prior binary that signed says nothing about whether it
+# could have taken part in a key generation or a heartbeat, whose message sets,
+# anchors, and refusals are all different — so a mixed signing beside an
+# R1-only DKG and an R1-only heartbeat leaves most of the tBTC path never shown
+# to interoperate, while every family total reads as covered.
+run_verdict precutover_case eval '
+  PRECUTOVER_CONTRIBUTORS="\
+tbtc_wallet_action@840@wallet840=r1-node-1~1 \
+tbtc_wallet_action@840@wallet840=prior-node~7 \
+tbtc_dkg@842@dkg842=r1-node-1~1 \
+tbtc_signing@843@sign843=r1-node-1~1 \
+tbtc_signing@843@sign843=prior-node~7 \
+tbtc_heartbeat@844@beat844=r1-node-1~1 \
+beacon_signing@841@entry841=r1-node-1~1 \
+beacon_signing@841@entry841=prior-node~7 \
+beacon_dkg@845@bdkg845=r1-node-1~1 \
+beacon_dkg@845@bdkg845=prior-node~7"'
+check "a mixed signing does not cover the DKG and heartbeat beside it" 3 \
+  "no tbtc_dkg tbtc_heartbeat transcript incorporated a share"
+
+# The same one path down on the beacon side, where a mixed relay signing would
+# otherwise carry an R1-only group creation.
+run_verdict precutover_case eval '
+  PRECUTOVER_CONTRIBUTORS="\
+tbtc_wallet_action@840@wallet840=r1-node-1~1 \
+tbtc_wallet_action@840@wallet840=prior-node~7 \
+tbtc_dkg@842@dkg842=r1-node-1~1 \
+tbtc_dkg@842@dkg842=prior-node~7 \
+tbtc_signing@843@sign843=r1-node-1~1 \
+tbtc_signing@843@sign843=prior-node~7 \
+tbtc_heartbeat@844@beat844=r1-node-1~1 \
+tbtc_heartbeat@844@beat844=prior-node~7 \
+beacon_signing@841@entry841=r1-node-1~1 \
+beacon_signing@841@entry841=prior-node~7 \
+beacon_dkg@845@bdkg845=r1-node-1~1"'
+check "a mixed beacon signing does not cover the beacon DKG" 3 \
+  "no beacon_dkg transcript incorporated a share"
 
 # An R1 node is not the prior binary however many transcripts it appears in.
 run_verdict precutover_case eval '
@@ -3243,7 +3305,7 @@ tbtc_wallet_action@840@wallet840=r1-node-2~2 \
 beacon_signing@841@entry841=r1-node-1~1 \
 beacon_signing@841@entry841=r1-node-2~2"'
 check "a homogeneous R1 transcript cannot stand for a mixed one" 3 \
-  "took no part in the result"
+  "took no part in those results"
 
 # The mirror on the other release. A prior binary settling a ceremony among
 # its own kind is exactly as unmixed as an R1 fleet doing so, and a control
@@ -3253,32 +3315,43 @@ run_verdict precutover_case eval '
 tbtc_wallet_action@840@wallet840=prior-node~7 \
 beacon_signing@841@entry841=prior-node~7"'
 check "a homogeneous prior transcript cannot stand for a mixed one" 3 \
-  "no tbtc beacon transcript incorporated a share"
+  "took no part in those results"
 
-# Two homogeneous ceremonies are not one mixed ceremony. Counted per family
-# rather than per transcript, a prior-only wallet action beside an R1-only
-# signing would read as the two releases combining into a threshold output
-# that neither of them witnessed.
+# Two homogeneous ceremonies are not one mixed ceremony. Counted across
+# transcripts rather than within one, a prior-only wallet action beside an
+# R1-only signing would read as the two releases combining into a threshold
+# output that neither of them witnessed.
 run_verdict precutover_case eval '
   PRECUTOVER_CONTRIBUTORS="\
 tbtc_wallet_action@840@wallet840=prior-node~7 \
-tbtc_signing@842@sign842=r1-node-1~1 \
+tbtc_signing@843@sign843=r1-node-1~1 \
 beacon_signing@841@entry841=r1-node-1~1 \
-beacon_signing@841@entry841=prior-node~7"'
+beacon_signing@841@entry841=prior-node~7 \
+beacon_dkg@845@bdkg845=r1-node-1~1 \
+beacon_dkg@845@bdkg845=prior-node~7"'
 check "shares in separate transcripts are not one mixed transcript" 3 \
-  "no tbtc transcript incorporated a share"
+  "no tbtc_dkg tbtc_signing tbtc_heartbeat tbtc_wallet_action transcript \
+incorporated a share"
 
 # A service the rehearsal does not run is not the R1 fleet. Accepting any
 # non-prior holder would let a stray container satisfy the R1 half of the
 # claim without either rehearsed release having taken part.
 run_verdict precutover_case eval '
   PRECUTOVER_CONTRIBUTORS="\
+tbtc_wallet_action@840@wallet840=r1-node-1~1 \
 tbtc_wallet_action@840@wallet840=prior-node~7 \
-tbtc_wallet_action@840@wallet840=bystander-node~3 \
+tbtc_dkg@842@dkg842=bystander-node~3 \
+tbtc_dkg@842@dkg842=prior-node~7 \
+tbtc_signing@843@sign843=r1-node-1~1 \
+tbtc_signing@843@sign843=prior-node~7 \
+tbtc_heartbeat@844@beat844=r1-node-1~1 \
+tbtc_heartbeat@844@beat844=prior-node~7 \
 beacon_signing@841@entry841=r1-node-1~1 \
-beacon_signing@841@entry841=prior-node~7"'
+beacon_signing@841@entry841=prior-node~7 \
+beacon_dkg@845@bdkg845=r1-node-1~1 \
+beacon_dkg@845@bdkg845=prior-node~7"'
 check "an unrecognized service does not stand in for the R1 fleet" 3 \
-  "no tbtc transcript incorporated a share"
+  "no tbtc_dkg transcript incorporated a share"
 
 # Work driven by a fleet already past C is not pre-cutover work, whatever
 # mode counter moved.

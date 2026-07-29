@@ -5416,7 +5416,7 @@ missing_bound_families() {
   printf '%s' "${uncovered}"
 }
 
-# Of the required families, the ones where no one settled transcript
+# Of the required ceremonies, the ones where no one settled transcript
 # incorporated both the prior release and one of the named R1 services.
 #
 # A mixed-fleet claim needs this and cannot be read off a running container.
@@ -5424,24 +5424,31 @@ missing_bound_families() {
 # cryptographically excluded, and every one of those produces a settled
 # ceremony beside a running container — the same reading interoperation
 # produces. Asking which parties the transcript itself incorporated is the only
-# question that separates them, and it is asked per family because a prior
-# binary that contributed to a tBTC signing says nothing about the beacon path.
+# question that separates them.
+#
+# It is asked once per required ceremony rather than once per family. A family
+# is a set of separate call paths into the gate — tBTC DKG, signing, and the
+# heartbeat each anchor differently, refuse differently, and carry a different
+# message set — so a prior binary that contributed to a signing says nothing
+# about whether it could have contributed to a DKG. Counted per family, one
+# mixed signing beside an R1-only DKG and an R1-only heartbeat reads as the
+# whole tBTC path interoperating, when two of its three ceremonies were never
+# shown to.
 #
 # The two shares have to be in the same transcript. A prior share in one
 # ceremony and an R1 share in another is two homogeneous ceremonies however the
-# family totals read, and what a compatibility control claims is that the two
-# releases combined into a single threshold output — which only a transcript
-# naming both of them ever witnesses.
-families_without_mixed_transcript() {
+# totals read, and what a compatibility control claims is that the two releases
+# combined into a single threshold output — which only a transcript naming both
+# of them ever witnesses.
+ceremonies_without_mixed_transcript() {
   local contributors="$1" required="$2" prior="$3" r1="$4"
-  local family record work holder covered priors others uncovered=""
-  for family in ${required}; do
+  local ceremony record work holder covered priors others uncovered=""
+  for ceremony in ${required}; do
     priors=""
     others=""
     for record in ${contributors}; do
       work="$(work_id "${record}")"
-      [[ "$(ceremony_family "$(work_ceremony "${work}")")" == "${family}" ]] ||
-        continue
+      [[ "$(work_ceremony "${work}")" == "${ceremony}" ]] || continue
       holder="$(permit_holder "${record##*=}")"
       if [[ "${holder}" == "${prior}" ]]; then
         contains_token "${priors}" "${work}" ||
@@ -5457,7 +5464,7 @@ families_without_mixed_transcript() {
       covered=1
       break
     done
-    ((covered == 1)) || uncovered="${uncovered}${uncovered:+ }${family}"
+    ((covered == 1)) || uncovered="${uncovered}${uncovered:+ }${ceremony}"
   done
   printf '%s' "${uncovered}"
 }
@@ -7213,19 +7220,6 @@ missing_bound_ceremonies() {
   printf '%s' "${uncovered}"
 }
 
-# The distinct families a required-ceremony list spans, in the order they first
-# appear. The interoperation check is asked per call path into the gate, and
-# deriving its families from the ceremony list keeps one statement of what a
-# step must cover instead of two that can drift apart.
-ceremony_families() {
-  local ceremonies="$1" ceremony family out=""
-  for ceremony in ${ceremonies}; do
-    family="$(ceremony_family "${ceremony}")"
-    contains_token "${out}" "${family}" || out="${out}${out:+ }${family}"
-  done
-  printf '%s' "${out}"
-}
-
 # What one pre-cutover driver phase observed on a fleet that still has the
 # prior binary on its network.
 #
@@ -7333,15 +7327,14 @@ ${service} reported [${state:-unreadable}] at block [${block:-unreadable}]"
 precutover_verdict() {
   local step="$1" assertion="$2" required_ceremonies="$3" what="$4"
 
-  local required_families failed_results missing_ceremonies settlements
+  local failed_results missing_ceremonies settlements
   local uninteroperated
-  required_families="$(ceremony_families "${required_ceremonies}")"
   failed_results="$(unsuccessful_results "${PRECUTOVER_RESULTS}")"
   missing_ceremonies="$(missing_bound_ceremonies \
     "${PRECUTOVER_BOUND}" "${required_ceremonies}")"
   settlements="$(bound_settlements "${PRECUTOVER_BOUND}")"
-  uninteroperated="$(families_without_mixed_transcript \
-    "${PRECUTOVER_CONTRIBUTORS}" "${required_families}" \
+  uninteroperated="$(ceremonies_without_mixed_transcript \
+    "${PRECUTOVER_CONTRIBUTORS}" "${required_ceremonies}" \
     "${REHEARSAL_PRIOR_SERVICE}" "${REHEARSAL_R1_SERVICES[*]}")"
 
   if ((PRECUTOVER_DRIVER_SUPPLIED == 0)); then
@@ -7390,9 +7383,10 @@ to cover ${required_ceremonies}"
     block_step "${step}" "the work driver settled ${settlements}, but no \
 ${uninteroperated} transcript incorporated a share from both \
 ${REHEARSAL_PRIOR_SERVICE} and the R1 fleet; one release was running beside \
-the other and took no part in the result, which is what an unselected, \
-partitioned, or excluded party looks like from outside — two homogeneous \
-ceremonies cannot stand for the two releases interoperating"
+the other and took no part in those results, which is what an unselected, \
+partitioned, or excluded party looks like from outside — a ceremony the two \
+releases did interoperate on cannot stand for one they did not, and two \
+homogeneous ceremonies cannot stand for either"
   elif ((PRECUTOVER_LEGACY_AFTER <= PRECUTOVER_LEGACY_BEFORE)); then
     record_step "${step}" fail "the work driver settled ${settlements}, but \
 the fleet issued no new legacy permit (participation_mode_legacy_total still \
@@ -7422,8 +7416,8 @@ the prior binary; below C the two releases must be one wire format"
 $((PRECUTOVER_LEGACY_AFTER - PRECUTOVER_LEGACY_BEFORE)) new legacy permits \
 and no security-v2 permit (unchanged at [${PRECUTOVER_SECURITY_AFTER}]) \
 driving ${what} beside the running prior binary, the driver settled \
-${settlements} with nothing failing beside them, every ${required_families} \
-family settled a transcript incorporating shares from both \
+${settlements} with nothing failing beside them, each of \
+${required_ceremonies} settled a transcript incorporating shares from both \
 ${REHEARSAL_PRIOR_SERVICE} and the R1 fleet, and the fleet \
 recognized no cross-format peer (unchanged at \
 [${PRECUTOVER_SIGHTINGS_AFTER}])"
