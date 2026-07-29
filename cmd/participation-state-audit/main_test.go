@@ -847,6 +847,106 @@ func TestComputeTBTCDKGResultHashMatchesGeneratedWalletRegistryABI(
 // the given already-audited manifest: every persisted wallet and group the
 // manifest interprets is reconciled as registered and settled, and the prior
 // reader covers every required schema.
+// testRelayRequestID derives the beacon request identifier a fixture request
+// carries from the block it was made in. One request per block is what the
+// fixtures model, so the block identifies the request as well as the beacon's
+// own counter would.
+func testRelayRequestID(requestStartBlock uint64) *big.Int {
+	return new(big.Int).SetUint64(requestStartBlock*1_000 + 7)
+}
+
+// addTestBeaconRelayLogs appends the RandomBeacon logs the chain reconciliation
+// needs to corroborate every beacon relay outcome the manifest's journal
+// records as completed: the request each recovered entry answers, and the
+// termination each accepted timeout report earned.
+//
+// The audit reads a relay result as this permit's only when the beacon's own
+// request log sits in the permit's block over the entry it signs over, so a
+// fixture that omits the log describes a node whose result answers no request
+// the beacon ever made.
+func addTestBeaconRelayLogs(
+	t *testing.T,
+	record *chainReconciliationEvidence,
+	auditManifest *manifest,
+) {
+	t.Helper()
+
+	if auditManifest.ParticipationTerminalOutcomes == nil {
+		return
+	}
+
+	// Memberships of one request legitimately share it, so each request is
+	// logged once however many outcomes name it.
+	requested := make(map[string]struct{})
+	addRequest := func(startBlock uint64, previousEntry []byte) {
+		t.Helper()
+
+		identity := relayEntryIdentity(startBlock, previousEntry)
+		if _, done := requested[identity]; done {
+			return
+		}
+		requested[identity] = struct{}{}
+
+		addTestRelayEntryReceipt(
+			t,
+			record,
+			testRandomBeaconAddress,
+			"RelayEntryRequested",
+			testRelayRequestID(startBlock),
+			startBlock,
+			uint64(1),
+			previousEntry,
+		)
+	}
+
+	for _, outcome := range auditManifest.ParticipationTerminalOutcomes.Outcomes {
+		if outcome.Outcome != participation.TerminalOutcomeCompleted {
+			continue
+		}
+		switch outcome.Permit.Ceremony {
+		case participation.BeaconRelaySigning:
+			startBlock, _, previousEntry, _, err := participation.
+				ParseBeaconRelayEntryReference(outcome.Evidence.Reference)
+			if err != nil {
+				continue
+			}
+			addRequest(startBlock, previousEntry)
+		case participation.BeaconTimeoutReport:
+			startBlock, requestID, terminatedGroupID, err := participation.
+				ParseBeaconRelayTimeoutSettlementReference(
+					outcome.Evidence.Reference,
+				)
+			if err != nil {
+				continue
+			}
+			// A terminated request signs over a previous entry like any
+			// other, but no permit record names it, so the fixture supplies a
+			// point of its own rather than deriving one.
+			addTestRelayEntryReceipt(
+				t,
+				record,
+				testRandomBeaconAddress,
+				"RelayEntryRequested",
+				requestID,
+				startBlock,
+				uint64(1),
+				new(bn256.G1).ScalarBaseMult(
+					new(big.Int).SetUint64(startBlock+1),
+				).Marshal(),
+			)
+			addTestRelayEntryReceipt(
+				t,
+				record,
+				testRandomBeaconAddress,
+				"RelayEntryTimedOut",
+				requestID,
+				startBlock+1,
+				terminatedGroupID,
+			)
+		}
+	}
+}
+
 func newValidEvidence(t *testing.T, auditManifest *manifest) evidenceInputs {
 	t.Helper()
 
@@ -945,6 +1045,7 @@ func newValidEvidence(t *testing.T, auditManifest *manifest) evidenceInputs {
 		})
 	}
 	authenticateTestChainReconciliationEvidence(t, chainRecord)
+	addTestBeaconRelayLogs(t, chainRecord, auditManifest)
 
 	bitcoinRecord := &bitcoinReconciliationEvidence{
 		evidenceEnvelope: envelope("bitcoin_reconciliation"),
@@ -5532,6 +5633,307 @@ func TestValidateChainReconciliationEvidence_RelayTimeoutSettlement(
 		outcomes[0].Evidence = participation.TerminalEvidence{
 			Kind: participation.TerminalEvidenceNoThreshold,
 		}
+		assertSettles(t, validate(t, run, record))
+	})
+}
+
+// TestValidateChainReconciliationEvidence_RelayEntryResult asserts a recovered
+// relay entry is bound to the beacon's own request before it closes a signing
+// permit.
+//
+// The journal pass proves the entry is a threshold signature by a group whose
+// key the snapshot holds, and every entry the beacon ever produced keeps that
+// property forever. What it cannot prove is that this permit's ceremony
+// produced it: the record's only tie to a request is a start block the node
+// wrote beside an entry it chose. A historical entry relabelled with a live
+// permit's block verifies exactly as well and was never in this journal for the
+// replay guard to catch.
+func TestValidateChainReconciliationEvidence_RelayEntryResult(t *testing.T) {
+	capturedAt := time.Now().UTC().Add(-time.Minute)
+
+	const requestStartBlock = uint64(9_400)
+	const groupSecret = int64(0x5eed)
+
+	reference := testRelayEntryReference(
+		requestStartBlock,
+		groupSecret,
+		"relay-entry-reconciliation",
+	)
+	_, _, previousEntry, entry, err := participation.
+		ParseBeaconRelayEntryReference(reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestID := testRelayRequestID(requestStartBlock)
+
+	permit := participation.PermitSnapshot{
+		Ceremony:            participation.BeaconRelaySigning,
+		Mode:                participation.ModeSecurityV2.String(),
+		CanonicalStartBlock: requestStartBlock,
+		WorkID:              participation.BeaconRelayWorkID(requestStartBlock),
+		PermitID:            "1",
+		IdentityBound:       true,
+	}
+
+	newRunAndRecord := func() (*auditRun, *chainReconciliationEvidence) {
+		auditManifest := &manifest{
+			GeneratedAt: time.Now().UTC(),
+			Snapshot: snapshotIdentity{
+				AggregateSHA256: strings.Repeat("c", 64),
+			},
+			QuiescenceSnapshot: &participation.QuiescenceSnapshot{
+				SchemaVersion: participation.QuiescenceSnapshotSchemaVersion,
+				CapturedAt:    capturedAt,
+				ActivePermits: []participation.PermitSnapshot{permit},
+			},
+			ParticipationTerminalOutcomes: &participation.TerminalOutcomeJournal{
+				SchemaVersion:      participation.TerminalOutcomeJournalSchemaVersion,
+				SnapshotCapturedAt: capturedAt,
+				Outcomes: []participation.TerminalOutcomeRecord{
+					{
+						RecordedAt: time.Now().UTC(),
+						Permit:     permit,
+						Outcome:    participation.TerminalOutcomeCompleted,
+						Evidence: participation.TerminalEvidence{
+							Kind:      participation.TerminalEvidenceProtocolResult,
+							Reference: reference,
+						},
+					},
+				},
+			},
+		}
+		run := &auditRun{
+			manifest: auditManifest,
+			expected: expectedIdentityInputs{
+				ethereumChainID:              "1",
+				walletRegistryAddress:        testWalletRegistryAddress,
+				randomBeaconAddress:          testRandomBeaconAddress,
+				finalizedEthereumBlockNumber: testFinalizedEthereumBlock,
+				finalizedEthereumBlockHash: testCanonicalEthereumBlockHash(
+					testFinalizedEthereumBlock,
+				),
+				chainEvidencePublicKey: testChainEvidencePublicKey(),
+				maxEvidenceAge:         time.Hour,
+			},
+		}
+		chainRecord := &chainReconciliationEvidence{
+			evidenceEnvelope: evidenceEnvelope{
+				SchemaVersion:           evidenceSchemaVersion,
+				EvidenceType:            "chain_reconciliation",
+				GeneratedAt:             auditManifest.GeneratedAt,
+				SnapshotAggregateSHA256: auditManifest.Snapshot.AggregateSHA256,
+			},
+			EthereumChainID: "1",
+		}
+		authenticateTestChainReconciliationEvidence(t, chainRecord)
+		return run, chainRecord
+	}
+
+	addRequest := func(
+		t *testing.T,
+		record *chainReconciliationEvidence,
+		id *big.Int,
+		blockNumber uint64,
+		requestPreviousEntry []byte,
+	) {
+		t.Helper()
+
+		addTestRelayEntryReceipt(
+			t,
+			record,
+			testRandomBeaconAddress,
+			"RelayEntryRequested",
+			id,
+			blockNumber,
+			uint64(1),
+			requestPreviousEntry,
+		)
+	}
+
+	addSubmission := func(
+		t *testing.T,
+		record *chainReconciliationEvidence,
+		acceptedEntry []byte,
+	) {
+		t.Helper()
+
+		addTestRelayEntryReceipt(
+			t,
+			record,
+			testRandomBeaconAddress,
+			"RelayEntrySubmitted",
+			requestID,
+			requestStartBlock+2,
+			common.HexToAddress(testRandomBeaconAddress),
+			acceptedEntry,
+		)
+	}
+
+	validate := func(
+		t *testing.T,
+		run *auditRun,
+		record *chainReconciliationEvidence,
+	) []string {
+		t.Helper()
+
+		content, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return run.validateChainReconciliationEvidence(content)
+	}
+
+	assertBlockedBy := func(t *testing.T, violations []string, reason string) {
+		t.Helper()
+
+		for _, violation := range violations {
+			if strings.Contains(violation, reason) {
+				return
+			}
+		}
+		t.Fatalf(
+			"expected a violation containing [%s], got: %v",
+			reason,
+			violations,
+		)
+	}
+
+	assertSettles := func(t *testing.T, violations []string) {
+		t.Helper()
+
+		for _, violation := range violations {
+			if strings.Contains(violation, "reports relay entry") {
+				t.Fatalf(
+					"expected a corroborated relay entry to reconcile, got: %s",
+					violation,
+				)
+			}
+		}
+	}
+
+	t.Run("entry answering the permit's own request", func(t *testing.T) {
+		run, record := newRunAndRecord()
+		addRequest(t, record, requestID, requestStartBlock, previousEntry)
+		assertSettles(t, validate(t, run, record))
+	})
+
+	// The entry verifies under its group and answers the block the permit
+	// names, and still nothing says the beacon ever made that request.
+	t.Run("entry answering no logged request", func(t *testing.T) {
+		run, record := newRunAndRecord()
+		assertBlockedBy(
+			t,
+			validate(t, run, record),
+			"no authenticated RandomBeacon RelayEntryRequested log makes a "+
+				"request over that previous entry",
+		)
+	})
+
+	// The relabelling case: a real entry from an earlier request carries that
+	// request's previous entry, which the request at this permit's block is not
+	// signing over.
+	t.Run("request at the block over another previous entry", func(t *testing.T) {
+		run, record := newRunAndRecord()
+		addRequest(
+			t,
+			record,
+			requestID,
+			requestStartBlock,
+			new(bn256.G1).ScalarBaseMult(big.NewInt(3)).Marshal(),
+		)
+		assertBlockedBy(
+			t,
+			validate(t, run, record),
+			"no authenticated RandomBeacon RelayEntryRequested log makes a "+
+				"request over that previous entry",
+		)
+	})
+
+	// The request the entry answers is real, but it was made in a block this
+	// permit was not issued for.
+	t.Run("request at another block", func(t *testing.T) {
+		run, record := newRunAndRecord()
+		addRequest(t, record, requestID, requestStartBlock+1, previousEntry)
+		assertBlockedBy(
+			t,
+			validate(t, run, record),
+			"no authenticated RandomBeacon RelayEntryRequested log makes a "+
+				"request over that previous entry",
+		)
+	})
+
+	t.Run("two requests sharing one identity", func(t *testing.T) {
+		run, record := newRunAndRecord()
+		addRequest(t, record, requestID, requestStartBlock, previousEntry)
+		addRequest(
+			t,
+			record,
+			new(big.Int).Add(requestID, big.NewInt(1)),
+			requestStartBlock,
+			previousEntry,
+		)
+		assertBlockedBy(
+			t,
+			validate(t, run, record),
+			"more than one request over that previous entry",
+		)
+	})
+
+	t.Run("submission accepting the entry the node named", func(t *testing.T) {
+		run, record := newRunAndRecord()
+		addRequest(t, record, requestID, requestStartBlock, previousEntry)
+		addSubmission(t, record, entry)
+		assertSettles(t, validate(t, run, record))
+	})
+
+	t.Run("submission accepting a different entry", func(t *testing.T) {
+		run, record := newRunAndRecord()
+		addRequest(t, record, requestID, requestStartBlock, previousEntry)
+		addSubmission(
+			t,
+			record,
+			new(bn256.G1).ScalarBaseMult(big.NewInt(5)).Marshal(),
+		)
+		assertBlockedBy(
+			t,
+			validate(t, run, record),
+			"accepted a different entry",
+		)
+	})
+
+	t.Run("two submissions accepting different entries", func(t *testing.T) {
+		run, record := newRunAndRecord()
+		addRequest(t, record, requestID, requestStartBlock, previousEntry)
+		addSubmission(t, record, entry)
+		addSubmission(
+			t,
+			record,
+			new(bn256.G1).ScalarBaseMult(big.NewInt(5)).Marshal(),
+		)
+		assertBlockedBy(
+			t,
+			validate(t, run, record),
+			"more than one entry accepted for request",
+		)
+	})
+
+	// A group's threshold recovers the entry whoever publishes it, so a
+	// recovery whose submission reverted, was dropped, or lost the race is
+	// still that ceremony's durable result. Requiring a submission would refuse
+	// a completed ceremony for a transaction outcome that says nothing about
+	// it.
+	t.Run("recovered entry no submission answers", func(t *testing.T) {
+		run, record := newRunAndRecord()
+		addRequest(t, record, requestID, requestStartBlock, previousEntry)
+		addTestRelayEntryReceipt(
+			t,
+			record,
+			testRandomBeaconAddress,
+			"RelayEntryTimedOut",
+			requestID,
+			requestStartBlock+2,
+			uint64(1),
+		)
 		assertSettles(t, validate(t, run, record))
 	})
 }

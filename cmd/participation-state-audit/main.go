@@ -2407,6 +2407,10 @@ func (r *auditRun) validateChainReconciliationEvidence(
 		violations,
 		r.reconcileRelayTimeoutSettlements(record)...,
 	)
+	violations = append(
+		violations,
+		r.reconcileRelayEntryResults(record)...,
+	)
 
 	return violations
 }
@@ -2878,10 +2882,11 @@ func authenticatedInactivityClaims(
 // selected group answered, and which ones an accepted timeout report
 // terminated.
 //
-// The three are indexed together because no one of them settles a penalty on
-// its own. A timeout log proves a request was terminated but not which request
-// a permit was issued for; a request log supplies that binding; a submission
-// log contradicts the penalty outright.
+// The three are indexed together because no one of them settles a permit's
+// result on its own. A timeout log proves a request was terminated but not
+// which request a permit was issued for; a request log supplies that binding;
+// a submission log contradicts a penalty outright and says which entry the
+// beacon accepted for the request a signing permit answered.
 type relayEntryLifecycleLogs struct {
 	// requestBlocks maps a beacon request identifier to the block its
 	// RelayEntryRequested log was mined in.
@@ -2890,12 +2895,49 @@ type relayEntryLifecycleLogs struct {
 	// more than one block. Nothing in the logs says which block a caller meant,
 	// so such a request binds no permit rather than binding it to either.
 	ambiguousRequests map[string]struct{}
+	// requestIdentities maps the request identity a relay signing permit names
+	// itself by — the block the request was made in and the previous entry it
+	// signs over — to the beacon's request identifier. A relay entry reference
+	// carries no request identifier, so this is the only join from a recovered
+	// entry to the canonical request it answers.
+	requestIdentities map[string]string
+	// ambiguousIdentities names every block-and-previous-entry identity the
+	// receipts place more than one request under.
+	ambiguousIdentities map[string]struct{}
+	// submittedEntries maps a request identifier to the entry a
+	// RelayEntrySubmitted log records the beacon accepting for it, normalized
+	// to the canonical point encoding. A request whose receipts carry more than
+	// one differing accepted entry is absent and named ambiguous instead.
+	submittedEntries map[string][]byte
+	// ambiguousSubmissions names every request identifier the receipts record
+	// more than one differing accepted entry for.
+	ambiguousSubmissions map[string]struct{}
 	// submittedRequests names every request identifier a RelayEntrySubmitted
-	// log answers.
+	// log answers, including one whose entry could not be decoded.
 	submittedRequests map[string]struct{}
 	// timeouts maps the canonical settlement identity — request identifier and
 	// terminated group — to the block its RelayEntryTimedOut log was mined in.
 	timeouts map[string]uint64
+}
+
+// relayEntryIdentity renders the request identity a relay signing permit names
+// itself by: the block the request was made in and the previous entry it signs
+// over.
+func relayEntryIdentity(blockNumber uint64, previousEntry []byte) string {
+	return strconv.FormatUint(blockNumber, 10) + ":" +
+		hex.EncodeToString(previousEntry)
+}
+
+// canonicalRelayPoint normalizes marshaled beacon curve-point bytes to the
+// encoding the node's own terminal records are rendered in, so a log carrying a
+// non-canonical rendering of the same point still compares equal. Bytes that
+// are not a point at all name nothing and are refused.
+func canonicalRelayPoint(value []byte) ([]byte, bool) {
+	point := new(bn256.G1)
+	if _, err := point.Unmarshal(value); err != nil {
+		return nil, false
+	}
+	return point.Marshal(), true
 }
 
 // authenticatedRelayEntryLogs indexes every RelayEntryRequested,
@@ -2931,10 +2973,14 @@ func authenticatedRelayEntryLogs(
 	}
 
 	logs := &relayEntryLifecycleLogs{
-		requestBlocks:     make(map[string]uint64),
-		ambiguousRequests: make(map[string]struct{}),
-		submittedRequests: make(map[string]struct{}),
-		timeouts:          make(map[string]uint64),
+		requestBlocks:        make(map[string]uint64),
+		ambiguousRequests:    make(map[string]struct{}),
+		requestIdentities:    make(map[string]string),
+		ambiguousIdentities:  make(map[string]struct{}),
+		submittedEntries:     make(map[string][]byte),
+		ambiguousSubmissions: make(map[string]struct{}),
+		submittedRequests:    make(map[string]struct{}),
+		timeouts:             make(map[string]uint64),
 	}
 
 	// The enclosing receipt validation already requires every log address and
@@ -2969,8 +3015,74 @@ func authenticatedRelayEntryLogs(
 					continue
 				}
 				logs.requestBlocks[requestID] = receipt.BlockNumber
+
+				// The previous entry is the request's second non-indexed
+				// value; the first is the group the beacon selected, which
+				// names a registry index rather than the key a permit's
+				// record carries and so joins nothing here.
+				event := events["RelayEntryRequested"]
+				data, err := decodeCanonicalEthereumDynamicBytes(rawLog.Data)
+				if err != nil {
+					continue
+				}
+				values, err := event.Inputs.NonIndexed().Unpack(data)
+				if err != nil || len(values) < 2 {
+					continue
+				}
+				previousEntry, ok := values[1].([]byte)
+				if !ok {
+					continue
+				}
+				canonicalPreviousEntry, ok := canonicalRelayPoint(previousEntry)
+				if !ok {
+					continue
+				}
+
+				identity := relayEntryIdentity(
+					receipt.BlockNumber,
+					canonicalPreviousEntry,
+				)
+				if known, seen := logs.requestIdentities[identity]; seen &&
+					known != requestID {
+					logs.ambiguousIdentities[identity] = struct{}{}
+					continue
+				}
+				logs.requestIdentities[identity] = requestID
 			case events["RelayEntrySubmitted"].ID.Hex():
 				logs.submittedRequests[requestID] = struct{}{}
+
+				// The accepted entry is the submission's second non-indexed
+				// value; the first is the submitter, which says who published
+				// the entry rather than what the beacon accepted.
+				event := events["RelayEntrySubmitted"]
+				data, err := decodeCanonicalEthereumDynamicBytes(rawLog.Data)
+				if err != nil {
+					continue
+				}
+				values, err := event.Inputs.NonIndexed().Unpack(data)
+				if err != nil || len(values) < 2 {
+					continue
+				}
+				entry, ok := values[1].([]byte)
+				if !ok {
+					continue
+				}
+				canonicalEntry, ok := canonicalRelayPoint(entry)
+				if !ok {
+					continue
+				}
+
+				if known, seen := logs.submittedEntries[requestID]; seen &&
+					!bytes.Equal(known, canonicalEntry) {
+					logs.ambiguousSubmissions[requestID] = struct{}{}
+					delete(logs.submittedEntries, requestID)
+					continue
+				}
+				if _, ambiguous :=
+					logs.ambiguousSubmissions[requestID]; ambiguous {
+					continue
+				}
+				logs.submittedEntries[requestID] = canonicalEntry
 			case events["RelayEntryTimedOut"].ID.Hex():
 				event := events["RelayEntryTimedOut"]
 				data, err := decodeCanonicalEthereumDynamicBytes(rawLog.Data)
@@ -3120,6 +3232,124 @@ func (r *auditRun) reconcileRelayTimeoutSettlements(
 					"settlement [%s], but an authenticated RandomBeacon "+
 					"RelayEntrySubmitted log answers request [%s]; a delivered "+
 					"entry and a timeout cannot both settle one request",
+				i,
+				outcome.Evidence.Reference,
+				requestID,
+			))
+		}
+	}
+
+	return violations
+}
+
+// reconcileRelayEntryResults binds every relay entry a node recorded as its
+// signing permit's result to the beacon's own request, and refuses one the
+// beacon contradicts.
+//
+// The offline journal pass verifies the entry itself: a threshold BLS signature
+// by a group whose key material the snapshot decoded, over the previous entry
+// the record names. That proves authorship, and every entry the beacon ever
+// produced keeps it forever. What it cannot prove is that the ceremony this
+// permit was issued for is the one that produced it. The record's binding to a
+// request is a start block the node wrote next to an entry it chose, so a
+// historical entry relabelled with a live permit's block satisfies the pairing
+// check and the journal-wide replay guard alike — the entry it replays was
+// never in this journal to begin with.
+//
+// A canonical RelayEntryRequested log closes that. The beacon identifies a
+// request by the block it was made in and the previous entry it signs over,
+// which is exactly the pair a relay entry record names, so the log the beacon
+// emitted for this permit's block has to be the one signing over this record's
+// previous entry. An entry recovered for another request signs over that
+// request's previous entry and matches no request at this block.
+//
+// Where the beacon accepted an entry for that request, it must be the entry the
+// node named. A submission is not required, though: a group's threshold
+// recovers the entry regardless of which member publishes it, and a recovery
+// whose on-chain submission then reverted, was dropped, or lost the race is
+// still that ceremony's durable result. Requiring one would refuse a completed
+// ceremony for a transaction outcome that says nothing about it.
+func (r *auditRun) reconcileRelayEntryResults(
+	record *chainReconciliationEvidence,
+) []string {
+	if r.manifest.ParticipationTerminalOutcomes == nil {
+		return nil
+	}
+
+	var violations []string
+	var logs *relayEntryLifecycleLogs
+	for i, outcome := range r.manifest.ParticipationTerminalOutcomes.Outcomes {
+		if outcome.Permit.Ceremony != participation.BeaconRelaySigning ||
+			outcome.Outcome != participation.TerminalOutcomeCompleted {
+			continue
+		}
+
+		referenceStartBlock, _, previousEntry, entry, err :=
+			participation.ParseBeaconRelayEntryReference(
+				outcome.Evidence.Reference,
+			)
+		if err != nil {
+			// The journal pass reports the unparseable reference itself; this
+			// pass has nothing left to join it to.
+			continue
+		}
+
+		if logs == nil {
+			logs, err = authenticatedRelayEntryLogs(record)
+			if err != nil {
+				violations = append(violations, fmt.Sprintf(
+					"cannot decode the authenticated beacon relay entry logs: "+
+						"[%v]",
+					err,
+				))
+				break
+			}
+		}
+
+		identity := relayEntryIdentity(referenceStartBlock, previousEntry)
+		if _, ambiguous := logs.ambiguousIdentities[identity]; ambiguous {
+			violations = append(violations, fmt.Sprintf(
+				"node-authored outcome [%d] reports relay entry [%s], but the "+
+					"authenticated logs make more than one request over that "+
+					"previous entry at block [%d], so the answered request "+
+					"cannot be bound to the permit",
+				i,
+				outcome.Evidence.Reference,
+				referenceStartBlock,
+			))
+			continue
+		}
+		requestID, requested := logs.requestIdentities[identity]
+		if !requested {
+			violations = append(violations, fmt.Sprintf(
+				"node-authored outcome [%d] reports relay entry [%s], but no "+
+					"authenticated RandomBeacon RelayEntryRequested log makes a "+
+					"request over that previous entry at block [%d], so the "+
+					"entry answers no request the permit was issued for",
+				i,
+				outcome.Evidence.Reference,
+				referenceStartBlock,
+			))
+			continue
+		}
+
+		if _, ambiguous := logs.ambiguousSubmissions[requestID]; ambiguous {
+			violations = append(violations, fmt.Sprintf(
+				"node-authored outcome [%d] reports relay entry [%s], but the "+
+					"authenticated logs record more than one entry accepted "+
+					"for request [%s]",
+				i,
+				outcome.Evidence.Reference,
+				requestID,
+			))
+			continue
+		}
+		if accepted, submitted := logs.submittedEntries[requestID]; submitted &&
+			!bytes.Equal(accepted, entry) {
+			violations = append(violations, fmt.Sprintf(
+				"node-authored outcome [%d] reports relay entry [%s], but the "+
+					"authenticated RandomBeacon RelayEntrySubmitted log for "+
+					"request [%s] accepted a different entry",
 				i,
 				outcome.Evidence.Reference,
 				requestID,

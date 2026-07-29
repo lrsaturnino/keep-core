@@ -110,6 +110,19 @@ transaction that reverts, is dropped, or loses the race to another reporter
 leaves the beacon exactly as it was and renders exactly the same node-authored
 reference — so a settlement the beacon's own logs do not carry blocks rollback.
 
+A completed relay signing outcome is bound the same way. Its recovered entry is
+a threshold BLS signature the audit verifies outright, but authorship is
+forever: nothing in the record ties the entry to the ceremony the permit was
+issued for except a start block the node wrote beside it. So the supplied
+RandomBeacon must carry a `RelayEntryRequested` log in that block signing over
+the very previous entry the record names, and where a `RelayEntrySubmitted` log
+accepted an entry for that request it must be the entry the node named. A
+submission is not required — the group's threshold recovers the entry whoever
+publishes it, and a submission that reverted or lost the race says nothing about
+the ceremony — but a missing or contradicted request does block. The generator
+must therefore include the beacon's relay request, submission, and timeout
+receipts for every relay permit the drained node recorded a result for.
+
 The rollback rehearsal runs that audit **twice over the same snapshot**, and
 the order is the whole point. Every external record must carry the audited
 snapshot's `snapshot_aggregate_sha256`, and the audit rejects any that names
