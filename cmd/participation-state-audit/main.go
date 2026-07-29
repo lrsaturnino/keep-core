@@ -59,6 +59,7 @@ import (
 
 	"github.com/keep-network/keep-core/config"
 	"github.com/keep-network/keep-core/pkg/beacon/registry"
+	"github.com/keep-network/keep-core/pkg/bitcoin"
 	ecdsaabi "github.com/keep-network/keep-core/pkg/chain/ethereum/ecdsa/gen/abi"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/protocol/participation"
@@ -3140,12 +3141,28 @@ func (r *auditRun) validateBitcoinReconciliationEvidence(
 			"the pending transaction set is not attested complete",
 		)
 	}
+	reconciled := make(map[string]string, len(record.PendingTransactions))
 	for i, transaction := range record.PendingTransactions {
 		if transaction.TransactionHash == "" {
 			violations = append(violations, fmt.Sprintf(
 				"pending transaction entry [%d] is missing its hash",
 				i,
 			))
+		} else if !isCanonicalBitcoinTransactionHash(
+			transaction.TransactionHash,
+		) {
+			// A hash in any other rendering cannot be matched against the
+			// node's own record, so an entry could satisfy the coverage check
+			// below by naming the same transaction in a shape that never
+			// compares equal.
+			violations = append(violations, fmt.Sprintf(
+				"pending transaction entry [%d] hash [%s] is not a canonical "+
+					"lowercase transaction hash",
+				i,
+				transaction.TransactionHash,
+			))
+		} else {
+			reconciled[transaction.TransactionHash] = transaction.State
 		}
 		if _, ok := validBitcoinTransactionStates[transaction.State]; !ok {
 			violations = append(violations, fmt.Sprintf(
@@ -3156,7 +3173,83 @@ func (r *auditRun) validateBitcoinReconciliationEvidence(
 		}
 	}
 
+	violations = append(
+		violations,
+		r.reconcileSignedTransactionCoverage(reconciled)...,
+	)
+
 	return violations
+}
+
+// reconcileSignedTransactionCoverage joins every wallet action the node
+// recorded as completed to the reconciled pending-transaction set. The node
+// authors that record itself: it pins the transaction hash the moment the
+// threshold signature is applied, before any broadcast, precisely because a
+// permit canceled mid-broadcast may still have put the transaction on the
+// network. So a signed transaction the reconciliation never enumerated is the
+// ambiguous case the barrier exists to catch — the set attests it is complete,
+// and it is missing a transaction the node knows it signed. Without this join
+// the node's own token clears the journal and nothing checks it against
+// Bitcoin.
+func (r *auditRun) reconcileSignedTransactionCoverage(
+	reconciled map[string]string,
+) []string {
+	if r.manifest.ParticipationTerminalOutcomes == nil {
+		return nil
+	}
+
+	var violations []string
+	for i, outcome := range r.manifest.ParticipationTerminalOutcomes.Outcomes {
+		if outcome.Outcome != participation.TerminalOutcomeCompleted ||
+			outcome.Permit.Ceremony != participation.TBTCSigning {
+			continue
+		}
+		if outcome.Evidence.Kind !=
+			participation.TerminalEvidenceBitcoinTransaction {
+			// The evidence-kind rule already blocks this; skipping here keeps
+			// one defect from being reported twice.
+			continue
+		}
+		if !isCanonicalBitcoinTransactionHash(outcome.Evidence.Reference) {
+			violations = append(violations, fmt.Sprintf(
+				"node-authored completed wallet action [%d] names transaction "+
+					"[%s], which is not a canonical transaction hash the "+
+					"Bitcoin reconciliation could enumerate",
+				i,
+				outcome.Evidence.Reference,
+			))
+			continue
+		}
+		if _, covered := reconciled[outcome.Evidence.Reference]; !covered {
+			violations = append(violations, fmt.Sprintf(
+				"node-authored completed wallet action [%d] signed transaction "+
+					"[%s], which the attested-complete pending transaction set "+
+					"does not enumerate",
+				i,
+				outcome.Evidence.Reference,
+			))
+		}
+	}
+
+	return violations
+}
+
+// isCanonicalBitcoinTransactionHash reports whether value is the unprefixed
+// lowercase hex rendering a Bitcoin transaction hash serializes to. Any other
+// shape — mixed case, a 0x prefix, a truncated digest — is an alias that would
+// silently fail every set comparison it takes part in.
+func isCanonicalBitcoinTransactionHash(value string) bool {
+	if len(value) != 2*bitcoin.HashByteLength {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		character := value[i]
+		if (character < '0' || character > '9') &&
+			(character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // quarantineIdentity identifies one quarantined local permit. Several DKG

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -296,7 +297,7 @@ func testTerminalOutcomeRecord(
 		case participation.TBTCSigning:
 			evidence = participation.TerminalEvidence{
 				Kind:      participation.TerminalEvidenceBitcoinTransaction,
-				Reference: resultReference,
+				Reference: testBitcoinTransactionHash(resultReference),
 			}
 		case participation.TBTCInactivityClaim:
 			evidence = participation.TerminalEvidence{
@@ -328,6 +329,14 @@ func testTerminalOutcomeRecord(
 		Outcome:    participation.TerminalOutcome(permit.Outcome),
 		Evidence:   evidence,
 	}
+}
+
+// testBitcoinTransactionHash derives a canonical, unprefixed lowercase
+// transaction hash from a fixture label, so a wallet action's evidence has the
+// shape the Bitcoin reconciliation set can actually enumerate.
+func testBitcoinTransactionHash(label string) string {
+	digest := sha256.Sum256([]byte(label))
+	return hex.EncodeToString(digest[:])
 }
 
 func persistRealGateQuiescenceSnapshot(
@@ -871,6 +880,28 @@ func newValidEvidence(t *testing.T, auditManifest *manifest) evidenceInputs {
 		evidenceEnvelope: envelope("bitcoin_reconciliation"),
 		BitcoinNetwork:   "mainnet",
 		Complete:         true,
+	}
+	// A complete reconciliation enumerates every transaction the audited
+	// wallets signed, including the ones the node recorded as its own wallet
+	// actions' durable results.
+	if auditManifest.ParticipationTerminalOutcomes != nil {
+		for _, outcome := range auditManifest.ParticipationTerminalOutcomes.Outcomes {
+			if outcome.Outcome != participation.TerminalOutcomeCompleted ||
+				outcome.Evidence.Kind !=
+					participation.TerminalEvidenceBitcoinTransaction {
+				continue
+			}
+			bitcoinRecord.PendingTransactions = append(
+				bitcoinRecord.PendingTransactions,
+				struct {
+					TransactionHash string `json:"transaction_hash"`
+					State           string `json:"state"`
+				}{
+					TransactionHash: outcome.Evidence.Reference,
+					State:           "mined",
+				},
+			)
+		}
 	}
 
 	quiescenceEnvelope := envelope("quiescence_report")
@@ -2777,6 +2808,160 @@ func TestValidateNodeTerminalOutcomes_CompletedEvidenceKindIsPinnedPerCeremony(
 				violation,
 			)
 		}
+	}
+}
+
+// TestRunAudit_SignedTransactionMustBeEnumeratedByBitcoinReconciliation proves
+// a wallet action the node recorded as completed cannot clear the barrier
+// unless the attested-complete pending set names the exact transaction it
+// signed. The node pins that hash before broadcasting, so a transaction missing
+// from a complete reconciliation is precisely the ambiguous submission the
+// rollback barrier exists to catch.
+func TestRunAudit_SignedTransactionMustBeEnumeratedByBitcoinReconciliation(
+	t *testing.T,
+) {
+	permits := []quiescencePermitEvidence{
+		{
+			Ceremony:            string(participation.TBTCSigning),
+			Mode:                participation.ModeLegacy.String(),
+			CanonicalStartBlock: 999,
+			WorkID:              "wallet-action-legacy",
+			PermitID:            "wallet-action-legacy",
+			Outcome:             "completed",
+		},
+	}
+
+	tests := map[string]struct {
+		mutate          func(*bitcoinReconciliationEvidence)
+		expectedBlocker string
+	}{
+		"the signed transaction is dropped from a complete set": {
+			mutate: func(record *bitcoinReconciliationEvidence) {
+				record.PendingTransactions = nil
+			},
+			expectedBlocker: "does not enumerate",
+		},
+		"an unrelated transaction stands in for the signed one": {
+			mutate: func(record *bitcoinReconciliationEvidence) {
+				record.PendingTransactions[0].TransactionHash =
+					strings.Repeat("ab", 32)
+			},
+			expectedBlocker: "does not enumerate",
+		},
+		"the signed transaction is named in a noncanonical shape": {
+			mutate: func(record *bitcoinReconciliationEvidence) {
+				record.PendingTransactions[0].TransactionHash =
+					strings.ToUpper(
+						record.PendingTransactions[0].TransactionHash,
+					)
+			},
+			expectedBlocker: "is not a canonical lowercase transaction hash",
+		},
+	}
+
+	for testName, test := range tests {
+		t.Run(testName, func(t *testing.T) {
+			storageDir := newTestStorageWithQuiescencePermits(t, permits)
+
+			firstPass, err := runAudit(
+				storageDir,
+				testPassword,
+				evidenceInputs{},
+				testExpectedIdentity(),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			evidence := newValidEvidence(t, firstPass)
+			updateQuiescenceReport(
+				t,
+				evidence,
+				func(record *quiescenceReportEvidence) {
+					setQuiescencePermits(record, permits)
+				},
+			)
+
+			// The unmutated evidence must authorize the barrier, otherwise the
+			// mutation below proves nothing about this check.
+			baseline, err := runAudit(
+				storageDir,
+				testPassword,
+				evidence,
+				testExpectedIdentity(),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !baseline.RollbackBarrierReady {
+				t.Fatalf(
+					"the unmutated evidence does not authorize the barrier, "+
+						"blockers: %v",
+					baseline.RollbackBlockers,
+				)
+			}
+
+			updateBitcoinReconciliation(t, evidence, test.mutate)
+
+			auditManifest, err := runAudit(
+				storageDir,
+				testPassword,
+				evidence,
+				testExpectedIdentity(),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if auditManifest.RollbackBarrierReady {
+				t.Fatalf(
+					"a signed transaction the complete reconciliation does not " +
+						"cover authorized the barrier",
+				)
+			}
+			for _, blocker := range auditManifest.RollbackBlockers {
+				if strings.Contains(blocker, test.expectedBlocker) {
+					return
+				}
+			}
+			t.Errorf(
+				"expected a blocker containing [%s], blockers: %v",
+				test.expectedBlocker,
+				auditManifest.RollbackBlockers,
+			)
+		})
+	}
+}
+
+// updateBitcoinReconciliation rewrites the supplied Bitcoin reconciliation
+// evidence in place.
+func updateBitcoinReconciliation(
+	t *testing.T,
+	evidence evidenceInputs,
+	mutate func(*bitcoinReconciliationEvidence),
+) {
+	t.Helper()
+
+	record := &bitcoinReconciliationEvidence{}
+	content, err := os.ReadFile(evidence.bitcoinReconciliation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(content, record); err != nil {
+		t.Fatal(err)
+	}
+
+	mutate(record)
+
+	content, err = json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		evidence.bitcoinReconciliation,
+		content,
+		0o600,
+	); err != nil {
+		t.Fatal(err)
 	}
 }
 
