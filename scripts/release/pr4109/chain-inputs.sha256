@@ -1,24 +1,40 @@
-# Reviewed SHA-256 digests of the two programs this rehearsal executes but does
-# not contain: the work driver that originates ceremonies on the rehearsal
-# chain, and the generator that produces each node's external rollback
-# evidence. Both arrive from a mutable secret bundle at dispatch time, and both
-# produce readings that become release evidence — the driver's account of what
-# it originated and what became of it is the entire terminal half of the drain,
-# quiescence, straggler, and homogeneous controls.
+# Reviewed SHA-256 digests of the external inputs this rehearsal depends on but
+# does not contain.
 #
-# An executable bit is not provenance. Without a reviewed digest here, a stale,
-# replaced, or simply wrong program manufactures an internally consistent
-# passing account while every check in this repository stays green, which is
-# the one failure a dispatch cannot diagnose from the log it archives.
+# Two of them are programs it executes: the work driver that originates
+# ceremonies on the rehearsal chain, and the generator that produces each
+# node's external rollback evidence. Both arrive from a mutable secret bundle
+# at dispatch time, and both produce readings that become release evidence —
+# the driver's account of what it originated and what became of it is the
+# entire terminal half of the drain, quiescence, straggler, and homogeneous
+# controls.
 #
-# Format: "<64 hex digits>  <program>", one per line, over exactly the two
+# The third is not executed at all: the archived independent cryptographic
+# review of the dual-mode dependency revision `go.mod` resolves. It gates
+# acceptance of a single-release record rather than execution of any step,
+# because whether that review exists changes nothing about what a rehearsal
+# can run or observe — only whether the mixed prior/R1 legacy transcripts it
+# exercised are release-authoritative. A supplied record must additionally
+# name the exact revision `go.mod` resolves, so a review of some other
+# revision cannot stand in for one of the code under test.
+#
+# An executable bit is not provenance, and neither is a document asserting its
+# own approval. Without a reviewed digest here, a stale, replaced, or simply
+# wrong input manufactures an internally consistent passing account while every
+# check in this repository stays green, which is the one failure a dispatch
+# cannot diagnose from the log it archives.
+#
+# Format: "<64 hex digits>  <input>", one per line, over exactly the three
 # names below. Comments and blank lines are ignored.
 #
-# STATUS: no driver or generator has been written and reviewed. The digests
-# below are the all-zero placeholder, which matches no file, so every rehearsal
-# that supplies one of these programs blocks until the reviewed digest is
-# recorded here in a reviewed commit. That is deliberate: this file is the
-# release control, and an unpinned control that admits anything is worse than
-# an absent one because it reads as having been exercised.
+# STATUS: no driver or generator has been written and reviewed, and no
+# independent cryptographic review of the pinned dependency revision has been
+# archived. The digests below are the all-zero placeholder, which matches no
+# file, so every rehearsal that supplies one of these inputs blocks until the
+# reviewed digest is recorded here in a reviewed commit. That is deliberate:
+# this file is the release control, and an unpinned control that admits
+# anything is worse than an absent one because it reads as having been
+# exercised.
 0000000000000000000000000000000000000000000000000000000000000000  work-driver
 0000000000000000000000000000000000000000000000000000000000000000  rollback-evidence-generator
+0000000000000000000000000000000000000000000000000000000000000000  tsslib-review

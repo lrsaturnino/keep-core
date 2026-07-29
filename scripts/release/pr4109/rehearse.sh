@@ -86,6 +86,15 @@
 #                        begin and a positive control is about one finishing.
 #                        A report that cannot be read stops the step rather
 #                        than passing for nothing having happened
+#   PR4109_TSSLIB_REVIEW archived independent cryptographic review of the
+#                        dual-mode dependency revision go.mod resolves. It is
+#                        never executed and gates no step: a rehearsal runs
+#                        every mixed prior/R1 stage without it and records
+#                        what it observed. What it decides is acceptance —
+#                        whether those transcripts are release-authoritative.
+#                        Its bytes must hash to the reviewed tsslib-review
+#                        digest and the document must name the exact revision
+#                        go.mod resolves
 #
 # Fail-closed source binding (every proof stage):
 #
@@ -300,6 +309,11 @@ environment (preflight, single-release, rollback):
                       transaction_hashes array. The fleet only reacts to
                       chain events, so the steps that need a ceremony record
                       themselves blocked without one
+  PR4109_TSSLIB_REVIEW
+                      archived independent cryptographic review of the
+                      dual-mode dependency revision go.mod resolves. Gates
+                      acceptance of the emitted record, not execution of any
+                      step
 
 environment (rollback, additionally):
   STORAGE_SNAPSHOT_DIR
@@ -2480,6 +2494,75 @@ reviewed_input_digest() {
 WORK_DRIVER_DIGEST=""
 ROLLBACK_GENERATOR_DIGEST=""
 
+# The digest of the archived independent cryptographic review of the pinned
+# dual-mode dependency, when one was supplied. Unlike the two above this is not
+# an instrument the rehearsal runs: it is a release input the recorded evidence
+# is accepted against, so it may be absent from an execution that still runs
+# every step.
+TSSLIB_REVIEW_DIGEST=""
+
+# The immutable dependency revision the build actually resolves.
+#
+# Read out of go.mod rather than restated, so a review record can only ever be
+# bound to the revision this tree compiles against. Restating the commit here
+# would let the pin move under a review record that still names the old one,
+# which is the exact substitution the binding exists to prevent.
+pinned_tsslib_commit() {
+  local line commit=""
+  while read -r line; do
+    case "${line}" in
+    *"github.com/bnb-chain/tss-lib =>"*)
+      # The pseudo-version's trailing revision, e.g.
+      # v0.0.0-20260729021955-d847ce003019 -> d847ce003019.
+      commit="${line##*-}"
+      break
+      ;;
+    esac
+  done <"${REPO_ROOT}/go.mod"
+  printf '%s' "${commit}"
+}
+
+# Bind one supplied review record to its reviewed digest and to the exact
+# dependency revision it reviews, or refuse to accept it.
+#
+# A review record is an external document, and a document asserting that some
+# revision was reviewed says nothing about the revision this tree builds. Two
+# separate bindings are therefore required: the bytes must hash to a digest
+# reviewed in a commit of this repository, and the document must name the
+# commit go.mod resolves. Either alone admits a review of other code.
+require_reviewed_record() {
+  local variable="$1" program="$2" path="$3" control="${4:-}"
+  local reviewed actual commit
+  [[ -n "${path}" ]] || {
+    printf ''
+    return 0
+  }
+  [[ -f "${path}" && -r "${path}" ]] ||
+    blocked "${variable} points at ${path}, which is not a readable file; a \
+review record that cannot be read cannot be bound to anything"
+  reviewed="$(reviewed_input_digest "${program}" "${control}")"
+  [[ -n "${reviewed}" ]] ||
+    blocked "no reviewed SHA-256 for ${program} is recorded in \
+${SCAFFOLD_DIR}/chain-inputs.sha256, so the record supplied through \
+${variable} is unbound; an unreviewed document asserting that the dependency \
+was reviewed is the assertion this gate exists to check, not evidence for it"
+  actual="$(hash_stdin <"${path}")"
+  [[ "${actual}" == "${reviewed}" ]] ||
+    blocked "the record supplied through ${variable} hashes to ${actual}, and \
+${SCAFFOLD_DIR}/chain-inputs.sha256 pins ${program} at ${reviewed}; a \
+rehearsal cannot accept a review record other than the reviewed one"
+  commit="$(pinned_tsslib_commit)"
+  [[ -n "${commit}" ]] ||
+    blocked "go.mod resolves no github.com/bnb-chain/tss-lib replacement, so \
+there is no dependency revision for the record supplied through ${variable} \
+to be bound to"
+  grep -qF "${commit}" "${path}" ||
+    blocked "the record supplied through ${variable} does not name the \
+dependency revision [${commit}] that go.mod resolves; a review of another \
+revision is not a review of the code this rehearsal runs"
+  printf '%s' "${actual}"
+}
+
 # Bind one supplied program to its reviewed digest, or refuse to run it.
 #
 # Both of these arrive from a mutable secret bundle, and both produce readings
@@ -4140,7 +4223,9 @@ that never captured it has nothing to bind"
   export PR4109_MANIFEST_SHA256
   PR4109_WORK_DRIVER_SHA256="${WORK_DRIVER_DIGEST}"
   PR4109_ROLLBACK_GENERATOR_SHA256="${ROLLBACK_GENERATOR_DIGEST}"
-  export PR4109_WORK_DRIVER_SHA256 PR4109_ROLLBACK_GENERATOR_SHA256
+  PR4109_TSSLIB_REVIEW_SHA256="${TSSLIB_REVIEW_DIGEST}"
+  export PR4109_WORK_DRIVER_SHA256 PR4109_ROLLBACK_GENERATOR_SHA256 \
+    PR4109_TSSLIB_REVIEW_SHA256
 
   node -e '
     const fs = require("fs");
@@ -4176,10 +4261,16 @@ that never captured it has nothing to bind"
       // has already refused any that did not hash to the reviewed digest, so
       // what is recorded here is a name for the instrument the readings below
       // were produced with rather than a claim the record makes about it.
+      // The review record is named here for the same reason and with the same
+      // meaning, except that preflight refused nothing by its absence: an
+      // execution without it is a complete rehearsal whose record simply
+      // cannot be accepted.
       chain_inputs: {
         work_driver_sha256: process.env.PR4109_WORK_DRIVER_SHA256 || undefined,
         rollback_evidence_generator_sha256:
           process.env.PR4109_ROLLBACK_GENERATOR_SHA256 || undefined,
+        tsslib_review_sha256:
+          process.env.PR4109_TSSLIB_REVIEW_SHA256 || undefined,
       },
       stages: JSON.parse("[" + stepsJSON + "]"),
       assertions: JSON.parse("[" + assertionsJSON + "]"),
@@ -4192,7 +4283,7 @@ that never captured it has nothing to bind"
     fail "cannot build the rehearsal evidence record"
   EMITTED_EVIDENCE_RECORD="${record}"
   unset PR4109_MANIFEST_SHA256 PR4109_WORK_DRIVER_SHA256 \
-    PR4109_ROLLBACK_GENERATOR_SHA256
+    PR4109_ROLLBACK_GENERATOR_SHA256 PR4109_TSSLIB_REVIEW_SHA256
 
   note "rehearsal evidence record written to ${record}"
   note "validating it with the acceptance stage's own validator"
@@ -4299,6 +4390,14 @@ path, and storage directory"
     PR4109_ROLLBACK_EVIDENCE_GENERATOR rollback-evidence-generator \
     "${PR4109_ROLLBACK_EVIDENCE_GENERATOR:-}")"
 
+  # Bound here rather than gating any step. Whether the dependency's
+  # cryptographic review exists changes nothing about what a rehearsal can
+  # execute or observe — the immutable images and the driver decide that — so
+  # a missing review leaves every step runnable and is settled once, against
+  # the emitted record, by the acceptance contract.
+  TSSLIB_REVIEW_DIGEST="$(require_reviewed_record PR4109_TSSLIB_REVIEW \
+    tsslib-review "${PR4109_TSSLIB_REVIEW:-}")"
+
   note "pulling both immutable digests to verify availability"
   docker pull "${PRIOR_IMAGE_DIGEST}"
   docker pull "${R1_IMAGE_DIGEST}"
@@ -4331,16 +4430,6 @@ chain say nothing about the work this fleet did"
   fi
   note "chain endpoint confirmed on chain id ${reported}"
 }
-
-# Mixed prior/R1 legacy work is release evidence only after the pinned
-# dual-mode dependency has an archived independent cryptographic review. The
-# implementation and immutable commit exist, but a local build cannot create
-# that external review record. Every blocked legacy-image step names the same
-# missing release input instead of misreporting the implementation as absent.
-LEGACY_INTEROP_UNAVAILABLE="the pinned tss-lib revision implements immutable \
-legacy/security-v2 transcript modes, but no independent cryptographic review \
-record for that revision was supplied; mixed prior/R1 legacy evidence is not \
-release-authoritative until that review is archived"
 
 # Prove the named services are running the image the rehearsal was told to
 # run.
@@ -5955,29 +6044,43 @@ QUIESCE_TERMINAL=""
 QUIESCE_TERMINAL_ASKED=0
 QUIESCE_TERMINAL_RC=0
 
+# record_assertion, for the quiescence steps the gate contract records one
+# for. The contract names a single graceful-quiescence assertion and binds it
+# to the security-v2 step, so the legacy step decides the same ladder and
+# reports no assertion of its own; writing one anyway would put a second entry
+# under a name the contract expects exactly once.
+quiescence_assertion() {
+  [[ -n "$1" ]] || return 0
+  record_assertion "$1" "$2" "$3"
+}
+
+# The verdict one quiescence control reached, for whichever permit mode was in
+# flight.
+#
+# Both modes are the same property observed over a different permit
+# population, so the ladder is shared and the mode is the caller's. Two copies
+# would let the statement of what a quiescing node may do drift between the
+# side of C the release is leaving and the side it is going to.
 quiescence_verdict() {
-  local node="$1"
-  local step="quiescence with an in-flight security-v2 permit"
-  local assertion="graceful quiescence starts no new work and lets held \
-permits finish"
+  local node="$1" step="$2" assertion="$3" mode="$4"
 
   if [[ "${QUIESCE_STATE}" != "quiescing" ]]; then
     record_step "${step}" fail "${node} never reported quiescing while \
-draining with ${QUIESCE_HELD_BEFORE} security-v2 ceremonies in flight"
-    record_assertion "${assertion}" false "${step}"
+draining with ${QUIESCE_HELD_BEFORE} ${mode} ceremonies in flight"
+    quiescence_assertion "${assertion}" false "${step}"
   elif [[ ! "${QUIESCE_ISSUED_BEFORE}" =~ ^[0-9]+$ ]] ||
     [[ ! "${QUIESCE_ISSUED_AFTER}" =~ ^[0-9]+$ ]]; then
     block_step "${step}" "${node} entered quiescing, but its issued-permit \
 counter could not be read (${QUIESCE_ISSUED_BEFORE:-unreadable} to \
 ${QUIESCE_ISSUED_AFTER:-unreadable}); the active gauge alone cannot say \
 whether a permit was taken and closed between two samples"
-    record_assertion "${assertion}" false "${step}"
+    quiescence_assertion "${assertion}" false "${step}"
   elif ((QUIESCE_ISSUED_AFTER > QUIESCE_ISSUED_BEFORE)); then
     record_step "${step}" fail "${node} entered quiescing and still issued \
 $((QUIESCE_ISSUED_AFTER - QUIESCE_ISSUED_BEFORE)) new permit(s) \
 (${QUIESCE_ISSUED_BEFORE} to ${QUIESCE_ISSUED_AFTER}); a quiescing node \
 started new work"
-    record_assertion "${assertion}" false "${step}"
+    quiescence_assertion "${assertion}" false "${step}"
   elif [[ ! "${QUIESCE_FORCED_BEFORE}" =~ ^[0-9]+$ ]] ||
     [[ ! "${QUIESCE_FORCED_AFTER}" =~ ^[0-9]+$ ]]; then
     block_step "${step}" "${node} entered quiescing and issued no new permit, \
@@ -5985,51 +6088,51 @@ but its forced-abort counter could not be read \
 (${QUIESCE_FORCED_BEFORE:-unreadable} to ${QUIESCE_FORCED_AFTER:-unreadable}), \
 so nothing here observed whether the permits it held finished or were cut \
 short"
-    record_assertion "${assertion}" false "${step}"
+    quiescence_assertion "${assertion}" false "${step}"
   elif ((QUIESCE_FORCED_AFTER > QUIESCE_FORCED_BEFORE)); then
     record_step "${step}" fail "${node} force-aborted \
 $((QUIESCE_FORCED_AFTER - QUIESCE_FORCED_BEFORE)) held permit(s) rather than \
 letting them finish inside the ${QUIESCE_GRACE}s grace"
-    record_assertion "${assertion}" false "${step}"
+    quiescence_assertion "${assertion}" false "${step}"
   elif ((QUIESCE_DRAINED == 0)); then
     block_step "${step}" "${node} entered quiescing holding \
-${QUIESCE_HELD_BEFORE} security-v2 ceremonies and was never seen without \
+${QUIESCE_HELD_BEFORE} ${mode} ceremonies and was never seen without \
 them; the node stopped answering with its in-flight count unobserved at zero, \
 so nothing here says those permits finished rather than went down with the \
 process"
-    record_assertion "${assertion}" false "${step}"
+    quiescence_assertion "${assertion}" false "${step}"
   elif [[ -z "${QUIESCE_INFLIGHT_WORK//[[:space:]]/}" ]]; then
     # The gauge fell, and a gauge falling is where this step used to stop. It
     # is the same reading a process that exited holding its permits produces,
     # so the permits have to be named before anything can be said about them.
     block_step "${step}" "${node} was seen without the \
-${QUIESCE_HELD_BEFORE} security-v2 ceremonies it held, but the driver named no \
+${QUIESCE_HELD_BEFORE} ${mode} ceremonies it held, but the driver named no \
 identified work it was holding; an in-flight count says how many permits there \
 were and not which work each one was issued for, and a count that fell to zero \
 cannot be followed to anything"
-    record_assertion "${assertion}" false "${step}"
+    quiescence_assertion "${assertion}" false "${step}"
   elif ((QUIESCE_HELD_BEFORE != $(count_tokens \
     "$(permit_identities "${QUIESCE_INFLIGHT_WORK}")"))); then
-    block_step "${step}" "${node} held ${QUIESCE_HELD_BEFORE} security-v2 \
+    block_step "${step}" "${node} held ${QUIESCE_HELD_BEFORE} ${mode} \
 permit(s) for $(count_tokens "$(permit_identities \
       "${QUIESCE_INFLIGHT_WORK}")") piece(s) of work the driver put on it \
 ($(permit_identities "${QUIESCE_INFLIGHT_WORK}")); the permit counter and the \
 driver's account describe different populations, so an outcome for one piece \
 of work cannot be said to be the outcome of any particular held permit"
-    record_assertion "${assertion}" false "${step}"
+    quiescence_assertion "${assertion}" false "${step}"
   elif ((QUIESCE_TERMINAL_ASKED == 0)); then
     block_step "${step}" "${node} let all ${QUIESCE_HELD_BEFORE} held permits \
 go without being force-aborted, but the driver was never asked what became of \
 the work behind them; a gauge that fell to zero is equally a ceremony that \
 finished and a process that exited holding it, and only one of those is a \
 permit that was allowed to finish"
-    record_assertion "${assertion}" false "${step}"
+    quiescence_assertion "${assertion}" false "${step}"
   elif ((QUIESCE_TERMINAL_RC != 0)); then
     block_step "${step}" "the work driver exited [${QUIESCE_TERMINAL_RC}] \
 reporting what became of the work ${node} held, so its account of the chain \
 stops wherever it failed; held permits reconciled against a partial report \
 take the outcomes it happened to reach for all there were"
-    record_assertion "${assertion}" false "${step}"
+    quiescence_assertion "${assertion}" false "${step}"
   elif [[ -n "$(unoriginated_terminals "${QUIESCE_TERMINAL}" \
     "${QUIESCE_INFLIGHT_WORK}")" ]]; then
     block_step "${step}" "the driver reported terminal outcomes for \
@@ -6037,7 +6140,7 @@ $(unoriginated_terminals "${QUIESCE_TERMINAL}" \
       "${QUIESCE_INFLIGHT_WORK}"), which ${node} did not originate with those \
 transactions; a later phase cannot replace the transaction that started held \
 work with an unrelated transaction and call its outcome the held permit's end"
-    record_assertion "${assertion}" false "${step}"
+    quiescence_assertion "${assertion}" false "${step}"
   elif [[ -n "$(unended_work "${QUIESCE_INFLIGHT_WORK}" \
     "${QUIESCE_TERMINAL}" "")" ]]; then
     block_step "${step}" "${node} was seen without the permits it held, but \
@@ -6045,7 +6148,7 @@ the driver reported no terminal outcome for $(unended_work \
       "${QUIESCE_INFLIGHT_WORK}" "${QUIESCE_TERMINAL}" ""); a permit that \
 stopped being counted while the work behind it never ended is a permit the \
 process took with it, which is the one reading this step exists to refuse"
-    record_assertion "${assertion}" false "${step}"
+    quiescence_assertion "${assertion}" false "${step}"
   elif [[ -n "$(unsettled_work "${QUIESCE_INFLIGHT_WORK}" \
     "${QUIESCE_TERMINAL}")" ]]; then
     # An end, but not the end this step's assertion is about. Nothing in this
@@ -6058,21 +6161,21 @@ followed them to an end, but $(unsettled_work "${QUIESCE_INFLIGHT_WORK}" \
 this gate audits no quarantined state, so work that gave up inside the grace \
 evidences neither that it was allowed to finish nor that what it left behind \
 is accounted for"
-    record_assertion "${assertion}" false "${step}"
+    quiescence_assertion "${assertion}" false "${step}"
   elif ((QUIESCE_OFFER_FAILED == 1)); then
     block_step "${step}" "${node} entered quiescing and let all \
 ${QUIESCE_HELD_BEFORE} held permits finish, but the work driver exited \
 [${QUIESCE_OFFER_RC:-unreadable}] without naming a transaction when it was \
 asked to originate work against the quiescing node, so nothing was put on the \
 chain for it to refuse and the unchanged permit counter records only that"
-    record_assertion "${assertion}" false "${step}"
+    quiescence_assertion "${assertion}" false "${step}"
   elif ((QUIESCE_ATTEMPTED == 0)); then
     block_step "${step}" "${node} entered quiescing, let all \
 ${QUIESCE_HELD_BEFORE} held permits finish, and issued none — but no work was \
 offered to it while it was quiescing, so the starts-no-new-work half rests on \
 nothing having asked; it needs work originated on the rehearsal chain after \
 the node enters quiescence"
-    record_assertion "${assertion}" false "${step}"
+    quiescence_assertion "${assertion}" false "${step}"
   elif [[ ! "${QUIESCE_REFUSALS_BEFORE}" =~ ^[0-9]+$ ]] ||
     [[ ! "${QUIESCE_REFUSALS_AFTER}" =~ ^[0-9]+$ ]]; then
     block_step "${step}" "${node} entered quiescing and was offered work, but \
@@ -6081,7 +6184,7 @@ its refusal counter could not be read \
 ${QUIESCE_REFUSALS_AFTER:-unreadable}); without it the node's own account of \
 having refused the offer is missing, and an unchanged permit counter is all \
 that is left"
-    record_assertion "${assertion}" false "${step}"
+    quiescence_assertion "${assertion}" false "${step}"
   elif ((QUIESCE_REFUSALS_AFTER <= QUIESCE_REFUSALS_BEFORE)); then
     # The reading this rung exists for. Work was submitted and no permit was
     # issued, which is what a refusal looks like — and also what an offer that
@@ -6092,7 +6195,7 @@ and issued no permit — but its own refusal counter never moved (still \
 ${QUIESCE_REFUSALS_AFTER}); nothing here says the offer reached this node \
 before it stopped, and an unchanged permit counter is equally the shape of \
 work that was never presented to it"
-    record_assertion "${assertion}" false "${step}"
+    quiescence_assertion "${assertion}" false "${step}"
   else
     local refused refused_offered
     refused="$(refused_ceremony_delta "${QUIESCE_CEREMONY_REFUSALS_BEFORE}" \
@@ -6103,7 +6206,7 @@ $((QUIESCE_REFUSALS_AFTER - QUIESCE_REFUSALS_BEFORE)) offer(s) while \
 quiescing, but no per-ceremony refusal counter moved with the total, so \
 nothing here says which ceremony it refused; a refusal a release cannot \
 attribute to a ceremony is not evidence about that ceremony"
-      record_assertion "${assertion}" false "${step}"
+      quiescence_assertion "${assertion}" false "${step}"
       return
     fi
     if [[ -z "${QUIESCE_OFFERED}" ]]; then
@@ -6111,7 +6214,7 @@ attribute to a ceremony is not evidence about that ceremony"
 the offer named no ceremony it originated, so nothing says the counter that \
 moved belongs to the work this step put in front of it; a refusal of \
 something else is not this offer being refused"
-      record_assertion "${assertion}" false "${step}"
+      quiescence_assertion "${assertion}" false "${step}"
       return
     fi
     refused_offered="$(refused_offered_delta \
@@ -6123,11 +6226,11 @@ this offer originated ${QUIESCE_OFFERED} and none of those counters moved; \
 the rehearsal chain carries other traffic, and a ceremony refused for its own \
 reasons moves the total and a per-ceremony counter together exactly as this \
 offer being refused would"
-      record_assertion "${assertion}" false "${step}"
+      quiescence_assertion "${assertion}" false "${step}"
       return
     fi
     record_step "${step}" pass "${node} entered quiescing holding \
-${QUIESCE_HELD_BEFORE} security-v2 ceremonies, was offered \
+${QUIESCE_HELD_BEFORE} ${mode} ceremonies, was offered \
 ${QUIESCE_OFFERED} while quiescing and refused it on its own account \
 (${refused_offered}; refusals \
 ${QUIESCE_REFUSALS_BEFORE} to ${QUIESCE_REFUSALS_AFTER}) while issuing no \
@@ -6136,8 +6239,147 @@ held permit finish inside the reviewed ${QUIESCE_GRACE}s grace — in-flight \
 count observed at zero, no forced abort (${QUIESCE_FORCED_BEFORE} to \
 ${QUIESCE_FORCED_AFTER}), and every piece of work it was holding settled on \
 chain ($(bound_settlements "${QUIESCE_TERMINAL}"))"
-    record_assertion "${assertion}" true "${step}"
+    quiescence_assertion "${assertion}" true "${step}"
   fi
+}
+
+# Drain one node holding permits of one mode, and record what that observed.
+#
+# Everything the ladder above decides on is collected here, so both quiescence
+# controls watch the same window in the same way and differ only in which
+# permit population they are about: the gauge that counts the held permits, the
+# counter that would show a new one being issued, and the driver phases that
+# put work of that mode in flight. The observation is a window rather than a
+# pair of samples because the contract — no new permit from the moment
+# quiescing begins, held permits left to finish — is a statement about the
+# whole drain.
+run_quiescence_control() {
+  local node="$1" step="$2" assertion="$3" mode="$4"
+  local active_field="$5" issued_metric="$6" phase="$7"
+
+  # The property is about a permit the node is holding while it is told to
+  # stop, so one has to be in flight before the stop is issued. A node with
+  # nothing running quiesces trivially and evidences nothing.
+  #
+  # The work it puts in flight is retained, not only the fact that it ran: the
+  # permits this node is about to be told to drain have to be followed to an
+  # outcome afterwards, and only the driver's account names which piece of work
+  # each one was issued for.
+  QUIESCE_INFLIGHT_WORK=""
+  if [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
+    run_work_driver "${phase}-inflight" || true
+    if driver_offered_work; then
+      QUIESCE_INFLIGHT_WORK="$(work_records_held_by \
+        "${WORK_DRIVER_ORIGINATED_WORK}" "${node}")"
+    fi
+  fi
+  QUIESCE_HELD_BEFORE="$(participation_field "${node}" \
+    "${active_field}" 2>/dev/null || printf '')"
+  QUIESCE_FORCED_BEFORE="$(metric_value "${node}" \
+    participation_quiesce_forced_aborts_total || printf '')"
+  QUIESCE_ISSUED_BEFORE="$(metric_value "${node}" \
+    "${issued_metric}" || printf '')"
+  QUIESCE_REFUSALS_BEFORE="$(metric_value "${node}" \
+    participation_refusals_total || printf '')"
+  QUIESCE_CEREMONY_REFUSALS_BEFORE="$(ceremony_refusal_counters "${node}")"
+
+  if [[ ! "${QUIESCE_HELD_BEFORE}" =~ ^[0-9]+$ ]] ||
+    ((QUIESCE_HELD_BEFORE == 0)); then
+    block_step "${step}" "${node} held no ${mode} ceremony when the stop was \
+due to be issued (${active_field} [${QUIESCE_HELD_BEFORE:-unreadable}]); a \
+node with nothing in flight quiesces trivially, so this needs work originated \
+on the rehearsal chain that is still running at shutdown"
+    quiescence_assertion "${assertion}" false "${step}"
+    return
+  fi
+
+  # The same grace the manifest grants and the compose file declares, so the
+  # node is not SIGKILLed before its own in-process backstop can finish what
+  # it holds. A number restated here would go on stopping nodes under the
+  # old ceiling the first time the reviewed bounds moved.
+  QUIESCE_GRACE="$(manifest_termination_grace)"
+  compose stop --timeout "${QUIESCE_GRACE}" "${node}" &
+  local stop_pid=$!
+
+  local held_now forced_now issued_now state_now refusals_now deadline
+  QUIESCE_STATE=""
+  QUIESCE_ISSUED_AFTER="${QUIESCE_ISSUED_BEFORE}"
+  QUIESCE_FORCED_AFTER="${QUIESCE_FORCED_BEFORE}"
+  QUIESCE_DRAINED=0
+  QUIESCE_ATTEMPTED=0
+  QUIESCE_OFFER_FAILED=0
+  QUIESCE_OFFER_RC=""
+  QUIESCE_REFUSALS_AFTER="${QUIESCE_REFUSALS_BEFORE}"
+  QUIESCE_CEREMONY_REFUSALS_AFTER="${QUIESCE_CEREMONY_REFUSALS_BEFORE}"
+  QUIESCE_OFFERED=""
+  deadline=$((SECONDS + QUIESCE_GRACE))
+  while ((SECONDS < deadline)); do
+    state_now="$(participation_field "${node}" gate_state 2>/dev/null || true)"
+    if [[ "${state_now}" == "quiescing" ]]; then
+      QUIESCE_STATE="quiescing"
+      # Offered once the node has actually entered quiescence, because the
+      # property is what a quiescing node does with new work — and a node
+      # that was never asked answers exactly like one that refused. Only a
+      # clean driver run that named its transactions counts as having asked;
+      # a failed or empty one leaves nothing for the node to have refused,
+      # and QUIESCE_OFFER_FAILED carries that apart from never having tried.
+      if ((QUIESCE_ATTEMPTED == 0 && QUIESCE_OFFER_FAILED == 0)) &&
+        [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
+        run_work_driver "${phase}-refusal" || true
+        if driver_offered_work; then
+          QUIESCE_ATTEMPTED=1
+          QUIESCE_OFFERED="${WORK_DRIVER_ORIGINATED}"
+        else
+          QUIESCE_OFFER_FAILED=1
+          QUIESCE_OFFER_RC="${WORK_DRIVER_RC}"
+        fi
+      fi
+    fi
+    held_now="$(participation_field "${node}" "${active_field}" \
+      2>/dev/null || printf '')"
+    if [[ "${held_now}" =~ ^[0-9]+$ ]] && ((held_now == 0)); then
+      QUIESCE_DRAINED=1
+    fi
+    issued_now="$(metric_value "${node}" "${issued_metric}" \
+      2>/dev/null || printf '')"
+    if [[ "${issued_now}" =~ ^[0-9]+$ ]]; then
+      QUIESCE_ISSUED_AFTER="${issued_now}"
+    fi
+    forced_now="$(metric_value "${node}" \
+      participation_quiesce_forced_aborts_total 2>/dev/null || printf '')"
+    if [[ "${forced_now}" =~ ^[0-9]+$ ]]; then
+      QUIESCE_FORCED_AFTER="${forced_now}"
+    fi
+    # Sampled inside the window rather than after it, for the same reason the
+    # issued counter is: the node stops answering when the drain finishes, and
+    # a refusal it recorded is only readable while it is still serving.
+    refusals_now="$(metric_value "${node}" \
+      participation_refusals_total 2>/dev/null || printf '')"
+    if [[ "${refusals_now}" =~ ^[0-9]+$ ]]; then
+      QUIESCE_REFUSALS_AFTER="${refusals_now}"
+      QUIESCE_CEREMONY_REFUSALS_AFTER="$(ceremony_refusal_counters "${node}")"
+    fi
+    # The node going unreachable is the drain finishing, not a failure.
+    node_reachable "${node}" || break
+    sleep 2
+  done
+  wait "${stop_pid}" || true
+
+  # What became of the work the node was holding, asked once the drain is
+  # over and the outcomes exist to be read. The window above cannot ask: its
+  # subject is work still running, and by the time an outcome exists the work
+  # it was about is finished.
+  QUIESCE_TERMINAL=""
+  QUIESCE_TERMINAL_ASKED=0
+  QUIESCE_TERMINAL_RC=0
+  if [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
+    QUIESCE_TERMINAL_ASKED=1
+    run_work_driver "${phase}-terminal" || true
+    QUIESCE_TERMINAL="${WORK_DRIVER_BOUND_RESULTS}"
+    QUIESCE_TERMINAL_RC="${WORK_DRIVER_RC}"
+  fi
+
+  quiescence_verdict "${node}" "${step}" "${assertion}" "${mode}"
 }
 
 # What the homogeneous positive control observed.
@@ -6774,6 +7016,361 @@ count_tokens() {
   printf '%s' "${count}"
 }
 
+# Whether a compose service's container is running right now.
+#
+# Preflight already proved which image each service was created from, but that
+# is a statement about the past. A mixed-fleet control's whole subject is the
+# prior binary being on the network while R1 works, and a prior container that
+# exited between then and now leaves a homogeneous R1 fleet producing readings
+# a mixed-fleet claim would be recorded over.
+service_container_running() {
+  local service="$1" container state
+  container="$(compose ps --quiet "${service}" 2>/dev/null || true)"
+  [[ -n "${container}" ]] || return 1
+  state="$(docker inspect --format '{{.State.Running}}' "${container}" \
+    2>/dev/null || true)"
+  [[ "${state}" == "true" ]]
+}
+
+# Of the required work classes, the ones no settled result represents. The
+# mirror of missing_bound_families over the class reader, for the control whose
+# claim is about the kind of work that settled rather than which half of the
+# release it belongs to.
+missing_bound_classes() {
+  local records="$1" required="$2" class record uncovered="" covered
+  for class in ${required}; do
+    covered=0
+    for record in ${records}; do
+      [[ "$(bound_outcome "${record}")" == "succeeded" ]] || continue
+      [[ "$(ceremony_class \
+        "$(work_ceremony "$(bound_work "${record}")")")" == "${class}" ]] ||
+        continue
+      covered=1
+      break
+    done
+    ((covered == 1)) || uncovered="${uncovered}${uncovered:+ }${class}"
+  done
+  printf '%s' "${uncovered}"
+}
+
+# What one pre-cutover driver phase observed on a fleet that still has the
+# prior binary on its network.
+#
+# Both halves of every counter are taken around the driver call rather than
+# compared against zero: these steps run first, but the gauges are cumulative
+# and a later re-read of this scaffold's own state must not make "the fleet
+# took a legacy permit" true of something the crossing did.
+PRECUTOVER_DRIVER_SUPPLIED=0
+PRECUTOVER_DRIVER_RC=0
+PRECUTOVER_TX=0
+PRECUTOVER_RESULTS=""
+PRECUTOVER_BOUND=""
+PRECUTOVER_PRIOR_RUNNING=0
+PRECUTOVER_STATES=""
+PRECUTOVER_LEGACY_BEFORE=""
+PRECUTOVER_LEGACY_AFTER=""
+PRECUTOVER_SECURITY_BEFORE=""
+PRECUTOVER_SECURITY_AFTER=""
+PRECUTOVER_SIGHTINGS_BEFORE=""
+PRECUTOVER_SIGHTINGS_AFTER=""
+
+# Both halves of the release, for the same reason the post-C control requires
+# them: a pre-C compatibility claim read off tBTC alone says nothing about the
+# beacon's path into the gate.
+PRECUTOVER_REQUIRED_FAMILIES="tbtc beacon"
+
+collect_precutover_work() {
+  local phase="$1" service state block
+
+  PRECUTOVER_DRIVER_SUPPLIED=0
+  PRECUTOVER_DRIVER_RC=0
+  PRECUTOVER_TX=0
+  PRECUTOVER_RESULTS=""
+  PRECUTOVER_BOUND=""
+  PRECUTOVER_STATES=""
+
+  # Every R1 node has to be on the legacy side of its own gate before the work
+  # starts. A node already past C would run this work under security-v2 and
+  # produce a settled ceremony a pre-cutover control would record as
+  # compatibility evidence.
+  for service in "${REHEARSAL_R1_SERVICES[@]}"; do
+    observe_canonical_block "${service}"
+    state="$(participation_field "${service}" gate_state 2>/dev/null || true)"
+    block="$(participation_field "${service}" current_block 2>/dev/null || true)"
+    if [[ "${state}" != "open_legacy" ]] ||
+      [[ ! "${block}" =~ ^[0-9]+$ ]] ||
+      ((block >= CUTOVER_BLOCK)); then
+      PRECUTOVER_STATES="${PRECUTOVER_STATES}${PRECUTOVER_STATES:+, }\
+${service} reported [${state:-unreadable}] at block [${block:-unreadable}]"
+    fi
+  done
+
+  PRECUTOVER_PRIOR_RUNNING=0
+  if service_container_running "${REHEARSAL_PRIOR_SERVICE}"; then
+    PRECUTOVER_PRIOR_RUNNING=1
+  fi
+
+  PRECUTOVER_LEGACY_BEFORE="$(fleet_metric_total \
+    participation_mode_legacy_total)"
+  PRECUTOVER_SECURITY_BEFORE="$(fleet_metric_total \
+    participation_mode_security_v2_total)"
+  # Pre-C the prior binary and R1 speak the same wire format, so a recognized
+  # cross-format peer here is the compatibility claim failing rather than a
+  # straggler being found. It is read where a mismatch would appear rather
+  # than inferred from the mode a permit pinned.
+  PRECUTOVER_SIGHTINGS_BEFORE="$(fleet_metric_total \
+    announcer_cross_format_peer_total)"
+
+  if [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
+    PRECUTOVER_DRIVER_SUPPLIED=1
+    run_work_driver "${phase}" || true
+    PRECUTOVER_DRIVER_RC="${WORK_DRIVER_RC}"
+    PRECUTOVER_TX="${WORK_DRIVER_TX_COUNT}"
+    PRECUTOVER_RESULTS="${WORK_DRIVER_CEREMONY_RESULTS}"
+    PRECUTOVER_BOUND="${WORK_DRIVER_BOUND_RESULTS}"
+  fi
+
+  PRECUTOVER_LEGACY_AFTER="$(fleet_metric_total \
+    participation_mode_legacy_total)"
+  PRECUTOVER_SECURITY_AFTER="$(fleet_metric_total \
+    participation_mode_security_v2_total)"
+  PRECUTOVER_SIGHTINGS_AFTER="$(fleet_metric_total \
+    announcer_cross_format_peer_total)"
+  for service in "${REHEARSAL_R1_SERVICES[@]}"; do
+    observe_gate_gauges "${service}"
+  done
+}
+
+# The verdict the readings above imply, for whichever pre-cutover step
+# collected them.
+#
+# The two pre-C steps decide on the same fleet observations and differ only in
+# what the driven work must cover, so the ladder is shared and the coverage
+# requirement is the caller's. Duplicating it per step would let the two
+# statements of "the fleet took no security-v2 permit" drift apart.
+precutover_verdict() {
+  local step="$1" assertion="$2" required_families="$3" required_classes="$4"
+  local what="$5"
+
+  local failed_results missing_families missing_classes settlements
+  failed_results="$(unsuccessful_results "${PRECUTOVER_RESULTS}")"
+  missing_families="$(missing_bound_families \
+    "${PRECUTOVER_BOUND}" "${required_families}")"
+  missing_classes="$(missing_bound_classes \
+    "${PRECUTOVER_BOUND}" "${required_classes}")"
+  settlements="$(bound_settlements "${PRECUTOVER_BOUND}")"
+
+  if ((PRECUTOVER_DRIVER_SUPPLIED == 0)); then
+    block_step "${step}" "no PR4109_WORK_DRIVER was supplied, so no \
+legacy-anchored ceremony was originated on the rehearsal chain and there is \
+nothing to observe; the fleet only reacts to chain events"
+  elif ((PRECUTOVER_PRIOR_RUNNING == 0)); then
+    block_step "${step}" "the prior binary's container was not running when \
+this step drove ${what}, so whatever the R1 fleet did it did alone; a mixed \
+prior/R1 claim cannot be read off a fleet with one release on it"
+  elif [[ -n "${PRECUTOVER_STATES}" ]]; then
+    block_step "${step}" "the R1 fleet was not on the legacy side of C when \
+this step began — ${PRECUTOVER_STATES} — so the work it drove was not \
+pre-cutover work; the rehearsal chain must be below C=[${CUTOVER_BLOCK}] for \
+this step"
+  elif ((PRECUTOVER_DRIVER_RC != 0)); then
+    record_step "${step}" fail "the work driver exited \
+[${PRECUTOVER_DRIVER_RC}] originating ${what}"
+  elif [[ ! "${PRECUTOVER_LEGACY_BEFORE}" =~ ^[0-9]+$ ]] ||
+    [[ ! "${PRECUTOVER_LEGACY_AFTER}" =~ ^[0-9]+$ ]] ||
+    [[ ! "${PRECUTOVER_SECURITY_BEFORE}" =~ ^[0-9]+$ ]] ||
+    [[ ! "${PRECUTOVER_SECURITY_AFTER}" =~ ^[0-9]+$ ]]; then
+    block_step "${step}" "the fleet permit counters could not be read (legacy \
+[${PRECUTOVER_LEGACY_BEFORE}] to [${PRECUTOVER_LEGACY_AFTER}], security-v2 \
+[${PRECUTOVER_SECURITY_BEFORE}] to [${PRECUTOVER_SECURITY_AFTER}]), so \
+nothing here observed which mode the ceremonies ran in"
+  elif ((PRECUTOVER_TX == 0)); then
+    block_step "${step}" "the work driver exited cleanly but reported no \
+transaction, so nothing attributes the fleet's permit activity to the \
+ceremonies this control claims to have originated"
+  elif [[ -n "${failed_results}" ]]; then
+    record_step "${step}" fail "the work driver reported ${failed_results} \
+driving ${what}; a compatibility control cannot be read off the subset of a \
+mixed fleet's work that survived"
+  elif [[ -z "${settlements}" ]]; then
+    block_step "${step}" "the work driver named no ceremony that completed \
+successfully on a transaction it originated, so this control observed work \
+being allowed to start and nothing about it finishing"
+  elif [[ -n "${missing_families}" ]]; then
+    block_step "${step}" "the work driver settled ${settlements} but nothing \
+from the ${missing_families} half of the release, so this control covers one \
+call path into the gate and says nothing about the other; it has to succeed \
+on ${required_families}"
+  elif [[ -n "${missing_classes}" ]]; then
+    block_step "${step}" "the work driver settled ${settlements} but no \
+${missing_classes}; this step's claim is about ${what}, and the work classes \
+it names are what make it that claim rather than a repeat of the step before"
+  elif ((PRECUTOVER_LEGACY_AFTER <= PRECUTOVER_LEGACY_BEFORE)); then
+    record_step "${step}" fail "the work driver settled ${settlements}, but \
+the fleet issued no new legacy permit (participation_mode_legacy_total still \
+[${PRECUTOVER_LEGACY_AFTER}]); the ceremonies it named were not run under \
+this fleet's gate on the legacy side of C"
+  elif ((PRECUTOVER_SECURITY_AFTER > PRECUTOVER_SECURITY_BEFORE)); then
+    record_step "${step}" fail "the fleet issued \
+$((PRECUTOVER_SECURITY_AFTER - PRECUTOVER_SECURITY_BEFORE)) security-v2 \
+permit(s) (participation_mode_security_v2_total \
+[${PRECUTOVER_SECURITY_BEFORE}] to [${PRECUTOVER_SECURITY_AFTER}]) driving \
+work anchored below C; a pre-cutover anchor must pin the legacy mode"
+  elif [[ ! "${PRECUTOVER_SIGHTINGS_BEFORE}" =~ ^[0-9]+$ ]] ||
+    [[ ! "${PRECUTOVER_SIGHTINGS_AFTER}" =~ ^[0-9]+$ ]]; then
+    block_step "${step}" "the fleet's cross-format sighting counter could not \
+be read (${PRECUTOVER_SIGHTINGS_BEFORE:-unreadable} to \
+${PRECUTOVER_SIGHTINGS_AFTER:-unreadable}), so the half of this control that \
+is about the prior binary being interoperable was never observed"
+  elif ((PRECUTOVER_SIGHTINGS_AFTER > PRECUTOVER_SIGHTINGS_BEFORE)); then
+    record_step "${step}" fail "the R1 fleet recognized \
+$((PRECUTOVER_SIGHTINGS_AFTER - PRECUTOVER_SIGHTINGS_BEFORE)) cross-format \
+peer(s) (announcer cross-format total [${PRECUTOVER_SIGHTINGS_BEFORE}] to \
+[${PRECUTOVER_SIGHTINGS_AFTER}]) while running legacy-anchored work beside \
+the prior binary; below C the two releases must be one wire format"
+  else
+    STEP_PERMIT_MODES='"legacy"'
+    record_step "${step}" pass "the fleet issued \
+$((PRECUTOVER_LEGACY_AFTER - PRECUTOVER_LEGACY_BEFORE)) new legacy permits \
+and no security-v2 permit (unchanged at [${PRECUTOVER_SECURITY_AFTER}]) \
+driving ${what} beside the running prior binary, the driver settled \
+${settlements} with nothing failing beside them, and the fleet recognized no \
+cross-format peer (unchanged at [${PRECUTOVER_SIGHTINGS_AFTER}])"
+    [[ -z "${assertion}" ]] || record_assertion "${assertion}" true "${step}"
+    return
+  fi
+
+  [[ -z "${assertion}" ]] || record_assertion "${assertion}" false "${step}"
+}
+
+# What the in-flight half of the crossing observed: work anchored below C that
+# was still running when C passed.
+#
+# This one cannot be collected in the step that decides it. Its subject is a
+# permit that outlives the crossing, so the work has to be put on the chain
+# before the crossing step runs and asked about afterwards; a phase that
+# originated and settled its work on one side of C would evidence a ceremony
+# completing, not a ceremony surviving.
+SURVIVING_DRIVER_SUPPLIED=0
+SURVIVING_ORIGINATE_RC=0
+SURVIVING_ORIGINATED=""
+SURVIVING_HELD_BEFORE=""
+SURVIVING_LEGACY_COMPLETIONS_BEFORE=""
+SURVIVING_LEGACY_COMPLETIONS_AFTER=""
+SURVIVING_TERMINAL_ASKED=0
+SURVIVING_TERMINAL_RC=0
+SURVIVING_TERMINAL=""
+
+originate_surviving_legacy_work() {
+  SURVIVING_DRIVER_SUPPLIED=0
+  SURVIVING_ORIGINATE_RC=0
+  SURVIVING_ORIGINATED=""
+  SURVIVING_TERMINAL_ASKED=0
+  SURVIVING_TERMINAL_RC=0
+  SURVIVING_TERMINAL=""
+
+  SURVIVING_LEGACY_COMPLETIONS_BEFORE="$(fleet_metric_total \
+    participation_legacy_completions_after_cutover_total)"
+  SURVIVING_HELD_BEFORE="$(fleet_metric_total \
+    participation_active_legacy_ceremonies)"
+
+  [[ -n "${PR4109_WORK_DRIVER:-}" ]] || return 0
+  SURVIVING_DRIVER_SUPPLIED=1
+  run_work_driver precutover-inflight || true
+  SURVIVING_ORIGINATE_RC="${WORK_DRIVER_RC}"
+  SURVIVING_ORIGINATED="${WORK_DRIVER_ORIGINATED_WORK}"
+  SURVIVING_HELD_BEFORE="$(fleet_metric_total \
+    participation_active_legacy_ceremonies)"
+}
+
+# What became of it, asked after the crossing step has established that C
+# passed in the same processes.
+resolve_surviving_legacy_work() {
+  SURVIVING_LEGACY_COMPLETIONS_AFTER="$(fleet_metric_total \
+    participation_legacy_completions_after_cutover_total)"
+
+  [[ -n "${PR4109_WORK_DRIVER:-}" ]] || return 0
+  SURVIVING_TERMINAL_ASKED=1
+  run_work_driver precutover-inflight-terminal || true
+  SURVIVING_TERMINAL_RC="${WORK_DRIVER_RC}"
+  SURVIVING_TERMINAL="${WORK_DRIVER_BOUND_RESULTS}"
+  SURVIVING_LEGACY_COMPLETIONS_AFTER="$(fleet_metric_total \
+    participation_legacy_completions_after_cutover_total)"
+}
+
+surviving_legacy_verdict() {
+  local step="pre-cutover legacy work survives C and completes"
+
+  local stray settlements failed
+  stray="$(unoriginated_terminals "${SURVIVING_TERMINAL}" \
+    "${SURVIVING_ORIGINATED}")"
+  settlements="$(bound_settlements "${SURVIVING_TERMINAL}")"
+  failed="$(bound_terminations "${SURVIVING_TERMINAL}")"
+
+  if ((SURVIVING_DRIVER_SUPPLIED == 0)); then
+    block_step "${step}" "no PR4109_WORK_DRIVER was supplied, so no \
+legacy-anchored ceremony was in flight when C passed and there is nothing to \
+observe surviving it"
+  elif ((SURVIVING_ORIGINATE_RC != 0)); then
+    record_step "${step}" fail "the work driver exited \
+[${SURVIVING_ORIGINATE_RC}] originating the legacy-anchored work that was to \
+be held across C"
+  elif [[ -z "${SURVIVING_ORIGINATED//[[:space:]]/}" ]]; then
+    block_step "${step}" "the work driver exited cleanly but named no work it \
+put on the chain before C, so nothing here identifies a permit that could \
+have survived the crossing; an in-flight count says how many permits there \
+were and not which work each one was issued for"
+  elif [[ ! "${SURVIVING_HELD_BEFORE}" =~ ^[0-9]+$ ]] ||
+    ((SURVIVING_HELD_BEFORE == 0)); then
+    block_step "${step}" "the fleet held \
+[${SURVIVING_HELD_BEFORE:-unreadable}] legacy ceremonies when C approached, \
+so the work the driver named had already ended and this step would be about a \
+ceremony that never met the crossing"
+  elif ((SURVIVING_TERMINAL_ASKED == 0)); then
+    block_step "${step}" "the driver was never asked what became of the \
+legacy work it held across C; a permit observed in flight before the crossing \
+and never followed up is equally one that completed and one that was cut short"
+  elif ((SURVIVING_TERMINAL_RC != 0)); then
+    block_step "${step}" "the work driver exited [${SURVIVING_TERMINAL_RC}] \
+reporting what became of the legacy work held across C, so its account stops \
+wherever it failed"
+  elif [[ -n "${stray}" ]]; then
+    block_step "${step}" "the driver reported terminal outcomes for ${stray}, \
+which this step did not originate before C with those transactions; an \
+outcome for other work cannot stand for the work that was held"
+  elif [[ -n "${failed}" ]]; then
+    record_step "${step}" fail "the legacy work held across C came to nothing: \
+${failed}; a legacy permit taken before C must be allowed to finish on the \
+far side of it, not abandoned there"
+  elif [[ -z "${settlements}" ]]; then
+    block_step "${step}" "the driver named no terminal outcome at all for the \
+legacy work it originated before C, so nothing here says those permits \
+finished rather than went unreported"
+  elif [[ ! "${SURVIVING_LEGACY_COMPLETIONS_BEFORE}" =~ ^[0-9]+$ ]] ||
+    [[ ! "${SURVIVING_LEGACY_COMPLETIONS_AFTER}" =~ ^[0-9]+$ ]]; then
+    block_step "${step}" "the fleet post-cutover legacy completion counter \
+could not be read (${SURVIVING_LEGACY_COMPLETIONS_BEFORE:-unreadable} to \
+${SURVIVING_LEGACY_COMPLETIONS_AFTER:-unreadable}); the driver account alone \
+cannot say the completion happened under this fleet gate after C"
+  elif ((SURVIVING_LEGACY_COMPLETIONS_AFTER <=
+    SURVIVING_LEGACY_COMPLETIONS_BEFORE)); then
+    record_step "${step}" fail "the driver settled ${settlements}, but no \
+gate recorded a legacy completion after C \
+(participation_legacy_completions_after_cutover_total still \
+[${SURVIVING_LEGACY_COMPLETIONS_AFTER}]); work that settled without one did \
+not finish on the far side of the crossing"
+  else
+    STEP_PERMIT_MODES='"legacy"'
+    record_step "${step}" pass "the ${SURVIVING_HELD_BEFORE} legacy \
+ceremonies the driver put on the fleet before C settled after it \
+(${settlements}), and the fleet gates recorded \
+$((SURVIVING_LEGACY_COMPLETIONS_AFTER -
+      SURVIVING_LEGACY_COMPLETIONS_BEFORE)) legacy completion(s) at or after \
+the cutover block; a permit taken on the legacy side of C kept its mode and \
+was allowed to finish"
+  fi
+}
+
 stage_single_release() {
   REHEARSAL_GATE="single_release"
   stage_preflight
@@ -6782,16 +7379,33 @@ stage_single_release() {
   verify_running_images "${PRIOR_IMAGE_DIGEST}" "${REHEARSAL_PRIOR_SERVICE}"
   capture_r1_release_identity
 
-  # Step 1 and step 2 both need R1 nodes running legacy-anchored ceremonies
-  # alongside the prior binary, which is the one thing this release cannot do.
+  # Step 1 and step 2 both run R1 nodes on legacy-anchored ceremonies beside
+  # the prior binary. Whether the dependency's dual-mode transcripts have an
+  # archived independent review decides whether the resulting record is
+  # release-authoritative, and that is settled once by the acceptance
+  # contract; it is not a reason for the fleet to refuse to run.
   begin_step "mixed prior/R1 pre-cutover compatibility controls"
-  observe_gate_gauges "${REHEARSAL_R1_SERVICES[0]}"
-  block_step "mixed prior/R1 pre-cutover compatibility controls" \
-    "${LEGACY_INTEROP_UNAVAILABLE}"
+  collect_precutover_work precutover-compatibility
+  precutover_verdict "mixed prior/R1 pre-cutover compatibility controls" \
+    "" "${PRECUTOVER_REQUIRED_FAMILIES}" "threshold_ceremony" \
+    "legacy-anchored ceremonies beside the prior binary"
 
+  # The second step is the first one's claim carried to the work that takes
+  # longest to finish: a wallet action holds its permit across signing and a
+  # Bitcoin broadcast, so it is the case where a legacy anchor has to survive
+  # the most.
   begin_step "representative pre-cutover work including the longest wallet action"
-  block_step "representative pre-cutover work including the longest wallet action" \
-    "${LEGACY_INTEROP_UNAVAILABLE}"
+  collect_precutover_work precutover-representative
+  precutover_verdict \
+    "representative pre-cutover work including the longest wallet action" \
+    "" "${PRECUTOVER_REQUIRED_FAMILIES}" \
+    "threshold_ceremony bitcoin_action" \
+    "representative pre-cutover work including the longest wallet action"
+
+  # The in-flight half of step 3 needs its subject on the chain while the
+  # fleet is still below C, so the work is originated here and asked about
+  # once the crossing step has established that C passed in-process.
+  originate_surviving_legacy_work
 
   # Step 3. The crossing itself is observable without any legacy work: the
   # gate re-reads the chain and flips the state it reports, and it must do so
@@ -6864,10 +7478,11 @@ open_security_v2 within an hour of it"
   fi
 
   # The half of step 3 that needs a pre-C legacy ceremony still running as C
-  # passes is the in-flight safety property, and it needs the same fork.
+  # passes: the in-flight safety property. Its work was put on the chain
+  # before the crossing above; what became of it is asked here.
   begin_step "pre-cutover legacy work survives C and completes"
-  block_step "pre-cutover legacy work survives C and completes" \
-    "${LEGACY_INTEROP_UNAVAILABLE}"
+  resolve_surviving_legacy_work
+  surviving_legacy_verdict
 
   # Step 4. Mode must come from the canonical anchor and the current chain, so
   # a node that lost its process state entirely must land on the same answer.
@@ -7120,146 +7735,25 @@ network"
   clock_failure_verdict
 
   # Step 8. Quiescence must hold both an in-flight legacy permit and an
-  # in-flight security-v2 permit. The security-v2 half runs; the legacy half
-  # needs the fork.
+  # in-flight security-v2 permit. Both halves run the same control over a
+  # different permit population, on a different node: the security-v2 half
+  # stops the node it drains, so the legacy half cannot be asked of it.
   begin_step "quiescence with an in-flight security-v2 permit"
-  local quiesce_node="${REHEARSAL_R1_SERVICES[1]}"
+  run_quiescence_control "${REHEARSAL_R1_SERVICES[1]}" \
+    "quiescence with an in-flight security-v2 permit" \
+    "graceful quiescence starts no new work and lets held permits finish" \
+    security-v2 active_security_v2_ceremonies \
+    participation_mode_security_v2_total quiesce
 
-  # The property is about a permit the node is holding while it is told to
-  # stop, so one has to be in flight before the stop is issued. A node with
-  # nothing running quiesces trivially and evidences nothing.
-  #
-  # The work it puts in flight is retained, not only the fact that it ran: the
-  # permits this node is about to be told to drain have to be followed to an
-  # outcome afterwards, and only the driver's account names which piece of work
-  # each one was issued for.
-  QUIESCE_INFLIGHT_WORK=""
-  if [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
-    run_work_driver quiesce-inflight || true
-    if driver_offered_work; then
-      QUIESCE_INFLIGHT_WORK="$(work_records_held_by \
-        "${WORK_DRIVER_ORIGINATED_WORK}" "${quiesce_node}")"
-    fi
-  fi
-  QUIESCE_HELD_BEFORE="$(participation_field "${quiesce_node}" \
-    active_security_v2_ceremonies 2>/dev/null || printf '')"
-  QUIESCE_FORCED_BEFORE="$(metric_value "${quiesce_node}" \
-    participation_quiesce_forced_aborts_total || printf '')"
-  QUIESCE_ISSUED_BEFORE="$(metric_value "${quiesce_node}" \
-    participation_mode_security_v2_total || printf '')"
-  QUIESCE_REFUSALS_BEFORE="$(metric_value "${quiesce_node}" \
-    participation_refusals_total || printf '')"
-  QUIESCE_CEREMONY_REFUSALS_BEFORE="$(ceremony_refusal_counters \
-    "${quiesce_node}")"
-
-  if [[ ! "${QUIESCE_HELD_BEFORE}" =~ ^[0-9]+$ ]] ||
-    ((QUIESCE_HELD_BEFORE == 0)); then
-    block_step "quiescence with an in-flight security-v2 permit" \
-      "${quiesce_node} held no security-v2 ceremony when the stop was due to \
-be issued (active_security_v2_ceremonies [${QUIESCE_HELD_BEFORE:-unreadable}]); \
-a node with nothing in flight quiesces trivially, so this needs work \
-originated on the rehearsal chain that is still running at shutdown"
-    record_assertion \
-      "graceful quiescence starts no new work and lets held permits finish" \
-      false "quiescence with an in-flight security-v2 permit"
-  else
-    # The same grace the manifest grants and the compose file declares, so the
-    # node is not SIGKILLed before its own in-process backstop can finish what
-    # it holds. A number restated here would go on stopping nodes under the
-    # old ceiling the first time the reviewed bounds moved.
-    QUIESCE_GRACE="$(manifest_termination_grace)"
-    compose stop --timeout "${QUIESCE_GRACE}" "${quiesce_node}" &
-    local stop_pid=$!
-
-    # Watch the drain rather than sample its end: the contract is that no new
-    # permit is issued from the moment quiescing begins and that the held ones
-    # are left to finish, and both are statements about the whole window.
-    local held_now forced_now issued_now state_now refusals_now
-    QUIESCE_STATE=""
-    QUIESCE_ISSUED_AFTER="${QUIESCE_ISSUED_BEFORE}"
-    QUIESCE_FORCED_AFTER="${QUIESCE_FORCED_BEFORE}"
-    QUIESCE_DRAINED=0
-    QUIESCE_ATTEMPTED=0
-    QUIESCE_OFFER_FAILED=0
-    QUIESCE_OFFER_RC=""
-    QUIESCE_REFUSALS_AFTER="${QUIESCE_REFUSALS_BEFORE}"
-    QUIESCE_CEREMONY_REFUSALS_AFTER="${QUIESCE_CEREMONY_REFUSALS_BEFORE}"
-    QUIESCE_OFFERED=""
-    deadline=$((SECONDS + QUIESCE_GRACE))
-    while ((SECONDS < deadline)); do
-      state_now="$(participation_field "${quiesce_node}" gate_state \
-        2>/dev/null || true)"
-      if [[ "${state_now}" == "quiescing" ]]; then
-        QUIESCE_STATE="quiescing"
-        # Offered once the node has actually entered quiescence, because the
-        # property is what a quiescing node does with new work — and a node
-        # that was never asked answers exactly like one that refused. Only a
-        # clean driver run that named its transactions counts as having asked;
-        # a failed or empty one leaves nothing for the node to have refused,
-        # and QUIESCE_OFFER_FAILED carries that apart from never having tried.
-        if ((QUIESCE_ATTEMPTED == 0 && QUIESCE_OFFER_FAILED == 0)) &&
-          [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
-          run_work_driver quiesce-refusal || true
-          if driver_offered_work; then
-            QUIESCE_ATTEMPTED=1
-            QUIESCE_OFFERED="${WORK_DRIVER_ORIGINATED}"
-          else
-            QUIESCE_OFFER_FAILED=1
-            QUIESCE_OFFER_RC="${WORK_DRIVER_RC}"
-          fi
-        fi
-      fi
-      held_now="$(participation_field "${quiesce_node}" \
-        active_security_v2_ceremonies 2>/dev/null || printf '')"
-      if [[ "${held_now}" =~ ^[0-9]+$ ]] && ((held_now == 0)); then
-        QUIESCE_DRAINED=1
-      fi
-      issued_now="$(metric_value "${quiesce_node}" \
-        participation_mode_security_v2_total 2>/dev/null || printf '')"
-      if [[ "${issued_now}" =~ ^[0-9]+$ ]]; then
-        QUIESCE_ISSUED_AFTER="${issued_now}"
-      fi
-      forced_now="$(metric_value "${quiesce_node}" \
-        participation_quiesce_forced_aborts_total 2>/dev/null || printf '')"
-      if [[ "${forced_now}" =~ ^[0-9]+$ ]]; then
-        QUIESCE_FORCED_AFTER="${forced_now}"
-      fi
-      # Sampled inside the window rather than after it, for the same reason the
-      # issued counter is: the node stops answering when the drain finishes, and
-      # a refusal it recorded is only readable while it is still serving.
-      refusals_now="$(metric_value "${quiesce_node}" \
-        participation_refusals_total 2>/dev/null || printf '')"
-      if [[ "${refusals_now}" =~ ^[0-9]+$ ]]; then
-        QUIESCE_REFUSALS_AFTER="${refusals_now}"
-        QUIESCE_CEREMONY_REFUSALS_AFTER="$(ceremony_refusal_counters \
-          "${quiesce_node}")"
-      fi
-      # The node going unreachable is the drain finishing, not a failure.
-      node_reachable "${quiesce_node}" || break
-      sleep 2
-    done
-    wait "${stop_pid}" || true
-
-    # What became of the work the node was holding, asked once the drain is
-    # over and the outcomes exist to be read. The window above cannot ask: its
-    # subject is work still running, and by the time an outcome exists the work
-    # it was about is finished.
-    QUIESCE_TERMINAL=""
-    QUIESCE_TERMINAL_ASKED=0
-    QUIESCE_TERMINAL_RC=0
-    if [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
-      QUIESCE_TERMINAL_ASKED=1
-      run_work_driver quiesce-terminal || true
-      QUIESCE_TERMINAL="${WORK_DRIVER_BOUND_RESULTS}"
-      QUIESCE_TERMINAL_RC="${WORK_DRIVER_RC}"
-    fi
-
-    quiescence_verdict "${quiesce_node}"
-  fi
-
+  # The legacy half needs a permit anchored below C still in flight after it,
+  # which the gate issues on the anchor rather than on the current height. The
+  # node is the one the clock-failure step severed and reconnected; the other
+  # one is stopped.
   begin_step "quiescence with an in-flight legacy permit"
-  block_step "quiescence with an in-flight legacy permit" \
-    "${LEGACY_INTEROP_UNAVAILABLE}"
+  run_quiescence_control "${REHEARSAL_R1_SERVICES[0]}" \
+    "quiescence with an in-flight legacy permit" \
+    "" legacy active_legacy_ceremonies \
+    participation_mode_legacy_total quiesce-legacy
 
   # This gate ends where the next one begins. A rollback rehearsal's whole
   # subject is that no prior binary participates while a release candidate can
@@ -7877,7 +8371,7 @@ grace is not evidence for this release"
     # taken with an instrument nobody can identify; and one naming a digest
     # the reviewed control does not pin is a program that was reviewed
     # somewhere other than in this repository.
-    local recorded_driver recorded_generator drove
+    local recorded_driver recorded_generator recorded_review drove
     recorded_driver="$(node -e '
       const fs = require("fs");
       const record = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
@@ -7891,6 +8385,13 @@ grace is not evidence for this release"
       process.stdout.write(String(
         (record.chain_inputs || {}).rollback_evidence_generator_sha256 || ""
       ));
+    ' "${record}")"
+    recorded_review="$(node -e '
+      const fs = require("fs");
+      const record = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      process.stdout.write(
+        String((record.chain_inputs || {}).tsslib_review_sha256 || "")
+      );
     ' "${record}")"
     drove="$(node -e '
       const fs = require("fs");
@@ -7918,6 +8419,13 @@ ${SCAFFOLD_DIR}/chain-inputs.sha256 does not pin"
       blocked "evidence record ${record} was produced with a rollback \
 evidence generator hashing to [${recorded_generator}], which \
 ${SCAFFOLD_DIR}/chain-inputs.sha256 does not pin"
+    fi
+    if [[ -n "${recorded_review}" ]] &&
+      [[ "${recorded_review}" != "$(reviewed_input_digest tsslib-review)" ]]; then
+      blocked "evidence record ${record} names a dependency review record \
+hashing to [${recorded_review}], which ${SCAFFOLD_DIR}/chain-inputs.sha256 \
+does not pin; a record naming an unpinned review asserts an approval this \
+repository never took"
     fi
   done
 
@@ -8002,7 +8510,12 @@ evidence_acceptance_findings() {
               "the cutover fleet leaves no release candidate running",
           },
         ],
-        inputs: ["work_driver_sha256"],
+        // The dependency review is an acceptance input, not an execution
+        // one. Every step above can run, pass, and be recorded without it;
+        // what it decides is whether the mixed prior/R1 legacy transcripts
+        // those steps exercised are release-authoritative, which is a
+        // question about the dependency rather than about the run.
+        inputs: ["work_driver_sha256", "tsslib_review_sha256"],
       },
       rollback: {
         stages: [
@@ -8157,12 +8670,16 @@ evidence_acceptance_findings() {
       }
     }
 
+    // Both the instruments a gate took its readings with and the external
+    // approvals that evidence is accepted under. A record missing either is
+    // incomplete in the same way: it reports observations nobody can attribute
+    // to a reviewed input.
     const inputs = record.chain_inputs || {};
     for (const input of contract.inputs) {
       if (typeof inputs[input] !== "string" || inputs[input].length === 0) {
         add(
           "unrehearsed",
-          "required reviewed instrument digest " + JSON.stringify(input) +
+          "required reviewed release input " + JSON.stringify(input) +
             " is absent"
         );
       }
@@ -8208,7 +8725,7 @@ whatever the records that do exist show"
 
   note "every required step passed exactly once, every required assertion \
 holds against its designated passing step, and every required reviewed \
-instrument digest is present"
+release input is present"
 }
 
 # Do the records show the gates held?

@@ -307,6 +307,14 @@ jobs:
             # not know a checksum computed later, and one that carried it
             # anyway would be describing a drain that had not happened.
             echo "PR4109_ROLLBACK_EVIDENCE_GENERATOR=$RUNNER_TEMP/rehearsal-inputs/rollback-evidence-generator"
+            # Not a program at all: the archived independent cryptographic
+            # review of the dependency revision go.mod resolves. It gates
+            # acceptance of a single-release record rather than execution of
+            # any step, so it is optional here and the step below unsets this
+            # path when the bundle carries no such record — a rehearsal
+            # without it still runs everything and simply produces a record
+            # acceptance refuses.
+            echo "PR4109_TSSLIB_REVIEW=$RUNNER_TEMP/rehearsal-inputs/tsslib-review"
             # Written to, not read from: the rollback stage captures each
             # drained node's state here straight out of the container it
             # stopped. It holds live protocol state — key shares included —
@@ -373,7 +381,10 @@ jobs:
             echo "rollback-evidence-generator (executable, called with the" >&2
             echo "service name, that node's identity audit manifest, and an" >&2
             echo "output directory to write the four rollback evidence" >&2
-            echo "records into), record each program's reviewed SHA-256 in" >&2
+            echo "records into), optionally tsslib-review (the archived" >&2
+            echo "independent cryptographic review of the dependency" >&2
+            echo "revision go.mod resolves, which gates acceptance rather" >&2
+            echo "than execution), record each member's reviewed SHA-256 in" >&2
             echo "scripts/release/pr4109/chain-inputs.sha256, then" >&2
             echo "re-dispatch" >&2
             exit 3
@@ -395,6 +406,20 @@ jobs:
             exit 3
           fi
           echo "provisioned the work driver and the rollback evidence generator"
+
+          # The review record is an acceptance input, so its absence is not a
+          # provisioning failure: the rehearsal runs every step either way.
+          # The path is cleared rather than left dangling, because a variable
+          # naming a file that is not there is a supplied record the
+          # rehearsal cannot read, and that does block.
+          if [ -f "$PR4109_TSSLIB_REVIEW" ]; then
+            echo "provisioned the archived dependency review record"
+          else
+            echo "PR4109_TSSLIB_REVIEW=" >> "$GITHUB_ENV"
+            echo "no dependency review record in the bundle; every step will" \
+              "run and the emitted single-release record will not be" \
+              "acceptable until one is supplied and pinned"
+          fi
 
       # The records these stages emit are measured against the compiled bounds
       # the local-proofs stage attested at this same commit, and that receipt

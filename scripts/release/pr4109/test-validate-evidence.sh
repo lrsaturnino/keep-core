@@ -111,6 +111,7 @@ REVIEWED_WORK_DRIVER_DIGEST="$(reviewed_input_digest work-driver)"
 REVIEWED_ROLLBACK_GENERATOR_DIGEST="$(
   reviewed_input_digest rollback-evidence-generator
 )"
+REVIEWED_TSSLIB_REVIEW_DIGEST="$(reviewed_input_digest tsslib-review)"
 
 # A schema-complete record bound to the given manifest hash, grace,
 # generation timestamp, and source commit. The negative cases change exactly
@@ -200,7 +201,8 @@ write_record() {
     "termination_grace_period_seconds": ${grace}
   },
   "chain_inputs": {
-    "work_driver_sha256": "${REVIEWED_WORK_DRIVER_DIGEST}"
+    "work_driver_sha256": "${REVIEWED_WORK_DRIVER_DIGEST}",
+    "tsslib_review_sha256": "${REVIEWED_TSSLIB_REVIEW_DIGEST}"
   },
   "stages": [ ${stages} ],
   "assertions": [ ${assertions} ]
@@ -598,7 +600,44 @@ node -e '
 ' "${D}/record.json"
 run_validator "${D}"
 check "a complete single-release roster still requires its reviewed driver" 3 \
-  "required reviewed instrument digest.*work_driver_sha256.*absent"
+  "required reviewed release input.*work_driver_sha256.*absent"
+
+# The decoupling this contract exists to express: whether the dependency has
+# an archived independent review changes nothing about what the fleet can run,
+# so a rehearsal without it executes and records every mandatory step. It is
+# refused here, once, at acceptance — the record is complete and still not
+# release-authoritative.
+D="${WORK}/accept-missing-dependency-review"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  delete record.chain_inputs.tsslib_review_sha256;
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "every mandatory step passing does not accept an unreviewed dependency" \
+  3 "required reviewed release input.*tsslib_review_sha256.*absent"
+
+D="${WORK}/accept-unpinned-dependency-review"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  record.chain_inputs.tsslib_review_sha256 = "c".repeat(64);
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "a record naming a review the control does not pin is rejected" 3 \
+  "review record hashing to \[c{64}\]"
 
 # Repetition and invention cannot manufacture a complete gate. These records
 # keep the canonical item count deliberately plausible so the decision cannot
@@ -671,7 +710,7 @@ write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
   "${ROLLBACK_ASSERTIONS}" rollback
 run_validator "${D}"
 check "rollback requires the reviewed evidence generator as well as the driver" \
-  3 "required reviewed instrument digest.*rollback_evidence_generator_sha256"
+  3 "required reviewed release input.*rollback_evidence_generator_sha256"
 
 D="${WORK}/accept-complete-rollback"
 mkdir -p "${D}"
@@ -689,7 +728,7 @@ node -e '
 run_validator "${D}"
 check "the complete rollback contract with both reviewed instruments passes" 0 \
   "every required step passed exactly once" \
-  "every required reviewed instrument digest is present"
+  "every required reviewed release input is present"
 
 D="${WORK}/accept-failed-step"
 mkdir -p "${D}"
@@ -896,11 +935,13 @@ run_rehearsal() {
       CUTOVER_BLOCK="9000000"
       # shellcheck disable=SC2030,SC2031,SC2034
       REHEARSAL_GATE="${gate}"
-      # The real preflight records the reviewed programs it was handed before
+      # The real preflight records the reviewed inputs it was handed before
       # the fleet starts. These emitter cases bypass preflight and install the
       # same proven identities directly.
       # shellcheck disable=SC2030,SC2031,SC2034
       WORK_DRIVER_DIGEST="${REVIEWED_WORK_DRIVER_DIGEST}"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      TSSLIB_REVIEW_DIGEST="${REVIEWED_TSSLIB_REVIEW_DIGEST}"
       if [[ "${gate}" == "rollback" ]]; then
         # shellcheck disable=SC2030,SC2031,SC2034
         ROLLBACK_GENERATOR_DIGEST="${REVIEWED_ROLLBACK_GENERATOR_DIGEST}"
@@ -2005,7 +2046,10 @@ beacon_dkg@841@seed841=succeeded=${QUIESCE_TX2}=0xgroup841"
 quiesce_case() {
   quiesce_readings
   "$@"
-  quiescence_verdict r1-node-2
+  quiescence_verdict r1-node-2 \
+    "quiescence with an in-flight security-v2 permit" \
+    "graceful quiescence starts no new work and lets held permits finish" \
+    security-v2
 }
 
 run_verdict quiesce_case :
@@ -3085,6 +3129,207 @@ run_verdict homogeneous_case eval 'HOMOGENEOUS_PERMITS_AFTER="unreadable"'
 check "unreadable permit counters observe no mode at all" 3 \
   "fleet permit counters could not be read"
 
+# ----------------------------------------------------------------------------
+
+# The pre-cutover mixed-fleet controls, which are the post-C control's claim
+# inverted: legacy permits must be the ones issued, security-v2 must not
+# appear, and the prior binary has to be on the network while it happens.
+PRE_TX1="0xdd44444444444444444444444444444444444444444444444444444444444444"
+PRE_TX2="0xee55555555555555555555555555555555555555555555555555555555555555"
+
+precutover_readings() {
+  # shellcheck disable=SC2034
+  PRECUTOVER_DRIVER_SUPPLIED=1
+  # shellcheck disable=SC2034
+  PRECUTOVER_DRIVER_RC=0
+  # shellcheck disable=SC2034
+  PRECUTOVER_TX=2
+  # shellcheck disable=SC2034
+  PRECUTOVER_RESULTS="tbtc_wallet_action=succeeded beacon_signing=succeeded"
+  # shellcheck disable=SC2034
+  PRECUTOVER_BOUND="tbtc_wallet_action@840@wallet840=succeeded=${PRE_TX1}=0xbtc840 \
+beacon_signing@841@entry841=succeeded=${PRE_TX2}=0xentry841"
+  # shellcheck disable=SC2034
+  PRECUTOVER_PRIOR_RUNNING=1
+  # shellcheck disable=SC2034
+  PRECUTOVER_STATES=""
+  # shellcheck disable=SC2034
+  PRECUTOVER_LEGACY_BEFORE="2"
+  # shellcheck disable=SC2034
+  PRECUTOVER_LEGACY_AFTER="6"
+  # shellcheck disable=SC2034
+  PRECUTOVER_SECURITY_BEFORE="0"
+  # shellcheck disable=SC2034
+  PRECUTOVER_SECURITY_AFTER="0"
+  # shellcheck disable=SC2034
+  PRECUTOVER_SIGHTINGS_BEFORE="4"
+  # shellcheck disable=SC2034
+  PRECUTOVER_SIGHTINGS_AFTER="4"
+  # shellcheck disable=SC2034
+  CUTOVER_BLOCK="1000000"
+}
+
+precutover_case() {
+  precutover_readings
+  "$@"
+  precutover_verdict \
+    "representative pre-cutover work including the longest wallet action" \
+    "" "tbtc beacon" "threshold_ceremony bitcoin_action" \
+    "representative pre-cutover work"
+}
+
+run_verdict precutover_case :
+check "legacy-anchored work settling beside the prior binary holds" 0 \
+  "issued 4 new legacy permits" \
+  "no security-v2 permit" \
+  "tbtc_wallet_action@840@wallet840 \(${PRE_TX1}, 0xbtc840\)" \
+  "recognized no cross-format peer"
+
+# The step is named for a mixed fleet, and a fleet with one release on it is
+# not one however well its own work went.
+run_verdict precutover_case eval 'PRECUTOVER_PRIOR_RUNNING=0'
+check "R1 working alone is not a mixed prior/R1 control" 3 \
+  "prior binary.*was not running"
+
+# Work driven by a fleet already past C is not pre-cutover work, whatever
+# mode counter moved.
+run_verdict precutover_case eval \
+  'PRECUTOVER_STATES="r1-node-1 reported [open_security_v2] at block [1000001]"'
+check "a fleet past C drives no pre-cutover work" 3 \
+  "not on the legacy side of C"
+
+# The claim is that a pre-C anchor pins legacy. A security-v2 permit taken
+# while driving work anchored below C refutes exactly that.
+run_verdict precutover_case eval 'PRECUTOVER_SECURITY_AFTER="1"'
+check "a security-v2 permit below C refutes the anchor rule" 1 \
+  "pre-cutover anchor must pin the legacy mode"
+
+# And its mirror: no legacy permit at all means the ceremonies the driver
+# named were not run under this fleet's gate.
+run_verdict precutover_case eval 'PRECUTOVER_LEGACY_AFTER="2"'
+check "settled work with no legacy permit was not run under this gate" 1 \
+  "issued no new legacy permit"
+
+# Below C both releases speak one wire format, so a recognized cross-format
+# peer is the compatibility claim failing.
+run_verdict precutover_case eval 'PRECUTOVER_SIGHTINGS_AFTER="5"'
+check "a cross-format peer below C refutes the compatibility claim" 1 \
+  "below C the two releases must be one wire format"
+
+# The coverage requirement is what makes the second pre-C step a different
+# claim from the first rather than a repeat of it.
+run_verdict precutover_case eval \
+  'PRECUTOVER_BOUND="beacon_signing@841@entry841=succeeded=${PRE_TX2}=0xentry841
+     tbtc_signing@840@wallet840=succeeded=${PRE_TX1}=0xsig840"'
+check "pre-cutover work without a wallet action is not the longest action" 3 \
+  "no bitcoin_action"
+
+run_verdict precutover_case eval 'PRECUTOVER_DRIVER_SUPPLIED=0'
+check "no driver originates no pre-cutover ceremony to observe" 3 \
+  "no PR4109_WORK_DRIVER was supplied"
+
+run_verdict precutover_case eval 'PRECUTOVER_TX=0'
+check "a pre-cutover driver naming no transaction attributes nothing" 3 \
+  "reported no transaction"
+
+run_verdict precutover_case eval \
+  'PRECUTOVER_RESULTS="tbtc_wallet_action=succeeded beacon_signing=timed_out"'
+check "a compatibility control is not read off the work that survived" 1 \
+  "beacon_signing=timed_out"
+
+# ----------------------------------------------------------------------------
+
+# The in-flight half of the crossing: a permit taken below C that is still
+# held when C passes and finishes afterwards.
+SURVIVE_TX="0xff66666666666666666666666666666666666666666666666666666666666666"
+
+surviving_readings() {
+  # shellcheck disable=SC2034
+  SURVIVING_DRIVER_SUPPLIED=1
+  # shellcheck disable=SC2034
+  SURVIVING_ORIGINATE_RC=0
+  # shellcheck disable=SC2034
+  SURVIVING_ORIGINATED="tbtc_signing@840@wallet840=${SURVIVE_TX}=r1-node-1~member-1"
+  # shellcheck disable=SC2034
+  SURVIVING_HELD_BEFORE="1"
+  # shellcheck disable=SC2034
+  SURVIVING_LEGACY_COMPLETIONS_BEFORE="0"
+  # shellcheck disable=SC2034
+  SURVIVING_LEGACY_COMPLETIONS_AFTER="1"
+  # shellcheck disable=SC2034
+  SURVIVING_TERMINAL_ASKED=1
+  # shellcheck disable=SC2034
+  SURVIVING_TERMINAL_RC=0
+  # shellcheck disable=SC2034
+  SURVIVING_TERMINAL="tbtc_signing@840@wallet840=succeeded=${SURVIVE_TX}=0xsigned840"
+}
+
+surviving_case() {
+  surviving_readings
+  "$@"
+  surviving_legacy_verdict
+}
+
+run_verdict surviving_case :
+check "a legacy permit held across C and finished holds the control" 0 \
+  "tbtc_signing@840@wallet840 \(${SURVIVE_TX}, 0xsigned840\)" \
+  "recorded 1 legacy completion"
+
+# The reading that separates surviving C from merely finishing before it.
+run_verdict surviving_case eval 'SURVIVING_LEGACY_COMPLETIONS_AFTER="0"'
+check "settled work with no post-C legacy completion did not survive C" 1 \
+  "no gate recorded a legacy completion after C"
+
+# A permit that had already ended when C approached never met the crossing.
+run_verdict surviving_case eval 'SURVIVING_HELD_BEFORE="0"'
+check "work that ended before C is not work held across it" 3 \
+  "had already ended"
+
+# A terminal phase must be about the work this step put on the chain.
+run_verdict surviving_case eval \
+  'SURVIVING_TERMINAL="beacon_dkg@900@seed900=succeeded=${SURVIVE_TX}=0xgroup900"'
+check "an outcome for other work is not the held permit finishing" 3 \
+  "did not originate before C"
+
+run_verdict surviving_case eval \
+  'SURVIVING_TERMINAL="tbtc_signing@840@wallet840=no_threshold=${SURVIVE_TX}=no_threshold"'
+check "legacy work abandoned on the far side of C refutes the gate" 1 \
+  "came to nothing"
+
+run_verdict surviving_case eval 'SURVIVING_TERMINAL_ASKED=0'
+check "a permit never followed up is not a permit that finished" 3 \
+  "never asked what became of"
+
+run_verdict surviving_case eval 'SURVIVING_ORIGINATED=""'
+check "a driver naming no pre-C work identifies no surviving permit" 3 \
+  "named no work it put on the chain before C"
+
+run_verdict surviving_case eval 'SURVIVING_DRIVER_SUPPLIED=0'
+check "no driver holds no legacy permit across C" 3 \
+  "no PR4109_WORK_DRIVER was supplied"
+
+# ----------------------------------------------------------------------------
+
+# The legacy half of quiescence decides the same ladder as the security-v2
+# half over a different permit population, and records no assertion of its
+# own: the contract names one graceful-quiescence assertion and binds it to
+# the security-v2 step.
+legacy_quiesce_case() {
+  quiesce_readings
+  "$@"
+  quiescence_verdict r1-node-1 \
+    "quiescence with an in-flight legacy permit" "" legacy
+}
+
+run_verdict legacy_quiesce_case :
+check "a legacy quiescence that drained its permits holds the same ladder" 0 \
+  "in-flight count observed at zero" \
+  "quiescence with an in-flight legacy permit"
+
+run_verdict legacy_quiesce_case eval 'QUIESCE_STATE=""'
+check "a draining node that never quiesced refutes the legacy half too" 1 \
+  "never reported quiescing" "legacy ceremonies in flight"
+
 # The accounting every "was work offered here" rung above reads. It comes off a
 # real driver invocation rather than a constructed reading, because what is
 # being tested is that the driver's own exit status and report reach those
@@ -3708,6 +3953,118 @@ rm -f "${INPUT_CONTROL}"
 input_case "${INPUT_PROGRAM}"
 check "a missing control file pins nothing and binds nothing" 3 \
   "no reviewed SHA-256 for work-driver is recorded"
+
+# The third external input, which the rehearsal never executes: the archived
+# independent review of the dependency revision the build resolves. It is
+# bound twice — to a digest reviewed in a commit, and to the commit go.mod
+# resolves — because either binding alone admits a review of other code.
+REVIEW_CONTROL="${WORK}/review-inputs.sha256"
+REVIEW_RECORD="${WORK}/tsslib-review-fixture.md"
+REVIEW_REPO="${WORK}/review-repo"
+mkdir -p "${REVIEW_REPO}"
+REVIEW_COMMIT="d847ce003019"
+cat >"${REVIEW_REPO}/go.mod" <<EOF
+module example
+
+replace (
+	github.com/bnb-chain/tss-lib => github.com/threshold-network/tss-lib v0.0.0-20260729021955-${REVIEW_COMMIT}
+)
+EOF
+
+review_case() {
+  set +e
+  CASE_OUT="$(
+    (
+      # shellcheck disable=SC2030,SC2031,SC2034
+      REPO_ROOT="${2:-${REVIEW_REPO}}"
+      require_reviewed_record PR4109_TSSLIB_REVIEW tsslib-review "$1" \
+        "${REVIEW_CONTROL}"
+    ) 2>&1
+  )"
+  CASE_RC=$?
+  set -e
+}
+
+printf 'reviewed %s: no findings\n' "${REVIEW_COMMIT}" >"${REVIEW_RECORD}"
+REVIEW_DIGEST="$(hash_stdin <"${REVIEW_RECORD}")"
+cat >"${REVIEW_CONTROL}" <<EOF
+# a reviewed control file
+${REVIEW_DIGEST}  tsslib-review
+EOF
+
+review_case "${REVIEW_RECORD}"
+check "a review record hashing to its reviewed digest and naming the pinned \
+revision is accepted" 0 "${REVIEW_DIGEST}"
+
+review_case ""
+check "a rehearsal handed no review record has none to bind" 0 "^$"
+
+review_case "${WORK}/no-such-review"
+check "a review record that cannot be read is bound to nothing" 3 \
+  "is not a readable file"
+
+# The substitution the commit binding exists for: a real, reviewed-looking
+# document about some other revision of the dependency.
+printf 'reviewed 0000000000ff: no findings\n' >"${WORK}/other-review"
+cat >"${REVIEW_CONTROL}" <<EOF
+$(hash_stdin <"${WORK}/other-review")  tsslib-review
+EOF
+review_case "${WORK}/other-review"
+check "a review of another revision is not a review of the pinned one" 3 \
+  "does not name the dependency revision \[${REVIEW_COMMIT}\]"
+
+# And the mutable-bundle regression, identical in shape to the driver one: a
+# document naming the right revision is still not the reviewed document.
+printf 'reviewed %s: findings withdrawn\n' "${REVIEW_COMMIT}" \
+  >"${WORK}/edited-review"
+cat >"${REVIEW_CONTROL}" <<EOF
+${REVIEW_DIGEST}  tsslib-review
+EOF
+review_case "${WORK}/edited-review"
+check "an edited review record stops the rehearsal" 3 \
+  "hashes to" "pins tsslib-review at ${REVIEW_DIGEST}"
+
+cat >"${REVIEW_CONTROL}" <<'EOF'
+# a control file pinning something else entirely
+0000000000000000000000000000000000000000000000000000000000000001  work-driver
+EOF
+review_case "${REVIEW_RECORD}"
+check "a review record no reviewed digest names at all is unbound" 3 \
+  "no reviewed SHA-256 for tsslib-review is recorded"
+
+# A tree whose build resolves no replacement has no revision for a review to
+# be about, so nothing can be bound and nothing is accepted.
+cat >"${REVIEW_CONTROL}" <<EOF
+${REVIEW_DIGEST}  tsslib-review
+EOF
+mkdir -p "${WORK}/no-replace-repo"
+printf 'module example\n' >"${WORK}/no-replace-repo/go.mod"
+review_case "${REVIEW_RECORD}" "${WORK}/no-replace-repo"
+check "a tree resolving no dependency replacement binds no review" 3 \
+  "resolves no github.com/bnb-chain/tss-lib replacement"
+
+# The revision the binding is against is the one this tree actually builds,
+# read where the build reads it.
+CHECKED_IN_TSSLIB="$(pinned_tsslib_commit)"
+if [[ "${CHECKED_IN_TSSLIB}" =~ ^[0-9a-f]{12}$ ]]; then
+  printf 'ok   the pinned dependency revision is read out of go.mod\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL go.mod resolved the dependency revision as [%s]\n' \
+    "${CHECKED_IN_TSSLIB}"
+  FAILED=$((FAILED + 1))
+fi
+
+CHECKED_IN_REVIEW="$(reviewed_input_digest tsslib-review)"
+if [[ "${CHECKED_IN_REVIEW}" == \
+  "0000000000000000000000000000000000000000000000000000000000000000" ]]; then
+  printf 'ok   the checked-in control pins no dependency review\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL the checked-in tsslib-review digest is [%s]; if a review has \
+been archived this expectation moves with it\n' "${CHECKED_IN_REVIEW}"
+  FAILED=$((FAILED + 1))
+fi
 
 # And the checked-in control itself: the placeholder must match no program, so
 # a rehearsal cannot be dispatched with an unreviewed driver until a reviewed

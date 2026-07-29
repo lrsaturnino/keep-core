@@ -1304,15 +1304,34 @@ owner of `SetProtocolMode` and session-nonce configuration, the temporary
 legacy refusals are removed, and the formerly skipped homogeneous legacy DKG
 and signing cases run complete real transcripts after a pre-cutover anchor.
 
-Independent cryptographic review is still a release gate. The commit is
-published on the dependency repository's `codex/dual-mode-transcript` branch
-and proposed for review in `threshold-network/tss-lib#9`, but this repository
-does not contain an archived independent review record for it. The
-`single-release` container rehearsal therefore records the mixed-prior/R1
-legacy-image steps as `blocked` until that external review input is supplied.
-This is intentionally narrower than the former blocker: the implementation,
-immutable dependency pin, and in-repository acceptance evidence now exist;
-only independent review and exact-image execution remain.
+Independent cryptographic review is still a release gate, and it is a gate on
+*evidence acceptance* rather than on execution. The commit is published on the
+dependency repository's `codex/dual-mode-transcript` branch and proposed for
+review in `threshold-network/tss-lib#9`, but this repository does not contain
+an archived independent review record for it.
+
+Whether that review exists changes nothing about what a rehearsal can run or
+observe — the immutable images and the work driver decide that — so the four
+mixed-prior/R1 legacy-image steps of the `single-release` gate execute
+whenever those artifacts are supplied, and record what they observed. What the
+review decides is whether the resulting record is release-authoritative, and
+that is settled once, at acceptance:
+
+- `PR4109_TSSLIB_REVIEW` names an archived review record. It is never
+  executed. It is bound twice — its bytes must hash to the `tsslib-review`
+  digest reviewed in `chain-inputs.sha256`, and the document must name the
+  exact dependency revision `go.mod` resolves — because either binding alone
+  admits a review of other code.
+- The `single_release` acceptance contract requires `tsslib_review_sha256` in
+  the emitted record's `chain_inputs`. A rehearsal that ran every mandatory
+  step without a review record produces a complete, admissible record that
+  acceptance still refuses.
+
+`chain-inputs.sha256` pins the all-zero placeholder for `tsslib-review`, which
+matches no file, so supplying a review record blocks until a real digest is
+recorded there in a reviewed commit. The implementation, immutable dependency
+pin, and in-repository acceptance evidence exist; independent review and
+exact-image execution remain.
 
 ## clientInfo.port 9601 compatibility smoke matrix
 

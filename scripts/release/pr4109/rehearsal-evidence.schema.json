@@ -66,12 +66,13 @@
       }
     },
     "chain_inputs": {
-      "description": "SHA-256 digests of the two programs the rehearsal executes but does not contain: the work driver that originates ceremonies on the rehearsal chain, and the generator that produces each node's external rollback evidence. Both arrive from outside the repository and both produce readings that become release evidence, so the rehearsal refuses to run either unless its bytes hash to the digest reviewed in scripts/release/pr4109/chain-inputs.sha256. A record naming no digest for a program is a run that was never handed one.",
+      "description": "SHA-256 digests of the external inputs the rehearsal depends on but does not contain. Two are programs it executes: the work driver that originates ceremonies on the rehearsal chain, and the generator that produces each node's external rollback evidence. Both arrive from outside the repository and both produce readings that become release evidence, so the rehearsal refuses to run either unless its bytes hash to the digest reviewed in scripts/release/pr4109/chain-inputs.sha256. The third is never executed: the archived independent cryptographic review of the dual-mode dependency revision go.mod resolves, which gates acceptance of a single-release record rather than execution of any step. A record naming no digest for an input is a run that was never handed one.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
         "work_driver_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-        "rollback_evidence_generator_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        "rollback_evidence_generator_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "tsslib_review_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
       }
     },
     "stages": {
