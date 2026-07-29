@@ -282,6 +282,7 @@ func TestRegisterDiagnosticSources_EmitsGateStateContract(t *testing.T) {
 				"identity_bound":        true,
 			},
 		},
+		"recent_terminal_outcomes": []interface{}{},
 	}
 
 	if !reflect.DeepEqual(decoded, expected) {
@@ -318,6 +319,87 @@ func TestRegisterDiagnosticSources_EmitsGateStateContract(t *testing.T) {
 			current,
 			float64(1300),
 		)
+	}
+}
+
+// TestRegisterDiagnosticSources_NamesWhatBecameOfClosedPermits asserts a scrape
+// can follow a permit past the point it stops being held.
+//
+// The held-permit list names work while the node has it. The moment the work
+// finishes, the permit leaves that list and the scrape says nothing further —
+// so an observer watching work cross the cutover can see it held and then has
+// to take some other party's report for how it ended. A report about a ceremony
+// is not evidence about a ceremony. The emitted record is the node's own, and
+// carries the same permit identity the held list does, so the two readings join.
+func TestRegisterDiagnosticSources_NamesWhatBecameOfClosedPermits(t *testing.T) {
+	gate, _, _ := newTestGate(
+		t,
+		Schedule{CutoverBlock: 1000},
+		1200,
+		inertPollInterval,
+	)
+	roster, _, _ := newTestRoster(t, 1200, 100)
+	registry := newRecordingRegistry()
+
+	RegisterDiagnosticSources(
+		registry,
+		gate,
+		roster,
+		&stubChainIdentity{chainID: big.NewInt(1)},
+		"release_baked",
+	)
+
+	permit, err := gate.Begin(
+		TBTCSigning,
+		1100,
+		PermitIdentity{WorkID: strings.Repeat("a", 64), PermitID: "1"},
+	)
+	if err != nil {
+		t.Fatalf("failed to begin a ceremony: [%v]", err)
+	}
+	if err := permit.RecordTerminalOutcome(
+		TerminalOutcomeCompleted,
+		TerminalEvidence{
+			Kind:      TerminalEvidenceBitcoinTransaction,
+			Reference: "signed-transaction-hash",
+		},
+	); err != nil {
+		t.Fatalf("failed to record a terminal outcome: [%v]", err)
+	}
+	permit.Close()
+
+	decoded := registry.scrape(t, DiagnosticsSourceProtocolParticipation)
+
+	if held, _ := decoded["active_permits"].([]interface{}); len(held) != 0 {
+		t.Fatalf("a closed permit is still emitted as held: %v", held)
+	}
+
+	outcomes, _ := decoded["recent_terminal_outcomes"].([]interface{})
+	if len(outcomes) != 1 {
+		t.Fatalf(
+			"expected the closed permit to be accounted for, got: %v",
+			decoded["recent_terminal_outcomes"],
+		)
+	}
+	record, _ := outcomes[0].(map[string]interface{})
+	if record["outcome"] != string(TerminalOutcomeCompleted) {
+		t.Errorf("unexpected emitted outcome: %v", record["outcome"])
+	}
+
+	// The permit identity is the join to the held reading; a disposition that
+	// named no permit would say only that something somewhere finished.
+	emittedPermit, _ := record["permit"].(map[string]interface{})
+	if emittedPermit["work_id"] != strings.Repeat("a", 64) ||
+		emittedPermit["permit_id"] != "1" ||
+		emittedPermit["ceremony"] != string(TBTCSigning) ||
+		emittedPermit["mode"] != ModeSecurityV2.String() {
+		t.Errorf("the closed permit is not identified: %v", record["permit"])
+	}
+
+	evidence, _ := record["evidence"].(map[string]interface{})
+	if evidence["kind"] != string(TerminalEvidenceBitcoinTransaction) ||
+		evidence["reference"] != "signed-transaction-hash" {
+		t.Errorf("the owner's evidence is not emitted: %v", record["evidence"])
 	}
 }
 

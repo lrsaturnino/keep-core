@@ -104,6 +104,20 @@ func RegisterDiagnosticSources(
 			if permits == nil {
 				permits = []PermitSnapshot{}
 			}
+			// What became of the permits that are no longer here. A live
+			// reading names the work a node is holding; without this, the
+			// moment that work finishes it leaves nothing behind, and an
+			// observer following work across the cutover has to take some
+			// other party's word for how it ended. These are the node's own
+			// records, written by each ceremony's owner, and they carry the
+			// same permit identities the live list does — so a permit seen
+			// held can be followed to the disposition its owner recorded for
+			// it. Public identities only, exactly as the quiescence journal
+			// that outlives them carries.
+			terminalOutcomes := snapshot.RecentTerminalOutcomes
+			if terminalOutcomes == nil {
+				terminalOutcomes = []TerminalOutcomeRecord{}
+			}
 			bytes, err := json.Marshal(map[string]interface{}{
 				"protocol_epoch":                CompiledEpoch.String(),
 				"ethereum_chain_id":             chainID.String(),
@@ -118,6 +132,7 @@ func RegisterDiagnosticSources(
 				"active_legacy_ceremonies":      snapshot.ActiveLegacyCeremonies,
 				"active_security_v2_ceremonies": snapshot.ActiveSecurityV2Ceremonies,
 				"active_permits":                permits,
+				"recent_terminal_outcomes":      terminalOutcomes,
 			})
 			if err != nil {
 				diagnosticsLogger.Errorf(

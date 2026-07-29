@@ -194,6 +194,229 @@ func TestGate_NodeAuthoredTerminalOutcomes(t *testing.T) {
 	}
 }
 
+// TestGate_RetainsTerminalOutcomesOfClosedPermits asserts the gate keeps its
+// own account of what became of the permits it closed, and that the account is
+// available without a quiescence transition.
+//
+// The journal exists only from the first quiescence onward. Before one, a
+// permit that finishes simply disappears from the live state: an observer
+// watching work cross the cutover sees it held and then sees nothing, and has
+// to take some other party's report for how it ended. A report about a
+// ceremony is not evidence about a ceremony, and the difference is the whole
+// point of the record — so what the ceremony's own owner recorded has to
+// outlive the permit while the node is still running.
+func TestGate_RetainsTerminalOutcomesOfClosedPermits(t *testing.T) {
+	const cutover = uint64(1_000)
+	gate, err := newGate(
+		context.Background(),
+		Schedule{CutoverBlock: cutover},
+		newGateBlockCounter(cutover),
+		newFakeMetrics(),
+		inertPollInterval,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(gate.Close)
+
+	// No quiescence transition anywhere in this test: the account has to be
+	// there for a node that is simply running.
+	completed, err := gate.Begin(
+		TBTCSigning,
+		cutover,
+		PermitIdentity{WorkID: "wallet-action", PermitID: "wallet"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	silent, err := gate.Begin(
+		BeaconRelayForwarding,
+		cutover,
+		PermitIdentity{WorkID: "relay-request", PermitID: "forwarder"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if held := gate.State().RecentTerminalOutcomes; len(held) != 0 {
+		t.Fatalf("a live permit was accounted for as closed: %+v", held)
+	}
+
+	if err := completed.RecordTerminalOutcome(
+		TerminalOutcomeCompleted,
+		TerminalEvidence{
+			Kind:      TerminalEvidenceBitcoinTransaction,
+			Reference: "signed-transaction-hash",
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	completed.Close()
+	silent.Close()
+
+	outcomes := gate.State().RecentTerminalOutcomes
+	if len(outcomes) != 2 {
+		t.Fatalf("expected two closed permits accounted for: %+v", outcomes)
+	}
+
+	// The order is the order they closed in, which is what says which of two
+	// dispositions came first.
+	if outcomes[0].Permit.WorkID != "wallet-action" ||
+		outcomes[1].Permit.WorkID != "relay-request" {
+		t.Errorf("closed permits are not in the order they closed: %+v", outcomes)
+	}
+	if outcomes[0].Outcome != TerminalOutcomeCompleted {
+		t.Errorf(
+			"the owner's recorded outcome was not retained: %+v",
+			outcomes[0],
+		)
+	}
+	if outcomes[0].Evidence.Reference != "signed-transaction-hash" {
+		t.Errorf(
+			"the owner's recorded evidence was not retained: %+v",
+			outcomes[0].Evidence,
+		)
+	}
+	// The permit identity is what a reader joins the record to a live reading
+	// on; without it the account names dispositions belonging to nobody.
+	if outcomes[0].Permit.PermitID != "wallet" ||
+		outcomes[0].Permit.Ceremony != TBTCSigning ||
+		outcomes[0].Permit.Mode != ModeSecurityV2.String() {
+		t.Errorf("the closed permit's identity was not retained: %+v", outcomes[0])
+	}
+	// A permit whose owner recorded nothing is not silently absent. Its
+	// ceremony came to something the node cannot vouch for, and that is a
+	// disposition a reader has to be able to see.
+	if outcomes[1].Outcome != terminalOutcomeUnresolved {
+		t.Errorf(
+			"a permit closed without an owner outcome was not accounted "+
+				"for as unresolved: %+v",
+			outcomes[1],
+		)
+	}
+
+	// Closing again must not double-count: an idempotent release that added a
+	// second record would make one ceremony look like two.
+	completed.Close()
+	if again := gate.State().RecentTerminalOutcomes; len(again) != 2 {
+		t.Errorf("a repeated release was accounted for twice: %+v", again)
+	}
+}
+
+// TestGate_TerminalOutcomeAccountIsBounded asserts the gate's account of closed
+// permits forgets rather than growing without limit, and that it forgets the
+// oldest.
+//
+// A node runs for as long as the release does, so an account that kept every
+// permit would be a slow leak in the one component every ceremony passes
+// through.
+func TestGate_TerminalOutcomeAccountIsBounded(t *testing.T) {
+	const cutover = uint64(1_000)
+	gate, err := newGate(
+		context.Background(),
+		Schedule{CutoverBlock: cutover},
+		newGateBlockCounter(cutover),
+		newFakeMetrics(),
+		inertPollInterval,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(gate.Close)
+
+	const surplus = 3
+	for i := 0; i < retainedTerminalOutcomes+surplus; i++ {
+		permit, err := gate.Begin(
+			TBTCSigning,
+			cutover,
+			PermitIdentity{
+				WorkID:   fmt.Sprintf("wallet-action-%d", i),
+				PermitID: fmt.Sprintf("wallet-%d", i),
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		permit.Close()
+	}
+
+	outcomes := gate.State().RecentTerminalOutcomes
+	if len(outcomes) != retainedTerminalOutcomes {
+		t.Fatalf(
+			"unexpected account size\nexpected: [%d]\nactual:   [%d]",
+			retainedTerminalOutcomes,
+			len(outcomes),
+		)
+	}
+	if first := outcomes[0].Permit.WorkID; first !=
+		fmt.Sprintf("wallet-action-%d", surplus) {
+		t.Errorf("the account did not forget the oldest permits: [%s]", first)
+	}
+	if last := outcomes[len(outcomes)-1].Permit.WorkID; last !=
+		fmt.Sprintf("wallet-action-%d", retainedTerminalOutcomes+surplus-1) {
+		t.Errorf("the account did not keep the newest permit: [%s]", last)
+	}
+}
+
+// TestGate_TerminalOutcomeAccountIsNotAliased asserts a reader cannot reach
+// into the gate's own account through the snapshot it is handed.
+//
+// The evidence carries the chain settlement by pointer, so a shallow copy
+// would hand every scrape a live reference to the record the gate keeps.
+func TestGate_TerminalOutcomeAccountIsNotAliased(t *testing.T) {
+	const cutover = uint64(1_000)
+	gate, err := newGate(
+		context.Background(),
+		Schedule{CutoverBlock: cutover},
+		newGateBlockCounter(cutover),
+		newFakeMetrics(),
+		inertPollInterval,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(gate.Close)
+
+	// The heartbeat is the one ceremony that dispatches a chain settlement of
+	// its own, so it is the only permit whose evidence carries the pointer
+	// this test is about.
+	permit, err := gate.Begin(
+		TBTCHeartbeat,
+		cutover,
+		PermitIdentity{WorkID: "heartbeat-work", PermitID: "heartbeat"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.RecordTerminalOutcome(
+		TerminalOutcomeCompleted,
+		TerminalEvidence{
+			Kind:      TerminalEvidenceProtocolResult,
+			Reference: "heartbeat-result-identity",
+			ChainSettlement: &ChainSettlementRecord{
+				Kind: ChainSettlementInactivityClaim,
+			},
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	permit.Close()
+
+	handed := gate.State().RecentTerminalOutcomes
+	if len(handed) != 1 || handed[0].Evidence.ChainSettlement == nil {
+		t.Fatalf("the settled outcome was not retained: %+v", handed)
+	}
+	handed[0].Evidence.ChainSettlement.Reference = "some-other-claim"
+
+	reread := gate.State().RecentTerminalOutcomes
+	if reread[0].Evidence.ChainSettlement.Reference != "" {
+		t.Errorf(
+			"a reader rewrote the gate's own record: [%s]",
+			reread[0].Evidence.ChainSettlement.Reference,
+		)
+	}
+}
+
 func TestGate_NodeAuthoredTerminalOutcomeRetriesPersistence(t *testing.T) {
 	const cutover = uint64(1_000)
 	capturedAt := time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC)

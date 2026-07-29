@@ -217,6 +217,11 @@ type Snapshot struct {
 	ActiveLegacyCeremonies     uint64
 	ActiveSecurityV2Ceremonies uint64
 	ActivePermits              []PermitSnapshot
+	// RecentTerminalOutcomes is the gate's own account of what became of the
+	// permits it has already closed, oldest first and bounded. It is the same
+	// record the quiescence journal carries, available while the node is still
+	// running rather than only from a quiescence transition onward.
+	RecentTerminalOutcomes []TerminalOutcomeRecord
 }
 
 // Gate issues per-ceremony participation permits with the protocol mode pinned
@@ -427,7 +432,25 @@ type chainGate struct {
 	lastState          State
 	nextPermitID       uint64
 	quiescenceSnapshot *QuiescenceSnapshot
+	// terminalOutcomes retains what became of the permits this gate has
+	// already closed, oldest first, bounded to the most recent
+	// retainedTerminalOutcomes.
+	//
+	// The journal only exists from a quiescence transition onward, so before
+	// one there is nothing node-authored saying what a permit came to — an
+	// observer watching work cross the cutover has only its own word for it,
+	// and a report about a ceremony is not evidence about a ceremony. This is
+	// the gate's own account of the same records, kept while the node is still
+	// running, so a permit that appeared in a live reading can be followed to
+	// the outcome its owner recorded rather than to one claimed for it.
+	terminalOutcomes []TerminalOutcomeRecord
 }
+
+// retainedTerminalOutcomes bounds the gate's in-memory account of closed
+// permits. A node runs indefinitely, so the account has to forget: this holds
+// well past the permit population of any one cutover while staying a fixed
+// cost.
+const retainedTerminalOutcomes = 512
 
 // NewGate constructs the production gate from a resolved schedule and the
 // shared chain block counter. It synchronously reads the current chain height
@@ -1288,27 +1311,31 @@ func (p *permit) Close() {
 			return
 		}
 
-		if g.quiescenceSnapshot != nil {
-			if p.terminalOutcome == nil {
-				p.terminalOutcome = &TerminalOutcomeRecord{
-					RecordedAt: g.now().UTC(),
-					Permit:     p.snapshot(),
-					Outcome:    terminalOutcomeUnresolved,
-				}
+		// A permit whose owner recorded nothing left no account of what its
+		// ceremony came to. That is a disposition in itself and it is the one
+		// the offline barrier refuses on, so it is written here rather than
+		// left as a silent absence — under quiescence for the journal, and
+		// always for the gate's own retained account.
+		if p.terminalOutcome == nil {
+			p.terminalOutcome = &TerminalOutcomeRecord{
+				RecordedAt: g.now().UTC(),
+				Permit:     p.snapshot(),
+				Outcome:    terminalOutcomeUnresolved,
 			}
+		}
+		g.retainTerminalOutcome(*p.terminalOutcome)
 
-			if g.recorder != nil {
-				if err := g.recorder.RecordTerminalOutcome(
-					*p.terminalOutcome,
-				); err != nil {
-					gateLogger.Warnf(
-						"protocol participation terminal outcome could not "+
-							"be persisted [ceremony=%s] [outcome=%s] [error=%s]",
-						p.ceremony,
-						p.terminalOutcome.Outcome,
-						err,
-					)
-				}
+		if g.quiescenceSnapshot != nil && g.recorder != nil {
+			if err := g.recorder.RecordTerminalOutcome(
+				*p.terminalOutcome,
+			); err != nil {
+				gateLogger.Warnf(
+					"protocol participation terminal outcome could not "+
+						"be persisted [ceremony=%s] [outcome=%s] [error=%s]",
+					p.ceremony,
+					p.terminalOutcome.Outcome,
+					err,
+				)
 			}
 		}
 
@@ -1366,7 +1393,47 @@ func (g *chainGate) State() Snapshot {
 		ActiveLegacyCeremonies:     g.activeLegacy,
 		ActiveSecurityV2Ceremonies: g.activeSecurityV2,
 		ActivePermits:              g.permitSnapshotsLocked(),
+		RecentTerminalOutcomes:     g.terminalOutcomesLocked(),
 	}
+}
+
+// retainTerminalOutcome adds a closed permit's disposition to the gate's own
+// account of them, dropping the oldest once the account is full. The caller
+// must hold g.mu.
+func (g *chainGate) retainTerminalOutcome(record TerminalOutcomeRecord) {
+	if len(g.terminalOutcomes) == retainedTerminalOutcomes {
+		copy(g.terminalOutcomes, g.terminalOutcomes[1:])
+		g.terminalOutcomes[len(g.terminalOutcomes)-1] = record
+		return
+	}
+
+	g.terminalOutcomes = append(g.terminalOutcomes, record)
+}
+
+// terminalOutcomesLocked returns a copy of the gate's account of closed
+// permits, oldest first. The caller must hold g.mu.
+//
+// The order is the order the permits closed in and is not re-sorted. What a
+// reader joins on is the permit identity each record carries; the sequence is
+// the one piece of information a re-sort would destroy, and it is what says
+// which of two dispositions of neighbouring work came first.
+func (g *chainGate) terminalOutcomesLocked() []TerminalOutcomeRecord {
+	if len(g.terminalOutcomes) == 0 {
+		return nil
+	}
+
+	records := make([]TerminalOutcomeRecord, 0, len(g.terminalOutcomes))
+	for _, record := range g.terminalOutcomes {
+		// The settlement hangs off the evidence by pointer, so a plain copy
+		// would hand a reader the gate's own record to hold.
+		if record.Evidence.ChainSettlement != nil {
+			settlement := *record.Evidence.ChainSettlement
+			record.Evidence.ChainSettlement = &settlement
+		}
+		records = append(records, record)
+	}
+
+	return records
 }
 
 // permitSnapshotsLocked returns a deterministic copy of the real live-permit
