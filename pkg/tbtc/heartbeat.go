@@ -63,7 +63,7 @@ type heartbeatSigningExecutor interface {
 		message *big.Int,
 		startBlock uint64,
 		mode participation.ProtocolMode,
-	) (*tecdsa.Signature, *signingActivityReport, uint64, error)
+	) (*signingOutcome, error)
 }
 
 // heartbeatInactivityClaimExecutor is an interface meant to decouple the
@@ -229,6 +229,7 @@ func (hps heartbeatPenaltyState) inactiveMemberBytes() []byte {
 // and is recorded as exhausted.
 func (ha *heartbeatAction) recordTerminalOutcome(
 	signature *tecdsa.Signature,
+	transcript *participation.TranscriptContribution,
 	penalty heartbeatPenaltyState,
 ) {
 	if signature == nil {
@@ -262,15 +263,22 @@ func (ha *heartbeatAction) recordTerminalOutcome(
 			// assert, so it travels separately as chain state the audit
 			// reconciles against the WalletRegistry.
 			ChainSettlement: penalty.chainSettlement(),
+			// Which memberships produced that signature, as this node
+			// authenticated them. The digest identifies the result; only this
+			// says who reached it, and every member records the same digest
+			// whatever population did.
+			Contribution: transcript,
 		},
 	)
 }
 
 func (ha *heartbeatAction) execute() error {
 	// heartbeatSignature holds the ceremony's durable result once signing
-	// produces one, and heartbeatPenalty the penalty state the same permit went
-	// on to create. The deferred recorder below reads their final values.
+	// produces one, heartbeatTranscript the memberships that produced it, and
+	// heartbeatPenalty the penalty state the same permit went on to create. The
+	// deferred recorder below reads their final values.
 	var heartbeatSignature *tecdsa.Signature
+	var heartbeatTranscript *participation.TranscriptContribution
 	var heartbeatPenalty heartbeatPenaltyState
 
 	// The action owns its permit from dispatch on; releasing it here ends the
@@ -279,7 +287,11 @@ func (ha *heartbeatAction) execute() error {
 	// while it is still open.
 	defer ha.permit.Close()
 	defer func() {
-		ha.recordTerminalOutcome(heartbeatSignature, heartbeatPenalty)
+		ha.recordTerminalOutcome(
+			heartbeatSignature,
+			heartbeatTranscript,
+			heartbeatPenalty,
+		)
 	}()
 
 	// Do not execute the heartbeat action if the operator is unstaking.
@@ -331,7 +343,7 @@ func (ha *heartbeatAction) execute() error {
 	)
 	defer cancelHeartbeatSigningCtx()
 
-	signature, activityReport, _, err := ha.signingExecutor.sign(
+	outcome, err := ha.signingExecutor.sign(
 		heartbeatSigningCtx,
 		messageToSign,
 		ha.startBlock,
@@ -349,11 +361,15 @@ func (ha *heartbeatAction) execute() error {
 
 	// Signing reached the threshold, so the ceremony has a durable result the
 	// rollback audit can identify, whatever the activity accounting below
-	// decides about penalties.
+	// decides about penalties. The transcript is pinned with it: the result and
+	// the memberships that produced it are one record.
+	signature := outcome.signature
 	heartbeatSignature = signature
+	heartbeatTranscript = outcome.contribution
 
 	// If the number of active members during signing was enough, we can
 	// consider the heartbeat procedure as successful.
+	activityReport := outcome.activityReport
 	activeMembersCount := len(activityReport.activeMembers)
 	if activeMembersCount >= heartbeatSigningMinimumActiveMembers {
 		ha.logger.Infof(

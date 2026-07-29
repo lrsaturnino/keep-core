@@ -295,7 +295,7 @@ type walletSigningExecutor interface {
 		messages []*big.Int,
 		startBlock uint64,
 		mode participation.ProtocolMode,
-	) ([]*tecdsa.Signature, error)
+	) ([]*tecdsa.Signature, *participation.TranscriptContribution, error)
 }
 
 // walletTransactionExecutor is a component allowing to sign and broadcast
@@ -324,6 +324,14 @@ type walletTransactionExecutor struct {
 	// chain to decide whether it was broadcast, mined, or is absent. It is
 	// written and read only on the action goroutine that owns the executor.
 	signedTransaction *bitcoin.Transaction
+
+	// signedTransactionTranscript is the local view of which memberships
+	// produced every signature the transaction above rests on. It travels with
+	// the transaction because the two are one result: a hash alone says the
+	// action reached a threshold signature, and every member of the ceremony
+	// records the same hash whatever population actually produced it. It is
+	// written and read on the same single goroutine as the transaction.
+	signedTransactionTranscript *participation.TranscriptContribution
 }
 
 func newWalletTransactionExecutor(
@@ -375,7 +383,7 @@ func (wte *walletTransactionExecutor) signTransaction(
 	)
 	defer cancelSigningCtx()
 
-	signatures, err := wte.signingExecutor.signBatch(
+	signatures, transcript, err := wte.signingExecutor.signBatch(
 		signingCtx,
 		sigHashes,
 		signingStartBlock,
@@ -412,8 +420,10 @@ func (wte *walletTransactionExecutor) signTransaction(
 	// The threshold signature is now bound to a concrete Bitcoin transaction,
 	// which is what the rollback audit has to reconcile. Pin it before the
 	// broadcast so a permit canceled mid-broadcast still reports the
-	// transaction it may have put on the network.
+	// transaction it may have put on the network, together with the transcript
+	// that produced it — the two are recorded as one result or not at all.
 	wte.signedTransaction = tx
+	wte.signedTransactionTranscript = transcript
 
 	return tx, nil
 }
@@ -440,6 +450,7 @@ func (wte *walletTransactionExecutor) recordTerminalOutcome(
 			Reference: wte.signedTransaction.Hash().Hex(
 				bitcoin.ReversedByteOrder,
 			),
+			Contribution: wte.signedTransactionTranscript,
 		},
 	)
 }

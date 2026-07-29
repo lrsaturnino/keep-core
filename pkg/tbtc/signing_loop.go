@@ -77,7 +77,12 @@ type signingDoneCheckStrategy interface {
 		endBlock uint64,
 	) error
 
-	waitUntilAllDone(ctx context.Context) (*signing.Result, uint64, error)
+	waitUntilAllDone(ctx context.Context) (
+		*signing.Result,
+		participation.MemberIndexes,
+		uint64,
+		error,
+	)
 }
 
 // signingRetryLoop is a struct that encapsulates the signing retry logic.
@@ -200,6 +205,11 @@ type signingRetryLoopResult struct {
 	// attemptTimeoutBlock is the block at which the successful attempt times
 	// out.
 	attemptTimeoutBlock uint64
+	// resultSigners are the memberships whose authenticated done checks carried
+	// the signature in result, ascending. They are the local view of who
+	// produced it, which is what distinguishes shares that combined from
+	// several parties from one party that arrived at the common result alone.
+	resultSigners participation.MemberIndexes
 }
 
 // start begins the signing retry loop using the given signing attempt function.
@@ -453,7 +463,8 @@ func (srl *signingRetryLoop) start(
 			)
 		}
 
-		result, latestEndBlock, err := srl.doneCheck.waitUntilAllDone(doneCheckTimeoutCtx)
+		result, resultSigners, latestEndBlock, err :=
+			srl.doneCheck.waitUntilAllDone(doneCheckTimeoutCtx)
 		if err != nil {
 			srl.logger.Warnf(
 				"[member:%v] cannot wait for signing done "+
@@ -475,6 +486,7 @@ func (srl *signingRetryLoop) start(
 			activityReport:      activityReport,
 			latestEndBlock:      latestEndBlock,
 			attemptTimeoutBlock: timeoutBlock,
+			resultSigners:       resultSigners,
 		}, nil
 	}
 }

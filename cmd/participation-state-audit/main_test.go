@@ -11,6 +11,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -273,6 +274,37 @@ func newTestStorageWithQuiescencePermits(
 	return storageDir
 }
 
+// testTranscriptContribution renders the transcript a completed outcome of the
+// given ceremony must carry, and nil for the ceremonies whose owners author
+// none. The local membership is the one the record persists, so the two halves
+// of the fixture describe one ceremony and a test that means to break the
+// binding has to say so.
+func testTranscriptContribution(
+	ceremony participation.Ceremony,
+	local group.MemberIndex,
+) *participation.TranscriptContribution {
+	if !participation.AuthorsTranscriptContribution(ceremony) {
+		return nil
+	}
+
+	if local == 0 {
+		local = group.MemberIndex(1)
+	}
+
+	incorporated := participation.MemberIndexes{local}
+	for _, peer := range []group.MemberIndex{1, 2, 3} {
+		if peer != local {
+			incorporated = append(incorporated, peer)
+		}
+	}
+	slices.Sort(incorporated)
+
+	return &participation.TranscriptContribution{
+		IncorporatedMembers: incorporated,
+		LocalMembers:        participation.MemberIndexes{local},
+	}
+}
+
 func testTerminalOutcomeRecord(
 	t *testing.T,
 	permit quiescencePermitEvidence,
@@ -343,6 +375,10 @@ func testTerminalOutcomeRecord(
 				Kind: participation.TerminalEvidenceForwarderClosed,
 			}
 		}
+		evidence.Contribution = testTranscriptContribution(
+			snapshot.Ceremony,
+			evidence.MembershipIndex,
+		)
 	case participation.TerminalOutcomeQuarantined:
 		evidence = participation.TerminalEvidence{
 			Kind: participation.TerminalEvidenceQuarantinedTBTCSinger,
@@ -3010,6 +3046,10 @@ func TestValidateNodeTerminalOutcomes_CompletedEvidenceKindIsPinnedPerCeremony(
 		participation.TerminalEvidence{
 			Kind:      participation.TerminalEvidenceBitcoinTransaction,
 			Reference: strings.Repeat("a", 64),
+			Contribution: testTranscriptContribution(
+				participation.TBTCSigning,
+				group.MemberIndex(1),
+			),
 		},
 	))
 	for _, violation := range honest {
@@ -3242,6 +3282,10 @@ func TestValidateChainReconciliationEvidence_TBTCDKGPermitLineage(
 							Kind:            participation.TerminalEvidencePersistedTBTCSinger,
 							Reference:       "wallet-storage-key",
 							MembershipIndex: firstMembership,
+							Contribution: testTranscriptContribution(
+								participation.TBTCDKG,
+								firstMembership,
+							),
 						},
 					},
 					{
@@ -3252,6 +3296,10 @@ func TestValidateChainReconciliationEvidence_TBTCDKGPermitLineage(
 							Kind:            participation.TerminalEvidencePersistedTBTCSinger,
 							Reference:       "wallet-storage-key",
 							MembershipIndex: secondMembership,
+							Contribution: testTranscriptContribution(
+								participation.TBTCDKG,
+								secondMembership,
+							),
 						},
 					},
 				},

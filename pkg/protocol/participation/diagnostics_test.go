@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/keep-network/keep-core/pkg/protocol/group"
 )
 
 // recordingRegistry captures what the production registration path registers,
@@ -362,6 +364,10 @@ func TestRegisterDiagnosticSources_NamesWhatBecameOfClosedPermits(t *testing.T) 
 		TerminalEvidence{
 			Kind:      TerminalEvidenceBitcoinTransaction,
 			Reference: "signed-transaction-hash",
+			Contribution: &TranscriptContribution{
+				IncorporatedMembers: []group.MemberIndex{1, 4, 9},
+				LocalMembers:        []group.MemberIndex{4},
+			},
 		},
 	); err != nil {
 		t.Fatalf("failed to record a terminal outcome: [%v]", err)
@@ -401,6 +407,47 @@ func TestRegisterDiagnosticSources_NamesWhatBecameOfClosedPermits(t *testing.T) 
 		evidence["reference"] != "signed-transaction-hash" {
 		t.Errorf("the owner's evidence is not emitted: %v", record["evidence"])
 	}
+
+	// Who was in the transcript, and which of them this node was. Without both
+	// lists a scrape can see that a result exists and that this node recorded
+	// it, and still cannot tell a ceremony several parties produced together
+	// from one this node produced alone — which is the entire question a
+	// mixed-release reading asks.
+	contribution, _ := evidence["contribution"].(map[string]interface{})
+	if !emittedMemberIndexesEqual(
+		contribution["incorporated_members"],
+		[]group.MemberIndex{1, 4, 9},
+	) || !emittedMemberIndexesEqual(
+		contribution["local_members"],
+		[]group.MemberIndex{4},
+	) {
+		t.Errorf(
+			"the transcript behind the result is not emitted: %v",
+			evidence["contribution"],
+		)
+	}
+}
+
+// emittedMemberIndexesEqual reports whether a decoded JSON member-index list
+// holds exactly the expected indexes in order. JSON numbers decode as float64,
+// so the comparison has to go through the emitted representation rather than
+// through the typed slice the gate was given.
+func emittedMemberIndexesEqual(
+	emitted interface{},
+	expected []group.MemberIndex,
+) bool {
+	indexes, ok := emitted.([]interface{})
+	if !ok || len(indexes) != len(expected) {
+		return false
+	}
+	for i, index := range indexes {
+		number, ok := index.(float64)
+		if !ok || group.MemberIndex(number) != expected[i] {
+			return false
+		}
+	}
+
+	return true
 }
 
 // The emitted permit list is what lets an observer name the work a node is

@@ -980,13 +980,13 @@ func (mhse *mockHeartbeatSigningExecutor) sign(
 	message *big.Int,
 	startBlock uint64,
 	mode participation.ProtocolMode,
-) (*tecdsa.Signature, *signingActivityReport, uint64, error) {
+) (*signingOutcome, error) {
 	mhse.requestedMessage = message
 	mhse.requestedStartBlock = startBlock
 	mhse.requestedMode = mode
 
 	if mhse.shouldFail {
-		return nil, nil, 0, fmt.Errorf("oofta")
+		return nil, fmt.Errorf("oofta")
 	}
 
 	activeMembers := make([]group.MemberIndex, 0)
@@ -1005,7 +1005,12 @@ func (mhse *mockHeartbeatSigningExecutor) sign(
 		inactiveMembers: inactiveMembers,
 	}
 
-	return &tecdsa.Signature{}, activityReport, startBlock + 1, nil
+	return &signingOutcome{
+		signature:      &tecdsa.Signature{},
+		activityReport: activityReport,
+		contribution:   mockSigningTranscript(),
+		endBlock:       startBlock + 1,
+	}, nil
 }
 
 type mockInactivityClaimExecutor struct {

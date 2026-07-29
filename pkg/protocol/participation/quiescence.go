@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io/fs"
 	"math/big"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -38,7 +39,14 @@ const (
 	// carry one, so it cannot distinguish a heartbeat that filed an inactivity
 	// claim from one that did not, and the audit must reject it outright
 	// rather than reconcile it under a rule it had no way to satisfy.
-	TerminalOutcomeJournalSchemaVersion = uint32(3)
+	//
+	// Version 4 added the transcript contribution behind a completed result.
+	// The same reasoning applies with more force: a version 3 journal records
+	// that a threshold ceremony completed and cannot say which memberships
+	// produced it, so every reading of it has to fall back on treating a
+	// completion as a contribution — which is exactly the inference this field
+	// exists to remove.
+	TerminalOutcomeJournalSchemaVersion = uint32(4)
 
 	// TerminalOutcomeJournalStorageFile identifies the terminal-outcome
 	// journal beside the immutable gate snapshot. Both records are encrypted
@@ -265,6 +273,112 @@ type TerminalEvidence struct {
 	// beyond its own protocol result. It is nil when the ceremony dispatched
 	// none.
 	ChainSettlement *ChainSettlementRecord `json:"chain_settlement,omitempty"`
+	// Contribution is the node's own account of which memberships combined
+	// into the result. It is nil for the endings that produced no threshold
+	// result and for ceremonies whose owners do not author one.
+	Contribution *TranscriptContribution `json:"contribution,omitempty"`
+}
+
+// TranscriptContribution is the ceremony owner's own account of which group
+// memberships combined into the result behind a completed outcome.
+//
+// It exists because a completion is not evidence of who produced it. Every
+// member of a threshold ceremony records "completed" and names the same result
+// identity whatever population actually reached it, so a reader holding only
+// completions cannot distinguish a run whose shares came from several parties
+// from one party that recovered or persisted the common result on its own. That
+// distinction is the whole claim of a mixed-release ceremony, and nothing else
+// in a terminal record carries it.
+//
+// The memberships named here are the ones whose protocol contributions this
+// node authenticated against the ceremony's on-chain membership and combined
+// into the result it recorded. It is the owner's local view of the transcript
+// rather than a report about the transcript: no other party can write it, and a
+// node cannot author a membership whose authenticated messages it never
+// accepted.
+type TranscriptContribution struct {
+	// IncorporatedMembers are the ceremony member indexes whose authenticated
+	// contributions were combined into the recorded result, ascending and
+	// distinct. The node's own memberships are among them: a member
+	// contributes to its own result.
+	IncorporatedMembers MemberIndexes `json:"incorporated_members"`
+	// LocalMembers are the incorporated memberships this node itself operated,
+	// ascending and distinct. Subtracting the fleet's local memberships from
+	// the incorporated set leaves the memberships some other node had to
+	// supply, which is the only part of a transcript a node's own record can
+	// attribute elsewhere — and so the only way a reader can tell a shared
+	// ceremony from a solitary one without taking some third party's word for
+	// the population.
+	//
+	// It is empty when none of this node's memberships were in the transcript.
+	// A wallet action owns its permit and records the signature it observed
+	// even when the attempt that produced it selected none of the memberships
+	// this node operates; naming none is the honest answer there, and refusing
+	// to record the result would leave the permit unresolved over work that
+	// demonstrably concluded.
+	LocalMembers MemberIndexes `json:"local_members"`
+}
+
+// MemberIndexes is a set of ceremony member indexes in a record that leaves the
+// node.
+//
+// It exists for its JSON encoding. A member index is a byte, so the default
+// encoding of a slice of them is base64 — an offline audit or a diagnostics
+// scrape would receive a transcript's membership as an opaque string, and the
+// one field that says who produced a result would be the one field a reader
+// cannot join to anything. The encoding here is a list of numbers, which is
+// also what the reader would write down by hand.
+type MemberIndexes []group.MemberIndex
+
+// MarshalJSON renders the indexes as a JSON array of numbers.
+func (m MemberIndexes) MarshalJSON() ([]byte, error) {
+	// A wider element type is what takes the encoding off the byte-slice path;
+	// the range is checked back on the way in.
+	numbers := make([]uint16, len(m))
+	for i, index := range m {
+		numbers[i] = uint16(index)
+	}
+
+	return json.Marshal(numbers)
+}
+
+// UnmarshalJSON reads a JSON array of numbers back, refusing any value that is
+// not a valid member index. The journal is read outside the node that wrote it,
+// so a corrupted or forged record must fail here rather than become a truncated
+// index further along.
+func (m *MemberIndexes) UnmarshalJSON(data []byte) error {
+	var numbers []uint16
+	if err := json.Unmarshal(data, &numbers); err != nil {
+		return err
+	}
+
+	indexes := make(MemberIndexes, len(numbers))
+	for i, number := range numbers {
+		if number == 0 || number > uint16(group.MaxMemberIndex) {
+			return fmt.Errorf(
+				"[%d] is not a member index from 1 through %d",
+				number,
+				group.MaxMemberIndex,
+			)
+		}
+		indexes[i] = group.MemberIndex(number)
+	}
+	*m = indexes
+
+	return nil
+}
+
+// Equal reports whether two contributions describe the same transcript. Like
+// TerminalEvidence.Equal it exists because the record travels by pointer and
+// carries slices, so == neither compiles for the fields nor compares an
+// observation with the same observation reloaded from the journal.
+func (c *TranscriptContribution) Equal(other *TranscriptContribution) bool {
+	if c == nil || other == nil {
+		return c == other
+	}
+
+	return slices.Equal(c.IncorporatedMembers, other.IncorporatedMembers) &&
+		slices.Equal(c.LocalMembers, other.LocalMembers)
 }
 
 // Equal reports whether two evidence records describe the same durable result.
@@ -276,6 +390,9 @@ func (e TerminalEvidence) Equal(other TerminalEvidence) bool {
 	if e.Kind != other.Kind ||
 		e.Reference != other.Reference ||
 		e.MembershipIndex != other.MembershipIndex {
+		return false
+	}
+	if !e.Contribution.Equal(other.Contribution) {
 		return false
 	}
 	if e.ChainSettlement == nil || other.ChainSettlement == nil {
@@ -970,7 +1087,171 @@ func ValidateTerminalOutcome(
 		}
 	}
 
+	if err := validateTranscriptContribution(
+		ceremony,
+		outcome,
+		evidence,
+	); err != nil {
+		return err
+	}
+
 	return validateChainSettlement(ceremony, outcome, evidence.ChainSettlement)
+}
+
+// transcriptContributionCeremonies names the ceremonies whose owners author the
+// transcript behind a completed result, and whose completed record is therefore
+// refused without one.
+//
+// It is a closed list rather than a blanket requirement because only a ceremony
+// that authenticates its peers' contributions can author this honestly. A
+// ceremony absent from the list either produces no threshold transcript — a
+// coordination proposal comes from one leader, a forwarder relays other
+// members' shares and computes nothing — or its owner does not yet collect the
+// authenticated population, and inventing a contribution for it would be the
+// self-attestation this record exists to remove.
+//
+// TODO: extend the list to BeaconDKG and BeaconRelaySigning once their owners
+// author the population. BeaconDKG can derive it from the GJKR result's
+// operating members, exactly as tBTC DKG derives it from its own, and
+// BeaconRelaySigning from the authenticated relay-entry shares the local member
+// combined. Both are the same shape of change as the tBTC producers: carry the
+// authenticated member set out of the protocol result and into the terminal
+// evidence, then add the ceremony here so its completed records cannot omit it.
+var transcriptContributionCeremonies = map[Ceremony]struct{}{
+	// The final signing group, which is exactly the DKG members whose shares
+	// this node validated through every round.
+	TBTCDKG: {},
+	// The signing members whose authenticated done checks carried the
+	// signature the action recorded.
+	TBTCSigning: {},
+	// The same, for the heartbeat's own signing round.
+	TBTCHeartbeat: {},
+}
+
+// AuthorsTranscriptContribution reports whether a ceremony's owner authenticates
+// the population behind its result and therefore authors the transcript. A
+// completed record for such a ceremony is refused without one; a completed
+// record for any other ceremony is refused with one.
+func AuthorsTranscriptContribution(ceremony Ceremony) bool {
+	_, authored := transcriptContributionCeremonies[ceremony]
+	return authored
+}
+
+// validateTranscriptContribution checks the ceremony owner's account of which
+// memberships combined into its result: that the ceremony is one that authors
+// the account at all, that the memberships are a well-formed set, and that the
+// node placed itself inside the population it is describing.
+//
+// The last part is what stops the record from becoming a report about other
+// parties. A node may only ever say "these memberships, including mine,
+// produced this result"; it cannot author a transcript it was not part of, and
+// it cannot name a persisted membership that is absent from the memberships it
+// says produced the result.
+func validateTranscriptContribution(
+	ceremony Ceremony,
+	outcome TerminalOutcome,
+	evidence TerminalEvidence,
+) error {
+	contribution := evidence.Contribution
+
+	if outcome != TerminalOutcomeCompleted {
+		if contribution != nil {
+			return fmt.Errorf(
+				"terminal outcome [%s] produced no result and must not carry "+
+					"a transcript contribution",
+				outcome,
+			)
+		}
+
+		return nil
+	}
+
+	_, authored := transcriptContributionCeremonies[ceremony]
+	if contribution == nil {
+		if authored {
+			return fmt.Errorf(
+				"completed ceremony [%s] requires the transcript contribution "+
+					"behind its result",
+				ceremony,
+			)
+		}
+
+		return nil
+	}
+	if !authored {
+		return fmt.Errorf(
+			"ceremony [%s] does not author a transcript contribution",
+			ceremony,
+		)
+	}
+
+	if len(contribution.IncorporatedMembers) == 0 {
+		return fmt.Errorf(
+			"a completed result names no memberships that produced it",
+		)
+	}
+	if err := validateMemberIndexSet(
+		"incorporated memberships",
+		contribution.IncorporatedMembers,
+	); err != nil {
+		return err
+	}
+	if err := validateMemberIndexSet(
+		"local memberships",
+		contribution.LocalMembers,
+	); err != nil {
+		return err
+	}
+
+	for _, local := range contribution.LocalMembers {
+		if !slices.Contains(contribution.IncorporatedMembers, local) {
+			return fmt.Errorf(
+				"local membership [%d] is absent from the memberships that "+
+					"produced the result",
+				local,
+			)
+		}
+	}
+
+	// The persisted membership and the transcript are two statements about one
+	// ceremony, so a record naming a membership it does not claim to have
+	// operated is describing two different ceremonies at once.
+	if evidence.MembershipIndex != 0 &&
+		!slices.Contains(contribution.LocalMembers, evidence.MembershipIndex) {
+		return fmt.Errorf(
+			"membership index [%d] is not among the memberships this node "+
+				"operated in the transcript",
+			evidence.MembershipIndex,
+		)
+	}
+
+	return nil
+}
+
+// validateMemberIndexSet checks that a member-index list is an ascending,
+// duplicate-free set of valid indexes. The ordering requirement is not
+// cosmetic: it makes one set have exactly one encoding, so two records of the
+// same transcript compare equal and a reader cannot be shown the same
+// membership twice to inflate a population. Emptiness is a question for each
+// caller, so it is left to them.
+func validateMemberIndexSet(name string, indexes MemberIndexes) error {
+	previous := group.MemberIndex(0)
+	for _, index := range indexes {
+		if index == 0 {
+			return fmt.Errorf("%s contain the invalid membership index 0", name)
+		}
+		if index <= previous {
+			return fmt.Errorf(
+				"%s must be ascending and distinct; [%d] follows [%d]",
+				name,
+				index,
+				previous,
+			)
+		}
+		previous = index
+	}
+
+	return nil
 }
 
 // chainSettlementKinds names the single chain side effect each ceremony may

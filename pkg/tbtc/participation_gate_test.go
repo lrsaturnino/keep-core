@@ -27,7 +27,7 @@ import (
 func TestSigningExecutor_Sign_RefusesUnsetMode(t *testing.T) {
 	executor := &signingExecutor{}
 
-	_, _, _, err := executor.sign(
+	_, err := executor.sign(
 		nil,
 		big.NewInt(100),
 		0,
@@ -1160,7 +1160,7 @@ func TestSigningExecutor_Sign_GateCancellationSkipsFailureMetrics(t *testing.T) 
 	gateCtx, cancelGateCtx := context.WithCancelCause(context.Background())
 	cancelGateCtx(participation.ErrClockUnavailable)
 
-	_, _, _, err := executor.sign(
+	_, err := executor.sign(
 		gateCtx,
 		big.NewInt(100),
 		0,
@@ -1182,7 +1182,7 @@ func TestSigningExecutor_Sign_GateCancellationSkipsFailureMetrics(t *testing.T) 
 	plainCtx, cancelPlainCtx := context.WithCancel(context.Background())
 	cancelPlainCtx()
 
-	_, _, _, err = executor.sign(
+	_, err = executor.sign(
 		plainCtx,
 		big.NewInt(101),
 		0,

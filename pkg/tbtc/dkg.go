@@ -750,10 +750,45 @@ func (de *dkgExecutor) completeDkgCeremony(
 				signer.wallet.publicKey,
 			),
 			MembershipIndex: signer.signingGroupMemberIndex,
+			Contribution:    dkgTranscriptContribution(signer),
 		},
 	)
 
 	return true
+}
+
+// dkgTranscriptContribution renders the memberships that produced a DKG result,
+// in the final signing group's own index space.
+//
+// The final signing group is built from exactly the DKG members this node saw
+// operating: a member whose round messages did not arrive, or arrived without a
+// valid membership behind them, was marked inactive and is absent from the final
+// group. Every final membership therefore stands for a member whose
+// contributions this node authenticated and combined into the key material it
+// persisted — which is the local view of the transcript, and the only thing that
+// distinguishes a key generated together with other parties from a persisted
+// share whose provenance is one party's word.
+//
+// The index space is the final group's rather than the DKG's because the
+// persisted membership this evidence names is a final index, and a transcript
+// that mixed the two would join a result produced in one ceremony to a signer
+// persisted from another.
+func dkgTranscriptContribution(
+	persistedSigner *signer,
+) *participation.TranscriptContribution {
+	finalGroupSize := len(persistedSigner.wallet.signingGroupOperators)
+
+	incorporated := make(participation.MemberIndexes, 0, finalGroupSize)
+	for seat := 1; seat <= finalGroupSize; seat++ {
+		incorporated = append(incorporated, group.MemberIndex(seat))
+	}
+
+	return &participation.TranscriptContribution{
+		IncorporatedMembers: incorporated,
+		LocalMembers: participation.MemberIndexes{
+			persistedSigner.signingGroupMemberIndex,
+		},
+	}
 }
 
 // buildFinalSigner determines the final signing group shape and constructs
@@ -903,6 +938,7 @@ func (de *dkgExecutor) preserveInterruptedSigner(
 						signer.wallet.publicKey,
 					),
 					MembershipIndex: signer.signingGroupMemberIndex,
+					Contribution:    dkgTranscriptContribution(signer),
 				},
 			)
 		}

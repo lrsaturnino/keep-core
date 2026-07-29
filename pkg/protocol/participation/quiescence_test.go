@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"math"
 	"math/big"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -134,8 +135,9 @@ func TestPersistenceQuiescenceSnapshotRecorder_PersistsTerminalJournal(
 		},
 		Outcome: TerminalOutcomeCompleted,
 		Evidence: TerminalEvidence{
-			Kind:      TerminalEvidenceProtocolResult,
-			Reference: "result-digest",
+			Kind:         TerminalEvidenceProtocolResult,
+			Reference:    "result-digest",
+			Contribution: testTranscriptContribution(TBTCSigning, 1),
 		},
 	}
 	if err := recorder.RecordTerminalOutcome(outcome); err != nil {
@@ -201,8 +203,9 @@ func TestValidateTerminalOutcome_DKGCompletionRequiresExactMembership(
 	for testName, test := range tests {
 		t.Run(testName, func(t *testing.T) {
 			evidence := TerminalEvidence{
-				Kind:      test.kind,
-				Reference: "persisted-signer",
+				Kind:         test.kind,
+				Reference:    "persisted-signer",
+				Contribution: testTranscriptContribution(test.ceremony, 7),
 			}
 			if err := ValidateTerminalOutcome(
 				test.ceremony,
@@ -307,6 +310,33 @@ func testWorkID(ceremony Ceremony) string {
 	return "work-identity"
 }
 
+// testTranscriptContribution renders the transcript a completed outcome of the
+// given ceremony must carry, and nil for the ceremonies that author none. The
+// local membership is passed in rather than fixed so a fixture that also names
+// a persisted membership index agrees with its own transcript, leaving the
+// disagreement to the tests that mean to provoke it.
+func testTranscriptContribution(
+	ceremony Ceremony,
+	local group.MemberIndex,
+) *TranscriptContribution {
+	if _, authored := transcriptContributionCeremonies[ceremony]; !authored {
+		return nil
+	}
+
+	incorporated := []group.MemberIndex{local}
+	for _, peer := range []group.MemberIndex{1, 2, 3} {
+		if peer != local {
+			incorporated = append(incorporated, peer)
+		}
+	}
+	slices.Sort(incorporated)
+
+	return &TranscriptContribution{
+		IncorporatedMembers: incorporated,
+		LocalMembers:        []group.MemberIndex{local},
+	}
+}
+
 // isBeaconRelayCeremony reports whether a ceremony's permits are issued for an
 // on-chain relay request.
 func isBeaconRelayCeremony(ceremony Ceremony) bool {
@@ -381,6 +411,7 @@ func TestTerminalResultReference_IsAcceptedAsEvidence(t *testing.T) {
 					ceremony,
 					TerminalResultReference("domain", []byte("result")),
 				),
+				Contribution: testTranscriptContribution(ceremony, 1),
 			},
 		); err != nil {
 			t.Errorf(
@@ -762,7 +793,10 @@ func TestValidateTerminalOutcome_CompletedEvidenceKindIsPinnedPerCeremony(
 		}
 
 		for _, kind := range everyKind {
-			evidence := TerminalEvidence{Kind: kind}
+			evidence := TerminalEvidence{
+				Kind:         kind,
+				Contribution: testTranscriptContribution(ceremony, 1),
+			}
 			switch kind {
 			case TerminalEvidencePersistedTBTCSinger,
 				TerminalEvidencePersistedBeaconSigner:
@@ -935,7 +969,10 @@ func TestValidateTerminalOutcome_ChainSettlementIsPinnedPerCeremony(
 			continue
 		}
 
-		evidence := TerminalEvidence{Kind: expectedKind}
+		evidence := TerminalEvidence{
+			Kind:         expectedKind,
+			Contribution: testTranscriptContribution(ceremony, 1),
+		}
 		switch expectedKind {
 		case TerminalEvidencePersistedTBTCSinger,
 			TerminalEvidencePersistedBeaconSigner:
@@ -1011,6 +1048,7 @@ func TestValidateTerminalOutcome_ChainSettlementShapes(t *testing.T) {
 			Kind:            TerminalEvidenceProtocolResult,
 			Reference:       "heartbeat-result-identity",
 			ChainSettlement: settlement,
+			Contribution:    testTranscriptContribution(TBTCHeartbeat, 1),
 		}
 	}
 
@@ -1055,5 +1093,348 @@ func TestValidateTerminalOutcome_ChainSettlementShapes(t *testing.T) {
 		},
 	); err == nil {
 		t.Error("an exhausted heartbeat reported a filed penalty")
+	}
+}
+
+// TestValidateTerminalOutcome_TranscriptContributionIsRequired asserts a
+// ceremony whose owner authenticates its peers cannot record a completed
+// threshold result without saying which memberships produced it.
+//
+// Without this the reader of a terminal record is left where every earlier
+// reading of a mixed-release ceremony was: every member of one ceremony records
+// the same completion and the same result identity, so the record cannot
+// distinguish shares that combined from several parties from a single party that
+// recovered the common result — and the population has to come from whichever
+// party wrote the report.
+func TestValidateTerminalOutcome_TranscriptContributionIsRequired(t *testing.T) {
+	for ceremony, expectedKind := range completedEvidenceKinds {
+		_, authored := transcriptContributionCeremonies[ceremony]
+
+		evidence := TerminalEvidence{Kind: expectedKind}
+		switch expectedKind {
+		case TerminalEvidencePersistedTBTCSinger,
+			TerminalEvidencePersistedBeaconSigner:
+			evidence.MembershipIndex = 1
+			evidence.Reference = "persisted-signer-identity"
+		case TerminalEvidenceForwarderClosed:
+		default:
+			evidence.Reference = testCompletedResultReference(
+				t,
+				ceremony,
+				"durable-result-identity",
+			)
+		}
+
+		err := ValidateTerminalOutcome(
+			ceremony,
+			testWorkID(ceremony),
+			TerminalOutcomeCompleted,
+			evidence,
+		)
+		if authored && err == nil {
+			t.Errorf(
+				"ceremony [%s] completed a threshold result without naming "+
+					"the memberships that produced it",
+				ceremony,
+			)
+		}
+		if !authored && err != nil {
+			t.Errorf(
+				"ceremony [%s] rejected its own completed evidence: [%v]",
+				ceremony,
+				err,
+			)
+		}
+
+		// The mirror: a ceremony that authenticates no peer population must not
+		// be able to attach one. A forwarder relays other members' shares and
+		// computes nothing, and a coordination proposal comes from one leader;
+		// letting either name a transcript would put a claim about other
+		// parties into a record that has no local view to support it.
+		evidence.Contribution = &TranscriptContribution{
+			IncorporatedMembers: []group.MemberIndex{1, 2},
+			LocalMembers:        []group.MemberIndex{1},
+		}
+		err = ValidateTerminalOutcome(
+			ceremony,
+			testWorkID(ceremony),
+			TerminalOutcomeCompleted,
+			evidence,
+		)
+		if !authored && err == nil {
+			t.Errorf(
+				"ceremony [%s] authored a transcript it cannot observe",
+				ceremony,
+			)
+		}
+		if authored && err != nil {
+			t.Errorf(
+				"ceremony [%s] rejected its own transcript: [%v]",
+				ceremony,
+				err,
+			)
+		}
+	}
+}
+
+// TestValidateTerminalOutcome_TranscriptContributionShapes asserts the
+// transcript is a well-formed set that places the recording node inside the
+// population it describes.
+func TestValidateTerminalOutcome_TranscriptContributionShapes(t *testing.T) {
+	signingEvidence := func(
+		contribution *TranscriptContribution,
+	) TerminalEvidence {
+		return TerminalEvidence{
+			Kind:         TerminalEvidenceBitcoinTransaction,
+			Reference:    "signed-transaction-hash",
+			Contribution: contribution,
+		}
+	}
+
+	refused := map[string]*TranscriptContribution{
+		"no incorporated membership": {
+			LocalMembers: []group.MemberIndex{1},
+		},
+		// An index of zero is no membership at all, and a reader that accepted
+		// it would count a party that cannot exist toward a population.
+		"a zero index": {
+			IncorporatedMembers: []group.MemberIndex{0, 2},
+			LocalMembers:        []group.MemberIndex{2},
+		},
+		// One encoding per set. Otherwise the same membership listed twice
+		// inflates a population, and two records of one transcript compare
+		// unequal for no reason a reader can see.
+		"a repeated membership": {
+			IncorporatedMembers: []group.MemberIndex{2, 2, 3},
+			LocalMembers:        []group.MemberIndex{2},
+		},
+		"an unordered set": {
+			IncorporatedMembers: []group.MemberIndex{3, 2},
+			LocalMembers:        []group.MemberIndex{2},
+		},
+		"unordered local memberships": {
+			IncorporatedMembers: []group.MemberIndex{1, 2, 3},
+			LocalMembers:        []group.MemberIndex{3, 1},
+		},
+		// The node has to be inside the transcript it authors. A record whose
+		// local membership is absent from the produced population is a report
+		// about other parties, which is the one thing this field must not be
+		// able to become.
+		"a local membership outside the population": {
+			IncorporatedMembers: []group.MemberIndex{1, 2},
+			LocalMembers:        []group.MemberIndex{4},
+		},
+	}
+
+	for name, contribution := range refused {
+		if err := ValidateTerminalOutcome(
+			TBTCSigning,
+			testWorkID(TBTCSigning),
+			TerminalOutcomeCompleted,
+			signingEvidence(contribution),
+		); err == nil {
+			t.Errorf("a transcript with %s was accepted", name)
+		}
+	}
+
+	// A node operating several memberships of one group records them all: the
+	// memberships some other node supplied are what is left after removing
+	// them, so an omitted local membership would be attributed elsewhere.
+	if err := ValidateTerminalOutcome(
+		TBTCSigning,
+		testWorkID(TBTCSigning),
+		TerminalOutcomeCompleted,
+		signingEvidence(&TranscriptContribution{
+			IncorporatedMembers: []group.MemberIndex{1, 2, 3, 7},
+			LocalMembers:        []group.MemberIndex{2, 7},
+		}),
+	); err != nil {
+		t.Errorf("a node operating several memberships was refused: [%v]", err)
+	}
+
+	// A wallet action owns its permit whether or not the attempt that produced
+	// the signature selected any of the memberships this node operates. The
+	// transcript it observed is still authenticated, and naming no local
+	// membership is the honest reading of it; refusing the record would leave a
+	// permit unresolved over work that demonstrably concluded.
+	if err := ValidateTerminalOutcome(
+		TBTCSigning,
+		testWorkID(TBTCSigning),
+		TerminalOutcomeCompleted,
+		signingEvidence(&TranscriptContribution{
+			IncorporatedMembers: []group.MemberIndex{1, 2, 3},
+		}),
+	); err != nil {
+		t.Errorf(
+			"a node that observed a result it did not sign was refused: [%v]",
+			err,
+		)
+	}
+}
+
+// TestValidateTerminalOutcome_TranscriptContributionBindsPersistedMembership
+// asserts a persisted DKG membership and the transcript behind it describe one
+// ceremony. A record naming a membership it does not claim to have operated
+// joins a result produced in one ceremony to a signer persisted from another.
+func TestValidateTerminalOutcome_TranscriptContributionBindsPersistedMembership(
+	t *testing.T,
+) {
+	evidence := func(local group.MemberIndex) TerminalEvidence {
+		return TerminalEvidence{
+			Kind:            TerminalEvidencePersistedTBTCSinger,
+			Reference:       "wallet-storage-key",
+			MembershipIndex: 4,
+			Contribution: &TranscriptContribution{
+				IncorporatedMembers: []group.MemberIndex{1, 4, 9},
+				LocalMembers:        []group.MemberIndex{local},
+			},
+		}
+	}
+
+	if err := ValidateTerminalOutcome(
+		TBTCDKG,
+		testWorkID(TBTCDKG),
+		TerminalOutcomeCompleted,
+		evidence(4),
+	); err != nil {
+		t.Errorf("a persisted membership inside its own transcript was refused: [%v]", err)
+	}
+
+	if err := ValidateTerminalOutcome(
+		TBTCDKG,
+		testWorkID(TBTCDKG),
+		TerminalOutcomeCompleted,
+		evidence(9),
+	); err == nil {
+		t.Error("a persisted membership the node never claimed to operate was accepted")
+	}
+}
+
+// TestValidateTerminalOutcome_TranscriptContributionNeedsAResult asserts an
+// ending that produced nothing cannot carry a transcript. Quarantine, exhaustion
+// and the unresolved marker left no threshold result behind, so a population
+// attached to one would describe a ceremony that did not conclude.
+func TestValidateTerminalOutcome_TranscriptContributionNeedsAResult(
+	t *testing.T,
+) {
+	contribution := &TranscriptContribution{
+		IncorporatedMembers: []group.MemberIndex{1, 2},
+		LocalMembers:        []group.MemberIndex{1},
+	}
+
+	if err := ValidateTerminalOutcome(
+		TBTCDKG,
+		testWorkID(TBTCDKG),
+		TerminalOutcomeQuarantined,
+		TerminalEvidence{
+			Kind:         TerminalEvidenceQuarantinedTBTCSinger,
+			Contribution: contribution,
+		},
+	); err == nil {
+		t.Error("a quarantined signer claimed a produced transcript")
+	}
+
+	if err := ValidateTerminalOutcome(
+		TBTCSigning,
+		testWorkID(TBTCSigning),
+		TerminalOutcomeExhausted,
+		TerminalEvidence{
+			Kind:         TerminalEvidenceNoThreshold,
+			Contribution: contribution,
+		},
+	); err == nil {
+		t.Error("an exhausted ceremony claimed a produced transcript")
+	}
+}
+
+// TestMemberIndexes_JSONRoundTrip asserts a transcript survives the journal as a
+// membership list rather than as an opaque string. A member index is a byte, so
+// the default encoding of a set of them is base64: the audit and the diagnostics
+// scrape would both receive the one field that says who produced a result in a
+// form they cannot join to a membership.
+func TestMemberIndexes_JSONRoundTrip(t *testing.T) {
+	contribution := &TranscriptContribution{
+		IncorporatedMembers: []group.MemberIndex{1, 4, 255},
+		LocalMembers:        []group.MemberIndex{4},
+	}
+
+	encoded, err := json.Marshal(contribution)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expected := `{"incorporated_members":[1,4,255],"local_members":[4]}`
+	if string(encoded) != expected {
+		t.Errorf(
+			"unexpected transcript encoding\nactual:   %s\nexpected: %s",
+			encoded,
+			expected,
+		)
+	}
+
+	decoded := &TranscriptContribution{}
+	if err := json.Unmarshal(encoded, decoded); err != nil {
+		t.Fatal(err)
+	}
+	if !decoded.Equal(contribution) {
+		t.Errorf("the transcript did not survive the journal: %+v", decoded)
+	}
+
+	// A record read outside the node that wrote it can be corrupt or forged, so
+	// a value that is not a member index has to fail on the way in rather than
+	// become a truncated index a reader would treat as a real membership.
+	for _, invalid := range []string{
+		`{"incorporated_members":[256],"local_members":[1]}`,
+		`{"incorporated_members":[0],"local_members":[1]}`,
+		`{"incorporated_members":[-1],"local_members":[1]}`,
+		`{"incorporated_members":"AQQJ","local_members":[1]}`,
+	} {
+		if err := json.Unmarshal(
+			[]byte(invalid),
+			&TranscriptContribution{},
+		); err == nil {
+			t.Errorf("an invalid transcript was decoded: %s", invalid)
+		}
+	}
+}
+
+// TestTranscriptContribution_EqualComparesTheTranscript asserts the record is
+// compared by the transcript it names. It travels by pointer and carries
+// slices, so the default comparison would separate one observation from the
+// same observation reloaded from the journal — which is what the terminal
+// recorder's idempotent retry rests on.
+func TestTranscriptContribution_EqualComparesTheTranscript(t *testing.T) {
+	contribution := func() *TranscriptContribution {
+		return &TranscriptContribution{
+			IncorporatedMembers: []group.MemberIndex{1, 2, 3},
+			LocalMembers:        []group.MemberIndex{2},
+		}
+	}
+
+	if !contribution().Equal(contribution()) {
+		t.Error("two records of one transcript compared unequal")
+	}
+
+	var absent *TranscriptContribution
+	if absent.Equal(contribution()) || contribution().Equal(absent) {
+		t.Error("a named transcript compared equal to none at all")
+	}
+	if !absent.Equal(nil) {
+		t.Error("two records naming no transcript compared unequal")
+	}
+
+	differing := contribution()
+	differing.IncorporatedMembers = []group.MemberIndex{1, 2, 4}
+	if contribution().Equal(differing) {
+		t.Error("two different populations compared equal")
+	}
+
+	// The same population with a different local half is a different node's
+	// record of the same ceremony, and the recorder must not treat one as a
+	// retry of the other.
+	relabeled := contribution()
+	relabeled.LocalMembers = []group.MemberIndex{3}
+	if contribution().Equal(relabeled) {
+		t.Error("two nodes' records of one ceremony compared equal")
 	}
 }

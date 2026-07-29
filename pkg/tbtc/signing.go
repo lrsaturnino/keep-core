@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -124,12 +125,15 @@ func (se *signingExecutor) signBatch(
 	messages []*big.Int,
 	startBlock uint64,
 	mode participation.ProtocolMode,
-) ([]*tecdsa.Signature, error) {
+) ([]*tecdsa.Signature, *participation.TranscriptContribution, error) {
 	wallet := se.wallet()
 
 	walletPublicKeyBytes, err := marshalPublicKey(wallet.publicKey)
 	if err != nil {
-		return nil, fmt.Errorf("cannot marshal wallet public key: [%v]", err)
+		return nil, nil, fmt.Errorf(
+			"cannot marshal wallet public key: [%v]",
+			err,
+		)
 	}
 
 	messagesDigests := make([]string, len(messages))
@@ -163,6 +167,11 @@ func (se *signingExecutor) signBatch(
 	signingStartBlock := startBlock // start block for the first signing
 	signatures := make([]*tecdsa.Signature, len(messages))
 	endBlocks := make([]uint64, len(messages))
+	transcripts := make(
+		[]*participation.TranscriptContribution,
+		0,
+		len(messages),
+	)
 
 	for i, message := range messages {
 		signingBatchMessageLogger := signingBatchLogger.With(
@@ -176,7 +185,7 @@ func (se *signingExecutor) signBatch(
 			signingStartBlock = endBlocks[i-1] + signingBatchInterludeBlocks
 		}
 
-		signature, _, endBlock, err := se.sign(
+		outcome, err := se.sign(
 			ctx,
 			message,
 			signingStartBlock,
@@ -184,42 +193,146 @@ func (se *signingExecutor) signBatch(
 		)
 		if err != nil {
 			// Error metrics are recorded in the sign() method for all error paths.
-			return nil, err
+			return nil, nil, err
 		}
 
 		signingBatchMessageLogger.Infof(
 			"generated signature [%v] for message at block [%v]",
-			signature,
-			endBlock,
+			outcome.signature,
+			outcome.endBlock,
 		)
 
-		signatures[i] = signature
-		endBlocks[i] = endBlock
+		signatures[i] = outcome.signature
+		endBlocks[i] = outcome.endBlock
+		transcripts = append(transcripts, outcome.contribution)
 	}
 
-	return signatures, nil
+	return signatures, intersectTranscripts(transcripts), nil
+}
+
+// intersectTranscripts reduces the transcripts behind a batch's signatures to
+// the memberships present in every one of them.
+//
+// A wallet action's durable result is one Bitcoin transaction carrying every
+// signature in its batch, and each signature's attempt selects its own members,
+// so the populations can differ across the batch. The intersection is the only
+// reading that cannot overclaim: a membership that carried one signature and not
+// another did not contribute to the transaction as a whole, and counting it
+// would let one share stand for the several a threshold needs.
+//
+// It can underclaim, and does so deliberately. Attempts that each reached an
+// honest majority through different members intersect to fewer memberships than
+// any one of them, and in the limit to none — a transaction every member
+// contributed to somewhere can name a population smaller than a threshold. That
+// is the safe direction for a reader deciding whether several parties produced a
+// result: the record can only understate the population, never invent one.
+//
+// TODO: record each signature's population separately if a caller ever needs to
+// establish participation per component rather than across the whole result — a
+// cross-release wallet action whose batch retried with different member sets is
+// the case where the intersection is too coarse to show that both releases took
+// part. That means carrying a list of transcripts through TerminalEvidence
+// instead of one, and teaching the offline audit and the participation validator
+// to read a list; the single-population shape here is what every current caller
+// needs, so the list is not worth its cost yet.
+func intersectTranscripts(
+	transcripts []*participation.TranscriptContribution,
+) *participation.TranscriptContribution {
+	if len(transcripts) == 0 {
+		return nil
+	}
+
+	intersection := &participation.TranscriptContribution{
+		IncorporatedMembers: transcripts[0].IncorporatedMembers,
+		LocalMembers:        transcripts[0].LocalMembers,
+	}
+	for _, transcript := range transcripts[1:] {
+		intersection.IncorporatedMembers = intersectMemberIndexes(
+			intersection.IncorporatedMembers,
+			transcript.IncorporatedMembers,
+		)
+		intersection.LocalMembers = intersectMemberIndexes(
+			intersection.LocalMembers,
+			transcript.LocalMembers,
+		)
+	}
+
+	return intersection
+}
+
+// intersectMemberIndexes returns the memberships both sets name, preserving the
+// ascending order the journal requires.
+func intersectMemberIndexes(
+	left participation.MemberIndexes,
+	right participation.MemberIndexes,
+) participation.MemberIndexes {
+	common := make(participation.MemberIndexes, 0, len(left))
+	for _, index := range left {
+		if slices.Contains(right, index) {
+			common = append(common, index)
+		}
+	}
+
+	return common
+}
+
+// transcriptContribution renders the local view of who produced a signature: the
+// memberships whose authenticated done checks carried it, and the ones among
+// them this node operates. The local half is what lets a reader of several
+// nodes' records subtract the fleet's own memberships and see which memberships
+// some other node had to supply.
+func (se *signingExecutor) transcriptContribution(
+	resultSigners participation.MemberIndexes,
+) *participation.TranscriptContribution {
+	local := make(participation.MemberIndexes, 0, len(se.signers))
+	for _, signer := range se.signers {
+		if slices.Contains(resultSigners, signer.signingGroupMemberIndex) {
+			local = append(local, signer.signingGroupMemberIndex)
+		}
+	}
+	slices.Sort(local)
+
+	return &participation.TranscriptContribution{
+		IncorporatedMembers: resultSigners,
+		LocalMembers:        local,
+	}
+}
+
+// signingOutcome is what one successful signing operation leaves its caller.
+type signingOutcome struct {
+	signature *tecdsa.Signature
+	// activityReport is the announcement-phase activity accounting the
+	// heartbeat's penalty decision reads.
+	activityReport *signingActivityReport
+	// contribution is the local view of which memberships produced the
+	// signature, recorded as the transcript behind the ceremony's terminal
+	// evidence.
+	contribution *participation.TranscriptContribution
+	// endBlock is common for all wallet signers so can be used as a
+	// synchronization point.
+	endBlock uint64
 }
 
 // sign performs the signing process for the given message. The process is
 // triggered according to the given start block. If the message cannot be signed
-// within a limited time window, an error is returned. If the message was
-// signed successfully, this function returns the signature along with the
-// number of active members that participated in signing, the block at which the
-// signature was calculated. The end block is common for all wallet signers so
-// can be used as a synchronization point. The protocol mode comes from the
-// wallet action's participation permit and applies to every retry attempt.
+// within a limited time window, an error is returned. If the message was signed
+// successfully, this function returns the signature along with the activity of
+// the signing group members, the memberships whose authenticated done checks
+// carried the signature, and the block at which the signature was calculated.
+// The protocol mode comes from the wallet action's participation permit and
+// applies to every retry attempt.
 func (se *signingExecutor) sign(
 	ctx context.Context,
 	message *big.Int,
 	startBlock uint64,
 	mode participation.ProtocolMode,
-) (*tecdsa.Signature, *signingActivityReport, uint64, error) {
+) (*signingOutcome, error) {
 	// The compatibility strategy bundle carries the wallet action's mode into
 	// every tECDSA party this operation constructs; each retry attempt reuses
 	// it unchanged.
 	strategies, err := compatibility.StrategiesFor(mode)
 	if err != nil {
-		return nil, nil, 0, fmt.Errorf(
+		return nil, fmt.Errorf(
 			"cannot select compatibility strategies: [%v]",
 			err,
 		)
@@ -231,7 +344,7 @@ func (se *signingExecutor) sign(
 			se.metricsRecorder.IncrementCounter(clientinfo.MetricSigningOperationsTotal, 1)
 			se.metricsRecorder.IncrementCounter(clientinfo.MetricSigningFailedTotal, 1)
 		}
-		return nil, nil, 0, errSigningExecutorBusy
+		return nil, errSigningExecutorBusy
 	}
 	defer se.lock.Release(1)
 
@@ -249,7 +362,7 @@ func (se *signingExecutor) sign(
 		if se.metricsRecorder != nil {
 			se.metricsRecorder.IncrementCounter(clientinfo.MetricSigningFailedTotal, 1)
 		}
-		return nil, nil, 0, fmt.Errorf("cannot marshal wallet public key: [%v]", err)
+		return nil, fmt.Errorf("cannot marshal wallet public key: [%v]", err)
 	}
 
 	loopTimeoutBlock := startBlock +
@@ -261,12 +374,6 @@ func (se *signingExecutor) sign(
 		zap.Uint64("signingStartBlock", startBlock),
 		zap.Uint64("signingTimeoutBlock", loopTimeoutBlock),
 	)
-
-	type signingOutcome struct {
-		signature      *tecdsa.Signature
-		activityReport *signingActivityReport
-		endBlock       uint64
-	}
 
 	wg := sync.WaitGroup{}
 	wg.Add(len(se.signers))
@@ -461,7 +568,10 @@ func (se *signingExecutor) sign(
 			signingOutcomeChan <- &signingOutcome{
 				signature:      loopResult.result.Signature,
 				activityReport: loopResult.activityReport,
-				endBlock:       loopResult.latestEndBlock,
+				contribution: se.transcriptContribution(
+					loopResult.resultSigners,
+				),
+				endBlock: loopResult.latestEndBlock,
 			}
 		}(currentSigner)
 	}
@@ -482,7 +592,7 @@ func (se *signingExecutor) sign(
 			se.metricsRecorder.IncrementCounter(clientinfo.MetricSigningSuccessTotal, 1)
 			se.metricsRecorder.RecordDuration(clientinfo.MetricSigningDurationSeconds, time.Since(startTime))
 		}
-		return outcome.signature, outcome.activityReport, outcome.endBlock, nil
+		return outcome, nil
 	default:
 		// A gate decision — clock failure, forced quiescence, or a closed
 		// permit — canceled the signing; it is not an ordinary protocol
@@ -490,7 +600,7 @@ func (se *signingExecutor) sign(
 		// metrics. The gate records the abort in its own metrics; the wrapped
 		// cause lets every caller layer classify the outcome the same way.
 		if cause := context.Cause(ctx); participation.IsGateRefusal(cause) {
-			return nil, nil, 0, fmt.Errorf(
+			return nil, fmt.Errorf(
 				"signing canceled by the participation gate: %w",
 				cause,
 			)
@@ -505,7 +615,7 @@ func (se *signingExecutor) sign(
 			se.metricsRecorder.IncrementCounter(clientinfo.MetricSigningTimeoutsTotal, 1)
 			se.metricsRecorder.RecordDuration(clientinfo.MetricSigningDurationSeconds, time.Since(startTime))
 		}
-		return nil, nil, 0, fmt.Errorf("all signers failed")
+		return nil, fmt.Errorf("all signers failed")
 	}
 }
 

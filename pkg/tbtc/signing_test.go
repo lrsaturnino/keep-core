@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"math/big"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -30,7 +31,7 @@ func TestSigningExecutor_Sign(t *testing.T) {
 	message := big.NewInt(100)
 	startBlock := uint64(0)
 
-	signature, _, endBlock, err := executor.sign(ctx, message, startBlock, participation.ModeSecurityV2)
+	outcome, err := executor.sign(ctx, message, startBlock, participation.ModeSecurityV2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,14 +41,35 @@ func TestSigningExecutor_Sign(t *testing.T) {
 	if !ecdsa.Verify(
 		walletPublicKey,
 		message.Bytes(),
-		signature.R,
-		signature.S,
+		outcome.signature.R,
+		outcome.signature.S,
 	) {
-		t.Errorf("invalid signature: [%+v]", signature)
+		t.Errorf("invalid signature: [%+v]", outcome.signature)
 	}
 
-	if endBlock <= startBlock {
+	if outcome.endBlock <= startBlock {
 		t.Errorf("wrong end block")
+	}
+
+	// The signature arrives with the local view of who produced it. Every
+	// membership here confirmed this exact signature with an authenticated done
+	// check, and the local half names the memberships this node operates, so a
+	// reader of the terminal record can tell a result several parties reached
+	// from one this node reached alone.
+	// This executor operates every membership of the group, so the memberships
+	// that confirmed the signature and the ones it operated are the same set —
+	// the attempt's members, which is an honest majority or more.
+	if outcome.contribution == nil ||
+		len(outcome.contribution.IncorporatedMembers) <
+			executor.groupParameters.HonestThreshold ||
+		!slices.Equal(
+			outcome.contribution.LocalMembers,
+			outcome.contribution.IncorporatedMembers,
+		) {
+		t.Errorf(
+			"unexpected transcript behind the signature: %+v",
+			outcome.contribution,
+		)
 	}
 }
 
@@ -62,13 +84,13 @@ func TestSigningExecutor_Sign_Busy(t *testing.T) {
 
 	errChan := make(chan error, 1)
 	go func() {
-		_, _, _, err := executor.sign(ctx, message, startBlock, participation.ModeSecurityV2)
+		_, err := executor.sign(ctx, message, startBlock, participation.ModeSecurityV2)
 		errChan <- err
 	}()
 
 	time.Sleep(100 * time.Millisecond)
 
-	_, _, _, err := executor.sign(ctx, message, startBlock, participation.ModeSecurityV2)
+	_, err := executor.sign(ctx, message, startBlock, participation.ModeSecurityV2)
 	testutils.AssertErrorsSame(t, errSigningExecutorBusy, err)
 
 	err = <-errChan
@@ -90,9 +112,37 @@ func TestSigningExecutor_SignBatch(t *testing.T) {
 	}
 	startBlock := uint64(0)
 
-	signatures, err := executor.signBatch(ctx, messages, startBlock, participation.ModeSecurityV2)
+	signatures, transcript, err := executor.signBatch(
+		ctx,
+		messages,
+		startBlock,
+		participation.ModeSecurityV2,
+	)
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	// The batch's signatures become one Bitcoin transaction, so the transcript
+	// it carries names the memberships present in every one of them. Anything
+	// wider would let a membership that produced one signature stand as a
+	// contributor to the whole transaction.
+	if transcript == nil ||
+		len(transcript.IncorporatedMembers) == 0 ||
+		!slices.Equal(
+			transcript.LocalMembers,
+			transcript.IncorporatedMembers,
+		) {
+		t.Errorf("unexpected transcript behind the batch: %+v", transcript)
+	}
+	// Each message's attempt selects its own members, so the intersection can
+	// be narrower than any single signature's population — and never wider.
+	for _, index := range transcript.IncorporatedMembers {
+		if int(index) < 1 || int(index) > executor.groupParameters.GroupSize {
+			t.Errorf(
+				"the batch transcript names membership [%d] outside the group",
+				index,
+			)
+		}
 	}
 
 	walletPublicKey := executor.wallet().publicKey
@@ -122,13 +172,13 @@ func TestSigningExecutor_Sign_ContextCancelled(t *testing.T) {
 	// rather than hanging.
 	cancelCtx()
 
-	signature, _, _, _ := executor.sign(ctx, message, startBlock, participation.ModeSecurityV2)
+	outcome, _ := executor.sign(ctx, message, startBlock, participation.ModeSecurityV2)
 
 	// A cancelled context may return nil signature with nil error (early exit)
 	// or an error -- both are acceptable. What must NOT happen is a hang or
 	// a successful signature returned despite cancellation.
-	if signature != nil {
-		t.Errorf("expected nil signature on context cancel, got: %+v", signature)
+	if outcome != nil {
+		t.Errorf("expected nil outcome on context cancel, got: %+v", outcome)
 	}
 }
 
@@ -144,12 +194,12 @@ func TestSigningExecutor_Sign_AllSignersFailed(t *testing.T) {
 	message := big.NewInt(100)
 	startBlock := uint64(0)
 
-	signature, _, _, err := executor.sign(ctx, message, startBlock, participation.ModeSecurityV2)
+	outcome, err := executor.sign(ctx, message, startBlock, participation.ModeSecurityV2)
 
 	// With zero attempts, all signers cannot succeed. We expect either
 	// errSigningExecutorBusy (if the lock is still held) or an error/nil
 	// result -- but not a completed valid signature.
-	if signature != nil && err == nil {
+	if outcome != nil && err == nil {
 		t.Error("expected failure when signingAttemptsLimit is 0, but got a valid signature")
 	}
 }
@@ -164,7 +214,7 @@ func TestSigningExecutor_Sign_MarshalError(t *testing.T) {
 	ctx, cancelCtx := context.WithCancel(context.Background())
 	defer cancelCtx()
 
-	_, _, _, err := executor.sign(ctx, big.NewInt(100), 0, participation.ModeSecurityV2)
+	_, err := executor.sign(ctx, big.NewInt(100), 0, participation.ModeSecurityV2)
 
 	if err == nil {
 		t.Fatal("expected error from sign, got nil")
@@ -185,7 +235,7 @@ func TestSigningExecutor_SignBatch_PartialFailure(t *testing.T) {
 
 	messages := []*big.Int{big.NewInt(1), big.NewInt(2), big.NewInt(3)}
 
-	_, err := executor.signBatch(ctx, messages, 0, participation.ModeSecurityV2)
+	_, _, err := executor.signBatch(ctx, messages, 0, participation.ModeSecurityV2)
 
 	if err == nil {
 		t.Error("expected error from signBatch when all signers fail, got nil")

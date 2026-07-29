@@ -162,8 +162,9 @@ func TestGate_NodeAuthoredTerminalOutcomes(t *testing.T) {
 	if err := completed.RecordTerminalOutcome(
 		TerminalOutcomeCompleted,
 		TerminalEvidence{
-			Kind:      TerminalEvidenceBitcoinTransaction,
-			Reference: "signed-transaction-hash",
+			Kind:         TerminalEvidenceBitcoinTransaction,
+			Reference:    "signed-transaction-hash",
+			Contribution: testTranscriptContribution(TBTCSigning, 1),
 		},
 	); err != nil {
 		t.Fatal(err)
@@ -245,8 +246,9 @@ func TestGate_RetainsTerminalOutcomesOfClosedPermits(t *testing.T) {
 	if err := completed.RecordTerminalOutcome(
 		TerminalOutcomeCompleted,
 		TerminalEvidence{
-			Kind:      TerminalEvidenceBitcoinTransaction,
-			Reference: "signed-transaction-hash",
+			Kind:         TerminalEvidenceBitcoinTransaction,
+			Reference:    "signed-transaction-hash",
+			Contribution: testTranscriptContribution(TBTCSigning, 1),
 		},
 	); err != nil {
 		t.Fatal(err)
@@ -396,6 +398,7 @@ func TestGate_TerminalOutcomeAccountIsNotAliased(t *testing.T) {
 			ChainSettlement: &ChainSettlementRecord{
 				Kind: ChainSettlementInactivityClaim,
 			},
+			Contribution: testTranscriptContribution(TBTCHeartbeat, 1),
 		},
 	); err != nil {
 		t.Fatal(err)
@@ -454,8 +457,9 @@ func TestGate_NodeAuthoredTerminalOutcomeRetriesPersistence(t *testing.T) {
 
 	outcome := TerminalOutcomeCompleted
 	evidence := TerminalEvidence{
-		Kind:      TerminalEvidenceBitcoinTransaction,
-		Reference: "signed-transaction-hash",
+		Kind:         TerminalEvidenceBitcoinTransaction,
+		Reference:    "signed-transaction-hash",
+		Contribution: testTranscriptContribution(TBTCSigning, 1),
 	}
 	if err := permit.RecordTerminalOutcome(
 		outcome,
@@ -2530,6 +2534,7 @@ func TestGate_TerminalOutcomeRetryComparesSettlementByValue(t *testing.T) {
 				Kind:      ChainSettlementInactivityClaim,
 				Reference: reference,
 			},
+			Contribution: testTranscriptContribution(TBTCHeartbeat, 1),
 		}
 	}
 

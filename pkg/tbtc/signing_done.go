@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/keep-network/keep-core/pkg/net"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/tecdsa"
 	"github.com/keep-network/keep-core/pkg/tecdsa/signing"
 )
@@ -151,12 +153,24 @@ func (sdc *signingDoneCheck) signalDone(
 
 // waitUntilAllDone blocks until it receives all the required done checks from
 // members or until the passed context is done. In the first case, it returns
-// the signature computed by the signing members and the block at which the
-// slowest signer completed the signature computation process. If the expected
-// done checks are not received on time, the function returns an error. If at
-// least one signature is different from others, the function returns an error.
+// the signature computed by the signing members, the memberships whose done
+// checks carried it, and the block at which the slowest signer completed the
+// signature computation process. If the expected done checks are not received
+// on time, the function returns an error. If at least one signature is
+// different from others, the function returns an error.
+//
+// The returned memberships are the local view of who produced the signature,
+// and the only one this node has. Every done check counted here was
+// authenticated against the wallet's on-chain signing group, bound to this
+// attempt, and carried a signature equal to every other — so a membership in
+// that list contributed to this exact result, and a membership absent from it
+// did not confirm anything about it. That distinction is what a reader
+// otherwise has to take from whichever party wrote the report: a completed
+// ceremony reads identically whether its shares came from several parties or
+// one party recovered the common result alone.
 func (sdc *signingDoneCheck) waitUntilAllDone(ctx context.Context) (
 	*signing.Result,
+	participation.MemberIndexes,
 	uint64,
 	error,
 ) {
@@ -168,11 +182,12 @@ func (sdc *signingDoneCheck) waitUntilAllDone(ctx context.Context) (
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, 0, errWaitDoneTimedOut
+			return nil, nil, 0, errWaitDoneTimedOut
 
 		case <-ticker.C:
-			result, endBlock, done, err := func() (
+			result, signers, endBlock, done, err := func() (
 				*signing.Result,
+				participation.MemberIndexes,
 				uint64,
 				bool,
 				error,
@@ -181,18 +196,23 @@ func (sdc *signingDoneCheck) waitUntilAllDone(ctx context.Context) (
 				defer sdc.doneSignersMutex.Unlock()
 
 				if sdc.expectedSignersCount != len(sdc.doneSigners) {
-					return nil, 0, false, nil
+					return nil, nil, 0, false, nil
 				}
 
 				var signature *tecdsa.Signature
 				var latestEndBlock uint64
+				signers := make(
+					participation.MemberIndexes,
+					0,
+					len(sdc.doneSigners),
+				)
 
-				for _, doneMessage := range sdc.doneSigners {
+				for senderID, doneMessage := range sdc.doneSigners {
 					if signature == nil {
 						signature = doneMessage.signature
 					} else {
 						if !signature.Equals(doneMessage.signature) {
-							return nil, 0, true, fmt.Errorf(
+							return nil, nil, 0, true, fmt.Errorf(
 								"not matching signatures detected: [%v] and [%v]",
 								signature,
 								doneMessage.signature,
@@ -203,13 +223,24 @@ func (sdc *signingDoneCheck) waitUntilAllDone(ctx context.Context) (
 					if doneMessage.endBlock > latestEndBlock {
 						latestEndBlock = doneMessage.endBlock
 					}
+
+					signers = append(signers, senderID)
 				}
 
-				return &signing.Result{Signature: signature}, latestEndBlock, true, nil
+				// Map iteration order is random, and this list identifies a
+				// transcript in a record two nodes have to agree on. Sorting
+				// gives one population exactly one rendering.
+				slices.Sort(signers)
+
+				return &signing.Result{Signature: signature},
+					signers,
+					latestEndBlock,
+					true,
+					nil
 			}()
 
 			if done {
-				return result, endBlock, err
+				return result, signers, endBlock, err
 			}
 		}
 	}

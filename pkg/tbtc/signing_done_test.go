@@ -18,6 +18,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/net/local"
 	"github.com/keep-network/keep-core/pkg/operator"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/tecdsa"
 	"github.com/keep-network/keep-core/pkg/tecdsa/signing"
 )
@@ -59,6 +60,7 @@ func TestSigningDoneCheck(t *testing.T) {
 	type outcome struct {
 		memberIndex group.MemberIndex
 		result      *signing.Result
+		signers     participation.MemberIndexes
 		endBlock    uint64
 		err         error
 	}
@@ -96,11 +98,12 @@ func TestSigningDoneCheck(t *testing.T) {
 				}
 			}
 
-			result, endBlock, err := doneCheck.waitUntilAllDone(ctx)
+			result, signers, endBlock, err := doneCheck.waitUntilAllDone(ctx)
 
 			outcomesChan <- &outcome{
 				memberIndex: memberIndex,
 				result:      result,
+				signers:     signers,
 				endBlock:    endBlock,
 				err:         err,
 			}
@@ -143,6 +146,26 @@ func TestSigningDoneCheck(t *testing.T) {
 			expectedEndBlock,
 			int(outcome.endBlock),
 		)
+
+		// Every member — including the ones the attempt excluded, which only
+		// listen — comes away with the same population: the memberships whose
+		// authenticated done checks carried this signature, in ascending order.
+		// This is the fact a terminal record needs and a completion cannot
+		// supply, so a member that could not name it would leave the ceremony's
+		// participants to whichever party wrote the report.
+		if !slices.Equal(
+			outcome.signers,
+			participation.MemberIndexes(attemptMemberIndexes),
+		) {
+			t.Errorf(
+				"unexpected done signers for member [%v]\n"+
+					"expected: [%v]\n"+
+					"actual:   [%v]",
+				outcome.memberIndex,
+				attemptMemberIndexes,
+				outcome.signers,
+			)
+		}
 	}
 }
 
@@ -200,10 +223,13 @@ func TestSigningDoneCheck_MissingConfirmation(t *testing.T) {
 		}
 	}
 
-	returnedResult, endBlock, err := doneCheck.waitUntilAllDone(ctx)
+	returnedResult, signers, endBlock, err := doneCheck.waitUntilAllDone(ctx)
 
 	if returnedResult != nil {
 		t.Errorf("expected nil result, has [%v]", returnedResult)
+	}
+	if len(signers) != 0 {
+		t.Errorf("expected no done signers, has [%v]", signers)
 	}
 	testutils.AssertIntsEqual(t, "end block", 0, int(endBlock))
 	testutils.AssertErrorsSame(t, errWaitDoneTimedOut, err)
@@ -287,10 +313,16 @@ func TestSigningDoneCheck_AnotherSignature(t *testing.T) {
 	// Give some time for the message handler goroutine
 	time.Sleep(100 * time.Millisecond)
 
-	returnedResult, endBlock, err := doneCheck.waitUntilAllDone(ctx)
+	returnedResult, signers, endBlock, err := doneCheck.waitUntilAllDone(ctx)
 
 	if returnedResult != nil {
 		t.Errorf("expected nil result, has [%v]", returnedResult)
+	}
+	// A population is only ever reported alongside a result the whole attempt
+	// agreed on; members naming different signatures did not produce one
+	// transcript, so there is nobody to name.
+	if len(signers) != 0 {
+		t.Errorf("expected no done signers, has [%v]", signers)
 	}
 	testutils.AssertIntsEqual(t, "end block", 0, int(endBlock))
 	if !strings.Contains(err.Error(), "not matching signatures detected") {

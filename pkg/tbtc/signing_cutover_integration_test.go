@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -158,7 +159,7 @@ func testSigningCutoverHomogeneous(
 
 	message := big.NewInt(100)
 
-	signature, _, endBlock, err := executor.sign(
+	outcome, err := executor.sign(
 		permit.Context(),
 		message,
 		0,
@@ -172,13 +173,33 @@ func testSigningCutoverHomogeneous(
 	if !ecdsa.Verify(
 		walletPublicKey,
 		message.Bytes(),
-		signature.R,
-		signature.S,
+		outcome.signature.R,
+		outcome.signature.S,
 	) {
-		t.Errorf("invalid signature: [%+v]", signature)
+		t.Errorf("invalid signature: [%+v]", outcome.signature)
 	}
-	if endBlock == 0 {
+	if outcome.endBlock == 0 {
 		t.Error("expected a nonzero end block")
+	}
+
+	// The transcript travels with the signature: the memberships whose
+	// authenticated done checks carried it, and the one this node operated.
+	// Without it the ceremony's terminal record could say a threshold result
+	// exists and not which parties reached it.
+	// This executor operates every membership of the group, so the memberships
+	// whose done checks carried the signature and the ones it operated are the
+	// same set — the attempt's members, an honest majority or more.
+	if outcome.contribution == nil ||
+		len(outcome.contribution.IncorporatedMembers) <
+			executor.groupParameters.HonestThreshold ||
+		!slices.Equal(
+			outcome.contribution.LocalMembers,
+			outcome.contribution.IncorporatedMembers,
+		) {
+		t.Errorf(
+			"unexpected transcript behind the signature: %+v",
+			outcome.contribution,
+		)
 	}
 
 	if err := permit.CheckCommit(
@@ -591,7 +612,7 @@ func TestSigningCutover_PostCutoverSplitFailsClosedWithEvidence(t *testing.T) {
 		)
 	}
 
-	signature, _, _, err := executor.sign(
+	outcome, err := executor.sign(
 		permit.Context(),
 		message,
 		currentBlock+2,
@@ -602,8 +623,8 @@ func TestSigningCutover_PostCutoverSplitFailsClosedWithEvidence(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "all signers failed") {
 		t.Fatalf("expected the retries to exhaust below threshold, got [%v]", err)
 	}
-	if signature != nil {
-		t.Errorf("expected no signature, got [%+v]", signature)
+	if outcome != nil {
+		t.Errorf("expected no signing outcome, got [%+v]", outcome)
 	}
 
 	// The failure is an ordinary signing failure of the split cohort.
@@ -896,7 +917,7 @@ func TestSigningCutover_GateQuiesceAbortSkipsOrdinaryFailureMetrics(t *testing.T
 	gate.Close()
 	<-quiesceDone
 
-	_, _, _, err = executor.sign(
+	_, err = executor.sign(
 		permit.Context(),
 		big.NewInt(555),
 		0,

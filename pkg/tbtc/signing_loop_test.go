@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/big"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
 
@@ -710,6 +711,113 @@ func TestSigningRetryLoop(t *testing.T) {
 	}
 }
 
+// TestSigningRetryLoop_CarriesTheDoneCheckPopulation proves the loop hands its
+// caller the memberships the done check reported as having carried the signature,
+// unchanged.
+//
+// The loop is the only place that sees both the result and the population behind
+// it, and the ceremony's terminal record is written from what it returns. A loop
+// that dropped the population would leave the record able to say a threshold
+// result exists and unable to say which parties reached it — the point at which
+// a reader has to fall back on whichever party wrote the report.
+func TestSigningRetryLoop_CarriesTheDoneCheckPopulation(t *testing.T) {
+	message := big.NewInt(100)
+
+	groupParameters := &GroupParameters{
+		GroupSize:       10,
+		HonestThreshold: 6,
+	}
+
+	signingGroupOperators := chain.Addresses{
+		"address-1",
+		"address-2",
+		"address-3",
+		"address-4",
+		"address-5",
+		"address-6",
+		"address-7",
+		"address-8",
+		"address-9",
+		"address-10",
+	}
+
+	signingGroupMembersIndexes := make([]group.MemberIndex, 0)
+	for i := range signingGroupOperators {
+		signingGroupMembersIndexes = append(
+			signingGroupMembersIndexes,
+			group.MemberIndex(i+1),
+		)
+	}
+
+	testResult := &signing.Result{
+		Signature: &tecdsa.Signature{
+			R:          big.NewInt(300),
+			S:          big.NewInt(400),
+			RecoveryID: 2,
+		},
+	}
+
+	doneSigners := participation.MemberIndexes{1, 2, 3, 4, 5, 6}
+
+	announcer := &mockSigningAnnouncer{
+		outgoingAnnouncements: make(map[string]group.MemberIndex),
+		incomingAnnouncementsFn: func(
+			sessionID string,
+		) ([]group.MemberIndex, error) {
+			return signingGroupMembersIndexes, nil
+		},
+	}
+	doneCheck := &mockSigningDoneCheck{
+		waitUntilAllDoneOutcomeFn: func(
+			attemptNumber uint64,
+		) (*signing.Result, uint64, error) {
+			return testResult, 215, nil
+		},
+		doneSigners: doneSigners,
+	}
+
+	retryLoop := newSigningRetryLoop(
+		&testutils.MockLogger{},
+		message,
+		participation.ModeSecurityV2,
+		200,
+		1,
+		signingGroupOperators,
+		groupParameters,
+		announcer,
+		doneCheck,
+	)
+
+	ctx, cancelCtx := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelCtx()
+
+	result, err := retryLoop.start(
+		ctx,
+		func(context.Context, uint64) error {
+			return nil
+		},
+		func() (uint64, error) {
+			return 200, nil
+		},
+		func(params *signingAttemptParams) (*signing.Result, uint64, error) {
+			return testResult, 215, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !slices.Equal(result.resultSigners, doneSigners) {
+		t.Errorf(
+			"unexpected population behind the result\n"+
+				"expected: [%v]\n"+
+				"actual:   [%v]",
+			doneSigners,
+			result.resultSigners,
+		)
+	}
+}
+
 func TestSigningAttemptSessionIDIncludesAttemptStartBlock(t *testing.T) {
 	message := big.NewInt(100)
 
@@ -774,6 +882,11 @@ type mockSigningDoneCheck struct {
 	outgoingDoneChecks        []*signingDoneMessage
 	currentAttemptNumber      uint64
 	waitUntilAllDoneOutcomeFn func(attemptNumber uint64) (*signing.Result, uint64, error)
+	// doneSigners stands in for the memberships the real done check reports as
+	// having carried the result. It is nil unless a test is about the
+	// transcript, so a case that does not set it expects the loop to carry
+	// nothing rather than to invent a population.
+	doneSigners participation.MemberIndexes
 }
 
 func (msdc *mockSigningDoneCheck) listen(
@@ -805,6 +918,15 @@ func (msdc *mockSigningDoneCheck) signalDone(
 	return nil
 }
 
-func (msdc *mockSigningDoneCheck) waitUntilAllDone(ctx context.Context) (*signing.Result, uint64, error) {
-	return msdc.waitUntilAllDoneOutcomeFn(msdc.currentAttemptNumber)
+func (msdc *mockSigningDoneCheck) waitUntilAllDone(ctx context.Context) (
+	*signing.Result,
+	participation.MemberIndexes,
+	uint64,
+	error,
+) {
+	result, endBlock, err := msdc.waitUntilAllDoneOutcomeFn(
+		msdc.currentAttemptNumber,
+	)
+
+	return result, msdc.doneSigners, endBlock, err
 }

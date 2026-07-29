@@ -634,7 +634,7 @@ func (mwse *mockWalletSigningExecutor) signBatch(
 	messages []*big.Int,
 	startBlock uint64,
 	mode participation.ProtocolMode,
-) ([]*tecdsa.Signature, error) {
+) ([]*tecdsa.Signature, *participation.TranscriptContribution, error) {
 	mwse.signaturesMutex.Lock()
 	defer mwse.signaturesMutex.Unlock()
 
@@ -642,10 +642,20 @@ func (mwse *mockWalletSigningExecutor) signBatch(
 
 	signatures, ok := mwse.signatures[key]
 	if !ok {
-		return nil, fmt.Errorf("signing error")
+		return nil, nil, fmt.Errorf("signing error")
 	}
 
-	return signatures, nil
+	return signatures, mockSigningTranscript(), nil
+}
+
+// mockSigningTranscript stands in for the local view a real signing operation
+// carries out of its done check: the memberships whose authenticated done
+// checks named the signature, and the one this node operated.
+func mockSigningTranscript() *participation.TranscriptContribution {
+	return &participation.TranscriptContribution{
+		IncorporatedMembers: participation.MemberIndexes{1, 2, 3},
+		LocalMembers:        participation.MemberIndexes{1},
+	}
 }
 
 func (mwse *mockWalletSigningExecutor) setSignatures(
