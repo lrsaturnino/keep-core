@@ -72,15 +72,22 @@ func newInactivityClaimExecutor(
 // submission consults it immediately before submitting, so a claim derived
 // from legacy work at or after the cutover block, or raced by process
 // quiescence, is suppressed instead of creating new penalty state.
+//
+// The returned event is the claim this call was observed to settle on chain,
+// whichever member's submission got there first, and nil when no settlement
+// was observed. Dispatching a claim proves nothing about the chain: publishing
+// can fail, be suppressed, or be canceled mid-flight, and the caller's terminal
+// record must be able to say which of those happened rather than assume the
+// claim landed.
 func (ice *inactivityClaimExecutor) claimInactivity(
 	ctx context.Context,
 	commitGuard participation.CommitGuard,
 	inactiveMembersIndexes []group.MemberIndex,
 	heartbeatFailed bool,
 	sessionID *big.Int,
-) error {
+) (*InactivityClaimedEvent, error) {
 	if lockAcquired := ice.lock.TryAcquire(1); !lockAcquired {
-		return errInactivityClaimExecutorBusy
+		return nil, errInactivityClaimExecutorBusy
 	}
 	defer ice.lock.Release(1)
 
@@ -89,7 +96,7 @@ func (ice *inactivityClaimExecutor) claimInactivity(
 	walletPublicKeyHash := bitcoin.PublicKeyHash(wallet.publicKey)
 	walletPublicKeyBytes, err := marshalPublicKey(wallet.publicKey)
 	if err != nil {
-		return fmt.Errorf("cannot marshal wallet public key: [%v]", err)
+		return nil, fmt.Errorf("cannot marshal wallet public key: [%v]", err)
 	}
 
 	execLogger := logger.With(
@@ -99,14 +106,14 @@ func (ice *inactivityClaimExecutor) claimInactivity(
 
 	walletRegistryData, err := ice.chain.GetWallet(walletPublicKeyHash)
 	if err != nil {
-		return fmt.Errorf("could not get registry data on wallet: [%v]", err)
+		return nil, fmt.Errorf("could not get registry data on wallet: [%v]", err)
 	}
 
 	nonce, err := ice.chain.GetInactivityClaimNonce(
 		walletRegistryData.EcdsaWalletID,
 	)
 	if err != nil {
-		return fmt.Errorf("could not get nonce for wallet: [%v]", err)
+		return nil, fmt.Errorf("could not get nonce for wallet: [%v]", err)
 	}
 
 	claim := inactivity.NewClaimPreimage(
@@ -118,8 +125,17 @@ func (ice *inactivityClaimExecutor) claimInactivity(
 
 	groupMembers, err := ice.getWalletOperatorsIDs()
 	if err != nil {
-		return fmt.Errorf("could not get wallet members info: [%v]", err)
+		return nil, fmt.Errorf("could not get wallet members info: [%v]", err)
 	}
+
+	// The wallet identity and nonce this claim is built for are what makes an
+	// observed event attributable to it. The registry accepts a claim only at
+	// the wallet's current nonce and increments it in the same call, so exactly
+	// one on-chain claim can ever carry this pair.
+	settlement := newInactivityClaimSettlementObserver(
+		walletRegistryData.EcdsaWalletID,
+		nonce,
+	)
 
 	wg := sync.WaitGroup{}
 	wg.Add(len(ice.signers))
@@ -141,6 +157,15 @@ func (ice *inactivityClaimExecutor) claimInactivity(
 
 			subscription := ice.chain.OnInactivityClaimed(
 				func(event *InactivityClaimedEvent) {
+					// The subscription is not filtered on chain, so an
+					// unrelated wallet's claim arrives here too. Attributing it
+					// to this claim would both abandon publishing for no reason
+					// and put another wallet's settlement on this permit's
+					// terminal record.
+					if !settlement.observe(event) {
+						return
+					}
+
 					defer cancelSignerCtx()
 
 					execLogger.Infof(
@@ -206,7 +231,66 @@ func (ice *inactivityClaimExecutor) claimInactivity(
 	// Wait until all controlled signers complete their routine.
 	wg.Wait()
 
-	return nil
+	return settlement.settled(), nil
+}
+
+// inactivityClaimSettlementObserver collects the on-chain settlement of one
+// inactivity claim. Every controlled signer subscribes independently and the
+// chain delivers events off the publishing goroutines, so the observation is
+// shared state written from arbitrary goroutines and read once publishing ends.
+type inactivityClaimSettlementObserver struct {
+	walletID [32]byte
+	nonce    *big.Int
+
+	mutex sync.Mutex
+	event *InactivityClaimedEvent
+}
+
+func newInactivityClaimSettlementObserver(
+	walletID [32]byte,
+	nonce *big.Int,
+) *inactivityClaimSettlementObserver {
+	return &inactivityClaimSettlementObserver{
+		walletID: walletID,
+		nonce:    nonce,
+	}
+}
+
+// observe records event as this claim's settlement and reports whether it
+// belongs to the claim at all. Only the wallet and nonce the claim was built
+// for match: the nonce is consumed by the submission that emits it, so a
+// matching event is the settlement of this exact claim and not of a later one
+// against the same wallet.
+func (o *inactivityClaimSettlementObserver) observe(
+	event *InactivityClaimedEvent,
+) bool {
+	if event == nil ||
+		event.WalletID != o.walletID ||
+		event.Nonce == nil ||
+		o.nonce == nil ||
+		event.Nonce.Cmp(o.nonce) != 0 {
+		return false
+	}
+
+	o.mutex.Lock()
+	defer o.mutex.Unlock()
+
+	// Each signer observes the same settlement; the first observation is the
+	// one recorded so the reported block cannot drift between members.
+	if o.event == nil {
+		o.event = event
+	}
+
+	return true
+}
+
+// settled returns the observed settlement, or nil when the claim was never
+// seen to reach the chain.
+func (o *inactivityClaimSettlementObserver) settled() *InactivityClaimedEvent {
+	o.mutex.Lock()
+	defer o.mutex.Unlock()
+
+	return o.event
 }
 
 func (ice *inactivityClaimExecutor) getWalletOperatorsIDs() ([]uint32, error) {

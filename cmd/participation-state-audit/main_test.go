@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/common"
 	ethereumCrypto "github.com/ethereum/go-ethereum/crypto"
 	bn256 "github.com/ethereum/go-ethereum/crypto/bn256/cloudflare"
 
@@ -4233,4 +4234,313 @@ func TestRunAudit_QuarantinedUnsettledOrMisidentifiedWalletIsBlocking(
 			auditManifest.RollbackBlockers,
 		)
 	}
+}
+
+// addTestInactivityClaimedReceipt appends an authenticated receipt carrying a
+// real ABI-encoded InactivityClaimed log for the given wallet and nonce, then
+// re-attests and re-signs the record. The log is built from the generated
+// WalletRegistry ABI so the audit's decode path is exercised against the exact
+// bytes the contract emits.
+func addTestInactivityClaimedReceipt(
+	t *testing.T,
+	record *chainReconciliationEvidence,
+	address string,
+	walletID [32]byte,
+	nonce *big.Int,
+	blockNumber uint64,
+) {
+	t.Helper()
+
+	parsed, err := ecdsaabi.WalletRegistryMetaData.GetAbi()
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, ok := parsed.Events["InactivityClaimed"]
+	if !ok {
+		t.Fatal("generated WalletRegistry ABI has no InactivityClaimed event")
+	}
+
+	data, err := event.Inputs.NonIndexed().Pack(
+		nonce,
+		common.HexToAddress(testWalletRegistryAddress),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	transactionHash := fmt.Sprintf("0x%064x", blockNumber*7+3)
+	record.Receipts = append(record.Receipts, ethereumReceiptEvidence{
+		TransactionHash:  transactionHash,
+		BlockHash:        testCanonicalEthereumBlockHash(blockNumber),
+		BlockNumber:      blockNumber,
+		TransactionIndex: uint64(len(record.Receipts)),
+		Status:           1,
+		Logs: []ethereumRawLogEvidence{
+			{
+				Address: address,
+				Topics: []string{
+					strings.ToLower(event.ID.Hex()),
+					"0x" + hex.EncodeToString(walletID[:]),
+				},
+				Data:     "0x" + hex.EncodeToString(data),
+				LogIndex: 0,
+			},
+		},
+	})
+
+	record.CollectorAttestation.CanonicalBlocks = append(
+		record.CollectorAttestation.CanonicalBlocks,
+		ethereumCanonicalBlockEvidence{
+			BlockNumber: blockNumber,
+			BlockHash:   testCanonicalEthereumBlockHash(blockNumber),
+		},
+	)
+	sort.Slice(
+		record.CollectorAttestation.CanonicalBlocks,
+		func(i, j int) bool {
+			return record.CollectorAttestation.CanonicalBlocks[i].BlockNumber <
+				record.CollectorAttestation.CanonicalBlocks[j].BlockNumber
+		},
+	)
+	resignTestChainReconciliationEvidence(t, record)
+}
+
+// TestValidateChainReconciliationEvidence_InactivityClaimSettlement asserts a
+// penalty a heartbeat filed is reconciled against the WalletRegistry rather
+// than accepted on the node's own record. The claim runs under the heartbeat's
+// permit and leaves no separate journal entry, so an unobserved or fabricated
+// settlement must block the barrier instead of clearing it.
+func TestValidateChainReconciliationEvidence_InactivityClaimSettlement(
+	t *testing.T,
+) {
+	capturedAt := time.Now().UTC().Add(-time.Minute)
+	walletID := [32]byte{
+		0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11,
+		0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19,
+		0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x21,
+		0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29,
+	}
+	const claimBlock = uint64(9_000)
+	nonce := big.NewInt(17)
+
+	settledReference, err := participation.InactivityClaimSettlementReference(
+		walletID[:],
+		nonce,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	permit := participation.PermitSnapshot{
+		Ceremony:            participation.TBTCHeartbeat,
+		Mode:                participation.ModeSecurityV2.String(),
+		CanonicalStartBlock: 8_000,
+		WorkID:              strings.Repeat("d", 64),
+		PermitID:            "1",
+		IdentityBound:       true,
+	}
+
+	newRunAndRecord := func(
+		settlement *participation.ChainSettlementRecord,
+	) (*auditRun, *chainReconciliationEvidence) {
+		auditManifest := &manifest{
+			GeneratedAt: time.Now().UTC(),
+			Snapshot: snapshotIdentity{
+				AggregateSHA256: strings.Repeat("c", 64),
+			},
+			QuiescenceSnapshot: &participation.QuiescenceSnapshot{
+				SchemaVersion: participation.QuiescenceSnapshotSchemaVersion,
+				CapturedAt:    capturedAt,
+				ActivePermits: []participation.PermitSnapshot{permit},
+			},
+			ParticipationTerminalOutcomes: &participation.TerminalOutcomeJournal{
+				SchemaVersion:      participation.TerminalOutcomeJournalSchemaVersion,
+				SnapshotCapturedAt: capturedAt,
+				Outcomes: []participation.TerminalOutcomeRecord{
+					{
+						RecordedAt: time.Now().UTC(),
+						Permit:     permit,
+						Outcome:    participation.TerminalOutcomeCompleted,
+						Evidence: participation.TerminalEvidence{
+							Kind:            participation.TerminalEvidenceProtocolResult,
+							Reference:       strings.Repeat("e", 64),
+							ChainSettlement: settlement,
+						},
+					},
+				},
+			},
+		}
+		run := &auditRun{
+			manifest: auditManifest,
+			expected: expectedIdentityInputs{
+				ethereumChainID:              "1",
+				walletRegistryAddress:        testWalletRegistryAddress,
+				finalizedEthereumBlockNumber: testFinalizedEthereumBlock,
+				finalizedEthereumBlockHash: testCanonicalEthereumBlockHash(
+					testFinalizedEthereumBlock,
+				),
+				chainEvidencePublicKey: testChainEvidencePublicKey(),
+				maxEvidenceAge:         time.Hour,
+			},
+		}
+		record := &chainReconciliationEvidence{
+			evidenceEnvelope: evidenceEnvelope{
+				SchemaVersion:           evidenceSchemaVersion,
+				EvidenceType:            "chain_reconciliation",
+				GeneratedAt:             auditManifest.GeneratedAt,
+				SnapshotAggregateSHA256: auditManifest.Snapshot.AggregateSHA256,
+			},
+			EthereumChainID: "1",
+		}
+		authenticateTestChainReconciliationEvidence(t, record)
+		return run, record
+	}
+
+	validate := func(
+		t *testing.T,
+		run *auditRun,
+		record *chainReconciliationEvidence,
+	) []string {
+		t.Helper()
+
+		content, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return run.validateChainReconciliationEvidence(content)
+	}
+
+	// The negative cases below differ from the passing one only in the
+	// settlement or the claim log, so requiring the reason pins each failure to
+	// the reconciliation instead of to some unrelated envelope defect.
+	assertBlockedBy := func(t *testing.T, violations []string, reason string) {
+		t.Helper()
+
+		for _, violation := range violations {
+			if strings.Contains(violation, reason) {
+				return
+			}
+		}
+		t.Fatalf(
+			"expected a violation containing [%s], got: %v",
+			reason,
+			violations,
+		)
+	}
+
+	t.Run("settlement corroborated by a canonical claim log", func(t *testing.T) {
+		run, record := newRunAndRecord(&participation.ChainSettlementRecord{
+			Kind:      participation.ChainSettlementInactivityClaim,
+			Reference: settledReference,
+		})
+		addTestInactivityClaimedReceipt(
+			t,
+			record,
+			testWalletRegistryAddress,
+			walletID,
+			nonce,
+			claimBlock,
+		)
+		if violations := validate(t, run, record); len(violations) != 0 {
+			t.Fatalf(
+				"expected a corroborated settlement to pass, got: %v",
+				violations,
+			)
+		}
+	})
+
+	t.Run("dispatch never observed to settle", func(t *testing.T) {
+		run, record := newRunAndRecord(&participation.ChainSettlementRecord{
+			Kind: participation.ChainSettlementInactivityClaim,
+		})
+		addTestInactivityClaimedReceipt(
+			t,
+			record,
+			testWalletRegistryAddress,
+			walletID,
+			nonce,
+			claimBlock,
+		)
+		// Even with the claim present on chain, an unobserved dispatch is
+		// unreconciled: the node cannot say the log it never saw is its own.
+		assertBlockedBy(
+			t,
+			validate(t, run, record),
+			"never observed settle",
+		)
+	})
+
+	t.Run("settlement with no matching claim log", func(t *testing.T) {
+		run, record := newRunAndRecord(&participation.ChainSettlementRecord{
+			Kind:      participation.ChainSettlementInactivityClaim,
+			Reference: settledReference,
+		})
+		assertBlockedBy(
+			t,
+			validate(t, run, record),
+			"no authenticated WalletRegistry InactivityClaimed log",
+		)
+	})
+
+	t.Run("claim log at a different nonce", func(t *testing.T) {
+		run, record := newRunAndRecord(&participation.ChainSettlementRecord{
+			Kind:      participation.ChainSettlementInactivityClaim,
+			Reference: settledReference,
+		})
+		addTestInactivityClaimedReceipt(
+			t,
+			record,
+			testWalletRegistryAddress,
+			walletID,
+			new(big.Int).Add(nonce, big.NewInt(1)),
+			claimBlock,
+		)
+		assertBlockedBy(
+			t,
+			validate(t, run, record),
+			"no authenticated WalletRegistry InactivityClaimed log",
+		)
+	})
+
+	t.Run("claim log for a different wallet", func(t *testing.T) {
+		run, record := newRunAndRecord(&participation.ChainSettlementRecord{
+			Kind:      participation.ChainSettlementInactivityClaim,
+			Reference: settledReference,
+		})
+		otherWalletID := walletID
+		otherWalletID[0] ^= 0xff
+		addTestInactivityClaimedReceipt(
+			t,
+			record,
+			testWalletRegistryAddress,
+			otherWalletID,
+			nonce,
+			claimBlock,
+		)
+		assertBlockedBy(
+			t,
+			validate(t, run, record),
+			"no authenticated WalletRegistry InactivityClaimed log",
+		)
+	})
+
+	t.Run("claim log from an unrelated contract", func(t *testing.T) {
+		run, record := newRunAndRecord(&participation.ChainSettlementRecord{
+			Kind:      participation.ChainSettlementInactivityClaim,
+			Reference: settledReference,
+		})
+		addTestInactivityClaimedReceipt(
+			t,
+			record,
+			"0x2222222222222222222222222222222222222222",
+			walletID,
+			nonce,
+			claimBlock,
+		)
+		assertBlockedBy(
+			t,
+			validate(t, run, record),
+			"no authenticated WalletRegistry InactivityClaimed log",
+		)
+	})
 }

@@ -1,9 +1,13 @@
 package participation
 
 import (
+	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"math/big"
+	"strings"
 	"testing"
 	"time"
 
@@ -370,5 +374,254 @@ func TestValidateTerminalOutcome_CompletedEvidenceKindIsPinnedPerCeremony(
 				)
 			}
 		}
+	}
+}
+
+// TestInactivityClaimSettlementReference_RoundTrips asserts the canonical claim
+// identity survives a round trip and that only the exact rendering is accepted.
+// The audit joins this string to a chain log by comparison, so an alias that
+// names the same claim in a different shape is indistinguishable from naming no
+// claim at all.
+func TestInactivityClaimSettlementReference_RoundTrips(t *testing.T) {
+	walletID := make([]byte, inactivityClaimWalletIDLength)
+	for i := range walletID {
+		walletID[i] = byte(i + 1)
+	}
+
+	for _, nonce := range []*big.Int{
+		big.NewInt(0),
+		big.NewInt(1),
+		new(big.Int).Lsh(big.NewInt(1), 200),
+	} {
+		reference, err := InactivityClaimSettlementReference(walletID, nonce)
+		if err != nil {
+			t.Fatalf("nonce [%s]: [%v]", nonce, err)
+		}
+
+		decodedWalletID, decodedNonce, err := ParseInactivityClaimSettlementReference(
+			reference,
+		)
+		if err != nil {
+			t.Fatalf("reference [%s]: [%v]", reference, err)
+		}
+		if !bytes.Equal(decodedWalletID, walletID) {
+			t.Errorf(
+				"reference [%s] round-tripped wallet [%x], expected [%x]",
+				reference,
+				decodedWalletID,
+				walletID,
+			)
+		}
+		if decodedNonce.Cmp(nonce) != 0 {
+			t.Errorf(
+				"reference [%s] round-tripped nonce [%s], expected [%s]",
+				reference,
+				decodedNonce,
+				nonce,
+			)
+		}
+	}
+}
+
+func TestInactivityClaimSettlementReference_RejectsNonCanonicalIdentities(
+	t *testing.T,
+) {
+	walletID := make([]byte, inactivityClaimWalletIDLength)
+	walletID[inactivityClaimWalletIDLength-1] = 0xab
+
+	canonical, err := InactivityClaimSettlementReference(
+		walletID,
+		big.NewInt(12),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ParseInactivityClaimSettlementReference(
+		canonical,
+	); err != nil {
+		t.Fatalf("the canonical rendering [%s] is rejected: [%v]", canonical, err)
+	}
+
+	shortWalletID := walletID[:inactivityClaimWalletIDLength-1]
+	if _, err := InactivityClaimSettlementReference(
+		shortWalletID,
+		big.NewInt(12),
+	); err == nil {
+		t.Error("a short wallet identifier produced a claim identity")
+	}
+	if _, err := InactivityClaimSettlementReference(walletID, nil); err == nil {
+		t.Error("a missing nonce produced a claim identity")
+	}
+	if _, err := InactivityClaimSettlementReference(
+		walletID,
+		big.NewInt(-1),
+	); err == nil {
+		t.Error("a negative nonce produced a claim identity")
+	}
+
+	for name, reference := range map[string]string{
+		"no separator":        hex.EncodeToString(walletID) + "12",
+		"uppercase wallet":    strings.ToUpper(hex.EncodeToString(walletID)) + ":12",
+		"prefixed wallet":     "0x" + hex.EncodeToString(walletID) + ":12",
+		"truncated wallet":    hex.EncodeToString(shortWalletID) + ":12",
+		"zero-padded nonce":   hex.EncodeToString(walletID) + ":012",
+		"hexadecimal nonce":   hex.EncodeToString(walletID) + ":0xc",
+		"signed nonce":        hex.EncodeToString(walletID) + ":+12",
+		"negative nonce":      hex.EncodeToString(walletID) + ":-12",
+		"empty nonce":         hex.EncodeToString(walletID) + ":",
+		"trailing separator":  canonical + ":",
+		"non-numeric nonce":   hex.EncodeToString(walletID) + ":twelve",
+		"non-hexadecimal key": strings.Repeat("z", 64) + ":12",
+	} {
+		if _, _, err := ParseInactivityClaimSettlementReference(
+			reference,
+		); err == nil {
+			t.Errorf(
+				"%s: alias [%s] was accepted as a canonical claim identity",
+				name,
+				reference,
+			)
+		}
+	}
+}
+
+// TestValidateTerminalOutcome_ChainSettlementIsPinnedPerCeremony asserts only a
+// ceremony with a code path that submits to a chain may report a settlement,
+// and only of the kind it actually dispatches. Without the restriction any
+// ceremony could attach a penalty submission it could not have made.
+func TestValidateTerminalOutcome_ChainSettlementIsPinnedPerCeremony(
+	t *testing.T,
+) {
+	walletID := make([]byte, inactivityClaimWalletIDLength)
+	walletID[0] = 0x7f
+	reference, err := InactivityClaimSettlementReference(
+		walletID,
+		big.NewInt(3),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, ceremony := range AllCeremonies() {
+		expectedKind, known := completedEvidenceKinds[ceremony]
+		if !known {
+			continue
+		}
+
+		evidence := TerminalEvidence{Kind: expectedKind}
+		switch expectedKind {
+		case TerminalEvidencePersistedTBTCSinger,
+			TerminalEvidencePersistedBeaconSigner:
+			evidence.MembershipIndex = 1
+			evidence.Reference = "persisted-signer-identity"
+		case TerminalEvidenceForwarderClosed:
+		default:
+			evidence.Reference = "durable-result-identity"
+		}
+
+		dispatches, permitted := chainSettlementKinds[ceremony]
+
+		settled := evidence
+		settled.ChainSettlement = &ChainSettlementRecord{
+			Kind:      ChainSettlementInactivityClaim,
+			Reference: reference,
+		}
+		err := ValidateTerminalOutcome(
+			ceremony,
+			TerminalOutcomeCompleted,
+			settled,
+		)
+		if permitted && dispatches == ChainSettlementInactivityClaim {
+			if err != nil {
+				t.Errorf(
+					"ceremony [%s] rejected the settlement it dispatches: [%v]",
+					ceremony,
+					err,
+				)
+			}
+		} else if err == nil {
+			t.Errorf(
+				"ceremony [%s] accepted an inactivity claim settlement it has "+
+					"no code path to file",
+				ceremony,
+			)
+		}
+
+		unknownKind := evidence
+		unknownKind.ChainSettlement = &ChainSettlementRecord{
+			Kind: "some_other_submission",
+		}
+		if err := ValidateTerminalOutcome(
+			ceremony,
+			TerminalOutcomeCompleted,
+			unknownKind,
+		); err == nil {
+			t.Errorf(
+				"ceremony [%s] accepted an undeclared chain settlement kind",
+				ceremony,
+			)
+		}
+	}
+}
+
+func TestValidateTerminalOutcome_ChainSettlementShapes(t *testing.T) {
+	walletID := make([]byte, inactivityClaimWalletIDLength)
+	walletID[0] = 0x11
+	reference, err := InactivityClaimSettlementReference(
+		walletID,
+		big.NewInt(9),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	heartbeatEvidence := func(
+		settlement *ChainSettlementRecord,
+	) TerminalEvidence {
+		return TerminalEvidence{
+			Kind:            TerminalEvidenceProtocolResult,
+			Reference:       "heartbeat-result-identity",
+			ChainSettlement: settlement,
+		}
+	}
+
+	// A dispatch with no observed settlement is the deliberate unreconciled
+	// record; rejecting it would force the node to either fabricate a claim
+	// identity or hide the dispatch entirely.
+	if err := ValidateTerminalOutcome(
+		TBTCHeartbeat,
+		TerminalOutcomeCompleted,
+		heartbeatEvidence(&ChainSettlementRecord{
+			Kind: ChainSettlementInactivityClaim,
+		}),
+	); err != nil {
+		t.Errorf("an unobserved dispatch was rejected: [%v]", err)
+	}
+
+	if err := ValidateTerminalOutcome(
+		TBTCHeartbeat,
+		TerminalOutcomeCompleted,
+		heartbeatEvidence(&ChainSettlementRecord{
+			Kind:      ChainSettlementInactivityClaim,
+			Reference: "not-a-claim-identity",
+		}),
+	); err == nil {
+		t.Error("a settlement naming no canonical claim was accepted")
+	}
+
+	// The dispatch runs downstream of the heartbeat's own threshold signature,
+	// so an outcome reporting no result cannot have reached one.
+	if err := ValidateTerminalOutcome(
+		TBTCHeartbeat,
+		TerminalOutcomeExhausted,
+		TerminalEvidence{
+			Kind: TerminalEvidenceNoThreshold,
+			ChainSettlement: &ChainSettlementRecord{
+				Kind:      ChainSettlementInactivityClaim,
+				Reference: reference,
+			},
+		},
+	); err == nil {
+		t.Error("an exhausted heartbeat reported a filed penalty")
 	}
 }

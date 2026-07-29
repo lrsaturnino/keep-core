@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math/big"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,7 +33,12 @@ const (
 	// TerminalOutcomeJournalSchemaVersion is the schema of the node-authored
 	// terminal-outcome journal. The journal is bound to the gate snapshot's
 	// capture time and covers that snapshot's permit inventory one-to-one.
-	TerminalOutcomeJournalSchemaVersion = uint32(2)
+	//
+	// Version 3 added the chain-settlement record. An earlier journal cannot
+	// carry one, so it cannot distinguish a heartbeat that filed an inactivity
+	// claim from one that did not, and the audit must reject it outright
+	// rather than reconcile it under a rule it had no way to satisfy.
+	TerminalOutcomeJournalSchemaVersion = uint32(3)
 
 	// TerminalOutcomeJournalStorageFile identifies the terminal-outcome
 	// journal beside the immutable gate snapshot. Both records are encrypted
@@ -230,6 +236,135 @@ type TerminalEvidence struct {
 	// inactive or disqualified members are removed. For beacon it is the
 	// persisted threshold signer's member index.
 	MembershipIndex group.MemberIndex `json:"membership_index,omitempty"`
+	// ChainSettlement reports a chain side effect the ceremony dispatched
+	// beyond its own protocol result. It is nil when the ceremony dispatched
+	// none.
+	ChainSettlement *ChainSettlementRecord `json:"chain_settlement,omitempty"`
+}
+
+// ChainSettlementKind identifies a chain side effect a ceremony dispatches
+// outside its own protocol result.
+type ChainSettlementKind string
+
+const (
+	// ChainSettlementInactivityClaim is the operator inactivity claim a
+	// low-activity tBTC heartbeat files against the WalletRegistry.
+	ChainSettlementInactivityClaim ChainSettlementKind = "tbtc_inactivity_claim"
+)
+
+// ChainSettlementRecord reports a chain side effect the ceremony dispatched
+// and the canonical chain state it was observed to settle into.
+//
+// Dispatching is not settling. The submitting call can fail, be suppressed by
+// the release gate, lose the race to another member's submission, or be
+// canceled mid-flight, and in none of those cases does the node know whether
+// the side effect reached the chain. A dispatch whose settlement was never
+// observed is therefore recorded with an empty Reference: the attempt is on
+// the record, its outcome is unknown, and the offline barrier must treat it as
+// unreconciled instead of letting a node-authored digest close the journal
+// over a penalty that may or may not exist on chain.
+type ChainSettlementRecord struct {
+	Kind ChainSettlementKind `json:"kind"`
+	// Reference is the canonical chain identity of the observed settlement.
+	// It is empty when the dispatch was never observed to settle.
+	Reference string `json:"reference,omitempty"`
+}
+
+// inactivityClaimWalletIDLength is the byte length of the WalletRegistry
+// wallet identifier an inactivity claim names.
+const inactivityClaimWalletIDLength = 32
+
+// InactivityClaimSettlementReference renders the canonical identity of an
+// on-chain tBTC inactivity claim: the wallet it was filed against and the
+// claim nonce it settled at. The pair identifies exactly one claim for all
+// time, because the WalletRegistry accepts a claim only at the wallet's
+// current nonce and increments that nonce in the same call. The offline audit
+// can therefore join the reference to exactly one authenticated
+// InactivityClaimed log, which is what keeps the node from naming a settlement
+// that never happened.
+func InactivityClaimSettlementReference(
+	walletID []byte,
+	nonce *big.Int,
+) (string, error) {
+	if len(walletID) != inactivityClaimWalletIDLength {
+		return "", fmt.Errorf(
+			"inactivity claim wallet identifier must be %d bytes, got [%d]",
+			inactivityClaimWalletIDLength,
+			len(walletID),
+		)
+	}
+	if nonce == nil {
+		return "", fmt.Errorf("inactivity claim nonce is missing")
+	}
+	if nonce.Sign() < 0 {
+		return "", fmt.Errorf(
+			"inactivity claim nonce [%s] is negative",
+			nonce,
+		)
+	}
+
+	return hex.EncodeToString(walletID) + ":" + nonce.String(), nil
+}
+
+// ParseInactivityClaimSettlementReference recovers the wallet identifier and
+// claim nonce from a reference produced by
+// InactivityClaimSettlementReference. Only the exact rendering that function
+// produces is accepted: an uppercase, prefixed, or zero-padded alias would
+// name the same claim while failing every string comparison the audit makes
+// against it, which is indistinguishable from naming no claim at all.
+func ParseInactivityClaimSettlementReference(
+	reference string,
+) ([]byte, *big.Int, error) {
+	walletIDText, nonceText, separated := strings.Cut(reference, ":")
+	if !separated {
+		return nil, nil, fmt.Errorf(
+			"inactivity claim reference [%s] is not a wallet identifier and "+
+				"nonce pair",
+			reference,
+		)
+	}
+
+	walletID, err := hex.DecodeString(walletIDText)
+	if err != nil {
+		return nil, nil, fmt.Errorf(
+			"inactivity claim reference wallet identifier [%s] is not hex: "+
+				"[%v]",
+			walletIDText,
+			err,
+		)
+	}
+	if len(walletID) != inactivityClaimWalletIDLength {
+		return nil, nil, fmt.Errorf(
+			"inactivity claim reference wallet identifier [%s] is not %d "+
+				"bytes",
+			walletIDText,
+			inactivityClaimWalletIDLength,
+		)
+	}
+	if hex.EncodeToString(walletID) != walletIDText {
+		return nil, nil, fmt.Errorf(
+			"inactivity claim reference wallet identifier [%s] is not "+
+				"canonically encoded",
+			walletIDText,
+		)
+	}
+
+	nonce, valid := new(big.Int).SetString(nonceText, 10)
+	if !valid || nonce.Sign() < 0 {
+		return nil, nil, fmt.Errorf(
+			"inactivity claim reference nonce [%s] is not a non-negative "+
+				"decimal integer",
+			nonceText,
+		)
+	}
+	if nonce.String() != nonceText {
+		return nil, nil, fmt.Errorf(
+			"inactivity claim reference nonce [%s] is not canonically encoded",
+			nonceText,
+		)
+	}
+
+	return walletID, nonce, nil
 }
 
 // TerminalResultReference derives the nonsecret, stable identity of a protocol
@@ -406,6 +541,69 @@ func ValidateTerminalOutcome(
 				expected,
 				evidence.Kind,
 			)
+		}
+	}
+
+	return validateChainSettlement(ceremony, outcome, evidence.ChainSettlement)
+}
+
+// chainSettlementKinds names the single chain side effect each ceremony may
+// dispatch outside its own protocol result. A ceremony absent from the map
+// dispatches none: it has no code path that submits to a chain, so a
+// settlement recorded against it is a fabricated one, and accepting it would
+// let any ceremony attach a penalty submission it could not have made.
+var chainSettlementKinds = map[Ceremony]ChainSettlementKind{
+	// A low-activity heartbeat files the inactivity claim under its own permit,
+	// so the heartbeat's terminal record is the only place that submission is
+	// ever reported.
+	TBTCHeartbeat: ChainSettlementInactivityClaim,
+}
+
+func validateChainSettlement(
+	ceremony Ceremony,
+	outcome TerminalOutcome,
+	settlement *ChainSettlementRecord,
+) error {
+	if settlement == nil {
+		return nil
+	}
+
+	expected, dispatches := chainSettlementKinds[ceremony]
+	if !dispatches {
+		return fmt.Errorf(
+			"ceremony [%s] dispatches no chain settlement",
+			ceremony,
+		)
+	}
+	if settlement.Kind != expected {
+		return fmt.Errorf(
+			"ceremony [%s] dispatches chain settlement kind [%s], got [%s]",
+			ceremony,
+			expected,
+			settlement.Kind,
+		)
+	}
+	// Every dispatch path runs downstream of the ceremony's own threshold
+	// result, so a ceremony that reports no result cannot have reached one.
+	if outcome != TerminalOutcomeCompleted {
+		return fmt.Errorf(
+			"[%s] outcome cannot carry a chain settlement",
+			outcome,
+		)
+	}
+
+	// An empty reference is the deliberate unobserved-dispatch record; only a
+	// reference that claims a settlement has to name one canonically.
+	if settlement.Reference == "" {
+		return nil
+	}
+
+	switch settlement.Kind {
+	case ChainSettlementInactivityClaim:
+		if _, _, err := ParseInactivityClaimSettlementReference(
+			settlement.Reference,
+		); err != nil {
+			return fmt.Errorf("invalid chain settlement reference: [%w]", err)
 		}
 	}
 

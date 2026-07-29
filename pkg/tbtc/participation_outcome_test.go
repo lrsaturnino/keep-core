@@ -339,6 +339,183 @@ func TestHeartbeatAction_TerminalOutcomeBindsDispatchedInactivityClaim(
 	}
 }
 
+// TestHeartbeatAction_TerminalOutcomeReportsObservedClaimSettlement drives a
+// heartbeat past the claim threshold and asserts the terminal record describes
+// what the chain did, not what the action tried to do. The claim is filed on
+// Ethereum under the heartbeat's own permit, so a record that treats the
+// dispatch call as the settlement would let a penalty that never landed — or
+// one that landed while the call errored — clear the rollback journal.
+func TestHeartbeatAction_TerminalOutcomeReportsObservedClaimSettlement(
+	t *testing.T,
+) {
+	proposal := &HeartbeatProposal{
+		Message: [16]byte{
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+		},
+	}
+
+	walletID := [32]byte{
+		0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11,
+		0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
+		0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11,
+		0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
+	}
+	settledReference, err := participation.InactivityClaimSettlementReference(
+		walletID[:],
+		big.NewInt(41),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := map[string]struct {
+		activeMembers     uint32
+		claimFails        bool
+		settledClaim      *InactivityClaimedEvent
+		expectedSettled   bool
+		expectedReference string
+	}{
+		"a healthy heartbeat dispatches nothing": {
+			activeMembers: heartbeatSigningMinimumActiveMembers,
+		},
+		"a dispatched claim observed to settle names the claim": {
+			activeMembers: heartbeatSigningMinimumActiveMembers - 1,
+			settledClaim: &InactivityClaimedEvent{
+				WalletID:    walletID,
+				Nonce:       big.NewInt(41),
+				BlockNumber: 4100,
+			},
+			expectedSettled:   true,
+			expectedReference: settledReference,
+		},
+		"a dispatched claim never observed to settle names none": {
+			activeMembers:   heartbeatSigningMinimumActiveMembers - 1,
+			expectedSettled: true,
+		},
+		"a failed dispatch that still settled names the claim": {
+			activeMembers: heartbeatSigningMinimumActiveMembers - 1,
+			claimFails:    true,
+			settledClaim: &InactivityClaimedEvent{
+				WalletID:    walletID,
+				Nonce:       big.NewInt(41),
+				BlockNumber: 4100,
+			},
+			expectedSettled:   true,
+			expectedReference: settledReference,
+		},
+		"a failed dispatch that never settled names none": {
+			activeMembers:   heartbeatSigningMinimumActiveMembers - 1,
+			claimFails:      true,
+			expectedSettled: true,
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			hostChain := Connect()
+			hostChain.setOperatorsEligibleStake(big.NewInt(100000))
+
+			claimExecutor := &mockInactivityClaimExecutor{
+				shouldFail:   test.claimFails,
+				settledClaim: test.settledClaim,
+			}
+			failureCounter := newHeartbeatFailureCounter()
+
+			// The claim is only dispatched once consecutive low-activity
+			// heartbeats cross the threshold, so the disposition under test is
+			// the last run's.
+			var permit *testPermit
+			for run := 0; run < heartbeatConsecutiveFailureThreshold; run++ {
+				permit = newTestPermit(participation.TBTCHeartbeat)
+
+				runHeartbeatActionWithFailureCounter(
+					t,
+					hostChain,
+					&mockHeartbeatSigningExecutor{
+						activeOperatorsCount: test.activeMembers,
+					},
+					claimExecutor,
+					failureCounter,
+					proposal,
+					permit,
+				)
+			}
+
+			evidence := assertRecordedTerminalOutcome(
+				t,
+				permit,
+				participation.TerminalOutcomeCompleted,
+				participation.TerminalEvidenceProtocolResult,
+			)
+
+			if !test.expectedSettled {
+				if evidence.ChainSettlement != nil {
+					t.Fatalf(
+						"a heartbeat that dispatched no claim reported "+
+							"settlement [%+v]",
+						evidence.ChainSettlement,
+					)
+				}
+				return
+			}
+
+			if evidence.ChainSettlement == nil {
+				t.Fatal(
+					"a heartbeat that dispatched a claim reported no chain " +
+						"settlement",
+				)
+			}
+			if evidence.ChainSettlement.Kind !=
+				participation.ChainSettlementInactivityClaim {
+				t.Errorf(
+					"unexpected settlement kind\nexpected: [%s]\nactual:   [%s]",
+					participation.ChainSettlementInactivityClaim,
+					evidence.ChainSettlement.Kind,
+				)
+			}
+			if evidence.ChainSettlement.Reference != test.expectedReference {
+				t.Errorf(
+					"unexpected settlement reference\nexpected: [%s]\nactual:   [%s]",
+					test.expectedReference,
+					evidence.ChainSettlement.Reference,
+				)
+			}
+		})
+	}
+}
+
+// TestHeartbeatPenaltyState_UnrenderableSettlementStaysUnobserved asserts a
+// settlement the node cannot name canonically is reported as unobserved. The
+// two records mean different things to the barrier — unreconciled versus
+// reconciled against a named claim — and only the unreconciled one is safe
+// when the identity is unusable.
+func TestHeartbeatPenaltyState_UnrenderableSettlementStaysUnobserved(
+	t *testing.T,
+) {
+	penalty := heartbeatPenaltyState{
+		claimDispatched: true,
+		inactiveMembers: []group.MemberIndex{1, 2},
+		settledClaim: &InactivityClaimedEvent{
+			WalletID: [32]byte{0x01},
+			// A claim the chain never assigns a nonce to cannot be joined to
+			// any InactivityClaimed log.
+			Nonce: nil,
+		},
+	}
+
+	settlement := penalty.chainSettlement()
+	if settlement == nil {
+		t.Fatal("expected the dispatch itself to still be reported")
+	}
+	if settlement.Reference != "" {
+		t.Errorf(
+			"expected no settlement reference, got [%s]",
+			settlement.Reference,
+		)
+	}
+}
+
 // TestHeartbeatPenaltyState_InactiveMemberBytesAreCanonical asserts the claimed
 // member set contributes a deterministic identity: the signing activity report's
 // ordering is incidental, so two records of the same claim must agree.

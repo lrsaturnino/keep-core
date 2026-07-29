@@ -1010,6 +1010,9 @@ func (mhse *mockHeartbeatSigningExecutor) sign(
 
 type mockInactivityClaimExecutor struct {
 	shouldFail bool
+	// settledClaim is the on-chain settlement the executor reports observing,
+	// independently of shouldFail: a claim can land and the call still error.
+	settledClaim *InactivityClaimedEvent
 
 	sessionID *big.Int
 	calls     int
@@ -1021,13 +1024,13 @@ func (mice *mockInactivityClaimExecutor) claimInactivity(
 	inactiveMembersIndexes []group.MemberIndex,
 	heartbeatFailed bool,
 	sessionID *big.Int,
-) error {
+) (*InactivityClaimedEvent, error) {
 	mice.sessionID = sessionID
 	mice.calls++
 
 	if mice.shouldFail {
-		return fmt.Errorf("mock inactivity claim executor error")
+		return mice.settledClaim, fmt.Errorf("mock inactivity claim executor error")
 	}
 
-	return nil
+	return mice.settledClaim, nil
 }

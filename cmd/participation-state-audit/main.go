@@ -20,7 +20,8 @@
 //
 // Namespace consistency alone is deliberately insufficient for the rollback
 // barrier. Chain reconciliation (wallet/group registration and DKG
-// settlement, for active and quarantined state alike), Bitcoin transaction
+// settlement, for active and quarantined state alike, plus the inactivity
+// claims a heartbeat filed against the WalletRegistry), Bitcoin transaction
 // reconciliation, the quiescence outcome report, and prior-reader
 // compatibility evidence are produced outside this offline tool; until a
 // reference to each is supplied and recorded, the manifest reports the
@@ -2332,8 +2333,154 @@ func (r *auditRun) validateChainReconciliationEvidence(
 		violations,
 		validateTBTCDKGTerminalLineage(r.manifest, record, wallets)...,
 	)
+	violations = append(
+		violations,
+		r.reconcileInactivityClaimSettlements(record)...,
+	)
 
 	return violations
+}
+
+// reconcileInactivityClaimSettlements joins every inactivity claim the node
+// recorded dispatching to the authenticated WalletRegistry logs.
+//
+// A heartbeat that punishes members files that penalty on Ethereum, and the
+// node authors nothing about it beyond a digest of its own signature. Two
+// cases have to be told apart and neither may pass on the node's word. A
+// dispatch the node never saw settle is ambiguous: the claim may be on chain
+// under a nonce this node's rollback would then contradict, so the barrier
+// blocks. A dispatch the node reports as settled must be corroborated by a
+// canonical InactivityClaimed log for the exact wallet and nonce named,
+// emitted by the expected WalletRegistry inside an authenticated receipt. The
+// enclosing receipt validation has already bound every receipt to an attested
+// canonical block with successful status, so a matched log is chain state and
+// not a report the evidence generator wrote.
+func (r *auditRun) reconcileInactivityClaimSettlements(
+	record *chainReconciliationEvidence,
+) []string {
+	if r.manifest.ParticipationTerminalOutcomes == nil {
+		return nil
+	}
+
+	var violations []string
+	var settled map[string]uint64
+	for i, outcome := range r.manifest.ParticipationTerminalOutcomes.Outcomes {
+		settlement := outcome.Evidence.ChainSettlement
+		if settlement == nil ||
+			settlement.Kind !=
+				participation.ChainSettlementInactivityClaim {
+			continue
+		}
+		if settlement.Reference == "" {
+			violations = append(violations, fmt.Sprintf(
+				"node-authored outcome [%d] dispatched an inactivity claim it "+
+					"never observed settle; the penalty may or may not be on "+
+					"chain and cannot be reconciled",
+				i,
+			))
+			continue
+		}
+		walletID, nonce, err := participation.
+			ParseInactivityClaimSettlementReference(settlement.Reference)
+		if err != nil {
+			violations = append(violations, fmt.Sprintf(
+				"node-authored outcome [%d] names inactivity claim settlement "+
+					"[%s], which is not a canonical claim identity: [%v]",
+				i,
+				settlement.Reference,
+				err,
+			))
+			continue
+		}
+
+		if settled == nil {
+			settled, err = authenticatedInactivityClaims(record)
+			if err != nil {
+				violations = append(violations, fmt.Sprintf(
+					"cannot decode the authenticated inactivity claim logs: "+
+						"[%v]",
+					err,
+				))
+				break
+			}
+		}
+
+		claimed := hex.EncodeToString(walletID) + ":" + nonce.String()
+		if _, corroborated := settled[claimed]; !corroborated {
+			violations = append(violations, fmt.Sprintf(
+				"node-authored outcome [%d] reports inactivity claim [%s] "+
+					"settled, but no authenticated WalletRegistry "+
+					"InactivityClaimed log names that wallet and nonce",
+				i,
+				settlement.Reference,
+			))
+		}
+	}
+
+	return violations
+}
+
+// authenticatedInactivityClaims indexes every InactivityClaimed log the
+// authenticated receipts carry, keyed by the canonical wallet-and-nonce
+// identity of the claim it settled. Logs from any contract other than the
+// expected WalletRegistry are ignored: an identically shaped event from an
+// attacker-deployed contract names no penalty the registry ever applied.
+func authenticatedInactivityClaims(
+	record *chainReconciliationEvidence,
+) (map[string]uint64, error) {
+	parsed, err := ecdsaabi.WalletRegistryMetaData.GetAbi()
+	if err != nil {
+		return nil, fmt.Errorf(
+			"cannot load the generated WalletRegistry ABI: [%v]",
+			err,
+		)
+	}
+	event, ok := parsed.Events["InactivityClaimed"]
+	if !ok {
+		return nil, fmt.Errorf(
+			"generated WalletRegistry ABI has no [InactivityClaimed] event",
+		)
+	}
+	// The enclosing receipt validation already requires every log address and
+	// topic to be canonically encoded, and the registry address to be both
+	// canonical and the expected one, so exact comparison is what distinguishes
+	// the registry's own logs here.
+	eventID := event.ID.Hex()
+
+	claims := make(map[string]uint64)
+	for _, receipt := range record.Receipts {
+		for _, rawLog := range receipt.Logs {
+			if rawLog.Address != record.WalletRegistryAddress {
+				continue
+			}
+			// walletID is the sole indexed input, so a claim log always has
+			// exactly the signature topic and the wallet topic.
+			if len(rawLog.Topics) != 2 || rawLog.Topics[0] != eventID {
+				continue
+			}
+			walletID, err := decodeCanonicalEthereumBytes(rawLog.Topics[1], 32)
+			if err != nil {
+				continue
+			}
+			data, err := decodeCanonicalEthereumDynamicBytes(rawLog.Data)
+			if err != nil {
+				continue
+			}
+			values, err := event.Inputs.NonIndexed().Unpack(data)
+			if err != nil || len(values) == 0 {
+				continue
+			}
+			nonce, ok := values[0].(*big.Int)
+			if !ok || nonce == nil || nonce.Sign() < 0 {
+				continue
+			}
+
+			claims[hex.EncodeToString(walletID)+":"+nonce.String()] =
+				receipt.BlockNumber
+		}
+	}
+
+	return claims, nil
 }
 
 func expectedTBTCDKGRawLog(

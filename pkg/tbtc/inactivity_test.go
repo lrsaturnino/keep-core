@@ -38,7 +38,7 @@ func TestInactivityClaimExecutor_ClaimInactivity(t *testing.T) {
 	message := big.NewInt(100)
 	inactiveMembersIndexes := []group.MemberIndex{1, 4}
 
-	err = executor.claimInactivity(
+	settledClaim, err := executor.claimInactivity(
 		ctx,
 		newTestPermit(participation.TBTCInactivityClaim),
 		inactiveMembersIndexes,
@@ -63,6 +63,106 @@ func TestInactivityClaimExecutor_ClaimInactivity(t *testing.T) {
 		expectedNonceDiff,
 		nonceDiff,
 	)
+
+	// The claim reached the chain, so the executor must report the settlement
+	// its caller records; the reported identity has to be the wallet and the
+	// nonce the claim consumed, not the wallet's current one.
+	if settledClaim == nil {
+		t.Fatal("expected the submitted inactivity claim to be reported settled")
+	}
+	if settledClaim.WalletID != walletEcdsaID {
+		t.Errorf(
+			"unexpected settled wallet\nexpected: [0x%x]\nactual:   [0x%x]",
+			walletEcdsaID,
+			settledClaim.WalletID,
+		)
+	}
+	testutils.AssertBigIntsEqual(
+		t,
+		"settled inactivity claim nonce",
+		initialNonce,
+		settledClaim.Nonce,
+	)
+}
+
+// TestInactivityClaimExecutor_ClaimInactivity_UnrelatedWalletSettlement checks
+// that a claim settled against a different wallet is not reported as this
+// claim's settlement. The chain subscription is unfiltered, so the executor is
+// the only thing standing between an unrelated penalty and a terminal record
+// that names it.
+func TestInactivityClaimExecutor_ClaimInactivity_UnrelatedWalletSettlement(
+	t *testing.T,
+) {
+	walletID := [32]byte{0x01}
+	nonce := big.NewInt(7)
+
+	observer := newInactivityClaimSettlementObserver(walletID, nonce)
+
+	for _, test := range []struct {
+		name  string
+		event *InactivityClaimedEvent
+	}{
+		{
+			name:  "no event at all",
+			event: nil,
+		},
+		{
+			name: "another wallet at the same nonce",
+			event: &InactivityClaimedEvent{
+				WalletID: [32]byte{0x02},
+				Nonce:    big.NewInt(7),
+			},
+		},
+		{
+			name: "the same wallet at a later nonce",
+			event: &InactivityClaimedEvent{
+				WalletID: walletID,
+				Nonce:    big.NewInt(8),
+			},
+		},
+		{
+			name: "the same wallet with no nonce",
+			event: &InactivityClaimedEvent{
+				WalletID: walletID,
+				Nonce:    nil,
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if observer.observe(test.event) {
+				t.Error("expected the event not to be attributed to the claim")
+			}
+			if observer.settled() != nil {
+				t.Error("expected no settlement to be recorded")
+			}
+		})
+	}
+
+	matching := &InactivityClaimedEvent{
+		WalletID:    walletID,
+		Nonce:       big.NewInt(7),
+		BlockNumber: 1000,
+	}
+	if !observer.observe(matching) {
+		t.Fatal("expected the matching event to be attributed to the claim")
+	}
+
+	// Every controlled signer observes the same settlement; the record must
+	// stay on the first observation so members cannot report different blocks
+	// for one claim.
+	if !observer.observe(&InactivityClaimedEvent{
+		WalletID:    walletID,
+		Nonce:       big.NewInt(7),
+		BlockNumber: 2000,
+	}) {
+		t.Fatal("expected a repeated matching event to still match the claim")
+	}
+	if settled := observer.settled(); settled != matching {
+		t.Errorf(
+			"expected the first observation to be retained, got [%v]",
+			settled,
+		)
+	}
 }
 
 func TestInactivityClaimExecutor_ClaimInactivity_Busy(t *testing.T) {
@@ -76,7 +176,7 @@ func TestInactivityClaimExecutor_ClaimInactivity_Busy(t *testing.T) {
 
 	errChan := make(chan error, 1)
 	go func() {
-		err := executor.claimInactivity(
+		_, err := executor.claimInactivity(
 			ctx,
 			newTestPermit(participation.TBTCInactivityClaim),
 			inactiveMembersIndexes,
@@ -88,7 +188,7 @@ func TestInactivityClaimExecutor_ClaimInactivity_Busy(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	err := executor.claimInactivity(
+	settledClaim, err := executor.claimInactivity(
 		ctx,
 		newTestPermit(participation.TBTCInactivityClaim),
 		inactiveMembersIndexes,
@@ -96,6 +196,15 @@ func TestInactivityClaimExecutor_ClaimInactivity_Busy(t *testing.T) {
 		message,
 	)
 	testutils.AssertErrorsSame(t, errInactivityClaimExecutorBusy, err)
+
+	// A refused call never subscribed to anything, so it cannot report a
+	// settlement observed by the call that holds the executor.
+	if settledClaim != nil {
+		t.Errorf(
+			"expected no settlement from a refused claim, got [%v]",
+			settledClaim,
+		)
+	}
 
 	err = <-errChan
 	if err != nil {
