@@ -421,6 +421,17 @@ and the gate refuses a completed record for any of them that publishes none, so
 each required ceremony is held to the same node-authored reading with no fallback
 to the report.
 
+Both halves are read out of **one** published transcript, never out of the
+fleet's several transcripts added together. The fleet-wide account is used for
+one thing only — which seats some node under test operated, the ownership map —
+and the mixed reading then asks a single record's incorporated population to
+contain a seat inside that map and a seat outside it. Aggregating the
+populations instead would invent transcripts: a threshold output can be recovered
+from different subsets of the same ceremony, so two holders naming one result
+need not name one population, and an R1-only record beside a prior-only
+observer's record of the same work would union into a mixed seat set that neither
+record contains and no ceremony ever had.
+
 Completing a ceremony and contributing to it are held apart. A wallet action owns
 its permit and records the signature it saw settle even when the attempt that
 produced it selected none of the memberships this node operates, which is the

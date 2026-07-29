@@ -6562,43 +6562,82 @@ uncredited_contributors() {
   printf '%s' "${out}"
 }
 
-# The memberships that produced one piece of chain work which nobody in the
-# fleet under test claims to have operated, comma-joined ascending.
+# Every seat on one piece of chain work that some holder of it says it operated
+# itself, space-joined. Repeats are left in: this is read as an ownership map
+# rather than as a population.
 #
-# This is the mixed-release claim reduced to something the fleet authors by
-# itself. Every R1 holder publishes the memberships whose authenticated
-# contributions it combined into the result, and separately the memberships it
-# operated. Union the first across the fleet and subtract the union of the
-# second: what remains are seats in the ceremony that produced the result which
-# no node in this fleet was sitting in, so some node outside the fleet supplied
-# them. The rehearsal runs exactly two releases, and the container set is the
-# harness's own rather than any report's, so a remaining seat is a seat the prior
-# binary held.
+# A seat in the map is a seat a node under test was sitting in. A seat outside it
+# is one no node in this fleet claims, and since the rehearsal runs exactly two
+# releases and the container set is the harness's own rather than any report's,
+# the only party left to have supplied it is the prior binary.
 #
-# Nothing here is the driver's word. A driver reporting a homogeneous run as
-# mixed leaves this empty, and a driver naming a party the fleet never
-# authenticated cannot add one.
-unaffiliated_transcript_members() {
-  local work="$1" authored="$2"
-  local token permit incorporated="" local_members="" member out=""
+# The map spans the fleet because a seat's operator is whichever node operated
+# it, not whichever node published the transcript naming it. Nothing in it is the
+# driver's word: each holder names only memberships of its own, and no report can
+# add one.
+authored_work_local_members() {
+  local work="$1" authored="$2" token permit members out=""
   for token in ${authored}; do
     authored_record_complete "${token}" || continue
     [[ "$(authored_outcome "${token}")" == "completed" ]] || continue
     permit="$(authored_permit "${token}")"
     [[ "$(identity_work "${permit}")" == "${work}" ]] || continue
-    incorporated="${incorporated} $(authored_incorporated "${token}")"
-    local_members="${local_members} $(authored_local "${token}")"
+    members="$(authored_local "${token}")"
+    # "-" is how the gate renders an absent set, and it must not survive into a
+    # membership map: read as a token it would make an incorporated "-" look
+    # like an operated seat.
+    [[ "${members}" == "-" ]] && continue
+    out="${out}${out:+ }${members//,/ }"
   done
-  # "-" is how the gate renders an absent set, and it must not survive into a
-  # membership list: read as a token it would compare unequal to every seat and
-  # count as an unaffiliated one.
-  incorporated="${incorporated//,/ }"
-  local_members="${local_members//,/ }"
-  for member in ${incorporated}; do
-    [[ "${member}" == "-" ]] && continue
-    contains_token "${local_members}" "${member}" && continue
-    contains_token "${out//,/ }" "${member}" && continue
-    out="${out}${out:+,}${member}"
+  printf '%s' "${out}"
+}
+
+# Of the completions on one piece of chain work, the ones whose own transcript
+# names both a seat this fleet operated and a seat it did not, rendered as
+# "<permit> (fleet <seats>, outside <seats>)".
+#
+# This is the mixed-release claim reduced to something the fleet authors by
+# itself, and it is asked of one transcript at a time. Every R1 holder publishes
+# the memberships whose authenticated contributions it combined into the result
+# and, separately, the memberships it operated; a single record naming a seat in
+# the fleet's ownership map and a seat outside it is one threshold output that
+# both releases went into.
+#
+# Populations from different records are never unioned, and that is the whole
+# point of reading them one at a time. Two holders of one piece of work can
+# recover the same threshold output from different subsets of the same ceremony,
+# so records agreeing on a result do not imply records agreeing on a population:
+# an R1-only transcript beside a prior-only observer's transcript is two
+# homogeneous readings of the same work, and a union of the two would manufacture
+# a mixed population that no node ever recorded and no ceremony ever had.
+#
+# Nothing here is the driver's word. A run this fleet performed alone leaves no
+# record with a seat outside the map, a run it only watched leaves no record with
+# a seat inside it, and a driver naming a party the fleet never authenticated
+# cannot add either half.
+mixed_transcript_permits() {
+  local work="$1" authored="$2"
+  local owned token permit incorporated member fleet outside out=""
+  owned="$(authored_work_local_members "${work}" "${authored}")"
+  for token in ${authored}; do
+    authored_record_complete "${token}" || continue
+    [[ "$(authored_outcome "${token}")" == "completed" ]] || continue
+    permit="$(authored_permit "${token}")"
+    [[ "$(identity_work "${permit}")" == "${work}" ]] || continue
+    incorporated="$(authored_incorporated "${token}")"
+    [[ "${incorporated}" == "-" ]] && continue
+    fleet=""
+    outside=""
+    for member in ${incorporated//,/ }; do
+      if contains_token "${owned}" "${member}"; then
+        fleet="${fleet}${fleet:+,}${member}"
+      else
+        outside="${outside}${outside:+,}${member}"
+      fi
+    done
+    [[ -n "${fleet}" ]] || continue
+    [[ -n "${outside}" ]] || continue
+    out="${out}${out:+, }${permit} (fleet ${fleet}, outside ${outside})"
   done
   printf '%s' "${out}"
 }
@@ -6777,15 +6816,24 @@ missing_bound_families() {
 # releases combined into one threshold output, because nothing else ever asked a
 # node who was there.
 #
-# Both are now read from the seats. Each R1 holder publishes the memberships
-# whose authenticated contributions it combined into the result and, separately,
-# the memberships it operated itself. A seat it operated is the R1 share; a seat
-# in the first set that no node in the fleet claims in the second is a seat some
-# node outside the fleet was sitting in, and the only other release on this
-# network is the prior binary. The driver's contributor list is still reconciled
-# in both directions before this runs, but it supplies neither half of the claim:
-# a run this fleet performed alone leaves no unaffiliated seat, and a run it only
-# watched leaves no seat of its own, whatever the report says about either.
+# Both are now read from the seats, and out of one record at a time. Each R1
+# holder publishes the memberships whose authenticated contributions it combined
+# into the result and, separately, the memberships it operated itself. One
+# published transcript naming a seat some node in the fleet operated and a seat
+# no node in it claims is a single threshold output both releases went into, and
+# the only other release on this network is the prior binary.
+#
+# The seats of separate records are never added together to reach that reading.
+# A threshold output can be recovered from different subsets of the same
+# ceremony, so two holders agreeing on a result need not agree on who produced
+# it: an R1-only transcript beside a prior-only observer's transcript of the same
+# work would satisfy an aggregate reading with neither transcript mixed.
+#
+# The driver's contributor list is still reconciled in both directions before
+# this runs, but it supplies neither half of the claim: a run this fleet
+# performed alone leaves no record with a seat outside its own, and a run it only
+# watched leaves no record with a seat of its own, whatever the report says about
+# either.
 ceremonies_without_mixed_transcript() {
   local claimed="$1" authored="$2" required="$3" prior="$4"
   local ceremony record work audited covered uncovered=""
@@ -6803,34 +6851,28 @@ ceremonies_without_mixed_transcript() {
       audited="$(audited_work_id "${work}")"
       # The same piece of work, not merely the same ceremony. A prior share on
       # one work and an R1 share on another are two homogeneous transcripts
-      # however the totals read, and the R1 half of this one is the fleet's own
-      # record of having contributed to exactly this work rather than the
-      # driver's account of who was in it.
+      # however the totals read, so the reading below is joined to exactly the
+      # work the prior claim is about.
       #
-      # Where the holders publish a transcript, contributing means one of the
-      # seats that produced the result was theirs. An R1 node that merely
-      # observed a prior-only result completes its permit honestly and is not a
-      # party to it, so it cannot supply this half; where they publish none — the
-      # beacon families — the completion is still all there is, which is the
-      # limit named below.
-      [[ -n "$(authored_work_contributors "${audited}" "${authored}")" ]] ||
+      # And it is one transcript's own population, not the fleet's aggregate
+      # view of the work: a record naming a seat the fleet operated beside a seat
+      # it did not. Both halves come off the seats rather than out of the report,
+      # with no fallback to the driver's word — every gated ceremony that reaches
+      # a threshold result publishes the population behind it (the tBTC signing
+      # families from their authenticated done checks, tBTC DKG from its final
+      # signing group, beacon DKG from the operating members of the accepted
+      # result, beacon relay signing from the authenticated entry shares it
+      # combined) and the gate refuses a completed record for any of them that
+      # names none. A work whose holders publish no transcript therefore has no
+      # reading here at all, which is the honest outcome: the driver cannot
+      # describe a population the fleet never authored.
+      #
+      # An R1 node that merely observed a prior-only result completes its permit
+      # honestly, claims no seat of its own in it, and so supplies neither half —
+      # its transcript is prior-only, and the R1-only transcript of an actual
+      # contributor beside it is still prior-free.
+      [[ -n "$(mixed_transcript_permits "${audited}" "${authored}")" ]] ||
         continue
-      # And the half that used to be taken on trust: a seat in the transcript
-      # the fleet says produced this exact work, which no node in the fleet says
-      # it operated.
-      #
-      # Required of every ceremony, with no fallback to the driver's word. Each
-      # gated ceremony that produces a threshold result now publishes the
-      # population behind it — the tBTC signing families from their
-      # authenticated done checks, tBTC DKG from its final signing group, beacon
-      # DKG from the operating members of the accepted result, beacon relay
-      # signing from the authenticated entry shares it combined — and the gate
-      # refuses a completed record for any of them that names none. A work whose
-      # holders publish no transcript therefore has no reading here at all,
-      # which is the honest outcome: the driver cannot describe a population the
-      # fleet never authored.
-      [[ -n "$(unaffiliated_transcript_members \
-        "${audited}" "${authored}")" ]] || continue
       covered=1
       break
     done

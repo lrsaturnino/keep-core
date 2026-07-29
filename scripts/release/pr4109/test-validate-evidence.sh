@@ -4042,6 +4042,41 @@ beacon_dkg@845@bdkg845=prior-node~7"'
 check "shares in separate transcripts are not one mixed transcript" 3 \
   "no tbtc_dkg tbtc_signing tbtc_heartbeat transcript incorporated a share"
 
+# The same distinction where both transcripts are of one piece of work, one
+# result, and one ceremony — the case an aggregate reading of the fleet's seats
+# cannot see. r1-node-1 publishes a signing transcript naming only its own seat,
+# and r1-node-2 publishes a prior-only view of that same result: the honest
+# ending of a permit whose attempt selected none of the memberships it operates.
+#
+# Neither population is mixed. One is this fleet producing a threshold output on
+# its own; the other is an R1 node watching the prior binary produce one. A
+# threshold output can be recovered from different subsets of the same ceremony,
+# so two holders naming the same result are not two holders naming the same
+# population, and adding their seats together invents the mixed set {1,7} that
+# neither record contains and no ceremony ever had.
+# shellcheck disable=SC2016
+run_verdict precutover_case eval '
+  PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS/\
+0xsign843=-=1,7=1=-/0xsign843=-=1=1=-}"
+  PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS} \
+r1-node-2@tbtc_signing@843@sign843#4=completed=bitcoin_transaction=0xsign843\
+=-=7=-=-"'
+check "two transcripts of one work are not one mixed transcript" 3 \
+  "no tbtc_signing transcript incorporated a share"
+
+# And the control that keeps the fix from being a refusal of everything: the
+# same two records with the contributing holder's own transcript naming the seat
+# outside the fleet as well. One published population now contains both halves,
+# which is what a mixed ceremony leaves behind, and the observer's prior-only
+# record beside it neither adds to that reading nor takes anything from it.
+# shellcheck disable=SC2016
+run_verdict precutover_case eval '
+  PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS} \
+r1-node-2@tbtc_signing@843@sign843#4=completed=bitcoin_transaction=0xsign843\
+=-=7=-=-"'
+check "one transcript holding both halves still covers the ceremony" 0 \
+  "issued 4 new legacy permits"
+
 # A service the rehearsal does not run is neither half of the claim. Reading a
 # third name as the R1 side would let a stray container supply a share no
 # rehearsed release was shown to have contributed; reading it as the prior side
