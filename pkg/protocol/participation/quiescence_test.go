@@ -158,7 +158,8 @@ func TestPersistenceQuiescenceSnapshotRecorder_PersistsTerminalJournal(
 			journal.SnapshotCapturedAt,
 		)
 	}
-	if len(journal.Outcomes) != 1 || journal.Outcomes[0] != outcome {
+	if len(journal.Outcomes) != 1 ||
+		!journal.Outcomes[0].Equal(outcome) {
 		t.Errorf("unexpected terminal outcomes: %+v", journal.Outcomes)
 	}
 }

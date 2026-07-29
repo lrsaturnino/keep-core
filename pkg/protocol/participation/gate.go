@@ -1145,7 +1145,7 @@ func (p *permit) RecordTerminalOutcome(
 	}
 	if p.terminalOutcome != nil {
 		if p.terminalOutcome.Outcome == outcome &&
-			p.terminalOutcome.Evidence == evidence {
+			p.terminalOutcome.Evidence.Equal(evidence) {
 			if g.quiescenceSnapshot != nil && g.recorder != nil {
 				if err := g.recorder.RecordTerminalOutcome(
 					*p.terminalOutcome,

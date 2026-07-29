@@ -242,6 +242,24 @@ type TerminalEvidence struct {
 	ChainSettlement *ChainSettlementRecord `json:"chain_settlement,omitempty"`
 }
 
+// Equal reports whether two evidence records describe the same durable result.
+// It exists because TerminalEvidence carries a pointer: Go's == would compare
+// the settlement by address, so two records built separately from the same
+// observation — a retried write, a record reloaded from the journal — would
+// read as different results. Callers must use this instead of ==.
+func (e TerminalEvidence) Equal(other TerminalEvidence) bool {
+	if e.Kind != other.Kind ||
+		e.Reference != other.Reference ||
+		e.MembershipIndex != other.MembershipIndex {
+		return false
+	}
+	if e.ChainSettlement == nil || other.ChainSettlement == nil {
+		return e.ChainSettlement == other.ChainSettlement
+	}
+
+	return *e.ChainSettlement == *other.ChainSettlement
+}
+
 // ChainSettlementKind identifies a chain side effect a ceremony dispatches
 // outside its own protocol result.
 type ChainSettlementKind string
@@ -400,6 +418,17 @@ type TerminalOutcomeRecord struct {
 	Permit     PermitSnapshot   `json:"permit"`
 	Outcome    TerminalOutcome  `json:"outcome"`
 	Evidence   TerminalEvidence `json:"evidence"`
+}
+
+// Equal reports whether two records report the same disposition of the same
+// permit. Like TerminalEvidence.Equal it exists because the embedded evidence
+// carries a pointer, so == would separate a record from an identical one
+// rebuilt or reloaded elsewhere. Callers must use this instead of ==.
+func (r TerminalOutcomeRecord) Equal(other TerminalOutcomeRecord) bool {
+	return r.RecordedAt.Equal(other.RecordedAt) &&
+		r.Permit == other.Permit &&
+		r.Outcome == other.Outcome &&
+		r.Evidence.Equal(other.Evidence)
 }
 
 // TerminalOutcomeJournal is the node-authored terminal record for the exact
@@ -766,7 +795,7 @@ func (r *persistenceQuiescenceSnapshotRecorder) RecordTerminalOutcome(
 
 	for _, existing := range r.journal.Outcomes {
 		if existing.Permit == outcome.Permit {
-			if existing == outcome {
+			if existing.Equal(outcome) {
 				return nil
 			}
 			return fmt.Errorf(

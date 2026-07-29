@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/big"
 	"strings"
 	"sync"
 	"testing"
@@ -248,7 +249,8 @@ func TestGate_NodeAuthoredTerminalOutcomeRetriesPersistence(t *testing.T) {
 	if len(outcomes) != 1 {
 		t.Fatalf("expected one terminal outcome, got [%d]", len(outcomes))
 	}
-	if outcomes[0].Outcome != outcome || outcomes[0].Evidence != evidence {
+	if outcomes[0].Outcome != outcome ||
+		!outcomes[0].Evidence.Equal(evidence) {
 		t.Errorf("unexpected terminal outcome after retry: %+v", outcomes[0])
 	}
 }
@@ -285,7 +287,7 @@ func (r *recordingQuiescenceSnapshotRecorder) RecordTerminalOutcome(
 
 	for _, existing := range r.outcomes {
 		if existing.Permit == outcome.Permit {
-			if existing == outcome {
+			if existing.Equal(outcome) {
 				return r.err
 			}
 			return fmt.Errorf("contradictory terminal outcome")
@@ -2241,5 +2243,108 @@ func TestGate_ConcurrentBeginAcrossCutover(t *testing.T) {
 		TBTCSigning, cutover,
 	); !errors.Is(err, ErrQuiescing) {
 		t.Errorf("expected a quiescing refusal after close, got: [%v]", err)
+	}
+}
+
+// TestGate_TerminalOutcomeRetryComparesSettlementByValue pins the retry path
+// for an outcome carrying a chain settlement. The retry is expected to be an
+// identical call, but a ceremony owner rebuilds its evidence each time, so the
+// two settlements are equal values at different addresses. Comparing them by
+// address would reject the retry as a contradictory second outcome and lose the
+// disposition the ceremony actually reached.
+func TestGate_TerminalOutcomeRetryComparesSettlementByValue(t *testing.T) {
+	const cutover = uint64(1_000)
+	capturedAt := time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC)
+	recorder := &recordingQuiescenceSnapshotRecorder{
+		terminalFailures: 1,
+		terminalErr:      errors.New("transient journal failure"),
+	}
+	gate, err := newGate(
+		context.Background(),
+		Schedule{CutoverBlock: cutover},
+		newGateBlockCounter(cutover),
+		newFakeMetrics(),
+		inertPollInterval,
+		WithArtifactIdentity("v2.1.0", "revision-test"),
+		WithQuiescenceSnapshotRecorder(recorder),
+		withGateTimeSource(func() time.Time { return capturedAt }),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(gate.Close)
+
+	permit, err := gate.Begin(
+		TBTCHeartbeat,
+		cutover,
+		PermitIdentity{
+			WorkID:   "heartbeat-retry",
+			PermitID: "heartbeat-retry",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate.Quiesce(fmt.Errorf("rollback drill"))
+
+	walletID := make([]byte, inactivityClaimWalletIDLength)
+	walletID[0] = 0x5c
+	reference, err := InactivityClaimSettlementReference(
+		walletID,
+		big.NewInt(4),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Each attempt builds its own settlement record, exactly as the ceremony
+	// owner does.
+	newEvidence := func() TerminalEvidence {
+		return TerminalEvidence{
+			Kind:      TerminalEvidenceProtocolResult,
+			Reference: "heartbeat-result-identity",
+			ChainSettlement: &ChainSettlementRecord{
+				Kind:      ChainSettlementInactivityClaim,
+				Reference: reference,
+			},
+		}
+	}
+
+	if err := permit.RecordTerminalOutcome(
+		TerminalOutcomeCompleted,
+		newEvidence(),
+	); !errors.Is(err, ErrTerminalOutcomePersistence) {
+		t.Fatalf("expected first persistence attempt to fail, got [%v]", err)
+	}
+	if err := permit.RecordTerminalOutcome(
+		TerminalOutcomeCompleted,
+		newEvidence(),
+	); err != nil {
+		t.Fatalf("expected identical outcome retry to succeed, got [%v]", err)
+	}
+	permit.Close()
+
+	outcomes := recorder.recordedOutcomes()
+	if len(outcomes) != 1 {
+		t.Fatalf("expected one terminal outcome, got [%d]", len(outcomes))
+	}
+	if !outcomes[0].Evidence.Equal(newEvidence()) {
+		t.Errorf(
+			"unexpected terminal outcome after retry: %+v",
+			outcomes[0].Evidence,
+		)
+	}
+
+	// A retry that names a different settlement is a contradiction, not a
+	// retry, and must still be refused.
+	contradicting := newEvidence()
+	contradicting.ChainSettlement = &ChainSettlementRecord{
+		Kind: ChainSettlementInactivityClaim,
+	}
+	if !TerminalEvidence.Equal(newEvidence(), newEvidence()) {
+		t.Error("two equal evidence values compared unequal")
+	}
+	if newEvidence().Equal(contradicting) {
+		t.Error("an unobserved settlement compared equal to an observed one")
 	}
 }
