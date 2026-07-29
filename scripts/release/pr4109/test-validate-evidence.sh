@@ -3427,6 +3427,7 @@ run_verdict homogeneous_case eval \
 check "a post-C settlement no node vouched for is not finished work" 3 \
   "no node recorded an ending for r1-node-1=bdkg1201#1"
 
+# shellcheck disable=SC2016
 run_verdict homogeneous_case eval \
   'HOMOGENEOUS_AUTHORED_ENDINGS="${HOMOGENEOUS_AUTHORED_ENDINGS} \
 r1-node-1=bdkg1201#1=exhausted"'
@@ -3453,12 +3454,14 @@ r1-node-1=bdkg1201#1=quarantined"'
 check "a quarantined post-C permit is not a completed ceremony" 1 \
   "r1-node-1=bdkg1201#1=quarantined"
 
+# shellcheck disable=SC2016
 run_verdict homogeneous_case eval \
   'HOMOGENEOUS_BOUND="${HOMOGENEOUS_BOUND} \
 tbtc_heartbeat@1202@beat1202=succeeded=${HOM_TX3}=0xbeat1202"'
 check "a post-C outcome for work never originated here is not evidence" 1 \
   "tbtc_heartbeat@1202@beat1202"
 
+# shellcheck disable=SC2016
 run_verdict homogeneous_case eval \
   'HOMOGENEOUS_ORIGINATED="${HOMOGENEOUS_ORIGINATED} \
 tbtc_heartbeat@1202@beat1202=${HOM_TX3}=r1-node-1~2"
@@ -3739,6 +3742,7 @@ check "a cross-format peer below C refutes the compatibility claim" 1 \
 
 # The coverage requirement is what makes the second pre-C step a different
 # claim from the first rather than a repeat of it.
+# shellcheck disable=SC2016
 run_verdict precutover_case eval \
   'PRECUTOVER_BOUND="beacon_signing@841@entry841=succeeded=${PRE_TX2}=0xentry841
      tbtc_dkg@842@dkg842=succeeded=${PRE_TX1}=0xdkg842
@@ -3751,6 +3755,7 @@ check "pre-cutover work without a wallet action is not the longest action" 3 \
 # What a family-and-class requirement cannot state. This fixture covers both
 # halves of the release and both work classes, and still leaves three mandated
 # ceremonies undriven — which is the reading a broad requirement accepts.
+# shellcheck disable=SC2016
 run_verdict precutover_case eval \
   'PRECUTOVER_BOUND="tbtc_wallet_action@840@wallet840=succeeded=${PRE_TX1}=0xbtc840
      beacon_signing@841@entry841=succeeded=${PRE_TX2}=0xentry841
@@ -3762,6 +3767,7 @@ check "a covered family and work class is not the mandated ceremony set" 3 \
 # likeliest to skip: it settles like a signing, and it is the one carrying the
 # inactivity penalty path the crossing has to keep quiet. A step that drove
 # none of them says nothing about that path.
+# shellcheck disable=SC2016
 run_verdict precutover_case eval \
   'PRECUTOVER_BOUND="tbtc_wallet_action@840@wallet840=succeeded=${PRE_TX1}=0xbtc840
      beacon_signing@841@entry841=succeeded=${PRE_TX2}=0xentry841
@@ -3774,6 +3780,7 @@ check "a pre-cutover step that drove no heartbeat is incomplete" 3 \
 # The beacon half is enumerated for the same reason the tBTC half is: its DKG
 # and its signing are separate paths into the gate, and one beacon ceremony
 # settling covers the family without covering the other path.
+# shellcheck disable=SC2016
 run_verdict precutover_case eval \
   'PRECUTOVER_BOUND="tbtc_wallet_action@840@wallet840=succeeded=${PRE_TX1}=0xbtc840
      tbtc_dkg@842@dkg842=succeeded=${PRE_TX1}=0xdkg842
@@ -3812,11 +3819,13 @@ check "a fleet that cannot be asked has vouched for no settlement" 3 \
 # The partial population: five permits ended with a record and the sixth simply
 # never mentioned, which is also what eviction from a bounded account looks
 # like. Both are the same thing to a reader.
+# shellcheck disable=SC2016
 run_verdict precutover_case eval \
   'PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS% *}"'
 check "a settled ceremony no node vouched for is not completed work" 3 \
   "no node recorded an ending for r1-node-1=bdkg845#1"
 
+# shellcheck disable=SC2016
 run_verdict precutover_case eval \
   'PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS} \
 r1-node-1=bdkg845#1=exhausted"'
@@ -3826,6 +3835,7 @@ check "one permit ending twice cannot be read as either ending" 3 \
 # A permit closed by an owner that recorded nothing. The gate writes that down
 # as an ending rather than leaving it absent, so it arrives as a disposition a
 # reader can refuse rather than as silence.
+# shellcheck disable=SC2016
 run_verdict precutover_case eval \
   'PRECUTOVER_AUTHORED_ENDINGS="\
 ${PRECUTOVER_AUTHORED_ENDINGS% *} r1-node-1=bdkg845#1=unresolved"'
@@ -3834,6 +3844,7 @@ check "a settled ceremony whose holder recorded nothing stands on nothing" 1 \
 
 # The disagreement this rung exists for: the driver reports a settlement and
 # the node holding the permit says the ceremony ran out of retries.
+# shellcheck disable=SC2016
 run_verdict precutover_case eval \
   'PRECUTOVER_AUTHORED_ENDINGS="\
 ${PRECUTOVER_AUTHORED_ENDINGS% *} r1-node-1=bdkg845#1=exhausted"'
@@ -3842,6 +3853,7 @@ check "a driver settlement the holder recorded as exhausted is refused" 1 \
 
 # Quarantine is a closing too, and a pre-C compatibility claim is about work
 # that finished rather than work whose key material was withdrawn.
+# shellcheck disable=SC2016
 run_verdict precutover_case eval \
   'PRECUTOVER_AUTHORED_ENDINGS="\
 ${PRECUTOVER_AUTHORED_ENDINGS% *} r1-node-1=bdkg845#1=quarantined"'
@@ -3851,12 +3863,14 @@ check "a quarantined permit is not a completed pre-cutover ceremony" 1 \
 # An outcome for a ceremony this phase did not put on the chain, and one whose
 # transaction is not the transaction that originated it. Either is somebody
 # else's ceremony arriving in this control's reckoning.
+# shellcheck disable=SC2016
 run_verdict precutover_case eval \
   'PRECUTOVER_BOUND="${PRECUTOVER_BOUND} \
 tbtc_signing@846@sign846=succeeded=${PRE_TX1}=0xsign846"'
 check "an outcome for work this phase never originated is not evidence" 1 \
   "tbtc_signing@846@sign846"
 
+# shellcheck disable=SC2016
 run_verdict precutover_case eval \
   'PRECUTOVER_ORIGINATED="${PRECUTOVER_ORIGINATED/@845@bdkg845=${PRE_TX2}/\
 @845@bdkg845=${PRE_TX1}}"'
@@ -3867,6 +3881,7 @@ evidence" 1 \
 # Originated work with no outcome at all, which is how a partial population
 # passes: six ceremonies driven, five reported, and every requirement above
 # satisfied by the five.
+# shellcheck disable=SC2016
 run_verdict precutover_case eval \
   'PRECUTOVER_ORIGINATED="${PRECUTOVER_ORIGINATED} \
 tbtc_signing@846@sign846=${PRE_TX1}=r1-node-1~2"
@@ -3991,11 +4006,13 @@ check "work that ended before C is not work held across it" 3 \
   "had already ended"
 
 # A terminal phase must be about the work this step put on the chain.
+# shellcheck disable=SC2016
 run_verdict surviving_case eval \
   'SURVIVING_TERMINAL="beacon_dkg@900@seed900=succeeded=${SURVIVE_TX}=0xgroup900"'
 check "an outcome for other work is not the held permit finishing" 3 \
   "did not originate before C"
 
+# shellcheck disable=SC2016
 run_verdict surviving_case eval \
   'SURVIVING_TERMINAL="tbtc_signing@840@wallet840=no_threshold=${SURVIVE_TX}=no_threshold"'
 check "legacy work abandoned on the far side of C refutes the gate" 1 \
@@ -4019,6 +4036,7 @@ check "no driver holds no legacy permit across C" 3 \
 SURVIVE_TX_SECOND="0xff77777777777777777777777777777777777777777777777777777777777777"
 
 # Two permits held across C, one settled, the other simply unmentioned.
+# shellcheck disable=SC2016
 run_verdict surviving_case eval '
   SURVIVING_ORIGINATED="tbtc_signing@840@wallet840=${SURVIVE_TX}=r1-node-1~member-1 tbtc_signing@841@wallet841=${SURVIVE_TX_SECOND}=r1-node-1~member-2"
   SURVIVING_HELD_BEFORE="2"
@@ -4068,6 +4086,7 @@ check "a legacy permit appearing only at the crossing is caught" 3 \
 # Both readings of the seeding name it, which is what the exclusion rests on.
 # shellcheck disable=SC2034
 QUIESCE_SEED_TX="0xee66666666666666666666666666666666666666666666666666666666666666"
+# shellcheck disable=SC2016
 SEEDED_AT_C='SURVIVING_PERMITS_AT_C="r1-node-1=wallet840#member-1 r1-node-1=quiesce900#member-7"
   QUIESCE_SEEDED_WORK="beacon_dkg@900@quiesce900=${QUIESCE_SEED_TX}=r1-node-1~member-7"
   QUIESCE_SEEDED_PERMITS_BEFORE_C="r1-node-1=quiesce900#member-7"'
@@ -4089,6 +4108,7 @@ check "an unreadable seed reading accounts for no arrival at C" 3 \
 # two samples is in it, and excusing the reading wholesale would wave that
 # permit through C under the seed's name — where it can supply the fleet-wide
 # completion increment the named permit is supposed to.
+# shellcheck disable=SC2016
 run_verdict surviving_case eval "${SEEDED_AT_C}"'
   SURVIVING_PERMITS_AT_C="${SURVIVING_PERMITS_AT_C} r1-node-1=bystander#member-8"
   QUIESCE_SEEDED_PERMITS_BEFORE_C="${QUIESCE_SEEDED_PERMITS_BEFORE_C} r1-node-1=bystander#member-8"'
@@ -4518,6 +4538,7 @@ run_verdict quiesce_seeded_case eval 'QUIESCE_SEQ_COLIVE_WORK=""'
 check "an other-mode permit nothing identifies cannot be followed" 3 \
   "the driver named no work it put there"
 
+# shellcheck disable=SC2016
 run_verdict quiesce_seeded_case eval \
   'QUIESCE_SEQ_COLIVE_WORK="tbtc_signing@840@colive900=${QUIESCE_SEQ_COLIVE_TX}=r1-node-1~other-1"'
 check "a second population on the same side of C exercises no fence" 3 \
