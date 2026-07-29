@@ -91,6 +91,14 @@ func heldPreviousEntry(entry []byte) func(int) ([]byte, error) {
 	return func(int) ([]byte, error) { return entry, nil }
 }
 
+// heldStartBlock scripts a beacon whose relay slot names the same start block
+// regardless of when it is read.
+func heldStartBlock(blockNumber uint64) func(int) (*big.Int, error) {
+	return func(int) (*big.Int, error) {
+		return new(big.Int).SetUint64(blockNumber), nil
+	}
+}
+
 // countingBlockCounter advances one block per wait, so a bounded resolution
 // loop terminates deterministically without any real timing.
 type countingBlockCounter struct {
@@ -144,11 +152,13 @@ func submittedEntries(blockNumbers ...uint64) chan *event.RelayEntrySubmitted {
 // carrying a delivery arrives strictly after the state read that saw the slot
 // already emptied can return, so an empty channel means "not yet", never "never".
 //
-// The one reading that settles the report is the beacon holding the reported
-// request past its start block while still building on the previous entry that
-// request was signing over. Only accepting a timeout report re-anchors a request
-// without advancing the relay. Every other reading leaves the rollback barrier
-// in place, which is what it exists for.
+// The readings that settle the report are the ones where the beacon left the
+// reported request behind without advancing the relay past the previous entry
+// that request was signing over: the request re-anchored onto a fresh group,
+// and — once a slot read has dated the view past the request — the slot cleared
+// outright, which is what the timeout path does when no active group is left to
+// retry with. Every other reading leaves the rollback barrier in place, which is
+// what it exists for.
 func TestRelayTimeoutReportSettled(t *testing.T) {
 	const relayRequestBlock = uint64(1_000)
 
@@ -200,12 +210,16 @@ func TestRelayTimeoutReportSettled(t *testing.T) {
 			},
 			expectedResult: true,
 		},
-		// An empty slot on its own says only that the request is over. A
-		// delivered entry leaves exactly the same trace, so an empty slot that
-		// nothing explains before the bound is not a penalty.
-		"the beacon holds no request and nothing explains the empty slot": {
+		// An empty slot in a view nothing has dated says only that no request
+		// is in progress there, which is equally true of the chain from before
+		// the reported request was made. Its previous entry is the reported
+		// request's for that same reason, so reading the pair as a cleared
+		// request would let a view from behind the request stand in for one
+		// past it.
+		"the beacon holds no request and nothing dated the empty slot": {
 			chain: &relayStateChain{
-				inProgress: func(int) (bool, error) { return false, nil },
+				inProgress:    func(int) (bool, error) { return false, nil },
+				previousEntry: heldPreviousEntry(reportedPreviousEntry),
 			},
 		},
 		// The group delivered. The relay advanced onto the delivered entry, so
@@ -235,7 +249,9 @@ func TestRelayTimeoutReportSettled(t *testing.T) {
 			entries: submittedEntries(relayRequestBlock + 20),
 		},
 		// The same race one observation later: the slot reads empty first and
-		// the delivery that emptied it reaches this node right after.
+		// the delivery that emptied it reaches this node right after. The
+		// delivery advanced the relay in the transaction that emptied the slot,
+		// so the state read alone already refuses the penalty.
 		"an entry is delivered as the slot is read empty": {
 			chain: &relayStateChain{
 				inProgress: func(read int) (bool, error) {
@@ -244,6 +260,7 @@ func TestRelayTimeoutReportSettled(t *testing.T) {
 				startBlock: func(int) (*big.Int, error) {
 					return new(big.Int).SetUint64(relayRequestBlock), nil
 				},
+				previousEntry: heldPreviousEntry(relayedPreviousEntry),
 				onRead: func(read int, entries chan *event.RelayEntrySubmitted) {
 					if read == 2 {
 						entries <- &event.RelayEntrySubmitted{
@@ -332,6 +349,87 @@ func TestRelayTimeoutReportSettled(t *testing.T) {
 				previousEntry: heldPreviousEntry(nil),
 			},
 		},
+		// The timeout path with no active group left to retry with clears the
+		// request from the slot instead of re-anchoring it, and leaves the
+		// relay's previous entry alone. Once the reported request has been seen
+		// holding the slot, that pair is the accepted report — and it is the
+		// one departure no successor request will ever explain, because the
+		// beacon opens none until a group exists again.
+		"the beacon cleared the reported request with no group left to retry": {
+			chain: &relayStateChain{
+				inProgress: func(read int) (bool, error) {
+					return read < 3, nil
+				},
+				startBlock:    heldStartBlock(relayRequestBlock),
+				previousEntry: heldPreviousEntry(reportedPreviousEntry),
+			},
+			expectedResult: true,
+		},
+		// The same emptied slot after a delivery instead. The delivery advanced
+		// the relay in the transaction that emptied the slot, so the previous
+		// entry the reported request was signing over is no longer the beacon's.
+		"the reported request left an emptied slot on a delivered entry": {
+			chain: &relayStateChain{
+				inProgress: func(read int) (bool, error) {
+					return read < 3, nil
+				},
+				startBlock:    heldStartBlock(relayRequestBlock),
+				previousEntry: heldPreviousEntry(relayedPreviousEntry),
+			},
+		},
+		// The discrimination the emptied slot rests on is the previous entry,
+		// so a beacon that will not give one leaves the report unproven.
+		"the beacon cannot say what previous entry is behind the emptied slot": {
+			chain: &relayStateChain{
+				inProgress: func(read int) (bool, error) {
+					return read < 3, nil
+				},
+				startBlock: heldStartBlock(relayRequestBlock),
+				previousEntry: func(int) ([]byte, error) {
+					return nil, errors.New("not implemented")
+				},
+			},
+		},
+		"the beacon reports no previous entry behind the emptied slot": {
+			chain: &relayStateChain{
+				inProgress: func(read int) (bool, error) {
+					return read < 3, nil
+				},
+				startBlock:    heldStartBlock(relayRequestBlock),
+				previousEntry: heldPreviousEntry(nil),
+			},
+		},
+		// A start block below the reported request's names a request made
+		// before it, which cannot be a request the beacon moved on to. The read
+		// is behind the reported request rather than past it, and the chain
+		// there is still building on the very previous entry that request went
+		// on to sign over — so comparing previous entries would read a stale
+		// answer as an accepted report.
+		"the beacon names a request older than the reported one": {
+			chain: &relayStateChain{
+				inProgress:    func(int) (bool, error) { return true, nil },
+				startBlock:    heldStartBlock(relayRequestBlock - 5),
+				previousEntry: heldPreviousEntry(reportedPreviousEntry),
+			},
+		},
+		// A view that catches up mid-resolution decides on the reads that
+		// arrive once it has: the reads from behind the request are refused,
+		// not held against the ones past it.
+		"a view behind the reported request catches up to a retry": {
+			chain: &relayStateChain{
+				inProgress: func(int) (bool, error) { return true, nil },
+				startBlock: func(read int) (*big.Int, error) {
+					if read < 3 {
+						return new(big.Int).SetUint64(
+							relayRequestBlock - 5,
+						), nil
+					}
+					return retriedStartBlock(read)
+				},
+				previousEntry: heldPreviousEntry(reportedPreviousEntry),
+			},
+			expectedResult: true,
+		},
 	}
 
 	for testName, test := range tests {
@@ -381,13 +479,39 @@ func TestRelayTimeoutReportSettled_DecidesWithoutEventDelivery(t *testing.T) {
 		chain          *relayStateChain
 		expectedResult bool
 	}{
-		// The iter-6 hazard exactly: the slot reads empty for the whole window
-		// because a late entry emptied it, and the event announcing that entry
-		// reaches this node only after the reconciliation has returned.
+		// The slot reads empty for the whole window because a late entry
+		// emptied it, and the event announcing that entry reaches this node
+		// only after the reconciliation has returned.
 		"a slot emptied by a delivery no event has announced yet": {
 			chain: &relayStateChain{
-				inProgress: func(int) (bool, error) { return false, nil },
+				inProgress:    func(int) (bool, error) { return false, nil },
+				previousEntry: heldPreviousEntry(relayedPreviousEntry),
 			},
+		},
+		// The same delivery after this node has seen the reported request
+		// holding the slot, so the empty slot is decided rather than waited
+		// out. The relay it left behind is the delivered entry's, and the
+		// event announcing that delivery still never arrives.
+		"a dated slot emptied by a delivery no event has announced yet": {
+			chain: &relayStateChain{
+				inProgress: func(read int) (bool, error) {
+					return read < 3, nil
+				},
+				startBlock:    heldStartBlock(relayRequestBlock),
+				previousEntry: heldPreviousEntry(relayedPreviousEntry),
+			},
+		},
+		// The mirror image on the emptied slot: the timeout path that found no
+		// group left to retry with, claimed on chain state alone.
+		"a cleared request with no event ever delivered": {
+			chain: &relayStateChain{
+				inProgress: func(read int) (bool, error) {
+					return read < 3, nil
+				},
+				startBlock:    heldStartBlock(relayRequestBlock),
+				previousEntry: heldPreviousEntry(reportedPreviousEntry),
+			},
+			expectedResult: true,
 		},
 		// The same delivery once the relay has visibly moved on, still with no
 		// event in hand.
@@ -452,6 +576,80 @@ func TestRelayTimeoutReportSettled_DecidesWithoutEventDelivery(t *testing.T) {
 					"the reconciliation consumed [%d] deliveries it was "+
 						"never handed",
 					len(entries)-1,
+				)
+			}
+		})
+	}
+}
+
+// TestRelayTimeoutReportSettled_EmptySlotNeedsADatedView pins the condition the
+// emptied-slot penalty rests on: a relay slot read must have placed this node's
+// view at or past the reported request before an empty slot may be read as that
+// request's ending.
+//
+// The reading itself — an empty slot the relay's own previous entry says was
+// not emptied by a delivery — is also what the chain looks like before the
+// reported request was ever made. Requesting an entry leaves the previous entry
+// untouched, so the pair is identical on both sides of the request and only the
+// dating tells them apart. Every subtest here scripts exactly that pair and
+// varies nothing but what the node was allowed to see first.
+func TestRelayTimeoutReportSettled_EmptySlotNeedsADatedView(t *testing.T) {
+	const relayRequestBlock = uint64(1_000)
+
+	tests := map[string]struct {
+		startBlock     func(read int) (*big.Int, error)
+		slotHeldUntil  int
+		expectedResult bool
+	}{
+		// Nothing dated the view. A node reading the chain from before its own
+		// request was made sees this, so it is not the request's ending.
+		"an empty slot no read has dated": {
+			slotHeldUntil: 0,
+		},
+		// The one read that could have dated the view named a request older
+		// than the reported one, which is a view behind the request rather than
+		// past it. It must not stand in for having seen the request.
+		"an empty slot dated only by a read from behind the request": {
+			startBlock:    heldStartBlock(relayRequestBlock - 5),
+			slotHeldUntil: 2,
+		},
+		// This node saw the reported request itself holding the slot, so the
+		// empty slot that follows is that request's ending and the untouched
+		// previous entry says the timeout path ended it.
+		"an empty slot dated by the reported request holding it": {
+			startBlock:     heldStartBlock(relayRequestBlock),
+			slotHeldUntil:  2,
+			expectedResult: true,
+		},
+	}
+
+	for testName, test := range tests {
+		t.Run(testName, func(t *testing.T) {
+			slotHeldUntil := test.slotHeldUntil
+			chain := &relayStateChain{
+				inProgress: func(read int) (bool, error) {
+					return read <= slotHeldUntil, nil
+				},
+				startBlock:    test.startBlock,
+				previousEntry: heldPreviousEntry(reportedPreviousEntry),
+				entries:       submittedEntries(),
+			}
+			node := &node{beaconChain: chain}
+
+			settled := node.relayTimeoutReportSettled(
+				context.Background(),
+				&testutils.MockLogger{},
+				&countingBlockCounter{height: 5_000},
+				relayRequestBlock,
+				reportedPreviousEntry,
+				chain.entries,
+			)
+
+			if settled != test.expectedResult {
+				t.Errorf(
+					"unexpected settlement\nexpected: [%t]\nactual:   [%t]",
+					test.expectedResult,
+					settled,
 				)
 			}
 		})

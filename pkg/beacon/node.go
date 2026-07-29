@@ -591,21 +591,37 @@ const (
 	// the start block it was requested at, so the filed report has not taken
 	// effect yet.
 	relayRequestHeld relayRequestDeparture = iota
+	// relayRequestPredated means the slot names a request that started before
+	// the reported one. A request cannot begin earlier than one the node
+	// already watched being made, so the read came from a view behind the
+	// reported request rather than past it. Such a view carries the very
+	// previous entry the reported request went on to sign over, which is
+	// exactly the reading an accepted report produces — so it is refused as a
+	// departure instead of being compared.
+	relayRequestPredated
 	// relayRequestRetried means the beacon holds a request re-anchored past the
 	// reported one and still built on the reported request's own previous
 	// entry. Accepting a timeout report is the only thing that re-anchors a
 	// request without advancing the relay, so this is the beacon's own record
 	// that the penalty exists.
 	relayRequestRetried
+	// relayRequestCleared means the slot the reported request was seen holding
+	// stands empty while the relay still names that request's own previous
+	// entry. Only two paths empty an occupied slot: a delivered entry, which
+	// advances the previous entry in the same transaction, and the timeout path
+	// that finds no group left to retry with, which clears the request and
+	// leaves the previous entry alone. So this is the beacon's own record that
+	// the penalty exists on the branch that has no successor request to name.
+	relayRequestCleared
 	// relayRequestSucceeded means the beacon holds a request built on a
-	// different previous entry. The relay's previous entry advances only when
-	// an entry is delivered, so the reported request was answered rather than
-	// penalized.
+	// different previous entry, or emptied the slot onto one. The relay's
+	// previous entry advances only when an entry is delivered, so the reported
+	// request was answered rather than penalized.
 	relayRequestSucceeded
-	// relayRequestReleased means the slot stands empty. A delivered entry and
-	// the timeout path that finds no group to retry with both leave it that
-	// way, and nothing in the empty slot tells the two apart; only the next
-	// request naming its previous entry does.
+	// relayRequestReleased means the slot stands empty in a view that has not
+	// yet placed itself at or past the reported request. The chain before that
+	// request was made is also an empty slot, so such a read says nothing about
+	// how the request ended.
 	relayRequestReleased
 )
 
@@ -621,15 +637,25 @@ const (
 // quiet channel as the penalty therefore claims a penalty on the strength of an
 // event not having arrived yet.
 //
-// What the beacon does expose is the relay's own previous entry. Accepting a
-// timeout report re-anchors the reported request onto a fresh group at a new
-// start block and leaves the previous entry exactly where it was; delivering an
-// entry advances the previous entry and every request opened afterwards is
-// built on the new one. So a request holding the beacon past the reported start
-// block, still built on the previous entry the reported request was signing
-// over, is a state only an accepted report produces. That reading is the sole
-// settled one, and it is taken from canonical chain state alone — no ordering
-// between this node's state reads and its event deliveries can manufacture it.
+// What the beacon does expose is the relay's own previous entry. Delivering an
+// entry advances that previous entry in the same transaction that ends the
+// request, and nothing else advances it. Both ways an accepted report ends the
+// reported request leave it exactly where it was: with an active group left the
+// report re-anchors the same request onto a fresh group at a new start block,
+// and with none left it clears the request from the slot outright. So the
+// beacon having left the reported request behind while still naming that
+// request's own previous entry is a state only an accepted report produces,
+// whether the slot is now held by the re-anchored request or standing empty.
+// Those two readings are the settled ones, and both are taken from canonical
+// chain state alone — no ordering between this node's state reads and its event
+// deliveries can manufacture either.
+//
+// The empty one carries a condition the held one does not need. A start block
+// past the reported request dates the read by itself; an empty slot has no
+// start block to date it with, and the chain from before the request was made
+// is an empty slot naming the same previous entry. So an empty slot is read as
+// a departure only once a relay slot read has already placed this node's view
+// at or past the reported request.
 //
 // The subscription is still read, but only to refuse faster: an entry seen at
 // any point ends the reconciliation against the report. It can never be what
@@ -637,11 +663,11 @@ const (
 //
 // Every other reading is a refusal to claim the penalty: an unreadable beacon,
 // a chain that does not expose the request state at all, a request still
-// holding the slot when the wait runs out, an empty slot no successor request
-// has yet explained, and a resolution bound that cannot be represented all
-// leave the permit exhausted. That direction is the safe one — the rollback
-// barrier exists to hold a penalty nobody can account for, so an unproven
-// report has to keep holding it.
+// holding the slot when the wait runs out, a read from behind the reported
+// request, an empty slot in a view nothing has dated past that request, and a
+// resolution bound that cannot be represented all leave the permit exhausted.
+// That direction is the safe one — the rollback barrier exists to hold a
+// penalty nobody can account for, so an unproven report has to keep holding it.
 func (n *node) relayTimeoutReportSettled(
 	ctx context.Context,
 	monitorLogger log.StandardLogger,
@@ -682,6 +708,48 @@ func (n *node) relayTimeoutReportSettled(
 		}
 	}
 
+	// relayPreviousEntryDeparture tells apart the two ways the beacon can leave
+	// the reported request behind, from the relay's own previous entry.
+	//
+	// The relay's previous entry advances only when an entry is delivered, and
+	// it advances in the same transaction that ends the request. So a beacon
+	// that has left the reported request behind while still naming that
+	// request's previous entry left it behind through the timeout path, and one
+	// naming a different previous entry left it behind through a delivery.
+	relayPreviousEntryDeparture := func(
+		penalized relayRequestDeparture,
+		what string,
+	) (relayRequestDeparture, error) {
+		previousEntry, err := n.beaconChain.CurrentRequestPreviousEntry()
+		if err != nil {
+			return relayRequestHeld, fmt.Errorf(
+				"cannot read the relay previous entry %s: [%w]",
+				what,
+				err,
+			)
+		}
+		if len(previousEntry) == 0 {
+			return relayRequestHeld, fmt.Errorf(
+				"the beacon reported no relay previous entry %s",
+				what,
+			)
+		}
+
+		if !bytes.Equal(previousEntry, relayRequestPreviousEntry) {
+			return relayRequestSucceeded, nil
+		}
+		return penalized, nil
+	}
+
+	// datedPastRequest records whether a read of the beacon's own relay slot
+	// has placed this node's view at or past the reported request. An empty
+	// slot means nothing without it, because the chain before the request was
+	// made is also an empty slot and still names the previous entry that
+	// request went on to sign over — the same reading an accepted report
+	// leaves behind. Only relay slot reads set it, so what dates a view is the
+	// same source as the reading it authorizes.
+	datedPastRequest := false
+
 	departed := func() (relayRequestDeparture, error) {
 		inProgress, err := n.beaconChain.IsEntryInProgress()
 		if err != nil {
@@ -691,7 +759,20 @@ func (n *node) relayTimeoutReportSettled(
 			)
 		}
 		if !inProgress {
-			return relayRequestReleased, nil
+			// An empty slot this node has not yet dated past the reported
+			// request is not the request's ending; it is a view that may
+			// predate the request entirely.
+			if !datedPastRequest {
+				return relayRequestReleased, nil
+			}
+			// The reported request was seen holding the slot and the slot is
+			// now empty. The timeout path that finds no active group left
+			// clears the request outright instead of retrying it, so this is
+			// the one departure no successor request will ever explain.
+			return relayPreviousEntryDeparture(
+				relayRequestCleared,
+				"behind the emptied request slot",
+			)
 		}
 
 		startBlock, err := n.beaconChain.CurrentRequestStartBlock()
@@ -708,6 +789,14 @@ func (n *node) relayTimeoutReportSettled(
 			)
 		}
 
+		if startBlock.Uint64() < relayRequestBlockNumber {
+			return relayRequestPredated, nil
+		}
+
+		// The beacon named the reported request or one opened after it, so
+		// this node's view is at or past the request from here on.
+		datedPastRequest = true
+
 		if startBlock.Uint64() == relayRequestBlockNumber {
 			return relayRequestHeld, nil
 		}
@@ -715,24 +804,10 @@ func (n *node) relayTimeoutReportSettled(
 		// The beacon moved past the reported request. Its previous entry is
 		// what says whether it moved because the relay advanced or because the
 		// report re-anchored the same request.
-		previousEntry, err := n.beaconChain.CurrentRequestPreviousEntry()
-		if err != nil {
-			return relayRequestHeld, fmt.Errorf(
-				"cannot read the current relay request previous entry: [%w]",
-				err,
-			)
-		}
-		if len(previousEntry) == 0 {
-			return relayRequestHeld, fmt.Errorf(
-				"the beacon reported no previous entry for the relay request " +
-					"holding it",
-			)
-		}
-
-		if !bytes.Equal(previousEntry, relayRequestPreviousEntry) {
-			return relayRequestSucceeded, nil
-		}
-		return relayRequestRetried, nil
+		return relayPreviousEntryDeparture(
+			relayRequestRetried,
+			"of the relay request holding the beacon",
+		)
 	}
 
 	currentBlock, err := blockCounter.CurrentBlock()
@@ -775,6 +850,18 @@ func (n *node) relayTimeoutReportSettled(
 			// advancing the relay. Nothing but an accepted timeout report does
 			// that, so the penalty is the beacon's own record now.
 			return true
+		case relayRequestCleared:
+			// The beacon dropped the reported request from the slot without
+			// advancing the relay. Only the timeout path with no active group
+			// left to retry with does that, so the penalty is the beacon's own
+			// record here too.
+			monitorLogger.Infof(
+				"the beacon cleared the relay request of block [%v] without "+
+					"advancing the relay; the filed timeout report was "+
+					"accepted with no group left to retry with",
+				relayRequestBlockNumber,
+			)
+			return true
 		case relayRequestSucceeded:
 			monitorLogger.Warnf(
 				"the beacon advanced past the previous entry the relay "+
@@ -784,10 +871,19 @@ func (n *node) relayTimeoutReportSettled(
 				relayRequestBlockNumber,
 			)
 			return false
+		case relayRequestPredated:
+			monitorLogger.Warnf(
+				"the beacon named a relay request older than the request of "+
+					"block [%v] the timeout report was filed against; the "+
+					"read is behind that request rather than past it and is "+
+					"not taken as a departure",
+				relayRequestBlockNumber,
+			)
 		}
-		// A held request has not resolved yet and an empty slot is not
-		// decidable until a successor request names its previous entry, so
-		// both keep polling to the bound.
+		// A held request has not resolved yet, a read from behind the reported
+		// request says nothing about it, and an undated empty slot is not
+		// decidable until a slot read places the view past the request, so all
+		// three keep polling to the bound.
 
 		height, err := blockCounter.CurrentBlock()
 		if err != nil {
