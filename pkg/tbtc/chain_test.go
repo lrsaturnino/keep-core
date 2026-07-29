@@ -72,6 +72,15 @@ type localChain struct {
 	inactivityNonceMutex sync.Mutex
 	inactivityNonces     map[[32]byte]uint64
 
+	// inactivityClaimMiner, when set, defers the on-chain effect of a
+	// submitted inactivity claim the way a real provider does: the submitting
+	// call returns once the transaction is accepted and the nonce advance and
+	// claim event happen only when the test mines it. Without it the chain
+	// settles inline, which hides every lifecycle race between a submission
+	// and the settlement it eventually produces.
+	inactivityClaimMinerMutex sync.Mutex
+	inactivityClaimMiner      func(mine func())
+
 	blocksByTimestampMutex sync.Mutex
 	blocksByTimestamp      map[uint64]uint64
 
@@ -632,19 +641,44 @@ func (lc *localChain) AssembleInactivityClaim(
 	}, nil
 }
 
+// inactivityClaimedHandlerCount reports how many inactivity claim
+// subscriptions are currently installed. It lets a test assert that a
+// submitted claim is still being listened for at a given moment, which is the
+// difference between resolving a late settlement and never seeing it.
+func (lc *localChain) inactivityClaimedHandlerCount() int {
+	lc.inactivityClaimedHandlersMutex.Lock()
+	defer lc.inactivityClaimedHandlersMutex.Unlock()
+
+	return len(lc.inactivityClaimedHandlers)
+}
+
+// setInactivityClaimMiner installs a hook that decides when a submitted
+// inactivity claim takes effect. The hook receives the closure that advances
+// the nonce and emits the claim event, so a test can hold a submission
+// unmined, mine it later, or drop it entirely.
+func (lc *localChain) setInactivityClaimMiner(miner func(mine func())) {
+	lc.inactivityClaimMinerMutex.Lock()
+	defer lc.inactivityClaimMinerMutex.Unlock()
+
+	lc.inactivityClaimMiner = miner
+}
+
 func (lc *localChain) SubmitInactivityClaim(
 	claim *InactivityClaim,
 	nonce *big.Int,
 	groupMembers []uint32,
 ) error {
-	lc.inactivityClaimedHandlersMutex.Lock()
-	defer lc.inactivityClaimedHandlersMutex.Unlock()
+	if err := func() error {
+		lc.inactivityNonceMutex.Lock()
+		defer lc.inactivityNonceMutex.Unlock()
 
-	lc.inactivityNonceMutex.Lock()
-	defer lc.inactivityNonceMutex.Unlock()
+		if nonce.Uint64() != lc.inactivityNonces[claim.WalletID] {
+			return fmt.Errorf("wrong inactivity claim nonce")
+		}
 
-	if nonce.Uint64() != lc.inactivityNonces[claim.WalletID] {
-		return fmt.Errorf("wrong inactivity claim nonce")
+		return nil
+	}(); err != nil {
+		return err
 	}
 
 	blockNumber, err := lc.blockCounter.CurrentBlock()
@@ -652,16 +686,36 @@ func (lc *localChain) SubmitInactivityClaim(
 		return fmt.Errorf("failed to get the current block")
 	}
 
-	for _, handler := range lc.inactivityClaimedHandlers {
-		handler(&InactivityClaimedEvent{
-			WalletID:    claim.WalletID,
-			Nonce:       nonce,
-			Notifier:    "",
-			BlockNumber: blockNumber,
-		})
+	// settle is everything the registry does once the transaction is included:
+	// consume the nonce and announce the claim.
+	settle := func() {
+		lc.inactivityNonceMutex.Lock()
+		lc.inactivityNonces[claim.WalletID]++
+		lc.inactivityNonceMutex.Unlock()
+
+		lc.inactivityClaimedHandlersMutex.Lock()
+		defer lc.inactivityClaimedHandlersMutex.Unlock()
+
+		for _, handler := range lc.inactivityClaimedHandlers {
+			handler(&InactivityClaimedEvent{
+				WalletID:    claim.WalletID,
+				Nonce:       nonce,
+				Notifier:    "",
+				BlockNumber: blockNumber,
+			})
+		}
 	}
 
-	lc.inactivityNonces[claim.WalletID]++
+	lc.inactivityClaimMinerMutex.Lock()
+	miner := lc.inactivityClaimMiner
+	lc.inactivityClaimMinerMutex.Unlock()
+
+	if miner == nil {
+		settle()
+		return nil
+	}
+
+	miner(settle)
 
 	return nil
 }

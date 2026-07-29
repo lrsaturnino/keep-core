@@ -77,7 +77,7 @@ type heartbeatInactivityClaimExecutor interface {
 		inactiveMembersIndexes []group.MemberIndex,
 		heartbeatFailed bool,
 		sessionID *big.Int,
-	) (*InactivityClaimedEvent, error)
+	) (inactivityClaimDisposition, error)
 }
 
 // heartbeatAction is a walletAction implementation handling heartbeat requests
@@ -149,19 +149,25 @@ type heartbeatPenaltyState struct {
 	// inactiveMembers is the exact member set the dispatched claim names. It is
 	// empty when no claim was dispatched.
 	inactiveMembers []group.MemberIndex
-	// settledClaim is the on-chain claim the dispatch was observed to settle
-	// into, and nil when no settlement was observed. Dispatch intent is not
-	// settlement: the claim can fail to publish, be suppressed by the release
-	// gate, or be canceled before any member submits, and the node cannot tell
-	// those apart from a claim that landed unless it sees the chain say so.
-	settledClaim *InactivityClaimedEvent
+	// claim is what the dispatched claim did about the chain: whether any
+	// member reached the submitting call, and which claim slot the settlement
+	// was resolved to. Dispatch intent is neither of those: the claim can fail
+	// to publish, be suppressed by the release gate, or be canceled before any
+	// member submits, and the node cannot tell those apart from a claim that
+	// landed without asking the chain.
+	claim inactivityClaimDisposition
 }
 
 // chainSettlement renders the penalty state as the chain-settlement record the
-// terminal outcome carries. A heartbeat that dispatched nothing settles nothing
-// and reports none; a dispatch with no observed settlement is reported with no
-// reference, which is what makes the offline barrier treat the penalty as
-// unreconciled rather than absent.
+// terminal outcome carries. Three cases have to stay distinct.
+//
+// A resolved settlement names the claim slot it consumed, which is what lets
+// the offline audit join it to an authenticated registry log. A submission the
+// executor could not resolve is reported with no reference, which makes the
+// barrier treat the penalty as unreconciled rather than absent. A dispatch that
+// never reached the submitting call left no transaction anywhere and reports no
+// settlement at all: calling it unresolved would block a rollback over a
+// penalty that provably cannot exist on chain.
 func (hps heartbeatPenaltyState) chainSettlement() *participation.ChainSettlementRecord {
 	if !hps.claimDispatched {
 		return nil
@@ -171,18 +177,21 @@ func (hps heartbeatPenaltyState) chainSettlement() *participation.ChainSettlemen
 		Kind: participation.ChainSettlementInactivityClaim,
 	}
 
-	if hps.settledClaim == nil {
+	if hps.claim.settlement == nil {
+		if !hps.claim.submissionAttempted {
+			return nil
+		}
 		return settlement
 	}
 
 	reference, err := participation.InactivityClaimSettlementReference(
-		hps.settledClaim.WalletID[:],
-		hps.settledClaim.Nonce,
+		hps.claim.settlement.walletID[:],
+		hps.claim.settlement.nonce,
 	)
 	if err != nil {
-		// An observed settlement that cannot be rendered canonically is
-		// indistinguishable to the audit from one that was never observed, and
-		// the unobserved record is the conservative of the two.
+		// A resolved settlement that cannot be rendered canonically is
+		// indistinguishable to the audit from one that was never resolved, and
+		// the unresolved record is the conservative of the two.
 		return settlement
 	}
 
@@ -427,7 +436,7 @@ func (ha *heartbeatAction) execute() error {
 	// The value of consecutive heartbeat inactivity failures exceeds the threshold.
 	// Proceed with operator inactivity claim. The claim is derived penalty
 	// work: it inherits the heartbeat permit as its commit fence.
-	settledClaim, err := ha.inactivityClaimExecutor.claimInactivity(
+	claimDisposition, err := ha.inactivityClaimExecutor.claimInactivity(
 		heartbeatInactivityCtx,
 		ha.permit,
 		// It's safe to consider unstaking members as inactive members in the claim.
@@ -437,10 +446,10 @@ func (ha *heartbeatAction) execute() error {
 		true,
 		messageToSign,
 	)
-	// A settlement observed on the way to an error still happened; recording it
-	// before the error path returns keeps the terminal record describing the
-	// chain rather than the call.
-	heartbeatPenalty.settledClaim = settledClaim
+	// A submission made or a settlement resolved on the way to an error still
+	// happened; recording the disposition before the error path returns keeps
+	// the terminal record describing the chain rather than the call.
+	heartbeatPenalty.claim = claimDisposition
 	if err != nil {
 		return fmt.Errorf(
 			"error while notifying about operator inactivity [%v]]",

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/big"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -38,7 +39,7 @@ func TestInactivityClaimExecutor_ClaimInactivity(t *testing.T) {
 	message := big.NewInt(100)
 	inactiveMembersIndexes := []group.MemberIndex{1, 4}
 
-	settledClaim, err := executor.claimInactivity(
+	disposition, err := executor.claimInactivity(
 		ctx,
 		newTestPermit(participation.TBTCInactivityClaim),
 		inactiveMembersIndexes,
@@ -64,24 +65,30 @@ func TestInactivityClaimExecutor_ClaimInactivity(t *testing.T) {
 		nonceDiff,
 	)
 
+	// A member reached the submitting call, so the disposition must say a
+	// transaction exists rather than leave the caller to infer it.
+	if !disposition.submissionAttempted {
+		t.Error("expected the executor to report an attempted submission")
+	}
+
 	// The claim reached the chain, so the executor must report the settlement
 	// its caller records; the reported identity has to be the wallet and the
 	// nonce the claim consumed, not the wallet's current one.
-	if settledClaim == nil {
+	if disposition.settlement == nil {
 		t.Fatal("expected the submitted inactivity claim to be reported settled")
 	}
-	if settledClaim.WalletID != walletEcdsaID {
+	if disposition.settlement.walletID != walletEcdsaID {
 		t.Errorf(
 			"unexpected settled wallet\nexpected: [0x%x]\nactual:   [0x%x]",
 			walletEcdsaID,
-			settledClaim.WalletID,
+			disposition.settlement.walletID,
 		)
 	}
 	testutils.AssertBigIntsEqual(
 		t,
 		"settled inactivity claim nonce",
 		initialNonce,
-		settledClaim.Nonce,
+		disposition.settlement.nonce,
 	)
 }
 
@@ -165,6 +172,332 @@ func TestInactivityClaimExecutor_ClaimInactivity_UnrelatedWalletSettlement(
 	}
 }
 
+// TestInactivityClaimExecutor_ResolveInactivityClaim walks every way one claim
+// can end once publishing has stopped.
+//
+// The lifecycle these cases pin is the one a real provider imposes: the
+// submitting call returns when the transaction is accepted, and the claim is
+// mined — and announced — afterwards. Observation therefore has to outlive
+// publishing, and the disposition has to keep "a transaction may exist" apart
+// from "the penalty landed", because a rollback reads those differently.
+func TestInactivityClaimExecutor_ResolveInactivityClaim(t *testing.T) {
+	walletID := [32]byte{0x07}
+	nonce := big.NewInt(0)
+
+	settlementEvent := &InactivityClaimedEvent{
+		WalletID:    walletID,
+		Nonce:       big.NewInt(0),
+		BlockNumber: 4242,
+	}
+
+	// mineCompetingClaim consumes the claim slot on chain without ever
+	// reaching this node's subscription, which is what a settlement observed
+	// by nobody here looks like.
+	mineCompetingClaim := func(t *testing.T, localChain *localChain) {
+		if err := localChain.SubmitInactivityClaim(
+			&InactivityClaim{WalletID: walletID},
+			new(big.Int).Set(nonce),
+			nil,
+		); err != nil {
+			t.Fatalf("cannot settle the competing claim: [%v]", err)
+		}
+	}
+
+	tests := map[string]struct {
+		submissionAttempted bool
+		// before runs against the chain before the resolution starts, standing
+		// in for whatever already happened while publishing was running.
+		before func(t *testing.T, localChain *localChain)
+		// wait stands in for whatever the chain does while the bounded
+		// settlement wait is in progress. It is nil for the cases that must
+		// take no wait at all.
+		wait func(
+			t *testing.T,
+			localChain *localChain,
+			settlement *inactivityClaimSettlementObserver,
+			ctx context.Context,
+		) error
+		expectedSettlement bool
+		expectedWait       bool
+	}{
+		// The regression this whole lifecycle exists for: the claim's own
+		// event arrives after every publishing goroutine has returned. The
+		// call-wide subscription is still listening, so the penalty is
+		// resolved instead of being reported as an unknown.
+		"a settlement announced after publishing ended is resolved": {
+			submissionAttempted: true,
+			wait: func(
+				_ *testing.T,
+				_ *localChain,
+				settlement *inactivityClaimSettlementObserver,
+				ctx context.Context,
+			) error {
+				go settlement.observe(settlementEvent)
+				// Blocking until cancellation makes the wait prove it ends on
+				// the settlement rather than on its own deadline.
+				<-ctx.Done()
+				return ctx.Err()
+			},
+			expectedSettlement: true,
+			expectedWait:       true,
+		},
+		// The subscription can miss the event entirely — a dropped
+		// notification, a reorganized filter. The consumed nonce is the
+		// chain's own receipt for the claim slot and resolves it anyway.
+		"a settlement seen only as a consumed nonce is resolved": {
+			submissionAttempted: true,
+			wait: func(
+				t *testing.T,
+				localChain *localChain,
+				_ *inactivityClaimSettlementObserver,
+				_ context.Context,
+			) error {
+				mineCompetingClaim(t, localChain)
+				return nil
+			},
+			expectedSettlement: true,
+			expectedWait:       true,
+		},
+		// The one genuinely ambiguous case: a transaction was handed to the
+		// chain and nothing came back. It must stay unresolved so the offline
+		// barrier blocks on it.
+		"a submission that never settles stays unresolved": {
+			submissionAttempted: true,
+			wait: func(
+				_ *testing.T,
+				_ *localChain,
+				_ *inactivityClaimSettlementObserver,
+				_ context.Context,
+			) error {
+				return nil
+			},
+			expectedWait: true,
+		},
+		// No member reached the submitting call, so nothing is in flight.
+		// Waiting for it would only delay the heartbeat that owns the claim.
+		"a claim that never reached the chain takes no wait": {},
+		// Another node's submission can settle this claim slot while no
+		// controlled member ever submits; the penalty is still on chain and
+		// still this permit's.
+		"a foreign settlement is resolved without any wait": {
+			before:             mineCompetingClaim,
+			expectedSettlement: true,
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			localChain := Connect()
+			settlement := newInactivityClaimSettlementObserver(
+				walletID,
+				new(big.Int).Set(nonce),
+			)
+
+			if test.before != nil {
+				test.before(t, localChain)
+			}
+
+			var waited bool
+			executor := &inactivityClaimExecutor{
+				chain: localChain,
+				waitForBlockFn: func(ctx context.Context, _ uint64) error {
+					waited = true
+					if test.wait == nil {
+						return nil
+					}
+					return test.wait(t, localChain, settlement, ctx)
+				},
+			}
+
+			disposition := executor.resolveInactivityClaim(
+				context.Background(),
+				&testutils.MockLogger{},
+				settlement,
+				walletID,
+				new(big.Int).Set(nonce),
+				test.submissionAttempted,
+			)
+
+			if disposition.submissionAttempted != test.submissionAttempted {
+				t.Errorf(
+					"unexpected submission attempt\nexpected: [%v]\nactual:   [%v]",
+					test.submissionAttempted,
+					disposition.submissionAttempted,
+				)
+			}
+			if waited != test.expectedWait {
+				t.Errorf(
+					"unexpected settlement wait\nexpected: [%v]\nactual:   [%v]",
+					test.expectedWait,
+					waited,
+				)
+			}
+
+			if !test.expectedSettlement {
+				if disposition.settlement != nil {
+					t.Fatalf(
+						"expected no resolved settlement, got [%+v]",
+						disposition.settlement,
+					)
+				}
+				return
+			}
+
+			if disposition.settlement == nil {
+				t.Fatal("expected the claim settlement to be resolved")
+			}
+			if disposition.settlement.walletID != walletID {
+				t.Errorf(
+					"unexpected settled wallet\nexpected: [0x%x]\nactual:   [0x%x]",
+					walletID,
+					disposition.settlement.walletID,
+				)
+			}
+			testutils.AssertBigIntsEqual(
+				t,
+				"settled inactivity claim nonce",
+				nonce,
+				disposition.settlement.nonce,
+			)
+		})
+	}
+}
+
+// TestInactivityClaimExecutor_ResolveInactivityClaim_ContextCancelled asserts a
+// claim whose owning window closes mid-wait is reported unresolved rather than
+// waited on past the deadline the heartbeat set for it.
+func TestInactivityClaimExecutor_ResolveInactivityClaim_ContextCancelled(
+	t *testing.T,
+) {
+	localChain := Connect()
+
+	walletID := [32]byte{0x09}
+	nonce := big.NewInt(0)
+
+	settlement := newInactivityClaimSettlementObserver(walletID, nonce)
+
+	ctx, cancelCtx := context.WithCancel(context.Background())
+	cancelCtx()
+
+	executor := &inactivityClaimExecutor{
+		chain: localChain,
+		waitForBlockFn: func(ctx context.Context, _ uint64) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+
+	disposition := executor.resolveInactivityClaim(
+		ctx,
+		&testutils.MockLogger{},
+		settlement,
+		walletID,
+		nonce,
+		true,
+	)
+
+	if !disposition.submissionAttempted {
+		t.Error("expected the submission to stay on the record")
+	}
+	if disposition.settlement != nil {
+		t.Errorf(
+			"expected a canceled resolution to settle nothing, got [%+v]",
+			disposition.settlement,
+		)
+	}
+}
+
+// TestInactivityClaimExecutor_ClaimInactivity_LateSettlement drives the whole
+// executor against a chain that behaves like a real provider: submissions are
+// accepted and mined only later. The claim's event therefore arrives after
+// every publishing goroutine has returned, which is precisely when a
+// per-publisher subscription would already be gone.
+func TestInactivityClaimExecutor_ClaimInactivity_LateSettlement(t *testing.T) {
+	executor, walletEcdsaID, localChain := setupInactivityClaimExecutorScenario(t)
+
+	initialNonce, err := localChain.GetInactivityClaimNonce(walletEcdsaID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var mutex sync.Mutex
+	var accepted []func()
+
+	localChain.setInactivityClaimMiner(func(mine func()) {
+		mutex.Lock()
+		defer mutex.Unlock()
+
+		accepted = append(accepted, mine)
+	})
+
+	// Every controlled member waits once for its submission delay and submits
+	// immediately afterwards, so a wait requested once all of them have been
+	// accepted can only be the executor's settlement resolution. Mining there
+	// puts the claim's event strictly after the end of publishing.
+	signerCount := len(executor.signers)
+	waitForBlock := executor.waitForBlockFn
+	listenersAtSettlement := -1
+	executor.waitForBlockFn = func(ctx context.Context, block uint64) error {
+		mutex.Lock()
+		var mine func()
+		if len(accepted) == signerCount {
+			mine, accepted = accepted[0], nil
+		}
+		mutex.Unlock()
+
+		if mine != nil {
+			listenersAtSettlement = localChain.inactivityClaimedHandlerCount()
+			mine()
+		}
+
+		return waitForBlock(ctx, block)
+	}
+
+	ctx, cancelCtx := context.WithCancel(context.Background())
+	defer cancelCtx()
+
+	disposition, err := executor.claimInactivity(
+		ctx,
+		newTestPermit(participation.TBTCInactivityClaim),
+		[]group.MemberIndex{1, 4},
+		true,
+		big.NewInt(100),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !disposition.submissionAttempted {
+		t.Error("expected the executor to report an attempted submission")
+	}
+	// The point of the lifecycle: the claim was announced with publishing
+	// already over, and something was still listening for it.
+	if listenersAtSettlement < 1 {
+		t.Errorf(
+			"the claim settled with [%d] subscriptions left listening",
+			listenersAtSettlement,
+		)
+	}
+	if disposition.settlement == nil {
+		t.Fatal(
+			"a claim mined after publishing ended was not reported settled",
+		)
+	}
+	if disposition.settlement.walletID != walletEcdsaID {
+		t.Errorf(
+			"unexpected settled wallet\nexpected: [0x%x]\nactual:   [0x%x]",
+			walletEcdsaID,
+			disposition.settlement.walletID,
+		)
+	}
+	testutils.AssertBigIntsEqual(
+		t,
+		"settled inactivity claim nonce",
+		initialNonce,
+		disposition.settlement.nonce,
+	)
+}
+
 func TestInactivityClaimExecutor_ClaimInactivity_Busy(t *testing.T) {
 	executor, _, _ := setupInactivityClaimExecutorScenario(t)
 
@@ -188,7 +521,7 @@ func TestInactivityClaimExecutor_ClaimInactivity_Busy(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	settledClaim, err := executor.claimInactivity(
+	disposition, err := executor.claimInactivity(
 		ctx,
 		newTestPermit(participation.TBTCInactivityClaim),
 		inactiveMembersIndexes,
@@ -197,12 +530,16 @@ func TestInactivityClaimExecutor_ClaimInactivity_Busy(t *testing.T) {
 	)
 	testutils.AssertErrorsSame(t, errInactivityClaimExecutorBusy, err)
 
-	// A refused call never subscribed to anything, so it cannot report a
-	// settlement observed by the call that holds the executor.
-	if settledClaim != nil {
+	// A refused call never subscribed to anything and never reached a
+	// submitting call, so it can neither report a settlement observed by the
+	// call that holds the executor nor claim a transaction of its own.
+	if disposition.submissionAttempted {
+		t.Error("expected a refused claim to report no attempted submission")
+	}
+	if disposition.settlement != nil {
 		t.Errorf(
-			"expected no settlement from a refused claim, got [%v]",
-			settledClaim,
+			"expected no settlement from a refused claim, got [%+v]",
+			disposition.settlement,
 		)
 	}
 
@@ -536,6 +873,147 @@ func TestVerifySignature_VerifyError(t *testing.T) {
 	}
 }
 
+// TestSubmitClaim_SubmissionAttemptAccounting pins which exits of the
+// submitter count as handing a transaction to the chain.
+//
+// The distinction decides what a rollback may do. An exit above the submitting
+// call — too few signatures, a claim another member already settled, a refused
+// penalty fence, a closed window — provably left no transaction anywhere, and
+// recording it as a possible penalty would block a homogeneous rollback over
+// state that cannot exist. From the submitting call on the opposite holds: a
+// call that returns an error may still have broadcast, so the attempt has to
+// survive the error.
+func TestSubmitClaim_SubmissionAttemptAccounting(t *testing.T) {
+	testData, err := tecdsatest.LoadPrivateKeyShareTestFixtures(1)
+	if err != nil {
+		t.Fatalf("failed to load test data: [%v]", err)
+	}
+	publicKey := tecdsa.NewPrivateKeyShare(testData[0]).PublicKey()
+
+	ecdsaWalletID := [32]byte{1, 2, 3}
+	groupMembers := []uint32{1, 2, 2, 3, 5}
+	groupParameters := &GroupParameters{
+		GroupSize:       5,
+		GroupQuorum:     4,
+		HonestThreshold: 3,
+	}
+
+	thresholdSignatures := map[group.MemberIndex][]byte{
+		1: []byte("signature 1"),
+		2: []byte("signature 2"),
+		3: []byte("signature 3"),
+		4: []byte("signature 4"),
+	}
+
+	tests := map[string]struct {
+		signatures map[group.MemberIndex][]byte
+		// claimNonce is the nonce the claim is built for; the wallet starts at
+		// nonce zero.
+		claimNonce int64
+		// settledFirst mimics another member consuming the claim slot before
+		// this member wakes from its submission delay.
+		settledFirst bool
+		// commitErr mimics the penalty fence refusing the submission.
+		commitErr error
+		// cancelled mimics the owning window closing before submission.
+		cancelled       bool
+		expectedAttempt bool
+	}{
+		"too few signatures to submit anything": {
+			signatures: map[group.MemberIndex][]byte{
+				1: []byte("signature 1"),
+				2: []byte("signature 2"),
+			},
+		},
+		"a claim another member already settled": {
+			signatures:   thresholdSignatures,
+			settledFirst: true,
+		},
+		"a refused penalty fence": {
+			signatures: thresholdSignatures,
+			commitErr:  participation.ErrPenaltySuppressed,
+		},
+		"a window closed before submission": {
+			signatures: thresholdSignatures,
+			cancelled:  true,
+		},
+		"a transaction the chain rejected": {
+			signatures: thresholdSignatures,
+			// A nonce the registry refuses still reaches it as a transaction.
+			claimNonce:      12345,
+			expectedAttempt: true,
+		},
+		"a transaction the chain accepted": {
+			signatures:      thresholdSignatures,
+			expectedAttempt: true,
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			localChain := Connect()
+			localChain.setWallet(
+				bitcoin.PublicKeyHash(publicKey),
+				&WalletChainData{EcdsaWalletID: ecdsaWalletID},
+			)
+
+			if test.settledFirst {
+				if err := localChain.SubmitInactivityClaim(
+					&InactivityClaim{WalletID: ecdsaWalletID},
+					big.NewInt(0),
+					groupMembers,
+				); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			permit := newTestPermit(participation.TBTCInactivityClaim)
+			permit.commitErr = test.commitErr
+
+			submission := &inactivityClaimSubmissionAttempt{}
+
+			submitter := newInactivityClaimSubmitter(
+				&testutils.MockLogger{},
+				localChain,
+				groupParameters,
+				groupMembers,
+				testWaitForBlockFn(localChain),
+				permit,
+				submission,
+			)
+
+			ctx, cancelCtx := context.WithCancel(context.Background())
+			defer cancelCtx()
+			if test.cancelled {
+				cancelCtx()
+			}
+
+			// SubmitClaim reports refusals and rejections through its error,
+			// which the executor classifies separately; what is under test
+			// here is only whether a transaction was handed to the chain.
+			_ = submitter.SubmitClaim(
+				ctx,
+				group.MemberIndex(1),
+				inactivity.NewClaimPreimage(
+					big.NewInt(test.claimNonce),
+					publicKey,
+					[]group.MemberIndex{11, 22, 33},
+					true,
+				),
+				test.signatures,
+			)
+
+			if submission.recorded() != test.expectedAttempt {
+				t.Errorf(
+					"unexpected submission attempt\nexpected: [%v]\nactual:   [%v]",
+					test.expectedAttempt,
+					submission.recorded(),
+				)
+			}
+		})
+	}
+}
+
 func TestSubmitClaim_MemberSubmitsClaim(t *testing.T) {
 	testData, err := tecdsatest.LoadPrivateKeyShareTestFixtures(1)
 	if err != nil {
@@ -571,6 +1049,7 @@ func TestSubmitClaim_MemberSubmitsClaim(t *testing.T) {
 		groupMembers,
 		testWaitForBlockFn(chain),
 		newTestPermit(participation.TBTCInactivityClaim),
+		&inactivityClaimSubmissionAttempt{},
 	)
 
 	ctx, cancelCtx := context.WithCancel(context.Background())
@@ -652,6 +1131,7 @@ func TestSubmitClaim_AnotherMemberSubmitsClaim(t *testing.T) {
 		groupMembers,
 		testWaitForBlockFn(chain),
 		newTestPermit(participation.TBTCInactivityClaim),
+		&inactivityClaimSubmissionAttempt{},
 	)
 
 	ctx, cancelCtx := context.WithCancel(context.Background())
@@ -780,6 +1260,7 @@ func TestSubmitClaim_StaleNonceAfterDelayTreatedAsSubmitted(t *testing.T) {
 		groupMembers,
 		func(context.Context, uint64) error { return nil },
 		newTestPermit(participation.TBTCInactivityClaim),
+		&inactivityClaimSubmissionAttempt{},
 	)
 
 	var firstMemberSubmitErr error
@@ -799,6 +1280,7 @@ func TestSubmitClaim_StaleNonceAfterDelayTreatedAsSubmitted(t *testing.T) {
 			return nil
 		},
 		newTestPermit(participation.TBTCInactivityClaim),
+		&inactivityClaimSubmissionAttempt{},
 	)
 
 	err = secondMemberSubmitter.SubmitClaim(
@@ -863,6 +1345,7 @@ func TestSubmitClaim_InvalidResult(t *testing.T) {
 		groupMembers,
 		testWaitForBlockFn(chain),
 		newTestPermit(participation.TBTCInactivityClaim),
+		&inactivityClaimSubmissionAttempt{},
 	)
 
 	ctx, cancelCtx := context.WithCancel(context.Background())
@@ -936,6 +1419,7 @@ func TestSubmitClaim_ContextCancelled(t *testing.T) {
 		groupMembers,
 		testWaitForBlockFn(chain),
 		newTestPermit(participation.TBTCInactivityClaim),
+		&inactivityClaimSubmissionAttempt{},
 	)
 
 	ctx, cancelCtx := context.WithCancel(context.Background())
@@ -1020,6 +1504,7 @@ func TestSubmitClaim_TooFewSignatures(t *testing.T) {
 		groupMembers,
 		testWaitForBlockFn(chain),
 		newTestPermit(participation.TBTCInactivityClaim),
+		&inactivityClaimSubmissionAttempt{},
 	)
 
 	ctx, cancelCtx := context.WithCancel(context.Background())
@@ -1129,6 +1614,7 @@ func TestSubmitClaim_NonceChangesDuringWait(t *testing.T) {
 		groupMembers,
 		hookedWaitForBlockFn,
 		newTestPermit(participation.TBTCInactivityClaim),
+		&inactivityClaimSubmissionAttempt{},
 	)
 
 	ctx, cancelCtx := context.WithCancel(context.Background())
