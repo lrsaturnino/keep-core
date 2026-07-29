@@ -6250,6 +6250,35 @@ result of that ceremony"
   printf '%s' "${out}"
 }
 
+# Of the named permits, the ones whose holder dispatched a chain side effect it
+# could not resolve, rendered with the kind it dispatched, comma-joined.
+#
+# The gate lets a settlement be recorded without its canonical identity because
+# the alternative is worse: a node that submitted a transaction and could not
+# learn what became of it must say so rather than record a settlement it cannot
+# name, or record nothing and leave the side effect invisible. What must not
+# happen is a verdict reading past it. An unresolved settlement is chain state
+# this fleet may have created and cannot account for — a filed inactivity claim,
+# a submitted penalty report — and every rung that reads a terminal record is
+# about work whose ending is known. It blocks rather than fails: nothing here
+# says the ceremony went wrong, only that its chain side effect is unaccounted
+# for, and the offline audit is where that is resolved.
+unresolved_authored_settlements() {
+  local wanted="$1" authored="$2" permit record settlement out=""
+  for permit in ${wanted}; do
+    record="$(authored_record "${permit}" "${authored}")"
+    [[ -n "${record}" ]] || continue
+    settlement="$(authored_settlement "${record}")"
+    [[ "${settlement}" == "-" ]] && continue
+    # A resolved settlement carries its canonical identity after the kind; a
+    # bare kind is the node saying it dispatched something it could not name.
+    [[ "${settlement}" == *:* ]] && continue
+    out="${out}${out:+, }${permit} dispatched a chain side effect it could not \
+resolve (${settlement})"
+  done
+  printf '%s' "${out}"
+}
+
 # Of the chain work the named permits belong to, the pieces whose holders
 # recorded completions naming different results, rendered with the results,
 # comma-joined.
@@ -6425,9 +6454,12 @@ contributor_permit_identity() {
 # it says one of the seats that produced the result was its own.
 #
 # A holder whose ceremony publishes no transcript at all is still counted on its
-# completion. That is the beacon families, whose owners do not yet author the
-# population behind their result, and it is the standing limit named at the
-# mixed-transcript control rather than a reading this helper can improve.
+# completion. Every ceremony that reaches a threshold result publishes one and is
+# refused without it, so what is left are the ceremonies that produce no
+# transcript to publish — a coordination proposal from one leader, a forwarder
+# relaying other members' shares, a penalty filing — and for those a completion
+# naming a result is the whole of what a holder can vouch for. None of them is a
+# ceremony a mixed-release claim is made about.
 authored_work_contributors() {
   local work="$1" authored="$2" token permit out=""
   for token in ${authored}; do
@@ -6745,14 +6777,15 @@ missing_bound_families() {
 # releases combined into one threshold output, because nothing else ever asked a
 # node who was there.
 #
-# It is now read from the seats. Each R1 holder publishes the memberships whose
-# authenticated contributions it combined into the result and, separately, the
-# memberships it operated itself. A seat in the first set that no node in the
-# fleet claims in the second is a seat some node outside the fleet was sitting
-# in, and the only other release on this network is the prior binary. The
-# driver's contributor list is still reconciled in both directions before this
-# runs, but it can no longer supply the mixed half of the claim: a run this fleet
-# performed alone leaves no unaffiliated seat, whatever the report says about it.
+# Both are now read from the seats. Each R1 holder publishes the memberships
+# whose authenticated contributions it combined into the result and, separately,
+# the memberships it operated itself. A seat it operated is the R1 share; a seat
+# in the first set that no node in the fleet claims in the second is a seat some
+# node outside the fleet was sitting in, and the only other release on this
+# network is the prior binary. The driver's contributor list is still reconciled
+# in both directions before this runs, but it supplies neither half of the claim:
+# a run this fleet performed alone leaves no unaffiliated seat, and a run it only
+# watched leaves no seat of its own, whatever the report says about either.
 ceremonies_without_mixed_transcript() {
   local claimed="$1" authored="$2" required="$3" prior="$4"
   local ceremony record work audited covered uncovered=""
@@ -6786,27 +6819,18 @@ ceremonies_without_mixed_transcript() {
       # the fleet says produced this exact work, which no node in the fleet says
       # it operated.
       #
-      # Only where the fleet publishes a transcript for this work. The tBTC
-      # ceremonies do, and their records are refused without one, so for them
-      # the reading below is the whole of the mixed claim and the driver cannot
-      # supply it. The beacon ceremonies publish none yet, and there the
-      # driver's contributor list — reconciled against the fleet in both
-      # directions, but still its own word for who else was there — remains the
-      # only account of the prior share. That is a standing limit of this
-      # rehearsal, recorded as one in the README beside this control.
-      #
-      # TODO: drop the conditional once the beacon ceremonies author their own
-      # transcripts, so every required ceremony is held to the node-authored
-      # reading. Beacon DKG can derive the population from the GJKR result the
-      # same way tBTC DKG derives it from its own operating members, and beacon
-      # relay signing from the authenticated entry shares the local member
-      # combined; adding those two producers, and their ceremonies to the gate
-      # list that refuses a completion without a transcript, is what makes the
-      # branch below unreachable.
-      if [[ -n "$(authored_work_transcript "${audited}" "${authored}")" ]]; then
-        [[ -n "$(unaffiliated_transcript_members \
-          "${audited}" "${authored}")" ]] || continue
-      fi
+      # Required of every ceremony, with no fallback to the driver's word. Each
+      # gated ceremony that produces a threshold result now publishes the
+      # population behind it — the tBTC signing families from their
+      # authenticated done checks, tBTC DKG from its final signing group, beacon
+      # DKG from the operating members of the accepted result, beacon relay
+      # signing from the authenticated entry shares it combined — and the gate
+      # refuses a completed record for any of them that names none. A work whose
+      # holders publish no transcript therefore has no reading here at all,
+      # which is the honest outcome: the driver cannot describe a population the
+      # fleet never authored.
+      [[ -n "$(unaffiliated_transcript_members \
+        "${audited}" "${authored}")" ]] || continue
       covered=1
       break
     done
@@ -8263,6 +8287,7 @@ homogeneous_control_verdict() {
   local failed_results missing_families settlements stray unended
   local named_permits unauthored duplicated unresolved misended authored
   local malformed misevidenced disagreeing unclaimed result_population
+  local unresolved_settlements
   failed_results="$(unsuccessful_results "${HOMOGENEOUS_RESULTS}")"
   missing_families="$(missing_bound_families \
     "${HOMOGENEOUS_BOUND}" "${HOMOGENEOUS_REQUIRED_FAMILIES}")"
@@ -8294,6 +8319,11 @@ homogeneous_control_verdict() {
     "${HOMOGENEOUS_AUTHORED_ENDINGS}")"
   misevidenced="$(misevidenced_authored_permits "${named_permits}" \
     "${HOMOGENEOUS_AUTHORED_ENDINGS}")"
+  # And what those completions dispatched beyond themselves. A side effect the
+  # holder could not resolve is chain state this fleet may have created and
+  # cannot account for, which every rung below would otherwise read past.
+  unresolved_settlements="$(unresolved_authored_settlements \
+    "${named_permits}" "${HOMOGENEOUS_AUTHORED_ENDINGS}")"
   # Every holder of this work, not only the ones the driver named. A holder it
   # omitted still published a record, and a result it recorded that disagrees
   # with the rest — or that no settlement claims — is exactly what a population
@@ -8416,6 +8446,12 @@ says settled"
 to the evidence class its result actually lives in, and a completion carrying \
 another class is a categorical claim about a ceremony whose real output \
 nothing here has seen"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ -n "${unresolved_settlements}" ]]; then
+    block_step "${step}" "${unresolved_settlements}; the fleet may have left \
+chain state behind that no node can name, and every reading below this is \
+about work whose ending is accounted for — an unresolved side effect is for the \
+offline audit to settle rather than for a step to read past"
     record_assertion "${assertion}" false "${step}"
   elif [[ -n "${disagreeing}" ]]; then
     record_step "${step}" fail "the holders of ${disagreeing} each recorded a \
@@ -9210,6 +9246,7 @@ precutover_verdict() {
   local uninteroperated stray unended invented uncredited unrecognized
   local named_permits unauthored duplicated unresolved misended authored
   local malformed misevidenced disagreeing unclaimed result_population
+  local unresolved_settlements
   failed_results="$(unsuccessful_results "${PRECUTOVER_RESULTS}")"
   missing_ceremonies="$(missing_bound_ceremonies \
     "${PRECUTOVER_BOUND}" "${required_ceremonies}")"
@@ -9247,6 +9284,11 @@ precutover_verdict() {
     "${PRECUTOVER_AUTHORED_ENDINGS}")"
   misevidenced="$(misevidenced_authored_permits "${named_permits}" \
     "${PRECUTOVER_AUTHORED_ENDINGS}")"
+  # And what those completions dispatched beyond themselves. A side effect the
+  # holder could not resolve is chain state this fleet may have created and
+  # cannot account for, which every rung below would otherwise read past.
+  unresolved_settlements="$(unresolved_authored_settlements \
+    "${named_permits}" "${PRECUTOVER_AUTHORED_ENDINGS}")"
   # Every holder of this work, not only the ones the driver named. A holder it
   # omitted still published a record, and a result it recorded that disagrees
   # with the rest — or that no settlement claims — is exactly what a population
@@ -9367,6 +9409,11 @@ says settled"
 to the evidence class its result actually lives in, and a completion carrying \
 another class is a categorical claim about a ceremony whose real output \
 nothing here has seen"
+  elif [[ -n "${unresolved_settlements}" ]]; then
+    block_step "${step}" "${unresolved_settlements}; the fleet may have left \
+chain state behind that no node can name, and every reading below this is \
+about work whose ending is accounted for — an unresolved side effect is for the \
+offline audit to settle rather than for a step to read past"
   elif [[ -n "${disagreeing}" ]]; then
     record_step "${step}" fail "the holders of ${disagreeing} each recorded a \
 completion naming a different result; a threshold ceremony has one output, so \
@@ -9538,6 +9585,7 @@ surviving_legacy_verdict() {
   local named_permits unheld_before unnamed_before lost_at_c arrived_at_c
   local unauthored duplicated unresolved misended authored
   local malformed misevidenced disagreeing unclaimed result_population
+  local unresolved_settlements
   named_permits="$(held_permit_identities "${SURVIVING_ORIGINATED}")"
   unheld_before="$(absent_tokens "${named_permits}" \
     "${SURVIVING_PERMITS_BEFORE}")"
@@ -9606,6 +9654,11 @@ surviving_legacy_verdict() {
     "${SURVIVING_AUTHORED_ENDINGS}")"
   misevidenced="$(misevidenced_authored_permits "${named_permits}" \
     "${SURVIVING_AUTHORED_ENDINGS}")"
+  # And what those completions dispatched beyond themselves. A side effect the
+  # holder could not resolve is chain state this fleet may have created and
+  # cannot account for, which every rung below would otherwise read past.
+  unresolved_settlements="$(unresolved_authored_settlements \
+    "${named_permits}" "${SURVIVING_AUTHORED_ENDINGS}")"
   # Every holder of this work, not only the ones the driver named. A holder it
   # omitted still published a record, and a result it recorded that disagrees
   # with the rest — or that no settlement claims — is exactly what a population
@@ -9751,6 +9804,11 @@ says settled"
 to the evidence class its result actually lives in, and a permit that crossed \
 C and then claimed another class produced nothing this control can show for \
 the crossing"
+  elif [[ -n "${unresolved_settlements}" ]]; then
+    block_step "${step}" "${unresolved_settlements}; the fleet may have left \
+chain state behind that no node can name, and every reading below this is \
+about work whose ending is accounted for — an unresolved side effect is for the \
+offline audit to settle rather than for a step to read past"
   elif [[ -n "${disagreeing}" ]]; then
     record_step "${step}" fail "the holders of ${disagreeing} each recorded a \
 completion naming a different result after C; a threshold ceremony has one \

@@ -21,6 +21,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/clientinfo"
 	"github.com/keep-network/keep-core/pkg/internal/interception"
 	"github.com/keep-network/keep-core/pkg/operator"
+	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/protocol/participation"
 
 	"github.com/keep-network/keep-core/pkg/beacon/dkg"
@@ -34,6 +35,10 @@ import (
 type Result struct {
 	entry          []byte
 	signerFailures []error
+	// populations is the transcript each signer reported behind the entry it
+	// recovered: the memberships whose authenticated shares it combined. A
+	// signer that recovered no entry is absent.
+	populations map[group.MemberIndex]participation.MemberIndexes
 }
 
 // EntryValue returns the value of relay entry from the result as G1 or
@@ -127,6 +132,7 @@ func executeSigning(
 
 	var signerFailuresMutex sync.Mutex
 	var signerFailures []error
+	populations := make(map[group.MemberIndex]participation.MemberIndexes)
 
 	var wg sync.WaitGroup
 	wg.Add(len(signers))
@@ -174,7 +180,7 @@ func executeSigning(
 		go func(signer *dkg.ThresholdSigner, permit participation.Permit) {
 			defer permit.Close()
 
-			_, err := entry.SignAndSubmit(
+			recovered, incorporated, err := entry.SignAndSubmit(
 				permit.Context(),
 				&testutils.MockLogger{},
 				blockCounter,
@@ -186,6 +192,11 @@ func executeSigning(
 				startBlockHeight,
 				permit,
 			)
+			if len(recovered) != 0 {
+				signerFailuresMutex.Lock()
+				populations[signer.MemberID()] = incorporated
+				signerFailuresMutex.Unlock()
+			}
 			if err != nil {
 				fmt.Printf("[signer:%v %v] failed with: [%v]\n", signer.MemberID(), previousEntry, err)
 				signerFailuresMutex.Lock()
@@ -209,6 +220,7 @@ func executeSigning(
 		return &Result{
 			entry,
 			signerFailures,
+			populations,
 		}, nil
 
 	case <-ctx.Done():
@@ -216,6 +228,7 @@ func executeSigning(
 		return &Result{
 			nil,
 			signerFailures,
+			populations,
 		}, nil
 	}
 }

@@ -612,7 +612,7 @@ func TestJoinDKGIfEligible_LegacyAnchorInteroperatesWithLegacyPeers(t *testing.T
 		go func(memberIndex group.MemberIndex) {
 			defer externalWait.Done()
 			defer externalPermit.Close()
-			_, err := dkg.ExecuteDKG(
+			_, _, err := dkg.ExecuteDKG(
 				externalPermit.Context(),
 				logger,
 				seed,

@@ -3,6 +3,7 @@ package beacon
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"math/big"
 	"strconv"
 	"sync"
@@ -14,7 +15,10 @@ import (
 	"github.com/keep-network/keep-core/pkg/bls"
 
 	"github.com/keep-network/keep-core/internal/testutils"
+	"github.com/keep-network/keep-core/pkg/beacon/dkg"
 	"github.com/keep-network/keep-core/pkg/beacon/event"
+	"github.com/keep-network/keep-core/pkg/beacon/registry"
+	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/protocol/participation"
 )
 
@@ -166,6 +170,109 @@ func assertRecordedTerminalOutcome(
 	return recorded[0].evidence
 }
 
+// localMemberships builds the group memberships a node operates, carrying only
+// the member indexes the relay transcript is read against.
+func localMemberships(
+	memberIndexes ...group.MemberIndex,
+) []*registry.Membership {
+	memberships := make([]*registry.Membership, 0, len(memberIndexes))
+	for _, memberIndex := range memberIndexes {
+		memberships = append(memberships, &registry.Membership{
+			Signer: dkg.NewThresholdSigner(memberIndex, nil, nil, nil, nil),
+		})
+	}
+
+	return memberships
+}
+
+// TestBeaconDKGTranscriptContribution covers the transcript a completed beacon
+// DKG publishes: the members the key material was generated with, and this
+// node's own seat among them. A completion alone cannot carry that — every
+// member of a finished DKG writes the same word and names the same group key
+// whatever population produced it — so the group key this record names would
+// otherwise be indistinguishable from a share one party generated and persisted
+// on its own.
+func TestBeaconDKGTranscriptContribution(t *testing.T) {
+	groupPublicKey := hex.EncodeToString(
+		altbn128.G2Point{
+			G2: new(bn256.G2).ScalarBaseMult(big.NewInt(42)),
+		}.Compress(),
+	)
+
+	t.Run("operating member", func(t *testing.T) {
+		signer := dkg.NewThresholdSigner(3, nil, nil, nil, nil)
+		operating := participation.MemberIndexes{1, 3, 4}
+
+		contribution := beaconDKGTranscriptContribution(signer, operating)
+
+		expected := &participation.TranscriptContribution{
+			IncorporatedMembers: operating,
+			LocalMembers:        participation.MemberIndexes{3},
+		}
+		if !contribution.Equal(expected) {
+			t.Fatalf(
+				"unexpected transcript contribution\n"+
+					"expected: [%+v]\nactual:   [%+v]",
+				expected,
+				contribution,
+			)
+		}
+
+		if err := participation.ValidateTerminalOutcome(
+			participation.BeaconDKG,
+			"test-work",
+			participation.TerminalOutcomeCompleted,
+			participation.TerminalEvidence{
+				Kind:            participation.TerminalEvidencePersistedBeaconSigner,
+				Reference:       groupPublicKey,
+				MembershipIndex: signer.MemberID(),
+				Contribution:    contribution,
+			},
+		); err != nil {
+			t.Errorf(
+				"the gate rejects the node-authored beacon DKG outcome: [%v]",
+				err,
+			)
+		}
+	})
+
+	// A signer persisted from a ceremony whose accepted result excluded it is
+	// incoherent rather than something to write down, so the seat is not claimed
+	// and the record fails closed at the gate: the permit is left unresolved and
+	// the offline barrier blocks on it, which is the safe reading of key material
+	// no transcript accounts for.
+	t.Run("member outside the operating set", func(t *testing.T) {
+		signer := dkg.NewThresholdSigner(5, nil, nil, nil, nil)
+		operating := participation.MemberIndexes{1, 3, 4}
+
+		contribution := beaconDKGTranscriptContribution(signer, operating)
+
+		if len(contribution.LocalMembers) != 0 {
+			t.Errorf(
+				"expected no local membership, got [%v]",
+				contribution.LocalMembers,
+			)
+		}
+
+		if err := participation.ValidateTerminalOutcome(
+			participation.BeaconDKG,
+			"test-work",
+			participation.TerminalOutcomeCompleted,
+			participation.TerminalEvidence{
+				Kind:            participation.TerminalEvidencePersistedBeaconSigner,
+				Reference:       groupPublicKey,
+				MembershipIndex: signer.MemberID(),
+				Contribution:    contribution,
+			},
+		); err == nil {
+			t.Error(
+				"the gate accepted a persisted membership the transcript " +
+					"does not account for",
+			)
+		}
+	})
+}
+
 // TestRecordRelayEntryTerminalOutcome covers one relay signing membership's
 // disposition. A relay entry is deterministic for a given previous entry, so
 // the recovered entry is the ceremony's durable result whichever member
@@ -191,6 +298,8 @@ func TestRecordRelayEntryTerminalOutcome(t *testing.T) {
 			groupPublicKey,
 			previousEntry,
 			nil,
+			nil,
+			nil,
 		)
 
 		evidence := assertRecordedTerminalOutcome(
@@ -208,6 +317,10 @@ func TestRecordRelayEntryTerminalOutcome(t *testing.T) {
 		}
 	})
 
+	// The memberships whose authenticated shares were combined into the entry,
+	// two of which this node does not operate.
+	incorporated := participation.MemberIndexes{1, 3, 4}
+
 	t.Run("entry recovered", func(t *testing.T) {
 		permit := newRecordingPermit(participation.BeaconRelaySigning)
 
@@ -218,6 +331,8 @@ func TestRecordRelayEntryTerminalOutcome(t *testing.T) {
 			groupPublicKey,
 			previousEntry,
 			relayEntry,
+			incorporated,
+			localMemberships(3, 5),
 		)
 
 		evidence := assertRecordedTerminalOutcome(
@@ -256,6 +371,27 @@ func TestRecordRelayEntryTerminalOutcome(t *testing.T) {
 				len(evidence.Reference),
 			)
 		}
+
+		// The transcript behind the entry, which the reference cannot carry: an
+		// entry is deterministic for a given previous entry, so its identity
+		// reads the same whether several parties supplied the shares it was
+		// recovered from or one party held every seat. Membership 5 is this
+		// node's and contributed no share to this entry, so it is not part of
+		// the population, and memberships 1 and 4 are seats some other node
+		// supplied — which is the only part of the transcript this record can
+		// attribute elsewhere.
+		expectedContribution := &participation.TranscriptContribution{
+			IncorporatedMembers: incorporated,
+			LocalMembers:        participation.MemberIndexes{3},
+		}
+		if !evidence.Contribution.Equal(expectedContribution) {
+			t.Errorf(
+				"unexpected transcript contribution\n"+
+					"expected: [%+v]\nactual:   [%+v]",
+				expectedContribution,
+				evidence.Contribution,
+			)
+		}
 	})
 
 	// A result the node cannot name verifiably must not reach the journal as
@@ -284,6 +420,8 @@ func TestRecordRelayEntryTerminalOutcome(t *testing.T) {
 				groupPublicKey,
 				test.previousEntry,
 				test.relayEntry,
+				participation.MemberIndexes{1, 3, 4},
+				localMemberships(3),
 			)
 
 			if recorded := permit.recorded(); len(recorded) != 0 {
@@ -317,6 +455,8 @@ func TestRecordRelayEntryTerminalOutcome_ReferenceVerifies(t *testing.T) {
 		}.Compress(),
 		previousEntryPoint.Marshal(),
 		bls.SignG1(groupSecret, previousEntryPoint).Marshal(),
+		participation.MemberIndexes{2},
+		localMemberships(2),
 	)
 
 	evidence := assertRecordedTerminalOutcome(

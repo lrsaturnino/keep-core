@@ -3776,7 +3776,7 @@ beacon_dkg@845@bdkg845=${PRE_TX2}=r1-node-1~1"
 r1-node-1@tbtc_signing@840@wallet840#1=completed=bitcoin_transaction=0xbtc840\
 =-=1,7=1=- \
 r1-node-1@beacon_relay_signing@841@entry841#1=completed=protocol_result\
-=0xentry841=-=-=-=- \
+=0xentry841=-=1,7=1=- \
 r1-node-1@tbtc_dkg@842@dkg842#1=completed=persisted_tbtc_signer=0xdkg842=1\
 =1,7=1=- \
 r1-node-1@tbtc_signing@843@sign843#1=completed=bitcoin_transaction=0xsign843\
@@ -3784,7 +3784,7 @@ r1-node-1@tbtc_signing@843@sign843#1=completed=bitcoin_transaction=0xsign843\
 r1-node-1@tbtc_heartbeat@844@beat844#1=completed=protocol_result=0xbeat844=-\
 =1,7=1=- \
 r1-node-1@beacon_dkg@845@bdkg845#1=completed=persisted_beacon_signer\
-=0xbdkg845=1=-=-=-"
+=0xbdkg845=1=1,7=1=-"
   # shellcheck disable=SC2034
   PRECUTOVER_PRIOR_RUNNING=1
   # shellcheck disable=SC2034
@@ -3919,19 +3919,15 @@ check "a homogeneous R1 transcript cannot stand for a mixed one" 3 \
 # The case the whole control used to rest on the driver for. Here the driver
 # names a prior contributor on every required ceremony, exactly as a genuine
 # mixed run would, and the fleet's own transcripts say every seat that produced
-# the tBTC results was one of its own. A report cannot add a party to a
-# transcript, so the tBTC requirements stay uncovered whatever the list claims.
-#
-# The beacon requirements are covered here, and that is the standing limit rather
-# than an oversight: those ceremonies publish no transcript, so their prior share
-# is still read from the driver's list. The verdict below therefore names the
-# tBTC ceremonies alone, which is exactly the set whose prior share this fleet
-# authors.
+# each result was one of its own. A report cannot add a party to a transcript, so
+# every requirement stays uncovered whatever the list claims — including the
+# beacon families, whose prior share was the driver's word for as long as their
+# ceremonies published no population of their own.
 run_verdict precutover_case eval '
   PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS//1,7/1}"'
 check "a driver-claimed prior party outside the transcript is refused" 3 \
-  "no tbtc_dkg tbtc_signing tbtc_heartbeat tbtc_wallet_action transcript \
-incorporated a share"
+  "no tbtc_dkg tbtc_signing tbtc_heartbeat beacon_dkg beacon_signing \
+tbtc_wallet_action transcript incorporated a share"
 
 # And the reverse mutation on the same fixture: a seat the fleet does not claim
 # is what makes the reading mixed, so moving that seat into a node's own
@@ -3939,8 +3935,46 @@ incorporated a share"
 run_verdict precutover_case eval '
   PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS//=1,7=1=/=1,7=1,7=}"'
 check "a fleet claiming every seat authored no mixed transcript" 3 \
-  "no tbtc_dkg tbtc_signing tbtc_heartbeat tbtc_wallet_action transcript \
-incorporated a share"
+  "no tbtc_dkg tbtc_signing tbtc_heartbeat beacon_dkg beacon_signing \
+tbtc_wallet_action transcript incorporated a share"
+
+# A chain side effect the holder dispatched and could not name. The gate lets a
+# settlement be recorded without its canonical identity on purpose — a node that
+# submitted a transaction and could not learn what became of it has to say so
+# rather than record a settlement it cannot name or leave the submission
+# invisible — and a step reading past it decides a compatibility claim while this
+# fleet may have left an inactivity claim on the chain that nobody can account
+# for.
+run_verdict precutover_case eval '
+  PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS/\
+0xbeat844=-=1,7=1=-/0xbeat844=-=1,7=1=tbtc_inactivity_claim}"'
+check "a side effect the holder could not resolve is not read past" 3 \
+  "tbtc_heartbeat@844@beat844#1 dispatched a chain side effect it could not \
+resolve" "tbtc_inactivity_claim"
+
+# The same side effect with its canonical identity beside it, which is what the
+# rung is asking for rather than an absence of side effects: a holder that named
+# the claim it filed leaves nothing for a later reader to resolve.
+run_verdict precutover_case eval '
+  PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS/\
+0xbeat844=-=1,7=1=-/0xbeat844=-=1,7=1=tbtc_inactivity_claim:0xwallet844:3}"'
+check "a resolved side effect leaves the step to its own claim" 0 \
+  "issued 4 new legacy permits"
+
+# The same mutation confined to the beacon families, which is where a driver's
+# claim used to be the whole of the prior share: their ceremonies published no
+# population, so a report naming a prior contributor was the only account of one
+# and nothing could contradict it. Both now publish the seats behind their
+# result — the DKG its accepted result's operating members, the relay the
+# authenticated shares it combined — so a homogeneous beacon run leaves no seat
+# the fleet does not claim, and the claim cannot add one.
+run_verdict precutover_case eval '
+  PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS/\
+0xentry841=-=1,7=1=-/0xentry841=-=1=1=-}"
+  PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS/\
+0xbdkg845=1=1,7=1=-/0xbdkg845=1=1=1=-}"'
+check "a homogeneous beacon run is not covered by a claimed prior party" 3 \
+  "no beacon_dkg beacon_signing transcript incorporated a share"
 
 # The seat sets read the other way round: every seat that produced the signing
 # result belongs to the prior binary and the R1 holder claims none of them.

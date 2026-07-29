@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"slices"
 
 	"github.com/keep-network/keep-core/pkg/beacon/event"
 
@@ -39,6 +40,17 @@ func RegisterUnmarshallers(channel net.BroadcastChannel) {
 // returned value is the ceremony's durable result and stays reconcilable
 // against the chain even if the submission below did not go through.
 //
+// Beside it, the memberships whose signature shares were combined into that
+// entry, and nil wherever no entry was recovered. Every one of them was
+// authenticated against the group public key share the DKG published for that
+// membership and against this exact previous entry, so a membership named there
+// held the private share behind its seat and put it into this result. That is
+// the local view of the transcript, and the only fact separating a threshold
+// entry several parties produced from one this node recovered among its own
+// kind: a completed relay ceremony reads identically either way, so a reader
+// holding only the completion has to take the population from whichever party
+// reported it.
+//
 // The context bounds the execution and must be the ceremony permit's context:
 // canceling it aborts the share exchange and the submission. The commit guard
 // is consulted immediately before the terminal on-chain entry submission.
@@ -53,11 +65,11 @@ func SignAndSubmit(
 	signer *dkg.ThresholdSigner,
 	startBlockHeight uint64,
 	commitGuard participation.CommitGuard,
-) ([]byte, error) {
+) ([]byte, participation.MemberIndexes, error) {
 	if commitGuard == nil {
 		// Submitting without a fence would publish an entry the release gate
 		// never authorized; there is no implicit default.
-		return nil, fmt.Errorf(
+		return nil, nil, fmt.Errorf(
 			"a commit guard is required to sign a relay entry",
 		)
 	}
@@ -81,13 +93,13 @@ func SignAndSubmit(
 		startBlockHeight + chainConfig.RelayEntryTimeout,
 	)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	previousEntry := new(bn256.G1)
 	_, err = previousEntry.Unmarshal(previousEntryBytes)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	selfShare := signer.CalculateSignatureShare(previousEntry)
@@ -159,15 +171,15 @@ func SignAndSubmit(
 				signer.MemberID(),
 				blockNumber,
 			)
-			return nil, nil
+			return nil, nil, nil
 		case blockNumber := <-relayEntryTimeoutChannel:
-			return nil, fmt.Errorf(
+			return nil, nil, fmt.Errorf(
 				"relay entry timed out at block [%v]; received [%v] valid signature shares",
 				blockNumber,
 				len(receivedValidShares),
 			)
 		case <-ctx.Done():
-			return nil, fmt.Errorf(
+			return nil, nil, fmt.Errorf(
 				"relay entry signing canceled: [%w]",
 				context.Cause(ctx),
 			)
@@ -176,8 +188,14 @@ func SignAndSubmit(
 
 	signature, err := completeSignature(logger, signer, receivedValidShares, honestThreshold)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+
+	// Read before anything else can add to the map. The loop above exits at
+	// exactly the honest threshold and every share it holds went into the
+	// recovery, so this is the population behind the entry rather than a
+	// population that merely spoke on the channel.
+	incorporated := incorporatedMemberships(receivedValidShares)
 
 	entryBytes := signature.Marshal()
 
@@ -196,7 +214,7 @@ func SignAndSubmit(
 	// The recovered entry is returned whatever the submission does: the local
 	// ceremony already reached its threshold result, and a submission refused
 	// by the release gate or won by another member does not undo it.
-	return entryBytes, submitter.submitRelayEntry(
+	return entryBytes, incorporated, submitter.submitRelayEntry(
 		ctx,
 		entryBytes,
 		signer.GroupPublicKeyBytes(),
@@ -205,6 +223,22 @@ func SignAndSubmit(
 		relayEntryTimeoutChannel,
 		commitGuard,
 	)
+}
+
+// incorporatedMemberships renders the memberships whose shares were combined
+// into a recovered entry, ascending. The ordering is what gives one population
+// exactly one rendering, so two members' records of the same relay compare
+// equal and a reader cannot be shown a seat twice.
+func incorporatedMemberships(
+	shares map[group.MemberIndex]*bn256.G1,
+) participation.MemberIndexes {
+	memberships := make(participation.MemberIndexes, 0, len(shares))
+	for memberID := range shares {
+		memberships = append(memberships, memberID)
+	}
+	slices.Sort(memberships)
+
+	return memberships
 }
 
 func broadcastShare(

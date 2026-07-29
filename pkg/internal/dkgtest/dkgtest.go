@@ -275,7 +275,7 @@ func executeDKG(
 		go func() {
 			defer permit.Close()
 
-			signer, err := dkg.ExecuteDKG(
+			signer, _, err := dkg.ExecuteDKG(
 				permit.Context(),
 				memberLogger,
 				seed,

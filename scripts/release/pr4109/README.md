@@ -349,6 +349,13 @@ reported:
   driver reports a settlement for it. Which endings those are is the control's
   own question: the crossing requires work to complete, while a drain is
   satisfied by completion or by audited quarantine.
+- A chain side effect the holder dispatched and could not name blocks. The gate
+  lets a settlement be recorded without its canonical identity on purpose — a
+  node that submitted a transaction and could not learn what became of it has to
+  say so rather than record a settlement it cannot name or leave the submission
+  invisible — and a step reading past it decides on work while this fleet may
+  have left chain state behind that nobody can account for. Resolving it is the
+  offline audit's job.
 
 The quiescence controls take their reading *inside* the drain window rather
 than after it, for the same reason the refusal counter is sampled there — the
@@ -377,16 +384,18 @@ says the same thing about it as about a ceremony that finished.
 The contributor set — which parties a settled transcript incorporated — is what
 the mixed-release steps distinguish a mixed committee from a homogeneous one by.
 Its R1 half is no longer the driver's word. Every R1 node publishes the permits
-it closed and the durable result each one produced, so "an R1 node was a party
-to this transcript" is answered out of that node's own record, at the whole
-permit identity and for the exact piece of chain work, with the driver taking no
-part in producing the answer. The driver's list is then reconciled against that
-derivation in both directions before any verdict reads it: a claimed R1 party
-the fleet published no completion for is refused, including a real holder named
-under a permit it never took — which is how one contribution would otherwise be
-counted as the several a threshold needs — and a completion the fleet did
-publish that the list omits is refused too, so the set is the population that
-ran rather than a subset of it. A holder that is neither the prior binary nor a
+it closed, the durable result each one produced, and which of the seats behind
+that result were its own, so "an R1 node was a party to this transcript" is
+answered out of that node's own record, at the whole permit identity and for the
+exact piece of chain work, with the driver taking no part in producing the
+answer. The driver's list is then reconciled against that derivation in both
+directions before any verdict reads it: a claimed R1 party the fleet published no
+contribution for is refused, including a real holder named under a permit it
+never took — which is how one contribution would otherwise be counted as the
+several a threshold needs — and a holder that recorded only watching the result
+finish, which is a completion and not a contribution — and a contribution the
+fleet did publish that the list omits is refused too, so the set is the
+population that ran rather than a subset of it. A holder that is neither the prior binary nor a
 node this rehearsal runs is refused outright, because a third name is neither
 half of the claim. The two releases are required to meet in one *piece of work*
 rather than in one ceremony, matched in the driver's vocabulary and not the
@@ -394,32 +403,31 @@ gate's: the gate spells a wallet action and a signing alike, so a prior share on
 the wallet action and an R1 completion on the signing beside it stays two
 homogeneous transcripts.
 
-For the tBTC ceremonies the prior share is no longer the driver's word either,
-and it is read without the prior binary having to say anything. Each R1 holder
-publishes the memberships whose authenticated contributions it combined into its
-result and, separately, the memberships it operated itself: a seat in the first
-set that no node in the fleet claims in the second is a seat some node outside
-the fleet was sitting in, and the only other release on this network is the prior
-binary. A tBTC run this fleet performed alone therefore leaves no such seat
-however the report describes it, and a driver cannot add one — the seats come
-from done checks each R1 node validated against the wallet's on-chain signing
-group, all carrying the one signature the attempt agreed on, or from the final
-signing group a DKG built out of exactly the members whose rounds it accepted.
+The prior share is no longer the driver's word either, and it is read without
+the prior binary having to say anything. Each R1 holder publishes the memberships
+whose authenticated contributions it combined into its result and, separately,
+the memberships it operated itself: a seat in the first set that no node in the
+fleet claims in the second is a seat some node outside the fleet was sitting in,
+and the only other release on this network is the prior binary. A run this fleet
+performed alone therefore leaves no such seat however the report describes it,
+and a driver cannot add one — the seats come from done checks each R1 node
+validated against the wallet's on-chain signing group, all carrying the one
+signature the attempt agreed on; from the final signing group a DKG built out of
+exactly the members whose rounds it accepted; from the operating members of the
+beacon DKG result this node's rounds produced; and from the relay shares each
+authenticated against the group public key share published for the membership
+that sent it. Every gated ceremony that reaches a threshold result publishes one,
+and the gate refuses a completed record for any of them that publishes none, so
+each required ceremony is held to the same node-authored reading with no fallback
+to the report.
 
-The seam is narrower but not closed, and what is still open is named here rather
-than left to be inferred from which verdicts the list above happens to omit. The
-beacon ceremonies publish no transcript yet — their owners do not carry the
-authenticated population out of the GJKR result or the combined relay shares into
-the terminal record — so for `beacon_dkg` and `beacon_signing` the prior share
-remains the driver's word. What is checked about that word is that it is attached
-to a piece of work the R1 fleet's own holders recorded completing, under the
-result they recorded, rather than to a work identity the driver invented beside
-them; what cannot be checked there is whether the prior node's share was really
-incorporated into that transcript rather than merely claimed against it. Unlike
-the prior binary's silence, this half is a repository-side gap and is recorded as
-one: the two beacon producers are named in the rehearsal beside the conditional
-that still admits the driver's claim, and closing them makes every required
-ceremony read the same node-authored way the tBTC ones now do.
+Completing a ceremony and contributing to it are held apart. A wallet action owns
+its permit and records the signature it saw settle even when the attempt that
+produced it selected none of the memberships this node operates, which is the
+honest ending of a permit whose ceremony ran without it — and not a contribution.
+The R1 half of every mixed claim is therefore a seat the holder says was its own,
+so an R1 node that only watched a prior-only result finish supplies neither half
+of the claim, and a driver naming it as a party is refused.
 
 The straggler control reads the announcer's own account of the sighting
 rather than the gate's refusal counter, which counts a node declining its own

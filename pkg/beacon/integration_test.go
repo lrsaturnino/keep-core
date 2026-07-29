@@ -48,6 +48,14 @@ func TestAllMembersSigning(t *testing.T) {
 	dkgtest.AssertSamePublicKey(t, dkgResult)
 	entrytest.AssertEntryPublished(t, signingResult)
 	entrytest.AssertNoSignerFailures(t, signingResult)
+	// Who produced the entry, which is what the release evidence records and
+	// what the deterministic entry value itself cannot say.
+	entrytest.AssertIncorporatedPopulations(
+		t,
+		signingResult,
+		honestThreshold,
+		groupSize,
+	)
 
 	groupPublicKey, err := getFirstGroupPublicKey(dkgResult)
 	if err != nil {
@@ -81,6 +89,14 @@ func TestHonestThresholdMembersSigning(t *testing.T) {
 	dkgtest.AssertSamePublicKey(t, dkgResult)
 	entrytest.AssertEntryPublished(t, signingResult)
 	entrytest.AssertNoSignerFailures(t, signingResult)
+	// Who produced the entry, which is what the release evidence records and
+	// what the deterministic entry value itself cannot say.
+	entrytest.AssertIncorporatedPopulations(
+		t,
+		signingResult,
+		honestThreshold,
+		groupSize,
+	)
 
 	groupPublicKey, err := getFirstGroupPublicKey(dkgResult)
 	if err != nil {
@@ -153,6 +169,14 @@ func TestInactiveMemberPublicKeySharesReconstructionAndSigning(t *testing.T) {
 	dkgtest.AssertSamePublicKey(t, dkgResult)
 	entrytest.AssertEntryPublished(t, signingResult)
 	entrytest.AssertNoSignerFailures(t, signingResult)
+	// Who produced the entry, which is what the release evidence records and
+	// what the deterministic entry value itself cannot say.
+	entrytest.AssertIncorporatedPopulations(
+		t,
+		signingResult,
+		honestThreshold,
+		groupSize,
+	)
 
 	groupPublicKey, err := getFirstGroupPublicKey(dkgResult)
 	if err != nil {
@@ -207,6 +231,14 @@ func TestInactivePointsAccusationsReconstructionAndSigning(t *testing.T) {
 	dkgtest.AssertSamePublicKey(t, dkgResult)
 	entrytest.AssertEntryPublished(t, signingResult)
 	entrytest.AssertNoSignerFailures(t, signingResult)
+	// Who produced the entry, which is what the release evidence records and
+	// what the deterministic entry value itself cannot say.
+	entrytest.AssertIncorporatedPopulations(
+		t,
+		signingResult,
+		honestThreshold,
+		groupSize,
+	)
 
 	groupPublicKey, err := getFirstGroupPublicKey(dkgResult)
 	if err != nil {
@@ -271,6 +303,14 @@ func TestSigningWithInvalidSignatureShare(t *testing.T) {
 	dkgtest.AssertSamePublicKey(t, dkgResult)
 	entrytest.AssertEntryPublished(t, signingResult)
 	entrytest.AssertNoSignerFailures(t, signingResult)
+	// Who produced the entry, which is what the release evidence records and
+	// what the deterministic entry value itself cannot say.
+	entrytest.AssertIncorporatedPopulations(
+		t,
+		signingResult,
+		honestThreshold,
+		groupSize,
+	)
 
 	groupPublicKey, err := getFirstGroupPublicKey(dkgResult)
 	if err != nil {

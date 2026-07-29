@@ -1104,19 +1104,12 @@ func ValidateTerminalOutcome(
 //
 // It is a closed list rather than a blanket requirement because only a ceremony
 // that authenticates its peers' contributions can author this honestly. A
-// ceremony absent from the list either produces no threshold transcript — a
-// coordination proposal comes from one leader, a forwarder relays other
-// members' shares and computes nothing — or its owner does not yet collect the
-// authenticated population, and inventing a contribution for it would be the
+// ceremony absent from the list produces no threshold transcript: a coordination
+// proposal comes from one leader, a forwarder relays other members' shares and
+// computes nothing, a timeout report is one node's penalty filing, and an
+// inactivity claim carries the population it accuses rather than one that
+// produced a result. Inventing a contribution for any of them would be the
 // self-attestation this record exists to remove.
-//
-// TODO: extend the list to BeaconDKG and BeaconRelaySigning once their owners
-// author the population. BeaconDKG can derive it from the GJKR result's
-// operating members, exactly as tBTC DKG derives it from its own, and
-// BeaconRelaySigning from the authenticated relay-entry shares the local member
-// combined. Both are the same shape of change as the tBTC producers: carry the
-// authenticated member set out of the protocol result and into the terminal
-// evidence, then add the ceremony here so its completed records cannot omit it.
 var transcriptContributionCeremonies = map[Ceremony]struct{}{
 	// The final signing group, which is exactly the DKG members whose shares
 	// this node validated through every round.
@@ -1126,6 +1119,12 @@ var transcriptContributionCeremonies = map[Ceremony]struct{}{
 	TBTCSigning: {},
 	// The same, for the heartbeat's own signing round.
 	TBTCHeartbeat: {},
+	// The operating members of the accepted result, which are exactly the
+	// members whose round messages this node accepted through every round.
+	BeaconDKG: {},
+	// The memberships whose signature shares, each authenticated against the
+	// group public key share published for it, were combined into the entry.
+	BeaconRelaySigning: {},
 }
 
 // AuthorsTranscriptContribution reports whether a ceremony's owner authenticates

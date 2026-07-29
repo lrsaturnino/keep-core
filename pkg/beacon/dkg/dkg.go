@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"slices"
 	"sort"
 
 	"github.com/ipfs/go-log/v2"
@@ -57,6 +58,16 @@ func (e *PublicationInterruptedError) Unwrap() error {
 // successful return means an on-chain publication of the result was observed;
 // a *PublicationInterruptedError return carries generated key material whose
 // publication the gate interrupted.
+//
+// Beside the signer it returns the members the key material was generated with:
+// the operating members of the accepted result, which are exactly the members
+// whose round messages this node authenticated against the group's on-chain
+// membership and accepted through every round — a member whose messages did not
+// arrive, or arrived without a valid membership behind them, was marked inactive
+// and is absent. That is the local view of the transcript, and the only fact
+// distinguishing a key generated together with other parties from a share whose
+// provenance is one party's word: every member of a finished DKG records the
+// same completion and names the same group key whatever population produced it.
 func ExecuteDKG(
 	ctx context.Context,
 	logger log.StandardLogger,
@@ -69,12 +80,12 @@ func ExecuteDKG(
 	selectedOperators []chain.Address,
 	strategies compatibility.Strategies,
 	commitGuard participation.CommitGuard,
-) (*ThresholdSigner, error) {
+) (*ThresholdSigner, participation.MemberIndexes, error) {
 	beaconConfig := beaconChain.GetConfig()
 
 	blockCounter, err := beaconChain.BlockCounter()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get block counter: [%v]", err)
+		return nil, nil, fmt.Errorf("failed to get block counter: [%v]", err)
 	}
 
 	gjkr.RegisterUnmarshallers(channel)
@@ -97,7 +108,7 @@ func ExecuteDKG(
 		startBlockHeight,
 	)
 	if err != nil {
-		return nil, fmt.Errorf(
+		return nil, nil, fmt.Errorf(
 			"[member:%v] GJKR execution failed [%w]",
 			memberIndex,
 			err,
@@ -150,7 +161,7 @@ func ExecuteDKG(
 	)
 	if err != nil {
 		if isGateInterruption(ctx, err) {
-			return nil, interruptedSigner(err)
+			return nil, nil, interruptedSigner(err)
 		}
 
 		// Result publication failed. It means that either the result this
@@ -175,9 +186,9 @@ func ExecuteDKG(
 			blockCounter,
 		); err != nil {
 			if isGateInterruption(ctx, err) {
-				return nil, interruptedSigner(err)
+				return nil, nil, interruptedSigner(err)
 			}
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
@@ -187,16 +198,35 @@ func ExecuteDKG(
 		beaconConfig,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to resolve group operators: [%v]", err)
+		return nil, nil, fmt.Errorf(
+			"failed to resolve group operators: [%v]",
+			err,
+		)
 	}
 
 	return &ThresholdSigner{
-		memberIndex:          memberIndex,
-		groupPublicKey:       gjkrResult.GroupPublicKey,
-		groupPrivateKeyShare: gjkrResult.GroupPrivateKeyShare,
-		groupPublicKeyShares: gjkrResult.GroupPublicKeyShares(),
-		groupOperators:       groupOperators,
-	}, nil
+			memberIndex:          memberIndex,
+			groupPublicKey:       gjkrResult.GroupPublicKey,
+			groupPrivateKeyShare: gjkrResult.GroupPrivateKeyShare,
+			groupPublicKeyShares: gjkrResult.GroupPublicKeyShares(),
+			groupOperators:       groupOperators,
+		},
+		operatingMemberships(operatingMemberIndexes),
+		nil
+}
+
+// operatingMemberships renders the members the key material was generated with,
+// ascending. The ordering gives one population exactly one rendering, so two
+// members' records of the same DKG compare equal; the copy keeps the rendering
+// independent of a caller that reorders the group's own view afterwards.
+func operatingMemberships(
+	operating []group.MemberIndex,
+) participation.MemberIndexes {
+	memberships := make(participation.MemberIndexes, len(operating))
+	copy(memberships, operating)
+	slices.Sort(memberships)
+
+	return memberships
 }
 
 // isGateInterruption distinguishes a release-gate decision from an ordinary

@@ -701,6 +701,14 @@ func TestValidateTerminalOutcome_RelayEntryIsBoundToItsRequest(t *testing.T) {
 		return TerminalEvidence{
 			Kind:      TerminalEvidenceProtocolResult,
 			Reference: reference,
+			// The relay ceremony authors the population behind its entry, so a
+			// completed record carrying none is refused before the reference is
+			// ever read. This case is about the reference, so every record here
+			// carries a well-formed transcript.
+			Contribution: &TranscriptContribution{
+				IncorporatedMembers: MemberIndexes{1, 2},
+				LocalMembers:        MemberIndexes{2},
+			},
 		}
 	}
 

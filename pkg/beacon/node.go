@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"slices"
 
 	bn256 "github.com/ethereum/go-ethereum/crypto/bn256/cloudflare"
 	"github.com/ipfs/go-log/v2"
@@ -260,7 +261,7 @@ func (n *node) JoinDKGIfEligible(
 					permit.CanonicalStartBlock(),
 				)
 
-				signer, err := dkg.ExecuteDKG(
+				signer, operatingMembers, err := dkg.ExecuteDKG(
 					permit.Context(),
 					dkgLogger,
 					dkgSeed,
@@ -345,6 +346,10 @@ func (n *node) JoinDKGIfEligible(
 								Kind:            participation.TerminalEvidencePersistedBeaconSigner,
 								Reference:       groupPublicKey,
 								MembershipIndex: signer.MemberID(),
+								Contribution: beaconDKGTranscriptContribution(
+									signer,
+									operatingMembers,
+								),
 							},
 						)
 					}
@@ -375,6 +380,10 @@ func (n *node) JoinDKGIfEligible(
 						Kind:            participation.TerminalEvidencePersistedBeaconSigner,
 						Reference:       groupPublicKey,
 						MembershipIndex: signer.MemberID(),
+						Contribution: beaconDKGTranscriptContribution(
+							signer,
+							operatingMembers,
+						),
 					},
 				)
 			}()
@@ -443,6 +452,36 @@ func (n *node) quarantineSigner(
 				Kind: participation.TerminalEvidenceQuarantinedBeaconSigner,
 			},
 		)
+	}
+}
+
+// beaconDKGTranscriptContribution renders the memberships that produced a DKG
+// result: the members the key material was generated with, and this node's own
+// seat among them.
+//
+// The local half is the seat this permit was issued for rather than every seat
+// this node holds in the group. Each locally controlled member runs its own DKG
+// under its own permit and publishes its own record, so the fleet's own
+// memberships are covered by the union of those records; a permit may only
+// speak for the ceremony it ran.
+//
+// A seat missing from the operating members is not written down as local. The
+// gate refuses a transcript whose local memberships are not among the ones that
+// produced the result, and a signer persisted from a ceremony that did not
+// include it is incoherent rather than something to record — so the record fails
+// closed and the offline barrier blocks on the permit instead.
+func beaconDKGTranscriptContribution(
+	signer *dkg.ThresholdSigner,
+	operatingMembers participation.MemberIndexes,
+) *participation.TranscriptContribution {
+	local := make(participation.MemberIndexes, 0, 1)
+	if slices.Contains(operatingMembers, signer.MemberID()) {
+		local = append(local, signer.MemberID())
+	}
+
+	return &participation.TranscriptContribution{
+		IncorporatedMembers: operatingMembers,
+		LocalMembers:        local,
 	}
 }
 
@@ -840,6 +879,8 @@ func recordRelayEntryTerminalOutcome(
 	groupPublicKey []byte,
 	previousEntry []byte,
 	relayEntry []byte,
+	incorporated participation.MemberIndexes,
+	memberships []*registry.Membership,
 ) {
 	if len(relayEntry) == 0 {
 		recordBeaconPermitNoThreshold(relayLogger, permit)
@@ -884,10 +925,41 @@ func recordRelayEntryTerminalOutcome(
 		permit,
 		participation.TerminalOutcomeCompleted,
 		participation.TerminalEvidence{
-			Kind:      participation.TerminalEvidenceProtocolResult,
-			Reference: reference,
+			Kind:         participation.TerminalEvidenceProtocolResult,
+			Reference:    reference,
+			Contribution: relayTranscriptContribution(incorporated, memberships),
 		},
 	)
+}
+
+// relayTranscriptContribution renders the local view of who produced a relay
+// entry: the memberships whose authenticated signature shares were combined
+// into it, and the ones among them this node operates in that group.
+//
+// The local half is read from every membership this node holds in the group
+// rather than from the one this permit was issued for. A node running several
+// seats supplies several shares, and a record naming only its own seat would
+// leave the rest looking like shares some other party had to supply — which is
+// exactly the reading a fleet subtracting its own memberships from the
+// incorporated population draws to find the parties outside it.
+func relayTranscriptContribution(
+	incorporated participation.MemberIndexes,
+	memberships []*registry.Membership,
+) *participation.TranscriptContribution {
+	local := make(participation.MemberIndexes, 0, len(memberships))
+	for _, membership := range memberships {
+		memberID := membership.Signer.MemberID()
+		if slices.Contains(incorporated, memberID) &&
+			!slices.Contains(local, memberID) {
+			local = append(local, memberID)
+		}
+	}
+	slices.Sort(local)
+
+	return &participation.TranscriptContribution{
+		IncorporatedMembers: incorporated,
+		LocalMembers:        local,
+	}
 }
 
 // ForwardSignatureShares enables the ability to forward signature shares
@@ -1295,7 +1367,7 @@ func (n *node) generateRelayEntry(
 			n.protocolLatch.Lock()
 			defer n.protocolLatch.Unlock()
 
-			relayEntry, err := entry.SignAndSubmit(
+			relayEntry, incorporated, err := entry.SignAndSubmit(
 				permit.Context(),
 				relayLogger,
 				blockCounter,
@@ -1309,7 +1381,10 @@ func (n *node) generateRelayEntry(
 			)
 			// The recovered entry, not the submission's fate, is this
 			// ceremony's node-owned terminal disposition: a member that never
-			// reached the honest threshold left no result behind.
+			// reached the honest threshold left no result behind. The
+			// memberships whose shares it was recovered from travel with it, so
+			// the record says who produced the entry rather than only that one
+			// exists.
 			recordRelayEntryTerminalOutcome(
 				relayLogger,
 				permit,
@@ -1317,6 +1392,8 @@ func (n *node) generateRelayEntry(
 				member.Signer.GroupPublicKeyBytesCompressed(),
 				previousEntry,
 				relayEntry,
+				incorporated,
+				memberships,
 			)
 			if err != nil {
 				if participation.IsGateRefusal(err) {
