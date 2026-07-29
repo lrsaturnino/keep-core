@@ -53,6 +53,27 @@ func (cutoverFakePersistence) ReadAll() (
 	return data, errs
 }
 
+func TestBeaconPermitIdentitiesAreCanonical(t *testing.T) {
+	seed := big.NewInt(123456789)
+	seedHash := sha256.Sum256(seed.Bytes())
+
+	dkgIdentity := beaconDKGPermitIdentity(seed, group.MemberIndex(17))
+	if dkgIdentity.WorkID != hex.EncodeToString(seedHash[:]) {
+		t.Errorf("unexpected DKG work ID [%s]", dkgIdentity.WorkID)
+	}
+	if dkgIdentity.PermitID != "17" {
+		t.Errorf("unexpected DKG permit ID [%s]", dkgIdentity.PermitID)
+	}
+
+	relayIdentity := beaconRelayPermitIdentity(1234, "17")
+	if relayIdentity.WorkID != "relay-request-1234" {
+		t.Errorf("unexpected relay work ID [%s]", relayIdentity.WorkID)
+	}
+	if relayIdentity.PermitID != "17" {
+		t.Errorf("unexpected relay permit ID [%s]", relayIdentity.PermitID)
+	}
+}
+
 // cutoverRecordingPersistence records every saved file name so tests can
 // assert exactly which namespace received signer material.
 type cutoverRecordingPersistence struct {

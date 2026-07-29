@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -27,10 +28,238 @@ type gateBlockCounter struct {
 	holdRelease chan struct{}
 }
 
+func TestGate_CeremonySpecificPermitIdentityValidation(t *testing.T) {
+	const cutover = uint64(1_000)
+	recorder := &recordingQuiescenceSnapshotRecorder{}
+	gate, err := newGate(
+		context.Background(),
+		Schedule{CutoverBlock: cutover},
+		newGateBlockCounter(cutover),
+		newFakeMetrics(),
+		inertPollInterval,
+		WithArtifactIdentity("v2.1.0", "revision-test"),
+		WithQuiescenceSnapshotRecorder(recorder),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(gate.Close)
+
+	tests := map[string]struct {
+		ceremony Ceremony
+		identity PermitIdentity
+	}{
+		"uppercase DKG seed hash": {
+			ceremony: TBTCDKG,
+			identity: PermitIdentity{
+				WorkID:   strings.Repeat("A", 64),
+				PermitID: "1",
+			},
+		},
+		"truncated DKG seed hash": {
+			ceremony: BeaconDKG,
+			identity: PermitIdentity{
+				WorkID:   strings.Repeat("a", 63),
+				PermitID: "1",
+			},
+		},
+		"prefixed member index": {
+			ceremony: TBTCDKG,
+			identity: PermitIdentity{
+				WorkID:   strings.Repeat("a", 64),
+				PermitID: "01",
+			},
+		},
+		"zero member index": {
+			ceremony: BeaconDKG,
+			identity: PermitIdentity{
+				WorkID:   strings.Repeat("a", 64),
+				PermitID: "0",
+			},
+		},
+		"nonmember relay identity": {
+			ceremony: BeaconRelaySigning,
+			identity: PermitIdentity{
+				WorkID:   "relay-request-1000",
+				PermitID: "member-1",
+			},
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := gate.Begin(
+				test.ceremony,
+				cutover,
+				test.identity,
+			); !errors.Is(err, ErrInvalidPermitIdentity) {
+				t.Fatalf(
+					"expected ceremony-specific identity rejection, got [%v]",
+					err,
+				)
+			}
+		})
+	}
+
+	permit, err := gate.Begin(
+		TBTCDKG,
+		cutover,
+		PermitIdentity{
+			WorkID:   strings.Repeat("a", 64),
+			PermitID: "255",
+		},
+	)
+	if err != nil {
+		t.Fatalf("canonical DKG identity rejected: [%v]", err)
+	}
+	permit.Close()
+}
+
+func TestGate_NodeAuthoredTerminalOutcomes(t *testing.T) {
+	const cutover = uint64(1_000)
+	capturedAt := time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC)
+	recorder := &recordingQuiescenceSnapshotRecorder{}
+	gate, err := newGate(
+		context.Background(),
+		Schedule{CutoverBlock: cutover},
+		newGateBlockCounter(cutover),
+		newFakeMetrics(),
+		inertPollInterval,
+		WithArtifactIdentity("v2.1.0", "revision-test"),
+		WithQuiescenceSnapshotRecorder(recorder),
+		withGateTimeSource(func() time.Time { return capturedAt }),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(gate.Close)
+
+	completed, err := gate.Begin(
+		TBTCSigning,
+		cutover,
+		PermitIdentity{
+			WorkID:   "wallet-action-completed",
+			PermitID: "wallet-completed",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unresolved, err := gate.Begin(
+		BeaconRelayForwarding,
+		cutover,
+		PermitIdentity{
+			WorkID:   "relay-request-unresolved",
+			PermitID: "forwarder",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gate.Quiesce(fmt.Errorf("rollback drill"))
+	if err := completed.RecordTerminalOutcome(
+		TerminalOutcomeCompleted,
+		TerminalEvidence{
+			Kind:      TerminalEvidenceProtocolResult,
+			Reference: "threshold-result-digest",
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := completed.RecordTerminalOutcome(
+		TerminalOutcomeExhausted,
+		TerminalEvidence{Kind: TerminalEvidenceNoThreshold},
+	); !errors.Is(err, ErrTerminalOutcomeAlreadyRecorded) {
+		t.Fatalf("expected immutable terminal outcome, got [%v]", err)
+	}
+
+	completed.Close()
+	unresolved.Close()
+
+	outcomes := recorder.recordedOutcomes()
+	if len(outcomes) != 2 {
+		t.Fatalf("expected two terminal outcomes, got [%d]", len(outcomes))
+	}
+	recorded := make(map[string]TerminalOutcome)
+	for _, outcome := range outcomes {
+		recorded[outcome.Permit.WorkID] = outcome.Outcome
+	}
+	if recorded["wallet-action-completed"] != TerminalOutcomeCompleted {
+		t.Errorf("completed permit outcome not persisted: %+v", outcomes)
+	}
+	if recorded["relay-request-unresolved"] != terminalOutcomeUnresolved {
+		t.Errorf("missing owner outcome did not fail closed: %+v", outcomes)
+	}
+}
+
+func TestGate_NodeAuthoredTerminalOutcomeRetriesPersistence(t *testing.T) {
+	const cutover = uint64(1_000)
+	capturedAt := time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC)
+	recorder := &recordingQuiescenceSnapshotRecorder{
+		terminalFailures: 1,
+		terminalErr:      errors.New("transient journal failure"),
+	}
+	gate, err := newGate(
+		context.Background(),
+		Schedule{CutoverBlock: cutover},
+		newGateBlockCounter(cutover),
+		newFakeMetrics(),
+		inertPollInterval,
+		WithArtifactIdentity("v2.1.0", "revision-test"),
+		WithQuiescenceSnapshotRecorder(recorder),
+		withGateTimeSource(func() time.Time { return capturedAt }),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(gate.Close)
+
+	permit, err := gate.Begin(
+		TBTCSigning,
+		cutover,
+		PermitIdentity{
+			WorkID:   "wallet-action-retry",
+			PermitID: "wallet-retry",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate.Quiesce(fmt.Errorf("rollback drill"))
+
+	outcome := TerminalOutcomeCompleted
+	evidence := TerminalEvidence{
+		Kind:      TerminalEvidenceProtocolResult,
+		Reference: "threshold-result-digest",
+	}
+	if err := permit.RecordTerminalOutcome(
+		outcome,
+		evidence,
+	); !errors.Is(err, ErrTerminalOutcomePersistence) {
+		t.Fatalf("expected first persistence attempt to fail, got [%v]", err)
+	}
+	if err := permit.RecordTerminalOutcome(outcome, evidence); err != nil {
+		t.Fatalf("expected identical outcome retry to succeed, got [%v]", err)
+	}
+	permit.Close()
+
+	outcomes := recorder.recordedOutcomes()
+	if len(outcomes) != 1 {
+		t.Fatalf("expected one terminal outcome, got [%d]", len(outcomes))
+	}
+	if outcomes[0].Outcome != outcome || outcomes[0].Evidence != evidence {
+		t.Errorf("unexpected terminal outcome after retry: %+v", outcomes[0])
+	}
+}
+
 type recordingQuiescenceSnapshotRecorder struct {
-	mu        sync.Mutex
-	snapshots []QuiescenceSnapshot
-	err       error
+	mu               sync.Mutex
+	snapshots        []QuiescenceSnapshot
+	outcomes         []TerminalOutcomeRecord
+	err              error
+	terminalFailures int
+	terminalErr      error
 }
 
 func (r *recordingQuiescenceSnapshotRecorder) Record(
@@ -43,6 +272,29 @@ func (r *recordingQuiescenceSnapshotRecorder) Record(
 	return r.err
 }
 
+func (r *recordingQuiescenceSnapshotRecorder) RecordTerminalOutcome(
+	outcome TerminalOutcomeRecord,
+) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.terminalFailures > 0 {
+		r.terminalFailures--
+		return r.terminalErr
+	}
+
+	for _, existing := range r.outcomes {
+		if existing.Permit == outcome.Permit {
+			if existing == outcome {
+				return r.err
+			}
+			return fmt.Errorf("contradictory terminal outcome")
+		}
+	}
+	r.outcomes = append(r.outcomes, outcome)
+	return r.err
+}
+
 func (r *recordingQuiescenceSnapshotRecorder) recorded() []QuiescenceSnapshot {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -52,6 +304,13 @@ func (r *recordingQuiescenceSnapshotRecorder) recorded() []QuiescenceSnapshot {
 		result[i] = cloneQuiescenceSnapshot(snapshot)
 	}
 	return result
+}
+
+func (r *recordingQuiescenceSnapshotRecorder) recordedOutcomes() []TerminalOutcomeRecord {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return append([]TerminalOutcomeRecord(nil), r.outcomes...)
 }
 
 func newGateBlockCounter(block uint64) *gateBlockCounter {

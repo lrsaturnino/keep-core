@@ -389,6 +389,14 @@ func (de *dkgExecutor) generateSigningGroup(
 		// wire traffic incompatible with both releases, so a legacy-mode DKG
 		// is refused outright instead.
 		if permit.Mode() != participation.ModeSecurityV2 {
+			de.recordPermitTerminalOutcome(
+				dkgLogger,
+				permit,
+				participation.TerminalOutcomeExhausted,
+				participation.TerminalEvidence{
+					Kind: participation.TerminalEvidenceNoThreshold,
+				},
+			)
 			permit.Close()
 			dkgLogger.Warnf(
 				"[member:%v] refusing to join DKG in protocol mode [%s]: "+
@@ -452,6 +460,14 @@ func (de *dkgExecutor) generateSigningGroup(
 			// attempt reuses it unchanged.
 			strategies, err := compatibility.StrategiesFor(currentMode)
 			if err != nil {
+				de.recordPermitTerminalOutcome(
+					dkgLogger,
+					permit,
+					participation.TerminalOutcomeExhausted,
+					participation.TerminalEvidence{
+						Kind: participation.TerminalEvidenceNoThreshold,
+					},
+				)
 				dkgLogger.Errorf(
 					"[member:%v] cannot select compatibility strategies: [%v]",
 					memberIndex,
@@ -558,6 +574,14 @@ func (de *dkgExecutor) generateSigningGroup(
 				// closed permit — is not an ordinary DKG failure and must not
 				// increment the ordinary failure metrics.
 				if cause := context.Cause(ctx); participation.IsGateRefusal(cause) {
+					de.recordPermitTerminalOutcome(
+						dkgLogger,
+						permit,
+						participation.TerminalOutcomeExhausted,
+						participation.TerminalEvidence{
+							Kind: participation.TerminalEvidenceNoThreshold,
+						},
+					)
 					dkgLogger.Warnf(
 						"[member:%v] DKG canceled by the participation "+
 							"gate: [%v]",
@@ -572,6 +596,14 @@ func (de *dkgExecutor) generateSigningGroup(
 					de.metricsRecorder.RecordDuration(clientinfo.MetricDKGDurationSeconds, time.Since(dkgStartTime))
 				}
 				if errors.Is(err, context.Canceled) {
+					de.recordPermitTerminalOutcome(
+						dkgLogger,
+						permit,
+						participation.TerminalOutcomeExhausted,
+						participation.TerminalEvidence{
+							Kind: participation.TerminalEvidenceNoThreshold,
+						},
+					)
 					dkgLogger.Infof(
 						"[member:%v] DKG is no longer awaiting the result; "+
 							"aborting DKG protocol execution",
@@ -584,6 +616,14 @@ func (de *dkgExecutor) generateSigningGroup(
 					"[member:%v] failed to execute DKG: [%v]",
 					memberIndex,
 					err,
+				)
+				de.recordPermitTerminalOutcome(
+					dkgLogger,
+					permit,
+					participation.TerminalOutcomeExhausted,
+					participation.TerminalEvidence{
+						Kind: participation.TerminalEvidenceNoThreshold,
+					},
 				)
 				return
 			}
@@ -756,6 +796,17 @@ func (de *dkgExecutor) completeDkgCeremony(
 	}
 
 	dkgLogger.Infof("registered %s", signer)
+	de.recordPermitTerminalOutcome(
+		dkgLogger,
+		permit,
+		participation.TerminalOutcomeCompleted,
+		participation.TerminalEvidence{
+			Kind: participation.TerminalEvidencePersistedTBTCSinger,
+			Reference: getWalletStorageKey(
+				signer.wallet.publicKey,
+			),
+		},
+	)
 
 	return true
 }
@@ -896,6 +947,18 @@ func (de *dkgExecutor) preserveInterruptedSigner(
 				memberIndex,
 				saveErr,
 			)
+		} else {
+			de.recordPermitTerminalOutcome(
+				dkgLogger,
+				permit,
+				participation.TerminalOutcomeCompleted,
+				participation.TerminalEvidence{
+					Kind: participation.TerminalEvidencePersistedTBTCSinger,
+					Reference: getWalletStorageKey(
+						signer.wallet.publicKey,
+					),
+				},
+			)
 		}
 		return
 	}
@@ -935,6 +998,32 @@ func (de *dkgExecutor) preserveInterruptedSigner(
 				"generated share is only in memory: [%v]",
 			memberIndex,
 			quarantineErr,
+		)
+	} else {
+		de.recordPermitTerminalOutcome(
+			dkgLogger,
+			permit,
+			participation.TerminalOutcomeQuarantined,
+			participation.TerminalEvidence{
+				Kind: participation.TerminalEvidenceQuarantinedTBTCSinger,
+			},
+		)
+	}
+}
+
+func (de *dkgExecutor) recordPermitTerminalOutcome(
+	dkgLogger log.StandardLogger,
+	permit participation.Permit,
+	outcome participation.TerminalOutcome,
+	evidence participation.TerminalEvidence,
+) {
+	if err := permit.RecordTerminalOutcome(outcome, evidence); err != nil {
+		dkgLogger.Warnf(
+			"could not persist the node-authored DKG terminal outcome "+
+				"[member=%s] [outcome=%s]: [%v]",
+			permit.PermitID(),
+			outcome,
+			err,
 		)
 	}
 }

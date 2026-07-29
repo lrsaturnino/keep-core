@@ -2,6 +2,8 @@ package tbtc
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"math/big"
 	"reflect"
@@ -23,6 +25,20 @@ import (
 	"github.com/keep-network/keep-core/pkg/tecdsa"
 	"github.com/keep-network/keep-core/pkg/tecdsa/dkg"
 )
+
+func TestTBTCDKGPermitIdentityIsCanonical(t *testing.T) {
+	seed := big.NewInt(123456789)
+	seedHash := sha256.Sum256(seed.Bytes())
+
+	identity := tbtcDKGPermitIdentity(seed, group.MemberIndex(17))
+
+	if identity.WorkID != hex.EncodeToString(seedHash[:]) {
+		t.Errorf("unexpected DKG work ID [%s]", identity.WorkID)
+	}
+	if identity.PermitID != "17" {
+		t.Errorf("unexpected DKG permit ID [%s]", identity.PermitID)
+	}
+}
 
 func TestDkgExecutor_RegisterSigner(t *testing.T) {
 	testData, err := tecdsatest.LoadPrivateKeyShareTestFixtures(1)

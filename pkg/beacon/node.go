@@ -233,6 +233,14 @@ func (n *node) JoinDKGIfEligible(
 				// Unreachable with a well-formed permit; refusing to
 				// participate is the only safe response to a mode without an
 				// explicit bundle.
+				recordBeaconPermitTerminalOutcome(
+					dkgLogger,
+					permit,
+					participation.TerminalOutcomeExhausted,
+					participation.TerminalEvidence{
+						Kind: participation.TerminalEvidenceNoThreshold,
+					},
+				)
 				permit.Close()
 				dkgLogger.Errorf(
 					"[member:%v] no compatibility strategies for the "+
@@ -287,6 +295,14 @@ func (n *node) JoinDKGIfEligible(
 					case participation.IsGateRefusal(err):
 						// A gate decision before key generation is not an
 						// ordinary DKG failure.
+						recordBeaconPermitTerminalOutcome(
+							dkgLogger,
+							permit,
+							participation.TerminalOutcomeExhausted,
+							participation.TerminalEvidence{
+								Kind: participation.TerminalEvidenceNoThreshold,
+							},
+						)
 						dkgLogger.Warnf(
 							"[member:%v] DKG canceled by the participation "+
 								"gate: [%v]",
@@ -294,6 +310,14 @@ func (n *node) JoinDKGIfEligible(
 							err,
 						)
 					default:
+						recordBeaconPermitTerminalOutcome(
+							dkgLogger,
+							permit,
+							participation.TerminalOutcomeExhausted,
+							participation.TerminalEvidence{
+								Kind: participation.TerminalEvidenceNoThreshold,
+							},
+						)
 						dkgLogger.Errorf("failed to execute dkg: [%v]", err)
 					}
 					return
@@ -333,6 +357,16 @@ func (n *node) JoinDKGIfEligible(
 							groupPublicKey,
 							saveErr,
 						)
+					} else {
+						recordBeaconPermitTerminalOutcome(
+							dkgLogger,
+							permit,
+							participation.TerminalOutcomeCompleted,
+							participation.TerminalEvidence{
+								Kind:      participation.TerminalEvidencePersistedBeaconSigner,
+								Reference: groupPublicKey,
+							},
+						)
 					}
 					return
 				}
@@ -352,6 +386,15 @@ func (n *node) JoinDKGIfEligible(
 					"[member:%v] group [0x%v] registered successfully",
 					signer.MemberID(),
 					groupPublicKey,
+				)
+				recordBeaconPermitTerminalOutcome(
+					dkgLogger,
+					permit,
+					participation.TerminalOutcomeCompleted,
+					participation.TerminalEvidence{
+						Kind:      participation.TerminalEvidencePersistedBeaconSigner,
+						Reference: groupPublicKey,
+					},
 				)
 			}()
 		}
@@ -410,6 +453,32 @@ func (n *node) quarantineSigner(
 			memberIndex,
 			err,
 		)
+	} else {
+		recordBeaconPermitTerminalOutcome(
+			dkgLogger,
+			permit,
+			participation.TerminalOutcomeQuarantined,
+			participation.TerminalEvidence{
+				Kind: participation.TerminalEvidenceQuarantinedBeaconSigner,
+			},
+		)
+	}
+}
+
+func recordBeaconPermitTerminalOutcome(
+	dkgLogger log.StandardLogger,
+	permit participation.Permit,
+	outcome participation.TerminalOutcome,
+	evidence participation.TerminalEvidence,
+) {
+	if err := permit.RecordTerminalOutcome(outcome, evidence); err != nil {
+		dkgLogger.Warnf(
+			"could not persist the node-authored beacon terminal outcome "+
+				"[member=%s] [outcome=%s]: [%v]",
+			permit.PermitID(),
+			outcome,
+			err,
+		)
 	}
 }
 
@@ -452,6 +521,14 @@ func (n *node) ForwardSignatureShares(
 
 	forwarder, err := n.netProvider.BroadcastChannelForwarderFor(name)
 	if err != nil {
+		recordBeaconPermitTerminalOutcome(
+			logger,
+			permit,
+			participation.TerminalOutcomeExhausted,
+			participation.TerminalEvidence{
+				Kind: participation.TerminalEvidenceNoThreshold,
+			},
+		)
 		permit.Close()
 		logger.Warnf(
 			"could not start the message forwarder for channel [%v]: [%v]",
@@ -472,6 +549,15 @@ func (n *node) ForwardSignatureShares(
 			// Clock failure or forced quiescence closes the relay.
 			forwarder.Close()
 		}
+
+		recordBeaconPermitTerminalOutcome(
+			logger,
+			permit,
+			participation.TerminalOutcomeCompleted,
+			participation.TerminalEvidence{
+				Kind: participation.TerminalEvidenceForwarderClosed,
+			},
+		)
 	}()
 }
 

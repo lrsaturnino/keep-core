@@ -113,6 +113,22 @@ var (
 	ErrInvalidPermitIdentity = errors.New(
 		"invalid participation permit identity",
 	)
+	// ErrInvalidTerminalOutcome means a permit owner supplied a terminal
+	// disposition or evidence shape that is not valid for its ceremony.
+	ErrInvalidTerminalOutcome = errors.New(
+		"invalid participation terminal outcome",
+	)
+	// ErrTerminalOutcomeAlreadyRecorded means a permit owner attempted to
+	// replace its immutable terminal disposition.
+	ErrTerminalOutcomeAlreadyRecorded = errors.New(
+		"participation terminal outcome already recorded",
+	)
+	// ErrTerminalOutcomePersistence means the node-owned terminal journal
+	// could not durably record the ceremony owner's outcome. The permit may
+	// still close, but the offline rollback audit will fail closed.
+	ErrTerminalOutcomePersistence = errors.New(
+		"participation terminal outcome persistence failed",
+	)
 )
 
 // IsGateRefusal reports whether the error is, or wraps, one of the gate's
@@ -176,6 +192,15 @@ type Permit interface {
 	// PermitID returns the immutable local membership/action identity supplied
 	// when the permit was issued.
 	PermitID() string
+	// RecordTerminalOutcome records the real ceremony owner's final
+	// disposition and the durable state or explicit no-threshold condition
+	// behind it. If this permit was present at the quiescence transition, the
+	// record is written into the encrypted node-authored terminal journal.
+	// The first valid outcome is immutable.
+	RecordTerminalOutcome(
+		outcome TerminalOutcome,
+		evidence TerminalEvidence,
+	) error
 	// Close releases the permit. It is idempotent.
 	Close()
 }
@@ -347,7 +372,8 @@ type permit struct {
 	ctx    context.Context
 	cancel context.CancelCauseFunc
 
-	closeOnce sync.Once
+	closeOnce       sync.Once
+	terminalOutcome *TerminalOutcomeRecord
 }
 
 func (p *permit) Context() context.Context    { return p.ctx }
@@ -852,7 +878,10 @@ func (g *chainGate) issue(
 		)
 	}
 	if len(identities) == 1 {
-		if err := validatePermitIdentity(identities[0]); err != nil {
+		if err := validatePermitIdentityForCeremony(
+			ceremony,
+			identities[0],
+		); err != nil {
 			return nil, fmt.Errorf(
 				"ceremony [%s] permit identity rejected: [%v]: %w",
 				ceremony,
@@ -1086,6 +1115,99 @@ func (p *permit) CheckCommit(operation string, class CommitClass) error {
 	return nil
 }
 
+// RecordTerminalOutcome implements Permit. Only the permit owner has this
+// method, so an external evidence generator cannot author or replace the
+// terminal disposition. The record is retained in memory before quiescence
+// and persisted if the permit is captured by the quiescence transition.
+func (p *permit) RecordTerminalOutcome(
+	outcome TerminalOutcome,
+	evidence TerminalEvidence,
+) error {
+	if err := ValidateTerminalOutcome(p.ceremony, outcome, evidence); err != nil {
+		return fmt.Errorf(
+			"terminal outcome for ceremony [%s] rejected: [%v]: %w",
+			p.ceremony,
+			err,
+			ErrInvalidTerminalOutcome,
+		)
+	}
+
+	g := p.gate
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if _, active := g.permits[p]; !active {
+		return fmt.Errorf(
+			"terminal outcome for ceremony [%s] refused: %w",
+			p.ceremony,
+			ErrPermitClosed,
+		)
+	}
+	if p.terminalOutcome != nil {
+		if p.terminalOutcome.Outcome == outcome &&
+			p.terminalOutcome.Evidence == evidence {
+			if g.quiescenceSnapshot != nil && g.recorder != nil {
+				if err := g.recorder.RecordTerminalOutcome(
+					*p.terminalOutcome,
+				); err != nil {
+					return fmt.Errorf(
+						"cannot persist terminal outcome for ceremony [%s]: "+
+							"[%v]: %w",
+						p.ceremony,
+						err,
+						ErrTerminalOutcomePersistence,
+					)
+				}
+			}
+
+			return nil
+		}
+
+		return fmt.Errorf(
+			"terminal outcome for ceremony [%s] is already [%s]: %w",
+			p.ceremony,
+			p.terminalOutcome.Outcome,
+			ErrTerminalOutcomeAlreadyRecorded,
+		)
+	}
+
+	record := &TerminalOutcomeRecord{
+		RecordedAt: g.now().UTC(),
+		Permit:     p.snapshot(),
+		Outcome:    outcome,
+		Evidence:   evidence,
+	}
+	// Retain the ceremony owner's immutable disposition before attempting
+	// persistence. A transient journal failure can then be retried by an
+	// identical call or by Close without replacing the real outcome with the
+	// fail-closed unresolved marker.
+	p.terminalOutcome = record
+
+	if g.quiescenceSnapshot != nil && g.recorder != nil {
+		if err := g.recorder.RecordTerminalOutcome(*record); err != nil {
+			return fmt.Errorf(
+				"cannot persist terminal outcome for ceremony [%s]: [%v]: %w",
+				p.ceremony,
+				err,
+				ErrTerminalOutcomePersistence,
+			)
+		}
+	}
+
+	return nil
+}
+
+func (p *permit) snapshot() PermitSnapshot {
+	return PermitSnapshot{
+		Ceremony:            p.ceremony,
+		Mode:                p.mode.String(),
+		CanonicalStartBlock: p.canonicalStartBlock,
+		WorkID:              p.workID,
+		PermitID:            p.permitID,
+		IdentityBound:       p.identityBound,
+	}
+}
+
 // refuseCommitLocked records a failed commit fence and returns the sentinel
 // wrapped with context. The caller must hold g.mu.
 func (g *chainGate) refuseCommitLocked(
@@ -1157,6 +1279,34 @@ func (p *permit) Close() {
 		g.mu.Lock()
 		defer g.mu.Unlock()
 
+		if _, active := g.permits[p]; !active {
+			return
+		}
+
+		if g.quiescenceSnapshot != nil {
+			if p.terminalOutcome == nil {
+				p.terminalOutcome = &TerminalOutcomeRecord{
+					RecordedAt: g.now().UTC(),
+					Permit:     p.snapshot(),
+					Outcome:    terminalOutcomeUnresolved,
+				}
+			}
+
+			if g.recorder != nil {
+				if err := g.recorder.RecordTerminalOutcome(
+					*p.terminalOutcome,
+				); err != nil {
+					gateLogger.Warnf(
+						"protocol participation terminal outcome could not "+
+							"be persisted [ceremony=%s] [outcome=%s] [error=%s]",
+						p.ceremony,
+						p.terminalOutcome.Outcome,
+						err,
+					)
+				}
+			}
+		}
+
 		delete(g.permits, p)
 		switch p.mode {
 		case ModeLegacy:
@@ -1219,14 +1369,7 @@ func (g *chainGate) State() Snapshot {
 func (g *chainGate) permitSnapshotsLocked() []PermitSnapshot {
 	snapshots := make([]PermitSnapshot, 0, len(g.permits))
 	for permit := range g.permits {
-		snapshots = append(snapshots, PermitSnapshot{
-			Ceremony:            permit.ceremony,
-			Mode:                permit.mode.String(),
-			CanonicalStartBlock: permit.canonicalStartBlock,
-			WorkID:              permit.workID,
-			PermitID:            permit.permitID,
-			IdentityBound:       permit.identityBound,
-		})
+		snapshots = append(snapshots, permit.snapshot())
 	}
 
 	sort.Slice(snapshots, func(i, j int) bool {
@@ -1308,6 +1451,22 @@ func (g *chainGate) Quiesce(cause error) <-chan struct{} {
 						"be persisted [error=%s]",
 					err,
 				)
+			}
+			for permit := range g.permits {
+				if permit.terminalOutcome == nil {
+					continue
+				}
+				if err := g.recorder.RecordTerminalOutcome(
+					*permit.terminalOutcome,
+				); err != nil {
+					gateLogger.Warnf(
+						"protocol participation terminal outcome could not "+
+							"be persisted [ceremony=%s] [outcome=%s] [error=%s]",
+						permit.ceremony,
+						permit.terminalOutcome.Outcome,
+						err,
+					)
+				}
 			}
 		}
 

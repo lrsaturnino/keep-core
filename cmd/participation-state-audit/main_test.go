@@ -215,8 +215,72 @@ func newTestStorageWithQuiescencePermits(
 	if err := recorder.Record(snapshot); err != nil {
 		t.Fatal(err)
 	}
+	for i, permit := range permits {
+		record := testTerminalOutcomeRecord(
+			permit,
+			participation.PermitSnapshot{
+				Ceremony:            participation.Ceremony(permit.Ceremony),
+				Mode:                permit.Mode,
+				CanonicalStartBlock: permit.CanonicalStartBlock,
+				WorkID:              permit.WorkID,
+				PermitID:            permit.PermitID,
+				IdentityBound:       true,
+			},
+			fmt.Sprintf("test-result-%d", i),
+			groupPublicKeyHex(activeMembership),
+		)
+		if err := recorder.RecordTerminalOutcome(record); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	return storageDir
+}
+
+func testTerminalOutcomeRecord(
+	permit quiescencePermitEvidence,
+	snapshot participation.PermitSnapshot,
+	resultReference string,
+	beaconSignerReference string,
+) participation.TerminalOutcomeRecord {
+	evidence := participation.TerminalEvidence{
+		Kind:      participation.TerminalEvidenceProtocolResult,
+		Reference: resultReference,
+	}
+	switch participation.TerminalOutcome(permit.Outcome) {
+	case participation.TerminalOutcomeCompleted:
+		switch snapshot.Ceremony {
+		case participation.TBTCDKG:
+			evidence = participation.TerminalEvidence{
+				Kind:      participation.TerminalEvidencePersistedTBTCSinger,
+				Reference: "test-tbtc-signer",
+			}
+		case participation.BeaconDKG:
+			evidence = participation.TerminalEvidence{
+				Kind:      participation.TerminalEvidencePersistedBeaconSigner,
+				Reference: beaconSignerReference,
+			}
+		}
+	case participation.TerminalOutcomeQuarantined:
+		evidence = participation.TerminalEvidence{
+			Kind: participation.TerminalEvidenceQuarantinedTBTCSinger,
+		}
+		if snapshot.Ceremony == participation.BeaconDKG {
+			evidence.Kind =
+				participation.TerminalEvidenceQuarantinedBeaconSigner
+		}
+	case participation.TerminalOutcomeExhausted:
+		evidence = participation.TerminalEvidence{
+			Kind: participation.TerminalEvidenceNoThreshold,
+		}
+	}
+
+	return participation.TerminalOutcomeRecord{
+		RecordedAt: time.Now().UTC(),
+		Permit:     snapshot,
+		Outcome:    participation.TerminalOutcome(permit.Outcome),
+		Evidence:   evidence,
+	}
 }
 
 func persistRealGateQuiescenceSnapshot(
@@ -283,7 +347,26 @@ func persistRealGateQuiescenceSnapshot(
 	}
 
 	gate.Quiesce(fmt.Errorf("rollback drill"))
-	for _, permit := range active {
+	for i, permit := range active {
+		record := testTerminalOutcomeRecord(
+			permits[i],
+			participation.PermitSnapshot{
+				Ceremony:            permit.Ceremony(),
+				Mode:                permit.Mode().String(),
+				CanonicalStartBlock: permit.CanonicalStartBlock(),
+				WorkID:              permit.WorkID(),
+				PermitID:            permit.PermitID(),
+				IdentityBound:       true,
+			},
+			fmt.Sprintf("real-gate-result-%d", i),
+			"",
+		)
+		if err := permit.RecordTerminalOutcome(
+			record.Outcome,
+			record.Evidence,
+		); err != nil {
+			t.Fatal(err)
+		}
 		permit.Close()
 	}
 }
@@ -410,6 +493,15 @@ func newValidEvidence(t *testing.T, auditManifest *manifest) evidenceInputs {
 	}
 	if auditManifest.QuiescenceSnapshot != nil {
 		for _, permit := range auditManifest.QuiescenceSnapshot.ActivePermits {
+			outcome := participation.TerminalOutcomeCompleted
+			if auditManifest.ParticipationTerminalOutcomes != nil {
+				for _, terminal := range auditManifest.ParticipationTerminalOutcomes.Outcomes {
+					if terminal.Permit == permit {
+						outcome = terminal.Outcome
+						break
+					}
+				}
+			}
 			quiescenceRecord.ActivePermitsAtQuiescence = append(
 				quiescenceRecord.ActivePermitsAtQuiescence,
 				quiescencePermitEvidence{
@@ -418,7 +510,7 @@ func newValidEvidence(t *testing.T, auditManifest *manifest) evidenceInputs {
 					CanonicalStartBlock: permit.CanonicalStartBlock,
 					WorkID:              permit.WorkID,
 					PermitID:            permit.PermitID,
-					Outcome:             "completed",
+					Outcome:             string(outcome),
 				},
 			)
 		}
@@ -1946,6 +2038,239 @@ func TestRunAudit_CompleteNonemptyQuiescenceInventorySatisfiesBarrier(
 			auditManifest.RollbackBlockers,
 		)
 	}
+}
+
+func TestRunAudit_ExternalCompletedCannotReplaceNodeExhaustedOutcome(
+	t *testing.T,
+) {
+	permit := quiescencePermitEvidence{
+		Ceremony:            string(participation.TBTCSigning),
+		Mode:                participation.ModeLegacy.String(),
+		CanonicalStartBlock: 999,
+		WorkID:              "wallet-action-exhausted",
+		PermitID:            "wallet-exhausted",
+		Outcome:             string(participation.TerminalOutcomeExhausted),
+	}
+	storageDir := newTestStorageWithQuiescencePermits(
+		t,
+		[]quiescencePermitEvidence{permit},
+	)
+	firstPass, err := runAudit(
+		storageDir,
+		testPassword,
+		evidenceInputs{},
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := newValidEvidence(t, firstPass)
+
+	// An external generator labels the permit completed and supplies an
+	// unrelated successful Bitcoin transaction. Neither can replace the
+	// ceremony owner's durable no-threshold outcome.
+	updateQuiescenceReport(
+		t,
+		evidence,
+		func(record *quiescenceReportEvidence) {
+			record.ActivePermitsAtQuiescence[0].Outcome =
+				string(participation.TerminalOutcomeCompleted)
+		},
+	)
+	bitcoinRecord := &bitcoinReconciliationEvidence{}
+	content, err := os.ReadFile(evidence.bitcoinReconciliation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(content, bitcoinRecord); err != nil {
+		t.Fatal(err)
+	}
+	bitcoinRecord.PendingTransactions = append(
+		bitcoinRecord.PendingTransactions,
+		struct {
+			TransactionHash string `json:"transaction_hash"`
+			State           string `json:"state"`
+		}{
+			TransactionHash: strings.Repeat("ab", 32),
+			State:           "mined",
+		},
+	)
+	content, err = json.MarshalIndent(bitcoinRecord, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		evidence.bitcoinReconciliation,
+		content,
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	auditManifest, err := runAudit(
+		storageDir,
+		testPassword,
+		evidence,
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if auditManifest.RollbackBarrierReady {
+		t.Error(
+			"an external completed label and unrelated successful transaction " +
+				"must not replace the node-authored exhausted outcome",
+		)
+	}
+	if !hasBlocker(
+		auditManifest,
+		"claims terminal outcome [completed], but the node-authored journal records [exhausted]",
+	) {
+		t.Errorf(
+			"expected node-authored outcome mismatch blocker, blockers: %v",
+			auditManifest.RollbackBlockers,
+		)
+	}
+}
+
+func TestRunAudit_NodeCompletedDKGRequiresPersistedSigner(t *testing.T) {
+	permit := quiescencePermitEvidence{
+		Ceremony:            string(participation.TBTCDKG),
+		Mode:                participation.ModeSecurityV2.String(),
+		CanonicalStartBlock: 1_000,
+		WorkID:              strings.Repeat("d", 64),
+		PermitID:            "1",
+		Outcome:             string(participation.TerminalOutcomeCompleted),
+	}
+	storageDir := newTestStorageWithQuiescencePermits(
+		t,
+		[]quiescencePermitEvidence{permit},
+	)
+	firstPass, err := runAudit(
+		storageDir,
+		testPassword,
+		evidenceInputs{},
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := newValidEvidence(t, firstPass)
+
+	auditManifest, err := runAudit(
+		storageDir,
+		testPassword,
+		evidence,
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if auditManifest.RollbackBarrierReady {
+		t.Error(
+			"a node-authored completed DKG outcome without its persisted " +
+				"signer must not authorize the barrier",
+		)
+	}
+	if !hasFinding(
+		auditManifest,
+		"active tbtc namespace holds no matching signer",
+	) {
+		t.Errorf(
+			"expected persisted-signer corroboration finding, findings: %v",
+			auditManifest.Findings,
+		)
+	}
+}
+
+func TestRunAudit_NodeCompletedBeaconDKGMatchesPersistedSigner(t *testing.T) {
+	permit := quiescencePermitEvidence{
+		Ceremony:            string(participation.BeaconDKG),
+		Mode:                participation.ModeSecurityV2.String(),
+		CanonicalStartBlock: 1_000,
+		WorkID:              strings.Repeat("d", 64),
+		PermitID:            "1",
+		Outcome:             string(participation.TerminalOutcomeCompleted),
+	}
+	storageDir := newTestStorageWithQuiescencePermits(
+		t,
+		[]quiescencePermitEvidence{permit},
+	)
+	firstPass, err := runAudit(
+		storageDir,
+		testPassword,
+		evidenceInputs{},
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := newValidEvidence(t, firstPass)
+
+	auditManifest, err := runAudit(
+		storageDir,
+		testPassword,
+		evidence,
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !auditManifest.RollbackBarrierReady {
+		t.Errorf(
+			"a node-authored completed beacon DKG outcome matching its active "+
+				"signer should authorize the barrier, blockers: %v",
+			auditManifest.RollbackBlockers,
+		)
+	}
+}
+
+func TestValidateNodeTerminalOutcomes_RejectsUnsupportedEvidence(
+	t *testing.T,
+) {
+	capturedAt := time.Now().UTC().Add(-time.Minute)
+	permit := participation.PermitSnapshot{
+		Ceremony:            participation.TBTCSigning,
+		Mode:                participation.ModeSecurityV2.String(),
+		CanonicalStartBlock: 1_000,
+		WorkID:              "wallet-action",
+		PermitID:            "wallet",
+		IdentityBound:       true,
+	}
+	auditManifest := &manifest{
+		QuiescenceSnapshot: &participation.QuiescenceSnapshot{
+			CapturedAt:    capturedAt,
+			ActivePermits: []participation.PermitSnapshot{permit},
+		},
+		ParticipationTerminalOutcomes: &participation.TerminalOutcomeJournal{
+			SchemaVersion:      participation.TerminalOutcomeJournalSchemaVersion,
+			SnapshotCapturedAt: capturedAt,
+			Outcomes: []participation.TerminalOutcomeRecord{
+				{
+					RecordedAt: time.Now().UTC(),
+					Permit:     permit,
+					Outcome:    participation.TerminalOutcomeCompleted,
+					Evidence: participation.TerminalEvidence{
+						Kind: participation.TerminalEvidenceKind(
+							"fabricated_result",
+						),
+						Reference: "fabricated-result",
+					},
+				},
+			},
+		},
+	}
+
+	violations := validateNodeTerminalOutcomes(auditManifest)
+	for _, violation := range violations {
+		if strings.Contains(violation, "evidence is invalid") {
+			return
+		}
+	}
+	t.Fatalf(
+		"expected unsupported terminal evidence violation, got: %v",
+		violations,
+	)
 }
 
 // TestRunAudit_QuiescenceOutcomesMustCoverGateInventory proves terminal

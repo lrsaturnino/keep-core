@@ -269,6 +269,7 @@ var validBitcoinTransactionStates = map[string]struct{}{
 var validQuiescencePermitOutcomes = map[string]struct{}{
 	"completed":   {},
 	"quarantined": {},
+	"exhausted":   {},
 }
 
 type beaconMembershipRecord struct {
@@ -338,6 +339,10 @@ type manifest struct {
 	// work/participation artifact. External evidence cannot replace this
 	// inventory; terminal outcomes reconcile against it.
 	QuiescenceSnapshot *participation.QuiescenceSnapshot `json:"quiescence_snapshot,omitempty"`
+	// ParticipationTerminalOutcomes is decoded from the node-authored terminal
+	// journal beside the gate snapshot. External quiescence evidence must match
+	// this record exactly; it cannot author a completed outcome.
+	ParticipationTerminalOutcomes *participation.TerminalOutcomeJournal `json:"participation_terminal_outcomes,omitempty"`
 
 	// Findings lists every inconsistency; an empty list with Interpreted true
 	// means the namespaces are internally consistent.
@@ -443,8 +448,8 @@ func main() {
 		&evidence.quiescenceReport,
 		"quiescence-report",
 		"",
-		"path to the node's quiescence record: the independently captured "+
-			"gate inventory and each active permit's terminal outcome",
+		"path to the external quiescence reconciliation record: it must match "+
+			"the node-authored gate inventory and terminal-outcome journal",
 	)
 	flag.StringVar(
 		&evidence.priorReaderCompatibility,
@@ -1862,6 +1867,15 @@ func (r *auditRun) validateQuiescenceReportEvidence(content []byte) []string {
 		}
 	}
 
+	nodeOutcomes := make(
+		map[quarantineIdentity]participation.TerminalOutcomeRecord,
+	)
+	if r.manifest.ParticipationTerminalOutcomes != nil {
+		for _, outcome := range r.manifest.ParticipationTerminalOutcomes.Outcomes {
+			nodeOutcomes[inventoryIdentity(outcome.Permit)] = outcome
+		}
+	}
+
 	beaconQuarantined := make(map[quarantineIdentity]int)
 	for _, quarantined := range r.manifest.BeaconQuarantinedOutputs {
 		beaconQuarantined[quarantineIdentity{
@@ -1952,6 +1966,22 @@ func (r *auditRun) validateQuiescenceReportEvidence(content []byte) []string {
 				"permit entry [%d] has no matching identity in the "+
 					"at-quiescence gate inventory",
 				i,
+			))
+		}
+		nodeOutcome, nodeAuthored := nodeOutcomes[identity]
+		if !nodeAuthored {
+			violations = append(violations, fmt.Sprintf(
+				"permit entry [%d] has no matching node-authored terminal "+
+					"outcome",
+				i,
+			))
+		} else if string(nodeOutcome.Outcome) != permit.Outcome {
+			violations = append(violations, fmt.Sprintf(
+				"permit entry [%d] claims terminal outcome [%s], but the "+
+					"node-authored journal records [%s]",
+				i,
+				permit.Outcome,
+				nodeOutcome.Outcome,
 			))
 		}
 
@@ -2200,8 +2230,9 @@ func interpretKeyStoreNamespaces(
 
 // interpretParticipationQuiescenceSnapshot reads the node-authored gate
 // capture from encrypted work storage. This is the authoritative active-permit
-// inventory: the external quiescence report supplies only later terminal
-// outcomes and cannot replace or shorten this record.
+// inventory. Its companion terminal-outcome journal supplies the authoritative
+// dispositions; the external quiescence report can only corroborate them and
+// cannot replace or shorten either record.
 func interpretParticipationQuiescenceSnapshot(
 	diskStorage storage.Storage,
 	run *auditRun,
@@ -2226,16 +2257,14 @@ func interpretParticipationQuiescenceSnapshot(
 		}
 	}()
 
-	count := 0
+	snapshotCount := 0
+	journalCount := 0
 	for descriptor := range descriptors {
-		count++
 		if descriptor.Directory() !=
-			participation.QuiescenceSnapshotStorageDirectory ||
-			descriptor.Name() !=
-				participation.QuiescenceSnapshotStorageFile {
+			participation.QuiescenceSnapshotStorageDirectory {
 			run.finding(
-				"participation work record [%s/%s] is not the recognized "+
-					"node-authored quiescence snapshot",
+				"participation work record [%s/%s] is not in the recognized "+
+					"node-authored quiescence directory",
 				descriptor.Directory(),
 				descriptor.Name(),
 			)
@@ -2251,46 +2280,84 @@ func interpretParticipationQuiescenceSnapshot(
 			continue
 		}
 
-		snapshot := &participation.QuiescenceSnapshot{}
-		if err := strictUnmarshal(content, snapshot); err != nil {
-			run.finding(
-				"node-authored quiescence snapshot cannot be decoded: [%v]",
-				err,
-			)
-			continue
-		}
-		if run.manifest.QuiescenceSnapshot != nil {
-			run.finding(
-				"more than one node-authored quiescence snapshot is present",
-			)
-			continue
-		}
+		switch descriptor.Name() {
+		case participation.QuiescenceSnapshotStorageFile:
+			snapshotCount++
+			snapshot := &participation.QuiescenceSnapshot{}
+			if err := strictUnmarshal(content, snapshot); err != nil {
+				run.finding(
+					"node-authored quiescence snapshot cannot be decoded: [%v]",
+					err,
+				)
+				continue
+			}
+			if run.manifest.QuiescenceSnapshot != nil {
+				run.finding(
+					"more than one node-authored quiescence snapshot is present",
+				)
+				continue
+			}
 
-		run.manifest.QuiescenceSnapshot = snapshot
-		for _, violation := range validateNodeQuiescenceSnapshot(snapshot) {
-			run.finding("%s", violation)
-		}
-		if snapshot.CapturedAt.After(run.manifest.GeneratedAt) {
+			run.manifest.QuiescenceSnapshot = snapshot
+			for _, violation := range validateNodeQuiescenceSnapshot(snapshot) {
+				run.finding("%s", violation)
+			}
+			if snapshot.CapturedAt.After(run.manifest.GeneratedAt) {
+				run.finding(
+					"node-authored quiescence snapshot capture time is after " +
+						"the offline audit time",
+				)
+			} else if run.expected.maxEvidenceAge > 0 &&
+				run.manifest.GeneratedAt.Sub(snapshot.CapturedAt) >
+					run.expected.maxEvidenceAge {
+				run.finding(
+					"node-authored quiescence snapshot is older than the "+
+						"maximum evidence age [%s]",
+					run.expected.maxEvidenceAge,
+				)
+			}
+		case participation.TerminalOutcomeJournalStorageFile:
+			journalCount++
+			journal := &participation.TerminalOutcomeJournal{}
+			if err := strictUnmarshal(content, journal); err != nil {
+				run.finding(
+					"node-authored terminal-outcome journal cannot be "+
+						"decoded: [%v]",
+					err,
+				)
+				continue
+			}
+			if run.manifest.ParticipationTerminalOutcomes != nil {
+				run.finding(
+					"more than one node-authored terminal-outcome journal " +
+						"is present",
+				)
+				continue
+			}
+			run.manifest.ParticipationTerminalOutcomes = journal
+		default:
 			run.finding(
-				"node-authored quiescence snapshot capture time is after " +
-					"the offline audit time",
-			)
-		} else if run.expected.maxEvidenceAge > 0 &&
-			run.manifest.GeneratedAt.Sub(snapshot.CapturedAt) >
-				run.expected.maxEvidenceAge {
-			run.finding(
-				"node-authored quiescence snapshot is older than the "+
-					"maximum evidence age [%s]",
-				run.expected.maxEvidenceAge,
+				"participation work record [%s/%s] is not a recognized "+
+					"node-authored quiescence artifact",
+				descriptor.Directory(),
+				descriptor.Name(),
 			)
 		}
 	}
 	<-errorsDone
 
-	if count == 0 {
+	if snapshotCount == 0 {
 		run.finding(
 			"the node-authored participation quiescence snapshot is missing",
 		)
+	}
+	if journalCount == 0 {
+		run.finding(
+			"the node-authored participation terminal-outcome journal is missing",
+		)
+	}
+	for _, violation := range validateNodeTerminalOutcomes(run.manifest) {
+		run.finding("%s", violation)
 	}
 
 	return nil
@@ -2476,6 +2543,304 @@ func validateNodeQuiescenceSnapshot(
 			securityV2,
 			snapshot.ActiveSecurityV2Ceremonies,
 		))
+	}
+
+	return violations
+}
+
+// validateNodeTerminalOutcomes reconciles the ceremony-owner-authored terminal
+// journal with the immutable permit inventory captured by the gate. It also
+// corroborates DKG completion against persisted signer state and quarantine
+// against the protected signer namespaces. An external quiescence report is
+// deliberately not consulted here.
+func validateNodeTerminalOutcomes(
+	auditManifest *manifest,
+) []string {
+	journal := auditManifest.ParticipationTerminalOutcomes
+	if journal == nil {
+		return nil
+	}
+
+	violations := make([]string, 0)
+	if journal.SchemaVersion !=
+		participation.TerminalOutcomeJournalSchemaVersion {
+		violations = append(violations, fmt.Sprintf(
+			"node-authored terminal-outcome journal schema [%d] is not [%d]",
+			journal.SchemaVersion,
+			participation.TerminalOutcomeJournalSchemaVersion,
+		))
+	}
+
+	snapshot := auditManifest.QuiescenceSnapshot
+	if snapshot == nil {
+		violations = append(
+			violations,
+			"node-authored terminal-outcome journal has no gate snapshot to bind",
+		)
+		return violations
+	}
+	if !journal.SnapshotCapturedAt.Equal(snapshot.CapturedAt) {
+		violations = append(violations, fmt.Sprintf(
+			"node-authored terminal-outcome journal binds snapshot time [%s], "+
+				"but the gate snapshot was captured at [%s]",
+			journal.SnapshotCapturedAt,
+			snapshot.CapturedAt,
+		))
+	}
+
+	inventory := make(map[quarantineIdentity]int)
+	for i, permit := range snapshot.ActivePermits {
+		inventory[inventoryIdentity(permit)] = i
+	}
+
+	activeTBTCSigners := make(map[string]struct{})
+	for _, wallet := range auditManifest.TBTCActiveWallets {
+		activeTBTCSigners[wallet.WalletStorageKey] = struct{}{}
+		activeTBTCSigners[wallet.WalletID] = struct{}{}
+	}
+	activeBeaconSigners := make(map[string]struct{})
+	for _, membership := range auditManifest.BeaconActiveMemberships {
+		activeBeaconSigners[membership.GroupPublicKey] = struct{}{}
+	}
+	tbtcQuarantined := make(map[quarantineIdentity]struct{})
+	for _, quarantined := range auditManifest.TBTCQuarantinedOutputs {
+		tbtcQuarantined[quarantineIdentity{
+			ceremony:            quarantined.Ceremony,
+			mode:                quarantined.ProtocolMode,
+			canonicalStartBlock: quarantined.CanonicalStartBlock,
+			workID:              quarantined.SeedHash,
+			permitID:            fmt.Sprint(quarantined.MemberIndex),
+		}] = struct{}{}
+	}
+	beaconQuarantined := make(map[quarantineIdentity]struct{})
+	for _, quarantined := range auditManifest.BeaconQuarantinedOutputs {
+		beaconQuarantined[quarantineIdentity{
+			ceremony:            quarantined.Ceremony,
+			mode:                quarantined.ProtocolMode,
+			canonicalStartBlock: quarantined.CanonicalStartBlock,
+			workID:              quarantined.SeedHash,
+			permitID:            fmt.Sprint(quarantined.MemberIndex),
+		}] = struct{}{}
+	}
+
+	seen := make(map[quarantineIdentity]int)
+	for i, outcome := range journal.Outcomes {
+		identity := inventoryIdentity(outcome.Permit)
+		if firstIndex, duplicate := seen[identity]; duplicate {
+			violations = append(violations, fmt.Sprintf(
+				"node-authored terminal outcome [%d] duplicates the full "+
+					"permit identity first recorded by outcome [%d]",
+				i,
+				firstIndex,
+			))
+		} else {
+			seen[identity] = i
+		}
+		if _, inventoried := inventory[identity]; !inventoried {
+			violations = append(violations, fmt.Sprintf(
+				"node-authored terminal outcome [%d] has no matching permit "+
+					"in the at-quiescence gate inventory",
+				i,
+			))
+		}
+		if outcome.RecordedAt.IsZero() {
+			violations = append(violations, fmt.Sprintf(
+				"node-authored terminal outcome [%d] has no record time",
+				i,
+			))
+		}
+		if !outcome.Permit.IdentityBound {
+			violations = append(violations, fmt.Sprintf(
+				"node-authored terminal outcome [%d] belongs to an unbound "+
+					"permit identity",
+				i,
+			))
+		}
+		violations = append(
+			violations,
+			validateQuiescencePermitIdentity(
+				i,
+				quiescencePermitEvidence{
+					Ceremony:            string(outcome.Permit.Ceremony),
+					Mode:                outcome.Permit.Mode,
+					CanonicalStartBlock: outcome.Permit.CanonicalStartBlock,
+					WorkID:              outcome.Permit.WorkID,
+					PermitID:            outcome.Permit.PermitID,
+				},
+			)...,
+		)
+		if outcome.Outcome != "unresolved" {
+			if err := participation.ValidateTerminalOutcome(
+				outcome.Permit.Ceremony,
+				outcome.Outcome,
+				outcome.Evidence,
+			); err != nil {
+				violations = append(violations, fmt.Sprintf(
+					"node-authored terminal outcome [%d] evidence is invalid: [%v]",
+					i,
+					err,
+				))
+			}
+		}
+
+		switch outcome.Outcome {
+		case participation.TerminalOutcomeCompleted:
+			switch outcome.Permit.Ceremony {
+			case participation.TBTCDKG:
+				if outcome.Evidence.Kind !=
+					participation.TerminalEvidencePersistedTBTCSinger {
+					violations = append(violations, fmt.Sprintf(
+						"node-authored completed tbtc DKG outcome [%d] does "+
+							"not name persisted tbtc signer evidence",
+						i,
+					))
+				} else if _, ok :=
+					activeTBTCSigners[outcome.Evidence.Reference]; !ok {
+					violations = append(violations, fmt.Sprintf(
+						"node-authored completed tbtc DKG outcome [%d] names "+
+							"persisted signer [%s], but the active tbtc "+
+							"namespace holds no matching signer",
+						i,
+						outcome.Evidence.Reference,
+					))
+				}
+			case participation.BeaconDKG:
+				if outcome.Evidence.Kind !=
+					participation.TerminalEvidencePersistedBeaconSigner {
+					violations = append(violations, fmt.Sprintf(
+						"node-authored completed beacon DKG outcome [%d] does "+
+							"not name persisted beacon signer evidence",
+						i,
+					))
+				} else if _, ok :=
+					activeBeaconSigners[outcome.Evidence.Reference]; !ok {
+					violations = append(violations, fmt.Sprintf(
+						"node-authored completed beacon DKG outcome [%d] names "+
+							"persisted signer [%s], but the active beacon "+
+							"namespace holds no matching signer",
+						i,
+						outcome.Evidence.Reference,
+					))
+				}
+			default:
+				if outcome.Evidence.Kind ==
+					participation.TerminalEvidenceNoThreshold ||
+					outcome.Evidence.Kind == "" {
+					violations = append(violations, fmt.Sprintf(
+						"node-authored completed outcome [%d] has no durable "+
+							"result evidence",
+						i,
+					))
+				}
+			}
+			if outcome.Evidence.Reference != "" &&
+				!isStableEvidenceID(outcome.Evidence.Reference) {
+				violations = append(violations, fmt.Sprintf(
+					"node-authored completed outcome [%d] evidence reference "+
+						"[%s] is not a stable evidence identifier",
+					i,
+					outcome.Evidence.Reference,
+				))
+			}
+		case participation.TerminalOutcomeQuarantined:
+			switch outcome.Permit.Ceremony {
+			case participation.TBTCDKG:
+				if outcome.Evidence.Kind !=
+					participation.TerminalEvidenceQuarantinedTBTCSinger {
+					violations = append(violations, fmt.Sprintf(
+						"node-authored quarantined tbtc DKG outcome [%d] has "+
+							"the wrong evidence kind [%s]",
+						i,
+						outcome.Evidence.Kind,
+					))
+				}
+				if _, ok := tbtcQuarantined[identity]; !ok {
+					violations = append(violations, fmt.Sprintf(
+						"node-authored quarantined tbtc DKG outcome [%d] has "+
+							"no exact protected signer record",
+						i,
+					))
+				}
+			case participation.BeaconDKG:
+				if outcome.Evidence.Kind !=
+					participation.TerminalEvidenceQuarantinedBeaconSigner {
+					violations = append(violations, fmt.Sprintf(
+						"node-authored quarantined beacon DKG outcome [%d] has "+
+							"the wrong evidence kind [%s]",
+						i,
+						outcome.Evidence.Kind,
+					))
+				}
+				if _, ok := beaconQuarantined[identity]; !ok {
+					violations = append(violations, fmt.Sprintf(
+						"node-authored quarantined beacon DKG outcome [%d] has "+
+							"no exact protected signer record",
+						i,
+					))
+				}
+			default:
+				violations = append(violations, fmt.Sprintf(
+					"node-authored terminal outcome [%d] claims quarantine "+
+						"for ceremony [%s], which has no protected signer "+
+						"namespace",
+					i,
+					outcome.Permit.Ceremony,
+				))
+			}
+		case participation.TerminalOutcomeExhausted:
+			if outcome.Evidence.Kind !=
+				participation.TerminalEvidenceNoThreshold ||
+				outcome.Evidence.Reference != "" {
+				violations = append(violations, fmt.Sprintf(
+					"node-authored exhausted outcome [%d] is not an explicit "+
+						"no-threshold result",
+					i,
+				))
+			}
+		default:
+			violations = append(violations, fmt.Sprintf(
+				"node-authored terminal outcome [%d] is unresolved or unknown "+
+					"[%s]",
+				i,
+				outcome.Outcome,
+			))
+		}
+
+		if i > 0 &&
+			permitSnapshotLess(
+				outcome.Permit,
+				journal.Outcomes[i-1].Permit,
+			) {
+			violations = append(
+				violations,
+				"node-authored terminal-outcome journal is not "+
+					"deterministically sorted",
+			)
+		}
+	}
+
+	if len(journal.Outcomes) != len(snapshot.ActivePermits) {
+		violations = append(violations, fmt.Sprintf(
+			"node-authored terminal-outcome journal contains [%d] outcomes, "+
+				"but the gate snapshot inventories [%d] permits",
+			len(journal.Outcomes),
+			len(snapshot.ActivePermits),
+		))
+	}
+	for identity, inventoryIndex := range inventory {
+		if _, recorded := seen[identity]; !recorded {
+			violations = append(violations, fmt.Sprintf(
+				"node-authored gate inventory entry [%d] has no node-authored "+
+					"terminal outcome [ceremony=%s] [mode=%s] "+
+					"[canonicalStartBlock=%d] [workID=%s] [permitID=%s]",
+				inventoryIndex,
+				identity.ceremony,
+				identity.mode,
+				identity.canonicalStartBlock,
+				identity.workID,
+				identity.permitID,
+			))
+		}
 	}
 
 	return violations

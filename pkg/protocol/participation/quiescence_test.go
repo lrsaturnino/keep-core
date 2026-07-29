@@ -1,16 +1,17 @@
 package participation
 
 import (
+	"encoding/json"
 	"errors"
 	"io/fs"
 	"testing"
+	"time"
 )
 
 type quiescencePersistenceRecorder struct {
-	deletedDirectory string
-	deletedName      string
-	deleteErr        error
-	saved            []byte
+	deleted   []string
+	deleteErr error
+	saved     map[string][]byte
 }
 
 func (p *quiescencePersistenceRecorder) Save(
@@ -18,7 +19,10 @@ func (p *quiescencePersistenceRecorder) Save(
 	directory string,
 	name string,
 ) error {
-	p.saved = append([]byte(nil), data...)
+	if p.saved == nil {
+		p.saved = make(map[string][]byte)
+	}
+	p.saved[directory+"/"+name] = append([]byte(nil), data...)
 	return nil
 }
 
@@ -26,8 +30,7 @@ func (p *quiescencePersistenceRecorder) Delete(
 	directory string,
 	name string,
 ) error {
-	p.deletedDirectory = directory
-	p.deletedName = name
+	p.deleted = append(p.deleted, directory+"/"+name)
 	return p.deleteErr
 }
 
@@ -42,13 +45,25 @@ func TestNewPersistenceQuiescenceSnapshotRecorder_InvalidatesPriorRun(
 		t.Fatal(err)
 	}
 
-	if persistence.deletedDirectory !=
-		QuiescenceSnapshotStorageDirectory ||
-		persistence.deletedName != QuiescenceSnapshotStorageFile {
+	expected := map[string]bool{
+		QuiescenceSnapshotStorageDirectory + "/" +
+			QuiescenceSnapshotStorageFile: false,
+		QuiescenceSnapshotStorageDirectory + "/" +
+			TerminalOutcomeJournalStorageFile: false,
+	}
+	for _, deleted := range persistence.deleted {
+		if _, ok := expected[deleted]; ok {
+			expected[deleted] = true
+		}
+	}
+	for record, found := range expected {
+		if found {
+			continue
+		}
 		t.Errorf(
-			"unexpected invalidated record [%s/%s]",
-			persistence.deletedDirectory,
-			persistence.deletedName,
+			"expected prior record [%s] to be invalidated; deletes: %v",
+			record,
+			persistence.deleted,
 		)
 	}
 }
@@ -79,5 +94,79 @@ func TestNewPersistenceQuiescenceSnapshotRecorder_DeleteFailureIsFatal(
 		persistence,
 	); !errors.Is(err, deleteErr) {
 		t.Fatalf("expected delete failure, got [%v]", err)
+	}
+}
+
+func TestPersistenceQuiescenceSnapshotRecorder_PersistsTerminalJournal(
+	t *testing.T,
+) {
+	persistence := &quiescencePersistenceRecorder{}
+	recorder, err := NewPersistenceQuiescenceSnapshotRecorder(persistence)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	capturedAt := time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC)
+	if err := recorder.Record(QuiescenceSnapshot{
+		SchemaVersion: QuiescenceSnapshotSchemaVersion,
+		CapturedAt:    capturedAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	outcome := TerminalOutcomeRecord{
+		RecordedAt: capturedAt.Add(time.Second),
+		Permit: PermitSnapshot{
+			Ceremony:            TBTCSigning,
+			Mode:                ModeSecurityV2.String(),
+			CanonicalStartBlock: 1_000,
+			WorkID:              "wallet-action",
+			PermitID:            "wallet",
+			IdentityBound:       true,
+		},
+		Outcome: TerminalOutcomeCompleted,
+		Evidence: TerminalEvidence{
+			Kind:      TerminalEvidenceProtocolResult,
+			Reference: "result-digest",
+		},
+	}
+	if err := recorder.RecordTerminalOutcome(outcome); err != nil {
+		t.Fatal(err)
+	}
+
+	content := persistence.saved[QuiescenceSnapshotStorageDirectory+
+		"/"+TerminalOutcomeJournalStorageFile]
+	journal := &TerminalOutcomeJournal{}
+	if err := json.Unmarshal(content, journal); err != nil {
+		t.Fatal(err)
+	}
+	if journal.SchemaVersion != TerminalOutcomeJournalSchemaVersion {
+		t.Errorf(
+			"unexpected journal schema [%d]",
+			journal.SchemaVersion,
+		)
+	}
+	if !journal.SnapshotCapturedAt.Equal(capturedAt) {
+		t.Errorf(
+			"unexpected snapshot binding [%s]",
+			journal.SnapshotCapturedAt,
+		)
+	}
+	if len(journal.Outcomes) != 1 || journal.Outcomes[0] != outcome {
+		t.Errorf("unexpected terminal outcomes: %+v", journal.Outcomes)
+	}
+}
+
+func TestValidateTerminalOutcome_RejectsUnsupportedEvidence(t *testing.T) {
+	err := ValidateTerminalOutcome(
+		TBTCSigning,
+		TerminalOutcomeCompleted,
+		TerminalEvidence{
+			Kind:      TerminalEvidenceKind("fabricated_result"),
+			Reference: "fabricated-result",
+		},
+	)
+	if err == nil {
+		t.Fatal("expected unsupported terminal evidence to be rejected")
 	}
 }
