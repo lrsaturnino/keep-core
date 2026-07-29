@@ -3145,10 +3145,19 @@ precutover_readings() {
   # shellcheck disable=SC2034
   PRECUTOVER_TX=2
   # shellcheck disable=SC2034
-  PRECUTOVER_RESULTS="tbtc_wallet_action=succeeded beacon_signing=succeeded"
+  PRECUTOVER_RESULTS="tbtc_dkg=succeeded tbtc_signing=succeeded \
+tbtc_heartbeat=succeeded tbtc_wallet_action=succeeded beacon_dkg=succeeded \
+beacon_signing=succeeded"
+  # Every ceremony the pre-cutover mandate names, each settled on a transaction
+  # the driver originated. A step that named only a family or a work class
+  # would be satisfied by a subset of these.
   # shellcheck disable=SC2034
   PRECUTOVER_BOUND="tbtc_wallet_action@840@wallet840=succeeded=${PRE_TX1}=0xbtc840 \
-beacon_signing@841@entry841=succeeded=${PRE_TX2}=0xentry841"
+beacon_signing@841@entry841=succeeded=${PRE_TX2}=0xentry841 \
+tbtc_dkg@842@dkg842=succeeded=${PRE_TX1}=0xdkg842 \
+tbtc_signing@843@sign843=succeeded=${PRE_TX1}=0xsign843 \
+tbtc_heartbeat@844@beat844=succeeded=${PRE_TX1}=0xbeat844 \
+beacon_dkg@845@bdkg845=succeeded=${PRE_TX2}=0xbdkg845"
   # Who each settled transcript incorporated. Both releases took part in both
   # halves, which is the whole subject of a mixed prior/R1 control.
   # shellcheck disable=SC2034
@@ -3182,7 +3191,7 @@ precutover_case() {
   "$@"
   precutover_verdict \
     "representative pre-cutover work including the longest wallet action" \
-    "" "tbtc beacon" "threshold_ceremony bitcoin_action" \
+    "" "${PRECUTOVER_REQUIRED_CEREMONIES} tbtc_wallet_action" \
     "representative pre-cutover work"
 }
 
@@ -3300,9 +3309,47 @@ check "a cross-format peer below C refutes the compatibility claim" 1 \
 # claim from the first rather than a repeat of it.
 run_verdict precutover_case eval \
   'PRECUTOVER_BOUND="beacon_signing@841@entry841=succeeded=${PRE_TX2}=0xentry841
-     tbtc_signing@840@wallet840=succeeded=${PRE_TX1}=0xsig840"'
+     tbtc_dkg@842@dkg842=succeeded=${PRE_TX1}=0xdkg842
+     tbtc_signing@843@sign843=succeeded=${PRE_TX1}=0xsign843
+     tbtc_heartbeat@844@beat844=succeeded=${PRE_TX1}=0xbeat844
+     beacon_dkg@845@bdkg845=succeeded=${PRE_TX2}=0xbdkg845"'
 check "pre-cutover work without a wallet action is not the longest action" 3 \
-  "no bitcoin_action"
+  "no tbtc_wallet_action"
+
+# What a family-and-class requirement cannot state. This fixture covers both
+# halves of the release and both work classes, and still leaves three mandated
+# ceremonies undriven — which is the reading a broad requirement accepts.
+run_verdict precutover_case eval \
+  'PRECUTOVER_BOUND="tbtc_wallet_action@840@wallet840=succeeded=${PRE_TX1}=0xbtc840
+     beacon_signing@841@entry841=succeeded=${PRE_TX2}=0xentry841
+     tbtc_signing@843@sign843=succeeded=${PRE_TX1}=0xsign843"'
+check "a covered family and work class is not the mandated ceremony set" 3 \
+  "no tbtc_dkg tbtc_heartbeat beacon_dkg"
+
+# The heartbeat is the mandated ceremony a threshold-class requirement is
+# likeliest to skip: it settles like a signing, and it is the one carrying the
+# inactivity penalty path the crossing has to keep quiet. A step that drove
+# none of them says nothing about that path.
+run_verdict precutover_case eval \
+  'PRECUTOVER_BOUND="tbtc_wallet_action@840@wallet840=succeeded=${PRE_TX1}=0xbtc840
+     beacon_signing@841@entry841=succeeded=${PRE_TX2}=0xentry841
+     tbtc_dkg@842@dkg842=succeeded=${PRE_TX1}=0xdkg842
+     tbtc_signing@843@sign843=succeeded=${PRE_TX1}=0xsign843
+     beacon_dkg@845@bdkg845=succeeded=${PRE_TX2}=0xbdkg845"'
+check "a pre-cutover step that drove no heartbeat is incomplete" 3 \
+  "no tbtc_heartbeat"
+
+# The beacon half is enumerated for the same reason the tBTC half is: its DKG
+# and its signing are separate paths into the gate, and one beacon ceremony
+# settling covers the family without covering the other path.
+run_verdict precutover_case eval \
+  'PRECUTOVER_BOUND="tbtc_wallet_action@840@wallet840=succeeded=${PRE_TX1}=0xbtc840
+     tbtc_dkg@842@dkg842=succeeded=${PRE_TX1}=0xdkg842
+     tbtc_signing@843@sign843=succeeded=${PRE_TX1}=0xsign843
+     tbtc_heartbeat@844@beat844=succeeded=${PRE_TX1}=0xbeat844
+     beacon_dkg@845@bdkg845=succeeded=${PRE_TX2}=0xbdkg845"'
+check "one beacon ceremony does not cover the beacon controls" 3 \
+  "no beacon_signing"
 
 run_verdict precutover_case eval 'PRECUTOVER_DRIVER_SUPPLIED=0'
 check "no driver originates no pre-cutover ceremony to observe" 3 \

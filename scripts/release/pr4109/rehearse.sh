@@ -5150,7 +5150,7 @@ unsuccessful_results() {
 ceremony_class() {
   case "$1" in
   *_wallet_action) printf 'bitcoin_action' ;;
-  *_dkg | *_signing) printf 'threshold_ceremony' ;;
+  *_dkg | *_signing | *_heartbeat) printf 'threshold_ceremony' ;;
   *) printf 'unknown' ;;
   esac
 }
@@ -5510,7 +5510,7 @@ run_work_driver() {
     local parsed hashes
     parsed="$(printf '%s' "${report}" | node -e '
       const CEREMONIES = ["beacon_dkg", "beacon_signing", "tbtc_dkg",
-        "tbtc_signing", "tbtc_wallet_action"];
+        "tbtc_heartbeat", "tbtc_signing", "tbtc_wallet_action"];
       const OUTCOMES = ["succeeded", "failed", "timed_out"];
       // The two ways work legitimately comes to nothing, as opposed to work
       // that has simply not finished yet.
@@ -7193,25 +7193,37 @@ service_container_running() {
   [[ "${state}" == "true" ]]
 }
 
-# Of the required work classes, the ones no settled result represents. The
-# mirror of missing_bound_families over the class reader, for the control whose
-# claim is about the kind of work that settled rather than which half of the
-# release it belongs to.
-missing_bound_classes() {
-  local records="$1" required="$2" class record uncovered="" covered
-  for class in ${required}; do
+# Of the required ceremonies, the ones no bound successful result covers. The
+# mirror of missing_bound_families one level down, for the control whose claim
+# names the ceremonies it drove rather than the half of the release or the kind
+# of work they belong to.
+missing_bound_ceremonies() {
+  local records="$1" required="$2" ceremony record uncovered="" covered
+  for ceremony in ${required}; do
     covered=0
     for record in ${records}; do
       [[ "$(bound_outcome "${record}")" == "succeeded" ]] || continue
-      [[ "$(ceremony_class \
-        "$(work_ceremony "$(bound_work "${record}")")")" == "${class}" ]] ||
+      [[ "$(work_ceremony "$(bound_work "${record}")")" == "${ceremony}" ]] ||
         continue
       covered=1
       break
     done
-    ((covered == 1)) || uncovered="${uncovered}${uncovered:+ }${class}"
+    ((covered == 1)) || uncovered="${uncovered}${uncovered:+ }${ceremony}"
   done
   printf '%s' "${uncovered}"
+}
+
+# The distinct families a required-ceremony list spans, in the order they first
+# appear. The interoperation check is asked per call path into the gate, and
+# deriving its families from the ceremony list keeps one statement of what a
+# step must cover instead of two that can drift apart.
+ceremony_families() {
+  local ceremonies="$1" ceremony family out=""
+  for ceremony in ${ceremonies}; do
+    family="$(ceremony_family "${ceremony}")"
+    contains_token "${out}" "${family}" || out="${out}${out:+ }${family}"
+  done
+  printf '%s' "${out}"
 }
 
 # What one pre-cutover driver phase observed on a fleet that still has the
@@ -7235,10 +7247,17 @@ PRECUTOVER_SECURITY_AFTER=""
 PRECUTOVER_SIGHTINGS_BEFORE=""
 PRECUTOVER_SIGHTINGS_AFTER=""
 
-# Both halves of the release, for the same reason the post-C control requires
-# them: a pre-C compatibility claim read off tBTC alone says nothing about the
-# beacon's path into the gate.
-PRECUTOVER_REQUIRED_FAMILIES="tbtc beacon"
+# The ceremonies a pre-cutover step must see settle, named one by one.
+#
+# The mandate is that mixed prior/R1 tBTC signing, DKG and heartbeat and the
+# beacon controls all succeed below C. Neither a family nor a work-class
+# requirement can state that: "a tBTC threshold ceremony settled" is satisfied
+# by a signing alone, leaving the DKG and heartbeat paths into the gate
+# undriven, and those anchor differently and refuse separately. A step that
+# named a broad class would report on whichever ceremony the driver happened to
+# pick.
+PRECUTOVER_REQUIRED_CEREMONIES="tbtc_dkg tbtc_signing tbtc_heartbeat \
+beacon_dkg beacon_signing"
 
 collect_precutover_work() {
   local phase="$1" service state block
@@ -7312,16 +7331,14 @@ ${service} reported [${state:-unreadable}] at block [${block:-unreadable}]"
 # requirement is the caller's. Duplicating it per step would let the two
 # statements of "the fleet took no security-v2 permit" drift apart.
 precutover_verdict() {
-  local step="$1" assertion="$2" required_families="$3" required_classes="$4"
-  local what="$5"
+  local step="$1" assertion="$2" required_ceremonies="$3" what="$4"
 
-  local failed_results missing_families missing_classes settlements
+  local required_families failed_results missing_ceremonies settlements
   local uninteroperated
+  required_families="$(ceremony_families "${required_ceremonies}")"
   failed_results="$(unsuccessful_results "${PRECUTOVER_RESULTS}")"
-  missing_families="$(missing_bound_families \
-    "${PRECUTOVER_BOUND}" "${required_families}")"
-  missing_classes="$(missing_bound_classes \
-    "${PRECUTOVER_BOUND}" "${required_classes}")"
+  missing_ceremonies="$(missing_bound_ceremonies \
+    "${PRECUTOVER_BOUND}" "${required_ceremonies}")"
   settlements="$(bound_settlements "${PRECUTOVER_BOUND}")"
   uninteroperated="$(families_without_mixed_transcript \
     "${PRECUTOVER_CONTRIBUTORS}" "${required_families}" \
@@ -7363,15 +7380,12 @@ mixed fleet's work that survived"
     block_step "${step}" "the work driver named no ceremony that completed \
 successfully on a transaction it originated, so this control observed work \
 being allowed to start and nothing about it finishing"
-  elif [[ -n "${missing_families}" ]]; then
-    block_step "${step}" "the work driver settled ${settlements} but nothing \
-from the ${missing_families} half of the release, so this control covers one \
-call path into the gate and says nothing about the other; it has to succeed \
-on ${required_families}"
-  elif [[ -n "${missing_classes}" ]]; then
+  elif [[ -n "${missing_ceremonies}" ]]; then
     block_step "${step}" "the work driver settled ${settlements} but no \
-${missing_classes}; this step's claim is about ${what}, and the work classes \
-it names are what make it that claim rather than a repeat of the step before"
+${missing_ceremonies}; this step's claim is about ${what}, and each ceremony \
+it names is a separate path into the gate with its own anchor and its own \
+refusal — one of them settling says nothing about the rest, so the step has \
+to cover ${required_ceremonies}"
   elif [[ -n "${uninteroperated}" ]]; then
     block_step "${step}" "the work driver settled ${settlements}, but no \
 ${uninteroperated} transcript incorporated a share from both \
@@ -7600,7 +7614,7 @@ stage_single_release() {
   begin_step "mixed prior/R1 pre-cutover compatibility controls"
   collect_precutover_work precutover-compatibility
   precutover_verdict "mixed prior/R1 pre-cutover compatibility controls" \
-    "" "${PRECUTOVER_REQUIRED_FAMILIES}" "threshold_ceremony" \
+    "" "${PRECUTOVER_REQUIRED_CEREMONIES}" \
     "legacy-anchored ceremonies beside the prior binary"
 
   # The second step is the first one's claim carried to the work that takes
@@ -7611,8 +7625,7 @@ stage_single_release() {
   collect_precutover_work precutover-representative
   precutover_verdict \
     "representative pre-cutover work including the longest wallet action" \
-    "" "${PRECUTOVER_REQUIRED_FAMILIES}" \
-    "threshold_ceremony bitcoin_action" \
+    "" "${PRECUTOVER_REQUIRED_CEREMONIES} tbtc_wallet_action" \
     "representative pre-cutover work including the longest wallet action"
 
   # The in-flight half of step 3 needs its subject on the chain while the

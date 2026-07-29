@@ -362,6 +362,22 @@ A phase that kept the successes alone cannot tell a clean run from one where a
 required ceremony failed beside a passing one, and cannot see a ceremony
 succeeding where the property under test is that it must not.
 
+The pre-cutover steps name the ceremonies they must see settle one by one —
+`tbtc_dkg`, `tbtc_signing`, `tbtc_heartbeat`, `beacon_dkg` and
+`beacon_signing`, with `tbtc_wallet_action` added to the step whose subject is
+the longest practical action. The mandate is that mixed prior/R1 tBTC signing,
+DKG and heartbeat and the beacon controls all succeed below C, and neither a
+family nor a work-class requirement can state that. "A tBTC threshold ceremony
+settled" is satisfied by a signing alone, which leaves the DKG and heartbeat
+paths into the gate undriven even though each anchors differently and refuses
+separately; a fixture covering both halves of the release and both work classes
+can still be three mandated ceremonies short. The heartbeat is the clearest
+case: it settles like a signing and carries the inactivity penalty path the
+crossing has to keep quiet, so a step that drove none says nothing about the
+path most in need of the evidence. Naming the ceremonies means the step reports
+on the work the mandate describes rather than on whichever ceremony the driver
+happened to pick.
+
 The homogeneous control is decided against both halves of its own name, over
 the whole report, on bound records. "security-v2 controls" needs a ceremony the
 driver watched complete on a transaction it originated and that left a
