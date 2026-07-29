@@ -3481,6 +3481,11 @@ surviving_readings() {
   SURVIVING_PERMITS_AT_C="r1-node-1=wallet840#member-1"
   # shellcheck disable=SC2034
   SURVIVING_PERMITS_AT_C_READ=1
+  # The quiescence control's seed goes on the chain between those two
+  # readings, so it is the one legacy permit that legitimately appears at C
+  # without having been named here. The base case seeds nothing.
+  # shellcheck disable=SC2034
+  QUIESCE_SEEDED_PERMITS_BEFORE_C=""
   # shellcheck disable=SC2034
   SURVIVING_LEGACY_COMPLETIONS_BEFORE="0"
   # shellcheck disable=SC2034
@@ -3573,6 +3578,36 @@ check "an unnamed legacy permit crossing beside the named one is caught" 3 \
 run_verdict surviving_case eval 'SURVIVING_PERMITS_AT_C=""'
 check "a permit dropped at the crossing did not survive it" 1 \
   "no longer held.*when they reported open_security_v2"
+
+# The other direction of the same reading, and the one every other rung here
+# lets through. The completion fence at the bottom of this ladder is a
+# fleet-wide counter, so a legacy permit appearing only at the crossing
+# supplies an increment of its own: the driver's account of the named permit
+# settling is unchanged, the delta still equals the one permit this step
+# originated, and nothing below notices that the increment belongs to a permit
+# nobody identified.
+run_verdict surviving_case eval \
+  'SURVIVING_PERMITS_AT_C="r1-node-1=wallet840#member-1 r1-node-2=latecomer#member-4"'
+check "a legacy permit appearing only at the crossing is caught" 3 \
+  "neither in flight when this step named what it originated nor seeded"
+
+# The one permit that legitimately arrives between the two readings: the
+# quiescence control's seed, put on the chain after this work was originated
+# and observed in the gate that issued it while the fleet was still below C.
+run_verdict surviving_case eval \
+  'SURVIVING_PERMITS_AT_C="r1-node-1=wallet840#member-1 r1-node-1=quiesce900#member-7"
+  QUIESCE_SEEDED_PERMITS_BEFORE_C="r1-node-1=quiesce900#member-7"'
+check "the quiescence seed arriving before C is not an unaccounted permit" 0 \
+  "recorded 1 legacy completion"
+
+# A seed the issuing gate could not be asked about excludes nothing, so a
+# permit that looks like it stays unaccounted for rather than being waved
+# through on the strength of a reading that was never taken.
+run_verdict surviving_case eval \
+  'SURVIVING_PERMITS_AT_C="r1-node-1=wallet840#member-1 r1-node-1=quiesce900#member-7"
+  QUIESCE_SEEDED_PERMITS_BEFORE_C="unreadable on r1-node-1"'
+check "an unreadable seed reading accounts for no arrival at C" 3 \
+  "neither in flight when this step named what it originated nor seeded"
 
 # A crossing that never happened observed nothing, which is not the same as
 # observing a permit survive one.

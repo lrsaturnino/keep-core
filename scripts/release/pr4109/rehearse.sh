@@ -7798,13 +7798,34 @@ surviving_legacy_verdict() {
   local step="pre-cutover legacy work survives C and completes"
 
   local stray settlements failed unended originated_permits held_delta
-  local named_permits unheld_before unnamed_before lost_at_c
+  local named_permits unheld_before unnamed_before lost_at_c arrived_at_c
   named_permits="$(held_permit_identities "${SURVIVING_ORIGINATED}")"
   unheld_before="$(absent_tokens "${named_permits}" \
     "${SURVIVING_PERMITS_BEFORE}")"
   unnamed_before="$(absent_tokens "${SURVIVING_PERMITS_BEFORE}" \
     "${named_permits}")"
   lost_at_c="$(absent_tokens "${named_permits}" "${SURVIVING_PERMITS_AT_C}")"
+  # The comparison at C runs both ways. A named permit missing at C is one
+  # that did not cross; a legacy permit present at C that was not there before
+  # it is one this step never identified, and the completion fence at the
+  # bottom of this ladder is a fleet-wide counter. An unaccounted legacy permit
+  # completing after C supplies an increment of its own, which is exactly what
+  # would let a named permit bypass its completion fence and still leave the
+  # totals matching.
+  #
+  # One legacy permit is deliberately added between the two samples: the
+  # quiescence control's seed, put on the chain after this work was originated
+  # and before the crossing. It is named here rather than left to look like a
+  # stray, and only when the seeding gate could actually be read — an
+  # unreadable seed reading cannot exclude anything, so it leaves whatever
+  # arrived unaccounted for.
+  local accounted_at_c="${SURVIVING_PERMITS_BEFORE}"
+  if [[ -n "${QUIESCE_SEEDED_PERMITS_BEFORE_C}" &&
+    "${QUIESCE_SEEDED_PERMITS_BEFORE_C}" != "unreadable on "* ]]; then
+    accounted_at_c="${accounted_at_c} ${QUIESCE_SEEDED_PERMITS_BEFORE_C}"
+  fi
+  arrived_at_c="$(absent_tokens "${SURVIVING_PERMITS_AT_C}" \
+    "${accounted_at_c}")"
   stray="$(unoriginated_terminals "${SURVIVING_TERMINAL}" \
     "${SURVIVING_ORIGINATED}")"
   settlements="$(bound_settlements "${SURVIVING_TERMINAL}")"
@@ -7879,6 +7900,12 @@ leaves the survival unobserved"
 they reported open_security_v2, though this step put it on the chain before C \
 and no terminal outcome had been asked for yet; a legacy permit must keep its \
 mode across the crossing, not be dropped at it"
+  elif [[ -n "${arrived_at_c}" ]]; then
+    block_step "${step}" "the R1 gates held ${arrived_at_c} when they \
+reported open_security_v2, which was neither in flight when this step named \
+what it originated nor seeded for the quiescence control; the completion \
+count below is fleet-wide, so a legacy permit that appeared only at the \
+crossing can supply an increment no named permit earned"
   elif ((SURVIVING_TERMINAL_ASKED == 0)); then
     block_step "${step}" "the driver was never asked what became of the \
 legacy work it held across C; a permit observed in flight before the crossing \
