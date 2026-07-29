@@ -1123,7 +1123,12 @@ func (p *permit) RecordTerminalOutcome(
 	outcome TerminalOutcome,
 	evidence TerminalEvidence,
 ) error {
-	if err := ValidateTerminalOutcome(p.ceremony, outcome, evidence); err != nil {
+	if err := ValidateTerminalOutcome(
+		p.ceremony,
+		p.workID,
+		outcome,
+		evidence,
+	); err != nil {
 		return fmt.Errorf(
 			"terminal outcome for ceremony [%s] rejected: [%v]: %w",
 			p.ceremony,

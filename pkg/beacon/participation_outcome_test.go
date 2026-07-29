@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"math/big"
+	"strconv"
 	"sync"
 	"testing"
 
@@ -23,6 +24,7 @@ type recordingPermit struct {
 	ctx      context.Context
 	cancel   context.CancelCauseFunc
 	ceremony participation.Ceremony
+	workID   string
 
 	mu       sync.Mutex
 	outcomes []recordedOutcome
@@ -33,10 +35,29 @@ type recordedOutcome struct {
 	evidence participation.TerminalEvidence
 }
 
+// testRelayRequestStartBlock is the relay request every relay permit in this
+// file is issued for. Relay evidence names the request it answers and the gate
+// holds it to the permit's own request, so the two have to agree on one block.
+const testRelayRequestStartBlock = uint64(7_654_321)
+
 func newRecordingPermit(ceremony participation.Ceremony) *recordingPermit {
 	ctx, cancel := context.WithCancelCause(context.Background())
 
-	return &recordingPermit{ctx: ctx, cancel: cancel, ceremony: ceremony}
+	// Beacon relay work is the one ceremony whose work identity is parsed
+	// rather than only compared, so its permits carry the identity the node
+	// would really issue.
+	workID := "test-work"
+	if ceremony == participation.BeaconRelaySigning ||
+		ceremony == participation.BeaconTimeoutReport {
+		workID = participation.BeaconRelayWorkID(testRelayRequestStartBlock)
+	}
+
+	return &recordingPermit{
+		ctx:      ctx,
+		cancel:   cancel,
+		ceremony: ceremony,
+		workID:   workID,
+	}
 }
 
 func (rp *recordingPermit) Context() context.Context { return rp.ctx }
@@ -49,7 +70,7 @@ func (rp *recordingPermit) Mode() participation.ProtocolMode {
 	return participation.ModeSecurityV2
 }
 
-func (rp *recordingPermit) WorkID() string { return "test-work" }
+func (rp *recordingPermit) WorkID() string { return rp.workID }
 
 func (rp *recordingPermit) PermitID() string { return "1" }
 
@@ -119,6 +140,7 @@ func assertRecordedTerminalOutcome(
 
 	if err := participation.ValidateTerminalOutcome(
 		permit.Ceremony(),
+		permit.WorkID(),
 		recorded[0].outcome,
 		recorded[0].evidence,
 	); err != nil {
@@ -153,6 +175,7 @@ func TestRecordRelayEntryTerminalOutcome(t *testing.T) {
 		recordRelayEntryTerminalOutcome(
 			&testutils.MockLogger{},
 			permit,
+			testRelayRequestStartBlock,
 			groupPublicKey,
 			previousEntry,
 			nil,
@@ -179,6 +202,7 @@ func TestRecordRelayEntryTerminalOutcome(t *testing.T) {
 		recordRelayEntryTerminalOutcome(
 			&testutils.MockLogger{},
 			permit,
+			testRelayRequestStartBlock,
 			groupPublicKey,
 			previousEntry,
 			relayEntry,
@@ -192,6 +216,7 @@ func TestRecordRelayEntryTerminalOutcome(t *testing.T) {
 		)
 
 		expectedReference, err := participation.BeaconRelayEntryReference(
+			testRelayRequestStartBlock,
 			groupPublicKey,
 			previousEntry,
 			relayEntry,
@@ -207,11 +232,15 @@ func TestRecordRelayEntryTerminalOutcome(t *testing.T) {
 			)
 		}
 
-		// Three 64-byte components in hex, separated by two colons.
-		if len(evidence.Reference) != 3*128+2 {
+		// The decimal request start block and three 64-byte components in
+		// hex, separated by three colons.
+		expectedLength := len(strconv.FormatUint(
+			testRelayRequestStartBlock, 10,
+		)) + 3*128 + 3
+		if len(evidence.Reference) != expectedLength {
 			t.Errorf(
 				"expected a %d character reference, got [%d] characters",
-				3*128+2,
+				expectedLength,
 				len(evidence.Reference),
 			)
 		}
@@ -239,6 +268,7 @@ func TestRecordRelayEntryTerminalOutcome(t *testing.T) {
 			recordRelayEntryTerminalOutcome(
 				&testutils.MockLogger{},
 				permit,
+				testRelayRequestStartBlock,
 				groupPublicKey,
 				test.previousEntry,
 				test.relayEntry,
@@ -269,6 +299,7 @@ func TestRecordRelayEntryTerminalOutcome_ReferenceVerifies(t *testing.T) {
 	recordRelayEntryTerminalOutcome(
 		&testutils.MockLogger{},
 		permit,
+		testRelayRequestStartBlock,
 		altbn128.G2Point{
 			G2: new(bn256.G2).ScalarBaseMult(groupSecret),
 		}.Compress(),
@@ -283,7 +314,7 @@ func TestRecordRelayEntryTerminalOutcome_ReferenceVerifies(t *testing.T) {
 		participation.TerminalEvidenceProtocolResult,
 	)
 
-	groupPublicKeyBytes, previousEntryBytes, entryBytes, err :=
+	_, groupPublicKeyBytes, previousEntryBytes, entryBytes, err :=
 		participation.ParseBeaconRelayEntryReference(evidence.Reference)
 	if err != nil {
 		t.Fatal(err)

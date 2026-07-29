@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -249,6 +250,7 @@ func newTestStorageWithQuiescencePermits(
 	}
 	for i, permit := range permits {
 		record := testTerminalOutcomeRecord(
+			t,
 			permit,
 			participation.PermitSnapshot{
 				Ceremony:            participation.Ceremony(permit.Ceremony),
@@ -270,11 +272,14 @@ func newTestStorageWithQuiescencePermits(
 }
 
 func testTerminalOutcomeRecord(
+	t *testing.T,
 	permit quiescencePermitEvidence,
 	snapshot participation.PermitSnapshot,
 	resultReference string,
 	beaconSignerReference string,
 ) participation.TerminalOutcomeRecord {
+	t.Helper()
+
 	evidence := participation.TerminalEvidence{
 		Kind:      participation.TerminalEvidenceProtocolResult,
 		Reference: resultReference,
@@ -309,9 +314,24 @@ func testTerminalOutcomeRecord(
 				Reference: resultReference,
 			}
 		case participation.BeaconRelaySigning:
+			// A relay entry answers exactly one request, and the audit holds
+			// the record to the request its permit names, so the fixture
+			// derives the request from the permit rather than picking one.
+			requestStartBlock, err := participation.ParseBeaconRelayWorkID(
+				snapshot.WorkID,
+			)
+			if err != nil {
+				t.Fatalf(
+					"relay fixture work identity [%s] names no relay "+
+						"request: [%v]",
+					snapshot.WorkID,
+					err,
+				)
+			}
 			evidence = participation.TerminalEvidence{
 				Kind: participation.TerminalEvidenceProtocolResult,
 				Reference: testRelayEntryReference(
+					requestStartBlock,
 					testActiveGroupSecret,
 					resultReference,
 				),
@@ -354,11 +374,16 @@ const testActiveGroupSecret = int64(42)
 // makes the reference survive the audit's signature verification: the check is
 // a pairing over actual curve points, so a shaped-but-fabricated identity is
 // exactly what it exists to reject.
-func testRelayEntryReference(groupSecret int64, label string) string {
+func testRelayEntryReference(
+	requestStartBlock uint64,
+	groupSecret int64,
+	label string,
+) string {
 	secret := big.NewInt(groupSecret)
 	previousEntry := altbn128.G1HashToPoint([]byte(label))
 
 	reference, err := participation.BeaconRelayEntryReference(
+		requestStartBlock,
 		altbn128.G2Point{
 			G2: new(bn256.G2).ScalarBaseMult(secret),
 		}.Compress(),
@@ -446,6 +471,7 @@ func persistRealGateQuiescenceSnapshot(
 	gate.Quiesce(fmt.Errorf("rollback drill"))
 	for i, permit := range active {
 		record := testTerminalOutcomeRecord(
+			t,
 			permits[i],
 			participation.PermitSnapshot{
 				Ceremony:            permit.Ceremony(),
@@ -2386,7 +2412,7 @@ func TestRunAudit_MalformedQuiescencePermitIdentitiesAreBlocking(t *testing.T) {
 			),
 			Mode:                participation.ModeSecurityV2.String(),
 			CanonicalStartBlock: 1_000,
-			WorkID:              "relay-request-1",
+			WorkID:              participation.BeaconRelayWorkID(1),
 			PermitID:            "member-1",
 			Outcome:             "completed",
 		},
@@ -2473,7 +2499,7 @@ func TestRunAudit_CompleteNonemptyQuiescenceInventorySatisfiesBarrier(
 			),
 			Mode:                participation.ModeSecurityV2.String(),
 			CanonicalStartBlock: 1_000,
-			WorkID:              "relay-request-security-v2",
+			WorkID:              participation.BeaconRelayWorkID(1_000),
 			PermitID:            "2",
 			Outcome:             "completed",
 		},
@@ -3592,7 +3618,7 @@ func TestRunAudit_QuiescenceOutcomesMustCoverGateInventory(t *testing.T) {
 			Ceremony:            string(participation.BeaconRelaySigning),
 			Mode:                participation.ModeSecurityV2.String(),
 			CanonicalStartBlock: 1_000,
-			WorkID:              "relay-request-security-v2",
+			WorkID:              participation.BeaconRelayWorkID(1_000),
 			PermitID:            "2",
 			Outcome:             "completed",
 		},
@@ -3691,6 +3717,8 @@ func TestValidateRelayEntryTerminalResult(t *testing.T) {
 		foreignGroupSecret = int64(77)
 	)
 
+	const requestStartBlock = uint64(1_000)
+
 	heldGroupKey := hex.EncodeToString(
 		altbn128.G2Point{
 			G2: new(bn256.G2).ScalarBaseMult(big.NewInt(heldGroupSecret)),
@@ -3699,9 +3727,11 @@ func TestValidateRelayEntryTerminalResult(t *testing.T) {
 	beaconGroupKeys := map[string]struct{}{heldGroupKey: {}}
 
 	// reference renders an entry the given group really signed over the given
-	// previous entry, so only the deliberate mismatches below are wrong.
+	// previous entry, answering the given request, so only the deliberate
+	// mismatches below are wrong.
 	reference := func(
 		t *testing.T,
+		requestStartBlock uint64,
 		groupSecret int64,
 		signingSecret int64,
 		previousEntryLabel string,
@@ -3713,6 +3743,7 @@ func TestValidateRelayEntryTerminalResult(t *testing.T) {
 		named := altbn128.G1HashToPoint([]byte(namedPreviousEntryLabel))
 
 		rendered, err := participation.BeaconRelayEntryReference(
+			requestStartBlock,
 			altbn128.G2Point{
 				G2: new(bn256.G2).ScalarBaseMult(big.NewInt(groupSecret)),
 			}.Compress(),
@@ -3727,12 +3758,13 @@ func TestValidateRelayEntryTerminalResult(t *testing.T) {
 	}
 
 	tests := map[string]struct {
+		workID    string
 		reference func(t *testing.T) string
 		valid     bool
 	}{
 		"an entry the named group signed over the named previous entry": {
 			reference: func(t *testing.T) string {
-				return reference(t, heldGroupSecret, heldGroupSecret, "seed", "seed")
+				return reference(t, requestStartBlock, heldGroupSecret, heldGroupSecret, "seed", "seed")
 			},
 			valid: true,
 		},
@@ -3740,14 +3772,14 @@ func TestValidateRelayEntryTerminalResult(t *testing.T) {
 		// to and an entry that group never produced.
 		"an entry signed by nobody's threshold key": {
 			reference: func(t *testing.T) string {
-				return reference(t, heldGroupSecret, foreignGroupSecret, "seed", "seed")
+				return reference(t, requestStartBlock, heldGroupSecret, foreignGroupSecret, "seed", "seed")
 			},
 		},
 		// A genuine signature re-pointed at a previous entry it was not made
 		// over would let one relay round's result settle another's permit.
 		"a genuine entry over a different previous entry": {
 			reference: func(t *testing.T) string {
-				return reference(t, heldGroupSecret, heldGroupSecret, "seed", "other-seed")
+				return reference(t, requestStartBlock, heldGroupSecret, heldGroupSecret, "seed", "other-seed")
 			},
 		},
 		// Genuine and self-consistent, but produced by a group this snapshot
@@ -3756,11 +3788,38 @@ func TestValidateRelayEntryTerminalResult(t *testing.T) {
 			reference: func(t *testing.T) string {
 				return reference(
 					t,
+					requestStartBlock,
 					foreignGroupSecret,
 					foreignGroupSecret,
 					"seed",
 					"seed",
 				)
+			},
+		},
+		// The replay the request binding exists for: an entry this node's
+		// group really produced, for a request this permit was not issued
+		// for. The signature is genuine and stays genuine forever, so nothing
+		// but the request it names contradicts it.
+		"a genuine entry answering an earlier request": {
+			reference: func(t *testing.T) string {
+				return reference(t, requestStartBlock-1, heldGroupSecret, heldGroupSecret, "seed", "seed")
+			},
+		},
+		"a genuine entry answering a later request": {
+			reference: func(t *testing.T) string {
+				return reference(t, requestStartBlock+1, heldGroupSecret, heldGroupSecret, "seed", "seed")
+			},
+		},
+		"a permit whose work identity names no relay request": {
+			workID: "wallet-action",
+			reference: func(t *testing.T) string {
+				return reference(t, requestStartBlock, heldGroupSecret, heldGroupSecret, "seed", "seed")
+			},
+		},
+		"a permit whose request is not canonically rendered": {
+			workID: "relay-request-0" + strconv.FormatUint(requestStartBlock, 10),
+			reference: func(t *testing.T) string {
+				return reference(t, requestStartBlock, heldGroupSecret, heldGroupSecret, "seed", "seed")
 			},
 		},
 		"a reference that is not a canonical entry identity": {
@@ -3770,6 +3829,7 @@ func TestValidateRelayEntryTerminalResult(t *testing.T) {
 			reference: func(t *testing.T) string {
 				notAPoint := bytes.Repeat([]byte{0xff}, 64)
 				rendered, err := participation.BeaconRelayEntryReference(
+					requestStartBlock,
 					altbn128.G2Point{
 						G2: new(bn256.G2).ScalarBaseMult(
 							big.NewInt(heldGroupSecret),
@@ -3791,6 +3851,7 @@ func TestValidateRelayEntryTerminalResult(t *testing.T) {
 			reference: func(t *testing.T) string {
 				infinity := make([]byte, 64)
 				rendered, err := participation.BeaconRelayEntryReference(
+					requestStartBlock,
 					altbn128.G2Point{
 						G2: new(bn256.G2).ScalarBaseMult(
 							big.NewInt(heldGroupSecret),
@@ -3809,10 +3870,17 @@ func TestValidateRelayEntryTerminalResult(t *testing.T) {
 
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
+			workID := test.workID
+			if workID == "" {
+				workID = participation.BeaconRelayWorkID(requestStartBlock)
+			}
+
 			violations := validateRelayEntryTerminalResult(
 				0,
+				workID,
 				test.reference(t),
 				beaconGroupKeys,
+				make(map[string]relayEntryClaim),
 			)
 
 			if test.valid && len(violations) != 0 {
@@ -3825,6 +3893,61 @@ func TestValidateRelayEntryTerminalResult(t *testing.T) {
 				t.Fatal("expected the relay entry to be rejected")
 			}
 		})
+	}
+}
+
+// TestValidateRelayEntryTerminalResult_OneEntryAnswersOneRequest asserts a
+// relay result cannot close more than one relay request across the journal.
+//
+// A relay entry is deterministic for a given previous entry, so it belongs to
+// exactly one request; the signature stays valid whatever request it is filed
+// under. Without this the same genuine entry could settle every relay permit a
+// node ever held, which is what the rollback barrier reads as completed work.
+// Memberships of the same request legitimately recover and record the same
+// entry, so those must still pass.
+func TestValidateRelayEntryTerminalResult_OneEntryAnswersOneRequest(
+	t *testing.T,
+) {
+	const (
+		groupSecret             = int64(42)
+		firstRequestStartBlock  = uint64(1_000)
+		secondRequestStartBlock = uint64(2_000)
+	)
+
+	beaconGroupKeys := map[string]struct{}{
+		hex.EncodeToString(altbn128.G2Point{
+			G2: new(bn256.G2).ScalarBaseMult(big.NewInt(groupSecret)),
+		}.Compress()): {},
+	}
+	claimed := make(map[string]relayEntryClaim)
+
+	record := func(outcomeIndex int, requestStartBlock uint64) []string {
+		return validateRelayEntryTerminalResult(
+			outcomeIndex,
+			participation.BeaconRelayWorkID(requestStartBlock),
+			testRelayEntryReference(requestStartBlock, groupSecret, "seed"),
+			beaconGroupKeys,
+			claimed,
+		)
+	}
+
+	if violations := record(0, firstRequestStartBlock); len(violations) != 0 {
+		t.Fatalf("the first use of an entry was rejected: %v", violations)
+	}
+
+	// A second membership of the same request recovers the very same entry.
+	if violations := record(1, firstRequestStartBlock); len(violations) != 0 {
+		t.Errorf(
+			"a second membership of the same request was rejected: %v",
+			violations,
+		)
+	}
+
+	if violations := record(2, secondRequestStartBlock); len(violations) == 0 {
+		t.Error(
+			"an entry already used for one request was accepted as the " +
+				"result of another",
+		)
 	}
 }
 
@@ -3849,7 +3972,7 @@ func TestRunAudit_SelfAttestedEqualOmissionCannotHideRealGatePermit(
 			Ceremony:            string(participation.BeaconRelaySigning),
 			Mode:                participation.ModeSecurityV2.String(),
 			CanonicalStartBlock: 1_000,
-			WorkID:              "relay-request-real-security-v2",
+			WorkID:              participation.BeaconRelayWorkID(1_000),
 			PermitID:            "2",
 			Outcome:             "completed",
 		},

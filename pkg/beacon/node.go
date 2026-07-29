@@ -61,7 +61,7 @@ func beaconRelayPermitIdentity(
 	localPermitID string,
 ) participation.PermitIdentity {
 	return participation.PermitIdentity{
-		WorkID:   fmt.Sprintf("relay-request-%d", requestStartBlock),
+		WorkID:   participation.BeaconRelayWorkID(requestStartBlock),
 		PermitID: localPermitID,
 	}
 }
@@ -526,9 +526,15 @@ func recordRelayTimeoutTerminalOutcome(
 // threshold BLS signature the offline audit can verify against a group public
 // key it decoded from the snapshot's own key material, which no node can
 // produce without that group's threshold key.
+//
+// It names the relay request start block too, because a valid signature says
+// which group signed but not which request the result answers. The gate refuses
+// a record whose request does not match the permit's own, so an entry recovered
+// for one request cannot become another request's result.
 func recordRelayEntryTerminalOutcome(
 	relayLogger log.StandardLogger,
 	permit participation.Permit,
+	relayRequestStartBlock uint64,
 	groupPublicKey []byte,
 	previousEntry []byte,
 	relayEntry []byte,
@@ -553,6 +559,7 @@ func recordRelayEntryTerminalOutcome(
 	}
 
 	reference, err := participation.BeaconRelayEntryReference(
+		relayRequestStartBlock,
 		groupPublicKey,
 		canonicalPreviousEntry.Marshal(),
 		relayEntry,
@@ -970,6 +977,7 @@ func (n *node) generateRelayEntry(
 			recordRelayEntryTerminalOutcome(
 				relayLogger,
 				permit,
+				startBlockHeight,
 				member.Signer.GroupPublicKeyBytesCompressed(),
 				previousEntry,
 				relayEntry,

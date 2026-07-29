@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"math"
 	"math/big"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -167,6 +169,7 @@ func TestPersistenceQuiescenceSnapshotRecorder_PersistsTerminalJournal(
 func TestValidateTerminalOutcome_RejectsUnsupportedEvidence(t *testing.T) {
 	err := ValidateTerminalOutcome(
 		TBTCSigning,
+		testWorkID(TBTCSigning),
 		TerminalOutcomeCompleted,
 		TerminalEvidence{
 			Kind:      TerminalEvidenceKind("fabricated_result"),
@@ -203,6 +206,7 @@ func TestValidateTerminalOutcome_DKGCompletionRequiresExactMembership(
 			}
 			if err := ValidateTerminalOutcome(
 				test.ceremony,
+				testWorkID(test.ceremony),
 				TerminalOutcomeCompleted,
 				evidence,
 			); err == nil {
@@ -215,6 +219,7 @@ func TestValidateTerminalOutcome_DKGCompletionRequiresExactMembership(
 			evidence.MembershipIndex = group.MemberIndex(7)
 			if err := ValidateTerminalOutcome(
 				test.ceremony,
+				testWorkID(test.ceremony),
 				TerminalOutcomeCompleted,
 				evidence,
 			); err != nil {
@@ -233,6 +238,7 @@ func TestValidateTerminalOutcome_RejectsUnauthenticatedDKGExhaustion(
 	for _, ceremony := range []Ceremony{TBTCDKG, BeaconDKG} {
 		err := ValidateTerminalOutcome(
 			ceremony,
+			testWorkID(ceremony),
 			TerminalOutcomeExhausted,
 			TerminalEvidence{Kind: TerminalEvidenceNoThreshold},
 		)
@@ -284,11 +290,28 @@ func TestTerminalResultReference_DomainSeparates(t *testing.T) {
 	}
 }
 
+// testRelayRequestStartBlock is the relay request every relay-flavored fixture
+// in this file answers. Relay evidence is only valid against the permit issued
+// for its own request, so the reference and the work identity have to agree on
+// one block.
+const testRelayRequestStartBlock = uint64(4_100_900)
+
+// testWorkID renders a work identity the given ceremony's permits would carry.
+// Only the beacon relay constrains it: its evidence names the request it
+// answers, and the validator holds that to the request the permit was issued
+// for.
+func testWorkID(ceremony Ceremony) string {
+	if ceremony == BeaconRelaySigning {
+		return BeaconRelayWorkID(testRelayRequestStartBlock)
+	}
+	return "work-identity"
+}
+
 // testCompletedResultReference renders a protocol-result reference the given
 // ceremony accepts. Every ceremony but the beacon relay names a digest of its
-// own result; a relay entry names the group, the previous entry and the entry
-// itself so the offline audit can verify the signature, so no placeholder can
-// stand in for one.
+// own result; a relay entry names the request it answers, the group, the
+// previous entry and the entry itself so the offline audit can verify the
+// signature and bind it to one request, so no placeholder can stand in for one.
 func testCompletedResultReference(
 	t *testing.T,
 	ceremony Ceremony,
@@ -301,6 +324,7 @@ func testCompletedResultReference(
 	}
 
 	reference, err := BeaconRelayEntryReference(
+		testRelayRequestStartBlock,
 		bytes.Repeat([]byte{0x01}, beaconRelayEntryComponentLength),
 		bytes.Repeat([]byte{0x02}, beaconRelayEntryComponentLength),
 		bytes.Repeat([]byte{0x03}, beaconRelayEntryComponentLength),
@@ -324,6 +348,7 @@ func TestTerminalResultReference_IsAcceptedAsEvidence(t *testing.T) {
 	} {
 		if err := ValidateTerminalOutcome(
 			ceremony,
+			testWorkID(ceremony),
 			TerminalOutcomeCompleted,
 			TerminalEvidence{
 				Kind: TerminalEvidenceProtocolResult,
@@ -354,6 +379,7 @@ func TestBeaconRelayEntryReference_RoundTrips(t *testing.T) {
 	entry := bytes.Repeat([]byte{0xc3}, beaconRelayEntryComponentLength)
 
 	reference, err := BeaconRelayEntryReference(
+		testRelayRequestStartBlock,
 		groupPublicKey,
 		previousEntry,
 		entry,
@@ -362,10 +388,18 @@ func TestBeaconRelayEntryReference_RoundTrips(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	parsedGroup, parsedPrevious, parsedEntry, err :=
+	parsedStartBlock, parsedGroup, parsedPrevious, parsedEntry, err :=
 		ParseBeaconRelayEntryReference(reference)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if parsedStartBlock != testRelayRequestStartBlock {
+		t.Errorf(
+			"request start block did not round-trip\n"+
+				"expected: [%d]\nactual:   [%d]",
+			testRelayRequestStartBlock,
+			parsedStartBlock,
+		)
 	}
 	for _, component := range []struct {
 		name     string
@@ -398,6 +432,7 @@ func TestBeaconRelayEntryReference_RoundTrips(t *testing.T) {
 		{name: "short entry", groupPublicKey: groupPublicKey, previousEntry: previousEntry, entry: short},
 	} {
 		if _, err := BeaconRelayEntryReference(
+			testRelayRequestStartBlock,
 			test.groupPublicKey,
 			test.previousEntry,
 			test.entry,
@@ -406,20 +441,161 @@ func TestBeaconRelayEntryReference_RoundTrips(t *testing.T) {
 		}
 	}
 
+	components := hex.EncodeToString(groupPublicKey) + ":" +
+		hex.EncodeToString(previousEntry) + ":" + hex.EncodeToString(entry)
 	for _, test := range []struct {
 		name      string
 		reference string
 	}{
 		{name: "no components", reference: ""},
-		{name: "two components", reference: hex.EncodeToString(groupPublicKey) +
-			":" + hex.EncodeToString(entry)},
-		{name: "four components", reference: reference + ":" +
+		{name: "three components", reference: components},
+		{name: "five components", reference: reference + ":" +
 			hex.EncodeToString(entry)},
 		{name: "uppercase alias", reference: strings.ToUpper(reference)},
 		{name: "prefixed alias", reference: "0x" + reference},
+		// A start block rendered any way but the canonical one names the same
+		// request while comparing unequal to the permit's own rendering, which
+		// is what the binding check reads.
+		{name: "zero-padded start block", reference: "0" + reference},
+		{name: "signed start block", reference: "+" + reference},
+		{name: "hexadecimal start block", reference: "0x" +
+			strconv.FormatUint(testRelayRequestStartBlock, 16) + ":" +
+			components},
+		{name: "non-numeric start block", reference: "block:" + components},
 	} {
-		if _, _, _, err := ParseBeaconRelayEntryReference(
+		if _, _, _, _, err := ParseBeaconRelayEntryReference(
 			test.reference,
+		); err == nil {
+			t.Errorf("expected [%s] to be rejected", test.name)
+		}
+	}
+}
+
+// TestBeaconRelayWorkID_RoundTrips asserts a relay permit's work identity
+// names exactly one request start block and that only the exact rendering the
+// node writes is read back. The audit compares the request a relay entry
+// answers against the request its permit was issued for, so a work identity
+// that parses loosely would let two renderings of one block — or a block that
+// was never rendered at all — pass as agreement.
+func TestBeaconRelayWorkID_RoundTrips(t *testing.T) {
+	for _, startBlock := range []uint64{
+		0,
+		1,
+		testRelayRequestStartBlock,
+		math.MaxUint64,
+	} {
+		workID := BeaconRelayWorkID(startBlock)
+
+		parsed, err := ParseBeaconRelayWorkID(workID)
+		if err != nil {
+			t.Fatalf("work identity [%s] was rejected: [%v]", workID, err)
+		}
+		if parsed != startBlock {
+			t.Errorf(
+				"work identity [%s] did not round-trip\n"+
+					"expected: [%d]\nactual:   [%d]",
+				workID,
+				startBlock,
+				parsed,
+			)
+		}
+	}
+
+	for _, test := range []struct {
+		name   string
+		workID string
+	}{
+		{name: "empty", workID: ""},
+		{name: "no request", workID: "relay-entry-17"},
+		{name: "no start block", workID: "relay-request-"},
+		{name: "zero-padded", workID: "relay-request-017"},
+		{name: "signed", workID: "relay-request-+17"},
+		{name: "negative", workID: "relay-request--17"},
+		{name: "hexadecimal", workID: "relay-request-0x11"},
+		{name: "beyond uint64", workID: "relay-request-18446744073709551616"},
+		{name: "trailing text", workID: "relay-request-17-timeout-monitor"},
+	} {
+		if _, err := ParseBeaconRelayWorkID(test.workID); err == nil {
+			t.Errorf("expected [%s] to be rejected", test.name)
+		}
+	}
+}
+
+// TestValidateTerminalOutcome_RelayEntryIsBoundToItsRequest asserts a relay
+// entry can only settle the permit issued for the request it answers. The
+// consequential direction is a genuine historical entry, which verifies as a
+// threshold signature forever, standing in as the result of an unrelated
+// request whose work this node may never have completed.
+func TestValidateTerminalOutcome_RelayEntryIsBoundToItsRequest(t *testing.T) {
+	relayEvidence := func(startBlock uint64) TerminalEvidence {
+		reference, err := BeaconRelayEntryReference(
+			startBlock,
+			bytes.Repeat([]byte{0xa1}, beaconRelayEntryComponentLength),
+			bytes.Repeat([]byte{0xb2}, beaconRelayEntryComponentLength),
+			bytes.Repeat([]byte{0xc3}, beaconRelayEntryComponentLength),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return TerminalEvidence{
+			Kind:      TerminalEvidenceProtocolResult,
+			Reference: reference,
+		}
+	}
+
+	if err := ValidateTerminalOutcome(
+		BeaconRelaySigning,
+		BeaconRelayWorkID(testRelayRequestStartBlock),
+		TerminalOutcomeCompleted,
+		relayEvidence(testRelayRequestStartBlock),
+	); err != nil {
+		t.Fatalf("an entry answering its own request was rejected: [%v]", err)
+	}
+
+	// The widest reference a real relay round can produce still has to fit the
+	// evidence bound. A bound that no longer admits it would reject genuine
+	// results at the top of the block range as unnameable, which the recorder
+	// reads as no result at all.
+	if err := ValidateTerminalOutcome(
+		BeaconRelaySigning,
+		BeaconRelayWorkID(math.MaxUint64),
+		TerminalOutcomeCompleted,
+		relayEvidence(math.MaxUint64),
+	); err != nil {
+		t.Errorf("the widest relay entry reference was rejected: [%v]", err)
+	}
+
+	for _, test := range []struct {
+		name       string
+		workID     string
+		startBlock uint64
+	}{
+		{
+			name:       "an entry from an earlier request",
+			workID:     BeaconRelayWorkID(testRelayRequestStartBlock),
+			startBlock: testRelayRequestStartBlock - 1,
+		},
+		{
+			name:       "an entry from a later request",
+			workID:     BeaconRelayWorkID(testRelayRequestStartBlock),
+			startBlock: testRelayRequestStartBlock + 1,
+		},
+		{
+			name:       "a permit naming no relay request",
+			workID:     "wallet-action",
+			startBlock: testRelayRequestStartBlock,
+		},
+		{
+			name:       "a permit whose request is not canonically rendered",
+			workID:     "relay-request-0" + strconv.FormatUint(testRelayRequestStartBlock, 10),
+			startBlock: testRelayRequestStartBlock,
+		},
+	} {
+		if err := ValidateTerminalOutcome(
+			BeaconRelaySigning,
+			test.workID,
+			TerminalOutcomeCompleted,
+			relayEvidence(test.startBlock),
 		); err == nil {
 			t.Errorf("expected [%s] to be rejected", test.name)
 		}
@@ -473,6 +649,7 @@ func TestValidateTerminalOutcome_CompletedEvidenceKindIsPinnedPerCeremony(
 
 			err := ValidateTerminalOutcome(
 				ceremony,
+				testWorkID(ceremony),
 				TerminalOutcomeCompleted,
 				evidence,
 			)
@@ -648,6 +825,7 @@ func TestValidateTerminalOutcome_ChainSettlementIsPinnedPerCeremony(
 		}
 		err := ValidateTerminalOutcome(
 			ceremony,
+			testWorkID(ceremony),
 			TerminalOutcomeCompleted,
 			settled,
 		)
@@ -673,6 +851,7 @@ func TestValidateTerminalOutcome_ChainSettlementIsPinnedPerCeremony(
 		}
 		if err := ValidateTerminalOutcome(
 			ceremony,
+			testWorkID(ceremony),
 			TerminalOutcomeCompleted,
 			unknownKind,
 		); err == nil {
@@ -710,6 +889,7 @@ func TestValidateTerminalOutcome_ChainSettlementShapes(t *testing.T) {
 	// identity or hide the dispatch entirely.
 	if err := ValidateTerminalOutcome(
 		TBTCHeartbeat,
+		testWorkID(TBTCHeartbeat),
 		TerminalOutcomeCompleted,
 		heartbeatEvidence(&ChainSettlementRecord{
 			Kind: ChainSettlementInactivityClaim,
@@ -720,6 +900,7 @@ func TestValidateTerminalOutcome_ChainSettlementShapes(t *testing.T) {
 
 	if err := ValidateTerminalOutcome(
 		TBTCHeartbeat,
+		testWorkID(TBTCHeartbeat),
 		TerminalOutcomeCompleted,
 		heartbeatEvidence(&ChainSettlementRecord{
 			Kind:      ChainSettlementInactivityClaim,
@@ -733,6 +914,7 @@ func TestValidateTerminalOutcome_ChainSettlementShapes(t *testing.T) {
 	// so an outcome reporting no result cannot have reached one.
 	if err := ValidateTerminalOutcome(
 		TBTCHeartbeat,
+		testWorkID(TBTCHeartbeat),
 		TerminalOutcomeExhausted,
 		TerminalEvidence{
 			Kind: TerminalEvidenceNoThreshold,

@@ -2486,13 +2486,24 @@ func (r *auditRun) reconcileInactivityClaimSettlements(
 // generator — can produce. The group is required to be one the snapshot itself
 // decoded key material for, because an entry verified under a group this node
 // never belonged to says nothing about what this node did.
+//
+// A signature alone is still only a proof of authorship, and every entry the
+// beacon ever produced keeps that property forever. Two further checks turn it
+// into a proof about this permit's work. The reference must answer the relay
+// request its own permit was issued for, and one entry must answer one request
+// across the whole journal: a relay entry is deterministic for a given previous
+// entry, so a genuine entry standing in as the result of a second request is a
+// replay however well it verifies. Memberships of the same request share their
+// entry legitimately and are not counted against it.
 func validateRelayEntryTerminalResult(
 	outcomeIndex int,
+	workID string,
 	reference string,
 	beaconGroupKeys map[string]struct{},
+	claimedRelayEntries map[string]relayEntryClaim,
 ) []string {
-	groupPublicKeyBytes, previousEntryBytes, entryBytes, err := participation.
-		ParseBeaconRelayEntryReference(reference)
+	referenceStartBlock, groupPublicKeyBytes, previousEntryBytes, entryBytes,
+		err := participation.ParseBeaconRelayEntryReference(reference)
 	if err != nil {
 		return []string{fmt.Sprintf(
 			"node-authored completed beacon relay outcome [%d] names relay "+
@@ -2501,6 +2512,49 @@ func validateRelayEntryTerminalResult(
 			reference,
 			err,
 		)}
+	}
+
+	permitStartBlock, err := participation.ParseBeaconRelayWorkID(workID)
+	if err != nil {
+		return []string{fmt.Sprintf(
+			"node-authored completed beacon relay outcome [%d] belongs to "+
+				"permit work [%s], which names no relay request: [%v]",
+			outcomeIndex,
+			workID,
+			err,
+		)}
+	}
+	if referenceStartBlock != permitStartBlock {
+		return []string{fmt.Sprintf(
+			"node-authored completed beacon relay outcome [%d] names an "+
+				"entry answering request start block [%d], but its permit "+
+				"was issued for request start block [%d]",
+			outcomeIndex,
+			referenceStartBlock,
+			permitStartBlock,
+		)}
+	}
+
+	entryIdentity := hex.EncodeToString(groupPublicKeyBytes) + ":" +
+		hex.EncodeToString(previousEntryBytes) + ":" +
+		hex.EncodeToString(entryBytes)
+	if claimed, replayed := claimedRelayEntries[entryIdentity]; replayed {
+		if claimed.requestStartBlock != referenceStartBlock {
+			return []string{fmt.Sprintf(
+				"node-authored completed beacon relay outcome [%d] answers "+
+					"request start block [%d] with the entry outcome [%d] "+
+					"already answered request start block [%d] with",
+				outcomeIndex,
+				referenceStartBlock,
+				claimed.outcomeIndex,
+				claimed.requestStartBlock,
+			)}
+		}
+	} else {
+		claimedRelayEntries[entryIdentity] = relayEntryClaim{
+			outcomeIndex:      outcomeIndex,
+			requestStartBlock: referenceStartBlock,
+		}
 	}
 
 	groupPublicKey := hex.EncodeToString(groupPublicKeyBytes)
@@ -3614,6 +3668,13 @@ type persistedSignerIdentity struct {
 	membershipIndex group.MemberIndex
 }
 
+// relayEntryClaim records which relay request a recovered entry has already
+// been accepted as the result of, and the outcome that first claimed it.
+type relayEntryClaim struct {
+	outcomeIndex      int
+	requestStartBlock uint64
+}
+
 // cutoverModeViolation applies the release gate's one-value schedule to
 // persisted evidence. It is shared by quiescence records and both quarantine
 // namespaces so completed and interrupted work are judged by the same
@@ -4638,6 +4699,10 @@ func validateNodeTerminalOutcomes(
 	}
 	claimedTBTCSigners := make(map[persistedSignerIdentity]int)
 	claimedBeaconSigners := make(map[persistedSignerIdentity]int)
+	// One relay entry answers one relay request, so the journal-wide record of
+	// which request each entry was already used for is what catches an entry
+	// replayed onto a second request.
+	claimedRelayEntries := make(map[string]relayEntryClaim)
 	tbtcQuarantined := make(map[quarantineIdentity]struct{})
 	for _, quarantined := range auditManifest.TBTCQuarantinedOutputs {
 		tbtcQuarantined[quarantineIdentity{
@@ -4708,6 +4773,7 @@ func validateNodeTerminalOutcomes(
 		if outcome.Outcome != "unresolved" {
 			if err := participation.ValidateTerminalOutcome(
 				outcome.Permit.Ceremony,
+				outcome.Permit.WorkID,
 				outcome.Outcome,
 				outcome.Evidence,
 			); err != nil {
@@ -4814,8 +4880,10 @@ func validateNodeTerminalOutcomes(
 					violations,
 					validateRelayEntryTerminalResult(
 						i,
+						outcome.Permit.WorkID,
 						outcome.Evidence.Reference,
 						beaconGroupKeys,
+						claimedRelayEntries,
 					)...,
 				)
 			default:

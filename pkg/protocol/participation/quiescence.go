@@ -57,14 +57,19 @@ type PermitIdentity struct {
 
 const (
 	maxPermitIdentityComponentLength = 256
+	// maxDecimalUint64Length is the width of the widest decimal uint64.
+	maxDecimalUint64Length = len("18446744073709551615")
 	// maxTerminalEvidenceReferenceLength bounds a terminal evidence reference.
 	// It is wider than a permit identity component because one evidence class
 	// is verifiable rather than merely nameable: a beacon relay entry carries
 	// the group public key, the previous entry and the entry as public curve
 	// points precisely so the offline audit can check the signature instead of
-	// taking the node's word for the result. Three 64-byte components in hex
-	// with their separators is the widest reference any ceremony produces.
-	maxTerminalEvidenceReferenceLength = 3*2*beaconRelayEntryComponentLength + 2
+	// taking the node's word for the result, alongside the decimal start block
+	// of the request it answers so that proof is bound to one request. Those
+	// four components with their separators is the widest reference any
+	// ceremony produces.
+	maxTerminalEvidenceReferenceLength = maxDecimalUint64Length +
+		3*2*beaconRelayEntryComponentLength + 3
 )
 
 // validateNonsecretToken applies the shared shape of every identity and
@@ -416,19 +421,74 @@ func ParseInactivityClaimSettlementReference(
 // previous entry, and a marshaled recovered entry are all 64 bytes.
 const beaconRelayEntryComponentLength = 64
 
+// beaconRelayWorkIDPrefix labels the work every beacon relay permit for one
+// on-chain relay request shares. The request's start block completes it, so
+// every membership, the forwarder and the timeout monitor of a single request
+// name the same work while distinct requests never can.
+const beaconRelayWorkIDPrefix = "relay-request-"
+
+// BeaconRelayWorkID renders the work identity of every permit issued for the
+// relay request that started at the given block.
+func BeaconRelayWorkID(relayRequestStartBlock uint64) string {
+	return beaconRelayWorkIDPrefix +
+		strconv.FormatUint(relayRequestStartBlock, 10)
+}
+
+// ParseBeaconRelayWorkID recovers the relay request start block from a work
+// identity produced by BeaconRelayWorkID. Only that exact rendering is
+// accepted, so a zero-padded or signed alias cannot name a request the audit
+// would then compare against a differently rendered one and read as a
+// different request.
+func ParseBeaconRelayWorkID(workID string) (uint64, error) {
+	blockText, found := strings.CutPrefix(workID, beaconRelayWorkIDPrefix)
+	if !found {
+		return 0, fmt.Errorf(
+			"beacon relay work identity [%s] does not name a relay request",
+			workID,
+		)
+	}
+
+	startBlock, err := strconv.ParseUint(blockText, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf(
+			"beacon relay work identity [%s] does not name a relay request "+
+				"start block: [%v]",
+			workID,
+			err,
+		)
+	}
+	if strconv.FormatUint(startBlock, 10) != blockText {
+		return 0, fmt.Errorf(
+			"beacon relay work identity [%s] start block is not canonically "+
+				"encoded",
+			workID,
+		)
+	}
+
+	return startBlock, nil
+}
+
 // BeaconRelayEntryReference renders the canonical identity of a recovered
-// relay entry: the group that signed it, the previous entry it signed over,
-// and the entry itself.
+// relay entry: the relay request it answers, the group that signed it, the
+// previous entry it signed over, and the entry itself.
 //
 // Unlike every other protocol result, this identity is not a digest. A relay
 // entry is a threshold BLS signature by the group over the previous entry, and
-// all three components are public beacon state that the chain publishes
-// anyway. Carrying them in the clear is what lets the offline audit verify the
-// pairing itself: an entry that verifies under a group public key the snapshot
-// holds cannot have been authored by anything but that group's threshold key,
-// so the node's word is not what makes the record true. A digest would prove
-// only that the node was consistent with itself.
+// every component is public beacon state that the chain publishes anyway.
+// Carrying them in the clear is what lets the offline audit verify the pairing
+// itself: an entry that verifies under a group public key the snapshot holds
+// cannot have been authored by anything but that group's threshold key, so the
+// node's word is not what makes the record true. A digest would prove only that
+// the node was consistent with itself.
+//
+// The request start block leads the identity because the signature alone says
+// which group produced an entry, not which request that entry answers. Naming
+// the request inside the reference is what lets the audit hold the record to
+// the permit that authorized it and to one request only: a genuine historical
+// entry lifted onto an unrelated permit still verifies as a signature, and
+// without this component nothing about the record contradicts it.
 func BeaconRelayEntryReference(
+	relayRequestStartBlock uint64,
 	groupPublicKey []byte,
 	previousEntry []byte,
 	entry []byte,
@@ -451,63 +511,88 @@ func BeaconRelayEntryReference(
 		}
 	}
 
-	return hex.EncodeToString(groupPublicKey) + ":" +
+	return strconv.FormatUint(relayRequestStartBlock, 10) + ":" +
+		hex.EncodeToString(groupPublicKey) + ":" +
 		hex.EncodeToString(previousEntry) + ":" +
 		hex.EncodeToString(entry), nil
 }
 
-// ParseBeaconRelayEntryReference recovers the group public key, previous entry
-// and recovered entry from a reference produced by BeaconRelayEntryReference.
-// Only that exact rendering is accepted: an uppercase or prefixed alias would
-// name the same entry while failing every comparison the audit makes against
-// the group identities it decoded, which is indistinguishable from naming no
-// group at all.
-func ParseBeaconRelayEntryReference(
-	reference string,
-) (groupPublicKey []byte, previousEntry []byte, entry []byte, err error) {
+// ParseBeaconRelayEntryReference recovers the relay request start block, group
+// public key, previous entry and recovered entry from a reference produced by
+// BeaconRelayEntryReference. Only that exact rendering is accepted: an
+// uppercase, prefixed or zero-padded alias would name the same entry while
+// failing every comparison the audit makes against the group identities it
+// decoded and the request its permit names, which is indistinguishable from
+// naming no group and no request at all.
+func ParseBeaconRelayEntryReference(reference string) (
+	relayRequestStartBlock uint64,
+	groupPublicKey []byte,
+	previousEntry []byte,
+	entry []byte,
+	err error,
+) {
 	parts := strings.Split(reference, ":")
-	if len(parts) != 3 {
-		return nil, nil, nil, fmt.Errorf(
-			"relay entry reference [%s] is not a group, previous entry and "+
-				"entry triple",
+	if len(parts) != 4 {
+		return 0, nil, nil, nil, fmt.Errorf(
+			"relay entry reference [%s] is not a request start block, group, "+
+				"previous entry and entry quadruple",
 			reference,
 		)
 	}
 
-	decoded := make([][]byte, 0, len(parts))
+	startBlock, err := strconv.ParseUint(parts[0], 10, 64)
+	if err != nil {
+		return 0, nil, nil, nil, fmt.Errorf(
+			"relay entry reference request start block [%s] is not an "+
+				"unsigned decimal integer: [%v]",
+			parts[0],
+			err,
+		)
+	}
+	if strconv.FormatUint(startBlock, 10) != parts[0] {
+		return 0, nil, nil, nil, fmt.Errorf(
+			"relay entry reference request start block [%s] is not "+
+				"canonically encoded",
+			parts[0],
+		)
+	}
+
+	decoded := make([][]byte, 0, 3)
 	for i, name := range []string{
 		"group public key",
 		"previous entry",
 		"entry",
 	} {
-		value, err := hex.DecodeString(parts[i])
+		part := parts[i+1]
+
+		value, err := hex.DecodeString(part)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf(
+			return 0, nil, nil, nil, fmt.Errorf(
 				"relay entry reference %s [%s] is not hex: [%v]",
 				name,
-				parts[i],
+				part,
 				err,
 			)
 		}
 		if len(value) != beaconRelayEntryComponentLength {
-			return nil, nil, nil, fmt.Errorf(
+			return 0, nil, nil, nil, fmt.Errorf(
 				"relay entry reference %s [%s] is not %d bytes",
 				name,
-				parts[i],
+				part,
 				beaconRelayEntryComponentLength,
 			)
 		}
-		if hex.EncodeToString(value) != parts[i] {
-			return nil, nil, nil, fmt.Errorf(
+		if hex.EncodeToString(value) != part {
+			return 0, nil, nil, nil, fmt.Errorf(
 				"relay entry reference %s [%s] is not canonically encoded",
 				name,
-				parts[i],
+				part,
 			)
 		}
 		decoded = append(decoded, value)
 	}
 
-	return decoded[0], decoded[1], decoded[2], nil
+	return startBlock, decoded[0], decoded[1], decoded[2], nil
 }
 
 // TerminalResultReference derives the nonsecret, stable identity of a protocol
@@ -565,11 +650,13 @@ type TerminalOutcomeJournal struct {
 }
 
 // ValidateTerminalOutcome checks that an outcome and its evidence have a
-// supported shape for the owning ceremony. The live gate and the offline
-// state audit use this same validator so corrupted journal data cannot exploit
-// schema drift between issuance and reconciliation.
+// supported shape for the owning ceremony, and that evidence naming the work
+// it settles names the work the permit was issued for. The live gate and the
+// offline state audit use this same validator so corrupted journal data cannot
+// exploit schema drift between issuance and reconciliation.
 func ValidateTerminalOutcome(
 	ceremony Ceremony,
+	workID string,
 	outcome TerminalOutcome,
 	evidence TerminalEvidence,
 ) error {
@@ -701,10 +788,33 @@ func ValidateTerminalOutcome(
 		// verifiable rather than merely well formed, so a malformed one is
 		// rejected here instead of reaching an audit that could not check it.
 		if ceremony == BeaconRelaySigning {
-			if _, _, _, err := ParseBeaconRelayEntryReference(
+			referenceStartBlock, _, _, _, err := ParseBeaconRelayEntryReference(
 				evidence.Reference,
-			); err != nil {
+			)
+			if err != nil {
 				return fmt.Errorf("invalid relay entry reference: [%w]", err)
+			}
+
+			// The permit authorizes work on exactly one relay request, so an
+			// entry answering a different one settles nothing this permit was
+			// issued for. Refusing the pair here means a node cannot write the
+			// mismatch at all: a genuine entry from another request cannot be
+			// lifted onto this permit and still be recorded.
+			permitStartBlock, err := ParseBeaconRelayWorkID(workID)
+			if err != nil {
+				return fmt.Errorf(
+					"relay entry evidence cannot be bound to its permit: [%w]",
+					err,
+				)
+			}
+			if referenceStartBlock != permitStartBlock {
+				return fmt.Errorf(
+					"relay entry reference answers request start block [%d], "+
+						"but the permit was issued for request start block "+
+						"[%d]",
+					referenceStartBlock,
+					permitStartBlock,
+				)
 			}
 		}
 	}

@@ -58,6 +58,7 @@ func assertRecordedTerminalOutcome(
 
 	if err := participation.ValidateTerminalOutcome(
 		permit.Ceremony(),
+		permit.WorkID(),
 		recorded[0].outcome,
 		recorded[0].evidence,
 	); err != nil {
