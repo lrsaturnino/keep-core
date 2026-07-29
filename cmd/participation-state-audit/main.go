@@ -3381,13 +3381,18 @@ func relayGroupKeyHash(compressedGroupPublicKey []byte) (string, error) {
 // the group signs under. Together they turn the node's claim into one the chain
 // can refuse.
 //
-// Absence is not a contradiction. Evidence gathered around a request carries no
-// reason to include the receipt that registered a group blocks or months
-// earlier, and failing a completed ceremony over a log that is merely not in
-// the bundle would refuse honest nodes. What is refused is evidence that
-// contradicts itself or the record: a request selecting two groups, a group
-// registered under two keys, or a selected group whose registered key is not
-// the one the record names.
+// Both halves of that join are mandatory. The registration that binds a group
+// is older than the request — blocks or months older — so an evidence bundle
+// gathered around the request has no reason to carry it unless the generator is
+// told to go and fetch it, and that is exactly what the generator contract now
+// requires. Treating its absence as consent would leave the whole join
+// optional: a node closing a selected group's permit with another of its
+// groups' entries need only hand in evidence without the registration, which is
+// the shape an honest bundle would have had. So a missing selection or a
+// missing registration blocks, alongside evidence that contradicts itself or
+// the record — a request selecting two groups, a group registered under two
+// keys, or a selected group whose registered key is not the one the record
+// names.
 func relayEntryGroupSelectionViolation(
 	logs *relayEntryLifecycleLogs,
 	outcomeIndex int,
@@ -3407,7 +3412,15 @@ func relayEntryGroupSelectionViolation(
 	}
 	selectedGroup, selected := logs.requestGroups[requestID]
 	if !selected {
-		return ""
+		return fmt.Sprintf(
+			"node-authored outcome [%d] reports relay entry [%s], but no "+
+				"authenticated RandomBeacon RelayEntryRequested log names the "+
+				"group selected to answer request [%s], so nothing says the "+
+				"entry came from the group the beacon asked",
+			outcomeIndex,
+			reference,
+			requestID,
+		)
 	}
 
 	if _, ambiguous :=
@@ -3424,7 +3437,16 @@ func relayEntryGroupSelectionViolation(
 	}
 	registeredKeyHash, registered := logs.registeredGroupKeys[selectedGroup]
 	if !registered {
-		return ""
+		return fmt.Sprintf(
+			"node-authored outcome [%d] reports relay entry [%s], but no "+
+				"authenticated RandomBeacon GroupRegistered log registers "+
+				"group [%s] — the group request [%s] selected — so the key "+
+				"the entry names is bound to no selected group",
+			outcomeIndex,
+			reference,
+			selectedGroup,
+			requestID,
+		)
 	}
 
 	namedKeyHash, err := relayGroupKeyHash(compressedGroupPublicKey)
@@ -3478,7 +3500,10 @@ func relayEntryGroupSelectionViolation(
 // several groups can otherwise close a selected group's permit with an entry a
 // different one of its groups produced over the same previous entry, which
 // verifies and answers this very request but records work by a group that did
-// none.
+// none. The selection names a registry index rather than a key, so the
+// GroupRegistered receipt that binds that index is required as well: without it
+// the index binds nothing, and leaving it out would be the cheapest way to skip
+// the check entirely.
 //
 // Where the beacon accepted an entry for that request, it must be the entry the
 // node named. A submission is not required, though: a group's threshold

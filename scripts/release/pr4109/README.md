@@ -119,9 +119,22 @@ the very previous entry the record names, and where a `RelayEntrySubmitted` log
 accepted an entry for that request it must be the entry the node named. A
 submission is not required — the group's threshold recovers the entry whoever
 publishes it, and a submission that reverted or lost the race says nothing about
-the ceremony — but a missing or contradicted request does block. The generator
-must therefore include the beacon's relay request, submission, and timeout
-receipts for every relay permit the drained node recorded a result for.
+the ceremony — but a missing or contradicted request does block.
+
+That request also names the group the beacon selected, and the entry must be
+that group's. Relay entries are deterministic, so an entry another group the
+node holds a membership of produced over the same previous entry is a real
+signature that verifies and answers this very request, while recording work the
+selected group never did. The selection names a registry index, and only the
+`GroupRegistered` log binds that index to the hash of the key the group signs
+under, so **the selected group's registration receipt is required too** — it is
+older than the request, often by months, and is the one receipt that gathering
+evidence around the request will not produce by itself. Omitting it blocks
+rollback rather than passing, because an omission that waived the check would be
+indistinguishable from the omission an attacker needs. The generator must
+therefore include the beacon's relay request, submission, and timeout receipts
+for every relay permit the drained node recorded a result for, plus the
+`GroupRegistered` receipt of the group each of those requests selected.
 
 The rollback rehearsal runs that audit **twice over the same snapshot**, and
 the order is the whole point. Every external record must carry the audited

@@ -371,6 +371,12 @@ func testTerminalOutcomeRecord(
 // decoded rather than merely well-formed ones.
 const testActiveGroupSecret = int64(42)
 
+// testFixtureSelectedGroupID is the registry index the fixture beacon selects
+// for every relay request it logs. It is the index the group behind
+// testActiveGroupSecret is registered under, since the audit refuses a
+// completed entry whose key is not the one the selected index is bound to.
+const testFixtureSelectedGroupID = uint64(1)
+
 // testRelayEntryReference derives a relay entry identity from a fixture label,
 // signed for real by the given group. Passing the group's own secret is what
 // makes the reference survive the audit's signature verification: the check is
@@ -894,8 +900,34 @@ func addTestBeaconRelayLogs(
 			"RelayEntryRequested",
 			testRelayRequestID(startBlock),
 			startBlock,
-			uint64(1),
+			testFixtureSelectedGroupID,
 			previousEntry,
+		)
+	}
+
+	// Every request above selects the one group these fixtures sign under, and
+	// the audit holds a completed entry to the key that group is registered
+	// against, so the registration has to be in the bundle for a corroborated
+	// entry to settle at all. One registration covers every request: the
+	// receipt is the group's, not the round's.
+	registered := false
+	registerSigningGroup := func() {
+		t.Helper()
+
+		if registered {
+			return
+		}
+		registered = true
+
+		addTestGroupRegisteredReceipt(
+			t,
+			record,
+			testRandomBeaconAddress,
+			testFixtureSelectedGroupID,
+			new(bn256.G2).ScalarBaseMult(
+				big.NewInt(testActiveGroupSecret),
+			).Marshal(),
+			uint64(1),
 		)
 	}
 
@@ -911,6 +943,7 @@ func addTestBeaconRelayLogs(
 				continue
 			}
 			addRequest(startBlock, previousEntry)
+			registerSigningGroup()
 		case participation.BeaconTimeoutReport:
 			startBlock, requestID, terminatedGroupID, err := participation.
 				ParseBeaconRelayTimeoutSettlementReference(
@@ -5841,6 +5874,36 @@ func TestValidateChainReconciliationEvidence_RelayEntryResult(t *testing.T) {
 		)
 	}
 
+	// The selected group's registration is what binds the index the request
+	// names to the key the record signs under, and the audit requires it, so
+	// every case that is meant to settle has to supply it.
+	addRegistration := func(
+		t *testing.T,
+		record *chainReconciliationEvidence,
+		groupID uint64,
+		secret int64,
+	) {
+		t.Helper()
+
+		addTestGroupRegisteredReceipt(
+			t,
+			record,
+			testRandomBeaconAddress,
+			groupID,
+			onChainGroupPublicKey(secret),
+			requestStartBlock-100,
+		)
+	}
+
+	addSelectedRegistration := func(
+		t *testing.T,
+		record *chainReconciliationEvidence,
+	) {
+		t.Helper()
+
+		addRegistration(t, record, selectedGroupID, groupSecret)
+	}
+
 	addSubmission := func(
 		t *testing.T,
 		record *chainReconciliationEvidence,
@@ -5905,6 +5968,7 @@ func TestValidateChainReconciliationEvidence_RelayEntryResult(t *testing.T) {
 	t.Run("entry answering the permit's own request", func(t *testing.T) {
 		run, record := newRunAndRecord()
 		addRequest(t, record, requestID, requestStartBlock, previousEntry)
+		addSelectedRegistration(t, record)
 		assertSettles(t, validate(t, run, record))
 	})
 
@@ -6055,22 +6119,77 @@ func TestValidateChainReconciliationEvidence_RelayEntryResult(t *testing.T) {
 		)
 	})
 
-	// Evidence gathered around a request has no reason to carry the receipt
-	// that registered its group, which may be blocks or months older. A group
-	// registration for some other group binds nothing here, and refusing the
-	// ceremony over a log that is merely absent would fail honest nodes.
+	// The registration is older than the request, so nothing about gathering
+	// evidence around the request produces it — the generator has to be told to
+	// fetch it, and the contract says so. A registration for some other group
+	// binds the selected index to nothing, which is the same position as having
+	// supplied none at all.
 	t.Run("registration of an unrelated group", func(t *testing.T) {
 		run, record := newRunAndRecord()
 		addRequest(t, record, requestID, requestStartBlock, previousEntry)
-		addTestGroupRegisteredReceipt(
+		addRegistration(t, record, otherGroupID, otherGroupSecret)
+		assertBlockedBy(
+			t,
+			validate(t, run, record),
+			"no authenticated RandomBeacon GroupRegistered log registers "+
+				"group [1]",
+		)
+	})
+
+	// The discriminating case. Everything here is exactly what an honest
+	// bundle looks like — a real request at the permit's block, a real
+	// threshold entry over its previous entry that the pairing check accepts —
+	// except that the group which produced the entry is not the one the beacon
+	// selected. Nothing in the bundle says so, because the receipt that would
+	// have said so is the one left out. Were absence read as consent, omitting
+	// it would be all it takes to close a selected group's permit with another
+	// group's work.
+	t.Run("wrong group with the registration omitted", func(t *testing.T) {
+		run, record := newRunAndRecord()
+		addRequestFromGroup(
 			t,
 			record,
-			testRandomBeaconAddress,
+			requestID,
+			requestStartBlock,
 			otherGroupID,
-			onChainGroupPublicKey(otherGroupSecret),
-			requestStartBlock-100,
+			previousEntry,
 		)
-		assertSettles(t, validate(t, run, record))
+		assertBlockedBy(
+			t,
+			validate(t, run, record),
+			"no authenticated RandomBeacon GroupRegistered log registers "+
+				"group [7]",
+		)
+	})
+
+	// The same omission on the selection side. Every log that indexes a request
+	// identity also records the group it selected, so the audit's own decoder
+	// cannot produce this pair; the join is asked directly rather than through
+	// evidence that cannot express it. It still has to block, because what
+	// makes the selection mandatory is that an entry with no selected group to
+	// be held to is exactly the entry that was never checked.
+	t.Run("request naming no selected group", func(t *testing.T) {
+		violation := relayEntryGroupSelectionViolation(
+			&relayEntryLifecycleLogs{
+				requestGroups:               make(map[string]string),
+				ambiguousRequestGroups:      make(map[string]struct{}),
+				registeredGroupKeys:         make(map[string]string),
+				ambiguousGroupRegistrations: make(map[string]struct{}),
+			},
+			0,
+			reference,
+			requestID.String(),
+			nil,
+		)
+		if !strings.Contains(
+			violation,
+			"names the group selected to answer request",
+		) {
+			t.Fatalf(
+				"expected an unselected group to block, got: [%s]",
+				violation,
+			)
+		}
 	})
 
 	t.Run("two requests sharing one identity", func(t *testing.T) {
@@ -6093,6 +6212,7 @@ func TestValidateChainReconciliationEvidence_RelayEntryResult(t *testing.T) {
 	t.Run("submission accepting the entry the node named", func(t *testing.T) {
 		run, record := newRunAndRecord()
 		addRequest(t, record, requestID, requestStartBlock, previousEntry)
+		addSelectedRegistration(t, record)
 		addSubmission(t, record, entry)
 		assertSettles(t, validate(t, run, record))
 	})
@@ -6100,6 +6220,7 @@ func TestValidateChainReconciliationEvidence_RelayEntryResult(t *testing.T) {
 	t.Run("submission accepting a different entry", func(t *testing.T) {
 		run, record := newRunAndRecord()
 		addRequest(t, record, requestID, requestStartBlock, previousEntry)
+		addSelectedRegistration(t, record)
 		addSubmission(
 			t,
 			record,
@@ -6115,6 +6236,7 @@ func TestValidateChainReconciliationEvidence_RelayEntryResult(t *testing.T) {
 	t.Run("two submissions accepting different entries", func(t *testing.T) {
 		run, record := newRunAndRecord()
 		addRequest(t, record, requestID, requestStartBlock, previousEntry)
+		addSelectedRegistration(t, record)
 		addSubmission(t, record, entry)
 		addSubmission(
 			t,
@@ -6136,6 +6258,7 @@ func TestValidateChainReconciliationEvidence_RelayEntryResult(t *testing.T) {
 	t.Run("recovered entry no submission answers", func(t *testing.T) {
 		run, record := newRunAndRecord()
 		addRequest(t, record, requestID, requestStartBlock, previousEntry)
+		addSelectedRegistration(t, record)
 		addTestRelayEntryReceipt(
 			t,
 			record,
