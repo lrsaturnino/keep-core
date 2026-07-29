@@ -1,6 +1,7 @@
 package beacon
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -581,52 +582,87 @@ func relayEntryTimeoutReportResolutionDeadline(
 	return currentBlock + relayEntryTimeoutReportResolutionBlocks, nil
 }
 
-// relayRequestDeparture is what one read of the beacon's in-flight slot says
-// about the relay request a timeout report was filed against.
+// relayRequestDeparture is what one read of the beacon's canonical relay
+// request state says about the request a timeout report was filed against.
 type relayRequestDeparture int
 
 const (
-	// relayRequestHeld means the reported request still occupies the slot, so
-	// the filed report has not taken effect yet.
+	// relayRequestHeld means the reported request still occupies the slot at
+	// the start block it was requested at, so the filed report has not taken
+	// effect yet.
 	relayRequestHeld relayRequestDeparture = iota
-	// relayRequestReleased means the slot stands empty. Nothing but the report
-	// and a delivered entry can empty it, so paired with an entry subscription
-	// that saw no delivery this is the report's own effect.
+	// relayRequestRetried means the beacon holds a request re-anchored past the
+	// reported one and still built on the reported request's own previous
+	// entry. Accepting a timeout report is the only thing that re-anchors a
+	// request without advancing the relay, so this is the beacon's own record
+	// that the penalty exists.
+	relayRequestRetried
+	// relayRequestSucceeded means the beacon holds a request built on a
+	// different previous entry. The relay's previous entry advances only when
+	// an entry is delivered, so the reported request was answered rather than
+	// penalized.
+	relayRequestSucceeded
+	// relayRequestReleased means the slot stands empty. A delivered entry and
+	// the timeout path that finds no group to retry with both leave it that
+	// way, and nothing in the empty slot tells the two apart; only the next
+	// request naming its previous entry does.
 	relayRequestReleased
-	// relayRequestSuperseded means another request occupies the slot. The
-	// reported one is over, but a request only opens after the previous one
-	// closed, so this reading cannot tell a settled report from a delivered
-	// entry whose event this node missed.
-	relayRequestSuperseded
 )
 
 // relayTimeoutReportSettled asks the beacon whether the relay request this
-// monitor reported a timeout for left the in-flight slot *because of the
-// report*, which is the beacon's own record that a penalty exists rather than
-// the node's.
+// monitor reported a timeout for was penalized *because of the report*, which
+// is the beacon's own record that a penalty exists rather than the node's.
 //
-// Departure alone does not say that. A relay entry delivered late empties the
-// same slot the report would, and the request that follows it looks from the
-// outside exactly like the request that follows an accepted report. The monitor
-// therefore keeps its relay-entry subscription open across this reconciliation
-// and passes it in here: an entry observed at any point during the window means
-// the group delivered, and a slot handed to a different request is ambiguous on
-// its face. Only an empty slot with no entry seen leaves the report as the one
-// explanation.
+// Departure from the in-flight slot does not say that, and neither does the
+// absence of a delivery on this node's subscription. A relay entry delivered
+// late empties the very same slot an accepted report empties, and the event
+// carrying that delivery reaches the node's callback strictly after the state
+// read that observed the emptied slot can return. Reading an empty slot plus a
+// quiet channel as the penalty therefore claims a penalty on the strength of an
+// event not having arrived yet.
+//
+// What the beacon does expose is the relay's own previous entry. Accepting a
+// timeout report re-anchors the reported request onto a fresh group at a new
+// start block and leaves the previous entry exactly where it was; delivering an
+// entry advances the previous entry and every request opened afterwards is
+// built on the new one. So a request holding the beacon past the reported start
+// block, still built on the previous entry the reported request was signing
+// over, is a state only an accepted report produces. That reading is the sole
+// settled one, and it is taken from canonical chain state alone — no ordering
+// between this node's state reads and its event deliveries can manufacture it.
+//
+// The subscription is still read, but only to refuse faster: an entry seen at
+// any point ends the reconciliation against the report. It can never be what
+// establishes one.
 //
 // Every other reading is a refusal to claim the penalty: an unreadable beacon,
 // a chain that does not expose the request state at all, a request still
-// holding the slot when the wait runs out, and a resolution bound that cannot
-// be represented all leave the permit exhausted. That direction is the safe one
-// — the rollback barrier exists to hold a penalty nobody can account for, so an
-// unproven report has to keep holding it.
+// holding the slot when the wait runs out, an empty slot no successor request
+// has yet explained, and a resolution bound that cannot be represented all
+// leave the permit exhausted. That direction is the safe one — the rollback
+// barrier exists to hold a penalty nobody can account for, so an unproven
+// report has to keep holding it.
 func (n *node) relayTimeoutReportSettled(
 	ctx context.Context,
 	monitorLogger log.StandardLogger,
 	blockCounter chain.BlockCounter,
 	relayRequestBlockNumber uint64,
+	relayRequestPreviousEntry []byte,
 	entries <-chan *event.RelayEntrySubmitted,
 ) bool {
+	// Without the reported request's own previous entry there is nothing to
+	// compare the beacon's against, so no reading could ever be the settled
+	// one. Refusing here says that plainly instead of polling to a deadline.
+	if len(relayRequestPreviousEntry) == 0 {
+		monitorLogger.Warnf(
+			"the relay request of block [%v] names no previous entry; the "+
+				"filed timeout report cannot be reconciled against the beacon "+
+				"and is not claimed as settled",
+			relayRequestBlockNumber,
+		)
+		return false
+	}
+
 	// entryDelivered reports whether the group submitted a relay entry. The
 	// read is non-blocking: the subscription's buffered channel holds a
 	// delivery that arrived while this loop was elsewhere, and an empty channel
@@ -672,10 +708,31 @@ func (n *node) relayTimeoutReportSettled(
 			)
 		}
 
-		if startBlock.Uint64() != relayRequestBlockNumber {
-			return relayRequestSuperseded, nil
+		if startBlock.Uint64() == relayRequestBlockNumber {
+			return relayRequestHeld, nil
 		}
-		return relayRequestHeld, nil
+
+		// The beacon moved past the reported request. Its previous entry is
+		// what says whether it moved because the relay advanced or because the
+		// report re-anchored the same request.
+		previousEntry, err := n.beaconChain.CurrentRequestPreviousEntry()
+		if err != nil {
+			return relayRequestHeld, fmt.Errorf(
+				"cannot read the current relay request previous entry: [%w]",
+				err,
+			)
+		}
+		if len(previousEntry) == 0 {
+			return relayRequestHeld, fmt.Errorf(
+				"the beacon reported no previous entry for the relay request " +
+					"holding it",
+			)
+		}
+
+		if !bytes.Equal(previousEntry, relayRequestPreviousEntry) {
+			return relayRequestSucceeded, nil
+		}
+		return relayRequestRetried, nil
 	}
 
 	currentBlock, err := blockCounter.CurrentBlock()
@@ -713,21 +770,24 @@ func (n *node) relayTimeoutReportSettled(
 			return false
 		}
 		switch departure {
-		case relayRequestReleased:
-			// The slot is empty. One last read of the subscription closes the
-			// race where the entry that emptied it is still in flight to this
-			// node between the two observations.
-			return !entryDelivered()
-		case relayRequestSuperseded:
+		case relayRequestRetried:
+			// The beacon handed the reported request to another group without
+			// advancing the relay. Nothing but an accepted timeout report does
+			// that, so the penalty is the beacon's own record now.
+			return true
+		case relayRequestSucceeded:
 			monitorLogger.Warnf(
-				"the beacon moved on from the relay request of block [%v] to "+
-					"another one; what ended the reported request cannot be "+
-					"told apart from a delivered entry, so the filed timeout "+
-					"report is not claimed as settled",
+				"the beacon advanced past the previous entry the relay "+
+					"request of block [%v] was signing over; the group "+
+					"delivered, so the filed timeout report is not claimed "+
+					"as settled",
 				relayRequestBlockNumber,
 			)
 			return false
 		}
+		// A held request has not resolved yet and an empty slot is not
+		// decidable until a successor request names its previous entry, so
+		// both keep polling to the bound.
 
 		height, err := blockCounter.CurrentBlock()
 		if err != nil {
@@ -741,9 +801,9 @@ func (n *node) relayTimeoutReportSettled(
 		}
 		if height >= deadline {
 			monitorLogger.Warnf(
-				"the relay request of block [%v] still holds the beacon at "+
-					"block [%v]; the filed timeout report is not claimed as "+
-					"settled",
+				"the beacon did not record a penalty for the relay request "+
+					"of block [%v] by block [%v]; the filed timeout report is "+
+					"not claimed as settled",
 				relayRequestBlockNumber,
 				height,
 			)
@@ -977,7 +1037,12 @@ func (n *node) ResumeSigningIfEligible() {
 // request block: a timeout report is a penalty commit, so a legacy permit
 // cannot report at or after the cutover block and no permit can report once
 // quiescence begins.
+//
+// The previous entry the monitored request is signing over is carried along
+// because it, and not the in-flight slot, is what tells an accepted timeout
+// report apart from a late delivery once the report has been filed.
 func (n *node) MonitorRelayEntry(
+	relayRequestPreviousEntry []byte,
 	relayRequestBlockNumber uint64,
 ) {
 	logger.Infof("monitoring chain for a new relay entry")
@@ -1102,6 +1167,7 @@ func (n *node) MonitorRelayEntry(
 				logger,
 				blockCounter,
 				relayRequestBlockNumber,
+				relayRequestPreviousEntry,
 				onEntrySubmittedChannel,
 			)
 			return

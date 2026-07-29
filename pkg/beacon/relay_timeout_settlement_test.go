@@ -14,7 +14,22 @@ import (
 	"github.com/keep-network/keep-core/pkg/chain"
 )
 
-// relayStateChain answers only the two relay request reads the timeout report
+// reportedPreviousEntry is the previous entry the relay request under test is
+// signing over. relayedPreviousEntry is what the beacon's previous entry
+// becomes once that request is answered — a distinct value, because the relay
+// advances only by a delivered entry.
+var (
+	reportedPreviousEntry = []byte("previous-entry-of-the-reported-request")
+	relayedPreviousEntry  = []byte("previous-entry-after-a-delivered-entry")
+)
+
+// errUnscriptedPreviousEntry is what the scripted chain answers when a test did
+// not script the previous entry read. Reaching it means the reconciliation
+// consulted state the test did not intend it to, which must not read as a
+// deliberate outcome.
+var errUnscriptedPreviousEntry = errors.New("previous entry not scripted")
+
+// relayStateChain answers only the three relay request reads the timeout report
 // reconciliation makes. Every other method of the beacon interface is left to
 // the embedded nil interface, so a reconciliation that reached for anything
 // else would fail the test loudly instead of silently widening what it trusts.
@@ -28,6 +43,7 @@ type relayStateChain struct {
 
 	inProgress    func(read int) (bool, error)
 	startBlock    func(read int) (*big.Int, error)
+	previousEntry func(read int) ([]byte, error)
 	inProgressErr error
 
 	// entries is the delivery channel the reconciliation reads. onRead lets a
@@ -57,6 +73,22 @@ func (c *relayStateChain) CurrentRequestStartBlock() (*big.Int, error) {
 	defer c.mutex.Unlock()
 
 	return c.startBlock(c.reads)
+}
+
+func (c *relayStateChain) CurrentRequestPreviousEntry() ([]byte, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	if c.previousEntry == nil {
+		return nil, errUnscriptedPreviousEntry
+	}
+	return c.previousEntry(c.reads)
+}
+
+// heldPreviousEntry scripts a beacon whose current request is built on the
+// given previous entry regardless of when it is read.
+func heldPreviousEntry(entry []byte) func(int) ([]byte, error) {
+	return func(int) ([]byte, error) { return entry, nil }
 }
 
 // countingBlockCounter advances one block per wait, so a bounded resolution
@@ -103,30 +135,96 @@ func submittedEntries(blockNumbers ...uint64) chan *event.RelayEntrySubmitted {
 }
 
 // TestRelayTimeoutReportSettled asserts a filed relay entry timeout report is
-// claimed as a penalty only when the beacon's own state says the reported
-// request left the in-flight slot *because of the report*.
+// claimed as a penalty only when the beacon's own canonical state records one.
 //
 // The submitting call returns once a provider accepts the transaction, which
-// says nothing about whether it mined, reverted, or was dropped. Departure is
-// not enough either: a late relay entry empties the very same slot, and the
-// request that opens next looks identical whichever of the two ended the
-// previous one. A monitor that read its own submission — or a bare departure —
-// as the penalty would clear the rollback barrier that exists precisely to hold
-// a penalty nobody can account for, so every ambiguous reading has to leave the
-// permit unclaimed.
+// says nothing about whether it mined, reverted, or was dropped. Departure from
+// the in-flight slot is not enough either: a late relay entry empties the very
+// same slot an accepted report empties. Nor is a quiet subscription — the event
+// carrying a delivery arrives strictly after the state read that saw the slot
+// already emptied can return, so an empty channel means "not yet", never "never".
+//
+// The one reading that settles the report is the beacon holding the reported
+// request past its start block while still building on the previous entry that
+// request was signing over. Only accepting a timeout report re-anchors a request
+// without advancing the relay. Every other reading leaves the rollback barrier
+// in place, which is what it exists for.
 func TestRelayTimeoutReportSettled(t *testing.T) {
 	const relayRequestBlock = uint64(1_000)
+
+	retriedStartBlock := func(int) (*big.Int, error) {
+		return new(big.Int).SetUint64(relayRequestBlock + 9), nil
+	}
 
 	tests := map[string]struct {
 		chain          *relayStateChain
 		entries        chan *event.RelayEntrySubmitted
 		expectedResult bool
 	}{
-		"the beacon holds no request and no entry was delivered": {
+		// The beacon handed the reported request to a fresh group without
+		// advancing the relay. Nothing but an accepted report does that.
+		"the beacon retried the reported request under a new group": {
+			chain: &relayStateChain{
+				inProgress:    func(int) (bool, error) { return true, nil },
+				startBlock:    retriedStartBlock,
+				previousEntry: heldPreviousEntry(reportedPreviousEntry),
+			},
+			expectedResult: true,
+		},
+		// The report mines a few blocks after the call returned, which is the
+		// ordinary case the bounded wait exists for.
+		"the beacon retries a few blocks after the report is filed": {
+			chain: &relayStateChain{
+				inProgress: func(int) (bool, error) { return true, nil },
+				startBlock: func(read int) (*big.Int, error) {
+					if read < 4 {
+						return new(big.Int).SetUint64(relayRequestBlock), nil
+					}
+					return retriedStartBlock(read)
+				},
+				previousEntry: heldPreviousEntry(reportedPreviousEntry),
+			},
+			expectedResult: true,
+		},
+		// The timeout path that finds no group to retry with empties the slot,
+		// and the request opened next is still built on the previous entry the
+		// reported one was signing over. The relay never advanced, so the
+		// penalty stands.
+		"the emptied slot is refilled by a request on the same previous entry": {
+			chain: &relayStateChain{
+				inProgress: func(read int) (bool, error) {
+					return read >= 3, nil
+				},
+				startBlock:    retriedStartBlock,
+				previousEntry: heldPreviousEntry(reportedPreviousEntry),
+			},
+			expectedResult: true,
+		},
+		// An empty slot on its own says only that the request is over. A
+		// delivered entry leaves exactly the same trace, so an empty slot that
+		// nothing explains before the bound is not a penalty.
+		"the beacon holds no request and nothing explains the empty slot": {
 			chain: &relayStateChain{
 				inProgress: func(int) (bool, error) { return false, nil },
 			},
-			expectedResult: true,
+		},
+		// The group delivered. The relay advanced onto the delivered entry, so
+		// every request opened afterwards names a different previous entry.
+		"the emptied slot is refilled by a request on the delivered entry": {
+			chain: &relayStateChain{
+				inProgress: func(read int) (bool, error) {
+					return read >= 3, nil
+				},
+				startBlock:    retriedStartBlock,
+				previousEntry: heldPreviousEntry(relayedPreviousEntry),
+			},
+		},
+		"the beacon advanced onto a different previous entry": {
+			chain: &relayStateChain{
+				inProgress:    func(int) (bool, error) { return true, nil },
+				startBlock:    retriedStartBlock,
+				previousEntry: heldPreviousEntry(relayedPreviousEntry),
+			},
 		},
 		// The group delivered late. The slot is empty for that reason, not
 		// because the report was accepted, so there is no penalty to claim.
@@ -155,17 +253,6 @@ func TestRelayTimeoutReportSettled(t *testing.T) {
 				},
 			},
 		},
-		// A different request holding the slot proves the reported one is over
-		// but not what ended it: an entry this node's subscription missed and
-		// an accepted report read exactly alike from here.
-		"a different request holds the beacon": {
-			chain: &relayStateChain{
-				inProgress: func(int) (bool, error) { return true, nil },
-				startBlock: func(int) (*big.Int, error) {
-					return new(big.Int).SetUint64(relayRequestBlock + 1), nil
-				},
-			},
-		},
 		// The consequential case: the provider took the transaction but the
 		// beacon still holds the very request the report was filed against, so
 		// no penalty exists to claim.
@@ -177,29 +264,18 @@ func TestRelayTimeoutReportSettled(t *testing.T) {
 				},
 			},
 		},
-		// The report mines a few blocks after the call returned, which is the
-		// ordinary case the bounded wait exists for.
-		"the request leaves the beacon a few blocks later": {
-			chain: &relayStateChain{
-				inProgress: func(read int) (bool, error) {
-					return read < 4, nil
-				},
-				startBlock: func(int) (*big.Int, error) {
-					return new(big.Int).SetUint64(relayRequestBlock), nil
-				},
-			},
-			expectedResult: true,
-		},
 		// An entry that arrives mid-window ends the reconciliation against the
-		// report even though the beacon would have released the slot later.
+		// report even though the beacon would have retried the request later.
 		"an entry is delivered while the report is still resolving": {
 			chain: &relayStateChain{
-				inProgress: func(read int) (bool, error) {
-					return read < 4, nil
+				inProgress: func(int) (bool, error) { return true, nil },
+				startBlock: func(read int) (*big.Int, error) {
+					if read < 4 {
+						return new(big.Int).SetUint64(relayRequestBlock), nil
+					}
+					return retriedStartBlock(read)
 				},
-				startBlock: func(int) (*big.Int, error) {
-					return new(big.Int).SetUint64(relayRequestBlock), nil
-				},
+				previousEntry: heldPreviousEntry(reportedPreviousEntry),
 				onRead: func(read int, entries chan *event.RelayEntrySubmitted) {
 					if read == 2 {
 						entries <- &event.RelayEntrySubmitted{
@@ -238,6 +314,24 @@ func TestRelayTimeoutReportSettled(t *testing.T) {
 				},
 			},
 		},
+		// Without the beacon's previous entry there is no way to tell a retry
+		// from a fresh request, which is the whole discrimination.
+		"the beacon cannot say what previous entry it is building on": {
+			chain: &relayStateChain{
+				inProgress: func(int) (bool, error) { return true, nil },
+				startBlock: retriedStartBlock,
+				previousEntry: func(int) ([]byte, error) {
+					return nil, errors.New("not implemented")
+				},
+			},
+		},
+		"the beacon reports an empty previous entry": {
+			chain: &relayStateChain{
+				inProgress:    func(int) (bool, error) { return true, nil },
+				startBlock:    retriedStartBlock,
+				previousEntry: heldPreviousEntry(nil),
+			},
+		},
 	}
 
 	for testName, test := range tests {
@@ -255,6 +349,7 @@ func TestRelayTimeoutReportSettled(t *testing.T) {
 				&testutils.MockLogger{},
 				&countingBlockCounter{height: 5_000},
 				relayRequestBlock,
+				reportedPreviousEntry,
 				entries,
 			)
 
@@ -266,6 +361,141 @@ func TestRelayTimeoutReportSettled(t *testing.T) {
 				)
 			}
 		})
+	}
+}
+
+// TestRelayTimeoutReportSettled_DecidesWithoutEventDelivery is the ordering
+// guarantee stated as a test: the settled reading is taken from canonical chain
+// state alone, so no delay on this node's relay entry callback can turn a
+// delivery into a penalty.
+//
+// Both subtests run with the subscription channel empty for the entire
+// reconciliation — the harshest form of "the callback has not arrived yet" —
+// and assert the outcome the chain state alone dictates. The delivered case is
+// then handed its event afterwards to confirm nothing in the window consumed
+// or depended on it.
+func TestRelayTimeoutReportSettled_DecidesWithoutEventDelivery(t *testing.T) {
+	const relayRequestBlock = uint64(1_000)
+
+	tests := map[string]struct {
+		chain          *relayStateChain
+		expectedResult bool
+	}{
+		// The iter-6 hazard exactly: the slot reads empty for the whole window
+		// because a late entry emptied it, and the event announcing that entry
+		// reaches this node only after the reconciliation has returned.
+		"a slot emptied by a delivery no event has announced yet": {
+			chain: &relayStateChain{
+				inProgress: func(int) (bool, error) { return false, nil },
+			},
+		},
+		// The same delivery once the relay has visibly moved on, still with no
+		// event in hand.
+		"a relay advanced past the reported request with no event in hand": {
+			chain: &relayStateChain{
+				inProgress: func(int) (bool, error) { return true, nil },
+				startBlock: func(int) (*big.Int, error) {
+					return new(big.Int).SetUint64(relayRequestBlock + 9), nil
+				},
+				previousEntry: heldPreviousEntry(relayedPreviousEntry),
+			},
+		},
+		// The mirror image: an accepted report is claimed on chain state alone,
+		// with no event ever delivered to help.
+		"a retried request with no event ever delivered": {
+			chain: &relayStateChain{
+				inProgress: func(int) (bool, error) { return true, nil },
+				startBlock: func(int) (*big.Int, error) {
+					return new(big.Int).SetUint64(relayRequestBlock + 9), nil
+				},
+				previousEntry: heldPreviousEntry(reportedPreviousEntry),
+			},
+			expectedResult: true,
+		},
+	}
+
+	for testName, test := range tests {
+		t.Run(testName, func(t *testing.T) {
+			entries := submittedEntries()
+			test.chain.entries = entries
+
+			node := &node{beaconChain: test.chain}
+
+			settled := node.relayTimeoutReportSettled(
+				context.Background(),
+				&testutils.MockLogger{},
+				&countingBlockCounter{height: 5_000},
+				relayRequestBlock,
+				reportedPreviousEntry,
+				entries,
+			)
+
+			if settled != test.expectedResult {
+				t.Errorf(
+					"unexpected settlement\nexpected: [%t]\nactual:   [%t]",
+					test.expectedResult,
+					settled,
+				)
+			}
+			if test.chain.reads == 0 {
+				t.Error("the reconciliation never read the beacon")
+			}
+
+			// The callback the production subscription would have run, now
+			// that the reconciliation is over. Nothing should have been
+			// waiting on it and nothing should have consumed it.
+			entries <- &event.RelayEntrySubmitted{
+				BlockNumber: relayRequestBlock + 20,
+			}
+			if len(entries) != 1 {
+				t.Errorf(
+					"the reconciliation consumed [%d] deliveries it was "+
+						"never handed",
+					len(entries)-1,
+				)
+			}
+		})
+	}
+}
+
+// TestRelayTimeoutReportSettled_WithoutPreviousEntryClaimsNothing asserts a
+// monitor that does not know what previous entry its request was signing over
+// refuses the claim outright rather than falling back on the slot reading the
+// previous entry exists to disambiguate.
+func TestRelayTimeoutReportSettled_WithoutPreviousEntryClaimsNothing(t *testing.T) {
+	const relayRequestBlock = uint64(1_000)
+
+	for _, previousEntry := range [][]byte{nil, {}} {
+		chain := &relayStateChain{
+			inProgress: func(int) (bool, error) { return true, nil },
+			startBlock: func(int) (*big.Int, error) {
+				return new(big.Int).SetUint64(relayRequestBlock + 9), nil
+			},
+			previousEntry: heldPreviousEntry(reportedPreviousEntry),
+		}
+		node := &node{beaconChain: chain}
+
+		if node.relayTimeoutReportSettled(
+			context.Background(),
+			&testutils.MockLogger{},
+			&countingBlockCounter{height: 5_000},
+			relayRequestBlock,
+			previousEntry,
+			submittedEntries(),
+		) {
+			t.Errorf(
+				"a report on a request with previous entry [%v] was claimed "+
+					"as settled",
+				previousEntry,
+			)
+		}
+		if chain.reads != 0 {
+			t.Errorf(
+				"the reconciliation read the beacon [%d] times without a "+
+					"previous entry to compare against",
+				chain.reads,
+			)
+		}
 	}
 }
 
@@ -291,6 +521,7 @@ func TestRelayTimeoutReportSettled_IsBounded(t *testing.T) {
 		&testutils.MockLogger{},
 		blockCounter,
 		relayRequestBlock,
+		reportedPreviousEntry,
 		submittedEntries(),
 	) {
 		t.Fatal("a request that never left the beacon was claimed as settled")
@@ -333,6 +564,7 @@ func TestRelayTimeoutReportSettled_CanceledPermitClaimsNothing(t *testing.T) {
 		&testutils.MockLogger{},
 		blockCounter,
 		relayRequestBlock,
+		reportedPreviousEntry,
 		submittedEntries(),
 	) {
 		t.Error("a canceled resolution claimed the report as settled")
@@ -361,6 +593,7 @@ func TestRelayTimeoutReportSettled_UnrepresentableBoundClaimsNothing(t *testing.
 		&testutils.MockLogger{},
 		&countingBlockCounter{height: math.MaxUint64 - 1},
 		relayRequestBlock,
+		reportedPreviousEntry,
 		submittedEntries(),
 	) {
 		t.Error(
@@ -385,10 +618,14 @@ func TestRelayTimeoutReportSettled_ResolvesAtTopOfBlockRange(t *testing.T) {
 	const relayRequestBlock = uint64(1_000)
 
 	chain := &relayStateChain{
-		inProgress: func(read int) (bool, error) { return read < 2, nil },
-		startBlock: func(int) (*big.Int, error) {
-			return new(big.Int).SetUint64(relayRequestBlock), nil
+		inProgress: func(int) (bool, error) { return true, nil },
+		startBlock: func(read int) (*big.Int, error) {
+			if read < 2 {
+				return new(big.Int).SetUint64(relayRequestBlock), nil
+			}
+			return new(big.Int).SetUint64(relayRequestBlock + 9), nil
 		},
+		previousEntry: heldPreviousEntry(reportedPreviousEntry),
 	}
 	node := &node{beaconChain: chain}
 
@@ -399,6 +636,7 @@ func TestRelayTimeoutReportSettled_ResolvesAtTopOfBlockRange(t *testing.T) {
 			height: math.MaxUint64 - relayEntryTimeoutReportResolutionBlocks,
 		},
 		relayRequestBlock,
+		reportedPreviousEntry,
 		submittedEntries(),
 	) {
 		t.Error(

@@ -140,6 +140,7 @@ func Initialize(
 			}
 
 			go node.MonitorRelayEntry(
+				request.PreviousEntry,
 				request.BlockNumber,
 			)
 		}

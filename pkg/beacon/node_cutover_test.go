@@ -980,7 +980,7 @@ func TestMonitorRelayEntry_LegacyTimeoutReportSuppressedAfterCutover(t *testing.
 	monitorDone := make(chan struct{})
 	go func() {
 		defer close(monitorDone)
-		node.MonitorRelayEntry(currentBlock)
+		node.MonitorRelayEntry(monitoredPreviousEntry, currentBlock)
 	}()
 
 	timeoutBlock := currentBlock +
@@ -1048,7 +1048,7 @@ func TestMonitorRelayEntry_TimeoutReportedBelowCutover(t *testing.T) {
 	monitorDone := make(chan struct{})
 	go func() {
 		defer close(monitorDone)
-		node.MonitorRelayEntry(currentBlock)
+		node.MonitorRelayEntry(monitoredPreviousEntry, currentBlock)
 	}()
 
 	timeoutBlock := currentBlock +

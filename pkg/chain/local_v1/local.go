@@ -430,7 +430,7 @@ func (c *localChain) CurrentRequestStartBlock() (*big.Int, error) {
 }
 
 func (c *localChain) CurrentRequestPreviousEntry() ([]byte, error) {
-	panic("not implemented")
+	return nil, errNoRelayRequestState
 }
 
 func (c *localChain) CurrentRequestGroupPublicKey() ([]byte, error) {

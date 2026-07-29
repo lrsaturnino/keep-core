@@ -13,6 +13,12 @@ import (
 
 var relayEntryTimeout = uint64(15)
 
+// monitoredPreviousEntry stands in for the previous entry the relay request
+// under monitoring is signing over. The monitor carries it so it can tell an
+// accepted timeout report from a late delivery; these tests only need it to be
+// a request the monitor can name.
+var monitoredPreviousEntry = []byte("monitored-request-previous-entry")
+
 // newMonitorTestNode builds the minimal node a relay entry monitoring test
 // needs: the local chain plus a real participation gate with the
 // developer-only disabled schedule, in which timeout reports stay allowed.
@@ -59,7 +65,7 @@ func TestMonitorRelayEntryOnChain_EntrySubmitted(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	go node.MonitorRelayEntry(startBlockHeight)
+	go node.MonitorRelayEntry(monitoredPreviousEntry, startBlockHeight)
 
 	// the window to get a relay entry is from currentBlock to (currentBlock+relayEntryTimeout)
 	// we subtract arbitarly 5 blocks to be within this window. Ex. 0 + 15 - 5
@@ -109,7 +115,7 @@ func TestMonitorRelayEntryOnChain_EntryNotSubmitted(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	go node.MonitorRelayEntry(startBlockHeight)
+	go node.MonitorRelayEntry(monitoredPreviousEntry, startBlockHeight)
 
 	relayEntryTimeoutFromStart := startBlockHeight + relayEntryTimeout
 
