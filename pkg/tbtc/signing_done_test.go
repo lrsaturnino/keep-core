@@ -363,17 +363,26 @@ func TestSigningDoneCheck_SenderOutsideTheAttempt(t *testing.T) {
 
 	doneCheck := setupSigningDoneCheck(t, groupParameters)
 
-	ctx, cancelCtx := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancelCtx()
+	// The listener outlives the wait on purpose. The barrier below has to be
+	// reachable on a loaded machine, while the wait's own deadline is the thing
+	// this test asserts on, so the two get separate budgets instead of one
+	// deadline that either makes the barrier flaky or the timeout slow.
+	listenCtx, cancelListenCtx := context.WithTimeout(
+		context.Background(),
+		signingDoneListenBudget,
+	)
+	defer cancelListenCtx()
 
 	message := big.NewInt(100)
 	attemptNumber := uint64(1)
 	attemptStartBlock := uint64(50)
 	attemptTimeoutBlock := uint64(1000)
 	attemptMemberIndexes := []group.MemberIndex{1, 2, 3}
-	// Members 1 and 2 were selected; member 4 is a valid wallet member the
-	// attempt excluded.
-	signalingMemberIndexes := []group.MemberIndex{1, 2, 4}
+	// Member 4 is a valid wallet member the attempt excluded, and it signals
+	// first: messages reach the check's receive loop in the order they were sent
+	// and are ruled on one at a time, so a membership accepted after this one is
+	// evidence that this one was already seen and refused.
+	signalingMemberIndexes := []group.MemberIndex{4, 1, 2}
 	result := &signing.Result{
 		Signature: &tecdsa.Signature{
 			R:          big.NewInt(200),
@@ -383,7 +392,7 @@ func TestSigningDoneCheck_SenderOutsideTheAttempt(t *testing.T) {
 	}
 
 	doneCheck.listen(
-		ctx,
+		listenCtx,
 		message,
 		attemptNumber,
 		attemptStartBlock,
@@ -393,7 +402,7 @@ func TestSigningDoneCheck_SenderOutsideTheAttempt(t *testing.T) {
 
 	for _, memberIndex := range signalingMemberIndexes {
 		err := doneCheck.signalDone(
-			ctx,
+			listenCtx,
 			memberIndex,
 			message,
 			attemptNumber,
@@ -405,25 +414,17 @@ func TestSigningDoneCheck_SenderOutsideTheAttempt(t *testing.T) {
 		}
 	}
 
-	// Give the message handler goroutine time to process all three messages, so
-	// the assertions below are about what the check refused rather than about
-	// what it had not seen yet.
-	time.Sleep(100 * time.Millisecond)
+	// The two selected members are accepted and the excluded one that preceded
+	// them is not, which is only readable once the check has ruled on all three.
+	awaitDoneSigners(t, doneCheck, participation.MemberIndexes{1, 2})
 
-	if !slices.Equal(
-		recordedDoneSigners(doneCheck),
-		participation.MemberIndexes{1, 2},
-	) {
-		t.Errorf(
-			"unexpected accepted done signers\n"+
-				"expected: [%v]\n"+
-				"actual:   [%v]",
-			participation.MemberIndexes{1, 2},
-			recordedDoneSigners(doneCheck),
-		)
-	}
+	waitCtx, cancelWaitCtx := context.WithTimeout(
+		context.Background(),
+		signingDoneWaitTimeout,
+	)
+	defer cancelWaitCtx()
 
-	returnedResult, signers, endBlock, err := doneCheck.waitUntilAllDone(ctx)
+	returnedResult, signers, endBlock, err := doneCheck.waitUntilAllDone(waitCtx)
 
 	if returnedResult != nil {
 		t.Errorf("expected nil result, has [%v]", returnedResult)
@@ -459,17 +460,30 @@ func TestSigningDoneCheck_DoneChecksFromAnotherRun(t *testing.T) {
 
 	doneCheck := setupSigningDoneCheck(t, groupParameters)
 
-	ctx, cancelCtx := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancelCtx()
+	listenCtx, cancelListenCtx := context.WithTimeout(
+		context.Background(),
+		signingDoneListenBudget,
+	)
+	defer cancelListenCtx()
 
 	message := big.NewInt(100)
 	attemptNumber := uint64(1)
 	attemptStartBlock := uint64(900)
 	attemptTimeoutBlock := uint64(930)
-	attemptMemberIndexes := []group.MemberIndex{1, 2, 3}
+	attemptMemberIndexes := []group.MemberIndex{1, 2, 3, 4}
+	// The memberships whose earlier-run messages are replayed here, and the one
+	// whose in-window message follows them. The barrier membership sends nothing
+	// from the earlier run, so the check accepting it and nothing else says
+	// exactly one thing: every replayed message ahead of it was ruled on and
+	// refused.
+	staleMemberIndexes := []group.MemberIndex{1, 2, 3}
+	barrierMemberIndex := group.MemberIndex(4)
 	// The end block the earlier run's members finished at, before this attempt's
 	// protocol started.
 	staleEndBlock := uint64(130)
+	// And a block inside this attempt's own window, which is what the check is
+	// asking the earlier run's messages for.
+	currentEndBlock := uint64(910)
 	result := &signing.Result{
 		Signature: &tecdsa.Signature{
 			R:          big.NewInt(200),
@@ -479,7 +493,7 @@ func TestSigningDoneCheck_DoneChecksFromAnotherRun(t *testing.T) {
 	}
 
 	doneCheck.listen(
-		ctx,
+		listenCtx,
 		message,
 		attemptNumber,
 		attemptStartBlock,
@@ -487,9 +501,9 @@ func TestSigningDoneCheck_DoneChecksFromAnotherRun(t *testing.T) {
 		attemptMemberIndexes,
 	)
 
-	for _, memberIndex := range attemptMemberIndexes {
+	for _, memberIndex := range staleMemberIndexes {
 		err := doneCheck.signalDone(
-			ctx,
+			listenCtx,
 			memberIndex,
 			message,
 			attemptNumber,
@@ -501,16 +515,30 @@ func TestSigningDoneCheck_DoneChecksFromAnotherRun(t *testing.T) {
 		}
 	}
 
-	time.Sleep(100 * time.Millisecond)
-
-	if len(recordedDoneSigners(doneCheck)) != 0 {
-		t.Errorf(
-			"expected no accepted done signers, has [%v]",
-			recordedDoneSigners(doneCheck),
-		)
+	if err := doneCheck.signalDone(
+		listenCtx,
+		barrierMemberIndex,
+		message,
+		attemptNumber,
+		result,
+		currentEndBlock,
+	); err != nil {
+		t.Fatal(err)
 	}
 
-	returnedResult, signers, endBlock, err := doneCheck.waitUntilAllDone(ctx)
+	awaitDoneSigners(
+		t,
+		doneCheck,
+		participation.MemberIndexes{barrierMemberIndex},
+	)
+
+	waitCtx, cancelWaitCtx := context.WithTimeout(
+		context.Background(),
+		signingDoneWaitTimeout,
+	)
+	defer cancelWaitCtx()
+
+	returnedResult, signers, endBlock, err := doneCheck.waitUntilAllDone(waitCtx)
 
 	if returnedResult != nil {
 		t.Errorf("expected nil result, has [%v]", returnedResult)
@@ -520,6 +548,92 @@ func TestSigningDoneCheck_DoneChecksFromAnotherRun(t *testing.T) {
 	}
 	testutils.AssertIntsEqual(t, "end block", 0, int(endBlock))
 	testutils.AssertErrorsSame(t, errWaitDoneTimedOut, err)
+}
+
+// How long a refusal test's listener stays up. It is also the barrier's
+// deadline: the two are the same budget because a barrier can only observe the
+// check ruling on a message while the check is still listening.
+//
+// Generous because it is never spent. The barrier returns as soon as its
+// evidence is in, so this bounds a broken build's failure rather than a working
+// build's runtime.
+const signingDoneListenBudget = 10 * time.Second
+
+// How long a refusal test then waits for a conclusion it must not reach. Several
+// done-check intervals wide, so the wait actually evaluates the accepted
+// population and declines to conclude on it rather than expiring before its
+// first tick.
+const signingDoneWaitTimeout = 500 * time.Millisecond
+
+// How often a barrier re-reads the accepted population. This bounds how long a
+// test lingers after its evidence has arrived, not how long it may wait for it.
+const signingDoneBarrierPollInterval = time.Millisecond
+
+// awaitDoneSigners blocks until the check has accepted exactly the given
+// memberships, and fails the test if it has not before the listener's budget
+// runs out.
+//
+// A refusal is only observable once the check has seen the message it refused,
+// and the accepted population reads identically before a message arrives and
+// after it was refused. A fixed sleep followed by an assertion about what is
+// absent therefore holds either way, and holds most readily on the machine least
+// likely to have processed anything — the one running the whole suite at once —
+// so it is a test that reports a refusal it never witnessed.
+//
+// Ordering is what makes the wait deterministic instead. Everything a test
+// offers reaches one receive channel in send order and is ruled on by a single
+// goroutine, so a membership present in the accepted population is evidence that
+// every message sent before it was already accepted or refused. A test therefore
+// offers the message it expects to be admitted last, and this function returns
+// only on exactly the population it names.
+func awaitDoneSigners(
+	t *testing.T,
+	doneCheck *signingDoneCheck,
+	expected participation.MemberIndexes,
+) {
+	t.Helper()
+
+	deadline := time.NewTimer(signingDoneListenBudget)
+	defer deadline.Stop()
+
+	ticker := time.NewTicker(signingDoneBarrierPollInterval)
+	defer ticker.Stop()
+
+	for {
+		actual := recordedDoneSigners(doneCheck)
+		if slices.Equal(actual, expected) {
+			return
+		}
+
+		// The accepted population only ever grows, so a membership outside the
+		// expected one is already a message the check admitted and had to
+		// refuse. Saying so here names the defect, where waiting out the
+		// deadline would only report that the population never settled.
+		for _, signer := range actual {
+			if !slices.Contains(expected, signer) {
+				t.Fatalf(
+					"the check accepted a done message from membership [%v]\n"+
+						"expected: [%v]\n"+
+						"actual:   [%v]",
+					signer,
+					expected,
+					actual,
+				)
+			}
+		}
+
+		select {
+		case <-deadline.C:
+			t.Fatalf(
+				"timed out waiting for the accepted done signers\n"+
+					"expected: [%v]\n"+
+					"actual:   [%v]",
+				expected,
+				recordedDoneSigners(doneCheck),
+			)
+		case <-ticker.C:
+		}
+	}
 }
 
 // recordedDoneSigners returns the memberships whose done messages the check
