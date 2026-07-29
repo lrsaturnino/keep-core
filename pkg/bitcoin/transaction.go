@@ -31,10 +31,19 @@ const (
 // 4,000,000 weight units, so its serialized length is always strictly below
 // that number.
 //
-// Rejecting longer input keeps deserialization defensive against untrusted
-// sources. The underlying btcd decoder slices all scripts of a single
-// transaction out of one fixed-size 4 MiB buffer and panics, rather than
-// returning an error, once their cumulative length exceeds it.
+// Rejecting longer input keeps deserialization defensive against grossly
+// oversized, untrusted input, but this cap alone does NOT close the
+// underlying btcd decoder's panic. btcd slices every script and witness
+// item of a single transaction out of one shared, fixed-size 4,194,304-byte
+// buffer, and readScriptBuf only checks a declared item's length varint
+// against the flat 4,000,000-byte maxWitnessItemSize constant, never
+// against that buffer's actual remaining capacity. Because a declared
+// length does not need to be backed by that many delivered bytes for the
+// panicking slice expression to be evaluated, a transaction whose real
+// wire length is far below this cap can still reach the panic once earlier
+// scripts have consumed enough of the shared buffer. See the recover() in
+// Deserialize below, which is what actually turns that panic into an
+// error.
 const MaxTransactionByteLength = 4_000_000
 
 // Transaction represents a Bitcoin transaction. For reference, see:
@@ -163,7 +172,7 @@ func (t *Transaction) SerializeLocktime() [4]byte {
 }
 
 // Deserialize deserializes the given byte array to a Transaction.
-func (t *Transaction) Deserialize(data []byte) error {
+func (t *Transaction) Deserialize(data []byte) (err error) {
 	if len(data) > MaxTransactionByteLength {
 		return fmt.Errorf(
 			"transaction byte length [%v] exceeds the maximum of [%v]",
@@ -172,8 +181,22 @@ func (t *Transaction) Deserialize(data []byte) error {
 		)
 	}
 
+	// data ultimately originates from an untrusted source (e.g. an Electrum
+	// server) and the underlying btcd decoder can panic on carefully
+	// crafted input that stays well under MaxTransactionByteLength (see the
+	// doc comment on that constant). Recover from any such panic and return
+	// it as a plain error instead of letting it crash the process.
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf(
+				"recovered from a panic while deserializing a transaction: [%v]",
+				r,
+			)
+		}
+	}()
+
 	internal := newInternalTransaction()
-	err := internal.Deserialize(bytes.NewReader(data))
+	err = internal.Deserialize(bytes.NewReader(data))
 	if err != nil {
 		return err
 	}

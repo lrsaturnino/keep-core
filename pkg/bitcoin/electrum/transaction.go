@@ -12,7 +12,7 @@ import (
 
 // decodeTransaction deserializes a transaction from the hexadecimal serialized
 // string to a btcd message format.
-func decodeTransaction(rawTx string) (*wire.MsgTx, error) {
+func decodeTransaction(rawTx string) (tx *wire.MsgTx, err error) {
 	headerBytes, err := hex.DecodeString(rawTx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode a hex string: [%w]", err)
@@ -28,6 +28,22 @@ func decodeTransaction(rawTx string) (*wire.MsgTx, error) {
 			bitcoin.MaxTransactionByteLength,
 		)
 	}
+
+	// The length guard above does not fully close the underlying btcd
+	// decoder's panic: a transaction whose real wire length is far below
+	// that guard can still trigger it (see the MaxTransactionByteLength
+	// doc comment in the bitcoin package). Recover from any such panic and
+	// return it as a plain error so a malicious or malformed response from
+	// the untrusted Electrum server cannot crash the process.
+	defer func() {
+		if r := recover(); r != nil {
+			tx = nil
+			err = fmt.Errorf(
+				"recovered from a panic while deserializing a transaction: [%v]",
+				r,
+			)
+		}
+	}()
 
 	buf := bytes.NewBuffer(headerBytes)
 
