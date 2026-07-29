@@ -112,6 +112,16 @@ type validationOptions struct {
 	signerApprovalVerifier            SignerApprovalVerifier
 	policyIndependentDigest           bool
 	currentBlock                      *uint64
+	// pinnedDepositorEthAddress, when non-empty, is used directly as the
+	// depositor's ETH identity for artifact-approval verification instead of
+	// resolving it from depositorTrustRoots. Poll's re-validation sets this
+	// from the job's DepositorEthAddress (resolved once at submit time and
+	// persisted on the durable job record) because policyIndependentDigest
+	// re-validation must not depend on depositorTrustRoots possibly having
+	// changed since submit, and the ETH identity - unlike the secp256k1
+	// depositor key - has no equivalent field embedded in the request itself
+	// for Poll to fall back to reading directly.
+	pinnedDepositorEthAddress string
 	// eip712ChainID and eip712Salt define the EIP-712 domain the artifact
 	// approval digest is wrapped with. They must be identical across Submit,
 	// Poll, and normalization so recomputed digests match stored ones.
@@ -412,8 +422,8 @@ func validateCommonRequest(
 		}
 
 		depositorPublicKey := template.DepositorPublicKey
-		depositorEthAddress := ""
-		if len(options.depositorTrustRoots) > 0 && !options.policyIndependentDigest {
+		depositorEthAddress := options.pinnedDepositorEthAddress
+		if depositorEthAddress == "" && len(options.depositorTrustRoots) > 0 && !options.policyIndependentDigest {
 			expectedDepositorPublicKey, ok := resolveExpectedDepositorPublicKey(
 				request,
 				options.depositorTrustRoots,
@@ -467,8 +477,8 @@ func validateCommonRequest(
 		}
 
 		depositorPublicKey := template.DepositorPublicKey
-		depositorEthAddress := ""
-		if len(options.depositorTrustRoots) > 0 && !options.policyIndependentDigest {
+		depositorEthAddress := options.pinnedDepositorEthAddress
+		if depositorEthAddress == "" && len(options.depositorTrustRoots) > 0 && !options.policyIndependentDigest {
 			expectedDepositorPublicKey, ok := resolveExpectedDepositorPublicKey(
 				request,
 				options.depositorTrustRoots,

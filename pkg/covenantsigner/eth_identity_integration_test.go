@@ -154,3 +154,65 @@ func TestServiceRejectsSelfV1WithWrongDepositorEthIdentity(t *testing.T) {
 		t.Fatalf("expected depositor ETH address mismatch error, got %v", err)
 	}
 }
+
+// TestServicePollAcceptsEthSignedSelfV1Approval guards against a regression
+// where a wallet-signed (ETH-identity) approval accepted at Submit is later
+// rejected at every Poll: Poll's re-validation must reuse the depositor ETH
+// address pinned at submit time rather than silently falling back to the
+// secp256k1 script-key check, which cannot verify an ETH-style signature.
+func TestServicePollAcceptsEthSignedSelfV1Approval(t *testing.T) {
+	privateKey, err := crypto.HexToECDSA(testDepositorEthPrivateKeyHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ethAddress := crypto.PubkeyToAddress(privateKey.PublicKey).Hex()
+
+	trustRoot := testDepositorTrustRoot(TemplateSelfV1)
+	trustRoot.EthAddress = ethAddress
+
+	service, err := NewService(
+		newMemoryHandle(),
+		&scriptedEngine{
+			submit: func(*Job) (*Transition, error) {
+				return &Transition{State: JobStatePending, Detail: "queued"}, nil
+			},
+			poll: func(*Job) (*Transition, error) {
+				return &Transition{
+					State:          JobStateArtifactReady,
+					Detail:         "artifact ready",
+					PSBTHash:       "0x090a",
+					TransactionHex: "0x0b0c",
+				}, nil
+			},
+		},
+		WithDepositorTrustRoots([]DepositorTrustRoot{trustRoot}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := ethSignedSelfV1Request(t, testDepositorEthPrivateKeyHex)
+
+	submitResult, err := service.Submit(context.Background(), TemplateSelfV1, SignerSubmitInput{
+		RouteRequestID: "ors_self_eth_poll",
+		Stage:          StageSignerCoordination,
+		Request:        request,
+	})
+	if err != nil {
+		t.Fatalf("expected ETH-signed approval to be accepted at submit, got %v", err)
+	}
+
+	pollResult, err := service.Poll(context.Background(), TemplateSelfV1, SignerPollInput{
+		RouteRequestID: "ors_self_eth_poll",
+		RequestID:      submitResult.RequestID,
+		Stage:          StageSignerCoordination,
+		Request:        request,
+	})
+	if err != nil {
+		t.Fatalf("expected ETH-signed approval to also be accepted at poll, got %v", err)
+	}
+
+	if pollResult.Status != StepStatusReady {
+		t.Fatalf("expected READY, got %s", pollResult.Status)
+	}
+}

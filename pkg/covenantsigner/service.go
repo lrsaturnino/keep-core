@@ -425,6 +425,7 @@ func (s *Service) createOrDedup(
 	input SignerSubmitInput,
 	normalizedRequest RouteSubmitRequest,
 	requestDigest string,
+	depositorEthAddress string,
 ) (*Job, *StepResult, error) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
@@ -462,17 +463,18 @@ func (s *Service) createOrDedup(
 	now := s.now()
 
 	job := &Job{
-		RequestID:       requestID,
-		RouteRequestID:  input.RouteRequestID,
-		Route:           route,
-		IdempotencyKey:  input.Request.IdempotencyKey,
-		FacadeRequestID: input.Request.FacadeRequestID,
-		RequestDigest:   requestDigest,
-		State:           JobStateSubmitted,
-		Detail:          "accepted for covenant signing",
-		CreatedAt:       now.Format(time.RFC3339Nano),
-		UpdatedAt:       now.Format(time.RFC3339Nano),
-		Request:         normalizedRequest,
+		RequestID:           requestID,
+		RouteRequestID:      input.RouteRequestID,
+		Route:               route,
+		IdempotencyKey:      input.Request.IdempotencyKey,
+		FacadeRequestID:     input.Request.FacadeRequestID,
+		RequestDigest:       requestDigest,
+		DepositorEthAddress: depositorEthAddress,
+		State:               JobStateSubmitted,
+		Detail:              "accepted for covenant signing",
+		CreatedAt:           now.Format(time.RFC3339Nano),
+		UpdatedAt:           now.Format(time.RFC3339Nano),
+		Request:             normalizedRequest,
 	}
 
 	if err := s.store.Put(job); err != nil {
@@ -523,7 +525,15 @@ func (s *Service) Submit(ctx context.Context, route TemplateID, input SignerSubm
 		return StepResult{}, err
 	}
 
-	job, existingResult, err := s.createOrDedup(route, input, normalizedRequest, requestDigest)
+	// Pin the depositor's ETH identity (if any) to the durable job record now,
+	// at submit time, using the exact same resolution validateSubmitInput just
+	// used to decide whether this request's approval verified. Poll's
+	// re-validation is policy-independent (see policyIndependentDigest) and
+	// must not re-resolve depositorTrustRoots - which could change after
+	// submit - so it reuses this pinned snapshot instead.
+	depositorEthAddress := resolveExpectedDepositorEthAddress(input.Request, s.depositorTrustRoots)
+
+	job, existingResult, err := s.createOrDedup(route, input, normalizedRequest, requestDigest, depositorEthAddress)
 	if err != nil {
 		return StepResult{}, err
 	}
@@ -616,14 +626,30 @@ func (s *Service) Poll(ctx context.Context, route TemplateID, input SignerPollIn
 	if err != nil {
 		return StepResult{}, err
 	}
+
+	// Look up the depositor ETH address pinned on the job at submit time, if
+	// any, so the signature re-verification below can use it. This must come
+	// from the durable job record rather than from live depositorTrustRoots
+	// config: policyIndependentDigest re-validation is deliberately isolated
+	// from config that could have changed since submit, and unlike the
+	// secp256k1 depositor key, the ETH identity has no equivalent field
+	// embedded in the resubmitted request for Poll to read back directly.
+	var pinnedDepositorEthAddress string
+	if storedJob, ok, err := s.store.GetByRequestID(input.RequestID); err != nil {
+		return StepResult{}, err
+	} else if ok && storedJob.Route == route && storedJob.RouteRequestID == input.RouteRequestID {
+		pinnedDepositorEthAddress = storedJob.DepositorEthAddress
+	}
+
 	if err := validatePollInput(
 		route,
 		input,
 		validationOptions{
-			policyIndependentDigest: true,
-			currentBlock:            currentBlock,
-			eip712ChainID:           s.eip712ChainID,
-			eip712Salt:              s.eip712Salt,
+			policyIndependentDigest:   true,
+			currentBlock:              currentBlock,
+			pinnedDepositorEthAddress: pinnedDepositorEthAddress,
+			eip712ChainID:             s.eip712ChainID,
+			eip712Salt:                s.eip712Salt,
 		},
 	); err != nil {
 		return StepResult{}, err

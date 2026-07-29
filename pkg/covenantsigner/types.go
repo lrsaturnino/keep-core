@@ -325,23 +325,32 @@ type StepResult struct {
 }
 
 type Job struct {
-	RequestID       string             `json:"requestId"`
-	RouteRequestID  string             `json:"routeRequestId"`
-	Route           TemplateID         `json:"route"`
-	IdempotencyKey  string             `json:"idempotencyKey"`
-	FacadeRequestID string             `json:"facadeRequestId"`
-	RequestDigest   string             `json:"requestDigest"`
-	State           JobState           `json:"state"`
-	Detail          string             `json:"detail,omitempty"`
-	Reason          FailureReason      `json:"reason,omitempty"`
-	CreatedAt       string             `json:"createdAt"`
-	UpdatedAt       string             `json:"updatedAt"`
-	CompletedAt     string             `json:"completedAt,omitempty"`
-	FailedAt        string             `json:"failedAt,omitempty"`
-	Request         RouteSubmitRequest `json:"request"`
-	PSBTHash        string             `json:"psbtHash,omitempty"`
-	TransactionHex  string             `json:"transactionHex,omitempty"`
-	Handoff         map[string]any     `json:"handoff,omitempty"`
+	RequestID       string     `json:"requestId"`
+	RouteRequestID  string     `json:"routeRequestId"`
+	Route           TemplateID `json:"route"`
+	IdempotencyKey  string     `json:"idempotencyKey"`
+	FacadeRequestID string     `json:"facadeRequestId"`
+	RequestDigest   string     `json:"requestDigest"`
+	// DepositorEthAddress is the depositor's ETH identity resolved from
+	// depositorTrustRoots at submit time, when one was configured for this
+	// request's trust-root scope; empty means the depositor's artifact
+	// approval was (and continues to be) verified against the secp256k1
+	// script-template key instead. Poll re-validation is policy-independent
+	// (it must not depend on depositorTrustRoots possibly having changed
+	// since submit), so it reuses this pinned snapshot rather than
+	// re-resolving trust roots on every poll.
+	DepositorEthAddress string             `json:"depositorEthAddress,omitempty"`
+	State               JobState           `json:"state"`
+	Detail              string             `json:"detail,omitempty"`
+	Reason              FailureReason      `json:"reason,omitempty"`
+	CreatedAt           string             `json:"createdAt"`
+	UpdatedAt           string             `json:"updatedAt"`
+	CompletedAt         string             `json:"completedAt,omitempty"`
+	FailedAt            string             `json:"failedAt,omitempty"`
+	Request             RouteSubmitRequest `json:"request"`
+	PSBTHash            string             `json:"psbtHash,omitempty"`
+	TransactionHex      string             `json:"transactionHex,omitempty"`
+	Handoff             map[string]any     `json:"handoff,omitempty"`
 }
 
 type SelfV1Template struct {
