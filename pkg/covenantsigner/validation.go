@@ -259,12 +259,19 @@ func normalizeRouteSubmitRequest(
 		return RouteSubmitRequest{}, err
 	}
 
-	normalizedMigrationPlanQuote, err := normalizeMigrationPlanQuote(
-		request,
-		options,
-	)
-	if err != nil {
-		return RouteSubmitRequest{}, err
+	// The migration plan quote authority path applies only to MIGRATION; REDEEM
+	// and RENEW requests carry no plan-quote field and must default to nil
+	// instead of being rejected by a deployment that also verifies MIGRATION
+	// plan quotes (mirrors the gating in validateCommonRequest).
+	var normalizedMigrationPlanQuote *MigrationDestinationPlanQuote
+	if request.ResolvedAction() == CovenantActionMigration {
+		normalizedMigrationPlanQuote, err = normalizeMigrationPlanQuote(
+			request,
+			options,
+		)
+		if err != nil {
+			return RouteSubmitRequest{}, err
+		}
 	}
 	normalizedRequestType, err := normalizeRequestType(request.Route, request.RequestType)
 	if err != nil {

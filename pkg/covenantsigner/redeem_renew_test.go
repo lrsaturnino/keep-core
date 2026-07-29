@@ -108,6 +108,59 @@ func TestServiceAcceptsRenewSelfV1(t *testing.T) {
 	}
 }
 
+// submitRedeemRenewWithMigrationPlanQuoteTrustRoots mirrors submitRedeemRenew
+// but configures the service with migrationPlanQuoteTrustRoots, matching a
+// realistic production deployment that also verifies MIGRATION plan quotes.
+// REDEEM/RENEW requests have no plan-quote field and must remain unaffected by
+// that configuration.
+func submitRedeemRenewWithMigrationPlanQuoteTrustRoots(
+	t *testing.T,
+	id string,
+	request RouteSubmitRequest,
+) error {
+	t.Helper()
+	service, err := NewService(
+		newMemoryHandle(),
+		&scriptedEngine{},
+		WithMigrationPlanQuoteTrustRoots([]MigrationPlanQuoteTrustRoot{
+			testMigrationPlanQuoteTrustRoot,
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.Submit(context.Background(), TemplateSelfV1, SignerSubmitInput{
+		RouteRequestID: id,
+		Stage:          StageSignerCoordination,
+		Request:        request,
+	})
+	return err
+}
+
+func TestServiceAcceptsRedeemSelfV1WithMigrationPlanQuoteTrustRootsConfigured(t *testing.T) {
+	err := submitRedeemRenewWithMigrationPlanQuoteTrustRoots(
+		t, "ors_redeem_trust_roots_configured", redeemSelfV1Request(t),
+	)
+	if err != nil {
+		t.Fatalf(
+			"expected redeem request to be accepted when migrationPlanQuoteTrustRoots are configured, got %v",
+			err,
+		)
+	}
+}
+
+func TestServiceAcceptsRenewSelfV1WithMigrationPlanQuoteTrustRootsConfigured(t *testing.T) {
+	err := submitRedeemRenewWithMigrationPlanQuoteTrustRoots(
+		t, "ors_renew_trust_roots_configured", renewSelfV1Request(t),
+	)
+	if err != nil {
+		t.Fatalf(
+			"expected renew request to be accepted when migrationPlanQuoteTrustRoots are configured, got %v",
+			err,
+		)
+	}
+}
+
 func TestServiceRejectsRedeemWithCommitmentMismatch(t *testing.T) {
 	request := redeemSelfV1Request(t)
 	// Tamper the output script without recomputing the commitment: the recomputed
