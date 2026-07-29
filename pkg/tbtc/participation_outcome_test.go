@@ -1,10 +1,12 @@
 package tbtc
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"math/big"
 	"testing"
 	"time"
@@ -12,6 +14,7 @@ import (
 	"github.com/keep-network/keep-core/internal/testutils"
 	"github.com/keep-network/keep-core/pkg/bitcoin"
 	"github.com/keep-network/keep-core/pkg/chain"
+	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/tecdsa"
 )
@@ -179,12 +182,37 @@ func TestWalletTransactionExecutor_TerminalOutcome_SignedTransaction(t *testing.
 }
 
 // runHeartbeatActionForOutcome executes one heartbeat action against the given
-// permit and returns the signing executor it used, so a caller can tell a
-// heartbeat that never signed apart from one that signed and failed.
+// permit, using a fresh failure counter so no earlier heartbeat can push this
+// one over the consecutive-failure threshold.
 func runHeartbeatActionForOutcome(
 	t *testing.T,
 	hostChain *localChain,
 	signingExecutor *mockHeartbeatSigningExecutor,
+	proposal *HeartbeatProposal,
+	permit participation.Permit,
+) {
+	t.Helper()
+
+	runHeartbeatActionWithFailureCounter(
+		t,
+		hostChain,
+		signingExecutor,
+		&mockInactivityClaimExecutor{},
+		newHeartbeatFailureCounter(),
+		proposal,
+		permit,
+	)
+}
+
+// runHeartbeatActionWithFailureCounter executes one heartbeat action against a
+// caller-owned failure counter and claim executor, so consecutive low-activity
+// heartbeats can be driven up to the threshold that dispatches a claim.
+func runHeartbeatActionWithFailureCounter(
+	t *testing.T,
+	hostChain *localChain,
+	signingExecutor *mockHeartbeatSigningExecutor,
+	claimExecutor *mockInactivityClaimExecutor,
+	failureCounter *heartbeatFailureCounter,
 	proposal *HeartbeatProposal,
 	permit participation.Permit,
 ) {
@@ -207,8 +235,8 @@ func runHeartbeatActionForOutcome(
 		},
 		signingExecutor,
 		proposal,
-		newHeartbeatFailureCounter(),
-		&mockInactivityClaimExecutor{},
+		failureCounter,
+		claimExecutor,
 		startBlock,
 		startBlock+heartbeatTotalProposalValidityBlocks,
 		func(ctx context.Context, blockHeight uint64) error { return nil },
@@ -218,6 +246,138 @@ func runHeartbeatActionForOutcome(
 	// The action's own error is not the subject here: every exit, successful or
 	// not, must leave exactly one terminal disposition behind.
 	_ = action.execute()
+}
+
+// TestHeartbeatAction_TerminalOutcomeBindsDispatchedInactivityClaim asserts a
+// heartbeat that went on to file an inactivity claim is distinguishable in the
+// journal from a healthy one. The claim runs under the heartbeat's own permit
+// and leaves no separate record, so a reference naming only the signature would
+// let the audit clear penalty state it never saw.
+func TestHeartbeatAction_TerminalOutcomeBindsDispatchedInactivityClaim(
+	t *testing.T,
+) {
+	proposal := &HeartbeatProposal{
+		Message: [16]byte{
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+		},
+	}
+
+	// runToClaimThreshold drives consecutive low-activity heartbeats until the
+	// claim threshold is crossed and returns the last heartbeat's evidence
+	// reference together with the number of claims that were dispatched.
+	runToClaimThreshold := func(
+		t *testing.T,
+		activeMembers uint32,
+		runs int,
+	) (string, int) {
+		t.Helper()
+
+		hostChain := Connect()
+		hostChain.setOperatorsEligibleStake(big.NewInt(100000))
+
+		claimExecutor := &mockInactivityClaimExecutor{}
+		failureCounter := newHeartbeatFailureCounter()
+
+		var reference string
+		for run := 0; run < runs; run++ {
+			permit := newTestPermit(participation.TBTCHeartbeat)
+
+			runHeartbeatActionWithFailureCounter(
+				t,
+				hostChain,
+				&mockHeartbeatSigningExecutor{
+					activeOperatorsCount: activeMembers,
+				},
+				claimExecutor,
+				failureCounter,
+				proposal,
+				permit,
+			)
+
+			reference = assertRecordedTerminalOutcome(
+				t,
+				permit,
+				participation.TerminalOutcomeCompleted,
+				participation.TerminalEvidenceProtocolResult,
+			).Reference
+		}
+
+		return reference, claimExecutor.calls
+	}
+
+	claimed, claimCalls := runToClaimThreshold(
+		t,
+		heartbeatSigningMinimumActiveMembers-1,
+		heartbeatConsecutiveFailureThreshold,
+	)
+	if claimCalls != 1 {
+		t.Fatalf(
+			"expected exactly one dispatched inactivity claim, got [%d]",
+			claimCalls,
+		)
+	}
+
+	healthy, healthyClaimCalls := runToClaimThreshold(
+		t,
+		heartbeatSigningMinimumActiveMembers,
+		heartbeatConsecutiveFailureThreshold,
+	)
+	if healthyClaimCalls != 0 {
+		t.Fatalf(
+			"expected no dispatched inactivity claim, got [%d]",
+			healthyClaimCalls,
+		)
+	}
+
+	if claimed == healthy {
+		t.Errorf(
+			"a heartbeat that filed an inactivity claim and one that did not "+
+				"produced the same evidence reference [%s]",
+			claimed,
+		)
+	}
+}
+
+// TestHeartbeatPenaltyState_InactiveMemberBytesAreCanonical asserts the claimed
+// member set contributes a deterministic identity: the signing activity report's
+// ordering is incidental, so two records of the same claim must agree.
+func TestHeartbeatPenaltyState_InactiveMemberBytesAreCanonical(t *testing.T) {
+	ordered := heartbeatPenaltyState{
+		claimDispatched: true,
+		inactiveMembers: []group.MemberIndex{3, 9, 14},
+	}
+	shuffled := heartbeatPenaltyState{
+		claimDispatched: true,
+		inactiveMembers: []group.MemberIndex{14, 3, 9, 3},
+	}
+
+	if !bytes.Equal(ordered.inactiveMemberBytes(), shuffled.inactiveMemberBytes()) {
+		t.Errorf(
+			"one claimed member set produced two identities [%x] and [%x]",
+			ordered.inactiveMemberBytes(),
+			shuffled.inactiveMemberBytes(),
+		)
+	}
+
+	disjoint := heartbeatPenaltyState{
+		claimDispatched: true,
+		inactiveMembers: []group.MemberIndex{3, 9, 15},
+	}
+	if bytes.Equal(ordered.inactiveMemberBytes(), disjoint.inactiveMemberBytes()) {
+		t.Errorf(
+			"two different claimed member sets produced the same identity [%x]",
+			ordered.inactiveMemberBytes(),
+		)
+	}
+
+	empty := heartbeatPenaltyState{}
+	if empty.inactiveMemberBytes() != nil {
+		t.Errorf(
+			"a heartbeat that dispatched no claim named members [%x]",
+			empty.inactiveMemberBytes(),
+		)
+	}
 }
 
 // TestHeartbeatAction_TerminalOutcome walks every exit of the heartbeat action
@@ -409,6 +569,101 @@ func TestCoordinationTerminalOutcome(t *testing.T) {
 			)
 		}
 	})
+
+	// A wallet can agree on two different redemptions of the same action type
+	// in the same window across a restart. An identity that named only the
+	// action type would report both as the same durable result, so the offline
+	// audit could clear one window's journal entry with the other's settlement.
+	t.Run("distinct proposals of one action type produce distinct references", func(t *testing.T) {
+		proposals := []CoordinationProposal{
+			&RedemptionProposal{
+				RedeemersOutputScripts: []bitcoin.Script{{0x01}},
+				RedemptionTxFee:        big.NewInt(1000),
+			},
+			&RedemptionProposal{
+				RedeemersOutputScripts: []bitcoin.Script{{0x02}},
+				RedemptionTxFee:        big.NewInt(1000),
+			},
+		}
+
+		references := make([]string, 0, len(proposals))
+		for _, proposal := range proposals {
+			permit := newTestPermit(participation.TBTCWalletCoordination)
+
+			recordCoordinationTerminalOutcome(
+				&testutils.MockLogger{},
+				permit,
+				walletPublicKeyBytes,
+				&coordinationResult{
+					window:   newCoordinationWindow(900),
+					leader:   chain.Address("0xleader"),
+					proposal: proposal,
+				},
+			)
+
+			evidence := assertRecordedTerminalOutcome(
+				t,
+				permit,
+				participation.TerminalOutcomeCompleted,
+				participation.TerminalEvidenceProtocolResult,
+			)
+			references = append(references, evidence.Reference)
+		}
+
+		if references[0] == references[1] {
+			t.Errorf(
+				"two distinct redemption proposals in one window produced the "+
+					"same evidence reference [%s]",
+				references[0],
+			)
+		}
+	})
+
+	// A proposal the node cannot serialize has no faithful identity. Recording
+	// a weaker reference would hand the audit a result it cannot pin down, and
+	// recording exhausted would deny a dispatched wallet action, so the permit
+	// must be left to close unresolved and block the offline barrier.
+	t.Run("unserializable proposal records nothing", func(t *testing.T) {
+		permit := newTestPermit(participation.TBTCWalletCoordination)
+
+		recordCoordinationTerminalOutcome(
+			&testutils.MockLogger{},
+			permit,
+			walletPublicKeyBytes,
+			&coordinationResult{
+				window:   newCoordinationWindow(900),
+				leader:   chain.Address("0xleader"),
+				proposal: &unmarshalableProposal{},
+			},
+		)
+
+		if recorded := permit.recordedTerminalOutcomes(); len(recorded) != 0 {
+			t.Errorf(
+				"expected no terminal outcome for an unidentifiable result, "+
+					"got [%+v]",
+				recorded,
+			)
+		}
+	})
+}
+
+// unmarshalableProposal stands in for a proposal whose serialization fails.
+type unmarshalableProposal struct{}
+
+func (up *unmarshalableProposal) ActionType() WalletActionType {
+	return ActionRedemption
+}
+
+func (up *unmarshalableProposal) ValidityBlocks() uint64 {
+	return 0
+}
+
+func (up *unmarshalableProposal) Marshal() ([]byte, error) {
+	return nil, errors.New("proposal cannot be serialized")
+}
+
+func (up *unmarshalableProposal) Unmarshal([]byte) error {
+	return errors.New("proposal cannot be deserialized")
 }
 
 // TestRecordPermitTerminalOutcome_NilPermit asserts the recorder tolerates a nil

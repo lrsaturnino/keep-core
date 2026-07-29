@@ -382,13 +382,6 @@ func ValidateTerminalOutcome(
 					"member did not publish an accepted result",
 			)
 		}
-		if outcome == TerminalOutcomeCompleted &&
-			evidence.Kind != TerminalEvidencePersistedTBTCSinger {
-			return fmt.Errorf(
-				"completed tbtc DKG requires evidence kind [%s]",
-				TerminalEvidencePersistedTBTCSinger,
-			)
-		}
 	case BeaconDKG:
 		if outcome == TerminalOutcomeExhausted {
 			return fmt.Errorf(
@@ -396,16 +389,62 @@ func ValidateTerminalOutcome(
 					"member did not publish an accepted result",
 			)
 		}
-		if outcome == TerminalOutcomeCompleted &&
-			evidence.Kind != TerminalEvidencePersistedBeaconSigner {
+	}
+
+	if outcome == TerminalOutcomeCompleted {
+		expected, known := completedEvidenceKinds[ceremony]
+		if !known {
 			return fmt.Errorf(
-				"completed beacon DKG requires evidence kind [%s]",
-				TerminalEvidencePersistedBeaconSigner,
+				"ceremony [%s] has no declared completed evidence kind",
+				ceremony,
+			)
+		}
+		if evidence.Kind != expected {
+			return fmt.Errorf(
+				"completed ceremony [%s] requires evidence kind [%s], got [%s]",
+				ceremony,
+				expected,
+				evidence.Kind,
 			)
 		}
 	}
 
 	return nil
+}
+
+// completedEvidenceKinds names the single evidence kind each ceremony may use
+// to claim a durable result. The mapping is deliberately exhaustive and
+// one-to-one: without it, a ceremony whose real result is an external
+// transaction — a signed Bitcoin spend, an on-chain penalty submission — could
+// settle its permit with TerminalEvidenceProtocolResult, a digest the node
+// authors entirely by itself. That would let an ambiguous submission clear the
+// rollback journal on the node's own say-so, with nothing for the offline audit
+// to reconcile against canonical state. Each ceremony is therefore pinned to
+// the evidence class its result actually lives in.
+//
+// A ceremony added to AllCeremonies without an entry here fails closed: its
+// completed outcome is rejected, the permit closes unresolved, and the offline
+// barrier blocks until the omission is fixed.
+var completedEvidenceKinds = map[Ceremony]TerminalEvidenceKind{
+	// The wallet's persisted signing-group membership.
+	TBTCDKG: TerminalEvidencePersistedTBTCSinger,
+	// The agreed proposal; it dispatches an action that settles separately.
+	TBTCWalletCoordination: TerminalEvidenceProtocolResult,
+	// The signed Bitcoin transaction the action may have broadcast.
+	TBTCSigning: TerminalEvidenceBitcoinTransaction,
+	// The threshold signature over the proposed heartbeat message.
+	TBTCHeartbeat: TerminalEvidenceProtocolResult,
+	// The claim submission, which is Ethereum state and never node-authored.
+	TBTCInactivityClaim: TerminalEvidenceEthereumTransaction,
+	// The persisted threshold signer.
+	BeaconDKG: TerminalEvidencePersistedBeaconSigner,
+	// The recovered relay entry, deterministic for a given previous entry.
+	BeaconRelaySigning: TerminalEvidenceProtocolResult,
+	// The forwarder relays other members' shares and produces no result of its
+	// own; reaching its close is the whole of its durable disposition.
+	BeaconRelayForwarding: TerminalEvidenceForwarderClosed,
+	// The filed timeout report, identified by its request and report blocks.
+	BeaconTimeoutReport: TerminalEvidenceProtocolResult,
 }
 
 func terminalOutcomeRecordLess(

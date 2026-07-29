@@ -1382,6 +1382,11 @@ func executeCoordinationProcedure(
 // action itself runs under its own permit and reports its own outcome. A
 // procedure that never agreed on a result — including one the release gate
 // canceled — left nothing behind and is recorded as exhausted.
+//
+// The evidence binds the proposal's full serialized payload, not just its
+// action type: a wallet can agree on two different deposit sweeps or two
+// different redemptions in the same window across a restart, and an identity
+// that only named the type would report both as the same durable result.
 func recordCoordinationTerminalOutcome(
 	procedureLogger log.StandardLogger,
 	permit participation.Permit,
@@ -1390,6 +1395,21 @@ func recordCoordinationTerminalOutcome(
 ) {
 	if result == nil {
 		recordPermitNoThreshold(procedureLogger, permit)
+		return
+	}
+
+	// A proposal the node cannot serialize has no faithful identity, and the
+	// procedure did dispatch a wallet action, so neither a weaker reference nor
+	// an exhausted record would be honest. Leaving the permit without a
+	// terminal outcome closes it as unresolved, which blocks the offline
+	// barrier until an operator reconciles the window by hand.
+	proposalBytes, err := result.proposal.Marshal()
+	if err != nil {
+		procedureLogger.Errorf(
+			"could not derive the coordination result identity for the "+
+				"node-authored terminal outcome: [%v]",
+			err,
+		)
 		return
 	}
 
@@ -1408,6 +1428,7 @@ func recordCoordinationTerminalOutcome(
 				coordinationBlock,
 				[]byte(result.leader),
 				[]byte(result.proposal.ActionType().String()),
+				proposalBytes,
 			),
 		},
 	)

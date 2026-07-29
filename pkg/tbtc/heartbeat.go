@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/big"
+	"slices"
 	"sync"
 
 	"github.com/ipfs/go-log/v2"
@@ -133,17 +134,65 @@ func newHeartbeatAction(
 	}
 }
 
+// heartbeatPenaltyState is the penalty state a heartbeat left behind on top of
+// its threshold signature. The inactivity claim derived from a low-activity
+// heartbeat runs under the heartbeat's own permit, so the heartbeat's terminal
+// record is the only place that disposition is reported. A record naming only
+// the signature cannot tell a healthy heartbeat apart from one that went on to
+// file an inactivity claim against named members, which is exactly the
+// distinction the rollback audit has to reconcile.
+type heartbeatPenaltyState struct {
+	// claimDispatched is true once the action handed a claim to the inactivity
+	// claim executor. It stays true when publishing then failed or was
+	// suppressed: the audit must treat a dispatched claim as possibly settled.
+	claimDispatched bool
+	// inactiveMembers is the exact member set the dispatched claim names. It is
+	// empty when no claim was dispatched.
+	inactiveMembers []group.MemberIndex
+}
+
+// inactiveMemberBytes renders the claimed inactive member set as a canonical,
+// order-independent byte string so the derived identity does not depend on the
+// order the signing activity report happened to produce.
+func (hps heartbeatPenaltyState) inactiveMemberBytes() []byte {
+	if len(hps.inactiveMembers) == 0 {
+		return nil
+	}
+
+	members := make([]group.MemberIndex, len(hps.inactiveMembers))
+	copy(members, hps.inactiveMembers)
+	slices.Sort(members)
+	members = slices.Compact(members)
+
+	bytes := make([]byte, len(members))
+	for i, member := range members {
+		bytes[i] = byte(member)
+	}
+
+	return bytes
+}
+
 // recordTerminalOutcome reports the heartbeat ceremony's node-owned final
 // disposition on its participation permit. The heartbeat's durable result is
-// the threshold signature it produced over the proposed message; a heartbeat
-// that never reached one — including one the release gate canceled — left no
-// state behind and is recorded as exhausted. The inactivity claim derived from
-// a low-activity heartbeat runs under this same permit, so it needs no
-// separate record.
-func (ha *heartbeatAction) recordTerminalOutcome(signature *tecdsa.Signature) {
+// the threshold signature it produced over the proposed message, qualified by
+// the penalty state the same permit created; a heartbeat that never reached a
+// signature — including one the release gate canceled — left no state behind
+// and is recorded as exhausted.
+func (ha *heartbeatAction) recordTerminalOutcome(
+	signature *tecdsa.Signature,
+	penalty heartbeatPenaltyState,
+) {
 	if signature == nil {
 		recordPermitNoThreshold(ha.logger, ha.permit)
 		return
+	}
+
+	// A dispatched claim gets its own domain so a healthy heartbeat's identity
+	// can never be replayed as the settlement of one that claimed inactivity,
+	// whatever member set the claim happened to name.
+	domain := "tbtc_heartbeat_signature"
+	if penalty.claimDispatched {
+		domain = "tbtc_heartbeat_signature_with_inactivity_claim"
 	}
 
 	recordPermitTerminalOutcome(
@@ -153,10 +202,11 @@ func (ha *heartbeatAction) recordTerminalOutcome(signature *tecdsa.Signature) {
 		participation.TerminalEvidence{
 			Kind: participation.TerminalEvidenceProtocolResult,
 			Reference: participation.TerminalResultReference(
-				"tbtc_heartbeat_signature",
+				domain,
 				ha.proposal.Message[:],
 				signatureComponentBytes(signature.R),
 				signatureComponentBytes(signature.S),
+				penalty.inactiveMemberBytes(),
 			),
 		},
 	)
@@ -164,8 +214,10 @@ func (ha *heartbeatAction) recordTerminalOutcome(signature *tecdsa.Signature) {
 
 func (ha *heartbeatAction) execute() error {
 	// heartbeatSignature holds the ceremony's durable result once signing
-	// produces one. The deferred recorder below reads its final value.
+	// produces one, and heartbeatPenalty the penalty state the same permit went
+	// on to create. The deferred recorder below reads their final values.
 	var heartbeatSignature *tecdsa.Signature
+	var heartbeatPenalty heartbeatPenaltyState
 
 	// The action owns its permit from dispatch on; releasing it here ends the
 	// ceremony's active accounting in the participation gate. The terminal
@@ -173,7 +225,7 @@ func (ha *heartbeatAction) execute() error {
 	// while it is still open.
 	defer ha.permit.Close()
 	defer func() {
-		ha.recordTerminalOutcome(heartbeatSignature)
+		ha.recordTerminalOutcome(heartbeatSignature, heartbeatPenalty)
 	}()
 
 	// Do not execute the heartbeat action if the operator is unstaking.
@@ -318,6 +370,14 @@ func (ha *heartbeatAction) execute() error {
 		ha.waitForBlockFn,
 	)
 	defer cancelHeartbeatInactivityCtx()
+
+	// Pin the penalty state before dispatching, not after: a claim the executor
+	// may already have published must show up in the terminal record even if
+	// the call below then errors out or the permit is canceled mid-flight.
+	heartbeatPenalty = heartbeatPenaltyState{
+		claimDispatched: true,
+		inactiveMembers: activityReport.inactiveMembers,
+	}
 
 	// The value of consecutive heartbeat inactivity failures exceeds the threshold.
 	// Proceed with operator inactivity claim. The claim is derived penalty

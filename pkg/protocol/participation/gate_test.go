@@ -161,8 +161,8 @@ func TestGate_NodeAuthoredTerminalOutcomes(t *testing.T) {
 	if err := completed.RecordTerminalOutcome(
 		TerminalOutcomeCompleted,
 		TerminalEvidence{
-			Kind:      TerminalEvidenceProtocolResult,
-			Reference: "threshold-result-digest",
+			Kind:      TerminalEvidenceBitcoinTransaction,
+			Reference: "signed-transaction-hash",
 		},
 	); err != nil {
 		t.Fatal(err)
@@ -230,8 +230,8 @@ func TestGate_NodeAuthoredTerminalOutcomeRetriesPersistence(t *testing.T) {
 
 	outcome := TerminalOutcomeCompleted
 	evidence := TerminalEvidence{
-		Kind:      TerminalEvidenceProtocolResult,
-		Reference: "threshold-result-digest",
+		Kind:      TerminalEvidenceBitcoinTransaction,
+		Reference: "signed-transaction-hash",
 	}
 	if err := permit.RecordTerminalOutcome(
 		outcome,

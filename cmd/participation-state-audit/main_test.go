@@ -276,6 +276,10 @@ func testTerminalOutcomeRecord(
 	}
 	switch participation.TerminalOutcome(permit.Outcome) {
 	case participation.TerminalOutcomeCompleted:
+		// Each ceremony settles on the evidence class its result actually
+		// lives in, mirroring what the node records in production. A fixture
+		// that settled everything on a node-authored protocol digest would
+		// exercise a shape the gate's own validator rejects.
 		switch snapshot.Ceremony {
 		case participation.TBTCDKG:
 			evidence = participation.TerminalEvidence{
@@ -288,6 +292,20 @@ func testTerminalOutcomeRecord(
 				Kind:            participation.TerminalEvidencePersistedBeaconSigner,
 				Reference:       beaconSignerReference,
 				MembershipIndex: group.MemberIndex(1),
+			}
+		case participation.TBTCSigning:
+			evidence = participation.TerminalEvidence{
+				Kind:      participation.TerminalEvidenceBitcoinTransaction,
+				Reference: resultReference,
+			}
+		case participation.TBTCInactivityClaim:
+			evidence = participation.TerminalEvidence{
+				Kind:      participation.TerminalEvidenceEthereumTransaction,
+				Reference: resultReference,
+			}
+		case participation.BeaconRelayForwarding:
+			evidence = participation.TerminalEvidence{
+				Kind: participation.TerminalEvidenceForwarderClosed,
 			}
 		}
 	case participation.TerminalOutcomeQuarantined:
@@ -2682,6 +2700,83 @@ func TestValidateNodeTerminalOutcomes_DKGCompletionIsMembershipExact(
 				violations,
 			)
 		})
+	}
+}
+
+// TestValidateNodeTerminalOutcomes_CompletedEvidenceKindIsPinnedPerCeremony
+// proves the offline audit refuses a settlement recorded in the wrong evidence
+// class. A wallet action's durable result is a Bitcoin transaction the audit
+// can reconcile against the chain; a node-authored protocol digest in its place
+// would clear the rollback journal on the node's own say-so after an ambiguous
+// submission, with nothing canonical left to check it against.
+func TestValidateNodeTerminalOutcomes_CompletedEvidenceKindIsPinnedPerCeremony(
+	t *testing.T,
+) {
+	capturedAt := time.Now().UTC().Add(-time.Minute)
+	permit := participation.PermitSnapshot{
+		Ceremony:            participation.TBTCSigning,
+		Mode:                participation.ModeLegacy.String(),
+		CanonicalStartBlock: 999,
+		WorkID:              "wallet-action-legacy",
+		PermitID:            "wallet-action-legacy",
+		IdentityBound:       true,
+	}
+
+	newManifest := func(evidence participation.TerminalEvidence) *manifest {
+		return &manifest{
+			QuiescenceSnapshot: &participation.QuiescenceSnapshot{
+				CapturedAt:    capturedAt,
+				ActivePermits: []participation.PermitSnapshot{permit},
+			},
+			ParticipationTerminalOutcomes: &participation.TerminalOutcomeJournal{
+				SchemaVersion:      participation.TerminalOutcomeJournalSchemaVersion,
+				SnapshotCapturedAt: capturedAt,
+				Outcomes: []participation.TerminalOutcomeRecord{
+					{
+						RecordedAt: time.Now().UTC(),
+						Permit:     permit,
+						Outcome:    participation.TerminalOutcomeCompleted,
+						Evidence:   evidence,
+					},
+				},
+			},
+		}
+	}
+
+	forged := validateNodeTerminalOutcomes(newManifest(
+		participation.TerminalEvidence{
+			Kind:      participation.TerminalEvidenceProtocolResult,
+			Reference: strings.Repeat("a", 64),
+		},
+	))
+	rejected := false
+	for _, violation := range forged {
+		if strings.Contains(violation, "requires evidence kind [bitcoin_transaction]") {
+			rejected = true
+			break
+		}
+	}
+	if !rejected {
+		t.Errorf(
+			"a completed wallet action settled on a node-authored protocol "+
+				"digest was not rejected, violations: %v",
+			forged,
+		)
+	}
+
+	honest := validateNodeTerminalOutcomes(newManifest(
+		participation.TerminalEvidence{
+			Kind:      participation.TerminalEvidenceBitcoinTransaction,
+			Reference: strings.Repeat("a", 64),
+		},
+	))
+	for _, violation := range honest {
+		if strings.Contains(violation, "evidence is invalid") {
+			t.Errorf(
+				"the wallet action's own evidence class was rejected: [%s]",
+				violation,
+			)
+		}
 	}
 }
 

@@ -284,7 +284,6 @@ func TestTerminalResultReference_DomainSeparates(t *testing.T) {
 // actually record it.
 func TestTerminalResultReference_IsAcceptedAsEvidence(t *testing.T) {
 	for _, ceremony := range []Ceremony{
-		TBTCSigning,
 		TBTCHeartbeat,
 		TBTCWalletCoordination,
 		BeaconRelaySigning,
@@ -303,6 +302,73 @@ func TestTerminalResultReference_IsAcceptedAsEvidence(t *testing.T) {
 				ceremony,
 				err,
 			)
+		}
+	}
+}
+
+// TestValidateTerminalOutcome_CompletedEvidenceKindIsPinnedPerCeremony asserts
+// no ceremony can settle a completed permit with an evidence class other than
+// the one its result actually lives in. The consequential direction is a
+// ceremony whose result is external state — a Bitcoin spend, an Ethereum
+// penalty submission — settling on a node-authored protocol digest instead,
+// which would leave the offline audit nothing canonical to reconcile against.
+func TestValidateTerminalOutcome_CompletedEvidenceKindIsPinnedPerCeremony(
+	t *testing.T,
+) {
+	everyKind := []TerminalEvidenceKind{
+		TerminalEvidencePersistedTBTCSinger,
+		TerminalEvidencePersistedBeaconSigner,
+		TerminalEvidenceBitcoinTransaction,
+		TerminalEvidenceEthereumTransaction,
+		TerminalEvidenceProtocolResult,
+		TerminalEvidenceForwarderClosed,
+	}
+
+	for _, ceremony := range AllCeremonies() {
+		expected, declared := completedEvidenceKinds[ceremony]
+		if !declared {
+			t.Errorf(
+				"ceremony [%s] has no declared completed evidence kind; a "+
+					"completed permit for it can never be recorded",
+				ceremony,
+			)
+			continue
+		}
+
+		for _, kind := range everyKind {
+			evidence := TerminalEvidence{Kind: kind}
+			switch kind {
+			case TerminalEvidencePersistedTBTCSinger,
+				TerminalEvidencePersistedBeaconSigner:
+				evidence.MembershipIndex = 1
+				evidence.Reference = "persisted-signer-identity"
+			case TerminalEvidenceForwarderClosed:
+			default:
+				evidence.Reference = "durable-result-identity"
+			}
+
+			err := ValidateTerminalOutcome(
+				ceremony,
+				TerminalOutcomeCompleted,
+				evidence,
+			)
+			if kind == expected && err != nil {
+				t.Errorf(
+					"ceremony [%s] rejected its own evidence kind [%s]: [%v]",
+					ceremony,
+					kind,
+					err,
+				)
+			}
+			if kind != expected && err == nil {
+				t.Errorf(
+					"ceremony [%s] accepted foreign evidence kind [%s]; only "+
+						"[%s] identifies its durable result",
+					ceremony,
+					kind,
+					expected,
+				)
+			}
 		}
 	}
 }
