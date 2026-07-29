@@ -3452,6 +3452,16 @@ surviving_readings() {
   SURVIVING_ORIGINATED="tbtc_signing@840@wallet840=${SURVIVE_TX}=r1-node-1~member-1"
   # shellcheck disable=SC2034
   SURVIVING_HELD_BEFORE="1"
+  # What the gates themselves reported holding, before C and again once they
+  # reported being past it. The identities are the driver's account rendered
+  # the way a gate renders its own live permits, so the two can be compared
+  # rather than counted against each other.
+  # shellcheck disable=SC2034
+  SURVIVING_PERMITS_BEFORE="r1-node-1=wallet840#member-1"
+  # shellcheck disable=SC2034
+  SURVIVING_PERMITS_AT_C="r1-node-1=wallet840#member-1"
+  # shellcheck disable=SC2034
+  SURVIVING_PERMITS_AT_C_READ=1
   # shellcheck disable=SC2034
   SURVIVING_LEGACY_COMPLETIONS_BEFORE="0"
   # shellcheck disable=SC2034
@@ -3517,9 +3527,51 @@ SURVIVE_TX_SECOND="0xff777777777777777777777777777777777777777777777777777777777
 run_verdict surviving_case eval '
   SURVIVING_ORIGINATED="tbtc_signing@840@wallet840=${SURVIVE_TX}=r1-node-1~member-1 tbtc_signing@841@wallet841=${SURVIVE_TX_SECOND}=r1-node-1~member-2"
   SURVIVING_HELD_BEFORE="2"
+  SURVIVING_PERMITS_BEFORE="r1-node-1=wallet840#member-1 r1-node-1=wallet841#member-2"
+  SURVIVING_PERMITS_AT_C="r1-node-1=wallet840#member-1 r1-node-1=wallet841#member-2"
   SURVIVING_LEGACY_COMPLETIONS_AFTER="2"'
 check "a held permit with no terminal outcome is not covered by another's" 3 \
   "reported no terminal outcome for it"
+
+# The reading the permit identities exist for. A count of active legacy
+# ceremonies moving in step with the driver's account is satisfied by any two
+# unrelated permits; naming them is what ties the crossing to this step's work.
+run_verdict surviving_case eval \
+  'SURVIVING_PERMITS_BEFORE="r1-node-1=someoneelse#member-9"'
+check "a gate holding some other permit is not holding this step's" 3 \
+  "no R1 gate reported holding it"
+
+# The mirror: the gates hold the named permit and another beside it, so the
+# verdict would speak for a permit crossing C that this step never identified.
+run_verdict surviving_case eval \
+  'SURVIVING_PERMITS_BEFORE="r1-node-1=wallet840#member-1 r1-node-2=wallet999#member-3"'
+check "an unnamed legacy permit crossing beside the named one is caught" 3 \
+  "which this step did not originate"
+
+# The crossing itself is where a permit would be dropped, so the survival has
+# to be read there. A permit gone by the time the gates report open_security_v2
+# was cut short at C however cleanly the driver later says it settled.
+run_verdict surviving_case eval 'SURVIVING_PERMITS_AT_C=""'
+check "a permit dropped at the crossing did not survive it" 1 \
+  "no longer held.*when they reported open_security_v2"
+
+# A crossing that never happened observed nothing, which is not the same as
+# observing a permit survive one.
+run_verdict surviving_case eval 'SURVIVING_PERMITS_AT_C_READ=0'
+check "an unobserved crossing evidences no surviving permit" 3 \
+  "never reached the point where the fleet reported open_security_v2"
+
+# An unread fleet on either side leaves the survival unobserved rather than
+# disproved, and a step that read a count alone would not notice.
+run_verdict surviving_case eval \
+  'SURVIVING_PERMITS_BEFORE="unreadable on r1-node-2"'
+check "gates that cannot be asked what they hold identify no permit" 3 \
+  "could not be asked which legacy permits they were holding"
+
+run_verdict surviving_case eval \
+  'SURVIVING_PERMITS_AT_C="unreadable on r1-node-2"'
+check "gates unread at the crossing leave the survival unobserved" 3 \
+  "could not be asked which legacy permits they still held"
 
 # The counter moves, but by more than this step put across the crossing: an
 # unrelated legacy ceremony finishing elsewhere in the fleet cannot stand in.

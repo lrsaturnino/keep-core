@@ -3761,6 +3761,78 @@ would be empty"
   fi
 }
 
+# The legacy permits one node's gate reports live at this instant, rendered as
+# "<service>=<chain work>#<permit>" tokens.
+#
+# A count of active legacy ceremonies answers "this node is holding two" and
+# nothing further, so a control watching work cross C can only compare totals —
+# and any two unrelated ceremonies moving in step satisfy that. The gate
+# publishes the permits themselves; naming them is what lets the control say
+# the permit that was in flight before C is the one that finished after it.
+#
+# Only identity-bound permits are usable. An unbound permit names no chain
+# work, so nothing can match it to work a driver put on the chain, and reading
+# it as a match would be reading the count again under another name.
+service_legacy_permits() {
+  local service="$1"
+  probe_diagnostics "${service}" |
+    node -e '
+      let raw = "";
+      process.stdin.on("data", (d) => (raw += d));
+      process.stdin.on("end", () => {
+        const state = (JSON.parse(raw).protocol_participation) || {};
+        const permits = state.active_permits;
+        if (!Array.isArray(permits)) {
+          console.error("no active_permits in the gate state");
+          process.exit(1);
+        }
+        const service = process.argv[1];
+        const out = [];
+        for (const permit of permits) {
+          if (permit === null || typeof permit !== "object" ||
+            Array.isArray(permit)) {
+            console.error("not a permit: " + JSON.stringify(permit));
+            process.exit(1);
+          }
+          if (permit.mode !== "legacy") {
+            continue;
+          }
+          if (permit.identity_bound !== true) {
+            console.error("a legacy permit is not identity-bound: " +
+              JSON.stringify(permit));
+            process.exit(1);
+          }
+          if (typeof permit.work_id !== "string" ||
+            !/^\S+$/.test(permit.work_id) ||
+            typeof permit.permit_id !== "string" ||
+            !/^\S+$/.test(permit.permit_id)) {
+            console.error("a legacy permit names no work or permit " +
+              "identity: " + JSON.stringify(permit));
+            process.exit(1);
+          }
+          out.push(service + "=" + permit.work_id + "#" + permit.permit_id);
+        }
+        process.stdout.write(out.join(" "));
+      });
+    ' "${service}"
+}
+
+# Every legacy permit the R1 fleet holds right now, in the form the originated
+# records render to. A node that cannot be read leaves the whole reading
+# unusable rather than a shorter list, which would otherwise be indistinguishable
+# from a node that had released its permits.
+fleet_legacy_permits() {
+  local service permits out=""
+  for service in "${REHEARSAL_R1_SERVICES[@]}"; do
+    if ! permits="$(service_legacy_permits "${service}" 2>/dev/null)"; then
+      printf 'unreadable on %s' "${service}"
+      return 0
+    fi
+    [[ -z "${permits}" ]] || out="${out}${out:+ }${permits}"
+  done
+  printf '%s' "${out}"
+}
+
 # Record the block the gate is clocked to, as that node reads it.
 observe_canonical_block() {
   local block
@@ -5292,11 +5364,52 @@ work_records_held_by() {
   printf '%s' "${out}"
 }
 
+# The chain-native work identity a work token names — the last component. The
+# ceremony and anchor in front of it are this rehearsal's own labelling; the
+# gate records only this part as a permit's work ID, so it is what a driver
+# account and a gate scrape have in common.
+work_chain_id() {
+  printf '%s' "${1##*@}"
+}
+
 # One permit record's identity, which retains the local permit after the chain
 # work it belongs to. This is the unit counted and matched to quarantine.
 permit_identity() {
   printf '%s#%s' "$(work_id "$1")" \
     "$(permit_local_id "$(work_permit "$1")")"
+}
+
+# The same identity rendered the way a gate scrape renders its own live
+# permits: "<holder>=<chain work>#<permit>". Two nodes can issue permits with
+# the same local id for the same chain work, so the holder belongs inside the
+# identity rather than beside it, and the chain work is the one the gate itself
+# recorded rather than this rehearsal's labelled form of it.
+held_permit_identity() {
+  local permit
+  permit="$(work_permit "$1")"
+  printf '%s=%s#%s' "$(permit_holder "${permit}")" \
+    "$(work_chain_id "$(work_id "$1")")" "$(permit_local_id "${permit}")"
+}
+
+held_permit_identities() {
+  local records="$1" record out=""
+  for record in ${records}; do
+    out="${out}${out:+ }$(held_permit_identity "${record}")"
+  done
+  printf '%s' "${out}"
+}
+
+# The tokens of the first list the second does not contain, comma-joined. The
+# asymmetry is the point: asked one way it names what went missing, asked the
+# other way it names what turned up unaccounted for, and a control that has to
+# say "these exact permits" needs both directions rather than a total.
+absent_tokens() {
+  local wanted="$1" have="$2" token out=""
+  for token in ${wanted}; do
+    contains_token "${have}" "${token}" && continue
+    out="${out}${out:+, }${token}"
+  done
+  printf '%s' "${out}"
 }
 
 # Every permit identity a set of originated records names, space-joined. Work
@@ -7440,6 +7553,9 @@ SURVIVING_DRIVER_SUPPLIED=0
 SURVIVING_ORIGINATE_RC=0
 SURVIVING_ORIGINATED=""
 SURVIVING_HELD_BEFORE=""
+SURVIVING_PERMITS_BEFORE=""
+SURVIVING_PERMITS_AT_C=""
+SURVIVING_PERMITS_AT_C_READ=0
 SURVIVING_LEGACY_COMPLETIONS_BEFORE=""
 SURVIVING_LEGACY_COMPLETIONS_AFTER=""
 SURVIVING_TERMINAL_ASKED=0
@@ -7450,6 +7566,9 @@ originate_surviving_legacy_work() {
   SURVIVING_DRIVER_SUPPLIED=0
   SURVIVING_ORIGINATE_RC=0
   SURVIVING_ORIGINATED=""
+  SURVIVING_PERMITS_BEFORE=""
+  SURVIVING_PERMITS_AT_C=""
+  SURVIVING_PERMITS_AT_C_READ=0
   SURVIVING_TERMINAL_ASKED=0
   SURVIVING_TERMINAL_RC=0
   SURVIVING_TERMINAL=""
@@ -7466,6 +7585,19 @@ originate_surviving_legacy_work() {
   SURVIVING_ORIGINATED="${WORK_DRIVER_ORIGINATED_WORK}"
   SURVIVING_HELD_BEFORE="$(fleet_metric_total \
     participation_active_legacy_ceremonies)"
+  # The gates' own list of what they are holding, taken beside the count. The
+  # count says how many permits met C; only the list says which, and the whole
+  # claim of this control is about particular permits.
+  SURVIVING_PERMITS_BEFORE="$(fleet_legacy_permits)"
+}
+
+# The same list read at the instant the fleet reports it is past C. Taken from
+# the crossing step rather than from the resolution that follows it: a permit
+# read after the work settled is a permit that is gone whether it survived the
+# crossing or was cut short at it, and the two readings have to be separable.
+observe_surviving_permits_at_cutover() {
+  SURVIVING_PERMITS_AT_C_READ=1
+  SURVIVING_PERMITS_AT_C="$(fleet_legacy_permits)"
 }
 
 # What became of it, asked after the crossing step has established that C
@@ -7487,6 +7619,13 @@ surviving_legacy_verdict() {
   local step="pre-cutover legacy work survives C and completes"
 
   local stray settlements failed unended originated_permits held_delta
+  local named_permits unheld_before unnamed_before lost_at_c
+  named_permits="$(held_permit_identities "${SURVIVING_ORIGINATED}")"
+  unheld_before="$(absent_tokens "${named_permits}" \
+    "${SURVIVING_PERMITS_BEFORE}")"
+  unnamed_before="$(absent_tokens "${SURVIVING_PERMITS_BEFORE}" \
+    "${named_permits}")"
+  lost_at_c="$(absent_tokens "${named_permits}" "${SURVIVING_PERMITS_AT_C}")"
   stray="$(unoriginated_terminals "${SURVIVING_TERMINAL}" \
     "${SURVIVING_ORIGINATED}")"
   settlements="$(bound_settlements "${SURVIVING_TERMINAL}")"
@@ -7533,6 +7672,34 @@ permit(s) it put there ($(permit_identities "${SURVIVING_ORIGINATED}")); a \
 count that does not match the named population leaves permits this step \
 cannot identify crossing C beside the ones it can, and the verdict below \
 would speak for those too"
+  elif [[ "${SURVIVING_PERMITS_BEFORE}" == "unreadable on "* ]]; then
+    block_step "${step}" "the fleet gates could not be asked which legacy \
+permits they were holding when C approached (${SURVIVING_PERMITS_BEFORE}); a \
+count of active legacy ceremonies says how many permits met the crossing and \
+never which, so nothing here could follow one across it"
+  elif [[ -n "${unheld_before}" ]]; then
+    block_step "${step}" "the driver named ${unheld_before} as put on the \
+chain before C, but no R1 gate reported holding it; a permit this step cannot \
+find in the gate that issued it is one the driver's account alone vouches for"
+  elif [[ -n "${unnamed_before}" ]]; then
+    block_step "${step}" "the R1 gates held ${unnamed_before} when C \
+approached, which this step did not originate; an unnamed legacy permit \
+crossing beside the named ones is one the verdict below would speak for \
+without ever having identified it"
+  elif ((SURVIVING_PERMITS_AT_C_READ == 0)); then
+    block_step "${step}" "the crossing step never reached the point where the \
+fleet reported open_security_v2, so nothing observed whether the legacy \
+permits named before C were still held once it passed"
+  elif [[ "${SURVIVING_PERMITS_AT_C}" == "unreadable on "* ]]; then
+    block_step "${step}" "the fleet gates could not be asked which legacy \
+permits they still held once C passed (${SURVIVING_PERMITS_AT_C}); the \
+crossing is exactly where a permit would be dropped, so an unread fleet there \
+leaves the survival unobserved"
+  elif [[ -n "${lost_at_c}" ]]; then
+    record_step "${step}" fail "the R1 gates no longer held ${lost_at_c} when \
+they reported open_security_v2, though this step put it on the chain before C \
+and no terminal outcome had been asked for yet; a legacy permit must keep its \
+mode across the crossing, not be dropped at it"
   elif ((SURVIVING_TERMINAL_ASKED == 0)); then
     block_step "${step}" "the driver was never asked what became of the \
 legacy work it held across C; a permit observed in flight before the crossing \
@@ -7583,12 +7750,13 @@ moved by a different amount counted completions this step did not originate, \
 or missed ones it did"
   else
     STEP_PERMIT_MODES='"legacy"'
-    record_step "${step}" pass "the ${SURVIVING_HELD_BEFORE} legacy \
-ceremonies the driver put on the fleet before C settled after it \
-(${settlements}), and the fleet gates recorded ${held_delta} legacy \
-completion(s) at or after the cutover block — one for each permit held across \
-the crossing; a permit taken on the legacy side of C kept its mode and was \
-allowed to finish"
+    record_step "${step}" pass "the R1 gates held exactly the legacy permits \
+this step originated before C (${named_permits}), still held those same \
+permits when they reported open_security_v2, and settled them afterwards \
+(${settlements}); the fleet gates recorded ${held_delta} legacy completion(s) \
+at or after the cutover block — one for each permit held across the crossing. \
+A permit taken on the legacy side of C kept its identity and its mode across \
+the crossing and was allowed to finish"
   fi
 }
 
@@ -7661,6 +7829,10 @@ could observe a crossing; the rehearsal chain must be below C=\
       "the gate crosses C in-process, without a restart or a global toggle" \
       false "cross C without restart"
   elif await_gate_state open_security_v2 3600; then
+    # Read before anything else in this branch: the legacy permits held across
+    # the crossing are what the next step decides on, and every reading taken
+    # here costs the fleet blocks in which one of them could finish.
+    observe_surviving_permits_at_cutover
     local permits_after=0 permits_read=1
     for service in "${REHEARSAL_R1_SERVICES[@]}"; do
       observe_canonical_block "${service}"
