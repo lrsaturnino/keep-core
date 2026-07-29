@@ -4309,16 +4309,15 @@ chain say nothing about the work this fleet did"
   note "chain endpoint confirmed on chain id ${reported}"
 }
 
-# The one refusal that decides which rehearsal steps this release can execute
-# at all. The pinned tss-lib carries only the hardened parameters, so the
-# legacy strategy bundle refuses to configure a TSS party and no R1 node can
-# join a legacy ceremony. Every step below that needs mixed prior/R1 legacy
-# work is blocked by exactly this and records it verbatim, so a reader sees
-# one external dependency rather than a scatter of unexplained gaps.
-LEGACY_INTEROP_UNAVAILABLE="the pinned tss-lib is the hardened-only revision, \
-so the legacy strategy bundle refuses every legacy TSS configuration and no \
-R1 node can join a legacy ceremony; this step needs the reviewed dual-mode \
-fork pinned first"
+# Mixed prior/R1 legacy work is release evidence only after the pinned
+# dual-mode dependency has an archived independent cryptographic review. The
+# implementation and immutable commit exist, but a local build cannot create
+# that external review record. Every blocked legacy-image step names the same
+# missing release input instead of misreporting the implementation as absent.
+LEGACY_INTEROP_UNAVAILABLE="the pinned tss-lib revision implements immutable \
+legacy/security-v2 transcript modes, but no independent cryptographic review \
+record for that revision was supplied; mixed prior/R1 legacy evidence is not \
+release-authoritative until that review is archived"
 
 # Prove the named services are running the image the rehearsal was told to
 # run.

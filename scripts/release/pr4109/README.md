@@ -1255,7 +1255,7 @@ that tag immutable — and the analyzer that pin binds. A record naming this
 repository as the source, carrying a `ref` where the `sha` belongs, or leaving
 the conditions unresolved, records something that does not close the boundary.
 
-### Reviewed tss-lib fork with an immutable per-party legacy mode
+### Dual-mode tss-lib fork and independent-review gate
 
 R1's per-ceremony compatibility bundle covers all four wire- and
 transcript-sensitive decisions (`pkg/protocol/compatibility`): the
@@ -1267,59 +1267,33 @@ explicitly — there is no default), and a repository check
 (`pkg/protocol/compatibility/transcript_ownership_test.go`) fails the build
 tests if a call site bypasses it.
 
-The legacy arm of the transcript decision has no implementation to select: a
-Go build resolves exactly one `github.com/bnb-chain/tss-lib` replacement
-(currently the hardened `threshold-network/tss-lib` revision `86bd1a375cc0`
-in `go.mod`), and that revision exposes no per-party protocol mode.
-Reproducing the legacy transcript requires extending that fork so each local
-party is constructed with an immutable legacy/security-v2 setting: legacy
-reproduces the prior-production proof transcript byte for byte — including
-the prior wire message formats, whose protobuf schema the hardened revision
-changed — security-v2 requires the session nonce, and every mode-independent
-memory-safety fix stays active in both modes.
+The build resolves exactly one `github.com/bnb-chain/tss-lib` replacement:
+the immutable `threshold-network/tss-lib` revision
+`d847ce0030193ccf5dbec0097571dcce5a2a5cf6` in `go.mod`. That revision adds an
+explicit per-party `legacy`/`security-v2` transcript mode with no default and
+freezes it when an ECDSA local party is constructed. Legacy reproduces the
+historical untagged challenge formulas; security-v2 retains the
+session-bound, domain-tagged transcript and requires a ceremony nonce. The
+mode-independent validation and memory-safety guards remain active on both
+paths.
 
-That extension is reviewed cryptographic work outside this repository, and an
-unreviewed in-tree fork is not an accepted substitute. The dependency was
-re-verified empirically on 2026-07-27: `git ls-remote --heads --tags
-https://github.com/threshold-network/tss-lib` showed `master` at exactly the
-pinned `86bd1a375cc0` revision and no tags; the remote carries development
-branches (`advisory-fix`, `codex/*`, `constant-time-hardening`,
-`integrate-bnb-hardening`, `resharing-fix-upstream`), and a shallow clone of
-every branch tip grepped for any per-party legacy/transcript-mode API surface
-found zero hits on all of them — the reviewed dual-mode revision does not
-exist anywhere on the fork remote yet, so the dependency is outstanding
-upstream, not merely unpinned here. Until the reviewed fork commit is pinned in `go.mod`:
+The dependency suite pins the historical DLN, range-proof, and Bob-proof
+challenge formulas directly and completes homogeneous keygen and signing in
+both modes. Its full test suite, focused race suite, and `go vet ./...` pass
+for the pinned commit. In keep-core, the compatibility bundle is now the sole
+owner of `SetProtocolMode` and session-nonce configuration, the temporary
+legacy refusals are removed, and the formerly skipped homogeneous legacy DKG
+and signing cases run complete real transcripts after a pre-cutover anchor.
 
-- tBTC ceremonies **fail closed on legacy permits** — deliberately, at two
-  layers. The authoritative fence is the legacy bundle itself: its TSS
-  configuration returns `ErrLegacyTSSTranscriptUnavailable`
-  (`pkg/protocol/compatibility`), so no tECDSA party can be constructed in
-  legacy mode anywhere in the tree. The tECDSA executors additionally refuse
-  legacy permits up front (`pkg/tbtc/dkg.go`, `pkg/tbtc/signing.go`,
-  `pkg/tbtc/node.go`) so a refused ceremony never announces itself to peers.
-- The pre-cutover interop acceptance cases of smoke gates 1 and 2 — mixed
-  prior/R1 legacy signing and DKG succeeding before the cutover block, and a
-  legacy-anchored ceremony completing with legacy peers — cannot produce
-  evidence. They are recorded as explicit skips in
-  `pkg/tbtc/signing_cutover_integration_test.go` and
-  `pkg/tbtc/dkg_cutover_integration_test.go`.
-- The `single-release` container rehearsal still exits `BLOCKED` with every
-  image/chain input supplied, because its mixed prior/R1 pre-cutover steps
-  cannot execute. It no longer refuses the whole sequence to say so: the run
-  starts the fleet, executes the steps that need no legacy capability —
-  crossing C in-process, restart-derives-mode-from-anchor, the straggler
-  negative control and its quarantine, clock failure, quiescence with a
-  security-v2 permit — and records the four legacy-dependent steps as
-  `blocked` against this same dependency. The emitted record is what shows
-  which half of the gate this release already satisfies.
-
-Unblocking requires the reviewed fork commit, its review record, transcript
-fixtures proving both modes reproduce their exact expected bytes, and the
-`go.mod` pin. The keep-core changes are then confined to: pinning the fork,
-replacing the legacy bundle's `ConfigureTSSParameters` refusal with the
-fork's legacy-mode configuration, deleting the three executor-level early
-refusals, and turning the skip-marked cases into runnable acceptance tests.
-Every other integration point already receives its mode from the permit.
+Independent cryptographic review is still a release gate. The commit is
+published on the dependency repository's `codex/dual-mode-transcript` branch
+and proposed for review in `threshold-network/tss-lib#9`, but this repository
+does not contain an archived independent review record for it. The
+`single-release` container rehearsal therefore records the mixed-prior/R1
+legacy-image steps as `blocked` until that external review input is supplied.
+This is intentionally narrower than the former blocker: the implementation,
+immutable dependency pin, and in-repository acceptance evidence now exist;
+only independent review and exact-image execution remain.
 
 ## clientInfo.port 9601 compatibility smoke matrix
 

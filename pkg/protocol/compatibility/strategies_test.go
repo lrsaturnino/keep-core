@@ -2,7 +2,6 @@ package compatibility
 
 import (
 	"bytes"
-	"errors"
 	"math/big"
 	"testing"
 
@@ -265,23 +264,40 @@ func TestConfigureTSSParametersSelection(t *testing.T) {
 			parameters.SessionNonce(),
 		)
 	}
-
-	// The legacy bundle fails closed: the pinned tss-lib revision has no
-	// reviewed legacy transcript, and running the hardened one under a
-	// legacy permit would interoperate with neither release.
-	err := legacy.ConfigureTSSParameters(newTestTSSParameters(), sessionID)
-	if !errors.Is(err, ErrLegacyTSSTranscriptUnavailable) {
+	if parameters.ProtocolMode() != tss.ProtocolModeSecurityV2 {
 		t.Errorf(
-			"legacy TSS configuration must fail closed with the "+
-				"unavailability sentinel, got: [%v]",
-			err,
+			"expected security-v2 TSS mode, got [%v]",
+			parameters.ProtocolMode(),
+		)
+	}
+
+	// The legacy bundle selects the historical untagged transcript and leaves
+	// the security-v2 session nonce unset.
+	parameters = newTestTSSParameters()
+	if err := legacy.ConfigureTSSParameters(parameters, sessionID); err != nil {
+		t.Fatalf("unexpected legacy configuration error: [%v]", err)
+	}
+	if parameters.ProtocolMode() != tss.ProtocolModeLegacy {
+		t.Errorf(
+			"expected legacy TSS mode, got [%v]",
+			parameters.ProtocolMode(),
+		)
+	}
+	if parameters.SessionNonce() != nil {
+		t.Errorf(
+			"legacy TSS configuration set a session nonce: [%v]",
+			parameters.SessionNonce(),
 		)
 	}
 }
 
 func TestConfigureTSSParametersValidation(t *testing.T) {
+	legacy, _ := StrategiesFor(participation.ModeLegacy)
 	securityV2, _ := StrategiesFor(participation.ModeSecurityV2)
 
+	if err := legacy.ConfigureTSSParameters(nil, "64757a1f-1"); err == nil {
+		t.Error("expected an error for nil legacy parameters")
+	}
 	if err := securityV2.ConfigureTSSParameters(
 		nil,
 		"dkg-64757a1f-0000000000000001",
@@ -297,5 +313,8 @@ func TestConfigureTSSParametersValidation(t *testing.T) {
 	}
 	if parameters.SessionNonce() != nil {
 		t.Error("session nonce must remain unset after a rejected session ID")
+	}
+	if parameters.ProtocolMode() != 0 {
+		t.Error("protocol mode must remain unset after a rejected session ID")
 	}
 }

@@ -1,7 +1,6 @@
 package signing
 
 import (
-	"errors"
 	"fmt"
 	"math/big"
 	"testing"
@@ -208,12 +207,7 @@ func TestIdentityConverter_TssPartyIDToMemberIndex_Corrupted(t *testing.T) {
 	testutils.AssertIntsEqual(t, "member ID", 0, int(memberIndex))
 }
 
-// TestInitializeTssRoundOneRefusesLegacyTranscript proves the crypto-boundary
-// fence: a member carrying the legacy strategy bundle cannot construct a TSS
-// party, because the pinned tss-lib revision has no reviewed legacy proof
-// transcript. The refusal must surface the unavailability sentinel before any
-// party state exists.
-func TestInitializeTssRoundOneRefusesLegacyTranscript(t *testing.T) {
+func TestInitializeTssRoundOneConfiguresLegacyTranscript(t *testing.T) {
 	testData, err := tecdsatest.LoadPrivateKeyShareTestFixtures(1)
 	if err != nil {
 		t.Fatalf("failed to load test data: [%v]", err)
@@ -231,15 +225,17 @@ func TestInitializeTssRoundOneRefusesLegacyTranscript(t *testing.T) {
 		tecdsa.NewPrivateKeyShare(testData[0]),
 	)
 
-	_, err = member.
+	roundOneMember, err := member.
 		initializeEphemeralKeysGeneration().
 		initializeSymmetricKeyGeneration().
 		initializeTssRoundOne()
-	if !errors.Is(err, compatibility.ErrLegacyTSSTranscriptUnavailable) {
+	if err != nil {
+		t.Fatalf("unexpected error: [%v]", err)
+	}
+	if roundOneMember.tssParameters.ProtocolMode() != tss.ProtocolModeLegacy {
 		t.Errorf(
-			"legacy TSS round one must fail closed with the unavailability "+
-				"sentinel, got: [%v]",
-			err,
+			"expected legacy TSS mode, got [%v]",
+			roundOneMember.tssParameters.ProtocolMode(),
 		)
 	}
 }

@@ -14,21 +14,9 @@
 // chain clock, a configuration file, or any global mode. Legacy strategies
 // reproduce, byte for byte, the behavior of the pre-hardening production
 // releases; security-v2 strategies reproduce the hardened behavior.
-//
-// The legacy tECDSA proof transcript is the one decision whose implementation
-// is still missing: the pinned tss-lib fork exposes no per-party protocol
-// mode, and extending that fork is reviewed cryptographic work outside this
-// repository. The legacy bundle therefore fails closed — its TSS
-// configuration returns ErrLegacyTSSTranscriptUnavailable — so a tECDSA
-// ceremony cannot run in legacy mode until the reviewed fork is pinned and
-// that single method is replaced with the fork's legacy-mode configuration.
-// The hard-dependency record — what the reviewed fork must provide and which
-// acceptance evidence is blocked on it — lives in
-// scripts/release/pr4109/README.md.
 package compatibility
 
 import (
-	"errors"
 	"fmt"
 	"math/big"
 
@@ -38,18 +26,6 @@ import (
 	"github.com/keep-network/keep-core/pkg/altbn128"
 	"github.com/keep-network/keep-core/pkg/crypto/ephemeral"
 	"github.com/keep-network/keep-core/pkg/protocol/participation"
-)
-
-// ErrLegacyTSSTranscriptUnavailable reports that the legacy tECDSA proof
-// transcript cannot be produced because the pinned tss-lib fork exposes no
-// per-party legacy mode. Running the hardened transcript under a legacy
-// permit would emit wire traffic incompatible with both releases, so the
-// legacy bundle refuses TSS configuration outright. The refusal disappears
-// only when a reviewed fork revision with an immutable per-party mode is
-// pinned in go.mod.
-var ErrLegacyTSSTranscriptUnavailable = errors.New(
-	"legacy tECDSA proof transcript unavailable: the pinned tss-lib " +
-		"revision has no reviewed legacy mode",
 )
 
 // minTSSSessionIDBytes mirrors the pinned tss-lib fork's minimum session-ID
@@ -96,9 +72,8 @@ type Strategies interface {
 	// decision to the given TSS parameters before any local party is
 	// constructed from them. The security-v2 configuration binds the GG20
 	// proof challenges to the ceremony's session ID; the legacy configuration
-	// fails closed with ErrLegacyTSSTranscriptUnavailable until the reviewed
-	// dual-mode tss-lib fork is pinned. The applied setting is immutable for
-	// the party's lifetime.
+	// selects the historical untagged proof transcript. The applied setting is
+	// immutable for the party's lifetime.
 	ConfigureTSSParameters(parameters *tss.Parameters, sessionID string) error
 }
 
@@ -169,13 +144,17 @@ func (legacyStrategies) G1HashToPoint(message []byte) *bn256.G1 {
 }
 
 func (legacyStrategies) ConfigureTSSParameters(
-	_ *tss.Parameters,
+	parameters *tss.Parameters,
 	_ string,
 ) error {
-	return fmt.Errorf(
-		"cannot configure TSS parameters for a legacy ceremony: %w",
-		ErrLegacyTSSTranscriptUnavailable,
-	)
+	if parameters == nil {
+		return fmt.Errorf(
+			"cannot configure TSS parameters: no parameters provided",
+		)
+	}
+
+	parameters.SetProtocolMode(tss.ProtocolModeLegacy)
+	return nil
 }
 
 // securityV2Strategies reproduces the hardened behavior of the security
@@ -236,6 +215,7 @@ func (securityV2Strategies) ConfigureTSSParameters(
 		)
 	}
 	// Bind GG20 proof challenges to the existing protocol session.
+	parameters.SetProtocolMode(tss.ProtocolModeSecurityV2)
 	parameters.SetSessionNonceBytes([]byte(sessionID))
 	return nil
 }

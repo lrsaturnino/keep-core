@@ -383,22 +383,6 @@ func (de *dkgExecutor) generateSigningGroup(
 			continue
 		}
 
-		// The pinned tss-lib fork exposes no per-party legacy mode, so a
-		// tECDSA ceremony cannot reproduce the legacy proof transcript.
-		// Running the hardened transcript under a legacy permit would emit
-		// wire traffic incompatible with both releases, so a legacy-mode DKG
-		// is refused outright instead.
-		if permit.Mode() != participation.ModeSecurityV2 {
-			permit.Close()
-			dkgLogger.Warnf(
-				"[member:%v] refusing to join DKG in protocol mode [%s]: "+
-					"the pinned tss-lib revision has no reviewed legacy mode",
-				memberIndex,
-				permit.Mode(),
-			)
-			continue
-		}
-
 		go func() {
 			defer permit.Close()
 

@@ -2,24 +2,21 @@ package tbtc
 
 // This file carries the in-repository part of the tBTC DKG cutover acceptance
 // evidence: the production DKG retry loop and announcer over real local
-// network providers, real participation gates clocked by a local chain, and —
-// for the security-v2 mode — complete tECDSA key-generation transcripts with
+// network providers, real participation gates clocked by a local chain, and
+// complete tECDSA key-generation transcripts in both modes with
 // fixture pre-parameters, including generated key material, misbehavior
 // evidence, and signer persistence across a registry restart.
 //
-// The legacy-transcript cases remain out of unit-suite reach: they are
-// blocked on the reviewed tss-lib fork with an immutable per-party legacy
-// mode. The on-chain 90-active/10-misbehaved consequence with reward
-// ineligibility belongs to the Solidity suite, and the exact-image
-// mixed-release rehearsals — including transcript realness at the full
-// hundred-member scale — to scripts/release/pr4109. What is proven here is
-// the anchor-derived mode selection, its immutability across the cutover
-// block, the quorum discipline of the retry loop, the real-transcript
-// conversion of post-cutover legacy and silent peers into misbehaved-members
-// evidence, mismatch metrics, and roster attribution, the exact
-// production-scale first-attempt exclusion of the ten legacy seats at the
-// ninety-member quorum, and the homogeneous security-v2 key-generation
-// control.
+// The on-chain 90-active/10-misbehaved consequence with reward ineligibility
+// belongs to the Solidity suite, and the exact-image mixed-release rehearsals
+// — including transcript realness at the full hundred-member scale — to the
+// release scripts. What is proven here is the anchor-derived mode selection,
+// its immutability across the cutover block, homogeneous legacy and
+// security-v2 transcripts, the quorum discipline of the retry loop, the
+// real-transcript conversion of post-cutover legacy and silent peers into
+// misbehaved-members evidence, mismatch metrics, and roster attribution, and
+// the exact production-scale first-attempt exclusion of ten legacy seats at
+// the ninety-member quorum.
 
 import (
 	"bytes"
@@ -404,15 +401,6 @@ func runRealDKGCutoverMember(
 	}
 	defer permit.Close()
 
-	if permit.Mode() != participation.ModeSecurityV2 {
-		outcome.err = fmt.Errorf(
-			"unexpected permit mode [%s] for anchor [%v]",
-			permit.Mode(),
-			anchor,
-		)
-		return
-	}
-
 	channelName := fmt.Sprintf("%s-%s", ProtocolName, seed.Text(16))
 	channel, err := cutoverGroup.provider(memberIndex).BroadcastChannelFor(
 		channelName,
@@ -498,6 +486,26 @@ func runRealDKGCutoverMember(
 // and all memberships. Result-publication fencing is covered separately by the
 // completion-fence tests.
 func TestDKGCutover_HomogeneousSecurityV2RealKeyGeneration(t *testing.T) {
+	testDKGCutoverHomogeneousRealKeyGeneration(
+		t,
+		participation.ModeSecurityV2,
+	)
+}
+
+// TestDKGCutover_HomogeneousLegacyRealKeyGeneration proves that a DKG event
+// anchored before the cutover, but executed after the chain has crossed it,
+// completes with the historical transcript and session-ID format. The
+// dependency's transcript regression tests pin the emitted legacy challenges
+// to the prior production formulas; exact-image prior/R1 process
+// interoperability remains a release rehearsal gate.
+func TestDKGCutover_HomogeneousLegacyRealKeyGeneration(t *testing.T) {
+	testDKGCutoverHomogeneousRealKeyGeneration(t, participation.ModeLegacy)
+}
+
+func testDKGCutoverHomogeneousRealKeyGeneration(
+	t *testing.T,
+	mode participation.ProtocolMode,
+) {
 	groupParameters := &GroupParameters{
 		GroupSize:       3,
 		GroupQuorum:     2,
@@ -519,9 +527,9 @@ func TestDKGCutover_HomogeneousSecurityV2RealKeyGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Cross the cutover block before the ceremony starts: the canonical
-	// anchor is the cutover block itself while the current height is already
-	// past it.
+	// Cross the cutover block before the ceremony starts. The canonical anchor
+	// selects the requested transcript and remains immutable even though the
+	// current height is already past the cutover.
 	cutoverBlock := uint64(2)
 	if err := cutoverGroup.blockCounter.WaitForBlockHeight(
 		cutoverBlock + 1,
@@ -530,6 +538,15 @@ func TestDKGCutover_HomogeneousSecurityV2RealKeyGeneration(t *testing.T) {
 	}
 
 	gate := newTestGateWithCutover(t, cutoverGroup.blockCounter, cutoverBlock)
+	anchor := cutoverBlock
+	if mode == participation.ModeLegacy {
+		anchor = cutoverBlock - 1
+	}
+
+	expectedStrategies, err := compatibility.StrategiesFor(mode)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	seed := big.NewInt(0x2C0DE)
 
@@ -556,7 +573,7 @@ func TestDKGCutover_HomogeneousSecurityV2RealKeyGeneration(t *testing.T) {
 			gate,
 			groupParameters,
 			seed,
-			cutoverBlock,
+			anchor,
 			memberIndex,
 			tecdsaExecutor,
 			outcomes,
@@ -583,7 +600,7 @@ func TestDKGCutover_HomogeneousSecurityV2RealKeyGeneration(t *testing.T) {
 		testutils.AssertStringsEqual(
 			t,
 			fmt.Sprintf("attempt session ID of member [%v]", outcome.memberIndex),
-			compatibility.SecurityV2().DKGSessionID(seed, 1),
+			expectedStrategies.DKGSessionID(seed, 1),
 			outcome.sessionIDs[0],
 		)
 
@@ -850,8 +867,8 @@ func TestDKGCutover_RealKeyGenerationExcludesSilentPeer(t *testing.T) {
 // attempt — the production retry loop derives the exact prior-release session
 // ID for a retry starting at or after the cutover block, and the permit's
 // mode never mutates while the process state is already open_security_v2.
-// The ceremony's cryptographic completion with prior-release peers stays
-// blocked on the reviewed tss-lib fork and is recorded separately.
+// Completed cryptographic legacy interoperability is covered by the
+// homogeneous legacy test above.
 func TestDKGCutover_LegacyAnchorPinnedThroughRetriesAcrossCutover(t *testing.T) {
 	groupParameters := &GroupParameters{
 		GroupSize:       3,
@@ -2086,25 +2103,5 @@ func TestDKGCutover_GateQuiesceAbortSkipsOrdinaryDKGFailureMetrics(t *testing.T)
 		"ordinary DKG failures after the gate abort",
 		0,
 		int(recorder.counter(clientinfo.MetricDKGFailedTotal)),
-	)
-}
-
-// TestDKGCutover_PriorReleaseInterop_BlockedOnReviewedTssLibFork records the
-// remaining smoke-gate-2 cases that require a completed legacy tECDSA
-// key-generation transcript: a canonical DKG event below the cutover block
-// that confirms after it succeeding with prior binaries on every R1 node, and
-// the homogeneous legacy control. The pinned tss-lib revision cannot produce
-// the legacy proof transcript: the release specification requires an
-// externally reviewed tss-lib fork with an immutable per-party
-// legacy/security-v2 mode. Until that fork is reviewed and pinned, R1
-// deliberately fails closed on legacy tBTC permits, and this acceptance
-// evidence cannot exist. See scripts/release/pr4109/README.md for the hard
-// dependency record.
-func TestDKGCutover_PriorReleaseInterop_BlockedOnReviewedTssLibFork(t *testing.T) {
-	t.Skip(
-		"blocked on the reviewed tss-lib fork with an immutable per-party " +
-			"legacy mode; until it is pinned, tECDSA cannot produce the " +
-			"legacy proof transcript and R1 deliberately fails closed on " +
-			"legacy tBTC permits",
 	)
 }

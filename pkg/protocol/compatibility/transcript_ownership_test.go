@@ -17,9 +17,9 @@ import (
 // site. It scans every production (non-test) Go file under pkg/ and cmd/ and
 // fails when:
 //
-//   - the GG20 proof-binding nonce (SetSessionNonce/SetSessionNonceBytes) is
-//     set anywhere outside this package — the bundle owns the proof-transcript
-//     configuration;
+//   - the GG20 protocol mode or proof-binding nonce (SetProtocolMode,
+//     SetSessionNonce, or SetSessionNonceBytes) is set anywhere outside this
+//     package — the bundle owns the proof-transcript configuration;
 //   - the ephemeral ECDH derivation (Ecdh/EcdhLegacy) is invoked anywhere
 //     outside this package — protocols must call the bundle's ECDH so the
 //     ceremony's pinned mode selects the derivation; or
@@ -73,10 +73,10 @@ func TestTranscriptDecisionOwnership(t *testing.T) {
 			dir := filepath.Dir(path)
 
 			switch selector.Sel.Name {
-			case "SetSessionNonce", "SetSessionNonceBytes":
+			case "SetProtocolMode", "SetSessionNonce", "SetSessionNonceBytes":
 				if !nonceAllowedDirs[dir] {
 					violations = append(violations, fmt.Sprintf(
-						"%s: the GG20 proof-binding nonce is owned by the "+
+						"%s: the GG20 transcript configuration is owned by the "+
 							"compatibility strategy bundle",
 						position,
 					))

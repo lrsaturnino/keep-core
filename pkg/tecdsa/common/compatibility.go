@@ -31,7 +31,6 @@ type CompatibilityStrategies interface {
 
 	// ConfigureTSSParameters applies the bundle's proof-transcript decision
 	// to the given TSS parameters before any local party is constructed from
-	// them. It fails when the bundle's mode cannot produce a transcript with
-	// the pinned tss-lib revision.
+	// them.
 	ConfigureTSSParameters(parameters *tss.Parameters, sessionID string) error
 }

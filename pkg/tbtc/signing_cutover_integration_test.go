@@ -2,14 +2,10 @@ package tbtc
 
 // This file carries the in-repository part of the tBTC signing cutover
 // acceptance evidence: real local network providers, the production announcer
-// and retry logic, and real participation gates clocked by a local chain.
-//
-// The cases that require a prior-release binary to actually complete a legacy
-// tECDSA transcript — mixed prior/R1 legacy signing before the cutover block
-// and a legacy-anchored ceremony succeeding with legacy peers — cannot run
-// until the reviewed tss-lib fork with an immutable per-party legacy mode is
-// pinned; they are recorded below as explicitly blocked. The exact-image
-// mixed-binary rehearsal lives in scripts/release/pr4109.
+// and retry logic, real participation gates clocked by a local chain, and
+// completed homogeneous tECDSA transcripts in both legacy and security-v2
+// modes. Exact-image bidirectional mixed-binary evidence remains part of the
+// release rehearsal.
 
 import (
 	"context"
@@ -111,6 +107,23 @@ func startPeerAnnouncer(
 // height is already past the cutover block, and the completion fence admits
 // the terminal commit.
 func TestSigningCutover_HomogeneousSecurityV2AfterCutover(t *testing.T) {
+	testSigningCutoverHomogeneous(t, participation.ModeSecurityV2)
+}
+
+// TestSigningCutover_HomogeneousLegacyAfterCutover proves that an R1 signing
+// cohort selected by a pre-cutover canonical anchor completes with the
+// historical transcript and session-ID format after the chain crosses the
+// cutover. Dependency-level transcript regression tests pin those legacy
+// challenges to the prior production formulas; exact-image bidirectional
+// prior/R1 interoperability remains a release rehearsal gate.
+func TestSigningCutover_HomogeneousLegacyAfterCutover(t *testing.T) {
+	testSigningCutoverHomogeneous(t, participation.ModeLegacy)
+}
+
+func testSigningCutoverHomogeneous(
+	t *testing.T,
+	mode participation.ProtocolMode,
+) {
 	executor, localChain := setupSigningExecutorWithChain(t)
 
 	blockCounter, err := localChain.BlockCounter()
@@ -127,15 +140,19 @@ func TestSigningCutover_HomogeneousSecurityV2AfterCutover(t *testing.T) {
 	}
 
 	gate := newTestGateWithCutover(t, blockCounter, cutoverBlock)
+	anchor := cutoverBlock
+	if mode == participation.ModeLegacy {
+		anchor = cutoverBlock - 1
+	}
 
-	permit, err := gate.Begin(participation.TBTCSigning, cutoverBlock)
+	permit, err := gate.Begin(participation.TBTCSigning, anchor)
 	if err != nil {
 		t.Fatal(err)
 	}
 	testutils.AssertStringsEqual(
 		t,
-		"permit mode for the anchor at the cutover block",
-		participation.ModeSecurityV2.String(),
+		"permit mode for the canonical anchor",
+		mode.String(),
 		permit.Mode().String(),
 	)
 
@@ -189,9 +206,9 @@ func TestSigningCutover_HomogeneousSecurityV2AfterCutover(t *testing.T) {
 // ID for an attempt starting at or after the cutover block, legacy peers
 // announcing those IDs stay ready, the permit's mode never mutates while the
 // process state is already open_security_v2, and the legacy completion commit
-// remains admitted while a new penalty commit is refused. The ceremony's
-// cryptographic completion with legacy peers stays blocked on the reviewed
-// tss-lib fork and is recorded separately.
+// remains admitted while a new penalty commit is refused. Completed
+// cryptographic legacy interoperability is covered by the homogeneous legacy
+// test above.
 func TestSigningCutover_LegacyAnchorPinnedThroughRetriesAcrossCutover(t *testing.T) {
 	// The group size equals the honest threshold so the loop's member-count
 	// trimming cannot exclude the local member: every ready member is needed
@@ -906,27 +923,5 @@ func TestSigningCutover_GateQuiesceAbortSkipsOrdinaryFailureMetrics(t *testing.T
 		"ordinary signing timeouts",
 		0,
 		int(recorder.counter(clientinfo.MetricSigningTimeoutsTotal)),
-	)
-}
-
-// TestSigningCutover_PriorReleaseLegacyInterop_BlockedOnReviewedTssLibFork
-// records the two remaining smoke-gate-1 cases — prior binary and R1 legacy
-// signing succeeding in both directions before the cutover block (9.2.1) and
-// a legacy-anchored wallet action completing with legacy peers (the success
-// half of 9.2.3). Both require a legacy tECDSA proof transcript, which the
-// pinned tss-lib revision cannot produce: the release specification requires
-// an externally reviewed tss-lib fork with an immutable per-party
-// legacy/security-v2 mode. Until that fork is reviewed and pinned, R1
-// deliberately fails closed on legacy tBTC permits, and this acceptance
-// evidence cannot exist. See scripts/release/pr4109/README.md for the hard
-// dependency record.
-func TestSigningCutover_PriorReleaseLegacyInterop_BlockedOnReviewedTssLibFork(
-	t *testing.T,
-) {
-	t.Skip(
-		"blocked on the reviewed tss-lib fork with an immutable per-party " +
-			"legacy mode; until it is pinned, tECDSA cannot produce the " +
-			"legacy proof transcript and R1 deliberately fails closed on " +
-			"legacy tBTC permits",
 	)
 }

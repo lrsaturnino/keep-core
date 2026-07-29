@@ -983,11 +983,11 @@ func TestProcessCoordinationResult_AtCutoverAnchorDispatches(t *testing.T) {
 	}
 }
 
-// TestProcessCoordinationResult_BeforeCutoverAnchorRefuses verifies the other
-// side of the cutover boundary: a wallet action whose canonical anchor is one
-// block below the cutover block resolves to the legacy mode, which the tECDSA
-// stack cannot run, so no proposal type may reach the dispatcher.
-func TestProcessCoordinationResult_BeforeCutoverAnchorRefuses(t *testing.T) {
+// TestProcessCoordinationResult_BeforeCutoverAnchorDispatches verifies the
+// other side of the cutover boundary: a wallet action whose canonical anchor
+// is one block below the cutover block resolves to the legacy mode and reaches
+// the dispatcher for every dispatchable proposal type.
+func TestProcessCoordinationResult_BeforeCutoverAnchorDispatches(t *testing.T) {
 	for action, proposal := range routingTestProposals() {
 		t.Run(action.String(), func(t *testing.T) {
 			n, signer, lc := setupNodeWithChain(t, 1*time.Millisecond)
@@ -1009,6 +1009,8 @@ func TestProcessCoordinationResult_BeforeCutoverAnchorRefuses(t *testing.T) {
 			recorder := newDispatcherMetricsRecorder()
 			n.walletDispatcher.setMetricsRecorder(recorder)
 
+			walletKey := markWalletBusy(t, n, signer)
+
 			result := &coordinationResult{
 				wallet:   signer.wallet,
 				window:   window,
@@ -1017,26 +1019,22 @@ func TestProcessCoordinationResult_BeforeCutoverAnchorRefuses(t *testing.T) {
 
 			processCoordinationResult(context.Background(), n, result)
 
-			if total := recorder.counter(clientinfo.MetricWalletActionsTotal); total != 0 {
+			rejected := recorder.counter(
+				clientinfo.MetricWalletDispatcherRejectedTotal,
+			)
+			if rejected != 1 {
 				t.Errorf(
-					"expected no dispatched actions for a legacy-mode anchor, "+
-						"got %v",
-					total,
-				)
-			}
-			if rejected := recorder.counter(clientinfo.MetricWalletDispatcherRejectedTotal); rejected != 0 {
-				t.Errorf(
-					"expected no dispatch attempts for a legacy-mode anchor, "+
+					"expected the pre-cutover legacy anchor to dispatch, "+
 						"got %v rejected-dispatch increments",
 					rejected,
 				)
 			}
-			if count := dispatchedActionsCount(n); count != 0 {
-				t.Errorf(
-					"expected walletDispatcher to stay idle for a legacy-mode "+
-						"anchor, got %d active actions",
-					count,
-				)
+
+			n.walletDispatcher.actionsMutex.Lock()
+			_, ok := n.walletDispatcher.actions[walletKey]
+			n.walletDispatcher.actionsMutex.Unlock()
+			if !ok {
+				t.Error("expected the busy sentinel to remain after dispatch")
 			}
 		})
 	}

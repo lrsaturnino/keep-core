@@ -214,19 +214,6 @@ func (se *signingExecutor) sign(
 	startBlock uint64,
 	mode participation.ProtocolMode,
 ) (*tecdsa.Signature, *signingActivityReport, uint64, error) {
-	// The pinned tss-lib fork exposes no per-party legacy mode, so a tECDSA
-	// signing ceremony cannot reproduce the legacy proof transcript. Running
-	// the hardened transcript under any other mode would emit wire traffic
-	// incompatible with both releases; refuse before any protocol work or
-	// ordinary failure accounting happens.
-	if mode != participation.ModeSecurityV2 {
-		return nil, nil, 0, fmt.Errorf(
-			"tECDSA signing cannot run in protocol mode [%s]: the pinned "+
-				"tss-lib revision has no reviewed legacy mode",
-			mode,
-		)
-	}
-
 	// The compatibility strategy bundle carries the wallet action's mode into
 	// every tECDSA party this operation constructs; each retry attempt reuses
 	// it unchanged.

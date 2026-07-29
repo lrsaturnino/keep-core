@@ -16,43 +16,35 @@ import (
 	"github.com/keep-network/keep-core/internal/testutils"
 	"github.com/keep-network/keep-core/pkg/bitcoin"
 	"github.com/keep-network/keep-core/pkg/chain"
-	"github.com/keep-network/keep-core/pkg/chain/local_v1"
 	"github.com/keep-network/keep-core/pkg/clientinfo"
 	"github.com/keep-network/keep-core/pkg/internal/tecdsatest"
-	"github.com/keep-network/keep-core/pkg/net/local"
-	"github.com/keep-network/keep-core/pkg/operator"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/tecdsa"
 	"github.com/keep-network/keep-core/pkg/tecdsa/dkg"
 )
 
-// TestSigningExecutor_Sign_RefusesLegacyMode proves the tECDSA signing
-// executor fails closed for any mode other than security-v2: without a
-// reviewed legacy tss-lib mode a legacy signing would emit a partially
-// hardened transcript incompatible with both releases.
-func TestSigningExecutor_Sign_RefusesLegacyMode(t *testing.T) {
+func TestSigningExecutor_Sign_RefusesUnsetMode(t *testing.T) {
 	executor := &signingExecutor{}
 
 	_, _, _, err := executor.sign(
 		nil,
 		big.NewInt(100),
 		0,
-		participation.ModeLegacy,
+		participation.ProtocolMode(0),
 	)
 	if err == nil {
-		t.Fatal("expected a legacy-mode refusal error")
+		t.Fatal("expected an unset-mode refusal error")
 	}
-	if !strings.Contains(err.Error(), "no reviewed legacy mode") {
+	if !strings.Contains(err.Error(), "cannot select compatibility strategies") {
 		t.Errorf("unexpected refusal error: [%v]", err)
 	}
 }
 
 // TestNode_BeginWalletActionPermit exercises the wallet action permit
 // acquisition: the heartbeat maps to its own ceremony class, other actions
-// are signing ceremonies, quiescence refuses, and a legacy-mode permit —
-// possible while the chain is below the cutover block — is refused and
-// released because the tECDSA stack cannot run it.
+// are signing ceremonies, quiescence refuses, and a legacy-mode permit remains
+// available while the chain is below the cutover block.
 func TestNode_BeginWalletActionPermit(t *testing.T) {
 	localChain := Connect()
 	blockCounter, err := localChain.BlockCounter()
@@ -124,9 +116,9 @@ func TestNode_BeginWalletActionPermit(t *testing.T) {
 		}
 	})
 
-	t.Run("legacy mode refused and released", func(t *testing.T) {
+	t.Run("legacy mode admitted", func(t *testing.T) {
 		// A cutover block far ahead pins every current anchor to the legacy
-		// mode, which the tECDSA stack cannot run.
+		// mode.
 		gate, err := participation.NewGate(
 			t.Context(),
 			participation.Schedule{CutoverBlock: 1_000_000},
@@ -140,88 +132,26 @@ func TestNode_BeginWalletActionPermit(t *testing.T) {
 
 		n := &node{participationGate: gate}
 
-		if permit := n.beginWalletActionPermit(ActionMovingFunds, 1); permit != nil {
-			permit.Close()
-			t.Error("expected no permit for the legacy mode")
+		permit := n.beginWalletActionPermit(ActionMovingFunds, 1)
+		if permit == nil {
+			t.Fatal("expected a permit for the legacy mode")
 		}
+		testutils.AssertStringsEqual(
+			t,
+			"legacy permit mode",
+			participation.ModeLegacy.String(),
+			permit.Mode().String(),
+		)
 
 		snapshot := gate.State()
 		testutils.AssertUintsEqual(
 			t,
-			"active ceremonies after the legacy refusal",
-			0,
+			"active ceremonies while the legacy permit is held",
+			1,
 			snapshot.ActiveCeremonies,
 		)
+		permit.Close()
 	})
-}
-
-// TestDkgExecutor_GenerateSigningGroup_RefusesLegacyMode proves that a DKG
-// whose canonical anchor pins the legacy mode never starts a member
-// goroutine: the executor's protocol dependencies are deliberately nil, so
-// reaching the protocol would panic the test.
-func TestDkgExecutor_GenerateSigningGroup_RefusesLegacyMode(t *testing.T) {
-	localChain := Connect()
-	blockCounter, err := localChain.BlockCounter()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := blockCounter.WaitForBlockHeight(1); err != nil {
-		t.Fatal(err)
-	}
-
-	gate, err := participation.NewGate(
-		t.Context(),
-		participation.Schedule{CutoverBlock: 1_000_000},
-		blockCounter,
-		testGateMetrics{},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(gate.Close)
-
-	_, operatorPublicKey, err := operator.GenerateKeyPair(local_v1.DefaultCurve)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	de := &dkgExecutor{
-		groupParameters: &GroupParameters{
-			GroupSize:       5,
-			GroupQuorum:     3,
-			HonestThreshold: 2,
-		},
-		chain:             localChain,
-		netProvider:       local.ConnectWithKey(operatorPublicKey),
-		participationGate: gate,
-		signerQuarantine: newSignerQuarantine(
-			logger,
-			&mockPersistenceHandle{},
-		),
-	}
-
-	gsr := &GroupSelectionResult{
-		OperatorsIDs:       chain.OperatorIDs{1, 2, 3, 4, 5},
-		OperatorsAddresses: chain.Addresses{"0xAA", "0xBB", "0xCC", "0xDD", "0xEE"},
-	}
-
-	de.generateSigningGroup(
-		logger.With(),
-		big.NewInt(1),
-		[]uint8{1},
-		gsr,
-		1,
-		0,
-	)
-
-	// The member permit was refused and released before any goroutine.
-	snapshot := gate.State()
-	testutils.AssertUintsEqual(
-		t,
-		"active ceremonies after the legacy refusal",
-		0,
-		snapshot.ActiveCeremonies,
-	)
 }
 
 // TestDkgExecutor_PreserveInterruptedSigner_Quarantines proves a refused

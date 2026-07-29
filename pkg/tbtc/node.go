@@ -1544,9 +1544,8 @@ func processCoordinationResult(
 }
 
 // beginWalletActionPermit acquires the participation permit for a wallet
-// action about to be orchestrated. It fails closed: without a gate, on a gate
-// refusal, or for a protocol mode the tECDSA stack cannot run, no permit is
-// returned and the action must not be dispatched.
+// action about to be orchestrated. It fails closed: without a gate or on a
+// gate refusal, no permit is returned and the action must not be dispatched.
 func (n *node) beginWalletActionPermit(
 	proposedAction WalletActionType,
 	startBlock uint64,
@@ -1604,22 +1603,6 @@ func (n *node) beginWalletActionPermit(
 			"[%s] wallet action refused by the participation gate: [%v]",
 			proposedAction,
 			err,
-		)
-		return nil
-	}
-
-	// The pinned tss-lib fork exposes no per-party legacy mode, so a tECDSA
-	// ceremony cannot reproduce the legacy proof transcript. Running the
-	// hardened transcript under a legacy permit would emit wire traffic
-	// incompatible with both releases, so a legacy-mode wallet action is
-	// refused outright instead.
-	if permit.Mode() != participation.ModeSecurityV2 {
-		permit.Close()
-		logger.Warnf(
-			"refusing the [%s] wallet action in protocol mode [%s]: the "+
-				"pinned tss-lib revision has no reviewed legacy mode",
-			proposedAction,
-			permit.Mode(),
 		)
 		return nil
 	}
