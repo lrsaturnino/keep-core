@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/big"
 
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	beaconchain "github.com/keep-network/keep-core/pkg/beacon/chain"
 	"github.com/keep-network/keep-core/pkg/beacon/event"
@@ -461,6 +462,91 @@ func soleCanonicalLog(count int, matches func(int) bool) (int, bool) {
 	return index, false
 }
 
+// relayEntryLogs is the chain view a relay entry timeout settlement is read
+// from: the head that view is pinned to, the hash each height on it commits
+// to, and the three log sets the settlement is composed of.
+//
+// The settlement is a penalty claim over three separate reads, so what the
+// reads are allowed to disagree about is part of the contract rather than a
+// property of whichever backend happens to serve them. Naming the view lets a
+// backend that moves between the reads be exercised.
+type relayEntryLogs interface {
+	// CurrentBlock returns the head of the view.
+	CurrentBlock() (uint64, error)
+
+	// BlockHashByNumber returns the hash the view holds at the given height.
+	BlockHashByNumber(blockNumber uint64) ([32]byte, error)
+
+	// RelayEntryRequests returns the relay entry requests logged in the given
+	// inclusive block range.
+	RelayEntryRequests(
+		startBlock, endBlock uint64,
+	) ([]*abi.RandomBeaconRelayEntryRequested, error)
+
+	// RelayEntrySubmissions returns the entry submissions logged for the given
+	// request in the given inclusive block range.
+	RelayEntrySubmissions(
+		startBlock, endBlock uint64,
+		requestID *big.Int,
+	) ([]*abi.RandomBeaconRelayEntrySubmitted, error)
+
+	// RelayEntryTimeouts returns the entry timeouts logged for the given
+	// request in the given inclusive block range.
+	RelayEntryTimeouts(
+		startBlock, endBlock uint64,
+		requestID *big.Int,
+	) ([]*abi.RandomBeaconRelayEntryTimedOut, error)
+}
+
+// beaconRelayEntryLogs reads relay entry logs off the RandomBeacon deployment
+// this node is attached to.
+type beaconRelayEntryLogs struct {
+	chain *BeaconChain
+}
+
+func (brel beaconRelayEntryLogs) CurrentBlock() (uint64, error) {
+	return brel.chain.blockCounter.CurrentBlock()
+}
+
+func (brel beaconRelayEntryLogs) BlockHashByNumber(blockNumber uint64) (
+	[32]byte,
+	error,
+) {
+	return brel.chain.GetBlockHashByNumber(blockNumber)
+}
+
+func (brel beaconRelayEntryLogs) RelayEntryRequests(
+	startBlock, endBlock uint64,
+) ([]*abi.RandomBeaconRelayEntryRequested, error) {
+	return brel.chain.randomBeacon.PastRelayEntryRequestedEvents(
+		startBlock,
+		&endBlock,
+		nil,
+	)
+}
+
+func (brel beaconRelayEntryLogs) RelayEntrySubmissions(
+	startBlock, endBlock uint64,
+	requestID *big.Int,
+) ([]*abi.RandomBeaconRelayEntrySubmitted, error) {
+	return brel.chain.randomBeacon.PastRelayEntrySubmittedEvents(
+		startBlock,
+		&endBlock,
+		[]*big.Int{requestID},
+	)
+}
+
+func (brel beaconRelayEntryLogs) RelayEntryTimeouts(
+	startBlock, endBlock uint64,
+	requestID *big.Int,
+) ([]*abi.RandomBeaconRelayEntryTimedOut, error) {
+	return brel.chain.randomBeacon.PastRelayEntryTimedOutEvents(
+		startBlock,
+		&endBlock,
+		[]*big.Int{requestID},
+	)
+}
+
 // RelayEntryTimeoutSettlement reads the RandomBeacon's own record that the
 // relay request made at the given block, over the given previous entry, was
 // terminated by an accepted timeout report.
@@ -479,6 +565,32 @@ func (bc *BeaconChain) RelayEntryTimeoutSettlement(
 	requestBlockNumber uint64,
 	requestPreviousEntry []byte,
 ) (*event.RelayEntryTimeoutSettlement, error) {
+	return resolveRelayEntryTimeoutSettlement(
+		beaconRelayEntryLogs{chain: bc},
+		bc.randomBeaconAddress.String(),
+		requestBlockNumber,
+		requestPreviousEntry,
+	)
+}
+
+// resolveRelayEntryTimeoutSettlement reads one relay request, its submissions
+// and its timeouts out of a single pinned chain view, and composes the
+// settlement from them.
+//
+// The three log sets are read as one snapshot rather than three independent
+// latest-head queries. Every read is bounded by the same end block, every log
+// kept is checked to sit on the branch that end block descends from, and the
+// hash of that end block is confirmed unchanged once the reads are done. A
+// backend that reorgs part-way through therefore fails the resolution instead
+// of returning a settlement that pairs a request on one branch with the
+// termination of the same request ID on another — a pairing no canonical view
+// of the chain ever held, and one that would claim a penalty on that basis.
+func resolveRelayEntryTimeoutSettlement(
+	logs relayEntryLogs,
+	contractAddress string,
+	requestBlockNumber uint64,
+	requestPreviousEntry []byte,
+) (*event.RelayEntryTimeoutSettlement, error) {
 	if len(requestPreviousEntry) == 0 {
 		return nil, fmt.Errorf(
 			"cannot resolve a relay entry timeout settlement without the " +
@@ -486,10 +598,21 @@ func (bc *BeaconChain) RelayEntryTimeoutSettlement(
 		)
 	}
 
-	requests, err := bc.randomBeacon.PastRelayEntryRequestedEvents(
+	snapshot, err := openRelayEntryLogSnapshot(logs)
+	if err != nil {
+		return nil, err
+	}
+
+	// A view whose head has not reached the request cannot hold the request,
+	// let alone its termination. There is nothing to settle yet and nothing to
+	// read a settlement from; the caller reads again against a later view.
+	if snapshot.endBlock < requestBlockNumber {
+		return nil, nil
+	}
+
+	requests, err := logs.RelayEntryRequests(
 		requestBlockNumber,
-		&requestBlockNumber,
-		nil,
+		requestBlockNumber,
 	)
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -499,13 +622,16 @@ func (bc *BeaconChain) RelayEntryTimeoutSettlement(
 		)
 	}
 
-	requestIndex, ambiguous := soleCanonicalLog(
+	requestIndex, ambiguous, err := snapshot.soleHeldLog(
 		len(requests),
+		func(i int) types.Log { return requests[i].Raw },
 		func(i int) bool {
-			return !requests[i].Raw.Removed &&
-				bytes.Equal(requests[i].PreviousEntry, requestPreviousEntry)
+			return bytes.Equal(requests[i].PreviousEntry, requestPreviousEntry)
 		},
 	)
+	if err != nil {
+		return nil, err
+	}
 	if ambiguous {
 		return nil, fmt.Errorf(
 			"block [%v] holds more than one relay entry request over the "+
@@ -519,10 +645,10 @@ func (bc *BeaconChain) RelayEntryTimeoutSettlement(
 	}
 	request := requests[requestIndex]
 
-	submissions, err := bc.randomBeacon.PastRelayEntrySubmittedEvents(
+	submissions, err := logs.RelayEntrySubmissions(
 		requestBlockNumber,
-		nil,
-		[]*big.Int{request.RequestId},
+		snapshot.endBlock,
+		request.RequestId,
 	)
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -532,10 +658,10 @@ func (bc *BeaconChain) RelayEntryTimeoutSettlement(
 		)
 	}
 
-	timeouts, err := bc.randomBeacon.PastRelayEntryTimedOutEvents(
+	timeouts, err := logs.RelayEntryTimeouts(
 		requestBlockNumber,
-		nil,
-		[]*big.Int{request.RequestId},
+		snapshot.endBlock,
+		request.RequestId,
 	)
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -545,12 +671,229 @@ func (bc *BeaconChain) RelayEntryTimeoutSettlement(
 		)
 	}
 
+	heldSubmissions, err := snapshot.heldSubmissions(submissions)
+	if err != nil {
+		return nil, err
+	}
+
+	heldTimeouts, err := snapshot.heldTimeouts(timeouts)
+	if err != nil {
+		return nil, err
+	}
+
+	// Everything the settlement rests on has now been read and bound to the
+	// branch this snapshot was opened on. Confirming that branch is still the
+	// one the view holds is what rules out a composition assembled across a
+	// reorg that happened mid-read.
+	if err := snapshot.confirm(); err != nil {
+		return nil, err
+	}
+
 	return relayEntryTimeoutSettlement(
 		request,
-		submissions,
-		timeouts,
-		bc.randomBeaconAddress.String(),
+		heldSubmissions,
+		heldTimeouts,
+		contractAddress,
 	)
+}
+
+// relayEntryLogSnapshot is one pinned chain view: an end block every read is
+// bounded by, and the hash that block was seen with. That hash commits to the
+// block's whole ancestry, so it is what a log read below the end block is
+// checked against and what the view is confirmed to still hold afterwards.
+type relayEntryLogSnapshot struct {
+	logs         relayEntryLogs
+	endBlock     uint64
+	endBlockHash [32]byte
+
+	// blockHashes caches the hash the view holds at each height a log was
+	// checked at, so a range holding many logs costs one lookup per block
+	// rather than one per log.
+	blockHashes map[uint64][32]byte
+}
+
+// openRelayEntryLogSnapshot pins a view to the head the backend reports and
+// the hash it holds there.
+func openRelayEntryLogSnapshot(logs relayEntryLogs) (
+	*relayEntryLogSnapshot,
+	error,
+) {
+	endBlock, err := logs.CurrentBlock()
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed to read the head a relay entry timeout settlement would "+
+				"be resolved against: [%w]",
+			err,
+		)
+	}
+
+	endBlockHash, err := logs.BlockHashByNumber(endBlock)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed to read the hash of block [%v] a relay entry timeout "+
+				"settlement would be resolved against: [%w]",
+			endBlock,
+			err,
+		)
+	}
+
+	return &relayEntryLogSnapshot{
+		logs:         logs,
+		endBlock:     endBlock,
+		endBlockHash: endBlockHash,
+		blockHashes:  make(map[uint64][32]byte),
+	}, nil
+}
+
+// holds reports whether the given log sits on the branch this snapshot was
+// opened on.
+//
+// A log is held when the view still reports its block as the canonical one at
+// that height and the backend has not flagged it as removed. A log the view
+// no longer holds belongs to an abandoned branch: it is not evidence of
+// anything the chain currently says happened, and composing it with logs that
+// are held is exactly the cross-branch reading the snapshot exists to reject.
+//
+// A hash that cannot be read is an error rather than a "not held", because
+// dropping a log on a failed lookup silently moves the composition towards
+// claiming a penalty.
+func (rels *relayEntryLogSnapshot) holds(log types.Log) (bool, error) {
+	if log.Removed {
+		return false, nil
+	}
+
+	if log.BlockNumber > rels.endBlock {
+		return false, fmt.Errorf(
+			"the backend returned a log from block [%v], past the block [%v] "+
+				"the read was bounded by",
+			log.BlockNumber,
+			rels.endBlock,
+		)
+	}
+
+	blockHash, cached := rels.blockHashes[log.BlockNumber]
+	if !cached {
+		if log.BlockNumber == rels.endBlock {
+			blockHash = rels.endBlockHash
+		} else {
+			var err error
+			blockHash, err = rels.logs.BlockHashByNumber(log.BlockNumber)
+			if err != nil {
+				return false, fmt.Errorf(
+					"failed to read the hash the chain view holds at block "+
+						"[%v], where a relay entry log the settlement would "+
+						"be composed from was mined: [%w]",
+					log.BlockNumber,
+					err,
+				)
+			}
+		}
+		rels.blockHashes[log.BlockNumber] = blockHash
+	}
+
+	return common.Hash(blockHash) == log.BlockHash, nil
+}
+
+// soleHeldLog returns the index of the one log the snapshot holds and the
+// caller's predicate accepts, or -1 when none does, and reports separately
+// whether more than one did.
+//
+// More than one match is reported rather than resolved. Nothing in the logs
+// says which one a caller meant, and picking either would make a penalty rest
+// on an ordering the chain never promised.
+func (rels *relayEntryLogSnapshot) soleHeldLog(
+	count int,
+	raw func(int) types.Log,
+	matches func(int) bool,
+) (int, bool, error) {
+	var lookupErr error
+
+	index, ambiguous := soleCanonicalLog(count, func(i int) bool {
+		if lookupErr != nil || !matches(i) {
+			return false
+		}
+
+		held, err := rels.holds(raw(i))
+		if err != nil {
+			lookupErr = err
+			return false
+		}
+
+		return held
+	})
+	if lookupErr != nil {
+		return -1, false, lookupErr
+	}
+
+	return index, ambiguous, nil
+}
+
+// heldSubmissions drops the entry submissions this snapshot's branch does not
+// hold.
+func (rels *relayEntryLogSnapshot) heldSubmissions(
+	submissions []*abi.RandomBeaconRelayEntrySubmitted,
+) ([]*abi.RandomBeaconRelayEntrySubmitted, error) {
+	held := make([]*abi.RandomBeaconRelayEntrySubmitted, 0, len(submissions))
+	for _, submission := range submissions {
+		onBranch, err := rels.holds(submission.Raw)
+		if err != nil {
+			return nil, err
+		}
+		if onBranch {
+			held = append(held, submission)
+		}
+	}
+
+	return held, nil
+}
+
+// heldTimeouts drops the entry timeouts this snapshot's branch does not hold.
+func (rels *relayEntryLogSnapshot) heldTimeouts(
+	timeouts []*abi.RandomBeaconRelayEntryTimedOut,
+) ([]*abi.RandomBeaconRelayEntryTimedOut, error) {
+	held := make([]*abi.RandomBeaconRelayEntryTimedOut, 0, len(timeouts))
+	for _, timeout := range timeouts {
+		onBranch, err := rels.holds(timeout.Raw)
+		if err != nil {
+			return nil, err
+		}
+		if onBranch {
+			held = append(held, timeout)
+		}
+	}
+
+	return held, nil
+}
+
+// confirm re-reads the hash of the end block and fails when the view no longer
+// holds the branch the snapshot was opened on.
+//
+// The logs were read one call at a time; this is what makes the composition of
+// them answer a single view of the chain. Without it a reorg landing between
+// two of the reads would go unnoticed, and the two halves of a settlement
+// could come from branches that never coexisted.
+func (rels *relayEntryLogSnapshot) confirm() error {
+	endBlockHash, err := rels.logs.BlockHashByNumber(rels.endBlock)
+	if err != nil {
+		return fmt.Errorf(
+			"failed to re-read the hash of block [%v] the relay entry "+
+				"timeout settlement was resolved against: [%w]",
+			rels.endBlock,
+			err,
+		)
+	}
+
+	if endBlockHash != rels.endBlockHash {
+		return fmt.Errorf(
+			"the chain view moved off block [%v] hash [%s] while the relay "+
+				"entry timeout settlement was being read; the logs it would "+
+				"be composed from do not answer one view of the chain",
+			rels.endBlock,
+			common.Hash(rels.endBlockHash),
+		)
+	}
+
+	return nil
 }
 
 // relayEntryTimeoutSettlement decides, from the canonical logs of one relay
