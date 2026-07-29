@@ -1394,7 +1394,7 @@ chain_rpc() {
   fi
   case "$1" in
   eth_chainId)
-    printf '{"jsonrpc":"2.0","id":1,"result":"%s"}' "${FIXTURE_CHAIN_ID}"
+    printf '{"jsonrpc":"2.0","id":1,"result":"%s","contributors":[{"service":"r1-node-1","permit_id":"1"}]}' "${FIXTURE_CHAIN_ID}"
     ;;
   eth_getTransactionReceipt)
     if [[ -n "${FIXTURE_RECEIPT_ABSENT}" ]]; then
@@ -3149,6 +3149,14 @@ precutover_readings() {
   # shellcheck disable=SC2034
   PRECUTOVER_BOUND="tbtc_wallet_action@840@wallet840=succeeded=${PRE_TX1}=0xbtc840 \
 beacon_signing@841@entry841=succeeded=${PRE_TX2}=0xentry841"
+  # Who each settled transcript incorporated. Both releases took part in both
+  # halves, which is the whole subject of a mixed prior/R1 control.
+  # shellcheck disable=SC2034
+  PRECUTOVER_CONTRIBUTORS="\
+tbtc_wallet_action@840@wallet840=r1-node-1~1 \
+tbtc_wallet_action@840@wallet840=prior-node~7 \
+beacon_signing@841@entry841=r1-node-1~1 \
+beacon_signing@841@entry841=prior-node~7"
   # shellcheck disable=SC2034
   PRECUTOVER_PRIOR_RUNNING=1
   # shellcheck disable=SC2034
@@ -3190,6 +3198,43 @@ check "legacy-anchored work settling beside the prior binary holds" 0 \
 run_verdict precutover_case eval 'PRECUTOVER_PRIOR_RUNNING=0'
 check "R1 working alone is not a mixed prior/R1 control" 3 \
   "prior binary.*was not running"
+
+# A running container is not a participating release. Unselected, partitioned,
+# and cryptographically excluded all leave the prior node up beside ceremonies
+# that settled without it, which is the reading interoperation produces too.
+run_verdict precutover_case eval 'PRECUTOVER_CONTRIBUTORS=""'
+check "a running prior binary that contributed nothing is not interop" 3 \
+  "took no part in the result"
+
+# Half the release interoperating is not the release interoperating: a prior
+# binary in the tBTC transcript says nothing about the beacon path into the
+# gate, which is a separate call path with its own wire format.
+run_verdict precutover_case eval '
+  PRECUTOVER_CONTRIBUTORS="\
+tbtc_wallet_action@840@wallet840=r1-node-1~1 \
+tbtc_wallet_action@840@wallet840=prior-node~7 \
+beacon_signing@841@entry841=r1-node-1~1"'
+check "a prior binary in one family alone does not cover the release" 3 \
+  "no beacon transcript incorporated a share"
+
+# The mirror on the other half, so neither family is covered by accident.
+run_verdict precutover_case eval '
+  PRECUTOVER_CONTRIBUTORS="\
+tbtc_wallet_action@840@wallet840=r1-node-1~1 \
+beacon_signing@841@entry841=r1-node-1~1 \
+beacon_signing@841@entry841=prior-node~7"'
+check "a prior binary absent from the tBTC transcript is caught too" 3 \
+  "no tbtc transcript incorporated a share"
+
+# An R1 node is not the prior binary however many transcripts it appears in.
+run_verdict precutover_case eval '
+  PRECUTOVER_CONTRIBUTORS="\
+tbtc_wallet_action@840@wallet840=r1-node-1~1 \
+tbtc_wallet_action@840@wallet840=r1-node-2~2 \
+beacon_signing@841@entry841=r1-node-1~1 \
+beacon_signing@841@entry841=r1-node-2~2"'
+check "a homogeneous R1 transcript cannot stand for a mixed one" 3 \
+  "took no part in the result"
 
 # Work driven by a fleet already past C is not pre-cutover work, whatever
 # mode counter moved.
@@ -3550,7 +3595,7 @@ write_driver <<EOF
 printf '{"transaction_hashes":["${HASH_A}","${HASH_B}"],"ceremony_results":['
 printf '{"ceremony":"tbtc_signing","outcome":"succeeded",'
 printf '"canonical_start_block":500,"work_id":"sign500",'
-printf '"transaction_hash":"${HASH_A}","result":"0xsigned"},'
+printf '"transaction_hash":"${HASH_A}","result":"0xsigned","contributors":[{"service":"r1-node-1","permit_id":"1"}]},'
 printf '{"ceremony":"beacon_dkg","outcome":"failed",'
 printf '"canonical_start_block":501,"work_id":"seed501",'
 printf '"transaction_hash":"${HASH_B}","termination":"no_threshold"}]}'
@@ -3751,10 +3796,10 @@ write_driver <<EOF
 printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
 printf '{"ceremony":"tbtc_signing","outcome":"succeeded",'
 printf '"canonical_start_block":600,"work_id":"sign600",'
-printf '"transaction_hash":"${HASH_A}","result":"0xs"},'
+printf '"transaction_hash":"${HASH_A}","result":"0xs","contributors":[{"service":"r1-node-1","permit_id":"1"}]},'
 printf '{"ceremony":"beacon_dkg","outcome":"succeeded",'
 printf '"canonical_start_block":601,"work_id":"seed601",'
-printf '"transaction_hash":"${HASH_A}","result":"0xg"}]}'
+printf '"transaction_hash":"${HASH_A}","result":"0xg","contributors":[{"service":"r1-node-1","permit_id":"1"}]}]}'
 EOF
 drive homogeneous-security-v2
 check "one transaction reused across both halves stops the step" 3 \
@@ -3773,7 +3818,7 @@ printf '"holders":[{"service":"r1-node-1","permit_id":"1"}]}],'
 printf '"ceremony_results":['
 printf '{"ceremony":"tbtc_signing","outcome":"succeeded",'
 printf '"canonical_start_block":600,"work_id":"sign600",'
-printf '"transaction_hash":"${HASH_B}","result":"0xs"}]}'
+printf '"transaction_hash":"${HASH_B}","result":"0xs","contributors":[{"service":"r1-node-1","permit_id":"1"}]}]}'
 EOF
 drive rollback-terminal
 check "one piece of work cannot change transactions at its terminal result" 3 \
@@ -3786,7 +3831,7 @@ write_driver <<EOF
 printf '{"transaction_hashes":["${HASH_A}","${HASH_B}"],"ceremony_results":['
 printf '{"ceremony":"tbtc_signing","outcome":"succeeded",'
 printf '"canonical_start_block":600,"work_id":"sign600",'
-printf '"transaction_hash":"${HASH_A}","result":"0xs"},'
+printf '"transaction_hash":"${HASH_A}","result":"0xs","contributors":[{"service":"r1-node-1","permit_id":"1"}]},'
 printf '{"ceremony":"tbtc_signing","outcome":"failed",'
 printf '"canonical_start_block":600,"work_id":"sign600",'
 printf '"transaction_hash":"${HASH_B}","termination":"no_threshold"}]}'
@@ -3819,7 +3864,7 @@ write_driver <<EOF
 #!/usr/bin/env bash
 printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
 printf '{"ceremony":"tbtc_signing","outcome":"succeeded",'
-printf '"transaction_hash":"${HASH_A}","result":"0xs"}]}'
+printf '"transaction_hash":"${HASH_A}","result":"0xs","contributors":[{"service":"r1-node-1","permit_id":"1"}]}]}'
 EOF
 drive homogeneous-security-v2
 check "an outcome naming no anchor identifies no piece of work" 3 \
@@ -3833,7 +3878,7 @@ write_driver <<EOF
 #!/usr/bin/env bash
 printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
 printf '{"ceremony":"tbtc_signing","outcome":"succeeded",'
-printf '"canonical_start_block":600,"work_id":"sign600","result":"0xs"}]}'
+printf '"canonical_start_block":600,"work_id":"sign600","result":"0xs","contributors":[{"service":"r1-node-1","permit_id":"1"}]}]}'
 EOF
 drive homogeneous-security-v2
 check "an outcome naming no transaction stops the step" 3 \
@@ -3846,7 +3891,7 @@ write_driver <<EOF
 printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
 printf '{"ceremony":"tbtc_signing","outcome":"succeeded",'
 printf '"canonical_start_block":600,"work_id":"sign600",'
-printf '"transaction_hash":"${HASH_B}","result":"0xs"}]}'
+printf '"transaction_hash":"${HASH_B}","result":"0xs","contributors":[{"service":"r1-node-1","permit_id":"1"}]}]}'
 EOF
 drive homogeneous-security-v2
 check "an outcome naming a transaction nobody originated stops the step" 3 \
@@ -3865,6 +3910,49 @@ EOF
 drive homogeneous-security-v2
 check "a success with no threshold output behind it stops the step" 3 \
   "carries no threshold output identity"
+
+# A threshold output says a ceremony settled; it does not say who settled it.
+# Every mixed-fleet control asks which releases took part, and a result that
+# named nobody would leave that question answerable only from which containers
+# happened to be running.
+write_driver <<EOF
+#!/usr/bin/env bash
+printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
+printf '{"ceremony":"tbtc_signing","outcome":"succeeded",'
+printf '"canonical_start_block":600,"work_id":"sign600",'
+printf '"transaction_hash":"${HASH_A}","result":"0xs"}]}'
+EOF
+drive homogeneous-security-v2
+check "a settled result naming no contributing party stops the step" 3 \
+  "names no contributing party"
+
+write_driver <<EOF
+#!/usr/bin/env bash
+printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
+printf '{"ceremony":"tbtc_signing","outcome":"succeeded",'
+printf '"canonical_start_block":600,"work_id":"sign600",'
+printf '"transaction_hash":"${HASH_A}","result":"0xs",'
+printf '"contributors":[{"service":"r1-node-1"}]}]}'
+EOF
+drive homogeneous-security-v2
+check "a contributing party with no local permit identity stops the step" 3 \
+  "names no local permit identity"
+
+# One party contributes to one transcript once. Repeating it would let a
+# single contribution be counted as the several a threshold needs, which is
+# exactly how a homogeneous run could look like it met one.
+write_driver <<EOF
+#!/usr/bin/env bash
+printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
+printf '{"ceremony":"tbtc_signing","outcome":"succeeded",'
+printf '"canonical_start_block":600,"work_id":"sign600",'
+printf '"transaction_hash":"${HASH_A}","result":"0xs",'
+printf '"contributors":[{"service":"r1-node-1","permit_id":"1"},'
+printf '{"service":"r1-node-1","permit_id":"1"}]}]}'
+EOF
+drive homogeneous-security-v2
+check "one party counted twice in a transcript stops the step" 3 \
+  "party contributed twice to one result"
 
 # The mirror, for the fails-closed controls: "failed" is equally what a
 # ceremony still retrying looks like from outside, and a control about work
@@ -3899,7 +3987,7 @@ write_driver <<EOF
 printf '{"transaction_hashes":["${HASH_A}"],"ceremony_results":['
 printf '{"ceremony":"tbtc_signing","outcome":"succeeded",'
 printf '"canonical_start_block":600,"work_id":"sign600",'
-printf '"transaction_hash":"${HASH_A}","result":"0xs"}]}'
+printf '"transaction_hash":"${HASH_A}","result":"0xs","contributors":[{"service":"r1-node-1","permit_id":"1"}]}]}'
 exit 9
 EOF
 drive rollback-terminal

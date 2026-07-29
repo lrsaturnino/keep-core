@@ -4991,6 +4991,17 @@ WORK_DRIVER_BOUND_RESULTS=""
 # The chain work ID distinguishes work items sharing an anchor; the holder and
 # local permit ID distinguish several permits one node took for that work.
 WORK_DRIVER_ORIGINATED_WORK=""
+# Every party whose share the settled result actually incorporated, space
+# joined as "<ceremony>@<canonical start block>@<chain-work-id>=\
+# <service>~<local-permit-id>".
+#
+# A mixed-fleet control needs this and cannot get it anywhere else. That a
+# container is running says nothing about whether the release inside it took
+# part: an unselected, disconnected, or cryptographically excluded party leaves
+# a running container beside a ceremony that settled without it, which reads
+# from outside exactly like interoperation. Only the transcript names who
+# contributed to the result, so the driver has to carry it out.
+WORK_DRIVER_RESULT_CONTRIBUTORS=""
 
 # How long a reported transaction may still be unmined before the rehearsal
 # stops waiting for it. A transaction that started work the fleet is holding
@@ -5397,6 +5408,34 @@ missing_bound_families() {
   printf '%s' "${uncovered}"
 }
 
+# Of the required families, the ones where no settled transcript incorporated
+# the named service.
+#
+# A mixed-fleet claim needs this and cannot be read off a running container.
+# The prior binary can be up and never selected, up and partitioned, or up and
+# cryptographically excluded, and every one of those produces a settled
+# ceremony beside a running container — the same reading interoperation
+# produces. Asking which parties the transcript itself incorporated is the only
+# question that separates them, and it is asked per family because a prior
+# binary that contributed to a tBTC signing says nothing about the beacon path.
+families_without_contributor() {
+  local contributors="$1" required="$2" service="$3"
+  local family record work covered uncovered=""
+  for family in ${required}; do
+    covered=0
+    for record in ${contributors}; do
+      [[ "$(permit_holder "${record##*=}")" == "${service}" ]] || continue
+      work="$(work_id "${record}")"
+      [[ "$(ceremony_family "$(work_ceremony "${work}")")" == "${family}" ]] ||
+        continue
+      covered=1
+      break
+    done
+    ((covered == 1)) || uncovered="${uncovered}${uncovered:+ }${family}"
+  done
+  printf '%s' "${uncovered}"
+}
+
 # The bound records that settled, rendered as "<ceremony> (<transaction>,
 # <identity>)" so a verdict names what it decided on rather than asserting it.
 bound_settlements() {
@@ -5431,15 +5470,17 @@ run_work_driver() {
   WORK_DRIVER_ORIGINATED=""
   WORK_DRIVER_BOUND_RESULTS=""
   WORK_DRIVER_ORIGINATED_WORK=""
+  WORK_DRIVER_RESULT_CONTRIBUTORS=""
   report="$("${PR4109_WORK_DRIVER}" "${phase}")" || rc=$?
   WORK_DRIVER_RC="${rc}"
 
   if [[ -n "${report//[[:space:]]/}" ]]; then
-    # Five lines out of one parse: the hashes, the outcomes, the ceremonies
-    # still in flight, the outcomes bound to what started them, and the
-    # in-flight work bound to the nodes holding a permit for it. Parsing five
-    # times would report a malformed object five times and, worse, could accept
-    # one part of a report whose other parts are unreadable.
+    # Six lines out of one parse: the hashes, the outcomes, the ceremonies
+    # still in flight, the outcomes bound to what started them, the in-flight
+    # work bound to the nodes holding a permit for it, and the parties each
+    # settled transcript incorporated. Parsing six times would report a
+    # malformed object six times and, worse, could accept one part of a report
+    # whose other parts are unreadable.
     local parsed hashes
     parsed="$(printf '%s' "${report}" | node -e '
       const CEREMONIES = ["beacon_dkg", "beacon_signing", "tbtc_dkg",
@@ -5605,6 +5646,7 @@ run_work_driver() {
         const results = report.ceremony_results;
         const all = [];
         const bound = [];
+        const contributors = [];
         const endedWork = new Set();
         if (results !== undefined) {
           if (!Array.isArray(results)) {
@@ -5666,6 +5708,44 @@ run_work_driver() {
                   "output identity: " + JSON.stringify(ceremony));
                 process.exit(1);
               }
+              // Who the settled transcript actually incorporated. Required on
+              // every success, because the control that reads it is about
+              // which releases took part and a result that named nobody would
+              // let a homogeneous run stand for a mixed one.
+              const parties = (result || {}).contributors;
+              if (!Array.isArray(parties) || parties.length === 0) {
+                console.error("successful result names no contributing " +
+                  "party: " + JSON.stringify(ceremony));
+                process.exit(1);
+              }
+              const seenParties = new Set();
+              for (const party of parties) {
+                if (party === null || typeof party !== "object" ||
+                  Array.isArray(party) ||
+                  typeof party.service !== "string" ||
+                  !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(party.service)) {
+                  console.error("not a contributing party: " +
+                    JSON.stringify(party));
+                  process.exit(1);
+                }
+                if (typeof party.permit_id !== "string" ||
+                  !/^[A-Za-z0-9][A-Za-z0-9_.:-]*$/.test(party.permit_id)) {
+                  console.error("contributing party names no local permit " +
+                    "identity: " + JSON.stringify(party.service));
+                  process.exit(1);
+                }
+                const localParty = party.service + "~" + party.permit_id;
+                // One party contributes to one transcript once. A repeated
+                // entry would let a single contribution be counted as the
+                // several a threshold needs.
+                if (seenParties.has(localParty)) {
+                  console.error("party contributed twice to one result: " +
+                    JSON.stringify(work + "#" + localParty));
+                  process.exit(1);
+                }
+                seenParties.add(localParty);
+                contributors.push(work + "=" + localParty);
+              }
             } else if (!TERMINATIONS.includes(termination)) {
               // The mirror of the above for the outcomes a fails-closed
               // control is about. "failed" alone is equally what a ceremony
@@ -5687,7 +5767,7 @@ run_work_driver() {
         }
         process.stdout.write(encoded.join(",") + "\n" +
           all.join(" ") + "\n" + started.join(" ") + "\n" + bound.join(" ") +
-          "\n" + inflight.join(" "));
+          "\n" + inflight.join(" ") + "\n" + contributors.join(" "));
       });
     ')" ||
       blocked "the work driver reported the ${phase} phase in a form this \
@@ -5702,15 +5782,17 @@ known ceremonies and outcomes — each naming a transaction the same report \
 originated and no other piece of work claims, each retaining the same \
 transaction wherever the same work appears, each identifying one chain work \
 item and local permit exactly once, and each carrying either a result identity \
-when it succeeded or a termination of retry_exhausted or no_threshold when it \
-did not — and a report that cannot be read leaves the step with no account of \
-what it drove"
+and a contributors array of {service, permit_id} objects naming every party the \
+settled transcript incorporated, no party twice, when it succeeded or a \
+termination of retry_exhausted or no_threshold when it did not — and a report \
+that cannot be read leaves the step with no account of what it drove"
 
     hashes="$(printf '%s\n' "${parsed}" | sed -n '1p')"
     WORK_DRIVER_CEREMONY_RESULTS="$(printf '%s\n' "${parsed}" | sed -n '2p')"
     WORK_DRIVER_ORIGINATED="$(printf '%s\n' "${parsed}" | sed -n '3p')"
     WORK_DRIVER_BOUND_RESULTS="$(printf '%s\n' "${parsed}" | sed -n '4p')"
     WORK_DRIVER_ORIGINATED_WORK="$(printf '%s\n' "${parsed}" | sed -n '5p')"
+    WORK_DRIVER_RESULT_CONTRIBUTORS="$(printf '%s\n' "${parsed}" | sed -n '6p')"
 
     # Before any of it enters a step's record. A reading taken from a report
     # the chain does not corroborate is not a weaker reading, it is a
@@ -7140,6 +7222,7 @@ collect_precutover_work() {
   PRECUTOVER_TX=0
   PRECUTOVER_RESULTS=""
   PRECUTOVER_BOUND=""
+  PRECUTOVER_CONTRIBUTORS=""
   PRECUTOVER_STATES=""
 
   # Every R1 node has to be on the legacy side of its own gate before the work
@@ -7181,6 +7264,7 @@ ${service} reported [${state:-unreadable}] at block [${block:-unreadable}]"
     PRECUTOVER_TX="${WORK_DRIVER_TX_COUNT}"
     PRECUTOVER_RESULTS="${WORK_DRIVER_CEREMONY_RESULTS}"
     PRECUTOVER_BOUND="${WORK_DRIVER_BOUND_RESULTS}"
+    PRECUTOVER_CONTRIBUTORS="${WORK_DRIVER_RESULT_CONTRIBUTORS}"
   fi
 
   PRECUTOVER_LEGACY_AFTER="$(fleet_metric_total \
@@ -7206,12 +7290,16 @@ precutover_verdict() {
   local what="$5"
 
   local failed_results missing_families missing_classes settlements
+  local uninteroperated
   failed_results="$(unsuccessful_results "${PRECUTOVER_RESULTS}")"
   missing_families="$(missing_bound_families \
     "${PRECUTOVER_BOUND}" "${required_families}")"
   missing_classes="$(missing_bound_classes \
     "${PRECUTOVER_BOUND}" "${required_classes}")"
   settlements="$(bound_settlements "${PRECUTOVER_BOUND}")"
+  uninteroperated="$(families_without_contributor \
+    "${PRECUTOVER_CONTRIBUTORS}" "${required_families}" \
+    "${REHEARSAL_PRIOR_SERVICE}")"
 
   if ((PRECUTOVER_DRIVER_SUPPLIED == 0)); then
     block_step "${step}" "no PR4109_WORK_DRIVER was supplied, so no \
@@ -7258,6 +7346,13 @@ on ${required_families}"
     block_step "${step}" "the work driver settled ${settlements} but no \
 ${missing_classes}; this step's claim is about ${what}, and the work classes \
 it names are what make it that claim rather than a repeat of the step before"
+  elif [[ -n "${uninteroperated}" ]]; then
+    block_step "${step}" "the work driver settled ${settlements}, but no \
+${uninteroperated} transcript incorporated a share from \
+${REHEARSAL_PRIOR_SERVICE}; the prior binary was running beside the R1 fleet \
+and took no part in the result, which is what an unselected, partitioned, or \
+excluded party looks like from outside — a homogeneous R1 ceremony cannot \
+stand for the two releases interoperating"
   elif ((PRECUTOVER_LEGACY_AFTER <= PRECUTOVER_LEGACY_BEFORE)); then
     record_step "${step}" fail "the work driver settled ${settlements}, but \
 the fleet issued no new legacy permit (participation_mode_legacy_total still \
@@ -7287,8 +7382,10 @@ the prior binary; below C the two releases must be one wire format"
 $((PRECUTOVER_LEGACY_AFTER - PRECUTOVER_LEGACY_BEFORE)) new legacy permits \
 and no security-v2 permit (unchanged at [${PRECUTOVER_SECURITY_AFTER}]) \
 driving ${what} beside the running prior binary, the driver settled \
-${settlements} with nothing failing beside them, and the fleet recognized no \
-cross-format peer (unchanged at [${PRECUTOVER_SIGHTINGS_AFTER}])"
+${settlements} with nothing failing beside them, every ${required_families} \
+transcript incorporated a share from ${REHEARSAL_PRIOR_SERVICE}, and the fleet \
+recognized no cross-format peer (unchanged at \
+[${PRECUTOVER_SIGHTINGS_AFTER}])"
     [[ -z "${assertion}" ]] || record_assertion "${assertion}" true "${step}"
     return
   fi

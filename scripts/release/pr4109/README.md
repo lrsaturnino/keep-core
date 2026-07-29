@@ -293,6 +293,19 @@ cannot be read stops the step — a driver whose account is unreadable has left
 the step unable to say what it drove, and recording that as "nothing happened"
 would enter silence as evidence.
 
+Every successful result additionally carries a `contributors` array of
+`{service, permit_id}` records naming each party whose share the settled
+transcript incorporated, no party twice. The mixed prior/R1 controls read it
+and nothing else can answer the question they ask: that the prior binary's
+container was running says only that it was running. Unselected, partitioned,
+and cryptographically excluded all leave it up beside a ceremony that settled
+without it, which from outside is the same reading interoperation produces. The
+pre-cutover steps therefore require the prior service to appear among the
+contributors of a settled transcript in *each* required family — a prior binary
+in a tBTC signing says nothing about the beacon's separate path into the gate.
+A driver that cannot report who contributed cannot support a mixed-fleet claim,
+so the field is mandatory on success rather than optional.
+
 Each outcome is bound to the work it belongs to, and controls are decided on
 the bound form rather than on the arrays beside it. One chain work item is
 `<ceremony>@<block>@<work_id>`: the canonical start block pins the mode, while
