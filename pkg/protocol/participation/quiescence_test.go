@@ -239,3 +239,70 @@ func TestValidateTerminalOutcome_RejectsUnauthenticatedDKGExhaustion(
 		}
 	}
 }
+
+// TestTerminalResultReference_ComponentBoundariesAreBinding asserts the
+// reference builder cannot be made to collide by shifting the boundary between
+// two components. Concatenating adjacent components must not reproduce another
+// call's digest, otherwise two different ceremony results could claim the same
+// journal identity.
+func TestTerminalResultReference_ComponentBoundariesAreBinding(t *testing.T) {
+	shifted := map[string][][]byte{
+		"split one way":     {[]byte("ab"), []byte("c")},
+		"split another way": {[]byte("a"), []byte("bc")},
+		"joined":            {[]byte("abc")},
+	}
+
+	seen := make(map[string]string)
+	for name, components := range shifted {
+		reference := TerminalResultReference("domain", components...)
+
+		if previous, taken := seen[reference]; taken {
+			t.Errorf(
+				"[%s] collides with [%s] on reference [%s]",
+				name,
+				previous,
+				reference,
+			)
+		}
+		seen[reference] = name
+	}
+}
+
+// TestTerminalResultReference_DomainSeparates asserts two ceremonies cannot
+// derive the same reference from identical components.
+func TestTerminalResultReference_DomainSeparates(t *testing.T) {
+	components := [][]byte{{0x01, 0x02}}
+
+	if TerminalResultReference("first_domain", components...) ==
+		TerminalResultReference("second_domain", components...) {
+		t.Error("distinct domains produced the same reference")
+	}
+}
+
+// TestTerminalResultReference_IsAcceptedAsEvidence asserts a derived reference
+// passes the journal's own identity rules, so a ceremony that authors one can
+// actually record it.
+func TestTerminalResultReference_IsAcceptedAsEvidence(t *testing.T) {
+	for _, ceremony := range []Ceremony{
+		TBTCSigning,
+		TBTCHeartbeat,
+		TBTCWalletCoordination,
+		BeaconRelaySigning,
+		BeaconTimeoutReport,
+	} {
+		if err := ValidateTerminalOutcome(
+			ceremony,
+			TerminalOutcomeCompleted,
+			TerminalEvidence{
+				Kind:      TerminalEvidenceProtocolResult,
+				Reference: TerminalResultReference("domain", []byte("result")),
+			},
+		); err != nil {
+			t.Errorf(
+				"derived reference rejected for ceremony [%s]: [%v]",
+				ceremony,
+				err,
+			)
+		}
+	}
+}

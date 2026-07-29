@@ -142,8 +142,11 @@ func newMovedFundsSweepAction(
 
 func (mfsa *movedFundsSweepAction) execute() error {
 	// The action owns its permit from dispatch on; releasing it here ends the
-	// ceremony's active accounting in the participation gate.
+	// ceremony's active accounting in the participation gate. The terminal
+	// outcome is registered afterwards so it runs first and reaches the permit
+	// while it is still open.
 	defer mfsa.permit.Close()
+	defer mfsa.transactionExecutor.recordTerminalOutcome(mfsa.logger)
 
 	validateProposalLogger := mfsa.logger.With(
 		zap.String("step", "validateProposal"),

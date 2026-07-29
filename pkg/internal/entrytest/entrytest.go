@@ -174,7 +174,7 @@ func executeSigning(
 		go func(signer *dkg.ThresholdSigner, permit participation.Permit) {
 			defer permit.Close()
 
-			err := entry.SignAndSubmit(
+			_, err := entry.SignAndSubmit(
 				permit.Context(),
 				&testutils.MockLogger{},
 				blockCounter,

@@ -1,6 +1,8 @@
 package participation
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -228,6 +230,31 @@ type TerminalEvidence struct {
 	// inactive or disqualified members are removed. For beacon it is the
 	// persisted threshold signer's member index.
 	MembershipIndex group.MemberIndex `json:"membership_index,omitempty"`
+}
+
+// TerminalResultReference derives the nonsecret, stable identity of a protocol
+// result for a terminal evidence record. Components are length-prefixed under a
+// domain label, so no two ceremonies can derive the same digest from different
+// inputs and no component boundary can be shifted to forge a collision. Only
+// the digest — never the underlying material — reaches the journal, which keeps
+// raw protocol inputs out of a record the rollback audit reads outside the
+// node's trust boundary.
+func TerminalResultReference(domain string, components ...[]byte) string {
+	digest := sha256.New()
+
+	writeComponent := func(component []byte) {
+		var length [8]byte
+		binary.BigEndian.PutUint64(length[:], uint64(len(component)))
+		digest.Write(length[:])
+		digest.Write(component)
+	}
+
+	writeComponent([]byte(domain))
+	for _, component := range components {
+		writeComponent(component)
+	}
+
+	return hex.EncodeToString(digest.Sum(nil))
 }
 
 // TerminalOutcomeRecord is written by the permit owner after real completion

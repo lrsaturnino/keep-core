@@ -133,10 +133,48 @@ func newHeartbeatAction(
 	}
 }
 
+// recordTerminalOutcome reports the heartbeat ceremony's node-owned final
+// disposition on its participation permit. The heartbeat's durable result is
+// the threshold signature it produced over the proposed message; a heartbeat
+// that never reached one — including one the release gate canceled — left no
+// state behind and is recorded as exhausted. The inactivity claim derived from
+// a low-activity heartbeat runs under this same permit, so it needs no
+// separate record.
+func (ha *heartbeatAction) recordTerminalOutcome(signature *tecdsa.Signature) {
+	if signature == nil {
+		recordPermitNoThreshold(ha.logger, ha.permit)
+		return
+	}
+
+	recordPermitTerminalOutcome(
+		ha.logger,
+		ha.permit,
+		participation.TerminalOutcomeCompleted,
+		participation.TerminalEvidence{
+			Kind: participation.TerminalEvidenceProtocolResult,
+			Reference: participation.TerminalResultReference(
+				"tbtc_heartbeat_signature",
+				ha.proposal.Message[:],
+				signatureComponentBytes(signature.R),
+				signatureComponentBytes(signature.S),
+			),
+		},
+	)
+}
+
 func (ha *heartbeatAction) execute() error {
+	// heartbeatSignature holds the ceremony's durable result once signing
+	// produces one. The deferred recorder below reads its final value.
+	var heartbeatSignature *tecdsa.Signature
+
 	// The action owns its permit from dispatch on; releasing it here ends the
-	// ceremony's active accounting in the participation gate.
+	// ceremony's active accounting in the participation gate. The terminal
+	// outcome is registered afterwards so it runs first and reaches the permit
+	// while it is still open.
 	defer ha.permit.Close()
+	defer func() {
+		ha.recordTerminalOutcome(heartbeatSignature)
+	}()
 
 	// Do not execute the heartbeat action if the operator is unstaking.
 	isUnstaking, err := ha.isOperatorUnstaking()
@@ -202,6 +240,11 @@ func (ha *heartbeatAction) execute() error {
 		// gate-caused abort apart from an ordinary failure.
 		return fmt.Errorf("heartbeat signing process errored out: [%w]", err)
 	}
+
+	// Signing reached the threshold, so the ceremony has a durable result the
+	// rollback audit can identify, whatever the activity accounting below
+	// decides about penalties.
+	heartbeatSignature = signature
 
 	// If the number of active members during signing was enough, we can
 	// consider the heartbeat procedure as successful.

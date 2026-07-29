@@ -3,6 +3,7 @@ package beacon
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -460,6 +461,87 @@ func recordBeaconPermitTerminalOutcome(
 	}
 }
 
+// recordBeaconPermitNoThreshold records that a beacon ceremony ended without
+// producing a threshold result or any durable state transition this node owns.
+// It is the honest disposition for a ceremony another member finished first,
+// one that timed out, and one the release gate canceled.
+func recordBeaconPermitNoThreshold(
+	beaconLogger log.StandardLogger,
+	permit participation.Permit,
+) {
+	recordBeaconPermitTerminalOutcome(
+		beaconLogger,
+		permit,
+		participation.TerminalOutcomeExhausted,
+		participation.TerminalEvidence{
+			Kind: participation.TerminalEvidenceNoThreshold,
+		},
+	)
+}
+
+// recordRelayTimeoutTerminalOutcome reports the relay entry monitor's
+// node-owned final disposition. The monitor exists only to file the penalty
+// report, so a filed report is its durable result; a monitor that ended because
+// the group delivered on time, because the report failed, or because the
+// release gate canceled it created no penalty state and is recorded as
+// exhausted.
+func recordRelayTimeoutTerminalOutcome(
+	monitorLogger log.StandardLogger,
+	permit participation.Permit,
+	relayRequestBlockNumber uint64,
+	timeoutReportedAtBlock uint64,
+) {
+	if timeoutReportedAtBlock == 0 {
+		recordBeaconPermitNoThreshold(monitorLogger, permit)
+		return
+	}
+
+	requestBlock := make([]byte, 8)
+	binary.BigEndian.PutUint64(requestBlock, relayRequestBlockNumber)
+	reportBlock := make([]byte, 8)
+	binary.BigEndian.PutUint64(reportBlock, timeoutReportedAtBlock)
+
+	recordBeaconPermitTerminalOutcome(
+		monitorLogger,
+		permit,
+		participation.TerminalOutcomeCompleted,
+		participation.TerminalEvidence{
+			Kind: participation.TerminalEvidenceProtocolResult,
+			Reference: participation.TerminalResultReference(
+				"beacon_relay_entry_timeout_report",
+				requestBlock,
+				reportBlock,
+			),
+		},
+	)
+}
+
+// recordRelayEntryTerminalOutcome reports one relay signing membership's
+// node-owned final disposition. A relay entry is deterministic for a given
+// previous entry, so the recovered entry itself is the ceremony's durable
+// result and remains reconcilable against the chain regardless of which member
+// published it.
+func recordRelayEntryTerminalOutcome(
+	relayLogger log.StandardLogger,
+	permit participation.Permit,
+	relayEntry []byte,
+) {
+	if len(relayEntry) == 0 {
+		recordBeaconPermitNoThreshold(relayLogger, permit)
+		return
+	}
+
+	recordBeaconPermitTerminalOutcome(
+		relayLogger,
+		permit,
+		participation.TerminalOutcomeCompleted,
+		participation.TerminalEvidence{
+			Kind:      participation.TerminalEvidenceProtocolResult,
+			Reference: hex.EncodeToString(relayEntry),
+		},
+	)
+}
+
 // ForwardSignatureShares enables the ability to forward signature shares
 // messages to other nodes even if this node is not a part of the group which
 // signs the relay entry. The forwarding runs under a participation permit
@@ -621,7 +703,22 @@ func (n *node) MonitorRelayEntry(
 		)
 		return
 	}
+	// timeoutReportedAtBlock holds the block the monitor filed its timeout
+	// report at, which is the only durable state this ceremony can create. The
+	// deferred recorder below reads its final value.
+	var timeoutReportedAtBlock uint64
+
+	// The terminal outcome is registered after the release so it runs first and
+	// reaches the permit while it is still open.
 	defer permit.Close()
+	defer func() {
+		recordRelayTimeoutTerminalOutcome(
+			logger,
+			permit,
+			relayRequestBlockNumber,
+			timeoutReportedAtBlock,
+		)
+	}()
 
 	blockCounter, err := n.beaconChain.BlockCounter()
 	if err != nil {
@@ -676,7 +773,9 @@ func (n *node) MonitorRelayEntry(
 			err = n.beaconChain.ReportRelayEntryTimeout()
 			if err != nil {
 				logger.Errorf("could not report a relay entry timeout: [%v]", err)
+				return
 			}
+			timeoutReportedAtBlock = blockNumber
 			return
 		case entry := <-onEntrySubmittedChannel:
 			logger.Infof(
@@ -814,7 +913,7 @@ func (n *node) generateRelayEntry(
 			n.protocolLatch.Lock()
 			defer n.protocolLatch.Unlock()
 
-			err := entry.SignAndSubmit(
+			relayEntry, err := entry.SignAndSubmit(
 				permit.Context(),
 				relayLogger,
 				blockCounter,
@@ -826,6 +925,10 @@ func (n *node) generateRelayEntry(
 				startBlockHeight,
 				permit,
 			)
+			// The recovered entry, not the submission's fate, is this
+			// ceremony's node-owned terminal disposition: a member that never
+			// reached the honest threshold left no result behind.
+			recordRelayEntryTerminalOutcome(relayLogger, permit, relayEntry)
 			if err != nil {
 				if participation.IsGateRefusal(err) {
 					relayLogger.Warnf(

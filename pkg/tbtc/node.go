@@ -3,12 +3,14 @@ package tbtc
 import (
 	"context"
 	"crypto/ecdsa"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"math/big"
 	"sync"
 	"time"
 
+	"github.com/ipfs/go-log/v2"
 	"github.com/keep-network/keep-common/pkg/chain/ethereum"
 	"github.com/keep-network/keep-core/pkg/bitcoin"
 	"github.com/keep-network/keep-core/pkg/chain"
@@ -1304,7 +1306,21 @@ func executeCoordinationProcedure(
 		)
 		return nil, false
 	}
+	// agreedResult holds the coordination procedure's durable result once the
+	// wallet agrees on one. The deferred recorder below reads its final value.
+	var agreedResult *coordinationResult
+
+	// The terminal outcome is registered after the release so it runs first and
+	// reaches the permit while it is still open.
 	defer permit.Close()
+	defer func() {
+		recordCoordinationTerminalOutcome(
+			procedureLogger,
+			permit,
+			walletPublicKeyBytes,
+			agreedResult,
+		)
+	}()
 
 	startTime := time.Now()
 	result, err := executor.coordinate(permit.Context(), window)
@@ -1338,6 +1354,8 @@ func executeCoordinationProcedure(
 		return nil, false
 	}
 
+	agreedResult = result
+
 	procedureLogger.Infof(
 		"coordination procedure finished successfully with result [%s]",
 		result,
@@ -1356,6 +1374,43 @@ func executeCoordinationProcedure(
 	)
 
 	return result, true
+}
+
+// recordCoordinationTerminalOutcome reports the coordination ceremony's
+// node-owned final disposition on its participation permit. The procedure's
+// durable result is the agreed proposal that dispatches the wallet action; the
+// action itself runs under its own permit and reports its own outcome. A
+// procedure that never agreed on a result — including one the release gate
+// canceled — left nothing behind and is recorded as exhausted.
+func recordCoordinationTerminalOutcome(
+	procedureLogger log.StandardLogger,
+	permit participation.Permit,
+	walletPublicKeyBytes []byte,
+	result *coordinationResult,
+) {
+	if result == nil {
+		recordPermitNoThreshold(procedureLogger, permit)
+		return
+	}
+
+	coordinationBlock := make([]byte, 8)
+	binary.BigEndian.PutUint64(coordinationBlock, result.window.coordinationBlock)
+
+	recordPermitTerminalOutcome(
+		procedureLogger,
+		permit,
+		participation.TerminalOutcomeCompleted,
+		participation.TerminalEvidence{
+			Kind: participation.TerminalEvidenceProtocolResult,
+			Reference: participation.TerminalResultReference(
+				"tbtc_wallet_coordination_result",
+				walletPublicKeyBytes,
+				coordinationBlock,
+				[]byte(result.leader),
+				[]byte(result.proposal.ActionType().String()),
+			),
+		},
+	)
 }
 
 // recordCoordinationOutcome records one wallet's coordination outcome in the

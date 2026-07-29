@@ -194,6 +194,8 @@ func TestDepositSweepAction_Execute(t *testing.T) {
 				rawSignatures,
 			)
 
+			permit := newTestPermit(participation.TBTCSigning)
+
 			action := newDepositSweepAction(
 				logger.With(),
 				hostChain,
@@ -206,7 +208,7 @@ func TestDepositSweepAction_Execute(t *testing.T) {
 				func(ctx context.Context, blockHeight uint64) error {
 					return nil
 				},
-				newTestPermit(participation.TBTCSigning),
+				permit,
 			)
 
 			// Modify the default parameters of the action to make
@@ -235,6 +237,28 @@ func TestDepositSweepAction_Execute(t *testing.T) {
 				scenario.ExpectedSweepTransaction.Serialize(),
 				broadcastedSweepTransaction.Serialize(),
 			)
+
+			// The action must leave the rollback journal pointing at the exact
+			// Bitcoin transaction it put on the network, recorded while its
+			// permit was still open.
+			evidence := assertRecordedTerminalOutcome(
+				t,
+				permit,
+				participation.TerminalOutcomeCompleted,
+				participation.TerminalEvidenceBitcoinTransaction,
+			)
+
+			expectedReference := scenario.ExpectedSweepTransactionHash.Hex(
+				bitcoin.ReversedByteOrder,
+			)
+			if evidence.Reference != expectedReference {
+				t.Errorf(
+					"unexpected evidence reference\n"+
+						"expected: [%s]\nactual:   [%s]",
+					expectedReference,
+					evidence.Reference,
+				)
+			}
 		})
 	}
 }

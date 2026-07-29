@@ -315,6 +315,15 @@ type walletTransactionExecutor struct {
 	// broadcastOperation names the action-specific Bitcoin broadcast in the
 	// commit fence, e.g. "tbtc_deposit_sweep_bitcoin_broadcast".
 	broadcastOperation string
+
+	// signedTransaction is the fully signed Bitcoin transaction this action
+	// produced, if the signing ceremony reached the threshold. It is the
+	// wallet action's durable result: once a valid signed transaction exists,
+	// any wallet member may put it on the Bitcoin network, so the offline
+	// rollback audit must reconcile this exact transaction against mempool and
+	// chain to decide whether it was broadcast, mined, or is absent. It is
+	// written and read only on the action goroutine that owns the executor.
+	signedTransaction *bitcoin.Transaction
 }
 
 func newWalletTransactionExecutor(
@@ -400,7 +409,39 @@ func (wte *walletTransactionExecutor) signTransaction(
 
 	signTxLogger.Infof("transaction created successfully")
 
+	// The threshold signature is now bound to a concrete Bitcoin transaction,
+	// which is what the rollback audit has to reconcile. Pin it before the
+	// broadcast so a permit canceled mid-broadcast still reports the
+	// transaction it may have put on the network.
+	wte.signedTransaction = tx
+
 	return tx, nil
+}
+
+// recordTerminalOutcome reports the wallet action's node-owned final
+// disposition on its participation permit. A signed Bitcoin transaction is the
+// action's durable result and is recorded by hash for offline reconciliation;
+// an action that never reached a signed transaction provably left no state
+// behind and is recorded as exhausted.
+func (wte *walletTransactionExecutor) recordTerminalOutcome(
+	actionLogger log.StandardLogger,
+) {
+	if wte.signedTransaction == nil {
+		recordPermitNoThreshold(actionLogger, wte.permit)
+		return
+	}
+
+	recordPermitTerminalOutcome(
+		actionLogger,
+		wte.permit,
+		participation.TerminalOutcomeCompleted,
+		participation.TerminalEvidence{
+			Kind: participation.TerminalEvidenceBitcoinTransaction,
+			Reference: wte.signedTransaction.Hash().Hex(
+				bitcoin.ReversedByteOrder,
+			),
+		},
+	)
 }
 
 // broadcastTransaction broadcasts a signed Bitcoin transaction until

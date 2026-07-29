@@ -176,8 +176,11 @@ func newRedemptionAction(
 
 func (ra *redemptionAction) execute() error {
 	// The action owns its permit from dispatch on; releasing it here ends the
-	// ceremony's active accounting in the participation gate.
+	// ceremony's active accounting in the participation gate. The terminal
+	// outcome is registered afterwards so it runs first and reaches the permit
+	// while it is still open.
 	defer ra.permit.Close()
+	defer ra.transactionExecutor.recordTerminalOutcome(ra.logger)
 
 	startTime := time.Now()
 

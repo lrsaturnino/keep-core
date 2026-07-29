@@ -32,6 +32,13 @@ func RegisterUnmarshallers(channel net.BroadcastChannel) {
 // previous relay entry and publishes the signature to the chain as
 // a new relay entry.
 //
+// It returns the marshaled relay entry this member recovered, or nil when the
+// local ceremony ended before reaching the honest threshold — because another
+// member submitted the entry first, the request timed out, or the permit was
+// canceled. A relay entry is deterministic for a given previous entry, so the
+// returned value is the ceremony's durable result and stays reconcilable
+// against the chain even if the submission below did not go through.
+//
 // The context bounds the execution and must be the ceremony permit's context:
 // canceling it aborts the share exchange and the submission. The commit guard
 // is consulted immediately before the terminal on-chain entry submission.
@@ -46,11 +53,13 @@ func SignAndSubmit(
 	signer *dkg.ThresholdSigner,
 	startBlockHeight uint64,
 	commitGuard participation.CommitGuard,
-) error {
+) ([]byte, error) {
 	if commitGuard == nil {
 		// Submitting without a fence would publish an entry the release gate
 		// never authorized; there is no implicit default.
-		return fmt.Errorf("a commit guard is required to sign a relay entry")
+		return nil, fmt.Errorf(
+			"a commit guard is required to sign a relay entry",
+		)
 	}
 
 	ctx, cancelCtx := context.WithCancel(ctx)
@@ -72,13 +81,13 @@ func SignAndSubmit(
 		startBlockHeight + chainConfig.RelayEntryTimeout,
 	)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	previousEntry := new(bn256.G1)
 	_, err = previousEntry.Unmarshal(previousEntryBytes)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	selfShare := signer.CalculateSignatureShare(previousEntry)
@@ -150,15 +159,15 @@ func SignAndSubmit(
 				signer.MemberID(),
 				blockNumber,
 			)
-			return nil
+			return nil, nil
 		case blockNumber := <-relayEntryTimeoutChannel:
-			return fmt.Errorf(
+			return nil, fmt.Errorf(
 				"relay entry timed out at block [%v]; received [%v] valid signature shares",
 				blockNumber,
 				len(receivedValidShares),
 			)
 		case <-ctx.Done():
-			return fmt.Errorf(
+			return nil, fmt.Errorf(
 				"relay entry signing canceled: [%w]",
 				context.Cause(ctx),
 			)
@@ -167,8 +176,10 @@ func SignAndSubmit(
 
 	signature, err := completeSignature(logger, signer, receivedValidShares, honestThreshold)
 	if err != nil {
-		return err
+		return nil, err
 	}
+
+	entryBytes := signature.Marshal()
 
 	submitter := &relayEntrySubmitter{
 		logger:       logger,
@@ -182,9 +193,12 @@ func SignAndSubmit(
 	// timeout signal appeared while executing the message loop. There is
 	// still a possibility those signals appear in the future so the submitter
 	// must be aware of them and break the execution if they occur.
-	return submitter.submitRelayEntry(
+	// The recovered entry is returned whatever the submission does: the local
+	// ceremony already reached its threshold result, and a submission refused
+	// by the release gate or won by another member does not undo it.
+	return entryBytes, submitter.submitRelayEntry(
 		ctx,
-		signature.Marshal(),
+		entryBytes,
 		signer.GroupPublicKeyBytes(),
 		startBlockHeight,
 		relayEntrySubmittedChannel,

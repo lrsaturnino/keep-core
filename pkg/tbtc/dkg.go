@@ -963,15 +963,7 @@ func (de *dkgExecutor) recordPermitTerminalOutcome(
 	outcome participation.TerminalOutcome,
 	evidence participation.TerminalEvidence,
 ) {
-	if err := permit.RecordTerminalOutcome(outcome, evidence); err != nil {
-		dkgLogger.Warnf(
-			"could not persist the node-authored DKG terminal outcome "+
-				"[member=%s] [outcome=%s]: [%v]",
-			permit.PermitID(),
-			outcome,
-			err,
-		)
-	}
+	recordPermitTerminalOutcome(dkgLogger, permit, outcome, evidence)
 }
 
 // publishDkgResult performs the DKG result publication process. The commit

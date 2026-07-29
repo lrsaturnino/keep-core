@@ -138,8 +138,11 @@ func newMovingFundsAction(
 
 func (mfa *movingFundsAction) execute() error {
 	// The action owns its permit from dispatch on; releasing it here ends the
-	// ceremony's active accounting in the participation gate.
+	// ceremony's active accounting in the participation gate. The terminal
+	// outcome is registered afterwards so it runs first and reaches the permit
+	// while it is still open.
 	defer mfa.permit.Close()
+	defer mfa.transactionExecutor.recordTerminalOutcome(mfa.logger)
 
 	validateProposalLogger := mfa.logger.With(
 		zap.String("step", "validateProposal"),
