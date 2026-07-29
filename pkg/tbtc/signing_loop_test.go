@@ -674,6 +674,34 @@ func TestSigningRetryLoop(t *testing.T) {
 			}
 
 			if test.expectedLastExecutedAttempt != nil {
+				// The done check decides which incoming done messages belong to
+				// an attempt from the window it was handed, so that window has
+				// to be the executed attempt's own. Handing over a window from
+				// another attempt would leave the check admitting done messages
+				// produced outside the run it is attesting to.
+				listen := doneCheck.listenFor(
+					uint64(test.expectedLastExecutedAttempt.number),
+				)
+				if listen == nil {
+					t.Errorf(
+						"done check was never asked to listen for attempt [%v]",
+						test.expectedLastExecutedAttempt.number,
+					)
+				} else {
+					testutils.AssertIntsEqual(
+						t,
+						"done check listen start block",
+						int(test.expectedLastExecutedAttempt.startBlock),
+						int(listen.startBlock),
+					)
+					testutils.AssertIntsEqual(
+						t,
+						"done check listen timeout block",
+						int(test.expectedLastExecutedAttempt.timeoutBlock),
+						int(listen.timeoutBlock),
+					)
+				}
+
 				testutils.AssertIntsEqual(
 					t,
 					"outgoing announcements count",
@@ -887,16 +915,49 @@ type mockSigningDoneCheck struct {
 	// transcript, so a case that does not set it expects the loop to carry
 	// nothing rather than to invent a population.
 	doneSigners participation.MemberIndexes
+	// listens records the attempt the loop asked the done check to listen for,
+	// so a test can hold the loop to handing over that attempt's own protocol
+	// window rather than some other attempt's.
+	listens []*mockSigningDoneCheckListen
+}
+
+// mockSigningDoneCheckListen is one recorded listen call.
+type mockSigningDoneCheckListen struct {
+	attemptNumber  uint64
+	startBlock     uint64
+	timeoutBlock   uint64
+	membersIndexes []group.MemberIndex
+}
+
+// listenFor returns the recorded listen call for the given attempt number, or
+// nil when the loop never asked to listen for that attempt.
+func (msdc *mockSigningDoneCheck) listenFor(
+	attemptNumber uint64,
+) *mockSigningDoneCheckListen {
+	for _, listen := range msdc.listens {
+		if listen.attemptNumber == attemptNumber {
+			return listen
+		}
+	}
+
+	return nil
 }
 
 func (msdc *mockSigningDoneCheck) listen(
 	ctx context.Context,
 	message *big.Int,
 	attemptNumber uint64,
+	attemptStartBlock uint64,
 	attemptTimeoutBlock uint64,
 	attemptMembersIndexes []group.MemberIndex,
 ) {
 	msdc.currentAttemptNumber = attemptNumber
+	msdc.listens = append(msdc.listens, &mockSigningDoneCheckListen{
+		attemptNumber:  attemptNumber,
+		startBlock:     attemptStartBlock,
+		timeoutBlock:   attemptTimeoutBlock,
+		membersIndexes: attemptMembersIndexes,
+	})
 }
 
 func (msdc *mockSigningDoneCheck) signalDone(

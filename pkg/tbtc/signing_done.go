@@ -52,11 +52,51 @@ type signingDoneCheck struct {
 	broadcastChannel    net.BroadcastChannel
 	membershipValidator *group.MembershipValidator
 
-	receiveCtx           context.Context
-	cancelReceiveCtx     context.CancelFunc
-	expectedSignersCount int
-	doneSigners          map[group.MemberIndex]*signingDoneMessage
-	doneSignersMutex     sync.Mutex
+	// receiveCtx, cancelReceiveCtx and attempt hold the state of the attempt
+	// this check is currently working on. They are written by listen and read
+	// by waitUntilAllDone, which the retry loop calls one after the other on
+	// its own goroutine; no other goroutine touches them.
+	receiveCtx       context.Context
+	cancelReceiveCtx context.CancelFunc
+	attempt          *signingDoneAttempt
+}
+
+// signingDoneAttempt is the done-check state of a single signing attempt: the
+// memberships the attempt selected and the done messages received from them.
+//
+// It is owned by the listen call that created it, and that call's listener
+// goroutine closes over it, because an attempt's listener is stopped by
+// cancelling its context and the next attempt does not wait for it to notice.
+// A listener still draining buffered messages from the previous attempt would
+// otherwise write into state the current attempt installed — filling a fresh
+// map with a finished attempt's messages, and validating them against the
+// wrong attempt's party set.
+type signingDoneAttempt struct {
+	// members are the memberships the attempt selected to sign, and the only
+	// senders whose done messages describe its transcript. Immutable once the
+	// attempt is constructed, so it needs no lock.
+	members []group.MemberIndex
+
+	doneSigners      map[group.MemberIndex]*signingDoneMessage
+	doneSignersMutex sync.Mutex
+}
+
+// recordDoneSigner stores a validated done message under its sender.
+func (sda *signingDoneAttempt) recordDoneSigner(doneMessage *signingDoneMessage) {
+	sda.doneSignersMutex.Lock()
+	defer sda.doneSignersMutex.Unlock()
+
+	sda.doneSigners[doneMessage.senderID] = doneMessage
+}
+
+// isDoneSigner reports whether a done message from the given sender was
+// already accepted for this attempt.
+func (sda *signingDoneAttempt) isDoneSigner(senderID group.MemberIndex) bool {
+	sda.doneSignersMutex.Lock()
+	defer sda.doneSignersMutex.Unlock()
+
+	_, done := sda.doneSigners[senderID]
+	return done
 }
 
 func newSigningDoneCheck(
@@ -72,17 +112,19 @@ func newSigningDoneCheck(
 }
 
 // listen runs the signing done check listening routine. This function listens
-// for incoming signing done checks from members participating in the given
-// signing attempt. Messages are filtered out based on the attempt number. Only
-// one message for the given attempt can be sent by the given signing group
-// member. This function should be called before the signing attempt starts to
-// ensure signing done messages are getting received as early as possible. This
-// is especially important when the current member is the slowest one with
-// executing the signing.
+// for incoming signing done checks from the members the given signing attempt
+// selected. Messages are filtered out based on the sending membership, the
+// attempt number, and the attempt's own protocol window. Only one message for
+// the given attempt can be sent by the given signing group member. This
+// function should be called before the signing attempt starts to ensure signing
+// done messages are getting received as early as possible. This is especially
+// important when the current member is the slowest one with executing the
+// signing.
 func (sdc *signingDoneCheck) listen(
 	ctx context.Context,
 	message *big.Int,
 	attemptNumber uint64,
+	attemptStartBlock uint64,
 	attemptTimeoutBlock uint64,
 	attemptMembersIndexes []group.MemberIndex,
 ) {
@@ -90,16 +132,22 @@ func (sdc *signingDoneCheck) listen(
 	// consuming goroutine are closed when the `waitUntilAllDone` completes its
 	// work. Leaving a dangling receiver without the message processing loop
 	// causes warnings on the channel level.
-	sdc.receiveCtx, sdc.cancelReceiveCtx = context.WithCancel(ctx)
+	receiveCtx, cancelReceiveCtx := context.WithCancel(ctx)
+	sdc.receiveCtx, sdc.cancelReceiveCtx = receiveCtx, cancelReceiveCtx
 
 	messagesChan := make(chan net.Message, signingDoneReceiveBuffer)
-	sdc.broadcastChannel.Recv(sdc.receiveCtx, func(message net.Message) {
+	sdc.broadcastChannel.Recv(receiveCtx, func(message net.Message) {
 		messagesChan <- message
 	})
 
-	sdc.expectedSignersCount = len(attemptMembersIndexes)
-	sdc.doneSigners = make(map[group.MemberIndex]*signingDoneMessage)
+	attempt := &signingDoneAttempt{
+		members:     slices.Clone(attemptMembersIndexes),
+		doneSigners: make(map[group.MemberIndex]*signingDoneMessage),
+	}
+	sdc.attempt = attempt
 
+	// The goroutine works on the attempt and context it was started with rather
+	// than on the check's fields, which the next attempt's listen replaces.
 	go func() {
 		for {
 			select {
@@ -110,22 +158,20 @@ func (sdc *signingDoneCheck) listen(
 				}
 
 				if !sdc.isValidDoneMessage(
+					attempt,
 					doneMessage,
 					netMessage.SenderPublicKey(),
 					message,
 					attemptNumber,
+					attemptStartBlock,
 					attemptTimeoutBlock,
 				) {
 					continue
 				}
 
-				func() {
-					sdc.doneSignersMutex.Lock()
-					defer sdc.doneSignersMutex.Unlock()
-					sdc.doneSigners[doneMessage.senderID] = doneMessage
-				}()
+				attempt.recordDoneSigner(doneMessage)
 
-			case <-sdc.receiveCtx.Done():
+			case <-receiveCtx.Done():
 				return
 			}
 		}
@@ -161,8 +207,9 @@ func (sdc *signingDoneCheck) signalDone(
 //
 // The returned memberships are the local view of who produced the signature,
 // and the only one this node has. Every done check counted here was
-// authenticated against the wallet's on-chain signing group, bound to this
-// attempt, and carried a signature equal to every other — so a membership in
+// authenticated against the wallet's on-chain signing group, sent by a
+// membership this attempt selected, ended inside this attempt's own protocol
+// window, and carried a signature equal to every other — so a membership in
 // that list contributed to this exact result, and a membership absent from it
 // did not confirm anything about it. That distinction is what a reader
 // otherwise has to take from whichever party wrote the report: a completed
@@ -175,6 +222,8 @@ func (sdc *signingDoneCheck) waitUntilAllDone(ctx context.Context) (
 	error,
 ) {
 	defer sdc.cancelReceiveCtx()
+
+	attempt := sdc.attempt
 
 	ticker := time.NewTicker(signingDoneCheckInterval)
 	defer ticker.Stop()
@@ -192,10 +241,10 @@ func (sdc *signingDoneCheck) waitUntilAllDone(ctx context.Context) (
 				bool,
 				error,
 			) {
-				sdc.doneSignersMutex.Lock()
-				defer sdc.doneSignersMutex.Unlock()
+				attempt.doneSignersMutex.Lock()
+				defer attempt.doneSignersMutex.Unlock()
 
-				if sdc.expectedSignersCount != len(sdc.doneSigners) {
+				if len(attempt.members) != len(attempt.doneSigners) {
 					return nil, nil, 0, false, nil
 				}
 
@@ -204,10 +253,10 @@ func (sdc *signingDoneCheck) waitUntilAllDone(ctx context.Context) (
 				signers := make(
 					participation.MemberIndexes,
 					0,
-					len(sdc.doneSigners),
+					len(attempt.doneSigners),
 				)
 
-				for senderID, doneMessage := range sdc.doneSigners {
+				for senderID, doneMessage := range attempt.doneSigners {
 					if signature == nil {
 						signature = doneMessage.signature
 					} else {
@@ -249,14 +298,15 @@ func (sdc *signingDoneCheck) waitUntilAllDone(ctx context.Context) (
 // isValidDoneMessage validates the given signingDoneMessage in the context
 // of the given signing attempt.
 func (sdc *signingDoneCheck) isValidDoneMessage(
+	attempt *signingDoneAttempt,
 	doneMessage *signingDoneMessage,
 	senderPublicKey []byte,
 	message *big.Int,
 	attemptNumber uint64,
+	attemptStartBlock uint64,
 	attemptTimeoutBlock uint64,
 ) bool {
-	_, signerDone := sdc.doneSigners[doneMessage.senderID]
-	if signerDone {
+	if attempt.isDoneSigner(doneMessage.senderID) {
 		// only one done message allowed
 		return false
 	}
@@ -268,6 +318,19 @@ func (sdc *signingDoneCheck) isValidDoneMessage(
 		return false
 	}
 
+	// A valid wallet membership is not necessarily one of this attempt's
+	// signers. The members the attempt excluded compute nothing and signal
+	// nothing, so a done message from one of them attests to a transcript that
+	// never existed — and the count check in waitUntilAllDone cannot tell the
+	// difference, because an excluded member's message standing in for a lost
+	// message from a selected one reaches the expected total over the wrong
+	// population. The attempt would then conclude on a signature it never
+	// gathered from its own signers and name a membership that never signed as
+	// having produced it.
+	if !slices.Contains(attempt.members, doneMessage.senderID) {
+		return false
+	}
+
 	if doneMessage.message.Cmp(message) != 0 {
 		return false
 	}
@@ -276,7 +339,16 @@ func (sdc *signingDoneCheck) isValidDoneMessage(
 		return false
 	}
 
-	if doneMessage.endBlock > attemptTimeoutBlock {
+	// The end block says when the sender finished computing, and the attempt's
+	// protocol window says when finishing this attempt was possible. The
+	// message and attempt number do not identify an attempt on their own: the
+	// same wallet can be asked to sign the same message again under a later
+	// canonical anchor, and its attempt numbering restarts from zero. A done
+	// message left over from such an earlier run — retransmitted past its own
+	// window, or replayed — describes that run's transcript, and its end block
+	// lies below the block this attempt's protocol started at.
+	if doneMessage.endBlock < attemptStartBlock ||
+		doneMessage.endBlock > attemptTimeoutBlock {
 		return false
 	}
 

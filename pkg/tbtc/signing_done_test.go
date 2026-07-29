@@ -47,6 +47,11 @@ func TestSigningDoneCheck(t *testing.T) {
 
 	message := big.NewInt(100)
 	attemptNumber := uint64(2)
+	// The members below exchange `500 + memberIndex` as their end block, so the
+	// lowest of them sits exactly on the attempt's start block. The window's
+	// lower edge is inclusive: a member that finished the moment the protocol
+	// started did finish inside this attempt.
+	attemptStartBlock := uint64(501)
 	attemptTimeoutBlock := uint64(1000)
 	attemptMemberIndexes := memberIndexes[:groupParameters.HonestThreshold]
 	result := &signing.Result{
@@ -79,6 +84,7 @@ func TestSigningDoneCheck(t *testing.T) {
 				ctx,
 				message,
 				attemptNumber,
+				attemptStartBlock,
 				attemptTimeoutBlock,
 				attemptMemberIndexes,
 			)
@@ -191,6 +197,7 @@ func TestSigningDoneCheck_MissingConfirmation(t *testing.T) {
 
 	message := big.NewInt(100)
 	attemptNumber := uint64(1)
+	attemptStartBlock := uint64(50)
 	attemptTimeoutBlock := uint64(1000)
 	attemptMemberIndexes := memberIndexes[:groupParameters.HonestThreshold]
 	result := &signing.Result{
@@ -205,6 +212,7 @@ func TestSigningDoneCheck_MissingConfirmation(t *testing.T) {
 		ctx,
 		message,
 		attemptNumber,
+		attemptStartBlock,
 		attemptTimeoutBlock,
 		attemptMemberIndexes,
 	)
@@ -257,6 +265,7 @@ func TestSigningDoneCheck_AnotherSignature(t *testing.T) {
 
 	message := big.NewInt(100)
 	attemptNumber := uint64(1)
+	attemptStartBlock := uint64(50)
 	attemptTimeoutBlock := uint64(1000)
 	attemptMemberIndexes := memberIndexes[:groupParameters.HonestThreshold]
 	correctResult := &signing.Result{
@@ -278,6 +287,7 @@ func TestSigningDoneCheck_AnotherSignature(t *testing.T) {
 		ctx,
 		message,
 		attemptNumber,
+		attemptStartBlock,
 		attemptTimeoutBlock,
 		attemptMemberIndexes,
 	)
@@ -328,6 +338,211 @@ func TestSigningDoneCheck_AnotherSignature(t *testing.T) {
 	if !strings.Contains(err.Error(), "not matching signatures detected") {
 		t.Errorf("unexpected error: [%v]", err)
 	}
+}
+
+// TestSigningDoneCheck_SenderOutsideTheAttempt covers a done message from a
+// signing group member the attempt did not select.
+//
+// Such a member computes nothing and signals nothing, so its done message
+// attests to a transcript that never existed. Counting it is not merely
+// untidy bookkeeping: the wait concludes as soon as the number of accepted
+// messages reaches the number of selected members, so one message from an
+// excluded member standing in for a lost message from a selected one both ends
+// the attempt early and names a membership that never signed as having
+// produced the signature. That name then travels into the release evidence as
+// the population behind the result.
+//
+// The case is built to reach exactly that count: two of the three selected
+// members signal, and an excluded member's message would complete the total.
+func TestSigningDoneCheck_SenderOutsideTheAttempt(t *testing.T) {
+	groupParameters := &GroupParameters{
+		GroupSize:       5,
+		GroupQuorum:     4,
+		HonestThreshold: 3,
+	}
+
+	doneCheck := setupSigningDoneCheck(t, groupParameters)
+
+	ctx, cancelCtx := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancelCtx()
+
+	message := big.NewInt(100)
+	attemptNumber := uint64(1)
+	attemptStartBlock := uint64(50)
+	attemptTimeoutBlock := uint64(1000)
+	attemptMemberIndexes := []group.MemberIndex{1, 2, 3}
+	// Members 1 and 2 were selected; member 4 is a valid wallet member the
+	// attempt excluded.
+	signalingMemberIndexes := []group.MemberIndex{1, 2, 4}
+	result := &signing.Result{
+		Signature: &tecdsa.Signature{
+			R:          big.NewInt(200),
+			S:          big.NewInt(300),
+			RecoveryID: 2,
+		},
+	}
+
+	doneCheck.listen(
+		ctx,
+		message,
+		attemptNumber,
+		attemptStartBlock,
+		attemptTimeoutBlock,
+		attemptMemberIndexes,
+	)
+
+	for _, memberIndex := range signalingMemberIndexes {
+		err := doneCheck.signalDone(
+			ctx,
+			memberIndex,
+			message,
+			attemptNumber,
+			result,
+			100,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Give the message handler goroutine time to process all three messages, so
+	// the assertions below are about what the check refused rather than about
+	// what it had not seen yet.
+	time.Sleep(100 * time.Millisecond)
+
+	if !slices.Equal(
+		recordedDoneSigners(doneCheck),
+		participation.MemberIndexes{1, 2},
+	) {
+		t.Errorf(
+			"unexpected accepted done signers\n"+
+				"expected: [%v]\n"+
+				"actual:   [%v]",
+			participation.MemberIndexes{1, 2},
+			recordedDoneSigners(doneCheck),
+		)
+	}
+
+	returnedResult, signers, endBlock, err := doneCheck.waitUntilAllDone(ctx)
+
+	if returnedResult != nil {
+		t.Errorf("expected nil result, has [%v]", returnedResult)
+	}
+	if len(signers) != 0 {
+		t.Errorf("expected no done signers, has [%v]", signers)
+	}
+	testutils.AssertIntsEqual(t, "end block", 0, int(endBlock))
+	testutils.AssertErrorsSame(t, errWaitDoneTimedOut, err)
+}
+
+// TestSigningDoneCheck_DoneChecksFromAnotherRun covers done messages produced by
+// an earlier run of the same message under a different canonical anchor.
+//
+// The message and the attempt number do not identify an attempt: a wallet can be
+// asked to sign the same message again from a later coordination window, and the
+// new run's attempt numbering restarts from zero. Done messages retransmitted
+// past their own window, or replayed, therefore match on both fields while
+// describing the earlier run's transcript — a different set of selected members,
+// reaching a signature over a different sequence of protocol messages. Accepting
+// them would let the release evidence for this attempt be populated by a
+// transcript this attempt had no part in.
+//
+// What separates the two runs is the block window each protocol ran in. The
+// earlier run finished before this one's protocol started, so its end blocks lie
+// below this attempt's start block.
+func TestSigningDoneCheck_DoneChecksFromAnotherRun(t *testing.T) {
+	groupParameters := &GroupParameters{
+		GroupSize:       5,
+		GroupQuorum:     4,
+		HonestThreshold: 3,
+	}
+
+	doneCheck := setupSigningDoneCheck(t, groupParameters)
+
+	ctx, cancelCtx := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancelCtx()
+
+	message := big.NewInt(100)
+	attemptNumber := uint64(1)
+	attemptStartBlock := uint64(900)
+	attemptTimeoutBlock := uint64(930)
+	attemptMemberIndexes := []group.MemberIndex{1, 2, 3}
+	// The end block the earlier run's members finished at, before this attempt's
+	// protocol started.
+	staleEndBlock := uint64(130)
+	result := &signing.Result{
+		Signature: &tecdsa.Signature{
+			R:          big.NewInt(200),
+			S:          big.NewInt(300),
+			RecoveryID: 2,
+		},
+	}
+
+	doneCheck.listen(
+		ctx,
+		message,
+		attemptNumber,
+		attemptStartBlock,
+		attemptTimeoutBlock,
+		attemptMemberIndexes,
+	)
+
+	for _, memberIndex := range attemptMemberIndexes {
+		err := doneCheck.signalDone(
+			ctx,
+			memberIndex,
+			message,
+			attemptNumber,
+			result,
+			staleEndBlock,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	if len(recordedDoneSigners(doneCheck)) != 0 {
+		t.Errorf(
+			"expected no accepted done signers, has [%v]",
+			recordedDoneSigners(doneCheck),
+		)
+	}
+
+	returnedResult, signers, endBlock, err := doneCheck.waitUntilAllDone(ctx)
+
+	if returnedResult != nil {
+		t.Errorf("expected nil result, has [%v]", returnedResult)
+	}
+	if len(signers) != 0 {
+		t.Errorf("expected no done signers, has [%v]", signers)
+	}
+	testutils.AssertIntsEqual(t, "end block", 0, int(endBlock))
+	testutils.AssertErrorsSame(t, errWaitDoneTimedOut, err)
+}
+
+// recordedDoneSigners returns the memberships whose done messages the check
+// accepted for the attempt it is listening for, ascending. A test that is about
+// a refusal reads this so it asserts on a message the check saw and rejected
+// rather than on one that had not arrived yet.
+func recordedDoneSigners(
+	doneCheck *signingDoneCheck,
+) participation.MemberIndexes {
+	doneCheck.attempt.doneSignersMutex.Lock()
+	defer doneCheck.attempt.doneSignersMutex.Unlock()
+
+	signers := make(
+		participation.MemberIndexes,
+		0,
+		len(doneCheck.attempt.doneSigners),
+	)
+	for senderID := range doneCheck.attempt.doneSigners {
+		signers = append(signers, senderID)
+	}
+	slices.Sort(signers)
+
+	return signers
 }
 
 // signingDoneCheckComponents holds the shared state used to construct one or

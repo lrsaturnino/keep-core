@@ -64,6 +64,7 @@ type signingDoneCheckStrategy interface {
 		ctx context.Context,
 		message *big.Int,
 		attemptNumber uint64,
+		attemptStartBlock uint64,
 		attemptTimeoutBlock uint64,
 		attemptMembersIndexes []group.MemberIndex,
 	)
@@ -397,10 +398,16 @@ func (srl *signingRetryLoop) start(
 		// participants have a chance to receive signingDoneMessage.
 		doneCheckTimeoutCtx, _ := withCancelOnBlock(ctx, timeoutBlock, waitForBlockFn)
 
+		// The announcement end block is where this attempt's protocol starts, so
+		// it is the earliest block a member of this attempt can have finished
+		// at. It bounds the done messages from below the way the timeout bounds
+		// them from above, which is what ties them to this attempt rather than
+		// to any run of the same message that carried the same attempt number.
 		srl.doneCheck.listen(
 			doneCheckTimeoutCtx,
 			srl.message,
 			uint64(srl.attemptCounter),
+			announcementEndBlock,
 			timeoutBlock,
 			includedMembersIndexes,
 		)
