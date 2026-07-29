@@ -2719,8 +2719,16 @@ run_local_proof_suite() {
     ./cmd/
   go test -count=1 -race ./cmd/participation-state-audit/
   go test -count=1 -run 'TestDecodeSignerAuditRecord' ./pkg/tbtc/
+  # The inactivity claim lifecycle publishes from one goroutine per controlled
+  # member and shares a call-wide chain subscription and an atomic submission
+  # record between them, so its tests only have teeth under the race detector.
+  # The filter is deliberate rather than a whole-package run: pkg/tbtc carries
+  # race warnings and a load-dependent block counter flake that reproduce at
+  # this branch's merge base, and a gate that is red before the release changes
+  # anything cannot report on them. Everything outside this filter is covered
+  # by the ordinary suite and by CI's scheduled whole-tree race job.
   go test -count=1 -race -timeout 900s -v \
-    -run 'Cutover|HandleAnnouncerSessionMismatch' \
+    -run 'Cutover|HandleAnnouncerSessionMismatch|InactivityClaim|SubmitClaim' \
     ./pkg/tbtc/
   # The integration-tagged test files are not compiled by the ordinary
   # suite; type-check them so a signature drift cannot hide behind the

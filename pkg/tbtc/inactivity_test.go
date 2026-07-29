@@ -1224,6 +1224,39 @@ func TestSubmitClaim_AnotherMemberSubmitsClaim(t *testing.T) {
 		},
 	)
 
+	// The second member has to be parked in its submission delay when the
+	// first member submits, otherwise both submit and the wallet's nonce
+	// advances twice. Holding its wait open until the first member is done is
+	// what makes that ordering the test's own rather than the block counter's:
+	// the delay is two blocks wide, so any wall-clock pause races it.
+	secondMemberWaiting := make(chan struct{})
+	releaseSecondMember := make(chan struct{})
+	var waitMutex sync.Mutex
+	waits := 0
+
+	waitForBlock := inactivityClaimSubmitter.waitForBlockFn
+	inactivityClaimSubmitter.waitForBlockFn = func(
+		ctx context.Context,
+		block uint64,
+	) error {
+		waitMutex.Lock()
+		waits++
+		held := waits == 1
+		waitMutex.Unlock()
+
+		// The second member's goroutine is the only one running until its
+		// wait is observed, so the first wait to arrive is always its own.
+		if held {
+			close(secondMemberWaiting)
+			select {
+			case <-releaseSecondMember:
+			case <-ctx.Done():
+			}
+		}
+
+		return waitForBlock(ctx, block)
+	}
+
 	secondMemberSubmissionChannel := make(chan error)
 	// Attempt to submit claim for the second member on a separate goroutine.
 	go func() {
@@ -1237,10 +1270,7 @@ func TestSubmitClaim_AnotherMemberSubmitsClaim(t *testing.T) {
 		secondMemberSubmissionChannel <- secondMemberErr
 	}()
 
-	// This sleep is needed to give enough time for the second member to
-	// register their claim submission event handler and act properly on the
-	// claim submitted by the first member.
-	time.Sleep(1 * time.Second)
+	<-secondMemberWaiting
 
 	// While the second member is waiting for submission eligibility, submit the
 	// claim with the first member.
@@ -1251,6 +1281,7 @@ func TestSubmitClaim_AnotherMemberSubmitsClaim(t *testing.T) {
 		claim,
 		signatures,
 	)
+	close(releaseSecondMember)
 	if firstMemberErr != nil {
 		t.Fatal(firstMemberErr)
 	}
