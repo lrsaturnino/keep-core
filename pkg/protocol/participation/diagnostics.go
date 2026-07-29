@@ -92,6 +92,18 @@ func RegisterDiagnosticSources(
 			}
 
 			snapshot := gate.State()
+			// The permits themselves, and not only how many there are. A
+			// count answers "this node holds two legacy ceremonies" and
+			// nothing more, so an observer watching work cross the cutover
+			// has to fall back on comparing fleet-wide totals — which any
+			// two unrelated ceremonies moving in step will satisfy. The
+			// identities let it name the permit that crossed instead. The
+			// fields are the same stable public identities the quiescence
+			// record carries; no key material or protocol input is exposed.
+			permits := snapshot.ActivePermits
+			if permits == nil {
+				permits = []PermitSnapshot{}
+			}
 			bytes, err := json.Marshal(map[string]interface{}{
 				"protocol_epoch":                CompiledEpoch.String(),
 				"ethereum_chain_id":             chainID.String(),
@@ -105,6 +117,7 @@ func RegisterDiagnosticSources(
 				"active_ceremonies":             snapshot.ActiveCeremonies,
 				"active_legacy_ceremonies":      snapshot.ActiveLegacyCeremonies,
 				"active_security_v2_ceremonies": snapshot.ActiveSecurityV2Ceremonies,
+				"active_permits":                permits,
 			})
 			if err != nil {
 				diagnosticsLogger.Errorf(

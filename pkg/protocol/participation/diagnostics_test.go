@@ -5,6 +5,7 @@ import (
 	"math/big"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -243,7 +244,13 @@ func TestRegisterDiagnosticSources_EmitsGateStateContract(t *testing.T) {
 
 	// Hold one live security-v2 permit so the active counters describe real
 	// gate state rather than an idle zero that any broken payload would match.
-	permit, err := gate.Begin(TBTCSigning, 1100)
+	// It is identity-bound because the emitted permit list is only useful to an
+	// observer if it names the work each permit was issued for.
+	permit, err := gate.Begin(
+		TBTCSigning,
+		1100,
+		PermitIdentity{WorkID: strings.Repeat("a", 64), PermitID: "1"},
+	)
 	if err != nil {
 		t.Fatalf("failed to begin a ceremony: [%v]", err)
 	}
@@ -265,6 +272,16 @@ func TestRegisterDiagnosticSources_EmitsGateStateContract(t *testing.T) {
 		"active_ceremonies":             float64(snapshot.ActiveCeremonies),
 		"active_legacy_ceremonies":      float64(snapshot.ActiveLegacyCeremonies),
 		"active_security_v2_ceremonies": float64(snapshot.ActiveSecurityV2Ceremonies),
+		"active_permits": []interface{}{
+			map[string]interface{}{
+				"ceremony":              string(TBTCSigning),
+				"mode":                  ModeSecurityV2.String(),
+				"canonical_start_block": float64(1100),
+				"work_id":               strings.Repeat("a", 64),
+				"permit_id":             "1",
+				"identity_bound":        true,
+			},
+		},
 	}
 
 	if !reflect.DeepEqual(decoded, expected) {
@@ -300,6 +317,134 @@ func TestRegisterDiagnosticSources_EmitsGateStateContract(t *testing.T) {
 			"unexpected current block\nactual:   %v\nexpected: %v",
 			current,
 			float64(1300),
+		)
+	}
+}
+
+// The emitted permit list is what lets an observer name the work a node is
+// holding rather than compare fleet-wide totals, and totals are precisely what
+// cannot distinguish two permits on opposite sides of the cutover from any
+// other pair.
+func TestRegisterDiagnosticSources_NamesEachHeldPermit(t *testing.T) {
+	gate, _, _ := newTestGate(
+		t,
+		Schedule{CutoverBlock: 1000},
+		1200,
+		inertPollInterval,
+	)
+	roster, _, _ := newTestRoster(t, 1200, 100)
+	registry := newRecordingRegistry()
+
+	RegisterDiagnosticSources(
+		registry,
+		gate,
+		roster,
+		&stubChainIdentity{chainID: big.NewInt(1)},
+		"release_baked",
+	)
+
+	// An idle gate emits an empty array rather than a null. A scrape that
+	// cannot tell "this node holds nothing" from "this build has no such
+	// field" would read a missing contract as an idle node.
+	idle := registry.scrape(t, DiagnosticsSourceProtocolParticipation)
+	held, ok := idle["active_permits"].([]interface{})
+	if !ok || len(held) != 0 {
+		t.Fatalf(
+			"unexpected idle permit list\nactual:   %#v\nexpected: []",
+			idle["active_permits"],
+		)
+	}
+
+	legacyWorkID := strings.Repeat("b", 64)
+	securityWorkID := strings.Repeat("c", 64)
+
+	// One permit anchored below the cutover and one above it, held at the same
+	// time. Their count is what any other pair of permits would produce; only
+	// the identities say which side of C each one was issued on.
+	legacy, err := gate.Begin(
+		TBTCSigning,
+		900,
+		PermitIdentity{WorkID: legacyWorkID, PermitID: "1"},
+	)
+	if err != nil {
+		t.Fatalf("failed to begin the legacy-anchored ceremony: [%v]", err)
+	}
+	defer legacy.Close()
+
+	securityV2, err := gate.Begin(
+		BeaconDKG,
+		1100,
+		PermitIdentity{WorkID: securityWorkID, PermitID: "2"},
+	)
+	if err != nil {
+		t.Fatalf("failed to begin the security-v2 ceremony: [%v]", err)
+	}
+	defer securityV2.Close()
+
+	decoded := registry.scrape(t, DiagnosticsSourceProtocolParticipation)
+	emitted, ok := decoded["active_permits"].([]interface{})
+	if !ok || len(emitted) != 2 {
+		t.Fatalf(
+			"unexpected permit list\nactual:   %#v\nexpected: 2 permits",
+			decoded["active_permits"],
+		)
+	}
+
+	modes := make(map[string]string, len(emitted))
+	anchors := make(map[string]float64, len(emitted))
+	for _, entry := range emitted {
+		permit, ok := entry.(map[string]interface{})
+		if !ok {
+			t.Fatalf("unexpected permit entry: %#v", entry)
+		}
+		workID, _ := permit["work_id"].(string)
+		modes[workID], _ = permit["mode"].(string)
+		anchors[workID], _ = permit["canonical_start_block"].(float64)
+	}
+
+	expectedModes := map[string]string{
+		legacyWorkID:   ModeLegacy.String(),
+		securityWorkID: ModeSecurityV2.String(),
+	}
+	if !reflect.DeepEqual(modes, expectedModes) {
+		t.Errorf(
+			"unexpected permit modes\nactual:   %v\nexpected: %v",
+			modes,
+			expectedModes,
+		)
+	}
+
+	expectedAnchors := map[string]float64{
+		legacyWorkID:   float64(900),
+		securityWorkID: float64(1100),
+	}
+	if !reflect.DeepEqual(anchors, expectedAnchors) {
+		t.Errorf(
+			"unexpected permit anchors\nactual:   %v\nexpected: %v",
+			anchors,
+			expectedAnchors,
+		)
+	}
+
+	// A closed permit leaves the list, so an observer reading it after the
+	// crossing sees what is still held rather than everything ever issued.
+	legacy.Close()
+
+	after := registry.scrape(t, DiagnosticsSourceProtocolParticipation)
+	remaining, ok := after["active_permits"].([]interface{})
+	if !ok || len(remaining) != 1 {
+		t.Fatalf(
+			"unexpected permit list after close\nactual:   %#v\n"+
+				"expected: 1 permit",
+			after["active_permits"],
+		)
+	}
+	if permit, ok := remaining[0].(map[string]interface{}); !ok ||
+		permit["work_id"] != securityWorkID {
+		t.Errorf(
+			"unexpected surviving permit\nactual:   %#v\nexpected: %v",
+			remaining[0],
+			securityWorkID,
 		)
 	}
 }
