@@ -24,6 +24,13 @@
 # would hand a release a refuted gate as a satisfied one. The rehearsal
 # ledger is driven to the same verdicts through the real emitter.
 #
+# One case is about the single-release stage's sequencing rather than its
+# records: the legacy quiescence control drains a permit seeded before C, and
+# three earlier controls in the same stage cancel every permit on the node they
+# act on. That case walks the stage's own control order and requires the seeded
+# permit to reach its drain, because a collision there produces a blocked step
+# that reads like a broken work driver rather than the misallocation it is.
+#
 # The receipt lifecycle is proved through stage_local_proofs itself and not
 # only through the invalidation function: the last cases give a reused
 # evidence directory a valid inherited receipt, fail the stage's proof seam,
@@ -4730,6 +4737,144 @@ else
   PASS=$((PASS + 1))
 fi
 rm -f "${WORK}/repo/untracked-during-rehearsal"
+
+# ----------------------------------------------------------------------------
+#
+# The single-release stage's node allocation. This is a sequencing property
+# rather than a validation one, and it is the kind that cannot be caught by
+# reading any single step: the permit step 8's legacy half drains is put on the
+# chain before C, and three earlier controls in the same stage — the restart,
+# the severed chain endpoint, and the security-v2 stop — destroy every permit
+# the node they act on is holding. Aiming any of them at the seeded node does
+# not fail loudly. The drain simply finds nothing and blocks for a reason that
+# reads like a broken work driver, so the whole gate reports an instrument
+# problem instead of the collision that caused it.
+#
+# The order below is read out of the stage's own body rather than restated
+# here, so a reallocation in the stage is what this case decides on.
+
+single_release_control_order() {
+  declare -f stage_single_release | awk '
+    function role(  found) {
+      found = match($0, /SINGLE_RELEASE_[A-Z_]+/)
+      return found ? substr($0, RSTART, RLENGTH) : "UNRESOLVED"
+    }
+    /seed_legacy_quiescence_work "\$\{/          { print "seed " role(); next }
+    /local restarted="\$\{/                      { print "destroy-restart " role(); next }
+    /local clock_node="\$\{/                     { print "destroy-sever " role(); next }
+    /run_quiescence_control "\$\{.*in-flight security-v2 permit"/ {
+      print "destroy-stop " role(); next
+    }
+    /run_quiescence_control "\$\{.*in-flight legacy permit"/ {
+      print "drain " role(); next
+    }
+  '
+}
+
+pass_case() {
+  printf 'ok   %s\n' "$1"
+  PASS=$((PASS + 1))
+}
+
+fail_case() {
+  printf 'FAIL %s\n' "$1"
+  [[ -n "${2:-}" ]] && printf -- '--- detail ---\n%s\n--------------\n' "$2"
+  FAILED=$((FAILED + 1))
+}
+
+if assign_single_release_nodes; then
+  pass_case "the rehearsal fleet can carry the single-release controls"
+else
+  fail_case "the rehearsal fleet can carry the single-release controls" \
+    "roster [${REHEARSAL_R1_SERVICES[*]:-empty}]"
+fi
+
+# A fleet that cannot separate the two roles must block the stage rather than
+# run it with both roles on one node, which is the collision itself.
+SAVED_R1_SERVICES=("${REHEARSAL_R1_SERVICES[@]}")
+REHEARSAL_R1_SERVICES=("r1-node-1")
+if assign_single_release_nodes; then
+  fail_case "a one-node fleet is refused the single-release controls"
+else
+  pass_case "a one-node fleet is refused the single-release controls"
+fi
+REHEARSAL_R1_SERVICES=("r1-node-1" "r1-node-1")
+if assign_single_release_nodes; then
+  fail_case "a fleet naming one node twice is refused the controls"
+else
+  pass_case "a fleet naming one node twice is refused the controls"
+fi
+REHEARSAL_R1_SERVICES=("${SAVED_R1_SERVICES[@]}")
+assign_single_release_nodes
+
+CONTROL_ORDER="$(single_release_control_order)"
+
+# Every control the sequence turns on has to be present and resolved. A site
+# that went back to naming a service directly drops out of the extraction
+# entirely, which would otherwise read as a stage that never touches the node.
+EXPECTED_CONTROLS="destroy-restart destroy-sever destroy-stop drain seed"
+SEEN_CONTROLS="$(printf '%s\n' "${CONTROL_ORDER}" | awk 'NF {print $1}' |
+  LC_ALL=C sort -u | tr '\n' ' ')"
+SEEN_CONTROLS="${SEEN_CONTROLS% }"
+if [[ "${SEEN_CONTROLS}" == "${EXPECTED_CONTROLS}" ]]; then
+  pass_case "every single-release control names its node through a role"
+else
+  fail_case "every single-release control names its node through a role" \
+    "found [${SEEN_CONTROLS}], want [${EXPECTED_CONTROLS}]"
+fi
+if printf '%s\n' "${CONTROL_ORDER}" | grep -q 'UNRESOLVED'; then
+  fail_case "no single-release control names an unresolvable node" \
+    "${CONTROL_ORDER}"
+else
+  pass_case "no single-release control names an unresolvable node"
+fi
+
+# The stage walked in the order it runs, carrying the one permit the sequence
+# is about: seeded below C on one node, and required to still be there when
+# that node is told to drain.
+SEEDED_NODE=""
+SEEDED_LOST_TO=""
+DRAIN_REACHED=0
+DRAIN_HELD_SEED=0
+while read -r control role; do
+  [[ -n "${control}" ]] || continue
+  node="${!role:-}"
+  case "${control}" in
+  seed)
+    SEEDED_NODE="${node}"
+    ;;
+  destroy-*)
+    if [[ -n "${SEEDED_NODE}" && "${node}" == "${SEEDED_NODE}" ]]; then
+      SEEDED_LOST_TO="${control} on ${node}"
+    fi
+    ;;
+  drain)
+    DRAIN_REACHED=1
+    if [[ -n "${SEEDED_NODE}" && "${node}" == "${SEEDED_NODE}" &&
+      -z "${SEEDED_LOST_TO}" ]]; then
+      DRAIN_HELD_SEED=1
+    fi
+    ;;
+  esac
+done <<<"${CONTROL_ORDER}"
+
+if [[ -z "${SEEDED_NODE}" ]]; then
+  fail_case "the stage seeds a legacy permit before it crosses C" \
+    "${CONTROL_ORDER}"
+elif ((DRAIN_REACHED == 0)); then
+  fail_case "the stage reaches the legacy drain" "${CONTROL_ORDER}"
+elif [[ -n "${SEEDED_LOST_TO}" ]]; then
+  fail_case "the seeded legacy permit survives every control before its drain" \
+    "seeded on ${SEEDED_NODE}, canceled by ${SEEDED_LOST_TO}
+${CONTROL_ORDER}"
+elif ((DRAIN_HELD_SEED == 0)); then
+  fail_case "the legacy drain runs on the node the permit was seeded on" \
+    "seeded on ${SEEDED_NODE}
+${CONTROL_ORDER}"
+else
+  pass_case "the seeded legacy permit reaches its drain on the node it was \
+seeded on, through every intervening control"
+fi
 
 # ----------------------------------------------------------------------------
 

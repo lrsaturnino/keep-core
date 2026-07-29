@@ -6188,6 +6188,11 @@ CLOCK_REFUSAL_ATTEMPTED=0
 # standing still, so the record has to tell them apart.
 CLOCK_OFFER_FAILED=0
 CLOCK_OFFER_RC=""
+# What the gate reported once its chain endpoint came back. The clock-failure
+# node is also the one the security-v2 quiescence half drains, so whether the
+# gate recovered decides whether that step has a subject at all; it is observed
+# here rather than inferred there from an empty drain.
+CLOCK_RECOVERED_STATE=""
 
 # The verdict those observations imply, with no fleet interaction of its own,
 # so the decision can be exercised directly against constructed readings.
@@ -7934,9 +7939,45 @@ the crossing and was allowed to finish"
   fi
 }
 
+# Which R1 node plays which part in the single-release stage.
+#
+# Three of this stage's controls destroy every permit the node they act on is
+# holding: the restart in step 4, the severed chain endpoint in step 7, and the
+# stop in step 8's security-v2 half. Step 8's legacy half is the one control
+# whose subject is a permit put on the chain before C and required to still be
+# held when its node is told to stop, so it has to run on a node none of those
+# three touched. That is the whole allocation: one node stays untouched from
+# before the crossing until its drain, and the other absorbs everything
+# destructive, in the order the steps run.
+#
+# The collision does not fail loudly if it is reintroduced — the seeded permit
+# is simply gone by the time the drain looks for it and the step blocks with a
+# reason that reads like a broken work driver — so the allocation is derived in
+# one place and checked rather than repeated at four call sites.
+SINGLE_RELEASE_LEGACY_NODE=""
+SINGLE_RELEASE_VOLATILE_NODE=""
+
+assign_single_release_nodes() {
+  SINGLE_RELEASE_LEGACY_NODE="${REHEARSAL_R1_SERVICES[0]:-}"
+  SINGLE_RELEASE_VOLATILE_NODE="${REHEARSAL_R1_SERVICES[1]:-}"
+
+  [[ -n "${SINGLE_RELEASE_LEGACY_NODE}" ]] || return 1
+  [[ -n "${SINGLE_RELEASE_VOLATILE_NODE}" ]] || return 1
+  [[ "${SINGLE_RELEASE_LEGACY_NODE}" != "${SINGLE_RELEASE_VOLATILE_NODE}" ]]
+}
+
 stage_single_release() {
   REHEARSAL_GATE="single_release"
   stage_preflight
+
+  if ! assign_single_release_nodes; then
+    begin_step "the fleet can carry the single-release controls"
+    block_step "the fleet can carry the single-release controls" "the R1 \
+fleet is [${REHEARSAL_R1_SERVICES[*]:-empty}]; this stage needs one node it \
+never restarts, severs, or stops before the legacy drain and a second one to \
+absorb those controls, so it cannot be run as configured"
+    return 0
+  fi
   fleet_up "${REHEARSAL_PRIOR_SERVICE}" "${REHEARSAL_R1_SERVICES[@]}"
   verify_running_images "${R1_IMAGE_DIGEST}" "${REHEARSAL_R1_SERVICES[@]}"
   verify_running_images "${PRIOR_IMAGE_DIGEST}" "${REHEARSAL_PRIOR_SERVICE}"
@@ -7973,7 +8014,7 @@ stage_single_release() {
   # its subject has to still be held when the node is told to stop, long after
   # the crossing. Seeding it here is what makes it a permit the gate issued on
   # the legacy side of C rather than one a driver says it anchored there.
-  seed_legacy_quiescence_work "${REHEARSAL_R1_SERVICES[0]}"
+  seed_legacy_quiescence_work "${SINGLE_RELEASE_LEGACY_NODE}"
 
   # Step 3. The crossing itself is observable without any legacy work: the
   # gate re-reads the chain and flips the state it reports, and it must do so
@@ -8059,7 +8100,7 @@ open_security_v2 within an hour of it"
   # Step 4. Mode must come from the canonical anchor and the current chain, so
   # a node that lost its process state entirely must land on the same answer.
   begin_step "restart across C derives mode from the chain, not from process state"
-  local restarted="${REHEARSAL_R1_SERVICES[1]}"
+  local restarted="${SINGLE_RELEASE_VOLATILE_NODE}"
   compose restart "${restarted}"
   local deadline=$((SECONDS + 600))
   until node_reachable "${restarted}"; do
@@ -8231,7 +8272,7 @@ network"
   # refuses new work and cancels what it holds rather than guessing a side of
   # C.
   begin_step "clock failure quarantines work rather than guessing a mode"
-  local clock_node="${REHEARSAL_R1_SERVICES[0]}"
+  local clock_node="${SINGLE_RELEASE_VOLATILE_NODE}"
 
   # The contract has two halves — refuse new work, and cancel what is already
   # held — and the second one needs something held. A node that was idle when
@@ -8304,6 +8345,23 @@ network"
   docker network connect "$(compose_project)_chain-egress" \
     "$(compose ps --quiet "${clock_node}")"
 
+  # A clock failure has to be recoverable, not merely survivable, and this
+  # stage depends on that concretely: the security-v2 quiescence half below
+  # drains this same node. Waiting for its gate to name a side of C again is
+  # what makes that next step's subject a working gate instead of a hopeful
+  # one, and the reading is kept so the step can say so rather than blame the
+  # drain for a node that never came back.
+  CLOCK_RECOVERED_STATE=""
+  deadline=$((SECONDS + 300))
+  while :; do
+    CLOCK_RECOVERED_STATE="$(participation_field "${clock_node}" gate_state \
+      2>/dev/null || true)"
+    [[ "${CLOCK_RECOVERED_STATE}" == "open_security_v2" ]] && break
+    ((SECONDS >= deadline)) && break
+    sleep 5
+  done
+  observe_gate_gauges "${clock_node}"
+
   clock_failure_verdict
 
   # Step 8. Quiescence must hold both an in-flight legacy permit and an
@@ -8311,11 +8369,25 @@ network"
   # different permit population, on a different node: the security-v2 half
   # stops the node it drains, so the legacy half cannot be asked of it.
   begin_step "quiescence with an in-flight security-v2 permit"
-  run_quiescence_control "${REHEARSAL_R1_SERVICES[1]}" \
-    "quiescence with an in-flight security-v2 permit" \
-    "graceful quiescence starts no new work and lets held permits finish" \
-    security-v2 active_security_v2_ceremonies \
-    participation_mode_security_v2_total quiesce
+  if [[ "${CLOCK_RECOVERED_STATE}" != "open_security_v2" ]]; then
+    # The node this half drains is the one the clock-failure step severed. A
+    # gate still reporting clock_unavailable refuses everything, so a drain
+    # observed on it would show an empty node and read as a clean quiescence.
+    block_step "quiescence with an in-flight security-v2 permit" \
+      "${SINGLE_RELEASE_VOLATILE_NODE} reported \
+[${CLOCK_RECOVERED_STATE:-unreadable}] rather than open_security_v2 after its \
+chain endpoint was restored; a gate that has not recovered refuses work for \
+that reason and its drain says nothing about quiescence"
+    record_assertion \
+      "graceful quiescence starts no new work and lets held permits finish" \
+      false "quiescence with an in-flight security-v2 permit"
+  else
+    run_quiescence_control "${SINGLE_RELEASE_VOLATILE_NODE}" \
+      "quiescence with an in-flight security-v2 permit" \
+      "graceful quiescence starts no new work and lets held permits finish" \
+      security-v2 active_security_v2_ceremonies \
+      participation_mode_security_v2_total quiesce
+  fi
 
   # The legacy half needs a permit anchored below C still in flight after it,
   # which the gate issues on the anchor rather than on the current height. This
@@ -8323,10 +8395,10 @@ network"
   # and observed in the issuing gate while the fleet was still on the legacy
   # side; the control reads the anchors it was handed and refuses to decide
   # when they are not legacy-anchored, rather than taking the phase name for
-  # the permit's mode. The node is the one the clock-failure step severed and
-  # reconnected; the other one is stopped.
+  # the permit's mode. The node is the one nothing in this stage has restarted,
+  # severed, or stopped, which is why the seeded permit is still there to drain.
   begin_step "quiescence with an in-flight legacy permit"
-  run_quiescence_control "${REHEARSAL_R1_SERVICES[0]}" \
+  run_quiescence_control "${SINGLE_RELEASE_LEGACY_NODE}" \
     "quiescence with an in-flight legacy permit" \
     "" legacy active_legacy_ceremonies \
     participation_mode_legacy_total quiesce-legacy "${QUIESCE_SEEDED_WORK}"
