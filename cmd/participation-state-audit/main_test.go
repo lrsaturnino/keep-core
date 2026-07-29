@@ -252,13 +252,15 @@ func testTerminalOutcomeRecord(
 		switch snapshot.Ceremony {
 		case participation.TBTCDKG:
 			evidence = participation.TerminalEvidence{
-				Kind:      participation.TerminalEvidencePersistedTBTCSinger,
-				Reference: "test-tbtc-signer",
+				Kind:            participation.TerminalEvidencePersistedTBTCSinger,
+				Reference:       "test-tbtc-signer",
+				MembershipIndex: group.MemberIndex(1),
 			}
 		case participation.BeaconDKG:
 			evidence = participation.TerminalEvidence{
-				Kind:      participation.TerminalEvidencePersistedBeaconSigner,
-				Reference: beaconSignerReference,
+				Kind:            participation.TerminalEvidencePersistedBeaconSigner,
+				Reference:       beaconSignerReference,
+				MembershipIndex: group.MemberIndex(1),
 			}
 		}
 	case participation.TerminalOutcomeQuarantined:
@@ -2181,6 +2183,168 @@ func TestRunAudit_NodeCompletedDKGRequiresPersistedSigner(t *testing.T) {
 			auditManifest.Findings,
 		)
 	}
+}
+
+func TestValidateNodeTerminalOutcomes_DKGCompletionIsMembershipExact(
+	t *testing.T,
+) {
+	capturedAt := time.Now().UTC().Add(-time.Minute)
+	workID := strings.Repeat("d", 64)
+	permits := []participation.PermitSnapshot{
+		{
+			Ceremony:            participation.TBTCDKG,
+			Mode:                participation.ModeSecurityV2.String(),
+			CanonicalStartBlock: 1_000,
+			WorkID:              workID,
+			PermitID:            "1",
+			IdentityBound:       true,
+		},
+		{
+			Ceremony:            participation.TBTCDKG,
+			Mode:                participation.ModeSecurityV2.String(),
+			CanonicalStartBlock: 1_000,
+			WorkID:              workID,
+			PermitID:            "2",
+			IdentityBound:       true,
+		},
+	}
+
+	newManifest := func(
+		secondReference string,
+		secondMembership group.MemberIndex,
+	) *manifest {
+		return &manifest{
+			QuiescenceSnapshot: &participation.QuiescenceSnapshot{
+				CapturedAt:    capturedAt,
+				ActivePermits: permits,
+			},
+			ParticipationTerminalOutcomes: &participation.TerminalOutcomeJournal{
+				SchemaVersion:      participation.TerminalOutcomeJournalSchemaVersion,
+				SnapshotCapturedAt: capturedAt,
+				Outcomes: []participation.TerminalOutcomeRecord{
+					{
+						RecordedAt: time.Now().UTC(),
+						Permit:     permits[0],
+						Outcome:    participation.TerminalOutcomeCompleted,
+						Evidence: participation.TerminalEvidence{
+							Kind:            participation.TerminalEvidencePersistedTBTCSinger,
+							Reference:       "wallet-storage-key",
+							MembershipIndex: group.MemberIndex(1),
+						},
+					},
+					{
+						RecordedAt: time.Now().UTC(),
+						Permit:     permits[1],
+						Outcome:    participation.TerminalOutcomeCompleted,
+						Evidence: participation.TerminalEvidence{
+							Kind:            participation.TerminalEvidencePersistedTBTCSinger,
+							Reference:       secondReference,
+							MembershipIndex: secondMembership,
+						},
+					},
+				},
+			},
+			TBTCActiveWallets: []tbtcWalletRecord{
+				{
+					WalletStorageKey: "wallet-storage-key",
+					WalletID:         "wallet-id",
+					MemberIndexes:    []uint8{1},
+					SigningGroupSize: 2,
+				},
+			},
+		}
+	}
+
+	tests := map[string]struct {
+		manifest        *manifest
+		expectedFinding string
+	}{
+		"missing second persisted membership": {
+			manifest: newManifest(
+				"wallet-storage-key",
+				group.MemberIndex(2),
+			),
+			expectedFinding: "membership [2], but the active tbtc namespace holds no matching signer",
+		},
+		"one persisted membership reused by two permits": {
+			manifest: newManifest(
+				"wallet-storage-key",
+				group.MemberIndex(1),
+			),
+			expectedFinding: "claim the same persisted signer [wallet-storage-key] membership [1]",
+		},
+		"wallet ID alias cannot replace the signer storage record": {
+			manifest: newManifest(
+				"wallet-id",
+				group.MemberIndex(1),
+			),
+			expectedFinding: "persisted signer [wallet-id] membership [1], but the active tbtc namespace holds no matching signer",
+		},
+	}
+
+	for testName, test := range tests {
+		t.Run(testName, func(t *testing.T) {
+			violations := validateNodeTerminalOutcomes(test.manifest)
+			for _, violation := range violations {
+				if strings.Contains(violation, test.expectedFinding) {
+					return
+				}
+			}
+			t.Fatalf(
+				"expected exact-membership violation containing [%s], got: %v",
+				test.expectedFinding,
+				violations,
+			)
+		})
+	}
+}
+
+func TestValidateNodeTerminalOutcomes_DKGExhaustionNeedsChainProof(
+	t *testing.T,
+) {
+	capturedAt := time.Now().UTC().Add(-time.Minute)
+	permit := participation.PermitSnapshot{
+		Ceremony:            participation.TBTCDKG,
+		Mode:                participation.ModeSecurityV2.String(),
+		CanonicalStartBlock: 1_000,
+		WorkID:              strings.Repeat("d", 64),
+		PermitID:            "1",
+		IdentityBound:       true,
+	}
+	auditManifest := &manifest{
+		QuiescenceSnapshot: &participation.QuiescenceSnapshot{
+			CapturedAt:    capturedAt,
+			ActivePermits: []participation.PermitSnapshot{permit},
+		},
+		ParticipationTerminalOutcomes: &participation.TerminalOutcomeJournal{
+			SchemaVersion:      participation.TerminalOutcomeJournalSchemaVersion,
+			SnapshotCapturedAt: capturedAt,
+			Outcomes: []participation.TerminalOutcomeRecord{
+				{
+					RecordedAt: time.Now().UTC(),
+					Permit:     permit,
+					Outcome:    participation.TerminalOutcomeExhausted,
+					Evidence: participation.TerminalEvidence{
+						Kind: participation.TerminalEvidenceNoThreshold,
+					},
+				},
+			},
+		},
+	}
+
+	violations := validateNodeTerminalOutcomes(auditManifest)
+	for _, violation := range violations {
+		if strings.Contains(
+			violation,
+			"no chain-derived proof that another member did not publish",
+		) {
+			return
+		}
+	}
+	t.Fatalf(
+		"expected unauthenticated DKG exhaustion to be rejected, got: %v",
+		violations,
+	)
 }
 
 func TestRunAudit_NodeCompletedBeaconDKGMatchesPersistedSigner(t *testing.T) {

@@ -30,7 +30,7 @@ const (
 	// TerminalOutcomeJournalSchemaVersion is the schema of the node-authored
 	// terminal-outcome journal. The journal is bound to the gate snapshot's
 	// capture time and covers that snapshot's permit inventory one-to-one.
-	TerminalOutcomeJournalSchemaVersion = uint32(1)
+	TerminalOutcomeJournalSchemaVersion = uint32(2)
 
 	// TerminalOutcomeJournalStorageFile identifies the terminal-outcome
 	// journal beside the immutable gate snapshot. Both records are encrypted
@@ -222,6 +222,12 @@ const (
 type TerminalEvidence struct {
 	Kind      TerminalEvidenceKind `json:"kind"`
 	Reference string               `json:"reference,omitempty"`
+	// MembershipIndex identifies the exact persisted membership produced by
+	// a completed DKG permit. For tBTC this is the final wallet signing-group
+	// index, which may differ from the original DKG permit index after
+	// inactive or disqualified members are removed. For beacon it is the
+	// persisted threshold signer's member index.
+	MembershipIndex group.MemberIndex `json:"membership_index,omitempty"`
 }
 
 // TerminalOutcomeRecord is written by the permit owner after real completion
@@ -290,6 +296,25 @@ func ValidateTerminalOutcome(
 		)
 	}
 
+	dkgSignerEvidence :=
+		evidence.Kind == TerminalEvidencePersistedTBTCSinger ||
+			evidence.Kind == TerminalEvidencePersistedBeaconSigner
+	if dkgSignerEvidence {
+		if evidence.MembershipIndex == 0 ||
+			evidence.MembershipIndex > group.MaxMemberIndex {
+			return fmt.Errorf(
+				"persisted DKG signer evidence requires a membership index "+
+					"from 1 through %d",
+				group.MaxMemberIndex,
+			)
+		}
+	} else if evidence.MembershipIndex != 0 {
+		return fmt.Errorf(
+			"terminal evidence kind [%s] must not carry a membership index",
+			evidence.Kind,
+		)
+	}
+
 	switch outcome {
 	case TerminalOutcomeCompleted:
 		if evidence.Kind == TerminalEvidenceQuarantinedTBTCSinger ||
@@ -324,6 +349,12 @@ func ValidateTerminalOutcome(
 
 	switch ceremony {
 	case TBTCDKG:
+		if outcome == TerminalOutcomeExhausted {
+			return fmt.Errorf(
+				"exhausted tbtc DKG has no chain-derived proof that another " +
+					"member did not publish an accepted result",
+			)
+		}
 		if outcome == TerminalOutcomeCompleted &&
 			evidence.Kind != TerminalEvidencePersistedTBTCSinger {
 			return fmt.Errorf(
@@ -332,6 +363,12 @@ func ValidateTerminalOutcome(
 			)
 		}
 	case BeaconDKG:
+		if outcome == TerminalOutcomeExhausted {
+			return fmt.Errorf(
+				"exhausted beacon DKG has no chain-derived proof that another " +
+					"member did not publish an accepted result",
+			)
+		}
 		if outcome == TerminalOutcomeCompleted &&
 			evidence.Kind != TerminalEvidencePersistedBeaconSigner {
 			return fmt.Errorf(

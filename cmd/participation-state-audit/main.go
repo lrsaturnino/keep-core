@@ -1598,6 +1598,15 @@ type quarantineIdentity struct {
 	permitID            string
 }
 
+// persistedSignerIdentity identifies one exact active membership record. A
+// wallet or beacon group can contain several locally controlled memberships,
+// so the group reference alone cannot corroborate several completed DKG
+// permits independently.
+type persistedSignerIdentity struct {
+	reference       string
+	membershipIndex group.MemberIndex
+}
+
 // cutoverModeViolation applies the release gate's one-value schedule to
 // persisted evidence. It is shared by quiescence records and both quarantine
 // namespaces so completed and interrupted work are judged by the same
@@ -2593,15 +2602,24 @@ func validateNodeTerminalOutcomes(
 		inventory[inventoryIdentity(permit)] = i
 	}
 
-	activeTBTCSigners := make(map[string]struct{})
+	activeTBTCSigners := make(map[persistedSignerIdentity]struct{})
 	for _, wallet := range auditManifest.TBTCActiveWallets {
-		activeTBTCSigners[wallet.WalletStorageKey] = struct{}{}
-		activeTBTCSigners[wallet.WalletID] = struct{}{}
+		for _, memberIndex := range wallet.MemberIndexes {
+			activeTBTCSigners[persistedSignerIdentity{
+				reference:       wallet.WalletStorageKey,
+				membershipIndex: group.MemberIndex(memberIndex),
+			}] = struct{}{}
+		}
 	}
-	activeBeaconSigners := make(map[string]struct{})
+	activeBeaconSigners := make(map[persistedSignerIdentity]struct{})
 	for _, membership := range auditManifest.BeaconActiveMemberships {
-		activeBeaconSigners[membership.GroupPublicKey] = struct{}{}
+		activeBeaconSigners[persistedSignerIdentity{
+			reference:       membership.GroupPublicKey,
+			membershipIndex: group.MemberIndex(membership.MemberIndex),
+		}] = struct{}{}
 	}
+	claimedTBTCSigners := make(map[persistedSignerIdentity]int)
+	claimedBeaconSigners := make(map[persistedSignerIdentity]int)
 	tbtcQuarantined := make(map[quarantineIdentity]struct{})
 	for _, quarantined := range auditManifest.TBTCQuarantinedOutputs {
 		tbtcQuarantined[quarantineIdentity{
@@ -2687,6 +2705,10 @@ func validateNodeTerminalOutcomes(
 		case participation.TerminalOutcomeCompleted:
 			switch outcome.Permit.Ceremony {
 			case participation.TBTCDKG:
+				signerIdentity := persistedSignerIdentity{
+					reference:       outcome.Evidence.Reference,
+					membershipIndex: outcome.Evidence.MembershipIndex,
+				}
 				if outcome.Evidence.Kind !=
 					participation.TerminalEvidencePersistedTBTCSinger {
 					violations = append(violations, fmt.Sprintf(
@@ -2694,17 +2716,34 @@ func validateNodeTerminalOutcomes(
 							"not name persisted tbtc signer evidence",
 						i,
 					))
-				} else if _, ok :=
-					activeTBTCSigners[outcome.Evidence.Reference]; !ok {
+				} else if _, ok := activeTBTCSigners[signerIdentity]; !ok {
 					violations = append(violations, fmt.Sprintf(
 						"node-authored completed tbtc DKG outcome [%d] names "+
-							"persisted signer [%s], but the active tbtc "+
-							"namespace holds no matching signer",
+							"persisted signer [%s] membership [%d], but the "+
+							"active tbtc namespace holds no matching signer",
 						i,
 						outcome.Evidence.Reference,
+						outcome.Evidence.MembershipIndex,
 					))
+				} else if firstOutcome, duplicate :=
+					claimedTBTCSigners[signerIdentity]; duplicate {
+					violations = append(violations, fmt.Sprintf(
+						"node-authored completed tbtc DKG outcomes [%d] and "+
+							"[%d] claim the same persisted signer [%s] "+
+							"membership [%d]",
+						firstOutcome,
+						i,
+						outcome.Evidence.Reference,
+						outcome.Evidence.MembershipIndex,
+					))
+				} else {
+					claimedTBTCSigners[signerIdentity] = i
 				}
 			case participation.BeaconDKG:
+				signerIdentity := persistedSignerIdentity{
+					reference:       outcome.Evidence.Reference,
+					membershipIndex: outcome.Evidence.MembershipIndex,
+				}
 				if outcome.Evidence.Kind !=
 					participation.TerminalEvidencePersistedBeaconSigner {
 					violations = append(violations, fmt.Sprintf(
@@ -2712,14 +2751,44 @@ func validateNodeTerminalOutcomes(
 							"not name persisted beacon signer evidence",
 						i,
 					))
-				} else if _, ok :=
-					activeBeaconSigners[outcome.Evidence.Reference]; !ok {
+				} else if _, ok := activeBeaconSigners[signerIdentity]; !ok {
 					violations = append(violations, fmt.Sprintf(
 						"node-authored completed beacon DKG outcome [%d] names "+
-							"persisted signer [%s], but the active beacon "+
-							"namespace holds no matching signer",
+							"persisted signer [%s] membership [%d], but the "+
+							"active beacon namespace holds no matching signer",
 						i,
 						outcome.Evidence.Reference,
+						outcome.Evidence.MembershipIndex,
+					))
+				} else if firstOutcome, duplicate :=
+					claimedBeaconSigners[signerIdentity]; duplicate {
+					violations = append(violations, fmt.Sprintf(
+						"node-authored completed beacon DKG outcomes [%d] and "+
+							"[%d] claim the same persisted signer [%s] "+
+							"membership [%d]",
+						firstOutcome,
+						i,
+						outcome.Evidence.Reference,
+						outcome.Evidence.MembershipIndex,
+					))
+				} else {
+					claimedBeaconSigners[signerIdentity] = i
+				}
+				permitMemberIndex, err := strconv.ParseUint(
+					outcome.Permit.PermitID,
+					10,
+					8,
+				)
+				if err == nil &&
+					outcome.Evidence.MembershipIndex !=
+						group.MemberIndex(permitMemberIndex) {
+					violations = append(violations, fmt.Sprintf(
+						"node-authored completed beacon DKG outcome [%d] "+
+							"belongs to permit member [%s], but names "+
+							"persisted membership [%d]",
+						i,
+						outcome.Permit.PermitID,
+						outcome.Evidence.MembershipIndex,
 					))
 				}
 			default:

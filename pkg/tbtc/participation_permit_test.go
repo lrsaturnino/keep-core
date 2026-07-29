@@ -68,9 +68,15 @@ type testPermit struct {
 	// refused fence.
 	commitErr error
 
-	mu      sync.Mutex
-	commits []string
-	closed  bool
+	mu               sync.Mutex
+	commits          []string
+	terminalOutcomes []testTerminalOutcome
+	closed           bool
+}
+
+type testTerminalOutcome struct {
+	outcome  participation.TerminalOutcome
+	evidence participation.TerminalEvidence
 }
 
 func newTestPermit(ceremony participation.Ceremony) *testPermit {
@@ -98,9 +104,17 @@ func (tp *testPermit) WorkID() string { return "test-work" }
 func (tp *testPermit) PermitID() string { return "test-permit" }
 
 func (tp *testPermit) RecordTerminalOutcome(
-	participation.TerminalOutcome,
-	participation.TerminalEvidence,
+	outcome participation.TerminalOutcome,
+	evidence participation.TerminalEvidence,
 ) error {
+	tp.mu.Lock()
+	defer tp.mu.Unlock()
+
+	tp.terminalOutcomes = append(
+		tp.terminalOutcomes,
+		testTerminalOutcome{outcome: outcome, evidence: evidence},
+	)
+
 	return nil
 }
 
@@ -124,6 +138,13 @@ func (tp *testPermit) Close() {
 		tp.closed = true
 		tp.cancel(participation.ErrPermitClosed)
 	}
+}
+
+func (tp *testPermit) recordedTerminalOutcomes() []testTerminalOutcome {
+	tp.mu.Lock()
+	defer tp.mu.Unlock()
+
+	return append([]testTerminalOutcome(nil), tp.terminalOutcomes...)
 }
 
 func (tp *testPermit) isClosed() bool {

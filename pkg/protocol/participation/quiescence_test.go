@@ -6,6 +6,8 @@ import (
 	"io/fs"
 	"testing"
 	"time"
+
+	"github.com/keep-network/keep-core/pkg/protocol/group"
 )
 
 type quiescencePersistenceRecorder struct {
@@ -168,5 +170,72 @@ func TestValidateTerminalOutcome_RejectsUnsupportedEvidence(t *testing.T) {
 	)
 	if err == nil {
 		t.Fatal("expected unsupported terminal evidence to be rejected")
+	}
+}
+
+func TestValidateTerminalOutcome_DKGCompletionRequiresExactMembership(
+	t *testing.T,
+) {
+	tests := map[string]struct {
+		ceremony Ceremony
+		kind     TerminalEvidenceKind
+	}{
+		"tbtc": {
+			ceremony: TBTCDKG,
+			kind:     TerminalEvidencePersistedTBTCSinger,
+		},
+		"beacon": {
+			ceremony: BeaconDKG,
+			kind:     TerminalEvidencePersistedBeaconSigner,
+		},
+	}
+
+	for testName, test := range tests {
+		t.Run(testName, func(t *testing.T) {
+			evidence := TerminalEvidence{
+				Kind:      test.kind,
+				Reference: "persisted-signer",
+			}
+			if err := ValidateTerminalOutcome(
+				test.ceremony,
+				TerminalOutcomeCompleted,
+				evidence,
+			); err == nil {
+				t.Fatal(
+					"expected DKG completion without a membership index " +
+						"to be rejected",
+				)
+			}
+
+			evidence.MembershipIndex = group.MemberIndex(7)
+			if err := ValidateTerminalOutcome(
+				test.ceremony,
+				TerminalOutcomeCompleted,
+				evidence,
+			); err != nil {
+				t.Fatalf(
+					"expected exact persisted membership evidence to pass: [%v]",
+					err,
+				)
+			}
+		})
+	}
+}
+
+func TestValidateTerminalOutcome_RejectsUnauthenticatedDKGExhaustion(
+	t *testing.T,
+) {
+	for _, ceremony := range []Ceremony{TBTCDKG, BeaconDKG} {
+		err := ValidateTerminalOutcome(
+			ceremony,
+			TerminalOutcomeExhausted,
+			TerminalEvidence{Kind: TerminalEvidenceNoThreshold},
+		)
+		if err == nil {
+			t.Errorf(
+				"expected local no-threshold marker for [%s] to be rejected",
+				ceremony,
+			)
+		}
 	}
 }

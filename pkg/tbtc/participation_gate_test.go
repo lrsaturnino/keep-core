@@ -744,6 +744,30 @@ func TestDkgExecutor_CompleteDkgCeremony_ActivatesAfterPublication(t *testing.T)
 		0,
 		len(quarantineHandle.saved),
 	)
+
+	terminalOutcomes := permit.recordedTerminalOutcomes()
+	testutils.AssertIntsEqual(
+		t,
+		"terminal outcomes",
+		1,
+		len(terminalOutcomes),
+	)
+	if len(terminalOutcomes) == 1 {
+		if terminalOutcomes[0].outcome !=
+			participation.TerminalOutcomeCompleted {
+			t.Errorf(
+				"unexpected terminal outcome [%s]",
+				terminalOutcomes[0].outcome,
+			)
+		}
+		if terminalOutcomes[0].evidence.MembershipIndex !=
+			group.MemberIndex(1) {
+			t.Errorf(
+				"terminal outcome names membership [%d], expected [1]",
+				terminalOutcomes[0].evidence.MembershipIndex,
+			)
+		}
+	}
 }
 
 // TestDkgExecutor_CompleteDkgCeremony_RegistrationFailureQuarantinesOnly
