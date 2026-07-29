@@ -1706,6 +1706,14 @@ run_audit_case() {
       # shellcheck disable=SC2030,SC2031,SC2034
       PR4109_ROLLBACK_EVIDENCE_GENERATOR="${GENERATOR}"
       # shellcheck disable=SC2030,SC2031,SC2034
+      PR4109_WALLET_REGISTRY_ADDRESS="0x1111111111111111111111111111111111111111"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      PR4109_FINALIZED_ETHEREUM_BLOCK_NUMBER="9001000"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      PR4109_FINALIZED_ETHEREUM_BLOCK_HASH="0x$(printf 'c%.0s' {1..64})"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      PR4109_CHAIN_EVIDENCE_PUBLIC_KEY="$(printf 'd%.0s' {1..64})"
+      # shellcheck disable=SC2030,SC2031,SC2034
       PR4109_BITCOIN_NETWORK="testnet"
       # shellcheck disable=SC2030,SC2031,SC2034
       PR4109_PRIOR_VERSION="v1.9.0"

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -28,6 +29,29 @@ import (
 )
 
 const testPassword = "audit-test-password"
+
+const (
+	testWalletRegistryAddress       = "0x1111111111111111111111111111111111111111"
+	testFinalizedEthereumBlock      = uint64(10_000)
+	testChainEvidencePrivateKeyByte = byte(0x42)
+)
+
+func testCanonicalEthereumBlockHash(block uint64) string {
+	return fmt.Sprintf("0x%064x", block+1)
+}
+
+func testChainEvidencePrivateKey() ed25519.PrivateKey {
+	seed := make([]byte, ed25519.SeedSize)
+	for i := range seed {
+		seed[i] = testChainEvidencePrivateKeyByte
+	}
+	return ed25519.NewKeyFromSeed(seed)
+}
+
+func testChainEvidencePublicKey() string {
+	publicKey := testChainEvidencePrivateKey().Public().(ed25519.PublicKey)
+	return hex.EncodeToString(publicKey)
+}
 
 type auditGateBlockCounter struct {
 	block uint64
@@ -416,11 +440,14 @@ func newValidTBTCDKGResultEvidence(
 	}
 
 	members := make([]uint32, originalGroupSize)
-	signingMemberIndexes := make([]uint16, 0, originalGroupSize)
+	signingMemberIndexes := make([]*big.Int, 0, originalGroupSize)
 	for i := uint16(0); i < originalGroupSize; i++ {
 		members[i] = uint32(10_000 + i)
 		if _, excluded := misbehaved[uint8(i+1)]; !excluded {
-			signingMemberIndexes = append(signingMemberIndexes, i+1)
+			signingMemberIndexes = append(
+				signingMemberIndexes,
+				new(big.Int).SetUint64(uint64(i+1)),
+			)
 		}
 	}
 	if len(signingMemberIndexes) == 0 {
@@ -435,14 +462,14 @@ func newValidTBTCDKGResultEvidence(
 				"0x%064x",
 				(seedTag<<16)+(blockNumber<<2)+logIndex+1,
 			),
-			BlockHash:   fmt.Sprintf("0x%064x", blockNumber+seedTag+1),
+			BlockHash:   testCanonicalEthereumBlockHash(blockNumber),
 			BlockNumber: blockNumber,
 			LogIndex:    logIndex,
 		}
 	}
 
 	chainResult := tbtcDKGChainResultEvidence{
-		SubmitterMemberIndex: signingMemberIndexes[0],
+		SubmitterMemberIndex: uint16(signingMemberIndexes[0].Uint64()),
 		GroupPublicKey: "0x" +
 			"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798" +
 			"483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8",
@@ -505,6 +532,136 @@ func newValidTBTCDKGResultEvidence(
 	return result, strings.TrimPrefix(walletID, "0x"), seedHash
 }
 
+func resignTestChainReconciliationEvidence(
+	t *testing.T,
+	record *chainReconciliationEvidence,
+) {
+	t.Helper()
+
+	record.CollectorAttestation.Signature = ""
+	payload, err := chainReconciliationSignaturePayload(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.CollectorAttestation.Signature = hex.EncodeToString(
+		ed25519.Sign(testChainEvidencePrivateKey(), payload),
+	)
+}
+
+func authenticateTestChainReconciliationEvidence(
+	t *testing.T,
+	record *chainReconciliationEvidence,
+) {
+	t.Helper()
+
+	record.WalletRegistryAddress = testWalletRegistryAddress
+	record.Receipts = nil
+
+	canonicalBlocks := map[uint64]string{
+		testFinalizedEthereumBlock: testCanonicalEthereumBlockHash(
+			testFinalizedEthereumBlock,
+		),
+	}
+	receiptIndexes := make(map[string]int)
+	transactionIndex := uint64(0)
+
+	addEvent := func(
+		name string,
+		event ethereumLogEvidence,
+		result *tbtcDKGResultEvidence,
+	) {
+		t.Helper()
+
+		topics, data, err := expectedTBTCDKGRawLog(name, result)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, topic := range topics {
+			if topic == "" {
+				topics[i] = "0x" + strings.Repeat("0", 24) +
+					strings.TrimPrefix(testWalletRegistryAddress, "0x")
+			}
+		}
+		rawLog := ethereumRawLogEvidence{
+			Address:  testWalletRegistryAddress,
+			Topics:   topics,
+			Data:     data,
+			LogIndex: event.LogIndex,
+		}
+
+		receiptIndex, ok := receiptIndexes[event.TransactionHash]
+		if !ok {
+			receiptIndex = len(record.Receipts)
+			receiptIndexes[event.TransactionHash] = receiptIndex
+			record.Receipts = append(record.Receipts, ethereumReceiptEvidence{
+				TransactionHash:  event.TransactionHash,
+				BlockHash:        event.BlockHash,
+				BlockNumber:      event.BlockNumber,
+				TransactionIndex: transactionIndex,
+				Status:           1,
+			})
+			transactionIndex++
+		}
+		record.Receipts[receiptIndex].Logs = append(
+			record.Receipts[receiptIndex].Logs,
+			rawLog,
+		)
+		canonicalBlocks[event.BlockNumber] = event.BlockHash
+	}
+
+	for _, wallet := range record.Wallets {
+		if wallet.DKGResult == nil {
+			continue
+		}
+		result := wallet.DKGResult
+		addEvent(
+			"DkgStarted",
+			result.Started.ethereumLogEvidence,
+			result,
+		)
+		addEvent(
+			"DkgResultSubmitted",
+			result.Submitted.ethereumLogEvidence,
+			result,
+		)
+		addEvent(
+			"DkgResultApproved",
+			result.Approved.ethereumLogEvidence,
+			result,
+		)
+		addEvent(
+			"WalletCreated",
+			result.WalletCreated.ethereumLogEvidence,
+			result,
+		)
+	}
+
+	blockNumbers := make([]uint64, 0, len(canonicalBlocks))
+	for blockNumber := range canonicalBlocks {
+		blockNumbers = append(blockNumbers, blockNumber)
+	}
+	sort.Slice(blockNumbers, func(i, j int) bool {
+		return blockNumbers[i] < blockNumbers[j]
+	})
+
+	record.CollectorAttestation = ethereumCollectorAttestation{
+		FinalizedBlockNumber: testFinalizedEthereumBlock,
+		FinalizedBlockHash: testCanonicalEthereumBlockHash(
+			testFinalizedEthereumBlock,
+		),
+	}
+	for _, blockNumber := range blockNumbers {
+		record.CollectorAttestation.CanonicalBlocks = append(
+			record.CollectorAttestation.CanonicalBlocks,
+			ethereumCanonicalBlockEvidence{
+				BlockNumber: blockNumber,
+				BlockHash:   canonicalBlocks[blockNumber],
+			},
+		)
+	}
+	resignTestChainReconciliationEvidence(t, record)
+}
+
 func TestComputeTBTCDKGResultHashMatchesGeneratedWalletRegistryABI(
 	t *testing.T,
 ) {
@@ -554,7 +711,7 @@ func TestComputeTBTCDKGResultHashMatchesGeneratedWalletRegistryABI(
 	copy(membersHash[:], membersHashBytes)
 	signingMemberIndexes := make([]*big.Int, len(result.SigningMemberIndexes))
 	for i, memberIndex := range result.SigningMemberIndexes {
-		signingMemberIndexes[i] = new(big.Int).SetUint64(uint64(memberIndex))
+		signingMemberIndexes[i] = new(big.Int).Set(memberIndex)
 	}
 
 	encoded, err := (abi.Arguments{{Type: event.Inputs[2].Type}}).Pack(
@@ -690,6 +847,7 @@ func newValidEvidence(t *testing.T, auditManifest *manifest) evidenceInputs {
 			Registered:     false,
 		})
 	}
+	authenticateTestChainReconciliationEvidence(t, chainRecord)
 
 	bitcoinRecord := &bitcoinReconciliationEvidence{
 		evidenceEnvelope: envelope("bitcoin_reconciliation"),
@@ -766,17 +924,23 @@ func newValidEvidence(t *testing.T, auditManifest *manifest) evidenceInputs {
 // passes unless a test deliberately mismatches it.
 func testExpectedIdentity() expectedIdentityInputs {
 	return expectedIdentityInputs{
-		ethereumChainID:    "1",
-		bitcoinNetwork:     "mainnet",
-		priorVersion:       "v2.0.0",
-		priorRevision:      strings.Repeat("ab", 20),
-		priorImageDigest:   "sha256:" + strings.Repeat("11", 32),
-		releaseVersion:     "v2.1.0",
-		releaseRevision:    strings.Repeat("ef", 20),
-		releaseImageDigest: "sha256:" + strings.Repeat("22", 32),
-		releaseEpoch:       participation.CompiledEpoch.String(),
-		cutoverBlock:       1_000,
-		maxEvidenceAge:     24 * time.Hour,
+		ethereumChainID:              "1",
+		walletRegistryAddress:        testWalletRegistryAddress,
+		finalizedEthereumBlockNumber: testFinalizedEthereumBlock,
+		finalizedEthereumBlockHash: testCanonicalEthereumBlockHash(
+			testFinalizedEthereumBlock,
+		),
+		chainEvidencePublicKey: testChainEvidencePublicKey(),
+		bitcoinNetwork:         "mainnet",
+		priorVersion:           "v2.0.0",
+		priorRevision:          strings.Repeat("ab", 20),
+		priorImageDigest:       "sha256:" + strings.Repeat("11", 32),
+		releaseVersion:         "v2.1.0",
+		releaseRevision:        strings.Repeat("ef", 20),
+		releaseImageDigest:     "sha256:" + strings.Repeat("22", 32),
+		releaseEpoch:           participation.CompiledEpoch.String(),
+		cutoverBlock:           1_000,
+		maxEvidenceAge:         24 * time.Hour,
 	}
 }
 
@@ -2616,8 +2780,14 @@ func TestValidateChainReconciliationEvidence_TBTCDKGPermitLineage(
 		run := &auditRun{
 			manifest: auditManifest,
 			expected: expectedIdentityInputs{
-				ethereumChainID: "1",
-				maxEvidenceAge:  time.Hour,
+				ethereumChainID:              "1",
+				walletRegistryAddress:        testWalletRegistryAddress,
+				finalizedEthereumBlockNumber: testFinalizedEthereumBlock,
+				finalizedEthereumBlockHash: testCanonicalEthereumBlockHash(
+					testFinalizedEthereumBlock,
+				),
+				chainEvidencePublicKey: testChainEvidencePublicKey(),
+				maxEvidenceAge:         time.Hour,
 			},
 		}
 		record := &chainReconciliationEvidence{
@@ -2638,6 +2808,7 @@ func TestValidateChainReconciliationEvidence_TBTCDKGPermitLineage(
 				},
 			},
 		}
+		authenticateTestChainReconciliationEvidence(t, record)
 		return run, record
 	}
 
@@ -2653,6 +2824,142 @@ func TestValidateChainReconciliationEvidence_TBTCDKGPermitLineage(
 		}
 		if violations := run.validateChainReconciliationEvidence(content); len(violations) != 0 {
 			t.Fatalf("expected exact DKG lineage to pass, got: %v", violations)
+		}
+	})
+
+	t.Run("self-consistent lineage from untrusted generator", func(t *testing.T) {
+		run, record := newRunAndRecord(
+			group.MemberIndex(1),
+			group.MemberIndex(2),
+			canonicalSeed,
+		)
+
+		seed := make([]byte, ed25519.SeedSize)
+		for i := range seed {
+			seed[i] = 0x24
+		}
+		untrustedKey := ed25519.NewKeyFromSeed(seed)
+		record.CollectorAttestation.Signature = ""
+		payload, err := chainReconciliationSignaturePayload(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		record.CollectorAttestation.Signature = hex.EncodeToString(
+			ed25519.Sign(untrustedKey, payload),
+		)
+
+		content, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		violations := run.validateChainReconciliationEvidence(content)
+		if !containsSubstring(
+			violations,
+			"not signed by the independently trusted finalized-chain collector",
+		) {
+			t.Fatalf(
+				"expected an unauthenticated-collector violation, got: %v",
+				violations,
+			)
+		}
+	})
+
+	t.Run("correct event bytes from unrelated contract", func(t *testing.T) {
+		run, record := newRunAndRecord(
+			group.MemberIndex(1),
+			group.MemberIndex(2),
+			canonicalSeed,
+		)
+		record.Receipts[0].Logs[0].Address =
+			"0x2222222222222222222222222222222222222222"
+		resignTestChainReconciliationEvidence(t, record)
+
+		content, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		violations := run.validateChainReconciliationEvidence(content)
+		if !containsSubstring(
+			violations,
+			"event was emitted by unrelated contract",
+		) {
+			t.Fatalf(
+				"expected an unrelated-contract violation, got: %v",
+				violations,
+			)
+		}
+	})
+
+	t.Run("failed receipt", func(t *testing.T) {
+		run, record := newRunAndRecord(
+			group.MemberIndex(1),
+			group.MemberIndex(2),
+			canonicalSeed,
+		)
+		record.Receipts[0].Status = 0
+		resignTestChainReconciliationEvidence(t, record)
+
+		content, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		violations := run.validateChainReconciliationEvidence(content)
+		if !containsSubstring(violations, "has failed status [0]") ||
+			!containsSubstring(violations, "belongs to failed receipt") {
+			t.Fatalf(
+				"expected failed-receipt violations, got: %v",
+				violations,
+			)
+		}
+	})
+
+	t.Run("non-canonical receipt block", func(t *testing.T) {
+		run, record := newRunAndRecord(
+			group.MemberIndex(1),
+			group.MemberIndex(2),
+			canonicalSeed,
+		)
+		record.Receipts[0].BlockHash = "0x" + strings.Repeat("f", 64)
+		resignTestChainReconciliationEvidence(t, record)
+
+		content, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		violations := run.validateChainReconciliationEvidence(content)
+		if !containsSubstring(violations, "names non-canonical block hash") {
+			t.Fatalf(
+				"expected a non-canonical-block violation, got: %v",
+				violations,
+			)
+		}
+	})
+
+	t.Run("full-width signing member index is rejected by group bounds", func(t *testing.T) {
+		run, record := newRunAndRecord(
+			group.MemberIndex(1),
+			group.MemberIndex(2),
+			canonicalSeed,
+		)
+		fullWidthIndex := new(big.Int).Lsh(big.NewInt(1), 128)
+		record.Wallets[0].DKGResult.Submitted.Result.
+			SigningMemberIndexes[0] = fullWidthIndex
+
+		content, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		violations := run.validateChainReconciliationEvidence(content)
+		if !containsSubstring(
+			violations,
+			"signing member ["+fullWidthIndex.String()+
+				"] outside original group size",
+		) {
+			t.Fatalf(
+				"expected full-width index to decode then fail group bounds, "+
+					"got: %v",
+				violations,
+			)
 		}
 	})
 

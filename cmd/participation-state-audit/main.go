@@ -38,6 +38,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -58,6 +59,7 @@ import (
 
 	"github.com/keep-network/keep-core/config"
 	"github.com/keep-network/keep-core/pkg/beacon/registry"
+	ecdsaabi "github.com/keep-network/keep-core/pkg/chain/ethereum/ecdsa/gen/abi"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/storage"
@@ -140,7 +142,10 @@ type evidenceRecord struct {
 
 // evidenceSchemaVersion versions the external rollback-evidence record
 // schemas this audit accepts.
-const evidenceSchemaVersion uint32 = 6
+const evidenceSchemaVersion uint32 = 7
+
+const chainReconciliationSignatureDomain = "keep-core/" +
+	"participation-state-audit/chain-reconciliation/v7\x00"
 
 // evidenceFutureSkewAllowance bounds how far in the future an evidence
 // record's generation time may lie relative to this audit before it is a
@@ -171,6 +176,48 @@ type ethereumLogEvidence struct {
 	LogIndex        uint64 `json:"log_index"`
 }
 
+// ethereumRawLogEvidence is the exact log projection returned in an Ethereum
+// transaction receipt. Event summaries below are accepted only when the
+// corresponding authenticated receipt contains byte-identical topics/data
+// emitted by the expected WalletRegistry address.
+type ethereumRawLogEvidence struct {
+	Address  string   `json:"address"`
+	Topics   []string `json:"topics"`
+	Data     string   `json:"data"`
+	LogIndex uint64   `json:"log_index"`
+}
+
+// ethereumReceiptEvidence carries the receipt fields needed to authenticate
+// an event observation. The collector signature authenticates these fields;
+// the audit still independently requires successful status, canonical block
+// membership, exact transaction/block identity, and an exact raw event log.
+type ethereumReceiptEvidence struct {
+	TransactionHash  string                   `json:"transaction_hash"`
+	BlockHash        string                   `json:"block_hash"`
+	BlockNumber      uint64                   `json:"block_number"`
+	TransactionIndex uint64                   `json:"transaction_index"`
+	Status           uint64                   `json:"status"`
+	Logs             []ethereumRawLogEvidence `json:"logs"`
+}
+
+type ethereumCanonicalBlockEvidence struct {
+	BlockNumber uint64 `json:"block_number"`
+	BlockHash   string `json:"block_hash"`
+}
+
+// ethereumCollectorAttestation makes the chain record an authenticated
+// collector artifact instead of a caller-authored decoded summary. Signature
+// is Ed25519 over the domain-separated canonical JSON encoding of the entire
+// chainReconciliationEvidence with this field empty. The trusted public key,
+// expected finalized block, and expected WalletRegistry are independent audit
+// inputs and therefore cannot be selected by the evidence generator.
+type ethereumCollectorAttestation struct {
+	FinalizedBlockNumber uint64                           `json:"finalized_block_number"`
+	FinalizedBlockHash   string                           `json:"finalized_block_hash"`
+	CanonicalBlocks      []ethereumCanonicalBlockEvidence `json:"canonical_blocks"`
+	Signature            string                           `json:"signature"`
+}
+
 // tbtcDKGChainResultEvidence is the complete EcdsaDkg.Result tuple emitted by
 // DkgResultSubmitted. The audit ABI-encodes this tuple exactly as the
 // WalletRegistry contract does and recomputes keccak256(abi.encode(result)).
@@ -178,13 +225,13 @@ type ethereumLogEvidence struct {
 // misbehaviour, members hash, and wallet identity are all derived from these
 // event bytes.
 type tbtcDKGChainResultEvidence struct {
-	SubmitterMemberIndex    uint16   `json:"submitter_member_index"`
-	GroupPublicKey          string   `json:"group_public_key"`
-	MisbehavedMemberIndexes []uint8  `json:"misbehaved_member_indexes"`
-	Signatures              string   `json:"signatures"`
-	SigningMemberIndexes    []uint16 `json:"signing_member_indexes"`
-	Members                 []uint32 `json:"members"`
-	MembersHash             string   `json:"members_hash"`
+	SubmitterMemberIndex    uint16     `json:"submitter_member_index"`
+	GroupPublicKey          string     `json:"group_public_key"`
+	MisbehavedMemberIndexes []uint8    `json:"misbehaved_member_indexes"`
+	Signatures              string     `json:"signatures"`
+	SigningMemberIndexes    []*big.Int `json:"signing_member_indexes"`
+	Members                 []uint32   `json:"members"`
+	MembersHash             string     `json:"members_hash"`
 }
 
 type tbtcDKGStartedEventEvidence struct {
@@ -265,9 +312,12 @@ type tbtcWalletChainEvidence struct {
 type chainReconciliationEvidence struct {
 	evidenceEnvelope
 
-	EthereumChainID string                    `json:"ethereum_chain_id"`
-	Wallets         []tbtcWalletChainEvidence `json:"wallets"`
-	BeaconGroups    []struct {
+	EthereumChainID       string                       `json:"ethereum_chain_id"`
+	WalletRegistryAddress string                       `json:"wallet_registry_address"`
+	Receipts              []ethereumReceiptEvidence    `json:"receipts"`
+	CollectorAttestation  ethereumCollectorAttestation `json:"collector_attestation"`
+	Wallets               []tbtcWalletChainEvidence    `json:"wallets"`
+	BeaconGroups          []struct {
 		GroupPublicKey string `json:"group_public_key"`
 		Registered     bool   `json:"registered"`
 	} `json:"beacon_groups"`
@@ -465,17 +515,21 @@ type manifest struct {
 // expectedIdentityRecord is the manifest's evidence trail of the expected
 // operational identities the audit ran with.
 type expectedIdentityRecord struct {
-	EthereumChainID    string `json:"ethereum_chain_id,omitempty"`
-	BitcoinNetwork     string `json:"bitcoin_network,omitempty"`
-	PriorVersion       string `json:"prior_version,omitempty"`
-	PriorRevision      string `json:"prior_revision,omitempty"`
-	PriorImageDigest   string `json:"prior_image_digest,omitempty"`
-	ReleaseVersion     string `json:"release_version,omitempty"`
-	ReleaseRevision    string `json:"release_revision,omitempty"`
-	ReleaseImageDigest string `json:"release_image_digest,omitempty"`
-	ReleaseEpoch       string `json:"release_epoch,omitempty"`
-	CutoverBlock       uint64 `json:"cutover_block,omitempty"`
-	MaxEvidenceAge     string `json:"max_evidence_age,omitempty"`
+	EthereumChainID              string `json:"ethereum_chain_id,omitempty"`
+	WalletRegistryAddress        string `json:"wallet_registry_address,omitempty"`
+	FinalizedEthereumBlockNumber uint64 `json:"finalized_ethereum_block_number,omitempty"`
+	FinalizedEthereumBlockHash   string `json:"finalized_ethereum_block_hash,omitempty"`
+	ChainEvidencePublicKeySHA256 string `json:"chain_evidence_public_key_sha256,omitempty"`
+	BitcoinNetwork               string `json:"bitcoin_network,omitempty"`
+	PriorVersion                 string `json:"prior_version,omitempty"`
+	PriorRevision                string `json:"prior_revision,omitempty"`
+	PriorImageDigest             string `json:"prior_image_digest,omitempty"`
+	ReleaseVersion               string `json:"release_version,omitempty"`
+	ReleaseRevision              string `json:"release_revision,omitempty"`
+	ReleaseImageDigest           string `json:"release_image_digest,omitempty"`
+	ReleaseEpoch                 string `json:"release_epoch,omitempty"`
+	CutoverBlock                 uint64 `json:"cutover_block,omitempty"`
+	MaxEvidenceAge               string `json:"max_evidence_age,omitempty"`
 }
 
 // evidenceInputs carries the externally produced rollback-evidence references
@@ -495,17 +549,21 @@ type evidenceInputs struct {
 // against the wrong target — or long before the rollback decision — would
 // pass. A missing input is a rollback blocker, not a skipped check.
 type expectedIdentityInputs struct {
-	ethereumChainID    string
-	bitcoinNetwork     string
-	priorVersion       string
-	priorRevision      string
-	priorImageDigest   string
-	releaseVersion     string
-	releaseRevision    string
-	releaseImageDigest string
-	releaseEpoch       string
-	cutoverBlock       uint64
-	maxEvidenceAge     time.Duration
+	ethereumChainID              string
+	walletRegistryAddress        string
+	finalizedEthereumBlockNumber uint64
+	finalizedEthereumBlockHash   string
+	chainEvidencePublicKey       string
+	bitcoinNetwork               string
+	priorVersion                 string
+	priorRevision                string
+	priorImageDigest             string
+	releaseVersion               string
+	releaseRevision              string
+	releaseImageDigest           string
+	releaseEpoch                 string
+	cutoverBlock                 uint64
+	maxEvidenceAge               time.Duration
 }
 
 func main() {
@@ -563,6 +621,34 @@ func main() {
 		"",
 		"the Ethereum chain ID the rollback targets; the chain "+
 			"reconciliation evidence must record exactly this chain",
+	)
+	flag.StringVar(
+		&expected.walletRegistryAddress,
+		"expected-wallet-registry-address",
+		"",
+		"the exact WalletRegistry address whose authenticated receipt logs "+
+			"may establish tBTC DKG settlement",
+	)
+	flag.Uint64Var(
+		&expected.finalizedEthereumBlockNumber,
+		"expected-finalized-ethereum-block-number",
+		0,
+		"the independently obtained finalized Ethereum block number anchoring "+
+			"the chain collector attestation",
+	)
+	flag.StringVar(
+		&expected.finalizedEthereumBlockHash,
+		"expected-finalized-ethereum-block-hash",
+		"",
+		"the independently obtained finalized Ethereum block hash anchoring "+
+			"the chain collector attestation",
+	)
+	flag.StringVar(
+		&expected.chainEvidencePublicKey,
+		"expected-chain-evidence-public-key",
+		"",
+		"the lowercase hexadecimal Ed25519 public key of the independently "+
+			"trusted finalized-chain evidence collector",
 	)
 	flag.StringVar(
 		&expected.bitcoinNetwork,
@@ -733,7 +819,13 @@ func runAudit(
 				RootMode: info.Mode().String(),
 			},
 			ExpectedIdentity: expectedIdentityRecord{
-				EthereumChainID:    expected.ethereumChainID,
+				EthereumChainID:              expected.ethereumChainID,
+				WalletRegistryAddress:        expected.walletRegistryAddress,
+				FinalizedEthereumBlockNumber: expected.finalizedEthereumBlockNumber,
+				FinalizedEthereumBlockHash:   expected.finalizedEthereumBlockHash,
+				ChainEvidencePublicKeySHA256: chainEvidencePublicKeySHA256(
+					expected.chainEvidencePublicKey,
+				),
 				BitcoinNetwork:     expected.bitcoinNetwork,
 				PriorVersion:       expected.priorVersion,
 				PriorRevision:      expected.priorRevision,
@@ -1059,26 +1151,46 @@ func decodeCanonicalEthereumDynamicBytes(value string) ([]byte, error) {
 	return decoded, nil
 }
 
-func computeTBTCDKGResultHash(
+func chainEvidencePublicKeySHA256(value string) string {
+	decoded, err := hex.DecodeString(value)
+	if err != nil ||
+		len(decoded) != ed25519.PublicKeySize ||
+		hex.EncodeToString(decoded) != value {
+		return ""
+	}
+	checksum := sha256.Sum256(decoded)
+	return hex.EncodeToString(checksum[:])
+}
+
+func tbtcDKGResultABIValue(
 	result tbtcDKGChainResultEvidence,
-) (string, error) {
+) (ecdsaabi.EcdsaDkgResult, error) {
 	groupPublicKey, err := decodeCanonicalEthereumBytes(
 		result.GroupPublicKey,
 		64,
 	)
 	if err != nil {
-		return "", fmt.Errorf("invalid group public key: [%v]", err)
+		return ecdsaabi.EcdsaDkgResult{}, fmt.Errorf(
+			"invalid group public key: [%v]",
+			err,
+		)
 	}
 	signatures, err := decodeCanonicalEthereumDynamicBytes(result.Signatures)
 	if err != nil {
-		return "", fmt.Errorf("invalid signatures: [%v]", err)
+		return ecdsaabi.EcdsaDkgResult{}, fmt.Errorf(
+			"invalid signatures: [%v]",
+			err,
+		)
 	}
 	membersHashBytes, err := decodeCanonicalEthereumBytes(
 		result.MembersHash,
 		32,
 	)
 	if err != nil {
-		return "", fmt.Errorf("invalid members hash: [%v]", err)
+		return ecdsaabi.EcdsaDkgResult{}, fmt.Errorf(
+			"invalid members hash: [%v]",
+			err,
+		)
 	}
 	var membersHash [32]byte
 	copy(membersHash[:], membersHashBytes)
@@ -1088,7 +1200,34 @@ func computeTBTCDKGResultHash(
 		len(result.SigningMemberIndexes),
 	)
 	for i, memberIndex := range result.SigningMemberIndexes {
-		signingMemberIndexes[i] = new(big.Int).SetUint64(uint64(memberIndex))
+		if memberIndex == nil {
+			return ecdsaabi.EcdsaDkgResult{}, fmt.Errorf(
+				"signing member index [%d] is null",
+				i,
+			)
+		}
+		signingMemberIndexes[i] = new(big.Int).Set(memberIndex)
+	}
+
+	return ecdsaabi.EcdsaDkgResult{
+		SubmitterMemberIndex: new(big.Int).SetUint64(
+			uint64(result.SubmitterMemberIndex),
+		),
+		GroupPubKey:              groupPublicKey,
+		MisbehavedMembersIndices: result.MisbehavedMemberIndexes,
+		Signatures:               signatures,
+		SigningMembersIndices:    signingMemberIndexes,
+		Members:                  result.Members,
+		MembersHash:              membersHash,
+	}, nil
+}
+
+func computeTBTCDKGResultHash(
+	result tbtcDKGChainResultEvidence,
+) (string, error) {
+	abiValue, err := tbtcDKGResultABIValue(result)
+	if err != nil {
+		return "", err
 	}
 
 	resultType, err := abi.NewType("tuple", "", []abi.ArgumentMarshaling{
@@ -1104,25 +1243,7 @@ func computeTBTCDKGResultHash(
 		return "", fmt.Errorf("cannot construct DKG result ABI type: [%v]", err)
 	}
 
-	encoded, err := (abi.Arguments{{Type: resultType}}).Pack(struct {
-		SubmitterMemberIndex     *big.Int
-		GroupPubKey              []byte
-		MisbehavedMembersIndices []uint8
-		Signatures               []byte
-		SigningMembersIndices    []*big.Int
-		Members                  []uint32
-		MembersHash              [32]byte
-	}{
-		SubmitterMemberIndex: new(big.Int).SetUint64(
-			uint64(result.SubmitterMemberIndex),
-		),
-		GroupPubKey:              groupPublicKey,
-		MisbehavedMembersIndices: result.MisbehavedMemberIndexes,
-		Signatures:               signatures,
-		SigningMembersIndices:    signingMemberIndexes,
-		Members:                  result.Members,
-		MembersHash:              membersHash,
-	})
+	encoded, err := (abi.Arguments{{Type: resultType}}).Pack(abiValue)
 	if err != nil {
 		return "", fmt.Errorf("cannot ABI-encode DKG result: [%v]", err)
 	}
@@ -1233,6 +1354,67 @@ func recordMissingExpectedIdentity(r *auditRun) {
 			blocker: "the expected Ethereum chain ID is not supplied: the " +
 				"chain reconciliation evidence cannot be bound to the " +
 				"rollback's operational target",
+		},
+		{
+			when: r.expected.walletRegistryAddress == "",
+			blocker: "the expected WalletRegistry address is not supplied: " +
+				"authenticated logs cannot be bound to the rollback's " +
+				"settlement contract",
+		},
+		{
+			when: r.expected.walletRegistryAddress != "" &&
+				func() bool {
+					_, err := decodeCanonicalEthereumBytes(
+						r.expected.walletRegistryAddress,
+						20,
+					)
+					return err != nil
+				}(),
+			blocker: fmt.Sprintf(
+				"the expected WalletRegistry address [%s] is not a "+
+					"canonical Ethereum address",
+				r.expected.walletRegistryAddress,
+			),
+		},
+		{
+			when: r.expected.finalizedEthereumBlockNumber == 0,
+			blocker: "the expected finalized Ethereum block number is not " +
+				"supplied: the chain evidence has no independent finality " +
+				"anchor",
+		},
+		{
+			when: r.expected.finalizedEthereumBlockHash == "",
+			blocker: "the expected finalized Ethereum block hash is not " +
+				"supplied: the chain evidence has no independent canonical " +
+				"anchor",
+		},
+		{
+			when: r.expected.finalizedEthereumBlockHash != "" &&
+				func() bool {
+					_, err := decodeCanonicalEthereumBytes(
+						r.expected.finalizedEthereumBlockHash,
+						32,
+					)
+					return err != nil
+				}(),
+			blocker: fmt.Sprintf(
+				"the expected finalized Ethereum block hash [%s] is not "+
+					"canonical",
+				r.expected.finalizedEthereumBlockHash,
+			),
+		},
+		{
+			when: r.expected.chainEvidencePublicKey == "",
+			blocker: "the expected chain-evidence public key is not supplied: " +
+				"caller-authored Ethereum summaries cannot authorize rollback",
+		},
+		{
+			when: r.expected.chainEvidencePublicKey != "" &&
+				chainEvidencePublicKeySHA256(
+					r.expected.chainEvidencePublicKey,
+				) == "",
+			blocker: "the expected chain-evidence public key is not a " +
+				"lowercase hexadecimal Ed25519 public key",
 		},
 		{
 			when: r.expected.bitcoinNetwork == "",
@@ -1536,6 +1718,294 @@ func digestViolations(
 	return violations
 }
 
+func chainReconciliationSignaturePayload(
+	record *chainReconciliationEvidence,
+) ([]byte, error) {
+	unsigned := *record
+	unsigned.CollectorAttestation.Signature = ""
+
+	encoded, err := json.Marshal(&unsigned)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"cannot encode the canonical chain record: [%v]",
+			err,
+		)
+	}
+
+	payload := make(
+		[]byte,
+		0,
+		len(chainReconciliationSignatureDomain)+len(encoded),
+	)
+	payload = append(payload, chainReconciliationSignatureDomain...)
+	payload = append(payload, encoded...)
+	return payload, nil
+}
+
+func (r *auditRun) validateAuthenticatedEthereumEvidence(
+	record *chainReconciliationEvidence,
+) []string {
+	var violations []string
+
+	if _, err := decodeCanonicalEthereumBytes(
+		record.WalletRegistryAddress,
+		20,
+	); err != nil {
+		violations = append(violations, fmt.Sprintf(
+			"the WalletRegistry address [%s] is invalid: [%v]",
+			record.WalletRegistryAddress,
+			err,
+		))
+	} else if r.expected.walletRegistryAddress != "" &&
+		record.WalletRegistryAddress != r.expected.walletRegistryAddress {
+		violations = append(violations, fmt.Sprintf(
+			"the WalletRegistry address [%s], expected [%s]",
+			record.WalletRegistryAddress,
+			r.expected.walletRegistryAddress,
+		))
+	}
+
+	attestation := record.CollectorAttestation
+	if attestation.FinalizedBlockNumber == 0 {
+		violations = append(
+			violations,
+			"the collector attestation has no finalized block number",
+		)
+	} else if r.expected.finalizedEthereumBlockNumber != 0 &&
+		attestation.FinalizedBlockNumber !=
+			r.expected.finalizedEthereumBlockNumber {
+		violations = append(violations, fmt.Sprintf(
+			"the collector finalized block number [%d], expected [%d]",
+			attestation.FinalizedBlockNumber,
+			r.expected.finalizedEthereumBlockNumber,
+		))
+	}
+	if _, err := decodeCanonicalEthereumBytes(
+		attestation.FinalizedBlockHash,
+		32,
+	); err != nil {
+		violations = append(violations, fmt.Sprintf(
+			"the collector finalized block hash [%s] is invalid: [%v]",
+			attestation.FinalizedBlockHash,
+			err,
+		))
+	} else if r.expected.finalizedEthereumBlockHash != "" &&
+		attestation.FinalizedBlockHash !=
+			r.expected.finalizedEthereumBlockHash {
+		violations = append(violations, fmt.Sprintf(
+			"the collector finalized block hash [%s], expected [%s]",
+			attestation.FinalizedBlockHash,
+			r.expected.finalizedEthereumBlockHash,
+		))
+	}
+
+	canonicalBlocks := make(map[uint64]string)
+	var previousBlock uint64
+	for i, block := range attestation.CanonicalBlocks {
+		if block.BlockNumber == 0 {
+			violations = append(violations, fmt.Sprintf(
+				"canonical block entry [%d] has zero block number",
+				i,
+			))
+		}
+		if _, err := decodeCanonicalEthereumBytes(
+			block.BlockHash,
+			32,
+		); err != nil {
+			violations = append(violations, fmt.Sprintf(
+				"canonical block [%d] has invalid hash [%s]: [%v]",
+				block.BlockNumber,
+				block.BlockHash,
+				err,
+			))
+		}
+		if _, duplicate := canonicalBlocks[block.BlockNumber]; duplicate {
+			violations = append(violations, fmt.Sprintf(
+				"canonical block [%d] is attested more than once",
+				block.BlockNumber,
+			))
+		}
+		if i > 0 && block.BlockNumber <= previousBlock {
+			violations = append(violations, fmt.Sprintf(
+				"canonical block entries are not strictly increasing at [%d]",
+				block.BlockNumber,
+			))
+		}
+		canonicalBlocks[block.BlockNumber] = block.BlockHash
+		previousBlock = block.BlockNumber
+	}
+	if hash, ok := canonicalBlocks[attestation.FinalizedBlockNumber]; !ok {
+		violations = append(violations, fmt.Sprintf(
+			"the finalized block [%d] is absent from the authenticated "+
+				"canonical block set",
+			attestation.FinalizedBlockNumber,
+		))
+	} else if hash != attestation.FinalizedBlockHash {
+		violations = append(violations, fmt.Sprintf(
+			"canonical block [%d] has hash [%s], not the attested finalized "+
+				"hash [%s]",
+			attestation.FinalizedBlockNumber,
+			hash,
+			attestation.FinalizedBlockHash,
+		))
+	}
+
+	publicKey, publicKeyErr := hex.DecodeString(
+		r.expected.chainEvidencePublicKey,
+	)
+	signature, signatureErr := hex.DecodeString(attestation.Signature)
+	switch {
+	case publicKeyErr != nil ||
+		len(publicKey) != ed25519.PublicKeySize ||
+		hex.EncodeToString(publicKey) != r.expected.chainEvidencePublicKey:
+		violations = append(
+			violations,
+			"the independently supplied chain-evidence public key is invalid",
+		)
+	case signatureErr != nil ||
+		len(signature) != ed25519.SignatureSize ||
+		hex.EncodeToString(signature) != attestation.Signature:
+		violations = append(
+			violations,
+			"the collector attestation signature is not canonical Ed25519",
+		)
+	default:
+		payload, err := chainReconciliationSignaturePayload(record)
+		if err != nil {
+			violations = append(violations, err.Error())
+		} else if !ed25519.Verify(publicKey, payload, signature) {
+			violations = append(
+				violations,
+				"the chain reconciliation record is not signed by the "+
+					"independently trusted finalized-chain collector",
+			)
+		}
+	}
+
+	receipts := make(map[string]struct{})
+	for i, receipt := range record.Receipts {
+		if _, err := decodeCanonicalEthereumBytes(
+			receipt.TransactionHash,
+			32,
+		); err != nil {
+			violations = append(violations, fmt.Sprintf(
+				"receipt [%d] has invalid transaction hash [%s]: [%v]",
+				i,
+				receipt.TransactionHash,
+				err,
+			))
+		}
+		if _, duplicate := receipts[receipt.TransactionHash]; duplicate {
+			violations = append(violations, fmt.Sprintf(
+				"transaction receipt [%s] is supplied more than once",
+				receipt.TransactionHash,
+			))
+		}
+		receipts[receipt.TransactionHash] = struct{}{}
+
+		if receipt.BlockNumber == 0 {
+			violations = append(violations, fmt.Sprintf(
+				"transaction receipt [%s] has zero block number",
+				receipt.TransactionHash,
+			))
+		}
+		if receipt.BlockNumber > attestation.FinalizedBlockNumber {
+			violations = append(violations, fmt.Sprintf(
+				"transaction receipt [%s] at block [%d] is newer than the "+
+					"attested finalized block [%d]",
+				receipt.TransactionHash,
+				receipt.BlockNumber,
+				attestation.FinalizedBlockNumber,
+			))
+		}
+		if _, err := decodeCanonicalEthereumBytes(
+			receipt.BlockHash,
+			32,
+		); err != nil {
+			violations = append(violations, fmt.Sprintf(
+				"transaction receipt [%s] has invalid block hash [%s]: [%v]",
+				receipt.TransactionHash,
+				receipt.BlockHash,
+				err,
+			))
+		}
+		if canonicalHash, ok := canonicalBlocks[receipt.BlockNumber]; !ok {
+			violations = append(violations, fmt.Sprintf(
+				"transaction receipt [%s] block [%d] is absent from the "+
+					"authenticated canonical block set",
+				receipt.TransactionHash,
+				receipt.BlockNumber,
+			))
+		} else if canonicalHash != receipt.BlockHash {
+			violations = append(violations, fmt.Sprintf(
+				"transaction receipt [%s] names non-canonical block hash "+
+					"[%s] at height [%d]; the collector attests [%s]",
+				receipt.TransactionHash,
+				receipt.BlockHash,
+				receipt.BlockNumber,
+				canonicalHash,
+			))
+		}
+		if receipt.Status != 1 {
+			violations = append(violations, fmt.Sprintf(
+				"transaction receipt [%s] has failed status [%d]",
+				receipt.TransactionHash,
+				receipt.Status,
+			))
+		}
+
+		logIndexes := make(map[uint64]struct{})
+		for j, rawLog := range receipt.Logs {
+			if _, duplicate := logIndexes[rawLog.LogIndex]; duplicate {
+				violations = append(violations, fmt.Sprintf(
+					"transaction receipt [%s] repeats log index [%d]",
+					receipt.TransactionHash,
+					rawLog.LogIndex,
+				))
+			}
+			logIndexes[rawLog.LogIndex] = struct{}{}
+			if _, err := decodeCanonicalEthereumBytes(
+				rawLog.Address,
+				20,
+			); err != nil {
+				violations = append(violations, fmt.Sprintf(
+					"transaction receipt [%s] log [%d] has invalid address "+
+						"[%s]: [%v]",
+					receipt.TransactionHash,
+					j,
+					rawLog.Address,
+					err,
+				))
+			}
+			for k, topic := range rawLog.Topics {
+				if _, err := decodeCanonicalEthereumBytes(topic, 32); err != nil {
+					violations = append(violations, fmt.Sprintf(
+						"transaction receipt [%s] log [%d] topic [%d] is "+
+							"invalid [%s]: [%v]",
+						receipt.TransactionHash,
+						j,
+						k,
+						topic,
+						err,
+					))
+				}
+			}
+			if _, err := decodeCanonicalEthereumDynamicBytes(
+				rawLog.Data,
+			); err != nil {
+				violations = append(violations, fmt.Sprintf(
+					"transaction receipt [%s] log [%d] has invalid data: [%v]",
+					receipt.TransactionHash,
+					j,
+					err,
+				))
+			}
+		}
+	}
+
+	return violations
+}
+
 // validateChainReconciliationEvidence checks the Ethereum reconciliation
 // record: schema, snapshot binding, the expected chain identity, one-to-one
 // coverage of every persisted tBTC wallet and beacon group — active and
@@ -1571,6 +2041,10 @@ func (r *auditRun) validateChainReconciliationEvidence(
 			r.expected.ethereumChainID,
 		))
 	}
+	violations = append(
+		violations,
+		r.validateAuthenticatedEthereumEvidence(record)...,
+	)
 
 	wallets := make(map[string]int)
 	walletIDs := make(map[string]string)
@@ -1631,6 +2105,7 @@ func (r *auditRun) validateChainReconciliationEvidence(
 					wallet.WalletStorageKey,
 					wallet.WalletID,
 					wallet.DKGResult,
+					record,
 				)...,
 			)
 			resultHash := wallet.DKGResult.resultHash()
@@ -1860,13 +2335,242 @@ func (r *auditRun) validateChainReconciliationEvidence(
 	return violations
 }
 
+func expectedTBTCDKGRawLog(
+	eventName string,
+	result *tbtcDKGResultEvidence,
+) ([]string, string, error) {
+	parsed, err := ecdsaabi.WalletRegistryMetaData.GetAbi()
+	if err != nil {
+		return nil, "", fmt.Errorf(
+			"cannot load the generated WalletRegistry ABI: [%v]",
+			err,
+		)
+	}
+	event, ok := parsed.Events[eventName]
+	if !ok {
+		return nil, "", fmt.Errorf(
+			"generated WalletRegistry ABI has no [%s] event",
+			eventName,
+		)
+	}
+
+	topics := []string{event.ID.Hex()}
+	var values []interface{}
+	switch eventName {
+	case "DkgStarted":
+		topics = append(topics, result.Started.Seed)
+	case "DkgResultSubmitted":
+		topics = append(
+			topics,
+			result.Submitted.ResultHash,
+			result.Submitted.Seed,
+		)
+		abiValue, err := tbtcDKGResultABIValue(result.Submitted.Result)
+		if err != nil {
+			return nil, "", err
+		}
+		values = append(values, abiValue)
+	case "DkgResultApproved":
+		// The approver is not part of wallet identity, but its indexed address
+		// must still be present and canonically encoded in the raw log. An
+		// empty expected topic below is that one explicit wildcard.
+		topics = append(topics, result.Approved.ResultHash, "")
+	case "WalletCreated":
+		topics = append(
+			topics,
+			result.WalletCreated.WalletID,
+			result.WalletCreated.DKGResultHash,
+		)
+	default:
+		return nil, "", fmt.Errorf(
+			"unsupported WalletRegistry event [%s]",
+			eventName,
+		)
+	}
+
+	data, err := event.Inputs.NonIndexed().Pack(values...)
+	if err != nil {
+		return nil, "", fmt.Errorf(
+			"cannot ABI-encode expected [%s] event data: [%v]",
+			eventName,
+			err,
+		)
+	}
+	return topics, "0x" + hex.EncodeToString(data), nil
+}
+
+func validateTBTCDKGAuthenticatedLineage(
+	walletStorageKey string,
+	result *tbtcDKGResultEvidence,
+	record *chainReconciliationEvidence,
+) []string {
+	var violations []string
+
+	receipts := make(map[string]ethereumReceiptEvidence)
+	for _, receipt := range record.Receipts {
+		if _, duplicate := receipts[receipt.TransactionHash]; !duplicate {
+			receipts[receipt.TransactionHash] = receipt
+		}
+	}
+
+	for _, observed := range []struct {
+		name string
+		log  ethereumLogEvidence
+	}{
+		{"DkgStarted", result.Started.ethereumLogEvidence},
+		{"DkgResultSubmitted", result.Submitted.ethereumLogEvidence},
+		{"DkgResultApproved", result.Approved.ethereumLogEvidence},
+		{"WalletCreated", result.WalletCreated.ethereumLogEvidence},
+	} {
+		receipt, ok := receipts[observed.log.TransactionHash]
+		if !ok {
+			violations = append(violations, fmt.Sprintf(
+				"tbtc wallet [%s] %s event transaction [%s] has no "+
+					"authenticated receipt",
+				walletStorageKey,
+				observed.name,
+				observed.log.TransactionHash,
+			))
+			continue
+		}
+		if receipt.BlockHash != observed.log.BlockHash ||
+			receipt.BlockNumber != observed.log.BlockNumber {
+			violations = append(violations, fmt.Sprintf(
+				"tbtc wallet [%s] %s event block identity does not match "+
+					"its authenticated receipt",
+				walletStorageKey,
+				observed.name,
+			))
+		}
+		if receipt.Status != 1 {
+			violations = append(violations, fmt.Sprintf(
+				"tbtc wallet [%s] %s event belongs to failed receipt [%s]",
+				walletStorageKey,
+				observed.name,
+				observed.log.TransactionHash,
+			))
+		}
+
+		var rawLog *ethereumRawLogEvidence
+		for i := range receipt.Logs {
+			if receipt.Logs[i].LogIndex == observed.log.LogIndex {
+				rawLog = &receipt.Logs[i]
+				break
+			}
+		}
+		if rawLog == nil {
+			violations = append(violations, fmt.Sprintf(
+				"tbtc wallet [%s] %s event log index [%d] is absent from "+
+					"authenticated receipt [%s]",
+				walletStorageKey,
+				observed.name,
+				observed.log.LogIndex,
+				observed.log.TransactionHash,
+			))
+			continue
+		}
+		if rawLog.Address != record.WalletRegistryAddress {
+			violations = append(violations, fmt.Sprintf(
+				"tbtc wallet [%s] %s event was emitted by unrelated "+
+					"contract [%s], expected WalletRegistry [%s]",
+				walletStorageKey,
+				observed.name,
+				rawLog.Address,
+				record.WalletRegistryAddress,
+			))
+		}
+
+		expectedTopics, expectedData, err := expectedTBTCDKGRawLog(
+			observed.name,
+			result,
+		)
+		if err != nil {
+			violations = append(violations, fmt.Sprintf(
+				"tbtc wallet [%s] cannot derive expected %s event bytes: [%v]",
+				walletStorageKey,
+				observed.name,
+				err,
+			))
+			continue
+		}
+		if len(rawLog.Topics) != len(expectedTopics) {
+			violations = append(violations, fmt.Sprintf(
+				"tbtc wallet [%s] %s raw log has [%d] topics, expected [%d]",
+				walletStorageKey,
+				observed.name,
+				len(rawLog.Topics),
+				len(expectedTopics),
+			))
+		} else {
+			for i, expectedTopic := range expectedTopics {
+				if expectedTopic == "" {
+					decoded, err := decodeCanonicalEthereumBytes(
+						rawLog.Topics[i],
+						32,
+					)
+					if err == nil {
+						for _, prefix := range decoded[:12] {
+							if prefix != 0 {
+								err = fmt.Errorf(
+									"address topic is not left-padded with zeroes",
+								)
+								break
+							}
+						}
+					}
+					if err != nil {
+						violations = append(violations, fmt.Sprintf(
+							"tbtc wallet [%s] %s raw approver topic is "+
+								"invalid: [%v]",
+							walletStorageKey,
+							observed.name,
+							err,
+						))
+					}
+					continue
+				}
+				if rawLog.Topics[i] != expectedTopic {
+					violations = append(violations, fmt.Sprintf(
+						"tbtc wallet [%s] %s raw topic [%d] [%s] does not "+
+							"match decoded event value [%s]",
+						walletStorageKey,
+						observed.name,
+						i,
+						rawLog.Topics[i],
+						expectedTopic,
+					))
+				}
+			}
+		}
+		if rawLog.Data != expectedData {
+			violations = append(violations, fmt.Sprintf(
+				"tbtc wallet [%s] %s raw data does not match the decoded "+
+					"event value",
+				walletStorageKey,
+				observed.name,
+			))
+		}
+	}
+
+	return violations
+}
+
 func validateTBTCDKGResultEvidence(
 	walletStorageKey string,
 	walletID string,
 	result *tbtcDKGResultEvidence,
+	record *chainReconciliationEvidence,
 ) []string {
 	violations := make([]string, 0)
 	resultHash := result.resultHash()
+	violations = append(
+		violations,
+		validateTBTCDKGAuthenticatedLineage(
+			walletStorageKey,
+			result,
+			record,
+		)...,
+	)
 
 	for _, event := range []struct {
 		name string
@@ -2124,34 +2828,48 @@ func validateTBTCDKGResultEvidence(
 			chainResult.SubmitterMemberIndex,
 		))
 	}
-	var previousSigning uint16
+	var previousSigning *big.Int
 	for i, memberIndex := range chainResult.SigningMemberIndexes {
-		if memberIndex == 0 || memberIndex > originalGroupSize {
+		if memberIndex == nil {
 			violations = append(violations, fmt.Sprintf(
-				"tbtc wallet [%s] DKG result [%s] has signing member [%d] "+
+				"tbtc wallet [%s] DKG result [%s] has null signing member "+
+					"at position [%d]",
+				walletStorageKey,
+				resultHash,
+				i,
+			))
+			continue
+		}
+		if memberIndex.Sign() <= 0 ||
+			!memberIndex.IsUint64() ||
+			memberIndex.Uint64() > uint64(originalGroupSize) {
+			violations = append(violations, fmt.Sprintf(
+				"tbtc wallet [%s] DKG result [%s] has signing member [%s] "+
 					"outside original group size [%d]",
 				walletStorageKey,
 				resultHash,
-				memberIndex,
+				memberIndex.String(),
 				originalGroupSize,
 			))
 		}
-		if _, excluded := misbehaved[uint8(memberIndex)]; excluded {
-			violations = append(violations, fmt.Sprintf(
-				"tbtc wallet [%s] DKG result [%s] names misbehaved member "+
-					"[%d] as a signer",
-				walletStorageKey,
-				resultHash,
-				memberIndex,
-			))
+		if memberIndex.IsUint64() {
+			if _, excluded := misbehaved[uint8(memberIndex.Uint64())]; excluded {
+				violations = append(violations, fmt.Sprintf(
+					"tbtc wallet [%s] DKG result [%s] names misbehaved "+
+						"member [%s] as a signer",
+					walletStorageKey,
+					resultHash,
+					memberIndex.String(),
+				))
+			}
 		}
-		if i > 0 && memberIndex <= previousSigning {
+		if previousSigning != nil && memberIndex.Cmp(previousSigning) <= 0 {
 			violations = append(violations, fmt.Sprintf(
 				"tbtc wallet [%s] DKG result [%s] signing members are not "+
-					"strictly increasing at [%d]",
+					"strictly increasing at [%s]",
 				walletStorageKey,
 				resultHash,
-				memberIndex,
+				memberIndex.String(),
 			))
 		}
 		previousSigning = memberIndex

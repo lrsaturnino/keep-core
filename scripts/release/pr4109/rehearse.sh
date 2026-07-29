@@ -50,10 +50,24 @@
 #                        bitcoin-reconciliation.json, quiescence-report.json,
 #                        and prior-reader-compatibility.json into the output
 #                        directory, each naming the identity manifest's
-#                        snapshot_aggregate_sha256. It is run rather than
-#                        supplied as files because every record has to speak
-#                        for the exact snapshot this run captured, and that
-#                        snapshot does not exist until the fleet has drained
+#                        snapshot_aggregate_sha256. The chain record must also
+#                        contain signed successful receipt/log projections
+#                        from the independently trusted collector named below.
+#                        It is run rather than supplied as files because every
+#                        record has to speak for the exact snapshot this run
+#                        captured, and that snapshot does not exist until the
+#                        fleet has drained
+#   PR4109_WALLET_REGISTRY_ADDRESS
+#                        exact WalletRegistry address whose logs establish DKG
+#                        settlement
+#   PR4109_FINALIZED_ETHEREUM_BLOCK_NUMBER
+#   PR4109_FINALIZED_ETHEREUM_BLOCK_HASH
+#                        independently obtained finalized-chain anchor the
+#                        collector's canonical block set must end at
+#   PR4109_CHAIN_EVIDENCE_PUBLIC_KEY
+#                        lowercase hexadecimal Ed25519 public key provisioned
+#                        independently from the evidence generator; its
+#                        signature authenticates the complete chain record
 #   PR4109_BITCOIN_NETWORK  the Bitcoin network the rollback targets
 #   PR4109_PRIOR_VERSION    exact version of the prior release restored
 #   PR4109_PRIOR_REVISION   exact revision of the prior release restored
@@ -301,6 +315,15 @@ environment (rollback, additionally):
                       the audit reports namespace consistency and nothing
                       about rollback safety, and a record produced before the
                       drain could not name the snapshot the drain left
+  PR4109_WALLET_REGISTRY_ADDRESS
+                      exact WalletRegistry whose raw logs establish DKG state
+  PR4109_FINALIZED_ETHEREUM_BLOCK_NUMBER
+  PR4109_FINALIZED_ETHEREUM_BLOCK_HASH
+                      independently obtained finalized block anchoring the
+                      authenticated canonical block set
+  PR4109_CHAIN_EVIDENCE_PUBLIC_KEY
+                      lowercase hexadecimal Ed25519 public key of the trusted
+                      finalized-chain evidence collector
   PR4109_BITCOIN_NETWORK
   PR4109_PRIOR_VERSION
   PR4109_PRIOR_REVISION
@@ -4563,6 +4586,10 @@ stopped container failed, so there is no capture of the state the drain left"
 # happened yet.
 ROLLBACK_AUDIT_INPUTS=(
   PR4109_ROLLBACK_EVIDENCE_GENERATOR
+  PR4109_WALLET_REGISTRY_ADDRESS
+  PR4109_FINALIZED_ETHEREUM_BLOCK_NUMBER
+  PR4109_FINALIZED_ETHEREUM_BLOCK_HASH
+  PR4109_CHAIN_EVIDENCE_PUBLIC_KEY
   PR4109_BITCOIN_NETWORK
   PR4109_PRIOR_VERSION
   PR4109_PRIOR_REVISION
@@ -4597,6 +4624,14 @@ audit_snapshot() {
     --storage-snapshot "${snapshot}"
     --output "${output}"
     --expected-ethereum-chain-id "${CHAIN_ID}"
+    --expected-wallet-registry-address
+    "${PR4109_WALLET_REGISTRY_ADDRESS}"
+    --expected-finalized-ethereum-block-number
+    "${PR4109_FINALIZED_ETHEREUM_BLOCK_NUMBER}"
+    --expected-finalized-ethereum-block-hash
+    "${PR4109_FINALIZED_ETHEREUM_BLOCK_HASH}"
+    --expected-chain-evidence-public-key
+    "${PR4109_CHAIN_EVIDENCE_PUBLIC_KEY}"
     --expected-bitcoin-network "${PR4109_BITCOIN_NETWORK}"
     --expected-prior-version "${PR4109_PRIOR_VERSION}"
     --expected-prior-revision "${PR4109_PRIOR_REVISION}"

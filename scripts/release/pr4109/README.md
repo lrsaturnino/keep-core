@@ -69,19 +69,32 @@ prior-reader compatibility evidence are supplied via its
 identities the evidence must bind to are supplied via its `--expected-*`
 flags — Ethereum chain ID, Bitcoin network, the exact prior and current
 release versions, revisions, and immutable image digests, the release epoch,
-the armed cutover block, and the evidence freshness bound. Its output never
-authorizes activating quarantined material by itself.
+the armed cutover block, and the evidence freshness bound. Chain evidence has
+additional independent inputs: the exact WalletRegistry address, a finalized
+Ethereum block number/hash obtained outside the evidence generator, and the
+lowercase hexadecimal Ed25519 public key of the trusted chain collector. Its
+output never authorizes activating quarantined material by itself.
 For every reconciled tBTC wallet whose DKG settlement is not `none`, schema
-v6 requires the complete `DkgStarted`, `DkgResultSubmitted`,
+v7 requires the complete `DkgStarted`, `DkgResultSubmitted`,
 `DkgResultApproved`, and `WalletCreated` event lineage. Each event names its
 transaction hash, block hash/number, and log index; the submitted event carries
-the full on-chain result tuple, not caller-supplied summary fields. The audit
+the full on-chain result tuple, not caller-supplied summary fields. The same
+record carries the successful receipt projections and exact address,
+topics/data, and log indexes. The audit verifies the collector signature over
+the entire record, requires each receipt block in the signed canonical set,
+binds that set to the independently supplied finalized block, rejects logs
+from any address other than the independently supplied WalletRegistry, and
+re-derives every decoded event field from the raw log bytes. A self-consistent
+history produced by an untrusted generator, a failed receipt, an unrelated
+contract, or a non-canonical block therefore blocks rollback. The audit also
 recomputes `keccak256(abi.encode(result))`, the operating-members hash, the
 seed hash, and the wallet ID, requires approval and wallet creation to share
 one receipt, and derives the original and final group shapes from those bytes.
-For an approved wallet it then maps each original DKG permit to the persisted
-final membership; a forged result hash, unrelated approved wallet, or two
-persisted memberships swapped between permits blocks rollback.
+Its `signing_member_indexes` decode at the contract's full `uint256` width
+before the protocol's one-byte group bounds are enforced. For an approved
+wallet it then maps each original DKG permit to the persisted final membership;
+a forged result hash, unrelated approved wallet, or two persisted memberships
+swapped between permits blocks rollback.
 
 The rollback rehearsal runs that audit **twice over the same snapshot**, and
 the order is the whole point. Every external record must carry the audited
@@ -109,7 +122,7 @@ evidence generator cannot replace it with a second self-attested inventory.
 Each process run invalidates the prior artifact before constructing its gate,
 so a restart or failed new capture leaves the rollback audit fail-closed
 instead of exposing stale inventory.
-The schema-v6 quiescence record supplies only the later
+The schema-v7 quiescence record supplies only the later
 `active_permits_at_quiescence` terminal-outcome list, which must cover the
 node-authored inventory one-to-one and reproduce all three counts. An empty or
 shortened outcome list over a nonempty gate artifact blocks rollback. Both
@@ -148,9 +161,10 @@ those inputs and reports `BLOCKED` with the exact missing one. The rollback
 gate additionally needs the audit inputs no storage snapshot can supply — the
 rollback evidence generator that produces the chain and Bitcoin
 reconciliation, quiescence outcome, and prior-reader compatibility records for
-each captured snapshot, plus the Bitcoin network and the prior artifact's
-version and revision — because without them the audit can classify namespaces
-and authorize nothing.
+each captured snapshot, the independently provisioned WalletRegistry/finalized
+block/collector-key trust inputs, plus the Bitcoin network and the prior
+artifact's version and revision — because without them the audit can classify
+namespaces and authorize nothing.
 
 Once preflight passes, `single-release` and `rollback` **run**: each drives
 its gate as an explicit sequence of steps, starting the fleet from the
