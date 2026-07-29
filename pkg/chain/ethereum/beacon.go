@@ -13,6 +13,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/keep-network/keep-common/pkg/chain/ethereum"
 	"github.com/keep-network/keep-core/pkg/chain"
+	"github.com/keep-network/keep-core/pkg/chain/ethereum/beacon/gen/abi"
 	"github.com/keep-network/keep-core/pkg/chain/ethereum/beacon/gen/contract"
 	"github.com/keep-network/keep-core/pkg/operator"
 )
@@ -530,11 +531,6 @@ func (bc *BeaconChain) RelayEntryTimeoutSettlement(
 			err,
 		)
 	}
-	for _, submission := range submissions {
-		if !submission.Raw.Removed {
-			return nil, nil
-		}
-	}
 
 	timeouts, err := bc.randomBeacon.PastRelayEntryTimedOutEvents(
 		requestBlockNumber,
@@ -547,6 +543,36 @@ func (bc *BeaconChain) RelayEntryTimeoutSettlement(
 			request.RequestId,
 			err,
 		)
+	}
+
+	return relayEntryTimeoutSettlement(
+		request,
+		submissions,
+		timeouts,
+		bc.randomBeaconAddress.String(),
+	)
+}
+
+// relayEntryTimeoutSettlement decides, from the canonical logs of one relay
+// request, whether that request was terminated by an accepted timeout report.
+//
+// The decision is separated from the reads because it is the part that has to
+// be right: a request the beacon answered ends the claim before the timeout
+// logs matter, since a delivered entry and a timeout are mutually exclusive
+// endings and a chain reporting both is one this node must not choose between.
+// A submission belonging to an abandoned branch is not such an answer, and
+// neither is a termination — both are skipped, so a reorg takes the state it
+// removed with it rather than leaving a stale reading behind.
+func relayEntryTimeoutSettlement(
+	request *abi.RandomBeaconRelayEntryRequested,
+	submissions []*abi.RandomBeaconRelayEntrySubmitted,
+	timeouts []*abi.RandomBeaconRelayEntryTimedOut,
+	contractAddress string,
+) (*event.RelayEntryTimeoutSettlement, error) {
+	for _, submission := range submissions {
+		if !submission.Raw.Removed {
+			return nil, nil
+		}
 	}
 
 	timeoutIndex, ambiguous := soleCanonicalLog(
@@ -575,6 +601,6 @@ func (bc *BeaconChain) RelayEntryTimeoutSettlement(
 		RequestPreviousEntry: previousEntry,
 		BlockNumber:          timeout.Raw.BlockNumber,
 		TransactionHash:      timeout.Raw.TxHash,
-		ContractAddress:      bc.randomBeaconAddress.String(),
+		ContractAddress:      contractAddress,
 	}, nil
 }
