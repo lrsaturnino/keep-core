@@ -13,12 +13,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/accounts/abi"
+	ethereumCrypto "github.com/ethereum/go-ethereum/crypto"
 	bn256 "github.com/ethereum/go-ethereum/crypto/bn256/cloudflare"
 
 	"github.com/keep-network/keep-core/internal/testutils"
 	"github.com/keep-network/keep-core/pkg/beacon/dkg"
 	"github.com/keep-network/keep-core/pkg/beacon/registry"
 	"github.com/keep-network/keep-core/pkg/chain"
+	ecdsaabi "github.com/keep-network/keep-core/pkg/chain/ethereum/ecdsa/gen/abi"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/storage"
@@ -396,10 +399,200 @@ func newPlaceholderEvidence(t *testing.T) evidenceInputs {
 	}
 }
 
-// newValidEvidence writes one schema-valid evidence record per external
-// rollback input, bound to the given already-audited manifest: every
-// persisted wallet and group the manifest interprets is reconciled as
-// registered and settled, and the prior reader covers every required schema.
+// newValidTBTCDKGResultEvidence constructs a complete accepted-event lineage
+// and returns its derived wallet ID and seed work identity.
+func newValidTBTCDKGResultEvidence(
+	t *testing.T,
+	seed *big.Int,
+	startBlock uint64,
+	originalGroupSize uint16,
+	misbehavedMemberIndexes []uint8,
+) (*tbtcDKGResultEvidence, string, string) {
+	t.Helper()
+
+	misbehaved := make(map[uint8]struct{}, len(misbehavedMemberIndexes))
+	for _, memberIndex := range misbehavedMemberIndexes {
+		misbehaved[memberIndex] = struct{}{}
+	}
+
+	members := make([]uint32, originalGroupSize)
+	signingMemberIndexes := make([]uint16, 0, originalGroupSize)
+	for i := uint16(0); i < originalGroupSize; i++ {
+		members[i] = uint32(10_000 + i)
+		if _, excluded := misbehaved[uint8(i+1)]; !excluded {
+			signingMemberIndexes = append(signingMemberIndexes, i+1)
+		}
+	}
+	if len(signingMemberIndexes) == 0 {
+		t.Fatal("test DKG result needs an operating member")
+	}
+
+	seedHex := fmt.Sprintf("0x%064x", seed)
+	seedTag := seed.Uint64()
+	log := func(blockNumber uint64, logIndex uint64) ethereumLogEvidence {
+		return ethereumLogEvidence{
+			TransactionHash: fmt.Sprintf(
+				"0x%064x",
+				(seedTag<<16)+(blockNumber<<2)+logIndex+1,
+			),
+			BlockHash:   fmt.Sprintf("0x%064x", blockNumber+seedTag+1),
+			BlockNumber: blockNumber,
+			LogIndex:    logIndex,
+		}
+	}
+
+	chainResult := tbtcDKGChainResultEvidence{
+		SubmitterMemberIndex: signingMemberIndexes[0],
+		GroupPublicKey: "0x" +
+			"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798" +
+			"483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8",
+		MisbehavedMemberIndexes: append(
+			[]uint8(nil),
+			misbehavedMemberIndexes...,
+		),
+		Signatures: "0x" + strings.Repeat(
+			"02",
+			65*len(signingMemberIndexes),
+		),
+		SigningMemberIndexes: signingMemberIndexes,
+		Members:              members,
+	}
+	membersHash, err := computeTBTCDKGMembersHash(chainResult)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chainResult.MembersHash = membersHash
+
+	resultHash, err := computeTBTCDKGResultHash(chainResult)
+	if err != nil {
+		t.Fatal(err)
+	}
+	walletID, err := computeTBTCWalletID(chainResult.GroupPublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	approvalLog := log(startBlock+2, 0)
+	walletCreatedLog := approvalLog
+	walletCreatedLog.LogIndex = 1
+
+	result := &tbtcDKGResultEvidence{
+		Started: tbtcDKGStartedEventEvidence{
+			ethereumLogEvidence: log(startBlock, 0),
+			Seed:                seedHex,
+		},
+		Submitted: tbtcDKGResultSubmittedEventEvidence{
+			ethereumLogEvidence: log(startBlock+1, 0),
+			ResultHash:          resultHash,
+			Seed:                seedHex,
+			Result:              chainResult,
+		},
+		Approved: tbtcDKGResultApprovedEventEvidence{
+			ethereumLogEvidence: approvalLog,
+			ResultHash:          resultHash,
+		},
+		WalletCreated: tbtcWalletCreatedEventEvidence{
+			ethereumLogEvidence: walletCreatedLog,
+			WalletID:            walletID,
+			DKGResultHash:       resultHash,
+		},
+	}
+	seedHash, err := result.seedHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return result, strings.TrimPrefix(walletID, "0x"), seedHash
+}
+
+func TestComputeTBTCDKGResultHashMatchesGeneratedWalletRegistryABI(
+	t *testing.T,
+) {
+	evidence, _, _ := newValidTBTCDKGResultEvidence(
+		t,
+		big.NewInt(42),
+		1_000,
+		4,
+		[]uint8{1},
+	)
+	result := evidence.Submitted.Result
+
+	parsed, err := ecdsaabi.WalletRegistryMetaData.GetAbi()
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, ok := parsed.Events["DkgResultSubmitted"]
+	if !ok {
+		t.Fatal("generated WalletRegistry ABI has no DkgResultSubmitted event")
+	}
+	if len(event.Inputs) != 3 {
+		t.Fatalf(
+			"expected DkgResultSubmitted to have 3 inputs, got %d",
+			len(event.Inputs),
+		)
+	}
+
+	groupPublicKey, err := decodeCanonicalEthereumBytes(
+		result.GroupPublicKey,
+		64,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signatures, err := decodeCanonicalEthereumDynamicBytes(result.Signatures)
+	if err != nil {
+		t.Fatal(err)
+	}
+	membersHashBytes, err := decodeCanonicalEthereumBytes(
+		result.MembersHash,
+		32,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var membersHash [32]byte
+	copy(membersHash[:], membersHashBytes)
+	signingMemberIndexes := make([]*big.Int, len(result.SigningMemberIndexes))
+	for i, memberIndex := range result.SigningMemberIndexes {
+		signingMemberIndexes[i] = new(big.Int).SetUint64(uint64(memberIndex))
+	}
+
+	encoded, err := (abi.Arguments{{Type: event.Inputs[2].Type}}).Pack(
+		ecdsaabi.EcdsaDkgResult{
+			SubmitterMemberIndex: new(big.Int).SetUint64(
+				uint64(result.SubmitterMemberIndex),
+			),
+			GroupPubKey:              groupPublicKey,
+			MisbehavedMembersIndices: result.MisbehavedMemberIndexes,
+			Signatures:               signatures,
+			SigningMembersIndices:    signingMemberIndexes,
+			Members:                  result.Members,
+			MembersHash:              membersHash,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := "0x" + hex.EncodeToString(ethereumCrypto.Keccak256(encoded))
+
+	actual, err := computeTBTCDKGResultHash(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if actual != expected {
+		t.Fatalf(
+			"result hash disagrees with generated WalletRegistry ABI: "+
+				"expected [%s], got [%s]",
+			expected,
+			actual,
+		)
+	}
+}
+
+// newValidEvidence builds every mandatory external rollback input, bound to
+// the given already-audited manifest: every persisted wallet and group the
+// manifest interprets is reconciled as registered and settled, and the prior
+// reader covers every required schema.
 func newValidEvidence(t *testing.T, auditManifest *manifest) evidenceInputs {
 	t.Helper()
 
@@ -429,30 +622,39 @@ func newValidEvidence(t *testing.T, auditManifest *manifest) evidenceInputs {
 		evidenceEnvelope: envelope("chain_reconciliation"),
 		EthereumChainID:  "1",
 	}
-	for walletIndex, wallet := range auditManifest.TBTCActiveWallets {
-		dkgResult := &tbtcDKGResultEvidence{
-			ResultHash:              fmt.Sprintf("%064x", walletIndex+1),
-			SeedHash:                strings.Repeat("a", 64),
-			StartBlock:              1,
-			OriginalGroupSize:       uint16(wallet.SigningGroupSize),
-			MisbehavedMemberIndexes: []uint8{},
-		}
+	for walletIndex := range auditManifest.TBTCActiveWallets {
+		wallet := &auditManifest.TBTCActiveWallets[walletIndex]
+		startBlock := uint64(1)
 		if auditManifest.ParticipationTerminalOutcomes != nil {
 			for _, outcome := range auditManifest.ParticipationTerminalOutcomes.Outcomes {
 				if outcome.Outcome ==
 					participation.TerminalOutcomeCompleted &&
 					outcome.Permit.Ceremony == participation.TBTCDKG &&
 					outcome.Evidence.Reference == wallet.WalletStorageKey {
-					dkgResult.SeedHash = outcome.Permit.WorkID
-					dkgResult.StartBlock =
-						outcome.Permit.CanonicalStartBlock
+					startBlock = outcome.Permit.CanonicalStartBlock
 					break
 				}
 			}
 		}
+		dkgResult, walletID, _ := newValidTBTCDKGResultEvidence(
+			t,
+			big.NewInt(int64(walletIndex+1)),
+			startBlock,
+			uint16(wallet.SigningGroupSize),
+			[]uint8{},
+		)
+		if wallet.WalletID != walletID {
+			t.Fatalf(
+				"test wallet [%s] has ID [%s], but its synthetic accepted "+
+					"event lineage derives [%s]",
+				wallet.WalletStorageKey,
+				wallet.WalletID,
+				walletID,
+			)
+		}
 		chainRecord.Wallets = append(chainRecord.Wallets, tbtcWalletChainEvidence{
 			WalletStorageKey: wallet.WalletStorageKey,
-			WalletID:         wallet.WalletID,
+			WalletID:         walletID,
 			Registered:       true,
 			DKGSettlement:    "approved",
 			DKGResult:        dkgResult,
@@ -2323,8 +2525,15 @@ func TestValidateChainReconciliationEvidence_TBTCDKGPermitLineage(
 	t *testing.T,
 ) {
 	capturedAt := time.Now().UTC().Add(-time.Minute)
-	seedHash := strings.Repeat("a", 64)
-	resultHash := strings.Repeat("b", 64)
+	canonicalSeed := big.NewInt(42)
+	canonicalResult, _, seedHash := newValidTBTCDKGResultEvidence(
+		t,
+		canonicalSeed,
+		1_000,
+		4,
+		[]uint8{1},
+	)
+	resultHash := canonicalResult.resultHash()
 	permits := []participation.PermitSnapshot{
 		{
 			Ceremony:            participation.TBTCDKG,
@@ -2347,8 +2556,15 @@ func TestValidateChainReconciliationEvidence_TBTCDKGPermitLineage(
 	newRunAndRecord := func(
 		firstMembership group.MemberIndex,
 		secondMembership group.MemberIndex,
-		resultSeedHash string,
+		resultSeed *big.Int,
 	) (*auditRun, *chainReconciliationEvidence) {
+		dkgResult, resultWalletID, _ := newValidTBTCDKGResultEvidence(
+			t,
+			resultSeed,
+			1_000,
+			4,
+			[]uint8{1},
+		)
 		auditManifest := &manifest{
 			GeneratedAt: time.Now().UTC(),
 			Snapshot: snapshotIdentity{
@@ -2388,7 +2604,7 @@ func TestValidateChainReconciliationEvidence_TBTCDKGPermitLineage(
 			TBTCActiveWallets: []tbtcWalletRecord{
 				{
 					WalletStorageKey: "wallet-storage-key",
-					WalletID:         "wallet-id",
+					WalletID:         resultWalletID,
 					MemberIndexes: []uint8{
 						uint8(firstMembership),
 						uint8(secondMembership),
@@ -2415,16 +2631,10 @@ func TestValidateChainReconciliationEvidence_TBTCDKGPermitLineage(
 			Wallets: []tbtcWalletChainEvidence{
 				{
 					WalletStorageKey: "wallet-storage-key",
-					WalletID:         "wallet-id",
+					WalletID:         resultWalletID,
 					Registered:       true,
 					DKGSettlement:    "approved",
-					DKGResult: &tbtcDKGResultEvidence{
-						ResultHash:              resultHash,
-						SeedHash:                resultSeedHash,
-						StartBlock:              1_000,
-						OriginalGroupSize:       4,
-						MisbehavedMemberIndexes: []uint8{1},
-					},
+					DKGResult:        dkgResult,
 				},
 			},
 		}
@@ -2435,7 +2645,7 @@ func TestValidateChainReconciliationEvidence_TBTCDKGPermitLineage(
 		run, record := newRunAndRecord(
 			group.MemberIndex(1),
 			group.MemberIndex(2),
-			seedHash,
+			canonicalSeed,
 		)
 		content, err := json.Marshal(record)
 		if err != nil {
@@ -2446,11 +2656,99 @@ func TestValidateChainReconciliationEvidence_TBTCDKGPermitLineage(
 		}
 	})
 
+	t.Run("caller-supplied result hash is recomputed", func(t *testing.T) {
+		run, record := newRunAndRecord(
+			group.MemberIndex(1),
+			group.MemberIndex(2),
+			canonicalSeed,
+		)
+		forgedHash := "0x" + strings.Repeat("f", 64)
+		record.Wallets[0].DKGResult.Submitted.ResultHash = forgedHash
+		record.Wallets[0].DKGResult.Approved.ResultHash = forgedHash
+		record.Wallets[0].DKGResult.WalletCreated.DKGResultHash = forgedHash
+
+		content, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		violations := run.validateChainReconciliationEvidence(content)
+		if !containsSubstring(
+			violations,
+			"does not match keccak256(abi.encode(result))",
+		) {
+			t.Fatalf(
+				"expected a derived-result-hash violation, got: %v",
+				violations,
+			)
+		}
+	})
+
+	t.Run("members hash is derived from the submitted result", func(t *testing.T) {
+		run, record := newRunAndRecord(
+			group.MemberIndex(1),
+			group.MemberIndex(2),
+			canonicalSeed,
+		)
+		result := record.Wallets[0].DKGResult
+		result.Submitted.Result.MembersHash =
+			"0x" + strings.Repeat("e", 64)
+		// Keep the event's indexed result hash internally consistent with the
+		// forged tuple. The independent operating-members derivation must
+		// still reject it.
+		forgedHash, err := computeTBTCDKGResultHash(result.Submitted.Result)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result.Submitted.ResultHash = forgedHash
+		result.Approved.ResultHash = forgedHash
+		result.WalletCreated.DKGResultHash = forgedHash
+
+		content, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		violations := run.validateChainReconciliationEvidence(content)
+		if !containsSubstring(
+			violations,
+			"does not match the derived operating-members hash",
+		) {
+			t.Fatalf(
+				"expected a derived-members-hash violation, got: %v",
+				violations,
+			)
+		}
+	})
+
+	t.Run("approval and wallet creation share one receipt", func(t *testing.T) {
+		run, record := newRunAndRecord(
+			group.MemberIndex(1),
+			group.MemberIndex(2),
+			canonicalSeed,
+		)
+		record.Wallets[0].DKGResult.WalletCreated.TransactionHash =
+			"0x" + strings.Repeat("d", 64)
+
+		content, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		violations := run.validateChainReconciliationEvidence(content)
+		if !containsSubstring(
+			violations,
+			"do not belong to the same approval receipt",
+		) {
+			t.Fatalf(
+				"expected an accepted-event-lineage violation, got: %v",
+				violations,
+			)
+		}
+	})
+
 	t.Run("swapped persisted memberships", func(t *testing.T) {
 		run, record := newRunAndRecord(
 			group.MemberIndex(2),
 			group.MemberIndex(1),
-			seedHash,
+			canonicalSeed,
 		)
 		// Storage existence and one-to-one claims alone accept this swap:
 		// both final memberships really exist and neither is reused.
@@ -2484,17 +2782,24 @@ func TestValidateChainReconciliationEvidence_TBTCDKGPermitLineage(
 		run, record := newRunAndRecord(
 			group.MemberIndex(1),
 			group.MemberIndex(2),
-			strings.Repeat("d", 64),
+			big.NewInt(43),
 		)
 		content, err := json.Marshal(record)
 		if err != nil {
 			t.Fatal(err)
 		}
 		violations := run.validateChainReconciliationEvidence(content)
+		_, _, unrelatedSeedHash := newValidTBTCDKGResultEvidence(
+			t,
+			big.NewInt(43),
+			1_000,
+			4,
+			[]uint8{1},
+		)
 		if !containsSubstring(
 			violations,
 			"persisted wallet [wallet-storage-key] was created by canonical "+
-				"result ["+resultHash+"] for seed ["+strings.Repeat("d", 64)+"]",
+				"result ["+resultHash+"] for seed ["+unrelatedSeedHash+"]",
 		) {
 			t.Fatalf(
 				"expected unrelated-approved-wallet violation, got: %v",

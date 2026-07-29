@@ -72,11 +72,16 @@ release versions, revisions, and immutable image digests, the release epoch,
 the armed cutover block, and the evidence freshness bound. Its output never
 authorizes activating quarantined material by itself.
 For every reconciled tBTC wallet whose DKG settlement is not `none`, schema
-v5 also requires the canonical DKG result hash, seed hash, start block,
-original selected-group size, and complete sorted misbehaved-member indexes.
-For an approved wallet the audit uses that result to derive the final
-membership belonging to each original DKG permit; an unrelated approved
-wallet or two persisted memberships swapped between permits blocks rollback.
+v6 requires the complete `DkgStarted`, `DkgResultSubmitted`,
+`DkgResultApproved`, and `WalletCreated` event lineage. Each event names its
+transaction hash, block hash/number, and log index; the submitted event carries
+the full on-chain result tuple, not caller-supplied summary fields. The audit
+recomputes `keccak256(abi.encode(result))`, the operating-members hash, the
+seed hash, and the wallet ID, requires approval and wallet creation to share
+one receipt, and derives the original and final group shapes from those bytes.
+For an approved wallet it then maps each original DKG permit to the persisted
+final membership; a forged result hash, unrelated approved wallet, or two
+persisted memberships swapped between permits blocks rollback.
 
 The rollback rehearsal runs that audit **twice over the same snapshot**, and
 the order is the whole point. Every external record must carry the audited
@@ -104,7 +109,7 @@ evidence generator cannot replace it with a second self-attested inventory.
 Each process run invalidates the prior artifact before constructing its gate,
 so a restart or failed new capture leaves the rollback audit fail-closed
 instead of exposing stale inventory.
-The schema-v5 quiescence record supplies only the later
+The schema-v6 quiescence record supplies only the later
 `active_permits_at_quiescence` terminal-outcome list, which must cover the
 node-authored inventory one-to-one and reproduce all three counts. An empty or
 shortened outcome list over a nonempty gate artifact blocks rollback. Both
