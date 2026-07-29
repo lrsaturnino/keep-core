@@ -1,6 +1,7 @@
 package ethereum
 
 import (
+	"bytes"
 	"fmt"
 	"math/big"
 
@@ -29,6 +30,12 @@ type BeaconChain struct {
 
 	randomBeacon  *contract.RandomBeacon
 	sortitionPool *contract.BeaconSortitionPool
+
+	// randomBeaconAddress is the address the RandomBeacon handle was resolved
+	// to. Canonical chain records read back from that contract carry it, so a
+	// record can name the deployment it came from rather than leaving a reader
+	// to assume one.
+	randomBeaconAddress common.Address
 }
 
 // newBeaconChain construct a new instance of the beacon-specific Ethereum
@@ -91,9 +98,10 @@ func newBeaconChain(
 	}
 
 	return &BeaconChain{
-		baseChain:     baseChain,
-		randomBeacon:  randomBeacon,
-		sortitionPool: sortitionPool,
+		baseChain:           baseChain,
+		randomBeacon:        randomBeacon,
+		sortitionPool:       sortitionPool,
+		randomBeaconAddress: randomBeaconAddress,
 	}, nil
 }
 
@@ -428,4 +436,145 @@ func (bc *BeaconChain) CurrentRequestPreviousEntry() ([]byte, error) {
 // TODO: Implement a real CurrentRequestGroupPublicKey function.
 func (bc *BeaconChain) CurrentRequestGroupPublicKey() ([]byte, error) {
 	return nil, errNotImplemented
+}
+
+// soleCanonicalLog returns the index of the one log in a filtered range that
+// the caller's predicate accepts, or -1 when none does, and reports separately
+// whether more than one did.
+//
+// More than one match is reported rather than resolved. Nothing in the logs
+// says which one a caller meant, and picking either would make a penalty rest
+// on an ordering the chain never promised.
+func soleCanonicalLog(count int, matches func(int) bool) (int, bool) {
+	index := -1
+	for i := 0; i < count; i++ {
+		if !matches(i) {
+			continue
+		}
+		if index >= 0 {
+			return -1, true
+		}
+		index = i
+	}
+
+	return index, false
+}
+
+// RelayEntryTimeoutSettlement reads the RandomBeacon's own record that the
+// relay request made at the given block, over the given previous entry, was
+// terminated by an accepted timeout report.
+//
+// The record is assembled from canonical logs on every call and nothing is
+// carried between calls. The request is identified by the RelayEntryRequested
+// log at the named block that signs over the named previous entry, so a chain
+// view that does not hold that log yields no settlement rather than one built
+// on a request the view never had — which is what makes a reorg that removed
+// the request take the penalty claim with it.
+//
+// A request the beacon answered is refused before the timeout logs are read.
+// A delivered entry and a timeout are mutually exclusive endings, so a chain
+// reporting both is one this node must not choose between.
+func (bc *BeaconChain) RelayEntryTimeoutSettlement(
+	requestBlockNumber uint64,
+	requestPreviousEntry []byte,
+) (*event.RelayEntryTimeoutSettlement, error) {
+	if len(requestPreviousEntry) == 0 {
+		return nil, fmt.Errorf(
+			"cannot resolve a relay entry timeout settlement without the " +
+				"previous entry the request was signing over",
+		)
+	}
+
+	requests, err := bc.randomBeacon.PastRelayEntryRequestedEvents(
+		requestBlockNumber,
+		&requestBlockNumber,
+		nil,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed to read the relay entry requests of block [%v]: [%w]",
+			requestBlockNumber,
+			err,
+		)
+	}
+
+	requestIndex, ambiguous := soleCanonicalLog(
+		len(requests),
+		func(i int) bool {
+			return !requests[i].Raw.Removed &&
+				bytes.Equal(requests[i].PreviousEntry, requestPreviousEntry)
+		},
+	)
+	if ambiguous {
+		return nil, fmt.Errorf(
+			"block [%v] holds more than one relay entry request over the "+
+				"named previous entry; the request a timeout settlement would "+
+				"terminate is ambiguous",
+			requestBlockNumber,
+		)
+	}
+	if requestIndex < 0 {
+		return nil, nil
+	}
+	request := requests[requestIndex]
+
+	submissions, err := bc.randomBeacon.PastRelayEntrySubmittedEvents(
+		requestBlockNumber,
+		nil,
+		[]*big.Int{request.RequestId},
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed to read the relay entry submissions of request [%s]: [%w]",
+			request.RequestId,
+			err,
+		)
+	}
+	for _, submission := range submissions {
+		if !submission.Raw.Removed {
+			return nil, nil
+		}
+	}
+
+	timeouts, err := bc.randomBeacon.PastRelayEntryTimedOutEvents(
+		requestBlockNumber,
+		nil,
+		[]*big.Int{request.RequestId},
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed to read the relay entry timeouts of request [%s]: [%w]",
+			request.RequestId,
+			err,
+		)
+	}
+
+	timeoutIndex, ambiguous := soleCanonicalLog(
+		len(timeouts),
+		func(i int) bool { return !timeouts[i].Raw.Removed },
+	)
+	if ambiguous {
+		return nil, fmt.Errorf(
+			"request [%s] was terminated more than once; the settlement to "+
+				"record is ambiguous",
+			request.RequestId,
+		)
+	}
+	if timeoutIndex < 0 {
+		return nil, nil
+	}
+	timeout := timeouts[timeoutIndex]
+
+	previousEntry := make([]byte, len(request.PreviousEntry))
+	copy(previousEntry, request.PreviousEntry)
+
+	return &event.RelayEntryTimeoutSettlement{
+		RequestID:            new(big.Int).Set(request.RequestId),
+		TerminatedGroupID:    timeout.TerminatedGroupId,
+		RequestBlockNumber:   request.Raw.BlockNumber,
+		RequestPreviousEntry: previousEntry,
+		BlockNumber:          timeout.Raw.BlockNumber,
+		TransactionHash:      timeout.Raw.TxHash,
+		ContractAddress:      bc.randomBeaconAddress.String(),
+	}, nil
 }

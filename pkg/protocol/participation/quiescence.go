@@ -468,29 +468,122 @@ func ParseBeaconRelayWorkID(workID string) (uint64, error) {
 	return startBlock, nil
 }
 
-// beaconRelayTimeoutReportDomain labels the digest of a filed relay entry
-// timeout report.
-const beaconRelayTimeoutReportDomain = "beacon_relay_entry_timeout_report"
-
-// BeaconRelayTimeoutReportReference renders the canonical identity of a relay
-// entry timeout report filed for the request that started at the given block.
+// BeaconRelayTimeoutSettlementReference renders the canonical identity of the
+// RandomBeacon's own record that a relay request was terminated by an accepted
+// timeout report: the request start block the permit was issued for, the
+// beacon's request identifier, and the group the beacon terminated.
 //
-// Unlike a relay entry, a filed report leaves nothing this node can prove
-// offline: the penalty lives on the RandomBeacon and the node only knows it
-// handed a transaction to a provider. What the identity can do is stop the
-// node choosing it. Deriving it from the request alone means one request has
-// exactly one report identity, so the audit recomputes the reference from the
-// permit's own work identity rather than reading a value the node picked —
-// there is no free component left to vary a report onto a request it was never
-// filed for.
-func BeaconRelayTimeoutReportReference(relayRequestStartBlock uint64) string {
-	requestBlock := make([]byte, 8)
-	binary.BigEndian.PutUint64(requestBlock, relayRequestStartBlock)
+// A filed report is not a penalty. The submitting call returns once the
+// transaction reaches a provider, and a transaction that reverts, is dropped,
+// or loses the race to another reporter leaves the beacon exactly as it was. So
+// the identity names the beacon's record rather than the node's submission: the
+// request identifier and terminated group are the two fields of a
+// RelayEntryTimedOut log, which the beacon emits at most once per request, so
+// the pair joins the reference to exactly one authenticated log. A node that
+// never earned the penalty cannot render this reference at all, because no such
+// log exists to read it from.
+//
+// The request start block leads the identity for the same reason it leads a
+// relay entry's: a request identifier alone does not say which permit the
+// settlement belongs to, and without that component a genuine settlement from
+// another request could stand in as this permit's result.
+func BeaconRelayTimeoutSettlementReference(
+	relayRequestStartBlock uint64,
+	requestID *big.Int,
+	terminatedGroupID uint64,
+) (string, error) {
+	if requestID == nil {
+		return "", fmt.Errorf("relay entry timeout request identifier is missing")
+	}
+	if requestID.Sign() < 0 {
+		return "", fmt.Errorf(
+			"relay entry timeout request identifier [%s] is negative",
+			requestID,
+		)
+	}
 
-	return TerminalResultReference(
-		beaconRelayTimeoutReportDomain,
-		requestBlock,
+	return strconv.FormatUint(relayRequestStartBlock, 10) + ":" +
+		requestID.String() + ":" +
+		strconv.FormatUint(terminatedGroupID, 10), nil
+}
+
+// ParseBeaconRelayTimeoutSettlementReference recovers the relay request start
+// block, the beacon's request identifier and the terminated group from a
+// reference produced by BeaconRelayTimeoutSettlementReference. Only that exact
+// rendering is accepted: a prefixed or zero-padded alias would name the same
+// settlement while failing every comparison the audit makes against the request
+// its permit names and against the authenticated log it joins to, which is
+// indistinguishable from naming no settlement at all.
+func ParseBeaconRelayTimeoutSettlementReference(reference string) (
+	relayRequestStartBlock uint64,
+	requestID *big.Int,
+	terminatedGroupID uint64,
+	err error,
+) {
+	parts := strings.Split(reference, ":")
+	if len(parts) != 3 {
+		return 0, nil, 0, fmt.Errorf(
+			"relay entry timeout settlement reference [%s] is not a request "+
+				"start block, request identifier and terminated group triple",
+			reference,
+		)
+	}
+
+	startBlock, err := parseCanonicalUint64(
+		"relay entry timeout settlement reference request start block",
+		parts[0],
 	)
+	if err != nil {
+		return 0, nil, 0, err
+	}
+
+	id, valid := new(big.Int).SetString(parts[1], 10)
+	if !valid || id.Sign() < 0 {
+		return 0, nil, 0, fmt.Errorf(
+			"relay entry timeout settlement reference request identifier [%s] "+
+				"is not a non-negative decimal integer",
+			parts[1],
+		)
+	}
+	if id.String() != parts[1] {
+		return 0, nil, 0, fmt.Errorf(
+			"relay entry timeout settlement reference request identifier [%s] "+
+				"is not canonically encoded",
+			parts[1],
+		)
+	}
+
+	groupID, err := parseCanonicalUint64(
+		"relay entry timeout settlement reference terminated group",
+		parts[2],
+	)
+	if err != nil {
+		return 0, nil, 0, err
+	}
+
+	return startBlock, id, groupID, nil
+}
+
+// parseCanonicalUint64 decodes an unsigned decimal component of a terminal
+// evidence reference, rejecting any rendering the reference builders do not
+// produce. A padded or signed alias names the same number while comparing
+// unequal to every reference the audit rebuilds, so it is refused rather than
+// normalized.
+func parseCanonicalUint64(name string, text string) (uint64, error) {
+	value, err := strconv.ParseUint(text, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf(
+			"%s [%s] is not an unsigned decimal integer: [%v]",
+			name,
+			text,
+			err,
+		)
+	}
+	if strconv.FormatUint(value, 10) != text {
+		return 0, fmt.Errorf("%s [%s] is not canonically encoded", name, text)
+	}
+
+	return value, nil
 }
 
 // BeaconRelayEntryReference renders the canonical identity of a recovered
@@ -843,26 +936,34 @@ func ValidateTerminalOutcome(
 			}
 		}
 
-		// A filed timeout report has no offline proof, so the one thing its
-		// identity must not be is a value the node chose. Derived from the
-		// permit's own request it is fully determined, and a report claiming
-		// any other request cannot be rendered at all.
+		// A timeout report completes on the beacon's own settlement record, so
+		// the reference must be readable as one and must answer the request the
+		// permit was issued for. A settlement lifted from another request is a
+		// real penalty that this permit did not earn.
 		if ceremony == BeaconTimeoutReport {
+			referenceStartBlock, _, _, err :=
+				ParseBeaconRelayTimeoutSettlementReference(evidence.Reference)
+			if err != nil {
+				return fmt.Errorf(
+					"invalid relay timeout settlement reference: [%w]",
+					err,
+				)
+			}
+
 			permitStartBlock, err := ParseBeaconRelayWorkID(workID)
 			if err != nil {
 				return fmt.Errorf(
-					"relay timeout report evidence cannot be bound to its "+
+					"relay timeout settlement evidence cannot be bound to its "+
 						"permit: [%w]",
 					err,
 				)
 			}
-			if expected := BeaconRelayTimeoutReportReference(
-				permitStartBlock,
-			); evidence.Reference != expected {
+			if referenceStartBlock != permitStartBlock {
 				return fmt.Errorf(
-					"relay timeout report reference [%s] is not the report "+
-						"identity of request start block [%d]",
-					evidence.Reference,
+					"relay timeout settlement reference terminates request "+
+						"start block [%d], but the permit was issued for "+
+						"request start block [%d]",
+					referenceStartBlock,
 					permitStartBlock,
 				)
 			}
@@ -966,8 +1067,9 @@ var completedEvidenceKinds = map[Ceremony]TerminalEvidenceKind{
 	// The forwarder relays other members' shares and produces no result of its
 	// own; reaching its close is the whole of its durable disposition.
 	BeaconRelayForwarding: TerminalEvidenceForwarderClosed,
-	// The filed timeout report, identified by its request and report blocks.
-	BeaconTimeoutReport: TerminalEvidenceProtocolResult,
+	// The beacon's own record of the terminated request, which is Ethereum
+	// state and never node-authored.
+	BeaconTimeoutReport: TerminalEvidenceEthereumTransaction,
 }
 
 func terminalOutcomeRecordLess(

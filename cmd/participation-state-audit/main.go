@@ -2627,6 +2627,91 @@ func validateRelayEntryTerminalResult(
 	return nil
 }
 
+// validateRelayTimeoutSettlement verifies the beacon timeout settlement a
+// completed timeout report outcome names.
+//
+// A filed report is not a penalty and the node knows only that it handed a
+// transaction to a provider, so the record has to name chain state rather than
+// anything the node derived. The reference carries the two fields of a
+// RelayEntryTimedOut log — the beacon's request identifier and the group it
+// terminated — which is what lets an operator join this record to exactly one
+// authenticated log. This audit runs offline and cannot fetch that log, so what
+// it establishes are the properties that must hold before the join is even
+// meaningful: the settlement answers the request its own permit was issued for,
+// and one settlement answers one request across the whole journal.
+//
+// The second check is the replay guard. A beacon terminates a request once, so
+// the same request identifier and group standing as the result of a second
+// request is a claim on a penalty that request never earned, however real the
+// underlying log is.
+func validateRelayTimeoutSettlement(
+	outcomeIndex int,
+	workID string,
+	reference string,
+	claimedTimeoutSettlements map[string]relayTimeoutSettlementClaim,
+) []string {
+	referenceStartBlock, requestID, terminatedGroupID, err :=
+		participation.ParseBeaconRelayTimeoutSettlementReference(reference)
+	if err != nil {
+		return []string{fmt.Sprintf(
+			"node-authored completed beacon timeout report outcome [%d] names "+
+				"settlement [%s], which is not a canonical settlement "+
+				"identity: [%v]",
+			outcomeIndex,
+			reference,
+			err,
+		)}
+	}
+
+	permitStartBlock, err := participation.ParseBeaconRelayWorkID(workID)
+	if err != nil {
+		return []string{fmt.Sprintf(
+			"node-authored completed beacon timeout report outcome [%d] "+
+				"belongs to permit work [%s], which names no relay request: "+
+				"[%v]",
+			outcomeIndex,
+			workID,
+			err,
+		)}
+	}
+	if referenceStartBlock != permitStartBlock {
+		return []string{fmt.Sprintf(
+			"node-authored completed beacon timeout report outcome [%d] names "+
+				"a settlement terminating request start block [%d], but its "+
+				"permit was issued for request start block [%d]",
+			outcomeIndex,
+			referenceStartBlock,
+			permitStartBlock,
+		)}
+	}
+
+	settlementIdentity := requestID.String() + ":" +
+		strconv.FormatUint(terminatedGroupID, 10)
+	if claimed, replayed :=
+		claimedTimeoutSettlements[settlementIdentity]; replayed {
+		if claimed.requestStartBlock != referenceStartBlock {
+			return []string{fmt.Sprintf(
+				"node-authored completed beacon timeout report outcome [%d] "+
+					"answers request start block [%d] with the settlement "+
+					"outcome [%d] already answered request start block [%d] "+
+					"with",
+				outcomeIndex,
+				referenceStartBlock,
+				claimed.outcomeIndex,
+				claimed.requestStartBlock,
+			)}
+		}
+	} else {
+		claimedTimeoutSettlements[settlementIdentity] =
+			relayTimeoutSettlementClaim{
+				outcomeIndex:      outcomeIndex,
+				requestStartBlock: referenceStartBlock,
+			}
+	}
+
+	return nil
+}
+
 // isInfinityG1 reports whether marshaled bn256 G1 bytes are the point at
 // infinity, which the curve encodes as all zeros.
 func isInfinityG1(point []byte) bool {
@@ -3675,6 +3760,13 @@ type relayEntryClaim struct {
 	requestStartBlock uint64
 }
 
+// relayTimeoutSettlementClaim records which relay request a node already
+// claimed a given beacon timeout settlement for.
+type relayTimeoutSettlementClaim struct {
+	outcomeIndex      int
+	requestStartBlock uint64
+}
+
 // cutoverModeViolation applies the release gate's one-value schedule to
 // persisted evidence. It is shared by quiescence records and both quarantine
 // namespaces so completed and interrupted work are judged by the same
@@ -4703,6 +4795,10 @@ func validateNodeTerminalOutcomes(
 	// which request each entry was already used for is what catches an entry
 	// replayed onto a second request.
 	claimedRelayEntries := make(map[string]relayEntryClaim)
+	// A beacon terminates one request once, so the journal-wide record of which
+	// request each settlement was already used for is what catches a real
+	// penalty replayed onto a second request.
+	claimedTimeoutSettlements := make(map[string]relayTimeoutSettlementClaim)
 	tbtcQuarantined := make(map[quarantineIdentity]struct{})
 	for _, quarantined := range auditManifest.TBTCQuarantinedOutputs {
 		tbtcQuarantined[quarantineIdentity{
@@ -4884,6 +4980,16 @@ func validateNodeTerminalOutcomes(
 						outcome.Evidence.Reference,
 						beaconGroupKeys,
 						claimedRelayEntries,
+					)...,
+				)
+			case participation.BeaconTimeoutReport:
+				violations = append(
+					violations,
+					validateRelayTimeoutSettlement(
+						i,
+						outcome.Permit.WorkID,
+						outcome.Evidence.Reference,
+						claimedTimeoutSettlements,
 					)...,
 				)
 			default:

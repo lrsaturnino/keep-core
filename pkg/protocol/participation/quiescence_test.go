@@ -315,11 +315,13 @@ func isBeaconRelayCeremony(ceremony Ceremony) bool {
 		ceremony == BeaconRelayForwarding
 }
 
-// testCompletedResultReference renders a protocol-result reference the given
-// ceremony accepts. Most ceremonies name a digest of their own result; the two
+// testCompletedResultReference renders a completed-outcome reference the given
+// ceremony accepts. Most ceremonies name a digest of their own result; the
 // relay ceremonies name the request they answer, so no placeholder can stand
 // in for one. A relay entry additionally names the group, the previous entry
-// and the entry itself so the offline audit can verify the signature.
+// and the entry itself so the offline audit can verify the signature, and a
+// timeout report names the beacon's own request identifier and terminated
+// group so the audit can join it to an authenticated log.
 func testCompletedResultReference(
 	t *testing.T,
 	ceremony Ceremony,
@@ -328,7 +330,15 @@ func testCompletedResultReference(
 	t.Helper()
 
 	if ceremony == BeaconTimeoutReport {
-		return BeaconRelayTimeoutReportReference(testRelayRequestStartBlock)
+		reference, err := BeaconRelayTimeoutSettlementReference(
+			testRelayRequestStartBlock,
+			big.NewInt(7),
+			3,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return reference
 	}
 	if ceremony != BeaconRelaySigning {
 		return digest
@@ -350,12 +360,15 @@ func testCompletedResultReference(
 // TestTerminalResultReference_IsAcceptedAsEvidence asserts a derived reference
 // passes the journal's own identity rules, so a ceremony that authors one can
 // actually record it.
+//
+// The list is exactly the ceremonies whose durable result is a protocol result.
+// A timeout report is deliberately absent: its result is the beacon's own
+// settlement record, so it has no derived reference to accept.
 func TestTerminalResultReference_IsAcceptedAsEvidence(t *testing.T) {
 	for _, ceremony := range []Ceremony{
 		TBTCHeartbeat,
 		TBTCWalletCoordination,
 		BeaconRelaySigning,
-		BeaconTimeoutReport,
 	} {
 		if err := ValidateTerminalOutcome(
 			ceremony,
@@ -375,6 +388,112 @@ func TestTerminalResultReference_IsAcceptedAsEvidence(t *testing.T) {
 				ceremony,
 				err,
 			)
+		}
+	}
+}
+
+// TestBeaconRelayTimeoutSettlementReference_RoundTrips asserts the beacon
+// settlement identity survives rendering and parsing unchanged, and that only
+// its exact canonical rendering is accepted. An alias that names the same
+// settlement while failing every comparison the audit makes against it is
+// indistinguishable from naming no settlement at all.
+func TestBeaconRelayTimeoutSettlementReference_RoundTrips(t *testing.T) {
+	requestID := big.NewInt(4_294_967_297)
+	const terminatedGroupID = uint64(9)
+
+	reference, err := BeaconRelayTimeoutSettlementReference(
+		testRelayRequestStartBlock,
+		requestID,
+		terminatedGroupID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parsedStartBlock, parsedRequestID, parsedGroupID, err :=
+		ParseBeaconRelayTimeoutSettlementReference(reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsedStartBlock != testRelayRequestStartBlock {
+		t.Errorf(
+			"request start block did not round-trip\n"+
+				"expected: [%d]\nactual:   [%d]",
+			testRelayRequestStartBlock,
+			parsedStartBlock,
+		)
+	}
+	if parsedRequestID.Cmp(requestID) != 0 {
+		t.Errorf(
+			"request identifier did not round-trip\n"+
+				"expected: [%s]\nactual:   [%s]",
+			requestID,
+			parsedRequestID,
+		)
+	}
+	if parsedGroupID != terminatedGroupID {
+		t.Errorf(
+			"terminated group did not round-trip\n"+
+				"expected: [%d]\nactual:   [%d]",
+			terminatedGroupID,
+			parsedGroupID,
+		)
+	}
+
+	// A settlement with no request identifier names no log, so it cannot be
+	// rendered at all rather than being rendered as an absent component.
+	for _, test := range []struct {
+		name      string
+		requestID *big.Int
+	}{
+		{name: "missing request identifier", requestID: nil},
+		{name: "negative request identifier", requestID: big.NewInt(-1)},
+	} {
+		if _, err := BeaconRelayTimeoutSettlementReference(
+			testRelayRequestStartBlock,
+			test.requestID,
+			terminatedGroupID,
+		); err == nil {
+			t.Errorf("expected [%s] to be rejected", test.name)
+		}
+	}
+
+	for _, test := range []struct {
+		name      string
+		reference string
+	}{
+		{name: "no components", reference: ""},
+		{name: "two components", reference: "1000:11"},
+		{name: "four components", reference: reference + ":1"},
+		{name: "prefixed alias", reference: "0x" + reference},
+		// Any component rendered other than canonically names the same
+		// settlement while comparing unequal to the reference the audit
+		// rebuilds, which reads as naming none.
+		{name: "zero-padded start block", reference: "0" + reference},
+		{name: "signed start block", reference: "+" + reference},
+		{name: "hexadecimal start block", reference: "0x" +
+			strconv.FormatUint(testRelayRequestStartBlock, 16) + ":" +
+			requestID.String() + ":" +
+			strconv.FormatUint(terminatedGroupID, 10)},
+		{name: "zero-padded request identifier", reference: strconv.FormatUint(
+			testRelayRequestStartBlock, 10) + ":0" + requestID.String() + ":" +
+			strconv.FormatUint(terminatedGroupID, 10)},
+		{name: "signed request identifier", reference: strconv.FormatUint(
+			testRelayRequestStartBlock, 10) + ":+" + requestID.String() + ":" +
+			strconv.FormatUint(terminatedGroupID, 10)},
+		{name: "negative request identifier", reference: strconv.FormatUint(
+			testRelayRequestStartBlock, 10) + ":-11:" +
+			strconv.FormatUint(terminatedGroupID, 10)},
+		{name: "zero-padded terminated group", reference: strconv.FormatUint(
+			testRelayRequestStartBlock, 10) + ":" + requestID.String() + ":09"},
+		{name: "non-numeric terminated group", reference: strconv.FormatUint(
+			testRelayRequestStartBlock, 10) + ":" + requestID.String() +
+			":group"},
+	} {
+		if _, _, _, err := ParseBeaconRelayTimeoutSettlementReference(
+			test.reference,
+		); err == nil {
+			t.Errorf("expected [%s] to be rejected", test.name)
 		}
 	}
 }

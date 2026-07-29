@@ -247,6 +247,13 @@ func (mbc *mockBeaconChain) IsEntryInProgress() (bool, error) {
 	panic("not implemented")
 }
 
+func (mbc *mockBeaconChain) RelayEntryTimeoutSettlement(
+	uint64,
+	[]byte,
+) (*event.RelayEntryTimeoutSettlement, error) {
+	panic("not implemented")
+}
+
 func (mbc *mockBeaconChain) CurrentRequestStartBlock() (*big.Int, error) {
 	mbc.currentRequestStartBlockExecutionCount++
 	startBlock, err := mbc.currentRequestStartBlockFn(mbc.currentRequestStartBlockExecutionCount)

@@ -14,6 +14,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/bls"
 
 	"github.com/keep-network/keep-core/internal/testutils"
+	"github.com/keep-network/keep-core/pkg/beacon/event"
 	"github.com/keep-network/keep-core/pkg/protocol/participation"
 )
 
@@ -352,14 +353,31 @@ func TestRecordRelayEntryTerminalOutcome_ReferenceVerifies(t *testing.T) {
 	}
 }
 
+// beaconTimeoutSettlement builds the beacon's own record of a terminated relay
+// request, as the chain handle resolves it from canonical logs.
+func beaconTimeoutSettlement(
+	requestBlock uint64,
+	requestID int64,
+	terminatedGroupID uint64,
+) *event.RelayEntryTimeoutSettlement {
+	return &event.RelayEntryTimeoutSettlement{
+		RequestID:            big.NewInt(requestID),
+		TerminatedGroupID:    terminatedGroupID,
+		RequestBlockNumber:   requestBlock,
+		RequestPreviousEntry: []byte("previous-entry"),
+		BlockNumber:          requestBlock + 64,
+		ContractAddress:      "0xbeac0n",
+	}
+}
+
 // TestRecordRelayTimeoutTerminalOutcome covers the relay entry monitor. The
-// monitor exists only to file the penalty report, and only a report the beacon
-// confirmed is a durable result; a report the node merely handed to a provider
-// created no penalty state it can account for.
+// monitor exists only to file the penalty report, and only the settlement the
+// beacon itself recorded is a durable result; a report the node merely handed
+// to a provider created no penalty state it can account for.
 func TestRecordRelayTimeoutTerminalOutcome(t *testing.T) {
 	const relayRequestBlock = uint64(100)
 
-	t.Run("no timeout reported", func(t *testing.T) {
+	t.Run("no settlement the beacon recorded", func(t *testing.T) {
 		permit := newRecordingRelayPermit(
 			participation.BeaconTimeoutReport,
 			relayRequestBlock,
@@ -369,7 +387,7 @@ func TestRecordRelayTimeoutTerminalOutcome(t *testing.T) {
 			&testutils.MockLogger{},
 			permit,
 			relayRequestBlock,
-			false,
+			nil,
 		)
 
 		evidence := assertRecordedTerminalOutcome(
@@ -387,7 +405,7 @@ func TestRecordRelayTimeoutTerminalOutcome(t *testing.T) {
 		}
 	})
 
-	t.Run("timeout report the beacon confirmed", func(t *testing.T) {
+	t.Run("a settlement the beacon recorded", func(t *testing.T) {
 		permit := newRecordingRelayPermit(
 			participation.BeaconTimeoutReport,
 			relayRequestBlock,
@@ -397,21 +415,26 @@ func TestRecordRelayTimeoutTerminalOutcome(t *testing.T) {
 			&testutils.MockLogger{},
 			permit,
 			relayRequestBlock,
-			true,
+			beaconTimeoutSettlement(relayRequestBlock, 7, 3),
 		)
 
 		evidence := assertRecordedTerminalOutcome(
 			t,
 			permit,
 			participation.TerminalOutcomeCompleted,
-			participation.TerminalEvidenceProtocolResult,
+			participation.TerminalEvidenceEthereumTransaction,
 		)
 
-		// The identity is fully determined by the request, so the node has no
-		// component left to choose.
-		expected := participation.BeaconRelayTimeoutReportReference(
+		// The identity names the authenticated log the audit joins to: the
+		// beacon's own request identifier and the group it terminated.
+		expected, err := participation.BeaconRelayTimeoutSettlementReference(
 			relayRequestBlock,
+			big.NewInt(7),
+			3,
 		)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if evidence.Reference != expected {
 			t.Errorf(
 				"unexpected evidence reference\nexpected: [%s]\nactual:   [%s]",
@@ -421,9 +444,42 @@ func TestRecordRelayTimeoutTerminalOutcome(t *testing.T) {
 		}
 	})
 
+	// A settlement whose identity cannot be rendered is one the offline audit
+	// could not join to any log, so it must not clear the rollback barrier.
+	t.Run("a settlement naming no request identifier", func(t *testing.T) {
+		permit := newRecordingRelayPermit(
+			participation.BeaconTimeoutReport,
+			relayRequestBlock,
+		)
+
+		settlement := beaconTimeoutSettlement(relayRequestBlock, 7, 3)
+		settlement.RequestID = nil
+
+		recordRelayTimeoutTerminalOutcome(
+			&testutils.MockLogger{},
+			permit,
+			relayRequestBlock,
+			settlement,
+		)
+
+		evidence := assertRecordedTerminalOutcome(
+			t,
+			permit,
+			participation.TerminalOutcomeExhausted,
+			participation.TerminalEvidenceNoThreshold,
+		)
+
+		if evidence.Reference != "" {
+			t.Errorf(
+				"expected no evidence reference, got [%s]",
+				evidence.Reference,
+			)
+		}
+	})
+
 	t.Run("distinct requests produce distinct references", func(t *testing.T) {
 		references := make([]string, 0, 2)
-		for _, requestBlock := range []uint64{100, 200} {
+		for i, requestBlock := range []uint64{100, 200} {
 			permit := newRecordingRelayPermit(
 				participation.BeaconTimeoutReport,
 				requestBlock,
@@ -433,14 +489,14 @@ func TestRecordRelayTimeoutTerminalOutcome(t *testing.T) {
 				&testutils.MockLogger{},
 				permit,
 				requestBlock,
-				true,
+				beaconTimeoutSettlement(requestBlock, int64(i+1), 3),
 			)
 
 			evidence := assertRecordedTerminalOutcome(
 				t,
 				permit,
 				participation.TerminalOutcomeCompleted,
-				participation.TerminalEvidenceProtocolResult,
+				participation.TerminalEvidenceEthereumTransaction,
 			)
 			references = append(references, evidence.Reference)
 		}
@@ -453,11 +509,11 @@ func TestRecordRelayTimeoutTerminalOutcome(t *testing.T) {
 		}
 	})
 
-	// The report a node filed for one request must not settle the permit it
-	// holds for another. A filed report has no offline proof at all, so the
-	// only thing standing between it and an arbitrary claim is that its
-	// identity is derived from the permit's own request.
-	t.Run("a report filed for another request", func(t *testing.T) {
+	// A settlement the beacon recorded against one request must not settle the
+	// permit a node holds for another. The penalty is real either way, so the
+	// component that keeps it on its own permit is the request start block the
+	// identity leads with.
+	t.Run("a settlement recorded for another request", func(t *testing.T) {
 		permit := newRecordingRelayPermit(
 			participation.BeaconTimeoutReport,
 			relayRequestBlock,
@@ -467,7 +523,7 @@ func TestRecordRelayTimeoutTerminalOutcome(t *testing.T) {
 			&testutils.MockLogger{},
 			permit,
 			relayRequestBlock+1,
-			true,
+			beaconTimeoutSettlement(relayRequestBlock+1, 7, 3),
 		)
 
 		recorded := permit.recorded()
@@ -481,7 +537,7 @@ func TestRecordRelayTimeoutTerminalOutcome(t *testing.T) {
 			recorded[0].evidence,
 		); err == nil {
 			t.Error(
-				"a timeout report naming another request settled this permit",
+				"a timeout settlement naming another request settled this permit",
 			)
 		}
 	})

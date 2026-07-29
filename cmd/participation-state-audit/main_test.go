@@ -3951,6 +3951,167 @@ func TestValidateRelayEntryTerminalResult_OneEntryAnswersOneRequest(
 	}
 }
 
+// testTimeoutSettlementReference renders the beacon settlement identity a
+// completed timeout report outcome carries.
+func testTimeoutSettlementReference(
+	t *testing.T,
+	requestStartBlock uint64,
+	requestID int64,
+	terminatedGroupID uint64,
+) string {
+	t.Helper()
+
+	reference, err := participation.BeaconRelayTimeoutSettlementReference(
+		requestStartBlock,
+		big.NewInt(requestID),
+		terminatedGroupID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reference
+}
+
+// TestValidateRelayTimeoutSettlement asserts the offline audit holds a
+// completed timeout report to a settlement identity it can join to exactly one
+// authenticated beacon log, and to the request its own permit was issued for.
+func TestValidateRelayTimeoutSettlement(t *testing.T) {
+	const requestStartBlock = uint64(1_000)
+
+	tests := map[string]struct {
+		workID          string
+		reference       string
+		expectViolation bool
+	}{
+		"a settlement terminating the permit's own request": {
+			workID: participation.BeaconRelayWorkID(requestStartBlock),
+			reference: testTimeoutSettlementReference(
+				t,
+				requestStartBlock,
+				11,
+				4,
+			),
+		},
+		// A real penalty, earned by another request. Nothing about the log it
+		// joins to is wrong; what is wrong is the permit it is settling.
+		"a settlement terminating another request": {
+			workID: participation.BeaconRelayWorkID(requestStartBlock),
+			reference: testTimeoutSettlementReference(
+				t,
+				requestStartBlock+1,
+				11,
+				4,
+			),
+			expectViolation: true,
+		},
+		"a permit that names no relay request": {
+			workID: "not-a-relay-request",
+			reference: testTimeoutSettlementReference(
+				t,
+				requestStartBlock,
+				11,
+				4,
+			),
+			expectViolation: true,
+		},
+		// A digest is exactly what the record must not be: it names no log an
+		// operator could fetch.
+		"a digest standing in for a settlement": {
+			workID: participation.BeaconRelayWorkID(requestStartBlock),
+			reference: participation.TerminalResultReference(
+				"domain",
+				[]byte("result"),
+			),
+			expectViolation: true,
+		},
+		"a settlement identity missing its terminated group": {
+			workID:          participation.BeaconRelayWorkID(requestStartBlock),
+			reference:       "1000:11",
+			expectViolation: true,
+		},
+		"a settlement identity with a padded request start block": {
+			workID:          participation.BeaconRelayWorkID(requestStartBlock),
+			reference:       "01000:11:4",
+			expectViolation: true,
+		},
+		"a settlement identity with a padded request identifier": {
+			workID:          participation.BeaconRelayWorkID(requestStartBlock),
+			reference:       "1000:011:4",
+			expectViolation: true,
+		},
+		"a settlement identity with a negative request identifier": {
+			workID:          participation.BeaconRelayWorkID(requestStartBlock),
+			reference:       "1000:-11:4",
+			expectViolation: true,
+		},
+	}
+
+	for testName, test := range tests {
+		t.Run(testName, func(t *testing.T) {
+			violations := validateRelayTimeoutSettlement(
+				0,
+				test.workID,
+				test.reference,
+				make(map[string]relayTimeoutSettlementClaim),
+			)
+
+			if hasViolation := len(violations) != 0; hasViolation !=
+				test.expectViolation {
+				t.Errorf(
+					"unexpected violations\nexpected any: [%t]\nactual: %v",
+					test.expectViolation,
+					violations,
+				)
+			}
+		})
+	}
+}
+
+// TestValidateRelayTimeoutSettlement_OneSettlementAnswersOneRequest asserts a
+// beacon settlement cannot settle two permits issued for different requests.
+// The beacon terminates a request once, so the same request identifier and
+// terminated group standing as a second request's result is a claim on a
+// penalty that request never earned.
+func TestValidateRelayTimeoutSettlement_OneSettlementAnswersOneRequest(
+	t *testing.T,
+) {
+	const (
+		firstRequestStartBlock  = uint64(1_000)
+		secondRequestStartBlock = uint64(2_000)
+	)
+
+	claimed := make(map[string]relayTimeoutSettlementClaim)
+
+	record := func(outcomeIndex int, requestStartBlock uint64) []string {
+		return validateRelayTimeoutSettlement(
+			outcomeIndex,
+			participation.BeaconRelayWorkID(requestStartBlock),
+			testTimeoutSettlementReference(t, requestStartBlock, 11, 4),
+			claimed,
+		)
+	}
+
+	if violations := record(0, firstRequestStartBlock); len(violations) != 0 {
+		t.Fatalf("the first use of a settlement was rejected: %v", violations)
+	}
+
+	// The same permit's record written twice — a retried journal write — is the
+	// same claim, not a replay.
+	if violations := record(1, firstRequestStartBlock); len(violations) != 0 {
+		t.Errorf(
+			"a repeated record of the same settlement was rejected: %v",
+			violations,
+		)
+	}
+
+	if violations := record(2, secondRequestStartBlock); len(violations) == 0 {
+		t.Error(
+			"a settlement already used for one request was accepted as the " +
+				"result of another",
+		)
+	}
+}
+
 // TestRunAudit_SelfAttestedEqualOmissionCannotHideRealGatePermit proves the
 // prior report-only attack is closed: even if an external generator reports a
 // shortened outcome list and would have shortened its own duplicate counts

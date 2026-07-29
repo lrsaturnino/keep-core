@@ -437,6 +437,13 @@ func (c *localChain) CurrentRequestGroupPublicKey() ([]byte, error) {
 	panic("not implemented")
 }
 
+func (c *localChain) RelayEntryTimeoutSettlement(
+	uint64,
+	[]byte,
+) (*event.RelayEntryTimeoutSettlement, error) {
+	return nil, errNoRelayRequestState
+}
+
 func (c *localChain) GetRelayEntryTimeoutReports() []uint64 {
 	c.relayEntryTimeoutReportsMutex.Lock()
 	defer c.relayEntryTimeoutReportsMutex.Unlock()

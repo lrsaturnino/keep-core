@@ -45,6 +45,24 @@ type RelayEntryInterface interface {
 	CurrentRequestPreviousEntry() ([]byte, error)
 	// CurrentRequestGroupPublicKey returns group public key for the current request.
 	CurrentRequestGroupPublicKey() ([]byte, error)
+	// RelayEntryTimeoutSettlement returns the chain's own record that the relay
+	// request made at the given block, over the given previous entry, was
+	// terminated by an accepted timeout report.
+	//
+	// It returns a nil settlement and no error whenever the chain holds no such
+	// record. That covers a request answered by a delivered entry, a report
+	// that has not been mined or accepted yet, and a canonical chain that no
+	// longer holds the request at all — the three cases a caller must not read
+	// as a penalty. An error means the chain could not be asked, which is also
+	// not a penalty but is worth reporting separately.
+	//
+	// Implementations must resolve the record from canonical chain state on
+	// every call rather than from anything the node observed earlier, so that a
+	// reorg which removes the request or the timeout takes the record with it.
+	RelayEntryTimeoutSettlement(
+		requestBlockNumber uint64,
+		requestPreviousEntry []byte,
+	) (*event.RelayEntryTimeoutSettlement, error)
 }
 
 // GroupSelectionInterface defines the subset of the beacon chain interface that
