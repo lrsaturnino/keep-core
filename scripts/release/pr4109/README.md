@@ -509,6 +509,17 @@ required to happen while a permit of the other mode is live on the same node —
 a gate draining a single population never has to keep the two modes apart,
 which is the fence quiescence is for.
 
+That second population is held to the same standard as the first, because the
+gate's promise covers every permit it was holding and the gate asks that both
+live modes finish or enter audited quarantine. So the `quiesce-legacy-inflight`
+phase must name the work it puts in flight beside the seeded permit, that work
+must be anchored on the other side of C from the drained population — a second
+population on the same side exercises no fence — the node's own gate must
+report holding exactly those permits for that mode, and the
+`quiesce-legacy-terminal` phase must report an outcome for every one of them
+alongside the seeded population's. A gate list that is merely non-empty says
+the fence was there and nothing about what the far side of it ended up doing.
+
 The straggler control binds its roster entry to the straggler's own operator.
 The prior node publishes the address it signs as at `/diagnostics`
 (`client_info.chain_address`), and that address is read off it while it is

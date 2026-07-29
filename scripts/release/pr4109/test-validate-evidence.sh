@@ -2056,6 +2056,9 @@ beacon_dkg@841@seed841=succeeded=${QUIESCE_TX2}=0xgroup841"
   QUIESCE_FROM_SEED=0
   QUIESCE_COLIVE_REQUIRED=0
   QUIESCE_COLIVE_PERMITS=""
+  QUIESCE_COLIVE_WORK=""
+  QUIESCE_COLIVE_MODE=""
+  QUIESCE_COLIVE_MISANCHORED=""
   QUIESCE_SEEDED_ASKED=0
   QUIESCE_SEEDED_RC=0
   QUIESCE_SEEDED_WORK=""
@@ -2075,7 +2078,7 @@ run_verdict quiesce_case :
 check "a quiescence that refused new work and drained its permits holds" 0 \
   "refused it on its own account \(tbtc_signing \+1" \
   "in-flight count observed at zero" \
-  "every piece of work it was holding settled on chain" \
+  "every piece of work it was holding across the security-v2 mode settled on chain" \
   "tbtc_signing@840@wallet840 \(${QUIESCE_TX1}, 0xsigned840\)"
 
 # The reading a gauge cannot carry, and the one this step used to stop at. The
@@ -3662,7 +3665,17 @@ legacy_quiesce_case() {
   # shellcheck disable=SC2034
   QUIESCE_COLIVE_REQUIRED=1
   # shellcheck disable=SC2034
+  QUIESCE_COLIVE_MODE="security-v2"
+  # shellcheck disable=SC2034
   QUIESCE_COLIVE_PERMITS="r1-node-1=colive900#other-1"
+  # The other mode's population is followed to an end on the same footing as
+  # the seeded one, so the fixture names the work behind that permit and the
+  # outcome the driver reported for it beside the seeded work's.
+  # shellcheck disable=SC2034
+  QUIESCE_COLIVE_WORK="tbtc_signing@1200@colive900=${QUIESCE_TX3}=r1-node-1~other-1"
+  # shellcheck disable=SC2034
+  QUIESCE_TERMINAL="${QUIESCE_TERMINAL} \
+tbtc_signing@1200@colive900=succeeded=${QUIESCE_TX3}=0xsigned1200"
   "$@"
   quiescence_verdict r1-node-1 \
     "quiescence with an in-flight legacy permit" "" legacy
@@ -3683,6 +3696,7 @@ check "a draining node that never quiesced refutes the legacy half too" 1 \
 # in-flight population directly and so cannot see that; these drive
 # run_quiescence_control itself, which is where the population is collected.
 QUIESCE_SEQ_TX="0xff88888888888888888888888888888888888888888888888888888888888888"
+QUIESCE_SEQ_COLIVE_TX="0xff99999999999999999999999999999999999999999999999999999999999999"
 
 # Everything run_quiescence_control reaches outside its own logic. The drain is
 # stubbed to succeed on its first sample so the ladder reaches the rung that
@@ -3758,14 +3772,35 @@ quiesce_sequencing_stubs() {
     esac
   }
 
+  # The other mode's work, which a seeded control puts in flight beside the
+  # permit it drains. It is anchored past C so it really is the other mode,
+  # and the control follows it to an outcome like any other held permit, so
+  # the terminal phase reports it beside the drained population's.
+  QUIESCE_SEQ_COLIVE_WORK="tbtc_signing@1200@colive900\
+=${QUIESCE_SEQ_COLIVE_TX}=r1-node-1~other-1"
+  QUIESCE_SEQ_COLIVE_TERMINAL="tbtc_signing@1200@colive900=succeeded\
+=${QUIESCE_SEQ_COLIVE_TX}=0xsigned1200"
+  # Empty for the unseeded control, whose in-flight phase originates the
+  # population it goes on to drain rather than a second one beside it.
+  QUIESCE_SEQ_SEEDED=0
+
   run_work_driver() {
     WORK_DRIVER_RC=0
     WORK_DRIVER_TX_COUNT=1
     WORK_DRIVER_ORIGINATED="tbtc_signing"
+    if ((QUIESCE_SEQ_SEEDED == 1)) && [[ "$1" == *-inflight ]]; then
+      WORK_DRIVER_ORIGINATED_WORK="${QUIESCE_SEQ_COLIVE_WORK}"
+      WORK_DRIVER_BOUND_RESULTS="${QUIESCE_SEQ_COLIVE_TERMINAL}"
+      return 0
+    fi
     WORK_DRIVER_ORIGINATED_WORK="tbtc_signing@${QUIESCE_SEQ_ANCHOR}\
 @wallet${QUIESCE_SEQ_ANCHOR}=${QUIESCE_SEQ_TX}=r1-node-1~member-1"
     WORK_DRIVER_BOUND_RESULTS="tbtc_signing@${QUIESCE_SEQ_ANCHOR}\
 @wallet${QUIESCE_SEQ_ANCHOR}=succeeded=${QUIESCE_SEQ_TX}=0xsigned"
+    if ((QUIESCE_SEQ_SEEDED == 1)) && [[ "$1" == *-terminal ]]; then
+      WORK_DRIVER_BOUND_RESULTS="${WORK_DRIVER_BOUND_RESULTS} \
+${QUIESCE_SEQ_COLIVE_TERMINAL}"
+    fi
   }
 }
 
@@ -3799,6 +3834,8 @@ quiesce_seeded_case() {
   # shellcheck disable=SC2034
   PR4109_WORK_DRIVER="/nonexistent/driver-is-stubbed"
   quiesce_sequencing_stubs 840
+  # shellcheck disable=SC2034
+  QUIESCE_SEQ_SEEDED=1
   # shellcheck disable=SC2034
   QUIESCE_SEEDED_ASKED=1
   # shellcheck disable=SC2034
@@ -3855,6 +3892,31 @@ run_verdict quiesce_seeded_case eval \
   'QUIESCE_SEQ_COLIVE="unreadable on r1-node-1"'
 check "an unread other-mode population leaves the fence unexercised" 3 \
   "could not be asked whether it held a permit of the other mode"
+
+# Both live modes have to finish or enter audited quarantine, so the other
+# mode's permits are followed to an end on the same footing as the drained
+# one's. These four take that half away in turn: a gate list nobody can match
+# to work, a second population anchored on the same side of C as the first,
+# the two disagreeing about which permits were live, and — the reading the
+# whole half exists for — an other-mode permit the drain simply never accounts
+# for.
+run_verdict quiesce_seeded_case eval 'QUIESCE_SEQ_COLIVE_WORK=""'
+check "an other-mode permit nothing identifies cannot be followed" 3 \
+  "the driver named no work it put there"
+
+run_verdict quiesce_seeded_case eval \
+  'QUIESCE_SEQ_COLIVE_WORK="tbtc_signing@840@colive900=${QUIESCE_SEQ_COLIVE_TX}=r1-node-1~other-1"'
+check "a second population on the same side of C exercises no fence" 3 \
+  "is not security-v2-anchored work"
+
+run_verdict quiesce_seeded_case eval \
+  'QUIESCE_SEQ_COLIVE="r1-node-1=somethingelse#other-9"'
+check "an other-mode permit the gate never held is the driver's word" 3 \
+  "does not include r1-node-1=colive900#other-1"
+
+run_verdict quiesce_seeded_case eval 'QUIESCE_SEQ_COLIVE_TERMINAL=""'
+check "an other-mode permit with no terminal outcome is unaccounted for" 3 \
+  "reported no terminal outcome for tbtc_signing@1200@colive900"
 
 # The accounting every "was work offered here" rung above reads. It comes off a
 # real driver invocation rather than a constructed reading, because what is

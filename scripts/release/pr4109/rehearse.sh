@@ -6341,6 +6341,15 @@ QUIESCE_TERMINAL_RC=0
 QUIESCE_PERMITS_BEFORE=""
 QUIESCE_COLIVE_PERMITS=""
 QUIESCE_COLIVE_REQUIRED=0
+# The other mode's population, beside the one the control is named for. The
+# fence a quiescing gate has to hold is the one where both modes are live at
+# once, and the gate's promise is about every permit it was holding — so the
+# other mode's permits are followed to a terminal outcome on the same footing
+# as the named mode's. A gate list that is merely non-empty says the fence was
+# exercised and nothing at all about what the far side of it ended up doing.
+QUIESCE_COLIVE_WORK=""
+QUIESCE_COLIVE_MODE=""
+QUIESCE_COLIVE_MISANCHORED=""
 QUIESCE_FROM_SEED=0
 
 # The legacy permit the quiescence control drains, put on the chain before the
@@ -6397,6 +6406,17 @@ quiescence_assertion() {
 # side of C the release is leaving and the side it is going to.
 quiescence_verdict() {
   local node="$1" step="$2" assertion="$3" mode="$4"
+
+  # Every permit the node was holding when it was told to stop, both modes
+  # together. Smoke gate 6 asks that both live modes finish or enter audited
+  # quarantine, so the terminal rungs below decide over the union rather than
+  # over the mode the control happens to be named for; reconciling one half
+  # would let the other end unaccounted while the step still reported that the
+  # gate let what it held finish.
+  local reconciled_work="${QUIESCE_INFLIGHT_WORK}"
+  if ((QUIESCE_COLIVE_REQUIRED == 1)); then
+    reconciled_work="${reconciled_work}${QUIESCE_COLIVE_WORK:+ ${QUIESCE_COLIVE_WORK}}"
+  fi
 
   # A seeded control's subject was put on the chain before C and has to be
   # shown to have been there. Everything below decides on the permits the node
@@ -6539,6 +6559,46 @@ issued; a gate draining one population never has to keep the two modes apart, \
 so this needs a permit of the other mode live beside the ${mode} one it is \
 about"
     quiescence_assertion "${assertion}" false "${step}"
+  elif ((QUIESCE_COLIVE_REQUIRED == 1)) &&
+    [[ -z "${QUIESCE_COLIVE_WORK//[[:space:]]/}" ]]; then
+    # The gate list is non-empty, which is where this rung used to stop. It
+    # names permits and not the work behind them, so nothing here could be
+    # followed to an outcome — and the gate's promise covers these permits too.
+    block_step "${step}" "${node} held ${QUIESCE_COLIVE_PERMITS} of the \
+${QUIESCE_COLIVE_MODE} mode beside the ${mode} permits it was drained for, but \
+the driver named no work it put there; a permit nothing identifies cannot be \
+followed to an end, so half the population this drain covers would go \
+unaccounted for"
+    quiescence_assertion "${assertion}" false "${step}"
+  elif ((QUIESCE_COLIVE_REQUIRED == 1)) &&
+    [[ -n "${QUIESCE_COLIVE_MISANCHORED}" ]]; then
+    block_step "${step}" "${node} held ${QUIESCE_COLIVE_MISANCHORED} beside \
+the ${mode} permits it was drained for, which is not \
+${QUIESCE_COLIVE_MODE}-anchored work; the fence this control is about is the \
+one where both modes are live at once, and a second population anchored on the \
+same side of C as the first leaves it unexercised"
+    quiescence_assertion "${assertion}" false "${step}"
+  elif ((QUIESCE_COLIVE_REQUIRED == 1)) &&
+    [[ -n "$(absent_tokens \
+      "$(held_permit_identities "${QUIESCE_COLIVE_WORK}")" \
+      "${QUIESCE_COLIVE_PERMITS}")" ]]; then
+    block_step "${step}" "${node} reported holding ${QUIESCE_COLIVE_PERMITS} \
+of the ${QUIESCE_COLIVE_MODE} mode, which does not include \
+$(absent_tokens "$(held_permit_identities "${QUIESCE_COLIVE_WORK}")" \
+      "${QUIESCE_COLIVE_PERMITS}") from the driver's account of the work it \
+put there; a permit the issuing gate never reported holding is one the driver \
+alone vouches for"
+    quiescence_assertion "${assertion}" false "${step}"
+  elif ((QUIESCE_COLIVE_REQUIRED == 1)) &&
+    [[ -n "$(absent_tokens "${QUIESCE_COLIVE_PERMITS}" \
+      "$(held_permit_identities "${QUIESCE_COLIVE_WORK}")")" ]]; then
+    block_step "${step}" "${node} was drained holding \
+$(absent_tokens "${QUIESCE_COLIVE_PERMITS}" \
+      "$(held_permit_identities "${QUIESCE_COLIVE_WORK}")") of the \
+${QUIESCE_COLIVE_MODE} mode beside the work the driver named; an unidentified \
+permit draining alongside the named ones is one this step would speak for \
+without ever having followed it"
+    quiescence_assertion "${assertion}" false "${step}"
   elif ((QUIESCE_TERMINAL_ASKED == 0)); then
     block_step "${step}" "${node} let all ${QUIESCE_HELD_BEFORE} held permits \
 go without being force-aborted, but the driver was never asked what became of \
@@ -6553,29 +6613,29 @@ stops wherever it failed; held permits reconciled against a partial report \
 take the outcomes it happened to reach for all there were"
     quiescence_assertion "${assertion}" false "${step}"
   elif [[ -n "$(unoriginated_terminals "${QUIESCE_TERMINAL}" \
-    "${QUIESCE_INFLIGHT_WORK}")" ]]; then
+    "${reconciled_work}")" ]]; then
     block_step "${step}" "the driver reported terminal outcomes for \
 $(unoriginated_terminals "${QUIESCE_TERMINAL}" \
-      "${QUIESCE_INFLIGHT_WORK}"), which ${node} did not originate with those \
+      "${reconciled_work}"), which ${node} did not originate with those \
 transactions; a later phase cannot replace the transaction that started held \
 work with an unrelated transaction and call its outcome the held permit's end"
     quiescence_assertion "${assertion}" false "${step}"
-  elif [[ -n "$(unended_work "${QUIESCE_INFLIGHT_WORK}" \
+  elif [[ -n "$(unended_work "${reconciled_work}" \
     "${QUIESCE_TERMINAL}" "")" ]]; then
     block_step "${step}" "${node} was seen without the permits it held, but \
 the driver reported no terminal outcome for $(unended_work \
-      "${QUIESCE_INFLIGHT_WORK}" "${QUIESCE_TERMINAL}" ""); a permit that \
+      "${reconciled_work}" "${QUIESCE_TERMINAL}" ""); a permit that \
 stopped being counted while the work behind it never ended is a permit the \
 process took with it, which is the one reading this step exists to refuse"
     quiescence_assertion "${assertion}" false "${step}"
-  elif [[ -n "$(unsettled_work "${QUIESCE_INFLIGHT_WORK}" \
+  elif [[ -n "$(unsettled_work "${reconciled_work}" \
     "${QUIESCE_TERMINAL}")" ]]; then
     # An end, but not the end this step's assertion is about. Nothing in this
     # gate audits the state a ceremony that gave up left behind — that is the
     # rollback gate's quarantine reconciliation — so a quiescence that produced
     # one is recorded as unproven rather than as work allowed to finish.
     block_step "${step}" "${node} let its held permits go and the driver \
-followed them to an end, but $(unsettled_work "${QUIESCE_INFLIGHT_WORK}" \
+followed them to an end, but $(unsettled_work "${reconciled_work}" \
       "${QUIESCE_TERMINAL}") came to nothing rather than settling on chain; \
 this gate audits no quarantined state, so work that gave up inside the grace \
 evidences neither that it was allowed to finish nor that what it left behind \
@@ -6651,16 +6711,18 @@ offer being refused would"
     record_step "${step}" pass "${node} entered quiescing holding \
 ${QUIESCE_HELD_BEFORE} ${mode} ceremonies its own gate named \
 (${QUIESCE_PERMITS_BEFORE})$( ((QUIESCE_COLIVE_REQUIRED == 1)) &&
-      printf ', seeded before C and live beside %s of the other mode' \
-        "${QUIESCE_COLIVE_PERMITS}"), was offered \
+      printf ', seeded before C and live beside %s of the %s mode' \
+        "${QUIESCE_COLIVE_PERMITS}" "${QUIESCE_COLIVE_MODE}"), was offered \
 ${QUIESCE_OFFERED} while quiescing and refused it on its own account \
 (${refused_offered}; refusals \
 ${QUIESCE_REFUSALS_BEFORE} to ${QUIESCE_REFUSALS_AFTER}) while issuing no \
 permit (${QUIESCE_ISSUED_BEFORE} to ${QUIESCE_ISSUED_AFTER}), and let every \
 held permit finish inside the reviewed ${QUIESCE_GRACE}s grace — in-flight \
 count observed at zero, no forced abort (${QUIESCE_FORCED_BEFORE} to \
-${QUIESCE_FORCED_AFTER}), and every piece of work it was holding settled on \
-chain ($(bound_settlements "${QUIESCE_TERMINAL}"))"
+${QUIESCE_FORCED_AFTER}), and every piece of work it was holding across \
+$( ((QUIESCE_COLIVE_REQUIRED == 1)) && printf 'both modes' ||
+      printf 'the %s mode' "${mode}") settled on chain \
+($(bound_settlements "${QUIESCE_TERMINAL}"))"
     quiescence_assertion "${assertion}" true "${step}"
   fi
 }
@@ -6699,13 +6761,28 @@ run_quiescence_control() {
   # examination with one taken on the far side of the crossing.
   QUIESCE_COLIVE_REQUIRED="${QUIESCE_FROM_SEED}"
   QUIESCE_COLIVE_PERMITS=""
+  QUIESCE_COLIVE_WORK=""
+  QUIESCE_COLIVE_MISANCHORED=""
+  QUIESCE_COLIVE_MODE=""
   QUIESCE_INFLIGHT_WORK="${seeded}"
   if ((QUIESCE_FROM_SEED == 1)); then
+    case "${mode}" in
+    legacy) QUIESCE_COLIVE_MODE="security-v2" ;;
+    *) QUIESCE_COLIVE_MODE="legacy" ;;
+    esac
     # The other mode is put in flight beside it deliberately. The fence a
     # quiescing gate has to hold is the one where both modes are live at once,
     # and a node draining a single population never exercises it.
+    #
+    # What that run originated is kept, not discarded: the gate's promise
+    # covers every permit it was holding, so these permits are reconciled to
+    # terminal outcomes exactly as the seeded ones are.
     if [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
       run_work_driver "${phase}-inflight" || true
+      if driver_offered_work; then
+        QUIESCE_COLIVE_WORK="$(work_records_held_by \
+          "${WORK_DRIVER_ORIGINATED_WORK}" "${node}")"
+      fi
     fi
   elif [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
     run_work_driver "${phase}-inflight" || true
@@ -6730,10 +6807,11 @@ run_quiescence_control() {
   # the gate that issued them rather than merely consistent with a gauge.
   QUIESCE_PERMITS_BEFORE="$(node_mode_permits "${node}" "${mode}")"
   if ((QUIESCE_COLIVE_REQUIRED == 1)); then
-    case "${mode}" in
-    legacy) QUIESCE_COLIVE_PERMITS="$(node_mode_permits "${node}" security-v2)" ;;
-    *) QUIESCE_COLIVE_PERMITS="$(node_mode_permits "${node}" legacy)" ;;
-    esac
+    QUIESCE_COLIVE_PERMITS="$(node_mode_permits "${node}" \
+      "${QUIESCE_COLIVE_MODE}")"
+    QUIESCE_COLIVE_MISANCHORED="$(misanchored_for_mode \
+      "${QUIESCE_COLIVE_WORK}" "${QUIESCE_COLIVE_MODE}" \
+      "${REHEARSAL_R1_CUTOVER_BLOCK}")"
   fi
   QUIESCE_FORCED_BEFORE="$(metric_value "${node}" \
     participation_quiesce_forced_aborts_total || printf '')"
