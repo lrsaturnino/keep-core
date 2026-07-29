@@ -282,6 +282,31 @@ that merely turned up there between the samples; the driver's alone is the
 driver's word for a below-C anchor, which is what the seeding is checked for. A
 gate that could not be read below C agrees with nothing and excuses nothing.
 
+#### What a permit's ending still rests on
+
+The in-flight half above names permits from the gates' own live readings. What
+became of each named permit does not come from there: the crossing verdicts
+read terminal outcomes, contributor identities, and per-permit results out of
+the work driver's report, and check them against fleet-wide counters and the
+chain. The driver both originates the work and reports how it ended, so those
+two readings are not independent — a counter moving the expected amount beside
+a driver's claim that it moved for the named permits is satisfied by a report
+that simply says so. This is the remaining self-attested seam in the exact-image
+evidence and it is not closed.
+
+What is now available to close it is the node's own answer. A permit used to
+disappear from `protocol_participation` the moment its ceremony finished, so
+before a quiescence transition there was no node-authored record of an ending to
+read at all. The gate now retains what its ceremony owners recorded for the
+permits it closed and emits it at `protocol_participation.
+recent_terminal_outcomes`, carrying the same `work_id`/`permit_id` identities
+the live list carries — so a permit the crossing control saw held can be
+followed to the disposition its own node recorded, and a permit whose owner
+recorded nothing appears as `unresolved` rather than as an absence. Wiring the
+crossing and surviving-work verdicts onto that reading, and reconciling every
+originated permit against it one-to-one instead of against the driver's
+account, is the work that closes the seam.
+
 The straggler control reads the announcer's own account of the sighting
 rather than the gate's refusal counter, which counts a node declining its own
 `Begin` for reasons that need no legacy announcement behind them. It requires
