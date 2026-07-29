@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"sync"
 	"sync/atomic"
@@ -432,7 +433,16 @@ func (ice *inactivityClaimExecutor) waitForInactivityClaimSettlement(
 		}
 	}()
 
-	deadline := currentBlock + inactivityClaimSettlementResolutionBlocks
+	deadline, wrapped := inactivityClaimSettlementDeadline(currentBlock)
+	if wrapped {
+		execLogger.Warnf(
+			"the inactivity claim settlement deadline of block [%v] plus "+
+				"[%v] blocks is not representable; waiting to the highest "+
+				"representable block instead",
+			currentBlock,
+			inactivityClaimSettlementResolutionBlocks,
+		)
+	}
 
 	execLogger.Infof(
 		"waiting until block [%v] for the submitted inactivity claim to settle",
@@ -446,6 +456,23 @@ func (ice *inactivityClaimExecutor) waitForInactivityClaimSettlement(
 			err,
 		)
 	}
+}
+
+// inactivityClaimSettlementDeadline returns the block the settlement wait runs
+// until, and reports whether the unchecked sum would have wrapped.
+//
+// A wrapped deadline is rejected rather than used: it names a block already in
+// the past, so the wait would return at once and a claim that settles a block
+// later would be journaled as unresolved — a penalty that is on chain recorded
+// as one that is not. Rejecting it by returning early would collapse the
+// observation window just as completely, so the representable maximum is what
+// replaces it: the settlement observer and the heartbeat window that owns the
+// claim both still cut the wait short, which is what actually bounds it.
+func inactivityClaimSettlementDeadline(currentBlock uint64) (uint64, bool) {
+	if currentBlock > math.MaxUint64-inactivityClaimSettlementResolutionBlocks {
+		return math.MaxUint64, true
+	}
+	return currentBlock + inactivityClaimSettlementResolutionBlocks, false
 }
 
 // inactivityClaimSubmissionAttempt records that a controlled member handed an

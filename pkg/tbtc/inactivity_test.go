@@ -3,6 +3,7 @@ package tbtc
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/big"
 	"reflect"
 	"sync"
@@ -496,6 +497,70 @@ func TestInactivityClaimExecutor_ClaimInactivity_LateSettlement(t *testing.T) {
 		initialNonce,
 		disposition.settlement.nonce,
 	)
+}
+
+func TestInactivityClaimSettlementDeadline(t *testing.T) {
+	const resolution = uint64(inactivityClaimSettlementResolutionBlocks)
+
+	tests := map[string]struct {
+		currentBlock     uint64
+		expectedDeadline uint64
+		expectedWrapped  bool
+	}{
+		"an ordinary height": {
+			currentBlock:     1_000_000,
+			expectedDeadline: 1_000_000 + resolution,
+			expectedWrapped:  false,
+		},
+		"the highest height whose deadline is representable": {
+			currentBlock:     math.MaxUint64 - resolution,
+			expectedDeadline: math.MaxUint64,
+			expectedWrapped:  false,
+		},
+		"the lowest height whose deadline is not": {
+			currentBlock:     math.MaxUint64 - resolution + 1,
+			expectedDeadline: math.MaxUint64,
+			expectedWrapped:  true,
+		},
+		"the highest representable height": {
+			currentBlock:     math.MaxUint64,
+			expectedDeadline: math.MaxUint64,
+			expectedWrapped:  true,
+		},
+	}
+
+	for testName, test := range tests {
+		t.Run(testName, func(t *testing.T) {
+			deadline, wrapped := inactivityClaimSettlementDeadline(
+				test.currentBlock,
+			)
+
+			if deadline != test.expectedDeadline {
+				t.Errorf(
+					"unexpected settlement deadline\n"+
+						"expected: [%d]\nactual:   [%d]",
+					test.expectedDeadline,
+					deadline,
+				)
+			}
+			if wrapped != test.expectedWrapped {
+				t.Errorf(
+					"unexpected wrap report\nexpected: [%t]\nactual:   [%t]",
+					test.expectedWrapped,
+					wrapped,
+				)
+			}
+			// The property the bound exists for: a deadline the executor waits
+			// on must never name a block the chain has already passed.
+			if deadline < test.currentBlock {
+				t.Errorf(
+					"settlement deadline [%d] is below the current block [%d]",
+					deadline,
+					test.currentBlock,
+				)
+			}
+		})
+	}
 }
 
 func TestInactivityClaimExecutor_ClaimInactivity_Busy(t *testing.T) {
