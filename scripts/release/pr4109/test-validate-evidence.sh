@@ -3308,6 +3308,31 @@ run_verdict surviving_case eval 'SURVIVING_DRIVER_SUPPLIED=0'
 check "no driver holds no legacy permit across C" 3 \
   "no PR4109_WORK_DRIVER was supplied"
 
+# A control that only rejects extra terminal records reads a partial population
+# as a whole one. These three mutations each leave a settlement and a moving
+# counter in place, and each hides a permit the step claims to speak for.
+SURVIVE_TX_SECOND="0xff77777777777777777777777777777777777777777777777777777777777777"
+
+# Two permits held across C, one settled, the other simply unmentioned.
+run_verdict surviving_case eval '
+  SURVIVING_ORIGINATED="tbtc_signing@840@wallet840=${SURVIVE_TX}=r1-node-1~member-1 tbtc_signing@841@wallet841=${SURVIVE_TX_SECOND}=r1-node-1~member-2"
+  SURVIVING_HELD_BEFORE="2"
+  SURVIVING_LEGACY_COMPLETIONS_AFTER="2"'
+check "a held permit with no terminal outcome is not covered by another's" 3 \
+  "reported no terminal outcome for it"
+
+# The counter moves, but by more than this step put across the crossing: an
+# unrelated legacy ceremony finishing elsewhere in the fleet cannot stand in.
+run_verdict surviving_case eval 'SURVIVING_LEGACY_COMPLETIONS_AFTER="2"'
+check "an unrelated legacy completion cannot stand for the held permit" 3 \
+  "counted completions this step did not originate"
+
+# The fleet held more legacy permits than the driver named, so the verdict
+# would speak for permits this step cannot identify.
+run_verdict surviving_case eval 'SURVIVING_HELD_BEFORE="2"'
+check "a held count above the named population leaves permits unidentified" 3 \
+  "does not match the named population"
+
 # ----------------------------------------------------------------------------
 
 # The legacy half of quiescence decides the same ladder as the security-v2

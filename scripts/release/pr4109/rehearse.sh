@@ -7301,11 +7301,26 @@ resolve_surviving_legacy_work() {
 surviving_legacy_verdict() {
   local step="pre-cutover legacy work survives C and completes"
 
-  local stray settlements failed
+  local stray settlements failed unended originated_permits held_delta
   stray="$(unoriginated_terminals "${SURVIVING_TERMINAL}" \
     "${SURVIVING_ORIGINATED}")"
   settlements="$(bound_settlements "${SURVIVING_TERMINAL}")"
   failed="$(bound_terminations "${SURVIVING_TERMINAL}")"
+  # The stray check above rejects a terminal record for work this control did
+  # not originate. Its mirror — originated work with no terminal record at all
+  # — is what lets a partial population pass: two permits held across C, one
+  # settled, and the unsettled one simply unmentioned.
+  unended="$(unended_work "${SURVIVING_ORIGINATED}" "${SURVIVING_TERMINAL}" "")"
+  originated_permits="$(count_tokens \
+    "$(permit_identities "${SURVIVING_ORIGINATED}")")"
+  held_delta=""
+  if [[ "${SURVIVING_LEGACY_COMPLETIONS_BEFORE}" =~ ^[0-9]+$ ]] &&
+    [[ "${SURVIVING_LEGACY_COMPLETIONS_AFTER}" =~ ^[0-9]+$ ]] &&
+    ((SURVIVING_LEGACY_COMPLETIONS_AFTER >=
+      SURVIVING_LEGACY_COMPLETIONS_BEFORE)); then
+    held_delta=$((SURVIVING_LEGACY_COMPLETIONS_AFTER -
+      SURVIVING_LEGACY_COMPLETIONS_BEFORE))
+  fi
 
   if ((SURVIVING_DRIVER_SUPPLIED == 0)); then
     block_step "${step}" "no PR4109_WORK_DRIVER was supplied, so no \
@@ -7326,6 +7341,13 @@ were and not which work each one was issued for"
 [${SURVIVING_HELD_BEFORE:-unreadable}] legacy ceremonies when C approached, \
 so the work the driver named had already ended and this step would be about a \
 ceremony that never met the crossing"
+  elif ((SURVIVING_HELD_BEFORE != originated_permits)); then
+    block_step "${step}" "the fleet held ${SURVIVING_HELD_BEFORE} legacy \
+ceremonies when C approached, but the driver named ${originated_permits} \
+permit(s) it put there ($(permit_identities "${SURVIVING_ORIGINATED}")); a \
+count that does not match the named population leaves permits this step \
+cannot identify crossing C beside the ones it can, and the verdict below \
+would speak for those too"
   elif ((SURVIVING_TERMINAL_ASKED == 0)); then
     block_step "${step}" "the driver was never asked what became of the \
 legacy work it held across C; a permit observed in flight before the crossing \
@@ -7342,6 +7364,11 @@ outcome for other work cannot stand for the work that was held"
     record_step "${step}" fail "the legacy work held across C came to nothing: \
 ${failed}; a legacy permit taken before C must be allowed to finish on the \
 far side of it, not abandoned there"
+  elif [[ -n "${unended}" ]]; then
+    block_step "${step}" "the driver originated ${unended} before C and \
+reported no terminal outcome for it; work held across the crossing and left \
+unmentioned is equally work that finished and work that was cut short, and \
+the settlements it did report cannot answer for it"
   elif [[ -z "${settlements}" ]]; then
     block_step "${step}" "the driver named no terminal outcome at all for the \
 legacy work it originated before C, so nothing here says those permits \
@@ -7359,15 +7386,24 @@ gate recorded a legacy completion after C \
 (participation_legacy_completions_after_cutover_total still \
 [${SURVIVING_LEGACY_COMPLETIONS_AFTER}]); work that settled without one did \
 not finish on the far side of the crossing"
+  elif ((held_delta != originated_permits)); then
+    # A delta merely greater than zero lets one settlement plus any unrelated
+    # legacy completion elsewhere in the fleet stand for the whole held
+    # population. The counter has to move by exactly the permits this step put
+    # there, or the increments it counted belong to ceremonies it never named.
+    block_step "${step}" "the fleet gates recorded ${held_delta} legacy \
+completion(s) at or after C, but this step held ${originated_permits} permit(s) \
+across it ($(permit_identities "${SURVIVING_ORIGINATED}")); a counter that \
+moved by a different amount counted completions this step did not originate, \
+or missed ones it did"
   else
     STEP_PERMIT_MODES='"legacy"'
     record_step "${step}" pass "the ${SURVIVING_HELD_BEFORE} legacy \
 ceremonies the driver put on the fleet before C settled after it \
-(${settlements}), and the fleet gates recorded \
-$((SURVIVING_LEGACY_COMPLETIONS_AFTER -
-      SURVIVING_LEGACY_COMPLETIONS_BEFORE)) legacy completion(s) at or after \
-the cutover block; a permit taken on the legacy side of C kept its mode and \
-was allowed to finish"
+(${settlements}), and the fleet gates recorded ${held_delta} legacy \
+completion(s) at or after the cutover block — one for each permit held across \
+the crossing; a permit taken on the legacy side of C kept its mode and was \
+allowed to finish"
   fi
 }
 
