@@ -1417,6 +1417,20 @@ owner of `SetProtocolMode` and session-nonce configuration, the temporary
 legacy refusals are removed, and the formerly skipped homogeneous legacy DKG
 and signing cases run complete real transcripts after a pre-cutover anchor.
 
+The homogeneous suites say nothing about a committee that disagrees, which is
+the case the crossing actually creates. That case is held in keep-core rather
+than in the dependency, because what has to stay true is a property of whatever
+revision `go.mod` resolves:
+`pkg/protocol/compatibility/mixed_transcript_test.go` drives a real tECDSA
+signing ceremony over the key-share fixtures with each member's transcript
+configured by the bundle its mode selects, and requires that no signature is
+produced in either mixed direction — a member that has not crossed joining a
+hardened group, and a member that has crossed refusing to sign with a group
+that has not. Both homogeneous committees run through the same driver and are
+required to sign, so the refusals cannot be an artifact of a driver that never
+finishes anything. A replacement dependency revision that tolerated a mixed
+committee fails this test rather than surfacing during a rehearsal.
+
 Independent cryptographic review is still a release gate, and it is a gate on
 *evidence acceptance* rather than on execution. The commit is published on the
 dependency repository's `codex/dual-mode-transcript` branch and proposed for
