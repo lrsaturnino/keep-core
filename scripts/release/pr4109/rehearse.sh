@@ -3907,6 +3907,107 @@ service_terminal_outcomes() {
     ' "${service}"
 }
 
+# The readings a drain watcher decides on, all taken out of one gate response:
+# the state the node reports, how many ceremonies of one mode it still holds,
+# and the endings it has recorded so far. Rendered as "state=", "active=" and
+# "outcomes=" lines.
+#
+# Asked one at a time these are three requests against a node that is in the
+# middle of stopping, and the answers need not describe the same instant. The
+# case that matters is the ordinary one: a node answers "quiescing", answers
+# "nothing in flight", and exits before the third request — so the watcher
+# records a drain beside whatever ending list some earlier pass happened to
+# hold, which is the list from before the last permit closed. The permits this
+# control exists to follow are exactly the ones that close last, so the reading
+# is wrong precisely where it is load-bearing.
+#
+# One response cannot do that. The gate composes the whole object from a single
+# state snapshot, so the three readings here are of one instant by
+# construction, and a node that stops mid-drain fails the fetch outright rather
+# than answering part of it.
+service_gate_snapshot() {
+  local service="$1" field="$2"
+  probe_diagnostics "${service}" |
+    node -e '
+      let raw = "";
+      process.stdin.on("data", (d) => (raw += d));
+      process.stdin.on("end", () => {
+        const state = (JSON.parse(raw).protocol_participation) || {};
+        const service = process.argv[1];
+        const field = process.argv[2];
+        const gateState = state.gate_state;
+        if (typeof gateState !== "string" || !/^\S+$/.test(gateState)) {
+          console.error("no gate_state in the gate state");
+          process.exit(1);
+        }
+        const active = state[field];
+        if (!Number.isInteger(active) || active < 0) {
+          console.error("no " + field + " count in the gate state");
+          process.exit(1);
+        }
+        const outcomes = state.recent_terminal_outcomes;
+        if (!Array.isArray(outcomes)) {
+          console.error("no recent_terminal_outcomes in the gate state");
+          process.exit(1);
+        }
+        // The same closed set, and the same refusal to skip an unreadable
+        // record, that the standalone outcome reading applies. A snapshot that
+        // dropped a malformed record would present a shorter ending list as a
+        // whole one, and this reading is the one a drain verdict treats as
+        // complete.
+        const OUTCOMES = [
+          "completed", "quarantined", "exhausted", "unresolved",
+        ];
+        const out = [];
+        for (const record of outcomes) {
+          if (record === null || typeof record !== "object" ||
+            Array.isArray(record)) {
+            console.error("not a terminal outcome record: " +
+              JSON.stringify(record));
+            process.exit(1);
+          }
+          const permit = record.permit;
+          if (permit === null || typeof permit !== "object" ||
+            Array.isArray(permit)) {
+            console.error("a terminal outcome names no permit: " +
+              JSON.stringify(record));
+            process.exit(1);
+          }
+          if (!OUTCOMES.includes(record.outcome)) {
+            console.error("not a terminal outcome: " +
+              JSON.stringify(record.outcome));
+            process.exit(1);
+          }
+          if (permit.identity_bound !== true) {
+            console.error("a closed permit is not identity-bound: " +
+              JSON.stringify(permit));
+            process.exit(1);
+          }
+          if (typeof permit.work_id !== "string" ||
+            !/^[^\s=]+$/.test(permit.work_id) ||
+            typeof permit.permit_id !== "string" ||
+            !/^[^\s=]+$/.test(permit.permit_id)) {
+            console.error("a closed permit names no work or permit " +
+              "identity: " + JSON.stringify(permit));
+            process.exit(1);
+          }
+          out.push(service + "=" + permit.work_id + "#" + permit.permit_id +
+            "=" + record.outcome);
+        }
+        process.stdout.write("state=" + gateState + "\n" +
+          "active=" + String(active) + "\n" +
+          "outcomes=" + out.join(" ") + "\n");
+      });
+    ' "${service}" "${field}"
+}
+
+# One field out of such a snapshot. The value may be empty — an ending list is
+# empty until the first permit closes — so this says nothing about whether the
+# snapshot was taken; that is the fetch's own exit status.
+snapshot_field() {
+  printf '%s\n' "$1" | sed -n "s/^$2=//p"
+}
+
 # The same across the R1 fleet, with the unreadable-is-unusable convention the
 # held-permit readings use: a node that cannot be asked leaves the whole
 # reading unusable rather than a shorter list, which would otherwise be
@@ -7141,7 +7242,7 @@ on the rehearsal chain that is still running at shutdown"
   local stop_pid=$!
 
   local held_now forced_now issued_now state_now refusals_now deadline
-  local outcomes_now
+  local snapshot_now
   QUIESCE_STATE=""
   QUIESCE_ISSUED_AFTER="${QUIESCE_ISSUED_BEFORE}"
   QUIESCE_FORCED_AFTER="${QUIESCE_FORCED_BEFORE}"
@@ -7156,9 +7257,33 @@ on the rehearsal chain that is still running at shutdown"
   QUIESCE_OFFERED=""
   deadline=$((SECONDS + QUIESCE_GRACE))
   while ((SECONDS < deadline)); do
-    state_now="$(participation_field "${node}" gate_state 2>/dev/null || true)"
-    if [[ "${state_now}" == "quiescing" ]]; then
-      QUIESCE_STATE="quiescing"
+    # The three readings this control decides on, taken together or not at all.
+    # Whether the node was quiescing, whether it had let go of everything, and
+    # what it recorded about the permits it let go of are one claim about one
+    # instant; read one request apart they can describe a node before and after
+    # the last permit it will ever close. Committed together, a snapshot either
+    # names the drain and the endings that produced it or is discarded whole
+    # and the previous one — which described some earlier consistent instant —
+    # stands.
+    if snapshot_now="$(service_gate_snapshot "${node}" "${active_field}" \
+      2>/dev/null)"; then
+      state_now="$(snapshot_field "${snapshot_now}" state)"
+      held_now="$(snapshot_field "${snapshot_now}" active)"
+      # The node's own account of what became of the permits it is draining,
+      # which goes away with the node. The account only grows as permits close,
+      # so the last snapshot taken before the node stops answering is the one
+      # that has every permit that ended in this window — which is why it is
+      # overwritten each pass rather than accumulated.
+      QUIESCE_AUTHORED_READ=1
+      QUIESCE_AUTHORED_ENDINGS="$(snapshot_field "${snapshot_now}" outcomes)"
+      if [[ "${state_now}" == "quiescing" ]]; then
+        QUIESCE_STATE="quiescing"
+      fi
+      if [[ "${held_now}" =~ ^[0-9]+$ ]] && ((held_now == 0)); then
+        QUIESCE_DRAINED=1
+      fi
+    fi
+    if [[ "${QUIESCE_STATE}" == "quiescing" ]]; then
       # Offered once the node has actually entered quiescence, because the
       # property is what a quiescing node does with new work — and a node
       # that was never asked answers exactly like one that refused. Only a
@@ -7176,11 +7301,6 @@ on the rehearsal chain that is still running at shutdown"
           QUIESCE_OFFER_RC="${WORK_DRIVER_RC}"
         fi
       fi
-    fi
-    held_now="$(participation_field "${node}" "${active_field}" \
-      2>/dev/null || printf '')"
-    if [[ "${held_now}" =~ ^[0-9]+$ ]] && ((held_now == 0)); then
-      QUIESCE_DRAINED=1
     fi
     issued_now="$(metric_value "${node}" "${issued_metric}" \
       2>/dev/null || printf '')"
@@ -7200,16 +7320,6 @@ on the rehearsal chain that is still running at shutdown"
     if [[ "${refusals_now}" =~ ^[0-9]+$ ]]; then
       QUIESCE_REFUSALS_AFTER="${refusals_now}"
       QUIESCE_CEREMONY_REFUSALS_AFTER="$(ceremony_refusal_counters "${node}")"
-    fi
-    # The same reason again, and the case that needs it most: this is the
-    # node's own account of what became of the permits it is draining, and it
-    # goes away with the node. The account only grows as permits close, so the
-    # last reading taken before the node stops answering is the one that has
-    # every permit that ended in this window — which is why it is overwritten
-    # each pass rather than accumulated.
-    if outcomes_now="$(service_terminal_outcomes "${node}" 2>/dev/null)"; then
-      QUIESCE_AUTHORED_READ=1
-      QUIESCE_AUTHORED_ENDINGS="${outcomes_now}"
     fi
     # The node going unreachable is the drain finishing, not a failure.
     node_reachable "${node}" || break
@@ -7924,6 +8034,18 @@ PRECUTOVER_SECURITY_BEFORE=""
 PRECUTOVER_SECURITY_AFTER=""
 PRECUTOVER_SIGHTINGS_BEFORE=""
 PRECUTOVER_SIGHTINGS_AFTER=""
+# The permits the driven work was actually issued, and what the nodes holding
+# them recorded about how each one ended.
+#
+# Everything above this pair is the driver's account of its own work: which
+# ceremonies it started, which it says settled, and which parties it says
+# contributed. A control whose claim is that a mixed fleet completed work below
+# C cannot rest on that alone — the same report is produced by a driver whose
+# ceremonies were refused and by one whose ceremonies never ran. These two name
+# the permits this fleet's gate issued for that work and join each of them to
+# the disposition its own holder wrote down.
+PRECUTOVER_ORIGINATED=""
+PRECUTOVER_AUTHORED_ENDINGS=""
 
 # The ceremonies a pre-cutover step must see settle, named one by one.
 #
@@ -7947,6 +8069,8 @@ collect_precutover_work() {
   PRECUTOVER_BOUND=""
   PRECUTOVER_CONTRIBUTORS=""
   PRECUTOVER_STATES=""
+  PRECUTOVER_ORIGINATED=""
+  PRECUTOVER_AUTHORED_ENDINGS=""
 
   # Every R1 node has to be on the legacy side of its own gate before the work
   # starts. A node already past C would run this work under security-v2 and
@@ -7988,6 +8112,13 @@ ${service} reported [${state:-unreadable}] at block [${block:-unreadable}]"
     PRECUTOVER_RESULTS="${WORK_DRIVER_CEREMONY_RESULTS}"
     PRECUTOVER_BOUND="${WORK_DRIVER_BOUND_RESULTS}"
     PRECUTOVER_CONTRIBUTORS="${WORK_DRIVER_RESULT_CONTRIBUTORS}"
+    PRECUTOVER_ORIGINATED="${WORK_DRIVER_ORIGINATED_WORK}"
+    # Taken after the driver has reported, so every permit it says was issued
+    # for this work has had its holder's own record written before the reading.
+    # The driver's account is kept beside it rather than replaced: it carries
+    # the settlement identities and transactions the chain corroborates, which
+    # a gate scrape does not know.
+    PRECUTOVER_AUTHORED_ENDINGS="$(fleet_terminal_outcomes)"
   fi
 
   PRECUTOVER_LEGACY_AFTER="$(fleet_metric_total \
@@ -8012,7 +8143,8 @@ precutover_verdict() {
   local step="$1" assertion="$2" required_ceremonies="$3" what="$4"
 
   local failed_results missing_ceremonies settlements
-  local uninteroperated
+  local uninteroperated stray unended
+  local named_permits unauthored duplicated unresolved misended authored
   failed_results="$(unsuccessful_results "${PRECUTOVER_RESULTS}")"
   missing_ceremonies="$(missing_bound_ceremonies \
     "${PRECUTOVER_BOUND}" "${required_ceremonies}")"
@@ -8020,6 +8152,33 @@ precutover_verdict() {
   uninteroperated="$(ceremonies_without_mixed_transcript \
     "${PRECUTOVER_CONTRIBUTORS}" "${required_ceremonies}" \
     "${REHEARSAL_PRIOR_SERVICE}" "${REHEARSAL_R1_SERVICES[*]}")"
+  # An outcome for work this phase did not originate on the transaction that
+  # originated it is somebody else's ceremony, and originated work with no
+  # outcome at all is how a partial population passes: five ceremonies driven,
+  # one reported.
+  stray="$(unoriginated_terminals "${PRECUTOVER_BOUND}" \
+    "${PRECUTOVER_ORIGINATED}")"
+  unended="$(unended_work "${PRECUTOVER_ORIGINATED}" "${PRECUTOVER_BOUND}" "")"
+  # The same population read off the nodes rather than off the driver. Every
+  # check above this line decides on an account the driver gave of its own
+  # work; these are the holders' own records of closing the very permits this
+  # fleet's gate issued for it.
+  named_permits="$(held_permit_identities "${PRECUTOVER_ORIGINATED}")"
+  unauthored="$(unauthored_permits "${named_permits}" \
+    "${PRECUTOVER_AUTHORED_ENDINGS}")"
+  duplicated="$(duplicated_authored_permits "${named_permits}" \
+    "${PRECUTOVER_AUTHORED_ENDINGS}")"
+  unresolved="$(unresolved_authored_permits "${named_permits}" \
+    "${PRECUTOVER_AUTHORED_ENDINGS}")"
+  # Completion only. A pre-C compatibility claim is that the mixed fleet
+  # finished this work; a permit that ran out of retries or had its key
+  # material quarantined is a closing, not a settlement, and the driver's
+  # report of a successful ceremony beside it is exactly the disagreement this
+  # rung exists to surface.
+  misended="$(misended_authored_permits "${named_permits}" \
+    "${PRECUTOVER_AUTHORED_ENDINGS}" completed)"
+  authored="$(authored_endings "${named_permits}" \
+    "${PRECUTOVER_AUTHORED_ENDINGS}")"
 
   if ((PRECUTOVER_DRIVER_SUPPLIED == 0)); then
     block_step "${step}" "no PR4109_WORK_DRIVER was supplied, so no \
@@ -8057,12 +8216,27 @@ mixed fleet's work that survived"
     block_step "${step}" "the work driver named no ceremony that completed \
 successfully on a transaction it originated, so this control observed work \
 being allowed to start and nothing about it finishing"
+  elif [[ -z "${named_permits//[[:space:]]/}" ]]; then
+    block_step "${step}" "the work driver settled ${settlements} but named no \
+node holding a permit for any of it, so nothing here identifies a permit this \
+fleet's gate issued; the settlements are the driver's account of its own work \
+and the gauges below only say the fleet took some legacy permit while it ran"
+  elif [[ -n "${stray}" ]]; then
+    record_step "${step}" fail "the work driver reported an outcome for \
+${stray}, which it did not originate here on that transaction; an outcome \
+belonging to another ceremony or another transaction is not evidence about \
+${what}"
   elif [[ -n "${missing_ceremonies}" ]]; then
     block_step "${step}" "the work driver settled ${settlements} but no \
 ${missing_ceremonies}; this step's claim is about ${what}, and each ceremony \
 it names is a separate path into the gate with its own anchor and its own \
 refusal — one of them settling says nothing about the rest, so the step has \
 to cover ${required_ceremonies}"
+  elif [[ -n "${unended}" ]]; then
+    block_step "${step}" "the work driver settled ${settlements} but reported \
+no outcome at all for ${unended}; a control that reads only the work its \
+driver chose to report on is satisfied by the subset that went well, which is \
+the reading a mixed-fleet claim must not be decided by"
   elif [[ -n "${uninteroperated}" ]]; then
     block_step "${step}" "the work driver settled ${settlements}, but no \
 ${uninteroperated} transcript incorporated a share from both \
@@ -8071,6 +8245,29 @@ the other and took no part in those results, which is what an unselected, \
 partitioned, or excluded party looks like from outside — a ceremony the two \
 releases did interoperate on cannot stand for one they did not, and two \
 homogeneous ceremonies cannot stand for either"
+  elif [[ "${PRECUTOVER_AUTHORED_ENDINGS}" == "unreadable on "* ]]; then
+    block_step "${step}" "the R1 fleet could not be asked what became of the \
+permits it took for ${what} (${PRECUTOVER_AUTHORED_ENDINGS}); without that \
+reading the settlements above are the driver's account of its own ceremonies \
+and no node has vouched for one of them"
+  elif [[ -n "${unauthored}" ]]; then
+    block_step "${step}" "no node recorded an ending for ${unauthored}, \
+though the driver named ${named_permits} as the permits issued for ${what}; a \
+permit whose own holder will not say how it ended cannot be counted as work a \
+mixed fleet completed"
+  elif [[ -n "${duplicated}" ]]; then
+    block_step "${step}" "more than one node-authored record claims to be the \
+ending of ${duplicated}; one permit ends once, and a reader taking the first \
+match would decide this control on whichever record happened to come first"
+  elif [[ -n "${unresolved}" ]]; then
+    record_step "${step}" fail "${unresolved} — the holder closed the permit \
+without recording what became of it, so the ceremony went somewhere the node \
+cannot say and the driver's settlement for it stands on nothing"
+  elif [[ -n "${misended}" ]]; then
+    record_step "${step}" fail "the work driver settled ${settlements}, but \
+the nodes holding the permits recorded ${misended}; a closing is not a \
+completion, and where the two accounts disagree it is the driver's that is \
+about its own work"
   elif ((PRECUTOVER_LEGACY_AFTER <= PRECUTOVER_LEGACY_BEFORE)); then
     record_step "${step}" fail "the work driver settled ${settlements}, but \
 the fleet issued no new legacy permit (participation_mode_legacy_total still \
@@ -8100,7 +8297,8 @@ the prior binary; below C the two releases must be one wire format"
 $((PRECUTOVER_LEGACY_AFTER - PRECUTOVER_LEGACY_BEFORE)) new legacy permits \
 and no security-v2 permit (unchanged at [${PRECUTOVER_SECURITY_AFTER}]) \
 driving ${what} beside the running prior binary, the driver settled \
-${settlements} with nothing failing beside them, each of \
+${settlements} with nothing failing beside them, the nodes holding the permits \
+issued for that work recorded ${authored}, each of \
 ${required_ceremonies} settled a transcript incorporating shares from both \
 ${REHEARSAL_PRIOR_SERVICE} and the R1 fleet, and the fleet \
 recognized no cross-format peer (unchanged at \

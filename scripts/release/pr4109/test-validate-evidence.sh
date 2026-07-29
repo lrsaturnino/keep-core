@@ -3388,6 +3388,27 @@ tbtc_heartbeat@844@beat844=r1-node-1~1 \
 tbtc_heartbeat@844@beat844=prior-node~7 \
 beacon_dkg@845@bdkg845=r1-node-1~1 \
 beacon_dkg@845@bdkg845=prior-node~7"
+  # The permits this fleet's gate issued for that work, one record per local
+  # permit, and what the node holding each one recorded when it closed. The
+  # settlements above are the driver's account of its own ceremonies; these are
+  # the gate's account of the permits they ran under and the holders' account
+  # of how each ended.
+  # shellcheck disable=SC2034
+  PRECUTOVER_ORIGINATED="\
+tbtc_wallet_action@840@wallet840=${PRE_TX1}=r1-node-1~1 \
+beacon_signing@841@entry841=${PRE_TX2}=r1-node-1~1 \
+tbtc_dkg@842@dkg842=${PRE_TX1}=r1-node-1~1 \
+tbtc_signing@843@sign843=${PRE_TX1}=r1-node-1~1 \
+tbtc_heartbeat@844@beat844=${PRE_TX1}=r1-node-1~1 \
+beacon_dkg@845@bdkg845=${PRE_TX2}=r1-node-1~1"
+  # shellcheck disable=SC2034
+  PRECUTOVER_AUTHORED_ENDINGS="\
+r1-node-1=wallet840#1=completed \
+r1-node-1=entry841#1=completed \
+r1-node-1=dkg842#1=completed \
+r1-node-1=sign843#1=completed \
+r1-node-1=beat844#1=completed \
+r1-node-1=bdkg845#1=completed"
   # shellcheck disable=SC2034
   PRECUTOVER_PRIOR_RUNNING=1
   # shellcheck disable=SC2034
@@ -3648,6 +3669,85 @@ run_verdict precutover_case eval \
   'PRECUTOVER_RESULTS="tbtc_wallet_action=succeeded beacon_signing=timed_out"'
 check "a compatibility control is not read off the work that survived" 1 \
   "beacon_signing=timed_out"
+
+# The half of this control that is not the driver's own account. Everything
+# above decides on what the driver said about ceremonies it ran; these decide
+# on the permits this fleet's gate issued for them and on what the nodes
+# holding those permits recorded when each one closed.
+run_verdict precutover_case eval 'PRECUTOVER_ORIGINATED=""'
+check "settled ceremonies naming no permit holder identify no gate permit" 3 \
+  "named no node holding a permit"
+
+run_verdict precutover_case eval \
+  'PRECUTOVER_AUTHORED_ENDINGS="unreadable on r1-node-2"'
+check "a fleet that cannot be asked has vouched for no settlement" 3 \
+  "could not be asked what became of the permits"
+
+# The partial population: five permits ended with a record and the sixth simply
+# never mentioned, which is also what eviction from a bounded account looks
+# like. Both are the same thing to a reader.
+run_verdict precutover_case eval \
+  'PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS% *}"'
+check "a settled ceremony no node vouched for is not completed work" 3 \
+  "no node recorded an ending for r1-node-1=bdkg845#1"
+
+run_verdict precutover_case eval \
+  'PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS} \
+r1-node-1=bdkg845#1=exhausted"'
+check "one permit ending twice cannot be read as either ending" 3 \
+  "more than one node-authored record"
+
+# A permit closed by an owner that recorded nothing. The gate writes that down
+# as an ending rather than leaving it absent, so it arrives as a disposition a
+# reader can refuse rather than as silence.
+run_verdict precutover_case eval \
+  'PRECUTOVER_AUTHORED_ENDINGS="\
+${PRECUTOVER_AUTHORED_ENDINGS% *} r1-node-1=bdkg845#1=unresolved"'
+check "a settled ceremony whose holder recorded nothing stands on nothing" 1 \
+  "closed the permit without recording" "r1-node-1=bdkg845#1=unresolved"
+
+# The disagreement this rung exists for: the driver reports a settlement and
+# the node holding the permit says the ceremony ran out of retries.
+run_verdict precutover_case eval \
+  'PRECUTOVER_AUTHORED_ENDINGS="\
+${PRECUTOVER_AUTHORED_ENDINGS% *} r1-node-1=bdkg845#1=exhausted"'
+check "a driver settlement the holder recorded as exhausted is refused" 1 \
+  "r1-node-1=bdkg845#1=exhausted"
+
+# Quarantine is a closing too, and a pre-C compatibility claim is about work
+# that finished rather than work whose key material was withdrawn.
+run_verdict precutover_case eval \
+  'PRECUTOVER_AUTHORED_ENDINGS="\
+${PRECUTOVER_AUTHORED_ENDINGS% *} r1-node-1=bdkg845#1=quarantined"'
+check "a quarantined permit is not a completed pre-cutover ceremony" 1 \
+  "r1-node-1=bdkg845#1=quarantined"
+
+# An outcome for a ceremony this phase did not put on the chain, and one whose
+# transaction is not the transaction that originated it. Either is somebody
+# else's ceremony arriving in this control's reckoning.
+run_verdict precutover_case eval \
+  'PRECUTOVER_BOUND="${PRECUTOVER_BOUND} \
+tbtc_signing@846@sign846=succeeded=${PRE_TX1}=0xsign846"'
+check "an outcome for work this phase never originated is not evidence" 1 \
+  "tbtc_signing@846@sign846"
+
+run_verdict precutover_case eval \
+  'PRECUTOVER_ORIGINATED="${PRECUTOVER_ORIGINATED/@845@bdkg845=${PRE_TX2}/\
+@845@bdkg845=${PRE_TX1}}"'
+check "an outcome bound to a transaction that started nothing here is not \
+evidence" 1 \
+  "originated as ${PRE_TX1}"
+
+# Originated work with no outcome at all, which is how a partial population
+# passes: six ceremonies driven, five reported, and every requirement above
+# satisfied by the five.
+run_verdict precutover_case eval \
+  'PRECUTOVER_ORIGINATED="${PRECUTOVER_ORIGINATED} \
+tbtc_signing@846@sign846=${PRE_TX1}=r1-node-1~2"
+   PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS} \
+r1-node-1=sign846#2=completed"'
+check "originated work the driver never reported on leaves a gap" 3 \
+  "no outcome at all for tbtc_signing@846@sign846#2"
 
 # ----------------------------------------------------------------------------
 
@@ -3970,29 +4070,27 @@ check "a draining node that never quiesced refutes the legacy half too" 1 \
 QUIESCE_SEQ_TX="0xff88888888888888888888888888888888888888888888888888888888888888"
 QUIESCE_SEQ_COLIVE_TX="0xff99999999999999999999999999999999999999999999999999999999999999"
 
+# The endings the node under test recorded, which both the stubbed drain
+# reading and the document the race case serves render from.
+quiesce_seq_endings() {
+  printf 'r1-node-1=wallet%s#member-1=completed' "${QUIESCE_SEQ_ANCHOR}"
+  if ((QUIESCE_SEQ_SEEDED == 1)); then
+    printf ' r1-node-1=colive900#other-1=completed'
+  fi
+}
+
 # Everything run_quiescence_control reaches outside its own logic. The drain is
 # stubbed to succeed on its first sample so the ladder reaches the rung that
 # reads the anchors rather than stopping at an earlier reading.
 quiesce_sequencing_stubs() {
   QUIESCE_SEQ_ANCHOR="$1"
-  # The control reads its gauge through command substitution, so a shell
-  # variable counting the samples is incremented in a subshell and lost. The
-  # marker is what makes the first read — the one taken before the stop — report
-  # a held permit and every read inside the drain report none.
-  QUIESCE_SEQ_MARKER="${WORK}/quiesce-seq-sampled"
-  rm -f "${QUIESCE_SEQ_MARKER}"
-
+  # The reading taken before the stop is issued, which is the only one the
+  # control still takes a field at a time: it needs a held permit there, or the
+  # ladder stops at "nothing was in flight" before reaching the anchors.
   participation_field() {
     case "$2" in
     gate_state) printf 'quiescing' ;;
-    *)
-      if [[ -f "${QUIESCE_SEQ_MARKER}" ]]; then
-        printf '0'
-      else
-        : >"${QUIESCE_SEQ_MARKER}"
-        printf '1'
-      fi
-      ;;
+    *) printf '1' ;;
     esac
   }
   # A node that drained cleanly: it refused the work offered while quiescing,
@@ -4044,22 +4142,6 @@ quiesce_sequencing_stubs() {
     esac
   }
 
-  # The node's own record of the permits it closed, which the control samples
-  # inside the drain window rather than after it. It answers for both
-  # populations: the co-live permit is reconciled on the same footing as the
-  # drained one, so a seeded control that could not read its ending would block
-  # exactly as one that could not read the drained permit's.
-  #
-  # Invoked by the control under test, which shellcheck cannot see across the
-  # source boundary into rehearse.sh.
-  # shellcheck disable=SC2329
-  service_terminal_outcomes() {
-    printf 'r1-node-1=wallet%s#member-1=completed' "${QUIESCE_SEQ_ANCHOR}"
-    if ((QUIESCE_SEQ_SEEDED == 1)); then
-      printf ' r1-node-1=colive900#other-1=completed'
-    fi
-  }
-
   # The other mode's work, which a seeded control puts in flight beside the
   # permit it drains. It is anchored past C so it really is the other mode,
   # and the control follows it to an outcome like any other held permit, so
@@ -4092,12 +4174,33 @@ ${QUIESCE_SEQ_COLIVE_TERMINAL}"
   }
 }
 
+# The one gate reading the drain window takes each pass: the state, what is
+# still held, and what the node recorded about the permits it let go of. It
+# answers for both populations — the co-live permit is reconciled on the same
+# footing as the drained one, so a seeded control that could not read its
+# ending would block exactly as one that could not read the drained permit's.
+#
+# Kept apart from the stub set above because the race case below has to let the
+# real reader run against a served document, and a case cannot get that back by
+# unsetting a stub: there is one function of this name, so overwriting it loses
+# the definition rehearse.sh contributed.
+#
+# Invoked by the control under test, which shellcheck cannot see across the
+# source boundary into rehearse.sh.
+# shellcheck disable=SC2329
+quiesce_stub_snapshot() {
+  service_gate_snapshot() {
+    printf 'state=quiescing\nactive=0\noutcomes=%s\n' "$(quiesce_seq_endings)"
+  }
+}
+
 quiesce_sequencing_case() {
   # shellcheck disable=SC2034
   REHEARSAL_R1_CUTOVER_BLOCK="1000"
   # shellcheck disable=SC2034
   PR4109_WORK_DRIVER="/nonexistent/driver-is-stubbed"
   quiesce_sequencing_stubs "$1"
+  quiesce_stub_snapshot
   run_quiescence_control r1-node-1 \
     "quiescence with an in-flight legacy permit" \
     "" legacy active_legacy_ceremonies participation_mode_legacy_total \
@@ -4122,6 +4225,7 @@ quiesce_seeded_case() {
   # shellcheck disable=SC2034
   PR4109_WORK_DRIVER="/nonexistent/driver-is-stubbed"
   quiesce_sequencing_stubs 840
+  quiesce_stub_snapshot
   # shellcheck disable=SC2034
   QUIESCE_SEQ_SEEDED=1
   # shellcheck disable=SC2034
@@ -4156,6 +4260,102 @@ check "a failed seeding puts nothing on the chain before C" 3 \
 run_verdict quiesce_seeded_case eval 'QUIESCE_SEEDED_WORK=""'
 check "a seeding that named no work identifies no pre-C permit" 3 \
   "named no legacy work it put on r1-node-1"
+
+# A node that stops the instant it has answered once.
+#
+# This is what a correct drain looks like from outside: the last permit closes,
+# the gate reports nothing held and the endings it recorded for what it let go
+# of, and the process exits. Every reading after that is against a node that is
+# gone. A watcher that asks for the state, then the count, then the endings
+# gets one of the three, and the mandatory gate blocks on a fleet that did
+# exactly what was asked of it — or, worse, records the drain beside an ending
+# list read before the last permit closed. So the document is served once and
+# every later fetch fails, which is the only stub in this file that lets the
+# real snapshot reader run: what is under test is that the control needs one
+# response, not three.
+QUIESCE_RACE_FETCHES="${WORK}/quiesce-race-fetches"
+
+quiesce_race_document() {
+  local outcomes="" token permit
+  for token in $(quiesce_seq_endings); do
+    # Back to the fields the gate serves from the identity a reader renders:
+    # the ending comes off the end and the node's own name off the front,
+    # because the reader is what puts the name there.
+    permit="${token%=*}"
+    permit="${permit#*=}"
+    outcomes="${outcomes}${outcomes:+,}
+      {
+        \"outcome\": \"${token##*=}\",
+        \"permit\": {
+          \"identity_bound\": true,
+          \"work_id\": \"${permit%#*}\",
+          \"permit_id\": \"${permit##*#}\"
+        }
+      }"
+  done
+  cat <<EOF
+{
+  "protocol_participation": {
+    "gate_state": "quiescing",
+    "active_legacy_ceremonies": 0,
+    "active_security_v2_ceremonies": 0,
+    "recent_terminal_outcomes": [${outcomes}
+    ]
+  }
+}
+EOF
+}
+
+quiesce_race_case() {
+  # shellcheck disable=SC2034
+  REHEARSAL_R1_CUTOVER_BLOCK="1000"
+  # shellcheck disable=SC2034
+  PR4109_WORK_DRIVER="/nonexistent/driver-is-stubbed"
+  quiesce_sequencing_stubs 840
+  # shellcheck disable=SC2034
+  QUIESCE_SEQ_SEEDED=1
+  # shellcheck disable=SC2034
+  QUIESCE_SEEDED_ASKED=1
+  # shellcheck disable=SC2034
+  QUIESCE_SEEDED_RC=0
+  QUIESCE_SEEDED_WORK="tbtc_signing@840@wallet840=${QUIESCE_SEQ_TX}=r1-node-1~member-1"
+  # shellcheck disable=SC2034
+  QUIESCE_SEEDED_PERMITS_BEFORE_C="r1-node-1=wallet840#member-1"
+
+  # The whole point of the case: the real reader — which is why no snapshot
+  # stub is installed here — against a node that answers one request and is
+  # then gone. The counter is a file because each fetch runs in its own command
+  # substitution.
+  : >"${QUIESCE_RACE_FETCHES}"
+  # Invoked by the reader under test, which shellcheck cannot see across the
+  # source boundary into rehearse.sh.
+  # shellcheck disable=SC2329
+  probe_diagnostics() {
+    printf 'x' >>"${QUIESCE_RACE_FETCHES}"
+    if (($(wc -c <"${QUIESCE_RACE_FETCHES}") > QUIESCE_RACE_ANSWERS)); then
+      return 1
+    fi
+    quiesce_race_document
+  }
+  "$@"
+  run_quiescence_control r1-node-1 \
+    "quiescence with an in-flight legacy permit" \
+    "" legacy active_legacy_ceremonies participation_mode_legacy_total \
+    quiesce-legacy "${QUIESCE_SEEDED_WORK}"
+}
+
+QUIESCE_RACE_ANSWERS=1
+run_verdict quiesce_race_case :
+check "a node that answers once and exits still evidences its own drain" 0 \
+  "seeded before C and live beside r1-node-1=colive900#other-1" \
+  "quiescence with an in-flight legacy permit"
+
+# The mirror, which keeps the case above from passing for the wrong reason: a
+# node that stops before it answers at all leaves nothing to read, and the
+# control has to say so rather than treat an unanswered drain as a clean one.
+run_verdict quiesce_race_case eval 'QUIESCE_RACE_ANSWERS=0'
+check "a node that stops before answering evidences no drain at all" 1 \
+  "never reported quiescing"
 
 # The reading the whole seeding exists for: the driver says it anchored the
 # work below C, and the gate that would have issued the permit never reported

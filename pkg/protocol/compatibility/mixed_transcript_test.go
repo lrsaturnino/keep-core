@@ -4,7 +4,7 @@ import (
 	"encoding/hex"
 	"math/big"
 	"sort"
-	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,18 +22,6 @@ import (
 // Failing closed can mean a party rejecting a proof or a party never receiving
 // one it can accept, and the second ending produces no error to wait on.
 const mixedTranscriptSettleTimeout = 60 * time.Second
-
-// mixedTranscriptQuiescence is how long a refused ceremony has to stay silent
-// before the driver calls it over.
-//
-// It is armed only after a refusal. Before one, a gap between rounds is a slow
-// ceremony and ending there would fail an honest group; after one, the group
-// can make no further progress, so silence is the ceremony having stopped. That
-// is the moment at which "no signature was produced" is something observed
-// rather than assumed — the driver keeps watching the result channel right up
-// to it, which is the difference between proving a refusal was reported and
-// proving nothing was output afterwards.
-const mixedTranscriptQuiescence = 5 * time.Second
 
 // TestMixedTranscriptSigningCeremonyFailsClosed asserts a tECDSA signing
 // ceremony whose members were configured by different compatibility bundles
@@ -98,7 +86,7 @@ func TestMixedTranscriptSigningCeremonyFailsClosed(t *testing.T) {
 
 	for testName, test := range tests {
 		t.Run(testName, func(t *testing.T) {
-			signatures, members, refusals :=
+			signatures, members, refusals, terminal :=
 				runMixedTranscriptSigningCeremony(t, test.modeAt)
 
 			assertMixedTranscriptOutcome(
@@ -108,6 +96,7 @@ func TestMixedTranscriptSigningCeremonyFailsClosed(t *testing.T) {
 				signatures,
 				members,
 				refusals,
+				terminal,
 			)
 		})
 	}
@@ -120,6 +109,11 @@ func TestMixedTranscriptSigningCeremonyFailsClosed(t *testing.T) {
 // would mean some members finished a ceremony others refused, which is the
 // split state the all-or-nothing crossing exists to prevent — a group holding
 // key material or a signature that only part of it agrees was produced.
+//
+// A ceremony that never reached its terminal state decides nothing either way.
+// The refusal claim is that no member *will* output, and a group still holding
+// live workers has not been shown that; the count in hand is what had appeared
+// by the time the drive gave up.
 func assertMixedTranscriptOutcome(
 	t *testing.T,
 	output string,
@@ -127,8 +121,21 @@ func assertMixedTranscriptOutcome(
 	outputs int,
 	members int,
 	refusals int,
+	terminal bool,
 ) {
 	t.Helper()
+
+	if !terminal {
+		t.Fatalf(
+			"the ceremony was still running after %s with %d/%d %ss and %d "+
+				"refusal(s); nothing was observed to terminal completion",
+			mixedTranscriptSettleTimeout,
+			outputs,
+			members,
+			output,
+			refusals,
+		)
+	}
 
 	if expectOutput {
 		if outputs != members {
@@ -217,7 +224,7 @@ func TestMixedTranscriptKeygenCeremonyFailsClosed(t *testing.T) {
 
 	for testName, test := range tests {
 		t.Run(testName, func(t *testing.T) {
-			shares, members, refusals :=
+			shares, members, refusals, terminal :=
 				runMixedTranscriptKeygenCeremony(t, test.modeAt)
 
 			assertMixedTranscriptOutcome(
@@ -227,6 +234,7 @@ func TestMixedTranscriptKeygenCeremonyFailsClosed(t *testing.T) {
 				shares,
 				members,
 				refusals,
+				terminal,
 			)
 		})
 	}
@@ -239,7 +247,7 @@ func TestMixedTranscriptKeygenCeremonyFailsClosed(t *testing.T) {
 func runMixedTranscriptKeygenCeremony(
 	t *testing.T,
 	modeAt func(index int) participation.ProtocolMode,
-) (int, int, int) {
+) (shares int, members int, refusals int, terminal bool) {
 	t.Helper()
 
 	// Keygen is quadratic in the group and dominated by Paillier work, so the
@@ -309,15 +317,13 @@ func runMixedTranscriptKeygenCeremony(
 		))
 	}
 
-	startTSSParties(parties, errChan)
-
-	shares, refusals := driveTSSCeremony(
+	shares, refusals, terminal = driveTSSCeremony(
 		parties,
 		outgoingChan,
 		resultChan,
 		errChan,
 	)
-	return shares, len(parties), refusals
+	return shares, len(parties), refusals, terminal
 }
 
 // mixedTranscriptDKGSessionID is a ceremony session identifier long enough to
@@ -331,7 +337,7 @@ const mixedTranscriptDKGSessionID = "dkg-64757a1f-0000000000000001"
 func runMixedTranscriptSigningCeremony(
 	t *testing.T,
 	modeAt func(index int) participation.ProtocolMode,
-) (int, int, int) {
+) (signatures int, members int, refusals int, terminal bool) {
 	t.Helper()
 
 	// The fixtures are a 3-of-5 group, so three members carry the signing
@@ -410,48 +416,45 @@ func runMixedTranscriptSigningCeremony(
 		))
 	}
 
-	startTSSParties(parties, errChan)
-
-	signatures, refusals := driveTSSCeremony(
+	signatures, refusals, terminal = driveTSSCeremony(
 		parties,
 		outgoingChan,
 		resultChan,
 		errChan,
 	)
-	return signatures, len(parties), refusals
-}
-
-// startTSSParties starts every party, reporting a start that fails closed the
-// same way a rejected proof does. A party that cannot start emits nothing, so
-// its error is the only thing that says the ceremony went anywhere.
-func startTSSParties(parties []tss.Party, errChan chan<- *tss.Error) {
-	for _, party := range parties {
-		go func(party tss.Party) {
-			if err := party.Start(); err != nil {
-				select {
-				case errChan <- err:
-				default:
-				}
-			}
-		}(party)
-	}
+	return signatures, len(parties), refusals, terminal
 }
 
 // mixedTranscriptSessionID is a ceremony session identifier long enough to
 // clear the security-v2 bundle's proof-binding floor.
 const mixedTranscriptSessionID = "signing-64757a1f-0000000000000001"
 
-// driveTSSCeremony routes messages between parties until every party has
-// produced its output, or until a refused ceremony has fallen silent, or until
-// the ceremony has had long enough to do either. It reports how many parties
-// output a result and how many refusals were seen.
+// driveTSSCeremony starts every party and routes messages between them until
+// the ceremony can produce nothing further. It reports how many parties output
+// a result, how many refusals were seen, and whether the ceremony was watched
+// all the way to that terminal state.
 //
-// A refusal does not end the drive. What is under test is that a mixed group
-// produces nothing, and stopping at the first error would only establish that
-// one party complained — a group that reported a refusal and then went on to
-// output a signature anyway would look identical. So routing continues, the
-// result channel keeps being watched, and the count the caller asserts on is
-// the number of outputs observed over the whole ceremony.
+// The terminal state is the point of this function. A tss-lib party emits its
+// messages and its save data from inside Start and UpdateFromBytes — every
+// goroutine a round spawns is joined before the round returns — so a ceremony
+// with no Start and no delivery still running, and nothing left queued to
+// deliver, has no path left by which a signature or a key share could appear.
+// That is a state this function can join and observe. A stretch of silence is
+// not: it says the ceremony has produced nothing *yet*, which is what a slow
+// round also looks like, and a caller asserting that nothing was output would
+// be asserting it of a group still holding workers that could output.
+//
+// A refusal therefore does not end the drive either. What is under test is that
+// a mixed group produces nothing, and stopping at the first error would only
+// establish that one party complained — a group that reported a refusal and
+// then went on to output a signature anyway would look identical. Routing
+// continues, the result channel keeps being watched, and the count the caller
+// asserts on is the number of outputs observed over the whole ceremony.
+//
+// The settle timeout bounds a party that hangs inside tss-lib rather than
+// returning. It is reported as a failure to reach the terminal state rather
+// than folded into the counts, because a ceremony still running proves nothing
+// about what it will not produce.
 //
 // It is generic over the result type because keygen and signing deliver
 // different save data over otherwise identical plumbing, and the property being
@@ -461,14 +464,35 @@ func driveTSSCeremony[R any](
 	outgoingChan <-chan tss.Message,
 	resultChan <-chan R,
 	errChan chan *tss.Error,
-) (outputs int, refusals int) {
-	var routing sync.WaitGroup
+) (outputs int, refusals int, terminal bool) {
+	// Everything that can still put something on one of the channels below:
+	// each party's Start, and each delivery into a party. Only the loop below
+	// adds to it, and it does so before releasing the worker, so a count of
+	// zero read there means no party code is executing anywhere.
+	var running atomic.Int64
+	// Coalescing and never blocking, because its only job is to wake the loop
+	// so it re-reads the count. A worker that could block here would be a
+	// worker the count never releases.
+	woken := make(chan struct{}, 1)
+	run := func(work func()) {
+		running.Add(1)
+		go func() {
+			defer func() {
+				running.Add(-1)
+				select {
+				case woken <- struct{}{}:
+				default:
+				}
+			}()
+			work()
+		}()
+	}
 
 	// A refusing party keeps refusing every later delivery, so reports can
 	// outnumber the channel long after the ceremony is decided. Dropping the
-	// surplus is what lets this function return: a routing goroutine still
-	// blocked on a full channel would hold the teardown below forever, and the
-	// first report already carries everything the caller reads.
+	// surplus is what keeps a delivery from blocking on a full channel, which
+	// would leave a worker the count never releases; the first report already
+	// carries everything the caller reads.
 	report := func(err *tss.Error) {
 		select {
 		case errChan <- err:
@@ -476,34 +500,8 @@ func driveTSSCeremony[R any](
 		}
 	}
 
-	// A party still mid-delivery when the drive ends can emit one more message,
-	// and a full outgoing channel would block the goroutine the teardown waits
-	// on. Draining until the deliveries finish is what keeps that wait bounded,
-	// and a result arriving during it still counts against the caller's claim
-	// that nothing was output.
-	defer func() {
-		delivered := make(chan struct{})
-		go func() {
-			routing.Wait()
-			close(delivered)
-		}()
-		for {
-			select {
-			case <-outgoingChan:
-			case <-errChan:
-			case <-resultChan:
-				outputs++
-			case <-delivered:
-				return
-			}
-		}
-	}()
-
 	deliver := func(to tss.Party, message tss.Message) {
-		routing.Add(1)
-		go func() {
-			defer routing.Done()
-
+		run(func() {
 			bytes, routingInfo, err := message.WireBytes()
 			if err != nil {
 				report(to.WrapError(err))
@@ -516,18 +514,55 @@ func driveTSSCeremony[R any](
 			); err != nil {
 				report(err)
 			}
-		}()
+		})
+	}
+
+	route := func(message tss.Message) {
+		destinations := message.GetTo()
+		if destinations == nil {
+			for _, party := range parties {
+				if party.PartyID().Index == message.GetFrom().Index {
+					continue
+				}
+				deliver(party, message)
+			}
+			return
+		}
+		for _, destination := range destinations {
+			deliver(parties[destination.Index], message)
+		}
+	}
+
+	// A party that cannot start emits nothing, so its error is the only thing
+	// that says the ceremony went anywhere.
+	for _, party := range parties {
+		run(func() {
+			if err := party.Start(); err != nil {
+				report(err)
+			}
+		})
 	}
 
 	settled := time.After(mixedTranscriptSettleTimeout)
 
 	for {
-		// The window restarts on every message, result, and refusal, so it
-		// measures silence since the ceremony last did anything rather than
-		// time since it started.
-		var quiet <-chan time.Time
-		if refusals > 0 {
-			quiet = time.After(mixedTranscriptQuiescence)
+		if running.Load() == 0 {
+			// Nothing is executing, so nothing can be added to these channels
+			// any more and whatever is already on them is all there will ever
+			// be. Taking it here rather than declaring the ceremony over keeps
+			// a result that landed in the same instant as the last worker
+			// returned counted against the caller's claim.
+			select {
+			case <-errChan:
+				refusals++
+			case <-resultChan:
+				outputs++
+			case message := <-outgoingChan:
+				route(message)
+			default:
+				return outputs, refusals, true
+			}
+			continue
 		}
 
 		select {
@@ -535,32 +570,15 @@ func driveTSSCeremony[R any](
 			refusals++
 
 		case message := <-outgoingChan:
-			destinations := message.GetTo()
-			if destinations == nil {
-				for _, party := range parties {
-					if party.PartyID().Index ==
-						message.GetFrom().Index {
-						continue
-					}
-					deliver(party, message)
-				}
-				continue
-			}
-			for _, destination := range destinations {
-				deliver(parties[destination.Index], message)
-			}
+			route(message)
 
 		case <-resultChan:
 			outputs++
-			if outputs == len(parties) {
-				return outputs, refusals
-			}
 
-		case <-quiet:
-			return outputs, refusals
+		case <-woken:
 
 		case <-settled:
-			return outputs, refusals
+			return outputs, refusals, false
 		}
 	}
 }
