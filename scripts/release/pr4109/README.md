@@ -315,10 +315,11 @@ closed and emits it at
 `work_id`/`permit_id` identities the live list carries — so a permit the
 crossing control saw held is followed to the disposition its own node recorded.
 
-The surviving-work verdict, both quiescence verdicts, and both pre-cutover
-verdicts decide on that reading. Every permit they named must appear in the
-closed-permit account exactly once, and the ending they require is the one the
-holder recorded, not the one the driver reported:
+The surviving-work verdict, both quiescence verdicts, both pre-cutover
+verdicts, and the homogeneous positive control decide on that reading. Every
+permit they named must appear in the closed-permit account exactly once, and
+the ending they require is the one the holder recorded, not the one the driver
+reported:
 
 - A gate that cannot be asked leaves the crossing unobserved rather than
   shortening the account, since a node that answers nothing and a node whose
@@ -345,18 +346,17 @@ goes with it. The account only grows as permits close, so the last reading taken
 before the node goes away is the one carrying every permit that ended in the
 window.
 
-Within those five verdicts the driver's account is kept beside the decision
+Within those six verdicts the driver's account is kept beside the decision
 rather than making it: it carries the settlement identities and transaction
 hashes the chain corroborates, neither of which a gate scrape knows, and it no
-longer says how a permit ended.
+longer says how a permit ended. Each of them also refuses an outcome for work
+that phase did not originate on the transaction that originated it, and
+originated work no outcome covers — a control that reads only the work its
+driver chose to report on is satisfied by the subset that went well.
 
 The seam is not closed, and the parts of it still open are named here rather
 than left to be inferred from which verdicts the list above happens to omit:
 
-- The homogeneous positive control still decides on driver settlements. Its
-  claim is that a fleet past C completes work with no legacy sighting beside
-  it, and the completion half of that is read from the report of the party that
-  drove it.
 - The rollback drain and rollback reconciliation verdicts still treat a driver
   terminal record as the proof that every nonquarantined permit completed. Gate
   7's claim about a fleet being taken back off the release therefore rests on

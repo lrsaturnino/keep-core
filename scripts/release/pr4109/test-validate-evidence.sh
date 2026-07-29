@@ -3218,6 +3218,12 @@ HOM_TX2="0xbb22222222222222222222222222222222222222222222222222222222222222"
 HOM_TX3="0xcc33333333333333333333333333333333333333333333333333333333333333"
 HOM_SIG1="0xsig1abc"
 HOM_SIG2="0xsig2def"
+# The work identities those ceremonies carry: ceremony, the block the permit
+# pinned its mode from, and the chain-native identity of the request behind it.
+# A bare ceremony name is not one — two runs of the same ceremony share it — and
+# the driver report this control reads cannot produce one.
+HOM_SIGNING="tbtc_signing@1200@sign1200"
+HOM_BEACON="beacon_dkg@1201@bdkg1201"
 
 homogeneous_readings() {
   # shellcheck disable=SC2034
@@ -3229,8 +3235,17 @@ homogeneous_readings() {
   # shellcheck disable=SC2034
   HOMOGENEOUS_RESULTS="tbtc_signing=succeeded beacon_dkg=succeeded"
   # shellcheck disable=SC2034
-  HOMOGENEOUS_BOUND="tbtc_signing=succeeded=${HOM_TX1}=${HOM_SIG1} \
-beacon_dkg=succeeded=${HOM_TX2}=${HOM_SIG2}"
+  HOMOGENEOUS_BOUND="${HOM_SIGNING}=succeeded=${HOM_TX1}=${HOM_SIG1} \
+${HOM_BEACON}=succeeded=${HOM_TX2}=${HOM_SIG2}"
+  # The permits the fleet's gate issued for that work and what their holders
+  # recorded when they closed. Without these the control decides entirely on
+  # the report of the party that drove the ceremonies.
+  # shellcheck disable=SC2034
+  HOMOGENEOUS_ORIGINATED="${HOM_SIGNING}=${HOM_TX1}=r1-node-1~1 \
+${HOM_BEACON}=${HOM_TX2}=r1-node-1~1"
+  # shellcheck disable=SC2034
+  HOMOGENEOUS_AUTHORED_ENDINGS="r1-node-1=sign1200#1=completed \
+r1-node-1=bdkg1201#1=completed"
   # shellcheck disable=SC2034
   HOMOGENEOUS_PERMITS_BEFORE="20"
   # shellcheck disable=SC2034
@@ -3255,8 +3270,9 @@ homogeneous_case() {
 
 run_verdict homogeneous_case :
 check "post-C ceremonies that completed under security-v2 hold the control" 0 \
-  "settled tbtc_signing \(${HOM_TX1}, ${HOM_SIG1}\)" \
-  "beacon_dkg \(${HOM_TX2}, ${HOM_SIG2}\)" \
+  "settled ${HOM_SIGNING} \(${HOM_TX1}, ${HOM_SIG1}\)" \
+  "${HOM_BEACON} \(${HOM_TX2}, ${HOM_SIG2}\)" \
+  "recorded r1-node-1=sign1200#1=completed" \
   "recognized no cross-format peer"
 
 # The half a permit counter cannot carry: work was allowed to start and
@@ -3271,17 +3287,17 @@ check "permits without a completed ceremony are not a positive control" 3 \
 # the half that passed recorded the control on its own.
 run_verdict homogeneous_case eval \
   "HOMOGENEOUS_RESULTS='tbtc_signing=succeeded beacon_dkg=failed'
-   HOMOGENEOUS_BOUND='tbtc_signing=succeeded=${HOM_TX1}=${HOM_SIG1} \
-beacon_dkg=failed=${HOM_TX2}=no_threshold'"
+   HOMOGENEOUS_BOUND='${HOM_SIGNING}=succeeded=${HOM_TX1}=${HOM_SIG1} \
+${HOM_BEACON}=failed=${HOM_TX2}=no_threshold'"
 check "a required ceremony failing beside a passing one refutes the control" \
   1 "reported beacon_dkg=failed" "cannot be read off the subset"
 
 run_verdict homogeneous_case eval \
   "HOMOGENEOUS_RESULTS='tbtc_signing=succeeded beacon_dkg=succeeded \
 tbtc_wallet_action=timed_out'
-   HOMOGENEOUS_BOUND='tbtc_signing=succeeded=${HOM_TX1}=${HOM_SIG1} \
-beacon_dkg=succeeded=${HOM_TX2}=${HOM_SIG2} \
-tbtc_wallet_action=timed_out=${HOM_TX3}=retry_exhausted'"
+   HOMOGENEOUS_BOUND='${HOM_SIGNING}=succeeded=${HOM_TX1}=${HOM_SIG1} \
+${HOM_BEACON}=succeeded=${HOM_TX2}=${HOM_SIG2} \
+tbtc_wallet_action@1202@act1202=timed_out=${HOM_TX3}=retry_exhausted'"
 check "a ceremony that timed out beside the controls refutes them" 1 \
   "tbtc_wallet_action=timed_out"
 
@@ -3290,15 +3306,15 @@ check "a ceremony that timed out beside the controls refutes them" 1 \
 # other unexercised however many times it succeeded.
 run_verdict homogeneous_case eval \
   "HOMOGENEOUS_RESULTS='tbtc_signing=succeeded tbtc_dkg=succeeded'
-   HOMOGENEOUS_BOUND='tbtc_signing=succeeded=${HOM_TX1}=${HOM_SIG1} \
-tbtc_dkg=succeeded=${HOM_TX2}=${HOM_SIG2}'"
+   HOMOGENEOUS_BOUND='${HOM_SIGNING}=succeeded=${HOM_TX1}=${HOM_SIG1} \
+tbtc_dkg@1201@dkg1201=succeeded=${HOM_TX2}=${HOM_SIG2}'"
 check "a control that drove only tBTC says nothing about the beacon" 3 \
   "nothing from the beacon half of the release"
 
 run_verdict homogeneous_case eval \
   "HOMOGENEOUS_RESULTS='beacon_dkg=succeeded beacon_signing=succeeded'
-   HOMOGENEOUS_BOUND='beacon_dkg=succeeded=${HOM_TX1}=${HOM_SIG1} \
-beacon_signing=succeeded=${HOM_TX2}=${HOM_SIG2}'"
+   HOMOGENEOUS_BOUND='beacon_dkg@1200@bdkg1200=succeeded=${HOM_TX1}=${HOM_SIG1} \
+beacon_signing@1201@entry1201=succeeded=${HOM_TX2}=${HOM_SIG2}'"
 check "a control that drove only the beacon says nothing about tBTC" 3 \
   "nothing from the tbtc half of the release"
 
@@ -3340,6 +3356,63 @@ check "no driver leaves the positive control with nothing to observe" 3 \
 run_verdict homogeneous_case eval 'HOMOGENEOUS_PERMITS_AFTER="unreadable"'
 check "unreadable permit counters observe no mode at all" 3 \
   "fleet permit counters could not be read"
+
+# The half of this control that is not the driver's own account. A positive
+# control's claim is that a fleet past C finishes work, and everything above
+# reads that claim off the report of the party that drove it.
+run_verdict homogeneous_case eval 'HOMOGENEOUS_ORIGINATED=""'
+check "settled ceremonies naming no holder identify no security-v2 permit" 3 \
+  "named no node holding a permit"
+
+run_verdict homogeneous_case eval \
+  'HOMOGENEOUS_AUTHORED_ENDINGS="unreadable on r1-node-2"'
+check "a post-C fleet that cannot be asked has vouched for nothing" 3 \
+  "could not be asked what became of the permits"
+
+run_verdict homogeneous_case eval \
+  'HOMOGENEOUS_AUTHORED_ENDINGS="r1-node-1=sign1200#1=completed"'
+check "a post-C settlement no node vouched for is not finished work" 3 \
+  "no node recorded an ending for r1-node-1=bdkg1201#1"
+
+run_verdict homogeneous_case eval \
+  'HOMOGENEOUS_AUTHORED_ENDINGS="${HOMOGENEOUS_AUTHORED_ENDINGS} \
+r1-node-1=bdkg1201#1=exhausted"'
+check "a post-C permit ending twice cannot be read as either ending" 3 \
+  "more than one node-authored record"
+
+run_verdict homogeneous_case eval \
+  'HOMOGENEOUS_AUTHORED_ENDINGS="r1-node-1=sign1200#1=completed \
+r1-node-1=bdkg1201#1=unresolved"'
+check "a post-C settlement whose holder recorded nothing stands on nothing" 1 \
+  "closed the permit without recording" "r1-node-1=bdkg1201#1=unresolved"
+
+run_verdict homogeneous_case eval \
+  'HOMOGENEOUS_AUTHORED_ENDINGS="r1-node-1=sign1200#1=completed \
+r1-node-1=bdkg1201#1=exhausted"'
+check "a post-C settlement the holder recorded as exhausted is refused" 1 \
+  "r1-node-1=bdkg1201#1=exhausted"
+
+# Quarantine closes a permit too, and a control whose whole job is to show a
+# post-C fleet finishing work cannot be satisfied by one that stopped.
+run_verdict homogeneous_case eval \
+  'HOMOGENEOUS_AUTHORED_ENDINGS="r1-node-1=sign1200#1=completed \
+r1-node-1=bdkg1201#1=quarantined"'
+check "a quarantined post-C permit is not a completed ceremony" 1 \
+  "r1-node-1=bdkg1201#1=quarantined"
+
+run_verdict homogeneous_case eval \
+  'HOMOGENEOUS_BOUND="${HOMOGENEOUS_BOUND} \
+tbtc_heartbeat@1202@beat1202=succeeded=${HOM_TX3}=0xbeat1202"'
+check "a post-C outcome for work never originated here is not evidence" 1 \
+  "tbtc_heartbeat@1202@beat1202"
+
+run_verdict homogeneous_case eval \
+  'HOMOGENEOUS_ORIGINATED="${HOMOGENEOUS_ORIGINATED} \
+tbtc_heartbeat@1202@beat1202=${HOM_TX3}=r1-node-1~2"
+   HOMOGENEOUS_AUTHORED_ENDINGS="${HOMOGENEOUS_AUTHORED_ENDINGS} \
+r1-node-1=beat1202#2=completed"'
+check "post-C work the driver never reported on leaves a gap" 3 \
+  "no outcome at all for tbtc_heartbeat@1202@beat1202#2"
 
 # ----------------------------------------------------------------------------
 

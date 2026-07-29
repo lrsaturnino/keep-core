@@ -7365,6 +7365,15 @@ HOMOGENEOUS_RESULTS=""
 # one that was already running, and a ceremony that produced a threshold
 # output from a report that merely says it did.
 HOMOGENEOUS_BOUND=""
+# The permits this fleet's gate issued for that same work, and what the node
+# holding each one recorded when it closed.
+#
+# The bound outcomes above are still one party's account of its own ceremonies:
+# the driver both starts the work and says how it went, and a positive control
+# that reads only that passes on a report which simply says so. These name the
+# permits the ceremonies ran under and join each to its holder's own ending.
+HOMOGENEOUS_ORIGINATED=""
+HOMOGENEOUS_AUTHORED_ENDINGS=""
 HOMOGENEOUS_PERMITS_BEFORE=""
 HOMOGENEOUS_PERMITS_AFTER=""
 HOMOGENEOUS_LEGACY_BEFORE=""
@@ -7385,11 +7394,34 @@ homogeneous_control_verdict() {
   # The required set is both halves of the release, because that is what
   # "controls" in the step's name means. Read before the ladder so the two
   # readings it adds are stated once.
-  local failed_results missing_families settlements
+  local failed_results missing_families settlements stray unended
+  local named_permits unauthored duplicated unresolved misended authored
   failed_results="$(unsuccessful_results "${HOMOGENEOUS_RESULTS}")"
   missing_families="$(missing_bound_families \
     "${HOMOGENEOUS_BOUND}" "${HOMOGENEOUS_REQUIRED_FAMILIES}")"
   settlements="$(bound_settlements "${HOMOGENEOUS_BOUND}")"
+  stray="$(unoriginated_terminals "${HOMOGENEOUS_BOUND}" \
+    "${HOMOGENEOUS_ORIGINATED}")"
+  unended="$(unended_work "${HOMOGENEOUS_ORIGINATED}" \
+    "${HOMOGENEOUS_BOUND}" "")"
+  # The population read off the nodes rather than off the driver: the permits
+  # the gate issued for this work, and the ending each holder recorded. A
+  # positive control's claim is that a fleet past C finishes work, and only
+  # this half of the reading is not the report of the party that drove it.
+  named_permits="$(held_permit_identities "${HOMOGENEOUS_ORIGINATED}")"
+  unauthored="$(unauthored_permits "${named_permits}" \
+    "${HOMOGENEOUS_AUTHORED_ENDINGS}")"
+  duplicated="$(duplicated_authored_permits "${named_permits}" \
+    "${HOMOGENEOUS_AUTHORED_ENDINGS}")"
+  unresolved="$(unresolved_authored_permits "${named_permits}" \
+    "${HOMOGENEOUS_AUTHORED_ENDINGS}")"
+  # Completion only, as for the crossing. Exhausted and quarantined are
+  # closings, and a control whose whole job is to show that work finishes
+  # cannot be satisfied by a permit that stopped.
+  misended="$(misended_authored_permits "${named_permits}" \
+    "${HOMOGENEOUS_AUTHORED_ENDINGS}" completed)"
+  authored="$(authored_endings "${named_permits}" \
+    "${HOMOGENEOUS_AUTHORED_ENDINGS}")"
 
   if ((HOMOGENEOUS_DRIVER_SUPPLIED == 0)); then
     block_step "${step}" "no PR4109_WORK_DRIVER was supplied, so no tBTC or \
@@ -7441,6 +7473,52 @@ from the ${missing_families} half of the release, so this control covers one \
 call path into the gate and says nothing about the other; a post-C control \
 has to succeed on ${HOMOGENEOUS_REQUIRED_FAMILIES}"
     record_assertion "${assertion}" false "${step}"
+  elif [[ -z "${named_permits//[[:space:]]/}" ]]; then
+    block_step "${step}" "the work driver settled ${settlements} but named no \
+node holding a permit for any of it, so nothing here identifies a permit this \
+fleet's gate issued; the settlements are the driver's account of its own work \
+and the counters below only say the fleet took some security-v2 permit while \
+it ran"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ -n "${stray}" ]]; then
+    record_step "${step}" fail "the work driver reported an outcome for \
+${stray}, which it did not originate here on that transaction; an outcome \
+belonging to another ceremony or another transaction is not this control's to \
+be positive about"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ -n "${unended}" ]]; then
+    block_step "${step}" "the work driver settled ${settlements} but reported \
+no outcome at all for ${unended}; a positive control that reads only the work \
+its driver chose to report on is satisfied by the subset that went well"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ "${HOMOGENEOUS_AUTHORED_ENDINGS}" == "unreadable on "* ]]; then
+    block_step "${step}" "the R1 fleet could not be asked what became of the \
+permits it took for these ceremonies (${HOMOGENEOUS_AUTHORED_ENDINGS}); \
+without that reading the settlements above are the driver's account of its \
+own work and no node has vouched for one of them"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ -n "${unauthored}" ]]; then
+    block_step "${step}" "no node recorded an ending for ${unauthored}, \
+though the driver named ${named_permits} as the permits issued for the \
+ceremonies it settled; a permit whose own holder will not say how it ended is \
+not work this fleet was observed finishing"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ -n "${duplicated}" ]]; then
+    block_step "${step}" "more than one node-authored record claims to be the \
+ending of ${duplicated}; one permit ends once, and a reader taking the first \
+match would decide this control on whichever record happened to come first"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ -n "${unresolved}" ]]; then
+    record_step "${step}" fail "${unresolved} — the holder closed the permit \
+without recording what became of it, so the ceremony went somewhere the node \
+cannot say and the driver's settlement for it stands on nothing"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ -n "${misended}" ]]; then
+    record_step "${step}" fail "the work driver settled ${settlements}, but \
+the nodes holding the permits recorded ${misended}; a closing is not a \
+completion, and where the two accounts disagree it is the driver's that is \
+about its own work"
+    record_assertion "${assertion}" false "${step}"
   elif ((HOMOGENEOUS_PERMITS_AFTER <= HOMOGENEOUS_PERMITS_BEFORE)); then
     record_step "${step}" fail "the work driver settled ${settlements}, but \
 the fleet issued no new security-v2 permit (still \
@@ -7481,7 +7559,8 @@ ran; a control with no legacy sightings cannot produce a legacy roster entry"
 $((HOMOGENEOUS_PERMITS_AFTER - HOMOGENEOUS_PERMITS_BEFORE)) new security-v2 \
 permits driving the post-C ceremonies the driver originated, the driver \
 settled ${settlements} with nothing failing beside \
-them and both ${HOMOGENEOUS_REQUIRED_FAMILIES} represented, and the fleet took no legacy \
+them and both ${HOMOGENEOUS_REQUIRED_FAMILIES} represented, the nodes holding \
+the permits issued for that work recorded ${authored}, and the fleet took no legacy \
 permit (participation_mode_legacy_total unchanged at \
 [${HOMOGENEOUS_LEGACY_AFTER}]), recognized no cross-format peer (unchanged at \
 [${HOMOGENEOUS_SIGHTINGS_AFTER}]), and added no operator to its legacy roster"
@@ -8892,6 +8971,8 @@ network"
   HOMOGENEOUS_TX=0
   HOMOGENEOUS_RESULTS=""
   HOMOGENEOUS_BOUND=""
+  HOMOGENEOUS_ORIGINATED=""
+  HOMOGENEOUS_AUTHORED_ENDINGS=""
   HOMOGENEOUS_NEW_OPERATORS=""
 
   # A zero legacy counter is true of a fleet that ran nothing at all, so the
@@ -8927,6 +9008,10 @@ network"
     HOMOGENEOUS_TX="${WORK_DRIVER_TX_COUNT}"
     HOMOGENEOUS_RESULTS="${WORK_DRIVER_CEREMONY_RESULTS}"
     HOMOGENEOUS_BOUND="${WORK_DRIVER_BOUND_RESULTS}"
+    HOMOGENEOUS_ORIGINATED="${WORK_DRIVER_ORIGINATED_WORK}"
+    # Asked after the driver has reported, so every permit it says was issued
+    # for this work has had its holder's own record written before the reading.
+    HOMOGENEOUS_AUTHORED_ENDINGS="$(fleet_terminal_outcomes)"
   fi
 
   HOMOGENEOUS_PERMITS_AFTER="$(fleet_metric_total \
