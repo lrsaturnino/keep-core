@@ -28,6 +28,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/beacon/registry"
 	"github.com/keep-network/keep-core/pkg/bls"
 	"github.com/keep-network/keep-core/pkg/chain"
+	beaconabi "github.com/keep-network/keep-core/pkg/chain/ethereum/beacon/gen/abi"
 	ecdsaabi "github.com/keep-network/keep-core/pkg/chain/ethereum/ecdsa/gen/abi"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/protocol/participation"
@@ -38,6 +39,7 @@ const testPassword = "audit-test-password"
 
 const (
 	testWalletRegistryAddress       = "0x1111111111111111111111111111111111111111"
+	testRandomBeaconAddress         = "0x3333333333333333333333333333333333333333"
 	testFinalizedEthereumBlock      = uint64(10_000)
 	testChainEvidencePrivateKeyByte = byte(0x42)
 )
@@ -649,6 +651,7 @@ func authenticateTestChainReconciliationEvidence(
 	t.Helper()
 
 	record.WalletRegistryAddress = testWalletRegistryAddress
+	record.RandomBeaconAddress = testRandomBeaconAddress
 	record.Receipts = nil
 
 	canonicalBlocks := map[uint64]string{
@@ -1042,6 +1045,7 @@ func testExpectedIdentity() expectedIdentityInputs {
 	return expectedIdentityInputs{
 		ethereumChainID:              "1",
 		walletRegistryAddress:        testWalletRegistryAddress,
+		randomBeaconAddress:          testRandomBeaconAddress,
 		finalizedEthereumBlockNumber: testFinalizedEthereumBlock,
 		finalizedEthereumBlockHash: testCanonicalEthereumBlockHash(
 			testFinalizedEthereumBlock,
@@ -1970,6 +1974,8 @@ func TestRunAudit_MissingExpectedIdentityIsBlocking(t *testing.T) {
 	}
 	for _, fragment := range []string{
 		"expected Ethereum chain ID is not supplied",
+		"expected WalletRegistry address is not supplied",
+		"expected RandomBeacon address is not supplied",
 		"expected Bitcoin network is not supplied",
 		"expected prior version is not supplied",
 		"expected prior revision is not supplied",
@@ -2008,11 +2014,13 @@ func TestRunAudit_MismatchedExpectedIdentityIsBlocking(t *testing.T) {
 	// [mainnet], version [v2.0.0]; the audit expects a different operational
 	// target for each.
 	mismatched := expectedIdentityInputs{
-		ethereumChainID: "11155111",
-		bitcoinNetwork:  "testnet",
-		priorVersion:    "v1.9.9",
-		priorRevision:   strings.Repeat("cd", 20),
-		maxEvidenceAge:  24 * time.Hour,
+		ethereumChainID:       "11155111",
+		walletRegistryAddress: "0x0000000000000000000000000000000000000001",
+		randomBeaconAddress:   "0x0000000000000000000000000000000000000002",
+		bitcoinNetwork:        "testnet",
+		priorVersion:          "v1.9.9",
+		priorRevision:         strings.Repeat("cd", 20),
+		maxEvidenceAge:        24 * time.Hour,
 	}
 
 	auditManifest, err := runAudit(
@@ -2030,6 +2038,8 @@ func TestRunAudit_MismatchedExpectedIdentityIsBlocking(t *testing.T) {
 	}
 	for _, fragment := range []string{
 		"reconciled against Ethereum chain [1], expected [11155111]",
+		"the WalletRegistry address [" + testWalletRegistryAddress + "]",
+		"the RandomBeacon address [" + testRandomBeaconAddress + "]",
 		"reconciled against Bitcoin network [mainnet], expected [testnet]",
 		"tested prior version [v2.0.0], expected [v1.9.9]",
 		"tested prior revision",
@@ -3129,6 +3139,7 @@ func TestValidateChainReconciliationEvidence_TBTCDKGPermitLineage(
 			expected: expectedIdentityInputs{
 				ethereumChainID:              "1",
 				walletRegistryAddress:        testWalletRegistryAddress,
+				randomBeaconAddress:          testRandomBeaconAddress,
 				finalizedEthereumBlockNumber: testFinalizedEthereumBlock,
 				finalizedEthereumBlockHash: testCanonicalEthereumBlockHash(
 					testFinalizedEthereumBlock,
@@ -4865,6 +4876,7 @@ func TestValidateChainReconciliationEvidence_InactivityClaimSettlement(
 			expected: expectedIdentityInputs{
 				ethereumChainID:              "1",
 				walletRegistryAddress:        testWalletRegistryAddress,
+				randomBeaconAddress:          testRandomBeaconAddress,
 				finalizedEthereumBlockNumber: testFinalizedEthereumBlock,
 				finalizedEthereumBlockHash: testCanonicalEthereumBlockHash(
 					testFinalizedEthereumBlock,
@@ -5131,5 +5143,395 @@ func TestValidateChainReconciliationEvidence_InactivityClaimSettlement(
 			validate(t, run, record),
 			"no authenticated WalletRegistry InactivityClaimed log",
 		)
+	})
+}
+
+// addTestRelayEntryReceipt appends an authenticated receipt carrying a real
+// ABI-encoded RandomBeacon relay lifecycle log, then re-attests and re-signs
+// the record. The log is built from the generated RandomBeacon ABI so the
+// audit's decode path is exercised against the exact bytes the contract emits.
+//
+// The non-indexed values are the ones each event actually carries: the
+// terminated group for a timeout, the selected group and previous entry for a
+// request, and the submitter and entry for a delivery.
+func addTestRelayEntryReceipt(
+	t *testing.T,
+	record *chainReconciliationEvidence,
+	address string,
+	eventName string,
+	requestID *big.Int,
+	blockNumber uint64,
+	values ...interface{},
+) {
+	t.Helper()
+
+	parsed, err := beaconabi.RandomBeaconMetaData.GetAbi()
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, ok := parsed.Events[eventName]
+	if !ok {
+		t.Fatalf("generated RandomBeacon ABI has no %s event", eventName)
+	}
+
+	data, err := event.Inputs.NonIndexed().Pack(values...)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var requestTopic [32]byte
+	requestID.FillBytes(requestTopic[:])
+
+	transactionHash := fmt.Sprintf(
+		"0x%064x",
+		blockNumber*31+uint64(len(record.Receipts))+1,
+	)
+	record.Receipts = append(record.Receipts, ethereumReceiptEvidence{
+		TransactionHash:  transactionHash,
+		BlockHash:        testCanonicalEthereumBlockHash(blockNumber),
+		BlockNumber:      blockNumber,
+		TransactionIndex: uint64(len(record.Receipts)),
+		Status:           1,
+		Logs: []ethereumRawLogEvidence{
+			{
+				Address: address,
+				Topics: []string{
+					strings.ToLower(event.ID.Hex()),
+					"0x" + hex.EncodeToString(requestTopic[:]),
+				},
+				Data:     "0x" + hex.EncodeToString(data),
+				LogIndex: 0,
+			},
+		},
+	})
+
+	record.CollectorAttestation.CanonicalBlocks = append(
+		record.CollectorAttestation.CanonicalBlocks,
+		ethereumCanonicalBlockEvidence{
+			BlockNumber: blockNumber,
+			BlockHash:   testCanonicalEthereumBlockHash(blockNumber),
+		},
+	)
+	sort.Slice(
+		record.CollectorAttestation.CanonicalBlocks,
+		func(i, j int) bool {
+			return record.CollectorAttestation.CanonicalBlocks[i].BlockNumber <
+				record.CollectorAttestation.CanonicalBlocks[j].BlockNumber
+		},
+	)
+	deduplicated := record.CollectorAttestation.CanonicalBlocks[:0]
+	for i, block := range record.CollectorAttestation.CanonicalBlocks {
+		if i > 0 && block.BlockNumber == deduplicated[len(deduplicated)-1].
+			BlockNumber {
+			continue
+		}
+		deduplicated = append(deduplicated, block)
+	}
+	record.CollectorAttestation.CanonicalBlocks = deduplicated
+
+	resignTestChainReconciliationEvidence(t, record)
+}
+
+// TestValidateChainReconciliationEvidence_RelayTimeoutSettlement asserts a
+// relay entry timeout penalty a node recorded as its permit's result is
+// reconciled against the RandomBeacon's own logs rather than accepted on the
+// node's word.
+//
+// A node that filed a report which reverted, was dropped, or lost the race to
+// another reporter renders exactly the same reference as one whose report the
+// beacon accepted, so nothing in the journal tells the two apart. The
+// authenticated logs do: the timeout must exist, the request it terminated
+// must be the one this permit was issued for, and no delivered entry may
+// answer that same request.
+func TestValidateChainReconciliationEvidence_RelayTimeoutSettlement(
+	t *testing.T,
+) {
+	capturedAt := time.Now().UTC().Add(-time.Minute)
+
+	const requestStartBlock = uint64(9_100)
+	const terminatedGroupID = uint64(4)
+	const timeoutBlock = uint64(9_200)
+	requestID := big.NewInt(77)
+
+	// The previous entry the terminated request was signing over. The beacon
+	// carries it in the request log; the audit only needs the log to exist at
+	// the permit's block, so any well-formed byte string serves here.
+	previousEntry := []byte{0x0a, 0x0b, 0x0c}
+
+	permit := participation.PermitSnapshot{
+		Ceremony:            participation.BeaconTimeoutReport,
+		Mode:                participation.ModeSecurityV2.String(),
+		CanonicalStartBlock: requestStartBlock,
+		WorkID:              participation.BeaconRelayWorkID(requestStartBlock),
+		PermitID:            "monitor",
+		IdentityBound:       true,
+	}
+
+	newRunAndRecord := func(
+		reference string,
+	) (*auditRun, *chainReconciliationEvidence) {
+		auditManifest := &manifest{
+			GeneratedAt: time.Now().UTC(),
+			Snapshot: snapshotIdentity{
+				AggregateSHA256: strings.Repeat("c", 64),
+			},
+			QuiescenceSnapshot: &participation.QuiescenceSnapshot{
+				SchemaVersion: participation.QuiescenceSnapshotSchemaVersion,
+				CapturedAt:    capturedAt,
+				ActivePermits: []participation.PermitSnapshot{permit},
+			},
+			ParticipationTerminalOutcomes: &participation.TerminalOutcomeJournal{
+				SchemaVersion:      participation.TerminalOutcomeJournalSchemaVersion,
+				SnapshotCapturedAt: capturedAt,
+				Outcomes: []participation.TerminalOutcomeRecord{
+					{
+						RecordedAt: time.Now().UTC(),
+						Permit:     permit,
+						Outcome:    participation.TerminalOutcomeCompleted,
+						Evidence: participation.TerminalEvidence{
+							Kind:      participation.TerminalEvidenceEthereumTransaction,
+							Reference: reference,
+						},
+					},
+				},
+			},
+		}
+		run := &auditRun{
+			manifest: auditManifest,
+			expected: expectedIdentityInputs{
+				ethereumChainID:              "1",
+				walletRegistryAddress:        testWalletRegistryAddress,
+				randomBeaconAddress:          testRandomBeaconAddress,
+				finalizedEthereumBlockNumber: testFinalizedEthereumBlock,
+				finalizedEthereumBlockHash: testCanonicalEthereumBlockHash(
+					testFinalizedEthereumBlock,
+				),
+				chainEvidencePublicKey: testChainEvidencePublicKey(),
+				maxEvidenceAge:         time.Hour,
+			},
+		}
+		record := &chainReconciliationEvidence{
+			evidenceEnvelope: evidenceEnvelope{
+				SchemaVersion:           evidenceSchemaVersion,
+				EvidenceType:            "chain_reconciliation",
+				GeneratedAt:             auditManifest.GeneratedAt,
+				SnapshotAggregateSHA256: auditManifest.Snapshot.AggregateSHA256,
+			},
+			EthereumChainID: "1",
+		}
+		authenticateTestChainReconciliationEvidence(t, record)
+		return run, record
+	}
+
+	addRequest := func(
+		t *testing.T,
+		record *chainReconciliationEvidence,
+		blockNumber uint64,
+	) {
+		t.Helper()
+
+		addTestRelayEntryReceipt(
+			t,
+			record,
+			testRandomBeaconAddress,
+			"RelayEntryRequested",
+			requestID,
+			blockNumber,
+			terminatedGroupID,
+			previousEntry,
+		)
+	}
+
+	addTimeout := func(
+		t *testing.T,
+		record *chainReconciliationEvidence,
+		address string,
+		groupID uint64,
+	) {
+		t.Helper()
+
+		addTestRelayEntryReceipt(
+			t,
+			record,
+			address,
+			"RelayEntryTimedOut",
+			requestID,
+			timeoutBlock,
+			groupID,
+		)
+	}
+
+	validate := func(
+		t *testing.T,
+		run *auditRun,
+		record *chainReconciliationEvidence,
+	) []string {
+		t.Helper()
+
+		content, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return run.validateChainReconciliationEvidence(content)
+	}
+
+	// The negative cases below differ from the passing one only in the logs the
+	// evidence carries, so requiring the reason pins each failure to the
+	// settlement reconciliation instead of to some unrelated envelope defect.
+	assertBlockedBy := func(t *testing.T, violations []string, reason string) {
+		t.Helper()
+
+		for _, violation := range violations {
+			if strings.Contains(violation, reason) {
+				return
+			}
+		}
+		t.Fatalf(
+			"expected a violation containing [%s], got: %v",
+			reason,
+			violations,
+		)
+	}
+
+	assertSettles := func(t *testing.T, violations []string) {
+		t.Helper()
+
+		for _, violation := range violations {
+			if strings.Contains(violation, "relay entry timeout settlement") {
+				t.Fatalf(
+					"expected a corroborated settlement to reconcile, got: %s",
+					violation,
+				)
+			}
+		}
+	}
+
+	settledReference := testTimeoutSettlementReference(
+		t,
+		requestStartBlock,
+		requestID.Int64(),
+		terminatedGroupID,
+	)
+
+	t.Run("settlement corroborated by canonical beacon logs", func(t *testing.T) {
+		run, record := newRunAndRecord(settledReference)
+		addRequest(t, record, requestStartBlock)
+		addTimeout(t, record, testRandomBeaconAddress, terminatedGroupID)
+		assertSettles(t, validate(t, run, record))
+	})
+
+	// The report the node filed is all the journal ever holds. Without the
+	// beacon's own termination log the penalty may never have happened, and an
+	// unproven penalty is exactly what the barrier exists to hold.
+	t.Run("settlement with no matching timeout log", func(t *testing.T) {
+		run, record := newRunAndRecord(settledReference)
+		addRequest(t, record, requestStartBlock)
+		assertBlockedBy(
+			t,
+			validate(t, run, record),
+			"no authenticated RandomBeacon RelayEntryTimedOut log",
+		)
+	})
+
+	t.Run("timeout log terminating a different group", func(t *testing.T) {
+		run, record := newRunAndRecord(settledReference)
+		addRequest(t, record, requestStartBlock)
+		addTimeout(t, record, testRandomBeaconAddress, terminatedGroupID+1)
+		assertBlockedBy(
+			t,
+			validate(t, run, record),
+			"no authenticated RandomBeacon RelayEntryTimedOut log",
+		)
+	})
+
+	// An identically shaped event from an attacker-deployed contract names no
+	// penalty the beacon ever applied.
+	t.Run("timeout log from an unrelated contract", func(t *testing.T) {
+		run, record := newRunAndRecord(settledReference)
+		addRequest(t, record, requestStartBlock)
+		addTimeout(t, record, testWalletRegistryAddress, terminatedGroupID)
+		assertBlockedBy(
+			t,
+			validate(t, run, record),
+			"no authenticated RandomBeacon RelayEntryTimedOut log",
+		)
+	})
+
+	// The termination is real and this node may even have reported it, but
+	// nothing yet says the request it terminated is the one this permit was
+	// issued for. Without the request log the settlement cannot be bound to the
+	// permit at all.
+	t.Run("settlement with no matching request log", func(t *testing.T) {
+		run, record := newRunAndRecord(settledReference)
+		addTimeout(t, record, testRandomBeaconAddress, terminatedGroupID)
+		assertBlockedBy(
+			t,
+			validate(t, run, record),
+			"no authenticated RandomBeacon RelayEntryRequested log",
+		)
+	})
+
+	// The check that keeps a real penalty from being borrowed: every genuine
+	// termination on the chain corroborates equally, so the request it belongs
+	// to has to sit in the block this permit names.
+	t.Run("request log at another block", func(t *testing.T) {
+		run, record := newRunAndRecord(settledReference)
+		addRequest(t, record, requestStartBlock+1)
+		addTimeout(t, record, testRandomBeaconAddress, terminatedGroupID)
+		assertBlockedBy(
+			t,
+			validate(t, run, record),
+			"not the request start block the permit was issued for",
+		)
+	})
+
+	// Nothing in the logs says which block a caller meant, so a request the
+	// evidence places twice binds no permit rather than binding it to either.
+	t.Run("request logged at two blocks", func(t *testing.T) {
+		run, record := newRunAndRecord(settledReference)
+		addRequest(t, record, requestStartBlock)
+		addRequest(t, record, requestStartBlock+1)
+		addTimeout(t, record, testRandomBeaconAddress, terminatedGroupID)
+		assertBlockedBy(
+			t,
+			validate(t, run, record),
+			"at more than one block",
+		)
+	})
+
+	// A delivered entry and a timeout are mutually exclusive endings. Evidence
+	// carrying both settles nothing, whichever one the node recorded.
+	t.Run("delivered entry answering the same request", func(t *testing.T) {
+		run, record := newRunAndRecord(settledReference)
+		addRequest(t, record, requestStartBlock)
+		addTimeout(t, record, testRandomBeaconAddress, terminatedGroupID)
+		addTestRelayEntryReceipt(
+			t,
+			record,
+			testRandomBeaconAddress,
+			"RelayEntrySubmitted",
+			requestID,
+			timeoutBlock,
+			common.HexToAddress(testRandomBeaconAddress),
+			[]byte{0x01, 0x02},
+		)
+		assertBlockedBy(
+			t,
+			validate(t, run, record),
+			"a delivered entry and a timeout cannot both settle one request",
+		)
+	})
+
+	// A monitor that ended without a penalty records no settlement at all, so
+	// there is nothing for this pass to corroborate and the absent beacon logs
+	// are not held against it.
+	t.Run("exhausted report naming no settlement", func(t *testing.T) {
+		run, record := newRunAndRecord("")
+		outcomes := run.manifest.ParticipationTerminalOutcomes.Outcomes
+		outcomes[0].Outcome = participation.TerminalOutcomeExhausted
+		outcomes[0].Evidence = participation.TerminalEvidence{
+			Kind: participation.TerminalEvidenceNoThreshold,
+		}
+		assertSettles(t, validate(t, run, record))
 	})
 }

@@ -60,6 +60,9 @@
 #   PR4109_WALLET_REGISTRY_ADDRESS
 #                        exact WalletRegistry address whose logs establish DKG
 #                        settlement
+#   PR4109_RANDOM_BEACON_ADDRESS
+#                        exact RandomBeacon address whose logs establish relay
+#                        entry request, delivery, and timeout settlement
 #   PR4109_FINALIZED_ETHEREUM_BLOCK_NUMBER
 #   PR4109_FINALIZED_ETHEREUM_BLOCK_HASH
 #                        independently obtained finalized-chain anchor the
@@ -331,6 +334,9 @@ environment (rollback, additionally):
                       drain could not name the snapshot the drain left
   PR4109_WALLET_REGISTRY_ADDRESS
                       exact WalletRegistry whose raw logs establish DKG state
+  PR4109_RANDOM_BEACON_ADDRESS
+                      exact RandomBeacon whose raw logs establish relay entry
+                      request, delivery, and timeout settlement
   PR4109_FINALIZED_ETHEREUM_BLOCK_NUMBER
   PR4109_FINALIZED_ETHEREUM_BLOCK_HASH
                       independently obtained finalized block anchoring the
@@ -4780,6 +4786,7 @@ stopped container failed, so there is no capture of the state the drain left"
 ROLLBACK_AUDIT_INPUTS=(
   PR4109_ROLLBACK_EVIDENCE_GENERATOR
   PR4109_WALLET_REGISTRY_ADDRESS
+  PR4109_RANDOM_BEACON_ADDRESS
   PR4109_FINALIZED_ETHEREUM_BLOCK_NUMBER
   PR4109_FINALIZED_ETHEREUM_BLOCK_HASH
   PR4109_CHAIN_EVIDENCE_PUBLIC_KEY
@@ -4819,6 +4826,8 @@ audit_snapshot() {
     --expected-ethereum-chain-id "${CHAIN_ID}"
     --expected-wallet-registry-address
     "${PR4109_WALLET_REGISTRY_ADDRESS}"
+    --expected-random-beacon-address
+    "${PR4109_RANDOM_BEACON_ADDRESS}"
     --expected-finalized-ethereum-block-number
     "${PR4109_FINALIZED_ETHEREUM_BLOCK_NUMBER}"
     --expected-finalized-ethereum-block-hash

@@ -70,12 +70,13 @@ identities the evidence must bind to are supplied via its `--expected-*`
 flags — Ethereum chain ID, Bitcoin network, the exact prior and current
 release versions, revisions, and immutable image digests, the release epoch,
 the armed cutover block, and the evidence freshness bound. Chain evidence has
-additional independent inputs: the exact WalletRegistry address, a finalized
-Ethereum block number/hash obtained outside the evidence generator, and the
-lowercase hexadecimal Ed25519 public key of the trusted chain collector. Its
-output never authorizes activating quarantined material by itself.
+additional independent inputs: the exact WalletRegistry and RandomBeacon
+addresses, a finalized Ethereum block number/hash obtained outside the evidence
+generator, and the lowercase hexadecimal Ed25519 public key of the trusted chain
+collector. Its output never authorizes activating quarantined material by
+itself.
 For every reconciled tBTC wallet whose DKG settlement is not `none`, schema
-v7 requires the complete `DkgStarted`, `DkgResultSubmitted`,
+v8 requires the complete `DkgStarted`, `DkgResultSubmitted`,
 `DkgResultApproved`, and `WalletCreated` event lineage. Each event names its
 transaction hash, block hash/number, and log index; the submitted event carries
 the full on-chain result tuple, not caller-supplied summary fields. The same
@@ -95,6 +96,19 @@ before the protocol's one-byte group bounds are enforced. For an approved
 wallet it then maps each original DKG permit to the persisted final membership;
 a forged result hash, unrelated approved wallet, or two persisted memberships
 swapped between permits blocks rollback.
+
+The same record settles the penalties a node recorded as its permits' results.
+A heartbeat's inactivity claim must be corroborated by a canonical
+`InactivityClaimed` log for the exact wallet and nonce named, emitted by the
+supplied WalletRegistry, and the punished wallet must be the one the permit is
+about. A relay entry timeout report must be corroborated by a canonical
+`RelayEntryTimedOut` log naming the exact request identifier and terminated
+group, emitted by the supplied RandomBeacon, whose `RelayEntryRequested` log
+sits in the very block the reporting permit was issued for and which no
+`RelayEntrySubmitted` log answers. Filing a report is not earning a penalty — a
+transaction that reverts, is dropped, or loses the race to another reporter
+leaves the beacon exactly as it was and renders exactly the same node-authored
+reference — so a settlement the beacon's own logs do not carry blocks rollback.
 
 The rollback rehearsal runs that audit **twice over the same snapshot**, and
 the order is the whole point. Every external record must carry the audited
@@ -122,7 +136,7 @@ evidence generator cannot replace it with a second self-attested inventory.
 Each process run invalidates the prior artifact before constructing its gate,
 so a restart or failed new capture leaves the rollback audit fail-closed
 instead of exposing stale inventory.
-The schema-v7 quiescence record supplies only the later
+The schema-v8 quiescence record supplies only the later
 `active_permits_at_quiescence` terminal-outcome list, which must cover the
 node-authored inventory one-to-one and reproduce all three counts. An empty or
 shortened outcome list over a nonempty gate artifact blocks rollback. Both

@@ -21,8 +21,9 @@
 // Namespace consistency alone is deliberately insufficient for the rollback
 // barrier. Chain reconciliation (wallet/group registration and DKG
 // settlement, for active and quarantined state alike, plus the inactivity
-// claims a heartbeat filed against the WalletRegistry), Bitcoin transaction
-// reconciliation, the quiescence outcome report, and prior-reader
+// claims a heartbeat filed against the WalletRegistry and the relay entry
+// timeout penalties a monitor earned from the RandomBeacon), Bitcoin
+// transaction reconciliation, the quiescence outcome report, and prior-reader
 // compatibility evidence are produced outside this offline tool; until a
 // reference to each is supplied and recorded, the manifest reports the
 // missing pieces as rollback blockers and the process exits nonzero. Every
@@ -64,6 +65,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/beacon/registry"
 	"github.com/keep-network/keep-core/pkg/bitcoin"
 	"github.com/keep-network/keep-core/pkg/bls"
+	beaconabi "github.com/keep-network/keep-core/pkg/chain/ethereum/beacon/gen/abi"
 	ecdsaabi "github.com/keep-network/keep-core/pkg/chain/ethereum/ecdsa/gen/abi"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/protocol/participation"
@@ -72,7 +74,7 @@ import (
 )
 
 // manifestSchemaVersion versions the audit manifest document.
-const manifestSchemaVersion = uint32(6)
+const manifestSchemaVersion = uint32(7)
 
 // The audited namespaces, relative to the storage root. The beacon quarantine
 // namespace is a sibling of the active beacon keystore precisely so the
@@ -147,10 +149,10 @@ type evidenceRecord struct {
 
 // evidenceSchemaVersion versions the external rollback-evidence record
 // schemas this audit accepts.
-const evidenceSchemaVersion uint32 = 7
+const evidenceSchemaVersion uint32 = 8
 
 const chainReconciliationSignatureDomain = "keep-core/" +
-	"participation-state-audit/chain-reconciliation/v7\x00"
+	"participation-state-audit/chain-reconciliation/v8\x00"
 
 // evidenceFutureSkewAllowance bounds how far in the future an evidence
 // record's generation time may lie relative to this audit before it is a
@@ -319,6 +321,7 @@ type chainReconciliationEvidence struct {
 
 	EthereumChainID       string                       `json:"ethereum_chain_id"`
 	WalletRegistryAddress string                       `json:"wallet_registry_address"`
+	RandomBeaconAddress   string                       `json:"random_beacon_address"`
 	Receipts              []ethereumReceiptEvidence    `json:"receipts"`
 	CollectorAttestation  ethereumCollectorAttestation `json:"collector_attestation"`
 	Wallets               []tbtcWalletChainEvidence    `json:"wallets"`
@@ -532,6 +535,7 @@ type manifest struct {
 type expectedIdentityRecord struct {
 	EthereumChainID              string `json:"ethereum_chain_id,omitempty"`
 	WalletRegistryAddress        string `json:"wallet_registry_address,omitempty"`
+	RandomBeaconAddress          string `json:"random_beacon_address,omitempty"`
 	FinalizedEthereumBlockNumber uint64 `json:"finalized_ethereum_block_number,omitempty"`
 	FinalizedEthereumBlockHash   string `json:"finalized_ethereum_block_hash,omitempty"`
 	ChainEvidencePublicKeySHA256 string `json:"chain_evidence_public_key_sha256,omitempty"`
@@ -566,6 +570,7 @@ type evidenceInputs struct {
 type expectedIdentityInputs struct {
 	ethereumChainID              string
 	walletRegistryAddress        string
+	randomBeaconAddress          string
 	finalizedEthereumBlockNumber uint64
 	finalizedEthereumBlockHash   string
 	chainEvidencePublicKey       string
@@ -643,6 +648,14 @@ func main() {
 		"",
 		"the exact WalletRegistry address whose authenticated receipt logs "+
 			"may establish tBTC DKG settlement",
+	)
+	flag.StringVar(
+		&expected.randomBeaconAddress,
+		"expected-random-beacon-address",
+		"",
+		"the exact RandomBeacon address whose authenticated receipt logs may "+
+			"establish beacon relay entry request, delivery, and timeout "+
+			"settlement",
 	)
 	flag.Uint64Var(
 		&expected.finalizedEthereumBlockNumber,
@@ -836,6 +849,7 @@ func runAudit(
 			ExpectedIdentity: expectedIdentityRecord{
 				EthereumChainID:              expected.ethereumChainID,
 				WalletRegistryAddress:        expected.walletRegistryAddress,
+				RandomBeaconAddress:          expected.randomBeaconAddress,
 				FinalizedEthereumBlockNumber: expected.finalizedEthereumBlockNumber,
 				FinalizedEthereumBlockHash:   expected.finalizedEthereumBlockHash,
 				ChainEvidencePublicKeySHA256: chainEvidencePublicKeySHA256(
@@ -1392,6 +1406,27 @@ func recordMissingExpectedIdentity(r *auditRun) {
 			),
 		},
 		{
+			when: r.expected.randomBeaconAddress == "",
+			blocker: "the expected RandomBeacon address is not supplied: " +
+				"authenticated logs cannot be bound to the rollback's beacon " +
+				"relay contract",
+		},
+		{
+			when: r.expected.randomBeaconAddress != "" &&
+				func() bool {
+					_, err := decodeCanonicalEthereumBytes(
+						r.expected.randomBeaconAddress,
+						20,
+					)
+					return err != nil
+				}(),
+			blocker: fmt.Sprintf(
+				"the expected RandomBeacon address [%s] is not a canonical "+
+					"Ethereum address",
+				r.expected.randomBeaconAddress,
+			),
+		},
+		{
 			when: r.expected.finalizedEthereumBlockNumber == 0,
 			blocker: "the expected finalized Ethereum block number is not " +
 				"supplied: the chain evidence has no independent finality " +
@@ -1777,6 +1812,24 @@ func (r *auditRun) validateAuthenticatedEthereumEvidence(
 			"the WalletRegistry address [%s], expected [%s]",
 			record.WalletRegistryAddress,
 			r.expected.walletRegistryAddress,
+		))
+	}
+
+	if _, err := decodeCanonicalEthereumBytes(
+		record.RandomBeaconAddress,
+		20,
+	); err != nil {
+		violations = append(violations, fmt.Sprintf(
+			"the RandomBeacon address [%s] is invalid: [%v]",
+			record.RandomBeaconAddress,
+			err,
+		))
+	} else if r.expected.randomBeaconAddress != "" &&
+		record.RandomBeaconAddress != r.expected.randomBeaconAddress {
+		violations = append(violations, fmt.Sprintf(
+			"the RandomBeacon address [%s], expected [%s]",
+			record.RandomBeaconAddress,
+			r.expected.randomBeaconAddress,
 		))
 	}
 
@@ -2350,6 +2403,10 @@ func (r *auditRun) validateChainReconciliationEvidence(
 		violations,
 		r.reconcileInactivityClaimSettlements(record)...,
 	)
+	violations = append(
+		violations,
+		r.reconcileRelayTimeoutSettlements(record)...,
+	)
 
 	return violations
 }
@@ -2814,6 +2871,263 @@ func authenticatedInactivityClaims(
 	}
 
 	return claims, nil
+}
+
+// relayEntryLifecycleLogs is the beacon's own account of the relay requests the
+// authenticated receipts reach: when each request was made, which ones the
+// selected group answered, and which ones an accepted timeout report
+// terminated.
+//
+// The three are indexed together because no one of them settles a penalty on
+// its own. A timeout log proves a request was terminated but not which request
+// a permit was issued for; a request log supplies that binding; a submission
+// log contradicts the penalty outright.
+type relayEntryLifecycleLogs struct {
+	// requestBlocks maps a beacon request identifier to the block its
+	// RelayEntryRequested log was mined in.
+	requestBlocks map[string]uint64
+	// ambiguousRequests names every request identifier the receipts place at
+	// more than one block. Nothing in the logs says which block a caller meant,
+	// so such a request binds no permit rather than binding it to either.
+	ambiguousRequests map[string]struct{}
+	// submittedRequests names every request identifier a RelayEntrySubmitted
+	// log answers.
+	submittedRequests map[string]struct{}
+	// timeouts maps the canonical settlement identity — request identifier and
+	// terminated group — to the block its RelayEntryTimedOut log was mined in.
+	timeouts map[string]uint64
+}
+
+// authenticatedRelayEntryLogs indexes every RelayEntryRequested,
+// RelayEntrySubmitted and RelayEntryTimedOut log the authenticated receipts
+// carry. Logs from any contract other than the expected RandomBeacon are
+// ignored: an identically shaped event from an attacker-deployed contract names
+// no request the beacon ever made and no penalty it ever applied.
+func authenticatedRelayEntryLogs(
+	record *chainReconciliationEvidence,
+) (*relayEntryLifecycleLogs, error) {
+	parsed, err := beaconabi.RandomBeaconMetaData.GetAbi()
+	if err != nil {
+		return nil, fmt.Errorf(
+			"cannot load the generated RandomBeacon ABI: [%v]",
+			err,
+		)
+	}
+
+	events := make(map[string]abi.Event, 3)
+	for _, name := range []string{
+		"RelayEntryRequested",
+		"RelayEntrySubmitted",
+		"RelayEntryTimedOut",
+	} {
+		event, ok := parsed.Events[name]
+		if !ok {
+			return nil, fmt.Errorf(
+				"generated RandomBeacon ABI has no [%s] event",
+				name,
+			)
+		}
+		events[name] = event
+	}
+
+	logs := &relayEntryLifecycleLogs{
+		requestBlocks:     make(map[string]uint64),
+		ambiguousRequests: make(map[string]struct{}),
+		submittedRequests: make(map[string]struct{}),
+		timeouts:          make(map[string]uint64),
+	}
+
+	// The enclosing receipt validation already requires every log address and
+	// topic to be canonically encoded, and the beacon address to be both
+	// canonical and the expected one, so exact comparison is what distinguishes
+	// the beacon's own logs here.
+	for _, receipt := range record.Receipts {
+		for _, rawLog := range receipt.Logs {
+			if rawLog.Address != record.RandomBeaconAddress {
+				continue
+			}
+			// The request identifier is the sole indexed input of all three
+			// events, so each log always has exactly the signature topic and
+			// the request topic.
+			if len(rawLog.Topics) != 2 {
+				continue
+			}
+			requestIDBytes, err := decodeCanonicalEthereumBytes(
+				rawLog.Topics[1],
+				32,
+			)
+			if err != nil {
+				continue
+			}
+			requestID := new(big.Int).SetBytes(requestIDBytes).String()
+
+			switch rawLog.Topics[0] {
+			case events["RelayEntryRequested"].ID.Hex():
+				if known, seen := logs.requestBlocks[requestID]; seen &&
+					known != receipt.BlockNumber {
+					logs.ambiguousRequests[requestID] = struct{}{}
+					continue
+				}
+				logs.requestBlocks[requestID] = receipt.BlockNumber
+			case events["RelayEntrySubmitted"].ID.Hex():
+				logs.submittedRequests[requestID] = struct{}{}
+			case events["RelayEntryTimedOut"].ID.Hex():
+				event := events["RelayEntryTimedOut"]
+				data, err := decodeCanonicalEthereumDynamicBytes(rawLog.Data)
+				if err != nil {
+					continue
+				}
+				values, err := event.Inputs.NonIndexed().Unpack(data)
+				if err != nil || len(values) == 0 {
+					continue
+				}
+				terminatedGroupID, ok := values[0].(uint64)
+				if !ok {
+					continue
+				}
+
+				logs.timeouts[requestID+":"+strconv.FormatUint(
+					terminatedGroupID,
+					10,
+				)] = receipt.BlockNumber
+			}
+		}
+	}
+
+	return logs, nil
+}
+
+// reconcileRelayTimeoutSettlements joins every relay entry timeout penalty the
+// node recorded as its permit's result to the beacon's own authenticated logs.
+//
+// The offline journal pass has already established what a node can be held to
+// on its own word: the settlement it names answers the request start block its
+// permit was issued for, and one settlement answers one request across the
+// whole journal. Neither says the penalty happened. A node that filed a report
+// which reverted, was dropped, or lost the race to another reporter can render
+// exactly the same reference as one whose report the beacon accepted.
+//
+// Three authenticated readings decide it, and the node's word supplies none of
+// them. A canonical RelayEntryTimedOut log emitted by the expected RandomBeacon
+// must name the exact request identifier and terminated group the reference
+// carries — the penalty happened. A canonical RelayEntryRequested log for that
+// same request must sit in the block the permit was issued for — the penalty is
+// this permit's, not a real penalty from some other request borrowed to close
+// it. And no RelayEntrySubmitted log may answer that request — a delivered
+// entry and a timeout are mutually exclusive endings, so evidence carrying both
+// settles nothing.
+//
+// The enclosing receipt validation has already bound every receipt to an
+// attested canonical block with successful status, so a matched log is chain
+// state rather than a report the evidence generator wrote. Evidence that simply
+// omits the beacon's logs proves nothing either way and blocks the barrier: an
+// unproven penalty is exactly what the barrier exists to hold.
+func (r *auditRun) reconcileRelayTimeoutSettlements(
+	record *chainReconciliationEvidence,
+) []string {
+	if r.manifest.ParticipationTerminalOutcomes == nil {
+		return nil
+	}
+
+	var violations []string
+	var logs *relayEntryLifecycleLogs
+	for i, outcome := range r.manifest.ParticipationTerminalOutcomes.Outcomes {
+		if outcome.Permit.Ceremony != participation.BeaconTimeoutReport ||
+			outcome.Outcome != participation.TerminalOutcomeCompleted {
+			continue
+		}
+
+		referenceStartBlock, requestID, terminatedGroupID, err :=
+			participation.ParseBeaconRelayTimeoutSettlementReference(
+				outcome.Evidence.Reference,
+			)
+		if err != nil {
+			// The journal pass reports the unparseable reference itself; this
+			// pass has nothing left to join it to.
+			continue
+		}
+
+		if logs == nil {
+			logs, err = authenticatedRelayEntryLogs(record)
+			if err != nil {
+				violations = append(violations, fmt.Sprintf(
+					"cannot decode the authenticated beacon relay entry logs: "+
+						"[%v]",
+					err,
+				))
+				break
+			}
+		}
+
+		settlementIdentity := requestID.String() + ":" +
+			strconv.FormatUint(terminatedGroupID, 10)
+		if _, corroborated := logs.timeouts[settlementIdentity]; !corroborated {
+			violations = append(violations, fmt.Sprintf(
+				"node-authored outcome [%d] reports relay entry timeout "+
+					"settlement [%s], but no authenticated RandomBeacon "+
+					"RelayEntryTimedOut log names that request and terminated "+
+					"group",
+				i,
+				outcome.Evidence.Reference,
+			))
+			continue
+		}
+
+		if _, ambiguous :=
+			logs.ambiguousRequests[requestID.String()]; ambiguous {
+			violations = append(violations, fmt.Sprintf(
+				"node-authored outcome [%d] reports relay entry timeout "+
+					"settlement [%s], but the authenticated logs place request "+
+					"[%s] at more than one block, so the terminated request "+
+					"cannot be bound to the permit",
+				i,
+				outcome.Evidence.Reference,
+				requestID,
+			))
+			continue
+		}
+		requestBlock, requested := logs.requestBlocks[requestID.String()]
+		if !requested {
+			violations = append(violations, fmt.Sprintf(
+				"node-authored outcome [%d] reports relay entry timeout "+
+					"settlement [%s], but no authenticated RandomBeacon "+
+					"RelayEntryRequested log names request [%s], so the "+
+					"terminated request cannot be bound to the permit",
+				i,
+				outcome.Evidence.Reference,
+				requestID,
+			))
+			continue
+		}
+		if requestBlock != referenceStartBlock {
+			violations = append(violations, fmt.Sprintf(
+				"node-authored outcome [%d] reports relay entry timeout "+
+					"settlement [%s], but the authenticated logs make request "+
+					"[%s] at block [%d], not the request start block the "+
+					"permit was issued for",
+				i,
+				outcome.Evidence.Reference,
+				requestID,
+				requestBlock,
+			))
+			continue
+		}
+
+		if _, delivered :=
+			logs.submittedRequests[requestID.String()]; delivered {
+			violations = append(violations, fmt.Sprintf(
+				"node-authored outcome [%d] reports relay entry timeout "+
+					"settlement [%s], but an authenticated RandomBeacon "+
+					"RelayEntrySubmitted log answers request [%s]; a delivered "+
+					"entry and a timeout cannot both settle one request",
+				i,
+				outcome.Evidence.Reference,
+				requestID,
+			))
+		}
+	}
+
+	return violations
 }
 
 func expectedTBTCDKGRawLog(
