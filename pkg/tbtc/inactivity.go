@@ -433,15 +433,14 @@ func (ice *inactivityClaimExecutor) waitForInactivityClaimSettlement(
 		}
 	}()
 
-	deadline, wrapped := inactivityClaimSettlementDeadline(currentBlock)
-	if wrapped {
+	deadline, err := inactivityClaimSettlementDeadline(currentBlock)
+	if err != nil {
 		execLogger.Warnf(
-			"the inactivity claim settlement deadline of block [%v] plus "+
-				"[%v] blocks is not representable; waiting to the highest "+
-				"representable block instead",
-			currentBlock,
-			inactivityClaimSettlementResolutionBlocks,
+			"cannot bound the wait for the inactivity claim settlement; the "+
+				"claim is left to the resolution that follows: [%v]",
+			err,
 		)
+		return
 	}
 
 	execLogger.Infof(
@@ -458,21 +457,65 @@ func (ice *inactivityClaimExecutor) waitForInactivityClaimSettlement(
 	}
 }
 
-// inactivityClaimSettlementDeadline returns the block the settlement wait runs
-// until, and reports whether the unchecked sum would have wrapped.
+// errInactivityDeadlineOverflow reports a block deadline the block range cannot
+// represent. Both deadlines this file derives are rejected on overflow rather
+// than clamped: a wrapped deadline names a block already in the past, so every
+// wait keyed to one returns at once and the fence it was standing in for is
+// gone without anything saying so.
+var errInactivityDeadlineOverflow = errors.New(
+	"the block deadline is not representable",
+)
+
+// inactivityClaimSubmissionBlock returns the block at which the given member
+// may hand its inactivity claim to the chain, or rejects a sum the block range
+// cannot represent.
 //
-// A wrapped deadline is rejected rather than used: it names a block already in
-// the past, so the wait would return at once and a claim that settles a block
-// later would be journaled as unresolved — a penalty that is on chain recorded
-// as one that is not. Rejecting it by returning early would collapse the
-// observation window just as completely, so the representable maximum is what
-// replaces it: the settlement observer and the heartbeat window that owns the
-// claim both still cut the wait short, which is what actually bounds it.
-func inactivityClaimSettlementDeadline(currentBlock uint64) (uint64, bool) {
-	if currentBlock > math.MaxUint64-inactivityClaimSettlementResolutionBlocks {
-		return math.MaxUint64, true
+// Members stagger their submissions by member index so they do not all pay for
+// the same claim. A wrapped submission block names a block already passed,
+// which collapses the whole stagger to "now" — but the reason it is rejected
+// rather than clamped is the one that matters: this is the last derived
+// quantity standing between the caller and an irreversible on-chain
+// submission, and arithmetic that overflowed cannot be allowed to authorize it.
+func inactivityClaimSubmissionBlock(
+	currentBlock uint64,
+	memberIndex group.MemberIndex,
+) (uint64, error) {
+	delayBlocks := uint64(memberIndex-1) * inactivityClaimSubmissionDelayStepBlocks
+
+	if currentBlock > math.MaxUint64-delayBlocks {
+		return 0, fmt.Errorf(
+			"%w: current block [%v] plus the [%v] block submission delay of "+
+				"member [%v]",
+			errInactivityDeadlineOverflow,
+			currentBlock,
+			delayBlocks,
+			memberIndex,
+		)
 	}
-	return currentBlock + inactivityClaimSettlementResolutionBlocks, false
+	return currentBlock + delayBlocks, nil
+}
+
+// inactivityClaimSettlementDeadline returns the block the settlement wait runs
+// until, or rejects a sum the block range cannot represent.
+//
+// A wrapped deadline names a block already in the past, so the wait would
+// return at once and a claim that settles a block later would be journaled as
+// unresolved — a penalty that is on chain recorded as one that is not. Clamping
+// to the top of the range instead would leave a wait nothing bounds but the
+// heartbeat window. Rejecting reaches the honest disposition, unresolved, and
+// says why: the offline barrier holds on an unreconciled claim, which is the
+// conservative direction for a penalty nobody can account for.
+func inactivityClaimSettlementDeadline(currentBlock uint64) (uint64, error) {
+	if currentBlock > math.MaxUint64-inactivityClaimSettlementResolutionBlocks {
+		return 0, fmt.Errorf(
+			"%w: current block [%v] plus the [%v] block settlement resolution "+
+				"bound",
+			errInactivityDeadlineOverflow,
+			currentBlock,
+			inactivityClaimSettlementResolutionBlocks,
+		)
+	}
+	return currentBlock + inactivityClaimSettlementResolutionBlocks, nil
 }
 
 // inactivityClaimSubmissionAttempt records that a controlled member handed an
@@ -805,8 +848,19 @@ func (ics *inactivityClaimSubmitter) SubmitClaim(
 	if err != nil {
 		return fmt.Errorf("cannot get current block: [%v]", err)
 	}
-	delayBlocks := uint64(memberIndex-1) * inactivityClaimSubmissionDelayStepBlocks
-	submissionBlock := currentBlock + delayBlocks
+	// The wait below is the last thing between this member and an irreversible
+	// submission, so the block it waits for is derived before the claim can be
+	// filed and a derivation that overflowed refuses the claim outright.
+	submissionBlock, err := inactivityClaimSubmissionBlock(
+		currentBlock,
+		memberIndex,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"cannot derive the inactivity claim submission block: [%w]",
+			err,
+		)
+	}
 
 	ics.inactivityLogger.Infof(
 		"[member:%v] waiting for block [%v] to submit inactivity claim",

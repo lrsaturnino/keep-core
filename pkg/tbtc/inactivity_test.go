@@ -2,6 +2,7 @@ package tbtc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
@@ -499,42 +500,56 @@ func TestInactivityClaimExecutor_ClaimInactivity_LateSettlement(t *testing.T) {
 	)
 }
 
+// TestInactivityClaimSettlementDeadline asserts the settlement wait's bound is
+// rejected when it overflows rather than clamped to the top of the block range.
+// A clamped bound leaves a wait nothing but the heartbeat window ends; the
+// rejection reaches the same disposition — the claim stays unresolved and the
+// offline barrier holds on it — and says why.
 func TestInactivityClaimSettlementDeadline(t *testing.T) {
 	const resolution = uint64(inactivityClaimSettlementResolutionBlocks)
 
 	tests := map[string]struct {
 		currentBlock     uint64
 		expectedDeadline uint64
-		expectedWrapped  bool
+		expectedError    bool
 	}{
 		"an ordinary height": {
 			currentBlock:     1_000_000,
 			expectedDeadline: 1_000_000 + resolution,
-			expectedWrapped:  false,
 		},
 		"the highest height whose deadline is representable": {
 			currentBlock:     math.MaxUint64 - resolution,
 			expectedDeadline: math.MaxUint64,
-			expectedWrapped:  false,
 		},
 		"the lowest height whose deadline is not": {
-			currentBlock:     math.MaxUint64 - resolution + 1,
-			expectedDeadline: math.MaxUint64,
-			expectedWrapped:  true,
+			currentBlock:  math.MaxUint64 - resolution + 1,
+			expectedError: true,
 		},
 		"the highest representable height": {
-			currentBlock:     math.MaxUint64,
-			expectedDeadline: math.MaxUint64,
-			expectedWrapped:  true,
+			currentBlock:  math.MaxUint64,
+			expectedError: true,
 		},
 	}
 
 	for testName, test := range tests {
 		t.Run(testName, func(t *testing.T) {
-			deadline, wrapped := inactivityClaimSettlementDeadline(
+			deadline, err := inactivityClaimSettlementDeadline(
 				test.currentBlock,
 			)
 
+			if test.expectedError {
+				if !errors.Is(err, errInactivityDeadlineOverflow) {
+					t.Errorf(
+						"expected an overflow rejection\nactual: [%v]",
+						err,
+					)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: [%v]", err)
+			}
 			if deadline != test.expectedDeadline {
 				t.Errorf(
 					"unexpected settlement deadline\n"+
@@ -543,19 +558,91 @@ func TestInactivityClaimSettlementDeadline(t *testing.T) {
 					deadline,
 				)
 			}
-			if wrapped != test.expectedWrapped {
-				t.Errorf(
-					"unexpected wrap report\nexpected: [%t]\nactual:   [%t]",
-					test.expectedWrapped,
-					wrapped,
-				)
-			}
 			// The property the bound exists for: a deadline the executor waits
 			// on must never name a block the chain has already passed.
 			if deadline < test.currentBlock {
 				t.Errorf(
 					"settlement deadline [%d] is below the current block [%d]",
 					deadline,
+					test.currentBlock,
+				)
+			}
+		})
+	}
+}
+
+// TestInactivityClaimSubmissionBlock asserts the staggered submission block is
+// rejected on overflow. It is the last quantity derived before an irreversible
+// on-chain claim, so a wrapped value would authorize the submission from
+// arithmetic that had already lost its meaning.
+func TestInactivityClaimSubmissionBlock(t *testing.T) {
+	const step = uint64(inactivityClaimSubmissionDelayStepBlocks)
+
+	tests := map[string]struct {
+		currentBlock  uint64
+		memberIndex   group.MemberIndex
+		expectedBlock uint64
+		expectedError bool
+	}{
+		"the first member never waits": {
+			currentBlock:  1_000_000,
+			memberIndex:   1,
+			expectedBlock: 1_000_000,
+		},
+		"a later member waits its index out": {
+			currentBlock:  1_000_000,
+			memberIndex:   5,
+			expectedBlock: 1_000_000 + 4*step,
+		},
+		"the first member at the top of the block range": {
+			currentBlock:  math.MaxUint64,
+			memberIndex:   1,
+			expectedBlock: math.MaxUint64,
+		},
+		"the highest height that still admits the delay": {
+			currentBlock:  math.MaxUint64 - 4*step,
+			memberIndex:   5,
+			expectedBlock: math.MaxUint64,
+		},
+		"one height past what the delay admits": {
+			currentBlock:  math.MaxUint64 - 4*step + 1,
+			memberIndex:   5,
+			expectedError: true,
+		},
+	}
+
+	for testName, test := range tests {
+		t.Run(testName, func(t *testing.T) {
+			submissionBlock, err := inactivityClaimSubmissionBlock(
+				test.currentBlock,
+				test.memberIndex,
+			)
+
+			if test.expectedError {
+				if !errors.Is(err, errInactivityDeadlineOverflow) {
+					t.Errorf(
+						"expected an overflow rejection\nactual: [%v]",
+						err,
+					)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: [%v]", err)
+			}
+			if submissionBlock != test.expectedBlock {
+				t.Errorf(
+					"unexpected submission block\n"+
+						"expected: [%d]\nactual:   [%d]",
+					test.expectedBlock,
+					submissionBlock,
+				)
+			}
+			if submissionBlock < test.currentBlock {
+				t.Errorf(
+					"submission block [%d] is below the current block [%d]",
+					submissionBlock,
 					test.currentBlock,
 				)
 			}

@@ -525,52 +525,157 @@ func recordRelayTimeoutTerminalOutcome(
 // the wait short in any case.
 const relayEntryTimeoutReportResolutionBlocks = 12
 
-// relayTimeoutReportSettled asks the beacon whether the relay request this
-// monitor reported a timeout for actually left the in-flight slot, which is the
-// beacon's own record that the report was accepted rather than the node's.
+// errRelayEntryDeadlineOverflow reports a block deadline the block range cannot
+// represent. Both deadlines the relay entry monitor derives are rejected on
+// overflow rather than clamped: a wrapped deadline names a block already in the
+// past, and every use of one here is a fence that would silently open.
+var errRelayEntryDeadlineOverflow = errors.New(
+	"the block deadline is not representable",
+)
+
+// relayEntryTimeoutBlock returns the block at which the selected group has run
+// out of time to deliver, or rejects a sum the block range cannot represent.
 //
-// Every reading other than a confirmed departure is a refusal to claim the
-// penalty: an unreadable beacon, a chain that does not expose the request state
-// at all, and a request still holding the slot when the wait runs out all leave
-// the permit exhausted. That direction is the safe one — the rollback barrier
-// exists to hold a penalty nobody can account for, so an unproven report has to
-// keep holding it.
+// The rejection is what keeps the monitor from filing a penalty nobody earned.
+// A wrapped timeout block names a block the chain already passed, so the waiter
+// on it fires at once and the monitor reports a request that has had no chance
+// to be answered. The report is the irreversible step, so the arithmetic that
+// authorizes it is checked before the monitor commits to running at all.
+func relayEntryTimeoutBlock(
+	relayRequestBlockNumber uint64,
+	relayEntryTimeout uint64,
+) (uint64, error) {
+	if relayRequestBlockNumber > math.MaxUint64-relayEntryTimeout {
+		return 0, fmt.Errorf(
+			"%w: relay request block [%v] plus the relay entry timeout of "+
+				"[%v] blocks",
+			errRelayEntryDeadlineOverflow,
+			relayRequestBlockNumber,
+			relayEntryTimeout,
+		)
+	}
+	return relayRequestBlockNumber + relayEntryTimeout, nil
+}
+
+// relayEntryTimeoutReportResolutionDeadline returns the block the monitor stops
+// asking the beacon about a filed report at, or rejects a sum the block range
+// cannot represent.
+//
+// A wrapped bound reads as already reached, which would end the reconciliation
+// before the beacon could answer and leave the permit exhausted. Rejecting it
+// reaches the same disposition without pretending a bounded observation
+// happened, and clamping it to the top of the range instead would widen the
+// window silently.
+func relayEntryTimeoutReportResolutionDeadline(
+	currentBlock uint64,
+) (uint64, error) {
+	if currentBlock > math.MaxUint64-relayEntryTimeoutReportResolutionBlocks {
+		return 0, fmt.Errorf(
+			"%w: current block [%v] plus the [%v] block report resolution "+
+				"bound",
+			errRelayEntryDeadlineOverflow,
+			currentBlock,
+			relayEntryTimeoutReportResolutionBlocks,
+		)
+	}
+	return currentBlock + relayEntryTimeoutReportResolutionBlocks, nil
+}
+
+// relayRequestDeparture is what one read of the beacon's in-flight slot says
+// about the relay request a timeout report was filed against.
+type relayRequestDeparture int
+
+const (
+	// relayRequestHeld means the reported request still occupies the slot, so
+	// the filed report has not taken effect yet.
+	relayRequestHeld relayRequestDeparture = iota
+	// relayRequestReleased means the slot stands empty. Nothing but the report
+	// and a delivered entry can empty it, so paired with an entry subscription
+	// that saw no delivery this is the report's own effect.
+	relayRequestReleased
+	// relayRequestSuperseded means another request occupies the slot. The
+	// reported one is over, but a request only opens after the previous one
+	// closed, so this reading cannot tell a settled report from a delivered
+	// entry whose event this node missed.
+	relayRequestSuperseded
+)
+
+// relayTimeoutReportSettled asks the beacon whether the relay request this
+// monitor reported a timeout for left the in-flight slot *because of the
+// report*, which is the beacon's own record that a penalty exists rather than
+// the node's.
+//
+// Departure alone does not say that. A relay entry delivered late empties the
+// same slot the report would, and the request that follows it looks from the
+// outside exactly like the request that follows an accepted report. The monitor
+// therefore keeps its relay-entry subscription open across this reconciliation
+// and passes it in here: an entry observed at any point during the window means
+// the group delivered, and a slot handed to a different request is ambiguous on
+// its face. Only an empty slot with no entry seen leaves the report as the one
+// explanation.
+//
+// Every other reading is a refusal to claim the penalty: an unreadable beacon,
+// a chain that does not expose the request state at all, a request still
+// holding the slot when the wait runs out, and a resolution bound that cannot
+// be represented all leave the permit exhausted. That direction is the safe one
+// — the rollback barrier exists to hold a penalty nobody can account for, so an
+// unproven report has to keep holding it.
 func (n *node) relayTimeoutReportSettled(
 	ctx context.Context,
 	monitorLogger log.StandardLogger,
 	blockCounter chain.BlockCounter,
 	relayRequestBlockNumber uint64,
+	entries <-chan *event.RelayEntrySubmitted,
 ) bool {
-	departed := func() (bool, error) {
+	// entryDelivered reports whether the group submitted a relay entry. The
+	// read is non-blocking: the subscription's buffered channel holds a
+	// delivery that arrived while this loop was elsewhere, and an empty channel
+	// means nothing has been delivered up to this point in the window.
+	entryDelivered := func() bool {
+		select {
+		case entry := <-entries:
+			monitorLogger.Warnf(
+				"a relay entry was submitted at block [%v] while the filed "+
+					"timeout report was being resolved; the group delivered, "+
+					"so no timeout penalty is claimed",
+				entry.BlockNumber,
+			)
+			return true
+		default:
+			return false
+		}
+	}
+
+	departed := func() (relayRequestDeparture, error) {
 		inProgress, err := n.beaconChain.IsEntryInProgress()
 		if err != nil {
-			return false, fmt.Errorf(
+			return relayRequestHeld, fmt.Errorf(
 				"cannot read whether a relay entry is in progress: [%w]",
 				err,
 			)
 		}
 		if !inProgress {
-			return true, nil
+			return relayRequestReleased, nil
 		}
 
 		startBlock, err := n.beaconChain.CurrentRequestStartBlock()
 		if err != nil {
-			return false, fmt.Errorf(
+			return relayRequestHeld, fmt.Errorf(
 				"cannot read the current relay request start block: [%w]",
 				err,
 			)
 		}
 		if startBlock == nil || !startBlock.IsUint64() {
-			return false, fmt.Errorf(
+			return relayRequestHeld, fmt.Errorf(
 				"the beacon reported no readable current relay request " +
 					"start block",
 			)
 		}
 
-		// A different request holding the slot means the one this monitor
-		// reported on is over; the same one still holding it means the report
-		// has not taken effect.
-		return startBlock.Uint64() != relayRequestBlockNumber, nil
+		if startBlock.Uint64() != relayRequestBlockNumber {
+			return relayRequestSuperseded, nil
+		}
+		return relayRequestHeld, nil
 	}
 
 	currentBlock, err := blockCounter.CurrentBlock()
@@ -583,13 +688,22 @@ func (n *node) relayTimeoutReportSettled(
 		return false
 	}
 
-	deadline := currentBlock + relayEntryTimeoutReportResolutionBlocks
-	if deadline < currentBlock {
-		deadline = math.MaxUint64
+	deadline, err := relayEntryTimeoutReportResolutionDeadline(currentBlock)
+	if err != nil {
+		monitorLogger.Warnf(
+			"cannot bound the relay entry timeout report resolution; the "+
+				"report is not claimed as settled: [%v]",
+			err,
+		)
+		return false
 	}
 
 	for {
-		settled, err := departed()
+		if entryDelivered() {
+			return false
+		}
+
+		departure, err := departed()
 		if err != nil {
 			monitorLogger.Warnf(
 				"cannot reconcile the relay entry timeout report against the "+
@@ -598,8 +712,21 @@ func (n *node) relayTimeoutReportSettled(
 			)
 			return false
 		}
-		if settled {
-			return true
+		switch departure {
+		case relayRequestReleased:
+			// The slot is empty. One last read of the subscription closes the
+			// race where the entry that emptied it is still in flight to this
+			// node between the two observations.
+			return !entryDelivered()
+		case relayRequestSuperseded:
+			monitorLogger.Warnf(
+				"the beacon moved on from the relay request of block [%v] to "+
+					"another one; what ended the reported request cannot be "+
+					"told apart from a delivered entry, so the filed timeout "+
+					"report is not claimed as settled",
+				relayRequestBlockNumber,
+			)
+			return false
 		}
 
 		height, err := blockCounter.CurrentBlock()
@@ -901,9 +1028,25 @@ func (n *node) MonitorRelayEntry(
 
 	chainConfig := n.beaconChain.GetConfig()
 
-	timeoutWaiterChannel, err := blockCounter.BlockHeightWaiter(
-		relayRequestBlockNumber + chainConfig.RelayEntryTimeout,
+	// The block the group runs out of time at is derived before anything is
+	// watched, because the derivation is what authorizes the report: a timeout
+	// block that overflowed would name a block already passed and turn the
+	// waiter below into an immediate false penalty.
+	timeoutBlock, err := relayEntryTimeoutBlock(
+		relayRequestBlockNumber,
+		chainConfig.RelayEntryTimeout,
 	)
+	if err != nil {
+		logger.Errorf(
+			"refusing to monitor the relay entry of block [%v]; its timeout "+
+				"block cannot be derived: [%v]",
+			relayRequestBlockNumber,
+			err,
+		)
+		return
+	}
+
+	timeoutWaiterChannel, err := blockCounter.BlockHeightWaiter(timeoutBlock)
 	if err != nil {
 		logger.Errorf("waiter for a relay entry timeout block failed: [%v]", err)
 		return
@@ -918,12 +1061,15 @@ func (n *node) MonitorRelayEntry(
 			onEntrySubmittedChannel <- event
 		},
 	)
+	// The subscription outlives the timeout branch. A report is only a penalty
+	// if the request left the beacon because of it, and a late entry delivered
+	// while the report is being resolved is what distinguishes the two, so the
+	// monitor keeps watching deliveries until it has stopped asking.
+	defer subscription.Unsubscribe()
 
 	for {
 		select {
 		case blockNumber := <-timeoutWaiterChannel:
-			subscription.Unsubscribe()
-
 			// The last-moment penalty fence: a late legacy timeout at or
 			// after the cutover block, or any timeout during quiescence,
 			// must not create new penalty state.
@@ -956,6 +1102,7 @@ func (n *node) MonitorRelayEntry(
 				logger,
 				blockCounter,
 				relayRequestBlockNumber,
+				onEntrySubmittedChannel,
 			)
 			return
 		case entry := <-onEntrySubmittedChannel:
@@ -965,7 +1112,6 @@ func (n *node) MonitorRelayEntry(
 			)
 			return
 		case <-permit.Context().Done():
-			subscription.Unsubscribe()
 			logger.Warnf(
 				"relay entry monitoring canceled by the participation "+
 					"gate: [%v]",
