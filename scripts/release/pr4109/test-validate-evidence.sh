@@ -1221,7 +1221,7 @@ read_terminal_outcomes "$(gate_state_with_outcomes \
   "\"recent_terminal_outcomes\":[$(closed_permit completed w-1 p-1)]")"
 check "a closed permit is rendered with the identity the held list carries" 0 \
   "^r1-node-1@beacon_relay_signing@10@w-1#p-1=completed=protocol_result\
-=0xentry=-$"
+=0xentry=-=-=-=-$"
 
 # The gate writes this itself when a permit is closed by an owner that recorded
 # nothing. It has to arrive as a disposition rather than as an absence, because
@@ -1231,7 +1231,7 @@ read_terminal_outcomes "$(gate_state_with_outcomes \
   "\"recent_terminal_outcomes\":[$(closed_permit unresolved w-1 p-1 true \
     '"kind":""')]")"
 check "an owner that recorded nothing is read as a disposition, not a gap" 0 \
-  "^r1-node-1@beacon_relay_signing@10@w-1#p-1=unresolved=-=-=-$"
+  "^r1-node-1@beacon_relay_signing@10@w-1#p-1=unresolved=-=-=-=-=-=-$"
 
 # A release that stopped publishing the account would otherwise leave every
 # control reading an empty list, which is what a fleet that closed nothing
@@ -1309,15 +1309,15 @@ read_terminal_outcomes "$(gate_state_with_outcomes \
     '"kind":"protocol_result","reference":"0xentry",'\
 '"chain_settlement":{"kind":"inactivity_claim","reference":"aabb:7"}')]")"
 check "a dispatched chain settlement is carried with the ending" 0 \
-  "=completed=protocol_result=0xentry=inactivity_claim:aabb:7$"
+  "=completed=protocol_result=0xentry=-=-=-=inactivity_claim:aabb:7$"
 
 # The joins. Each is asked about a named population and an account that does or
 # does not answer for it.
 P1="r1-node-1@beacon_relay_signing@10@w-1#p-1"
 P2="r1-node-1@beacon_relay_signing@11@w-2#p-2"
 NAMED="${P1} ${P2}"
-DONE1="${P1}=completed=protocol_result=0xr1=-"
-DONE2="${P2}=completed=protocol_result=0xr2=-"
+DONE1="${P1}=completed=protocol_result=0xr1=-=-=-=-"
+DONE2="${P2}=completed=protocol_result=0xr2=-=-=-=-"
 BOTH="${DONE1} ${DONE2}"
 
 check_join() {
@@ -1339,15 +1339,15 @@ check_join "a fully answered population leaves nothing unauthored" "" \
 check_join "one permit ending twice is named with its count" \
   "${P1} (2 records)" \
   "$(duplicated_authored_permits "${NAMED}" \
-    "${DONE1} ${P1}=exhausted=no_threshold=-=- ${DONE2}")"
+    "${DONE1} ${P1}=exhausted=no_threshold=-=-=-=-=- ${DONE2}")"
 check_join "an owner that recorded nothing is named with its ending" \
   "${P2}=unresolved" \
   "$(unresolved_authored_permits "${NAMED}" \
-    "${DONE1} ${P2}=unresolved=-=-=-")"
+    "${DONE1} ${P2}=unresolved=-=-=-=-=-=-")"
 check_join "a permit that ended some other way than required is named" \
   "${P2}=exhausted" \
   "$(misended_authored_permits "${NAMED}" \
-    "${DONE1} ${P2}=exhausted=no_threshold=-=-" completed)"
+    "${DONE1} ${P2}=exhausted=no_threshold=-=-=-=-=-" completed)"
 # The unauthored and unresolved checks own those two cases; reporting them here
 # as well would have one permit fail two controls with two different reasons.
 check_join "a permit with no record is left to the unauthored check" "" \
@@ -1363,15 +1363,18 @@ check_join "the endings a passing verdict quotes are the holders' own" \
 check_join "a record for the same work under another ceremony answers for none" \
   "${P1}" \
   "$(unauthored_permits "${P1}" \
-    "r1-node-1@tbtc_dkg@10@w-1#p-1=completed=persisted_tbtc_signer=0xr1=-")"
+    "r1-node-1@tbtc_dkg@10@w-1#p-1=completed=persisted_tbtc_signer=0xr1=1=1=1\
+=-")"
 check_join "a record for the same work at another anchor answers for none" \
   "${P1}" \
   "$(unauthored_permits "${P1}" \
-    "r1-node-1@beacon_relay_signing@99@w-1#p-1=completed=protocol_result=0xr1=-")"
+    "r1-node-1@beacon_relay_signing@99@w-1#p-1=completed=protocol_result=0xr1\
+=-=-=-=-")"
 check_join "a record from another holder answers for none" \
   "${P1}" \
   "$(unauthored_permits "${P1}" \
-    "r1-node-2@beacon_relay_signing@10@w-1#p-1=completed=protocol_result=0xr1=-")"
+    "r1-node-2@beacon_relay_signing@10@w-1#p-1=completed=protocol_result=0xr1\
+=-=-=-=-")"
 # And the mirror, so the three above cannot pass by never matching anything.
 check_join "the record naming the whole identity does answer for it" "" \
   "$(unauthored_permits "${P1}" "${DONE1}")"
@@ -1389,10 +1392,10 @@ check_join "a whole record reads as complete" "" \
 # it is derived from the output; holders of different ones cannot.
 S1="r1-node-1@beacon_relay_signing@10@w-1#1"
 S2="r1-node-2@beacon_relay_signing@10@w-1#2"
-SHARED="${S1}=completed=protocol_result=0xentry=- \
-${S2}=completed=protocol_result=0xentry=-"
-SPLIT="${S1}=completed=protocol_result=0xentry=- \
-${S2}=completed=protocol_result=0xelsewhere=-"
+SHARED="${S1}=completed=protocol_result=0xentry=-=-=-=- \
+${S2}=completed=protocol_result=0xentry=-=-=-=-"
+SPLIT="${S1}=completed=protocol_result=0xentry=-=-=-=- \
+${S2}=completed=protocol_result=0xelsewhere=-=-=-=-"
 
 check_join "holders that agree on one threshold output are not named" "" \
   "$(disagreeing_authored_results "${S1} ${S2}" "${SHARED}")"
@@ -1403,7 +1406,7 @@ check_join "a completion carrying another ceremony's evidence class is named" \
   "${S1} claims persisted_tbtc_signer where a protocol_result is the result of \
 that ceremony" \
   "$(misevidenced_authored_permits "${S1}" \
-    "${S1}=completed=persisted_tbtc_signer=0xentry=-")"
+    "${S1}=completed=persisted_tbtc_signer=0xentry=1=-=-=-")"
 check_join "a completion carrying its own ceremony's class is not named" "" \
   "$(misevidenced_authored_permits "${S1} ${S2}" "${SHARED}")"
 
@@ -2394,8 +2397,10 @@ beacon_dkg@841@seed841=succeeded=${QUIESCE_TX2}=0xgroup841"
   # the party that also originated the work; this is the holder's.
   QUIESCE_AUTHORED_READ=1
   QUIESCE_AUTHORED_ENDINGS="\
-r1-node-2@tbtc_signing@840@wallet840#member-1=completed=bitcoin_transaction=0xsigned840=- \
-r1-node-2@beacon_dkg@841@seed841#2=completed=persisted_beacon_signer=0xgroup841=-"
+r1-node-2@tbtc_signing@840@wallet840#member-1=completed=bitcoin_transaction\
+=0xsigned840=-=1=1=- \
+r1-node-2@beacon_dkg@841@seed841#2=completed=persisted_beacon_signer\
+=0xgroup841=1=-=-=-"
   # The security-v2 half is not seeded and drains one population, so neither
   # the pre-C seeding rungs nor the co-live requirement apply to it.
   QUIESCE_FROM_SEED=0
@@ -2437,7 +2442,7 @@ check "a node that cannot say how it closed its permits observed no drain" 3 \
 run_verdict quiesce_case eval \
   'QUIESCE_AUTHORED_ENDINGS="\
 r1-node-2@tbtc_signing@840@wallet840#member-1=completed=bitcoin_transaction\
-=0xsigned840=-"'
+=0xsigned840=-=1=1=-"'
 check "a drained permit only the driver vouches for is not accounted for" 3 \
   "recorded no ending for r1-node-2@beacon_dkg@841@seed841#2"
 
@@ -2446,7 +2451,7 @@ check "a drained permit only the driver vouches for is not accounted for" 3 \
 # shellcheck disable=SC2016
 run_verdict quiesce_case eval \
   'QUIESCE_AUTHORED_ENDINGS="${QUIESCE_AUTHORED_ENDINGS} \
-r1-node-2@beacon_dkg@841@seed841#2=exhausted=no_threshold=-=-"'
+r1-node-2@beacon_dkg@841@seed841#2=exhausted=no_threshold=-=-=-=-=-"'
 check "one drained permit ending twice cannot be read as either ending" 3 \
   "more than one ending for r1-node-2@beacon_dkg@841@seed841#2 \(2 records\)"
 
@@ -2455,7 +2460,8 @@ check "one drained permit ending twice cannot be read as either ending" 3 \
 # went. The driver still reports both settling.
 run_verdict quiesce_case eval \
   'QUIESCE_AUTHORED_ENDINGS="\
-r1-node-2@tbtc_signing@840@wallet840#member-1=completed r1-node-2@beacon_dkg@841@seed841#2=unresolved=-=-=-"'
+r1-node-2@tbtc_signing@840@wallet840#member-1\
+=completed r1-node-2@beacon_dkg@841@seed841#2=unresolved=-=-=-=-=-=-"'
 check "a drained permit whose owner recorded nothing refutes the gate" 1 \
   "without its ceremony owner recording any disposition"
 
@@ -2463,13 +2469,15 @@ check "a drained permit whose owner recorded nothing refutes the gate" 1 \
 # is allowed where the other is not.
 run_verdict quiesce_case eval \
   'QUIESCE_AUTHORED_ENDINGS="\
-r1-node-2@tbtc_signing@840@wallet840#member-1=completed r1-node-2@beacon_dkg@841@seed841#2=quarantined=quarantined_beacon_signer=-=-"'
+r1-node-2@tbtc_signing@840@wallet840#member-1\
+=completed r1-node-2@beacon_dkg@841@seed841#2=quarantined=quarantined_beacon_signer=-=-=-=-=-"'
 check "a drained permit whose key material was quarantined still holds" 0 \
   "r1-node-2@beacon_dkg@841@seed841#2=quarantined"
 
 run_verdict quiesce_case eval \
   'QUIESCE_AUTHORED_ENDINGS="\
-r1-node-2@tbtc_signing@840@wallet840#member-1=completed r1-node-2@beacon_dkg@841@seed841#2=exhausted=no_threshold=-=-"'
+r1-node-2@tbtc_signing@840@wallet840#member-1\
+=completed r1-node-2@beacon_dkg@841@seed841#2=exhausted=no_threshold=-=-=-=-=-"'
 check "a drained permit the holder recorded as exhausted refutes the gate" 1 \
   "r1-node-2@beacon_dkg@841@seed841#2=exhausted"
 
@@ -3185,11 +3193,11 @@ tbtc_wallet_action@1001@action1001=failed=${RECONCILE_TX2}=retry_exhausted"
   # deadline, and its holder recorded the quarantine the audit also wrote.
   # shellcheck disable=SC2034
   ROLLBACK_NODE_ENDINGS="r1-node-1 \
-${RECONCILE_SIGN1}=completed=bitcoin_transaction=0xsigned=- \
-${RECONCILE_ACTION1}=exhausted=no_threshold=-=-
-r1-node-2 ${RECONCILE_SIGN2}=completed=bitcoin_transaction=0xsigned=- \
-${RECONCILE_ACTION2}=exhausted=no_threshold=-=- \
-${RECONCILE_SEED}=quarantined=quarantined_beacon_signer=-=-"
+${RECONCILE_SIGN1}=completed=bitcoin_transaction=0xsigned=-=1=1=- \
+${RECONCILE_ACTION1}=exhausted=no_threshold=-=-=-=-=-
+r1-node-2 ${RECONCILE_SIGN2}=completed=bitcoin_transaction=0xsigned=-=1=1=- \
+${RECONCILE_ACTION2}=exhausted=no_threshold=-=-=-=-=- \
+${RECONCILE_SEED}=quarantined=quarantined_beacon_signer=-=-=-=-=-"
 }
 
 reconcile_case() {
@@ -3277,18 +3285,23 @@ check "a node that recorded no ending at all vouches for none of them" 3 \
 # looks like.
 # shellcheck disable=SC2016
 run_verdict reconcile_case eval \
-  'ROLLBACK_NODE_ENDINGS="r1-node-1 ${RECONCILE_SIGN1}=completed=bitcoin_transaction=0xsigned=-
-r1-node-2 ${RECONCILE_SIGN2}=completed=bitcoin_transaction=0xsigned=- \
-${RECONCILE_ACTION2}=exhausted=no_threshold=-=- ${RECONCILE_SEED}=quarantined=quarantined_beacon_signer=-=-"'
+  'ROLLBACK_NODE_ENDINGS="r1-node-1 ${RECONCILE_SIGN1}=completed\
+=bitcoin_transaction=0xsigned=-=1=1=-
+r1-node-2 ${RECONCILE_SIGN2}=completed=bitcoin_transaction=0xsigned=-=1=1=- \
+${RECONCILE_ACTION2}=exhausted=no_threshold=-=-=-=-=- ${RECONCILE_SEED}\
+=quarantined=quarantined_beacon_signer=-=-=-=-=-"'
 check "a permit its holder never accounted for is not reconciled" 3 \
   "recorded no ending for r1-node-1@tbtc_signing@1001@action1001#wallet-a"
 
 # shellcheck disable=SC2016
 run_verdict reconcile_case eval \
-  'ROLLBACK_NODE_ENDINGS="r1-node-1 ${RECONCILE_SIGN1}=completed=bitcoin_transaction=0xsigned=- \
-${RECONCILE_ACTION1}=exhausted=no_threshold=-=- ${RECONCILE_SIGN1}=exhausted=no_threshold=-=-
-r1-node-2 ${RECONCILE_SIGN2}=completed=bitcoin_transaction=0xsigned=- \
-${RECONCILE_ACTION2}=exhausted=no_threshold=-=- ${RECONCILE_SEED}=quarantined=quarantined_beacon_signer=-=-"'
+  'ROLLBACK_NODE_ENDINGS="r1-node-1 ${RECONCILE_SIGN1}=completed\
+=bitcoin_transaction=0xsigned=-=1=1=- \
+${RECONCILE_ACTION1}=exhausted=no_threshold=-=-=-=-=- ${RECONCILE_SIGN1}\
+=exhausted=no_threshold=-=-=-=-=-
+r1-node-2 ${RECONCILE_SIGN2}=completed=bitcoin_transaction=0xsigned=-=1=1=- \
+${RECONCILE_ACTION2}=exhausted=no_threshold=-=-=-=-=- ${RECONCILE_SEED}\
+=quarantined=quarantined_beacon_signer=-=-=-=-=-"'
 check "a drained permit ending twice cannot be read as either ending" 3 \
   "more than one ending for r1-node-1@tbtc_signing@1000@sign1000#1"
 
@@ -3297,10 +3310,11 @@ check "a drained permit ending twice cannot be read as either ending" 3 \
 # which is what a process going down holding a permit writes.
 # shellcheck disable=SC2016
 run_verdict reconcile_case eval \
-  'ROLLBACK_NODE_ENDINGS="r1-node-1 ${RECONCILE_SIGN1}=unresolved=-=-=- \
-${RECONCILE_ACTION1}=exhausted=no_threshold=-=-
-r1-node-2 ${RECONCILE_SIGN2}=completed=bitcoin_transaction=0xsigned=- \
-${RECONCILE_ACTION2}=exhausted=no_threshold=-=- ${RECONCILE_SEED}=quarantined=quarantined_beacon_signer=-=-"'
+  'ROLLBACK_NODE_ENDINGS="r1-node-1 ${RECONCILE_SIGN1}=unresolved=-=-=-=-=-=- \
+${RECONCILE_ACTION1}=exhausted=no_threshold=-=-=-=-=-
+r1-node-2 ${RECONCILE_SIGN2}=completed=bitcoin_transaction=0xsigned=-=1=1=- \
+${RECONCILE_ACTION2}=exhausted=no_threshold=-=-=-=-=- ${RECONCILE_SEED}\
+=quarantined=quarantined_beacon_signer=-=-=-=-=-"'
 check "a permit whose owner recorded nothing is not restorable state" 1 \
   "r1-node-1@tbtc_signing@1000@sign1000#1=unresolved"
 
@@ -3515,9 +3529,9 @@ ${HOM_BEACON}=${HOM_TX2}=r1-node-1~1"
   # shellcheck disable=SC2034
   HOMOGENEOUS_AUTHORED_ENDINGS="\
 r1-node-1@tbtc_signing@1200@sign1200#1=completed=bitcoin_transaction\
-=${HOM_SIG1}=- \
+=${HOM_SIG1}=-=1=1=- \
 r1-node-1@beacon_dkg@1201@bdkg1201#1=completed=persisted_beacon_signer\
-=${HOM_SIG2}=-"
+=${HOM_SIG2}=1=-=-=-"
   # shellcheck disable=SC2034
   HOMOGENEOUS_PERMITS_BEFORE="20"
   # shellcheck disable=SC2034
@@ -3645,7 +3659,7 @@ check "a post-C fleet that cannot be asked has vouched for nothing" 3 \
 run_verdict homogeneous_case eval \
   'HOMOGENEOUS_AUTHORED_ENDINGS="\
 r1-node-1@tbtc_signing@1200@sign1200#1=completed=bitcoin_transaction\
-=${HOM_SIG1}=-"'
+=${HOM_SIG1}=-=1=1=-"'
 check "a post-C settlement no node vouched for is not finished work" 3 \
   "no node recorded an ending for r1-node-1@beacon_dkg@1201@bdkg1201#1"
 
@@ -3658,7 +3672,7 @@ check "a post-C permit ending twice cannot be read as either ending" 3 \
 
 run_verdict homogeneous_case eval \
   'HOMOGENEOUS_AUTHORED_ENDINGS="r1-node-1@tbtc_signing@1200@sign1200#1=completed \
-r1-node-1@beacon_dkg@1201@bdkg1201#1=unresolved=-=-=-"'
+r1-node-1@beacon_dkg@1201@bdkg1201#1=unresolved=-=-=-=-=-=-"'
 check "a post-C settlement whose holder recorded nothing stands on nothing" 1 \
   "closed the permit without recording" "r1-node-1@beacon_dkg@1201@bdkg1201#1=unresolved"
 
@@ -3666,8 +3680,8 @@ check "a post-C settlement whose holder recorded nothing stands on nothing" 1 \
 run_verdict homogeneous_case eval \
   'HOMOGENEOUS_AUTHORED_ENDINGS="\
 r1-node-1@tbtc_signing@1200@sign1200#1=completed=bitcoin_transaction\
-=${HOM_SIG1}=- \
-r1-node-1@beacon_dkg@1201@bdkg1201#1=exhausted=no_threshold=-=-"'
+=${HOM_SIG1}=-=1=1=- \
+r1-node-1@beacon_dkg@1201@bdkg1201#1=exhausted=no_threshold=-=-=-=-=-"'
 check "a post-C settlement the holder recorded as exhausted is refused" 1 \
   "r1-node-1@beacon_dkg@1201@bdkg1201#1=exhausted"
 
@@ -3676,7 +3690,7 @@ check "a post-C settlement the holder recorded as exhausted is refused" 1 \
 run_verdict homogeneous_case eval \
   'HOMOGENEOUS_AUTHORED_ENDINGS="r1-node-1@tbtc_signing@1200@sign1200#1=completed \
 r1-node-1@beacon_dkg@1201@bdkg1201#1=quarantined=quarantined_beacon_signer\
-=-=-"'
+=-=-=-=-=-"'
 check "a quarantined post-C permit is not a completed ceremony" 1 \
   "r1-node-1@beacon_dkg@1201@bdkg1201#1=quarantined"
 
@@ -3692,7 +3706,8 @@ run_verdict homogeneous_case eval \
   'HOMOGENEOUS_ORIGINATED="${HOMOGENEOUS_ORIGINATED} \
 tbtc_heartbeat@1202@beat1202=${HOM_TX3}=r1-node-1~2"
    HOMOGENEOUS_AUTHORED_ENDINGS="${HOMOGENEOUS_AUTHORED_ENDINGS} \
-r1-node-1@tbtc_heartbeat@1202@beat1202#2=completed=protocol_result=0xbeat1202=-"'
+r1-node-1@tbtc_heartbeat@1202@beat1202#2=completed=protocol_result=0xbeat1202\
+=-=1=1=-"'
 check "post-C work the driver never reported on leaves a gap" 3 \
   "no outcome at all for tbtc_heartbeat@1202@beat1202#2"
 
@@ -3758,14 +3773,18 @@ tbtc_heartbeat@844@beat844=${PRE_TX1}=r1-node-1~1 \
 beacon_dkg@845@bdkg845=${PRE_TX2}=r1-node-1~1"
   # shellcheck disable=SC2034
   PRECUTOVER_AUTHORED_ENDINGS="\
-r1-node-1@tbtc_signing@840@wallet840#1=completed=bitcoin_transaction=0xbtc840=- \
+r1-node-1@tbtc_signing@840@wallet840#1=completed=bitcoin_transaction=0xbtc840\
+=-=1,7=1=- \
 r1-node-1@beacon_relay_signing@841@entry841#1=completed=protocol_result\
-=0xentry841=- \
-r1-node-1@tbtc_dkg@842@dkg842#1=completed=persisted_tbtc_signer=0xdkg842=- \
-r1-node-1@tbtc_signing@843@sign843#1=completed=bitcoin_transaction=0xsign843=- \
-r1-node-1@tbtc_heartbeat@844@beat844#1=completed=protocol_result=0xbeat844=- \
+=0xentry841=-=-=-=- \
+r1-node-1@tbtc_dkg@842@dkg842#1=completed=persisted_tbtc_signer=0xdkg842=1\
+=1,7=1=- \
+r1-node-1@tbtc_signing@843@sign843#1=completed=bitcoin_transaction=0xsign843\
+=-=1,7=1=- \
+r1-node-1@tbtc_heartbeat@844@beat844#1=completed=protocol_result=0xbeat844=-\
+=1,7=1=- \
 r1-node-1@beacon_dkg@845@bdkg845#1=completed=persisted_beacon_signer\
-=0xbdkg845=-"
+=0xbdkg845=1=-=-=-"
   # shellcheck disable=SC2034
   PRECUTOVER_PRIOR_RUNNING=1
   # shellcheck disable=SC2034
@@ -3897,6 +3916,32 @@ beacon_signing@841@entry841=r1-node-2~2"'
 check "a homogeneous R1 transcript cannot stand for a mixed one" 3 \
   "took no part in those results"
 
+# The case the whole control used to rest on the driver for. Here the driver
+# names a prior contributor on every required ceremony, exactly as a genuine
+# mixed run would, and the fleet's own transcripts say every seat that produced
+# the tBTC results was one of its own. A report cannot add a party to a
+# transcript, so the tBTC requirements stay uncovered whatever the list claims.
+#
+# The beacon requirements are covered here, and that is the standing limit rather
+# than an oversight: those ceremonies publish no transcript, so their prior share
+# is still read from the driver's list. The verdict below therefore names the
+# tBTC ceremonies alone, which is exactly the set whose prior share this fleet
+# authors.
+run_verdict precutover_case eval '
+  PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS//1,7/1}"'
+check "a driver-claimed prior party outside the transcript is refused" 3 \
+  "no tbtc_dkg tbtc_signing tbtc_heartbeat tbtc_wallet_action transcript \
+incorporated a share"
+
+# And the reverse mutation on the same fixture: a seat the fleet does not claim
+# is what makes the reading mixed, so moving that seat into a node's own
+# memberships leaves a transcript this fleet produced alone.
+run_verdict precutover_case eval '
+  PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS//=1,7=1=/=1,7=1,7=}"'
+check "a fleet claiming every seat authored no mixed transcript" 3 \
+  "no tbtc_dkg tbtc_signing tbtc_heartbeat tbtc_wallet_action transcript \
+incorporated a share"
+
 # The mirror on the other release. A prior binary settling a ceremony among
 # its own kind is exactly as unmixed as an R1 fleet doing so, and a control
 # that only ever looked for the prior share would call this interoperation.
@@ -4001,8 +4046,9 @@ check "a holder the contributor set omits is not left uncounted" 3 \
 # shellcheck disable=SC2016
 run_verdict precutover_case eval '
   PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS/\
-r1-node-1@tbtc_dkg@842@dkg842#1=completed=persisted_tbtc_signer=0xdkg842=-/\
-r1-node-1@tbtc_dkg@842@dkg842#1=exhausted=no_threshold=-=-}"'
+r1-node-1@tbtc_dkg@842@dkg842#1=completed=persisted_tbtc_signer=0xdkg842=1\
+=1,7=1=-/\
+r1-node-1@tbtc_dkg@842@dkg842#1=exhausted=no_threshold=-=-=-=-=-}"'
 check "a permit that produced nothing is not a party to a transcript" 1 \
   "tbtc_dkg@842@dkg842#1=exhausted"
 
@@ -4119,7 +4165,7 @@ check "a settled ceremony no node vouched for is not completed work" 3 \
 # shellcheck disable=SC2016
 run_verdict precutover_case eval \
   'PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS} \
-r1-node-1@beacon_dkg@845@bdkg845#1=exhausted=no_threshold=-=-"'
+r1-node-1@beacon_dkg@845@bdkg845#1=exhausted=no_threshold=-=-=-=-=-"'
 check "one permit ending twice cannot be read as either ending" 3 \
   "more than one node-authored record"
 
@@ -4129,7 +4175,8 @@ check "one permit ending twice cannot be read as either ending" 3 \
 # shellcheck disable=SC2016
 run_verdict precutover_case eval \
   'PRECUTOVER_AUTHORED_ENDINGS="\
-${PRECUTOVER_AUTHORED_ENDINGS% *} r1-node-1@beacon_dkg@845@bdkg845#1=unresolved=-=-=-"'
+${PRECUTOVER_AUTHORED_ENDINGS% *} r1-node-1@beacon_dkg@845@bdkg845#1\
+=unresolved=-=-=-=-=-=-"'
 check "a settled ceremony whose holder recorded nothing stands on nothing" 1 \
   "closed the permit without recording" "r1-node-1@beacon_dkg@845@bdkg845#1=unresolved"
 
@@ -4138,7 +4185,8 @@ check "a settled ceremony whose holder recorded nothing stands on nothing" 1 \
 # shellcheck disable=SC2016
 run_verdict precutover_case eval \
   'PRECUTOVER_AUTHORED_ENDINGS="\
-${PRECUTOVER_AUTHORED_ENDINGS% *} r1-node-1@beacon_dkg@845@bdkg845#1=exhausted=no_threshold=-=-"'
+${PRECUTOVER_AUTHORED_ENDINGS% *} r1-node-1@beacon_dkg@845@bdkg845#1\
+=exhausted=no_threshold=-=-=-=-=-"'
 check "a driver settlement the holder recorded as exhausted is refused" 1 \
   "r1-node-1@beacon_dkg@845@bdkg845#1=exhausted"
 
@@ -4147,7 +4195,8 @@ check "a driver settlement the holder recorded as exhausted is refused" 1 \
 # shellcheck disable=SC2016
 run_verdict precutover_case eval \
   'PRECUTOVER_AUTHORED_ENDINGS="\
-${PRECUTOVER_AUTHORED_ENDINGS% *} r1-node-1@beacon_dkg@845@bdkg845#1=quarantined=quarantined_beacon_signer=-=-"'
+${PRECUTOVER_AUTHORED_ENDINGS% *} r1-node-1@beacon_dkg@845@bdkg845#1\
+=quarantined=quarantined_beacon_signer=-=-=-=-=-"'
 check "a quarantined permit is not a completed pre-cutover ceremony" 1 \
   "r1-node-1@beacon_dkg@845@bdkg845#1=quarantined"
 
@@ -4160,7 +4209,8 @@ check "a quarantined permit is not a completed pre-cutover ceremony" 1 \
 run_verdict precutover_case eval \
   'PRECUTOVER_AUTHORED_ENDINGS="\
 ${PRECUTOVER_AUTHORED_ENDINGS% *} \
-r1-node-1@tbtc_dkg@845@bdkg845#1=completed=persisted_tbtc_signer=0xbdkg845=-"'
+r1-node-1@tbtc_dkg@845@bdkg845#1=completed=persisted_tbtc_signer=0xbdkg845=1\
+=1,7=1=-"'
 check "an ending recorded under another ceremony answers for no permit" 3 \
   "no node recorded an ending for r1-node-1@beacon_dkg@845@bdkg845#1"
 
@@ -4168,7 +4218,8 @@ check "an ending recorded under another ceremony answers for no permit" 3 \
 run_verdict precutover_case eval \
   'PRECUTOVER_AUTHORED_ENDINGS="\
 ${PRECUTOVER_AUTHORED_ENDINGS% *} \
-r1-node-1@beacon_dkg@999@bdkg845#1=completed=persisted_beacon_signer=0xbdkg845=-"'
+r1-node-1@beacon_dkg@999@bdkg845#1=completed=persisted_beacon_signer\
+=0xbdkg845=1=-=-=-"'
 check "an ending recorded at another anchor answers for no permit" 3 \
   "no node recorded an ending for r1-node-1@beacon_dkg@845@bdkg845#1"
 
@@ -4188,7 +4239,8 @@ check "an ending that stops at the category cannot be reconciled" 3 \
 run_verdict precutover_case eval \
   'PRECUTOVER_AUTHORED_ENDINGS="\
 ${PRECUTOVER_AUTHORED_ENDINGS% *} \
-r1-node-1@beacon_dkg@845@bdkg845#1=completed=protocol_result=0xbdkg845=-"'
+r1-node-1@beacon_dkg@845@bdkg845#1=completed=protocol_result=0xbdkg845=-=-=-\
+=-"'
 check "a completion carrying another ceremony's result class is refused" 1 \
   "claims protocol_result where a persisted_beacon_signer is the result"
 
@@ -4199,7 +4251,8 @@ run_verdict precutover_case eval \
   'PRECUTOVER_ORIGINATED="${PRECUTOVER_ORIGINATED} \
 beacon_dkg@845@bdkg845=${PRE_TX2}=r1-node-2~2"
    PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS} \
-r1-node-2@beacon_dkg@845@bdkg845#2=completed=persisted_beacon_signer=0xelsewhere=-"'
+r1-node-2@beacon_dkg@845@bdkg845#2=completed=persisted_beacon_signer\
+=0xelsewhere=1=-=-=-"'
 check "holders naming different outputs for one ceremony are refused" 1 \
   "beacon_dkg@845@bdkg845 \(0xbdkg845/0xelsewhere\)"
 
@@ -4209,7 +4262,8 @@ check "holders naming different outputs for one ceremony are refused" 1 \
 run_verdict precutover_case eval \
   'PRECUTOVER_AUTHORED_ENDINGS="\
 ${PRECUTOVER_AUTHORED_ENDINGS% *} \
-r1-node-1@beacon_dkg@845@bdkg845#1=completed=persisted_beacon_signer=0xelsewhere=-"'
+r1-node-1@beacon_dkg@845@bdkg845#1=completed=persisted_beacon_signer\
+=0xelsewhere=1=-=-=-"'
 check "a completion naming an output the driver never settled is refused" 1 \
   "recorded 0xelsewhere where the driver claims 0xbdkg845"
 
@@ -4239,7 +4293,8 @@ run_verdict precutover_case eval \
   'PRECUTOVER_ORIGINATED="${PRECUTOVER_ORIGINATED} \
 tbtc_signing@846@sign846=${PRE_TX1}=r1-node-1~2"
    PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS} \
-r1-node-1@tbtc_signing@846@sign846#2=completed=bitcoin_transaction=0xsign846=-"'
+r1-node-1@tbtc_signing@846@sign846#2=completed=bitcoin_transaction=0xsign846\
+=-=1,7=1=-"'
 check "originated work the driver never reported on leaves a gap" 3 \
   "no outcome at all for tbtc_signing@846@sign846#2"
 
@@ -4294,7 +4349,7 @@ surviving_readings() {
   # shellcheck disable=SC2034
   SURVIVING_AUTHORED_ENDINGS="\
 r1-node-1@tbtc_signing@840@wallet840#member-1=completed=bitcoin_transaction\
-=0xsigned840=-"
+=0xsigned840=-=1=1=-"
 }
 
 surviving_case() {
@@ -4328,15 +4383,16 @@ check "a permit only the driver vouches for does not hold the control" 3 \
 run_verdict surviving_case eval \
   'SURVIVING_AUTHORED_ENDINGS="\
 r1-node-1@tbtc_signing@999@wallet999#member-9=completed=bitcoin_transaction\
-=0xsigned999=-"'
+=0xsigned999=-=1=1=-"'
 check "a permit forgotten from the gate's own account is not vouched for" 3 \
   "no R1 gate recorded an ending for r1-node-1@tbtc_signing@840@wallet840#member-1"
 
 run_verdict surviving_case eval \
   'SURVIVING_AUTHORED_ENDINGS="\
 r1-node-1@tbtc_signing@840@wallet840#member-1=completed=bitcoin_transaction\
-=0xsigned840=- \
-r1-node-1@tbtc_signing@840@wallet840#member-1=exhausted=no_threshold=-=-"'
+=0xsigned840=-=1=1=- \
+r1-node-1@tbtc_signing@840@wallet840#member-1=exhausted=no_threshold=-=-=-=-\
+=-"'
 check "one permit ending twice cannot be read as either ending" 3 \
   "more than one ending for r1-node-1@tbtc_signing@840@wallet840#member-1 \(2 records\)"
 
@@ -4345,7 +4401,7 @@ check "one permit ending twice cannot be read as either ending" 3 \
 # that was allowed to finish.
 run_verdict surviving_case eval \
   'SURVIVING_AUTHORED_ENDINGS="\
-r1-node-1@tbtc_signing@840@wallet840#member-1=unresolved=-=-=-"'
+r1-node-1@tbtc_signing@840@wallet840#member-1=unresolved=-=-=-=-=-=-"'
 check "a permit whose owner recorded nothing refutes the gate" 1 \
   "without their ceremony owners recording any disposition"
 
@@ -4353,7 +4409,8 @@ check "a permit whose owner recorded nothing refutes the gate" 1 \
 # off the driver alone would pass this.
 run_verdict surviving_case eval \
   'SURVIVING_AUTHORED_ENDINGS="\
-r1-node-1@tbtc_signing@840@wallet840#member-1=exhausted=no_threshold=-=-"'
+r1-node-1@tbtc_signing@840@wallet840#member-1=exhausted=no_threshold=-=-=-=-\
+=-"'
 check "a holder recording an ending the driver contradicts refutes the gate" \
   1 "r1-node-1@tbtc_signing@840@wallet840#member-1=exhausted"
 
@@ -4556,7 +4613,7 @@ tbtc_signing@1200@colive900=succeeded=${QUIESCE_TX3}=0xsigned1200"
   # shellcheck disable=SC2034
   QUIESCE_AUTHORED_ENDINGS="${QUIESCE_AUTHORED_ENDINGS} \
 r1-node-1@tbtc_signing@1200@colive900#other-1=completed=bitcoin_transaction\
-=0xsigned1200=-"
+=0xsigned1200=-=1=1=-"
   "$@"
   quiescence_verdict r1-node-1 \
     "quiescence with an in-flight legacy permit" "" legacy
@@ -4584,10 +4641,10 @@ QUIESCE_SEQ_COLIVE_TX="0xff99999999999999999999999999999999999999999999999999999
 quiesce_seq_endings() {
   printf 'r1-node-1@tbtc_signing@%s@wallet%s#member-1' \
     "${QUIESCE_SEQ_ANCHOR}" "${QUIESCE_SEQ_ANCHOR}"
-  printf '=completed=bitcoin_transaction=0xsigned=-'
+  printf '=completed=bitcoin_transaction=0xsigned=-=1,2=1=-'
   if ((QUIESCE_SEQ_SEEDED == 1)); then
     printf ' r1-node-1@tbtc_signing@1200@colive900#other-1'
-    printf '=completed=bitcoin_transaction=0xsigned1200=-'
+    printf '=completed=bitcoin_transaction=0xsigned1200=-=1,2=1=-'
   fi
 }
 
@@ -4790,6 +4847,17 @@ check "a seeding that named no work identifies no pre-C permit" 3 \
 # response, not three.
 QUIESCE_RACE_FETCHES="${WORK}/quiesce-race-fetches"
 
+# One membership set as the gate serves it: a JSON array of numbers, and the
+# absent set as null so a record that names none reads as naming none rather
+# than as an empty ceremony.
+quiesce_race_members() {
+  [[ "$1" == "-" ]] && {
+    printf 'null'
+    return 0
+  }
+  printf '[%s]' "${1//,/, }"
+}
+
 quiesce_race_document() {
   local outcomes="" token permit work
   for token in $(quiesce_seq_endings); do
@@ -4803,7 +4871,13 @@ quiesce_race_document() {
         \"outcome\": \"$(authored_outcome "${token}")\",
         \"evidence\": {
           \"kind\": \"$(authored_evidence_kind "${token}")\",
-          \"reference\": \"$(authored_result "${token}")\"
+          \"reference\": \"$(authored_result "${token}")\",
+          \"contribution\": {
+            \"incorporated_members\": $(quiesce_race_members \
+              "$(authored_incorporated "${token}")"),
+            \"local_members\": $(quiesce_race_members \
+              "$(authored_local "${token}")")
+          }
         },
         \"permit\": {
           \"identity_bound\": true,

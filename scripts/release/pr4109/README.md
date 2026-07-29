@@ -315,6 +315,17 @@ closed and emits it at
 `work_id`/`permit_id` identities the live list carries — so a permit the
 crossing control saw held is followed to the disposition its own node recorded.
 
+A completed record also names who reached the result, not only that one exists.
+The ceremonies whose owners authenticate their peers publish the memberships
+whose contributions they combined into the result and, separately, the
+memberships they operated themselves, and their records are refused without
+both; a ceremony that authenticates no population — a forwarder relaying other
+members' shares, a coordination proposal from one leader — is refused with one.
+A completed DKG record additionally names the membership it persisted, which is
+a final signing-group seat rather than the DKG seat its permit was issued under.
+Every reading below takes those fields as it finds them: a record that omits one
+is unreadable rather than filled in.
+
 The surviving-work verdict, both quiescence verdicts, both pre-cutover
 verdicts, and the homogeneous positive control decide on that reading. Every
 permit they named must appear in the closed-permit account exactly once, and
@@ -383,19 +394,32 @@ gate's: the gate spells a wallet action and a signing alike, so a prior share on
 the wallet action and an R1 completion on the signing beside it stays two
 homogeneous transcripts.
 
+For the tBTC ceremonies the prior share is no longer the driver's word either,
+and it is read without the prior binary having to say anything. Each R1 holder
+publishes the memberships whose authenticated contributions it combined into its
+result and, separately, the memberships it operated itself: a seat in the first
+set that no node in the fleet claims in the second is a seat some node outside
+the fleet was sitting in, and the only other release on this network is the prior
+binary. A tBTC run this fleet performed alone therefore leaves no such seat
+however the report describes it, and a driver cannot add one — the seats come
+from done checks each R1 node validated against the wallet's on-chain signing
+group, all carrying the one signature the attempt agreed on, or from the final
+signing group a DKG built out of exactly the members whose rounds it accepted.
+
 The seam is narrower but not closed, and what is still open is named here rather
 than left to be inferred from which verdicts the list above happens to omit. The
-prior release publishes no gate account at all — it predates the diagnostics
-object these joins read — so its own share remains the driver's word. What is
-now checked about that word is that it is attached to a piece of work the R1
-fleet's own holders recorded completing, under the result they recorded, rather
-than to a work identity the driver invented beside them; what cannot be checked
-from outside is whether the prior node's share was really incorporated into that
-transcript rather than merely claimed against it. Closing that last step needs
-evidence the prior binary does not emit, so it is a standing limit of this
-rehearsal against a pre-gate release rather than a repository-side gap: gate 6's
-interoperability claim rests on the driver for exactly one half of one
-proposition, and on the fleet's own records for everything else.
+beacon ceremonies publish no transcript yet — their owners do not carry the
+authenticated population out of the GJKR result or the combined relay shares into
+the terminal record — so for `beacon_dkg` and `beacon_signing` the prior share
+remains the driver's word. What is checked about that word is that it is attached
+to a piece of work the R1 fleet's own holders recorded completing, under the
+result they recorded, rather than to a work identity the driver invented beside
+them; what cannot be checked there is whether the prior node's share was really
+incorporated into that transcript rather than merely claimed against it. Unlike
+the prior binary's silence, this half is a repository-side gap and is recorded as
+one: the two beacon producers are named in the rehearsal beside the conditional
+that still admits the driver's claim, and closing them makes every required
+ceremony read the same node-authored way the tBTC ones now do.
 
 The straggler control reads the announcer's own account of the sighting
 rather than the gate's refusal counter, which counts a node declining its own

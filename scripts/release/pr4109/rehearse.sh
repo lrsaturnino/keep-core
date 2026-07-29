@@ -3918,6 +3918,123 @@ TERMINAL_OUTCOME_JS='
       // token charset opens on an alphanumeric, so this can never collide with
       // a real reference.
       const NONE = "-";
+      // The ceremonies whose owners authenticate the parties behind their
+      // result and therefore publish the transcript. The list mirrors the one
+      // the gate keeps, and it is here rather than implied because a completed
+      // record for one of these ceremonies without a transcript is the case
+      // this reader has to refuse: it reads exactly like a ceremony that
+      // authored one and leaves the population to whoever wrote the report.
+      const TRANSCRIPT_CEREMONIES = [
+        "tbtc_dkg", "tbtc_signing", "tbtc_heartbeat",
+      ];
+      // The evidence kinds that name a persisted DKG membership. The gate
+      // requires the membership index on exactly these and forbids it
+      // elsewhere, so a reader that dropped it would lose the field that ties a
+      // persisted signer to the transcript that produced it.
+      const MEMBERSHIP_EVIDENCE = [
+        "persisted_tbtc_signer", "persisted_beacon_signer",
+      ];
+      // A membership index as the journal renders it: 1 through 255, no leading
+      // zeros, nothing else. Anything outside that is not a seat in a group.
+      const memberIndexOf = (value, what) => {
+        if (typeof value !== "number" || !Number.isInteger(value) ||
+          value < 1 || value > 255) {
+          console.error(what + " is not a membership index: " +
+            JSON.stringify(value));
+          process.exit(1);
+        }
+        return value;
+      };
+      // An ascending, duplicate-free membership set, rendered comma-joined.
+      // The ordering is a rule the gate enforces and is checked rather than
+      // normalized here: two records of one transcript have to compare equal as
+      // text, and a set that arrived out of order or with a repeat is a record
+      // no gate wrote.
+      const memberSetOf = (value, what) => {
+        if (!Array.isArray(value)) {
+          console.error(what + " is not a membership set: " +
+            JSON.stringify(value));
+          process.exit(1);
+        }
+        let previous = 0;
+        const members = [];
+        for (const member of value) {
+          const index = memberIndexOf(member, what);
+          if (index <= previous) {
+            console.error(what + " is not ascending and distinct: " +
+              JSON.stringify(value));
+            process.exit(1);
+          }
+          previous = index;
+          members.push(index);
+        }
+        return members;
+      };
+      // Who the holder says produced the result, and which of those
+      // memberships it operated itself.
+      //
+      // This is the field the mixed-release reading rests on. A completion says
+      // a threshold result exists; every member of every finished ceremony
+      // writes the same one, so a fleet whose shares combined from two releases
+      // and a fleet where one release recovered the common result alone are the
+      // same record without it. The two sets are kept apart because only their
+      // difference can be attributed elsewhere: memberships the whole fleet
+      // says it did not operate are memberships some node outside the fleet
+      // supplied.
+      const contributionOf = (record, kind) => {
+        const ceremony = (record.permit || {}).ceremony;
+        const authored = TRANSCRIPT_CEREMONIES.includes(ceremony);
+        const contribution = record.evidence.contribution;
+        if (contribution === undefined || contribution === null) {
+          if (authored) {
+            console.error("a completed " + JSON.stringify(ceremony) +
+              " permit names nobody who produced its result: " +
+              JSON.stringify(record));
+            process.exit(1);
+          }
+          return NONE + "=" + NONE;
+        }
+        if (!authored) {
+          console.error("a " + JSON.stringify(ceremony) +
+            " permit named a transcript it cannot observe: " +
+            JSON.stringify(record));
+          process.exit(1);
+        }
+        if (typeof contribution !== "object" || Array.isArray(contribution)) {
+          console.error("not a transcript contribution: " +
+            JSON.stringify(contribution));
+          process.exit(1);
+        }
+        const incorporated = memberSetOf(
+          contribution.incorporated_members,
+          "the memberships that produced the result",
+        );
+        if (incorporated.length === 0) {
+          console.error("a completed permit names no membership that " +
+            "produced its result: " + JSON.stringify(record));
+          process.exit(1);
+        }
+        // An empty local half is legitimate: a wallet action records the
+        // signature it observed even when the attempt that produced it
+        // selected none of its own memberships. A local membership outside the
+        // produced population is not, because the record would then be an
+        // account of other parties rather than of a ceremony this node was in.
+        const local = memberSetOf(
+          contribution.local_members === undefined ?
+            [] : contribution.local_members,
+          "the memberships this node operated",
+        );
+        for (const member of local) {
+          if (!incorporated.includes(member)) {
+            console.error("a node claims membership " + member +
+              " outside the memberships that produced the result: " +
+              JSON.stringify(record));
+            process.exit(1);
+          }
+        }
+        return (incorporated.join(",") || NONE) + "=" +
+          (local.join(",") || NONE);
+      };
       const evidenceOf = (record) => {
         const evidence = record.evidence;
         if (evidence === null || typeof evidence !== "object" ||
@@ -3937,7 +4054,8 @@ TERMINAL_OUTCOME_JS='
               JSON.stringify(record));
             process.exit(1);
           }
-          return NONE + "=" + NONE + "=" + NONE;
+          return NONE + "=" + NONE + "=" + NONE + "=" + NONE + "=" + NONE +
+            "=" + NONE;
         }
         const kind = evidence.kind;
         const referenced = REFERENCED_EVIDENCE.includes(kind);
@@ -3959,6 +4077,24 @@ TERMINAL_OUTCOME_JS='
           evidence.reference !== "") {
           console.error("terminal evidence of kind " + JSON.stringify(kind) +
             " must name no durable result: " + JSON.stringify(evidence));
+          process.exit(1);
+        }
+        // The membership a completed DKG permit persisted. It is load-bearing
+        // rather than decorative: the final signing group index can differ from
+        // the DKG index the permit was issued under, so this is what joins a
+        // persisted signer to the wallet seat the chain knows it by, and a
+        // reader that dropped it could not tell one member record from
+        // another beyond the seats they claim.
+        let membership = NONE;
+        if (MEMBERSHIP_EVIDENCE.includes(kind)) {
+          membership = String(memberIndexOf(
+            evidence.membership_index,
+            "the membership a persisted DKG signer names",
+          ));
+        } else if (evidence.membership_index !== undefined &&
+          evidence.membership_index !== 0) {
+          console.error("terminal evidence of kind " + JSON.stringify(kind) +
+            " must name no persisted membership: " + JSON.stringify(evidence));
           process.exit(1);
         }
         // A chain side effect the same permit dispatched beyond its own
@@ -3988,7 +4124,8 @@ TERMINAL_OUTCOME_JS='
             settlement = chain.kind + ":" + chain.reference;
           }
         }
-        return kind + "=" + reference + "=" + settlement;
+        return kind + "=" + reference + "=" + membership + "=" +
+          contributionOf(record, kind) + "=" + settlement;
       };
       const terminalOutcome = (service, record) => {
         if (record === null || typeof record !== "object" ||
@@ -4013,8 +4150,8 @@ TERMINAL_OUTCOME_JS='
 '
 
 # What one node's gate says became of the permits it has closed, rendered as
-# "<permit identity>=<outcome>=<evidence kind>=<result>=<settlement>" tokens in
-# the order they closed.
+# "<permit identity>=<outcome>=<evidence kind>=<result>=<membership>=
+# <incorporated>=<local>=<settlement>" tokens in the order they closed.
 #
 # This is the other half of the live permit list, and the half the controls
 # were missing. The held list names work a node has; the moment that work ends
@@ -5789,8 +5926,9 @@ present_tokens() {
 # The tokens on both sides open with the permit identity a gate scrape renders,
 # "<service>@<gate ceremony>@<anchor>@<chain work>#<permit>", which carries no
 # "=" of its own. The node-authored side appends what its holder recorded:
-# "=<outcome>=<evidence kind>=<result>=<settlement>", with "-" where the gate
-# carries no reference.
+# "=<outcome>=<evidence kind>=<result>=<membership>=<incorporated>=<local>=
+# <settlement>", with "-" wherever the gate carries no value. The two membership
+# sets are comma-joined ascending.
 # ---------------------------------------------------------------------------
 
 # The permit identity a node-authored outcome token names, without its ending.
@@ -5827,6 +5965,55 @@ authored_evidence_kind() {
 authored_result() {
   local rest
   rest="${1#*=}"
+  rest="${rest#*=}"
+  rest="${rest#*=}"
+  printf '%s' "${rest%%=*}"
+}
+
+# The membership a completed DKG permit persisted, or "-" for the endings that
+# persist none.
+#
+# The final signing group index can differ from the DKG index the permit was
+# issued under, so this is the field that joins a holder to the wallet seat the
+# chain knows it by rather than to the seat it started the ceremony in.
+authored_membership() {
+  local rest
+  rest="${1#*=}"
+  rest="${rest#*=}"
+  rest="${rest#*=}"
+  rest="${rest#*=}"
+  printf '%s' "${rest%%=*}"
+}
+
+# The memberships the holder says produced the result, comma-joined ascending,
+# or "-" for the endings that name none.
+#
+# This is the half of a transcript no completion can substitute for. Every
+# member of a finished ceremony writes "completed" and names the same result, so
+# a reader holding only those cannot tell shares that combined from several
+# parties from one party that arrived at the common result alone.
+authored_incorporated() {
+  local rest
+  rest="${1#*=}"
+  rest="${rest#*=}"
+  rest="${rest#*=}"
+  rest="${rest#*=}"
+  rest="${rest#*=}"
+  printf '%s' "${rest%%=*}"
+}
+
+# Of those memberships, the ones the holder says it operated itself,
+# comma-joined ascending, or "-" when none of them were its own.
+#
+# Held against the incorporated set across the whole fleet, this is what makes a
+# mixed reading node-authored: memberships the fleet says it produced but nobody
+# in the fleet claims to have operated are memberships supplied from outside it.
+authored_local() {
+  local rest
+  rest="${1#*=}"
+  rest="${rest#*=}"
+  rest="${rest#*=}"
+  rest="${rest#*=}"
   rest="${rest#*=}"
   rest="${rest#*=}"
   printf '%s' "${rest%%=*}"
@@ -5974,14 +6161,21 @@ authored_record() {
 }
 
 # Whether one node-authored token carries the whole ending shape: an identity,
-# the disposition, and the three evidence fields behind it.
+# the disposition, and the six evidence fields behind it — kind, result,
+# persisted membership, the memberships that produced the result, the ones the
+# holder operated, and the chain settlement.
+#
+# The count is exact rather than a floor. A token with fewer fields comes from a
+# release publishing a narrower account, and every reader below would take the
+# truncation for whatever field happened to land in that position; a token with
+# more comes from a release this rehearsal was not built to read.
 authored_record_complete() {
   local rest="$1" count=0
   while [[ "${rest}" == *=* ]]; do
     rest="${rest#*=}"
     count=$((count + 1))
   done
-  ((count == 4))
+  ((count == 7))
 }
 
 # Of the named permits, the ones whose node-authored record stops short of the
@@ -6285,6 +6479,69 @@ uncredited_contributors() {
   printf '%s' "${out}"
 }
 
+# The memberships that produced one piece of chain work which nobody in the
+# fleet under test claims to have operated, comma-joined ascending.
+#
+# This is the mixed-release claim reduced to something the fleet authors by
+# itself. Every R1 holder publishes the memberships whose authenticated
+# contributions it combined into the result, and separately the memberships it
+# operated. Union the first across the fleet and subtract the union of the
+# second: what remains are seats in the ceremony that produced the result which
+# no node in this fleet was sitting in, so some node outside the fleet supplied
+# them. The rehearsal runs exactly two releases, and the container set is the
+# harness's own rather than any report's, so a remaining seat is a seat the prior
+# binary held.
+#
+# Nothing here is the driver's word. A driver reporting a homogeneous run as
+# mixed leaves this empty, and a driver naming a party the fleet never
+# authenticated cannot add one.
+unaffiliated_transcript_members() {
+  local work="$1" authored="$2"
+  local token permit incorporated="" local_members="" member out=""
+  for token in ${authored}; do
+    authored_record_complete "${token}" || continue
+    [[ "$(authored_outcome "${token}")" == "completed" ]] || continue
+    permit="$(authored_permit "${token}")"
+    [[ "$(identity_work "${permit}")" == "${work}" ]] || continue
+    incorporated="${incorporated} $(authored_incorporated "${token}")"
+    local_members="${local_members} $(authored_local "${token}")"
+  done
+  # "-" is how the gate renders an absent set, and it must not survive into a
+  # membership list: read as a token it would compare unequal to every seat and
+  # count as an unaffiliated one.
+  incorporated="${incorporated//,/ }"
+  local_members="${local_members//,/ }"
+  for member in ${incorporated}; do
+    [[ "${member}" == "-" ]] && continue
+    contains_token "${local_members}" "${member}" && continue
+    contains_token "${out//,/ }" "${member}" && continue
+    out="${out}${out:+,}${member}"
+  done
+  printf '%s' "${out}"
+}
+
+# The memberships the fleet says produced one piece of chain work, comma-joined,
+# or empty when no holder of it published a transcript at all.
+#
+# Emptiness is structural rather than a fault. The ceremonies whose owners
+# authenticate their peers publish the population behind their result and their
+# records are refused without it; the ones that do not publish one leave this
+# empty for every holder, and a reader has to be able to tell "this fleet says
+# nobody produced it" from "this release does not answer the question".
+authored_work_transcript() {
+  local work="$1" authored="$2" token permit members out=""
+  for token in ${authored}; do
+    authored_record_complete "${token}" || continue
+    [[ "$(authored_outcome "${token}")" == "completed" ]] || continue
+    permit="$(authored_permit "${token}")"
+    [[ "$(identity_work "${permit}")" == "${work}" ]] || continue
+    members="$(authored_incorporated "${token}")"
+    [[ "${members}" == "-" ]] && continue
+    out="${out}${out:+,}${members}"
+  done
+  printf '%s' "${out}"
+}
+
 # Every permit identity a set of originated records names, space-joined. Work
 # may repeat here: two local permits for one chain work are two tokens.
 permit_identities() {
@@ -6427,18 +6684,27 @@ missing_bound_families() {
 # combined into a single threshold output — which only a transcript naming both
 # of them ever witnesses.
 #
-# The R1 side of each transcript is read off the fleet rather than out of the
-# driver's report. A node that took part published the permit it closed and the
-# result it produced, so "an R1 node was in this transcript" is answerable
-# without the driver, and the driver's own list is held against that answer in
-# both directions before this runs. The prior release publishes no such account,
-# so its share remains the driver's word; what is checked here is that the word
-# is attached to a piece of work the fleet really finished, under the result the
-# holders really recorded, rather than to a work identity the driver invented
-# beside them.
+# Both sides of each transcript are read off the fleet rather than out of the
+# driver's report.
+#
+# The R1 side was always answerable that way: a node that took part published the
+# permit it closed and the result it produced. The prior side used to be the
+# driver's word, and that was the whole weakness — a driver reporting a
+# homogeneous run as mixed satisfied a control whose entire claim is that two
+# releases combined into one threshold output, because nothing else ever asked a
+# node who was there.
+#
+# It is now read from the seats. Each R1 holder publishes the memberships whose
+# authenticated contributions it combined into the result and, separately, the
+# memberships it operated itself. A seat in the first set that no node in the
+# fleet claims in the second is a seat some node outside the fleet was sitting
+# in, and the only other release on this network is the prior binary. The
+# driver's contributor list is still reconciled in both directions before this
+# runs, but it can no longer supply the mixed half of the claim: a run this fleet
+# performed alone leaves no unaffiliated seat, whatever the report says about it.
 ceremonies_without_mixed_transcript() {
   local claimed="$1" authored="$2" required="$3" prior="$4"
-  local ceremony record work covered uncovered=""
+  local ceremony record work audited covered uncovered=""
   for ceremony in ${required}; do
     covered=0
     for record in ${claimed}; do
@@ -6450,13 +6716,39 @@ ceremonies_without_mixed_transcript() {
       # separate paths this control exists to cover one at a time.
       work="$(work_id "${record}")"
       [[ "$(work_ceremony "${work}")" == "${ceremony}" ]] || continue
+      audited="$(audited_work_id "${work}")"
       # The same piece of work, not merely the same ceremony. A prior share on
       # one work and an R1 share on another are two homogeneous transcripts
       # however the totals read, and the R1 half of this one is the fleet's own
       # record of having completed exactly this work rather than the driver's
       # account of who was in it.
-      [[ -n "$(authored_work_contributors \
-        "$(audited_work_id "${work}")" "${authored}")" ]] || continue
+      [[ -n "$(authored_work_contributors "${audited}" "${authored}")" ]] ||
+        continue
+      # And the half that used to be taken on trust: a seat in the transcript
+      # the fleet says produced this exact work, which no node in the fleet says
+      # it operated.
+      #
+      # Only where the fleet publishes a transcript for this work. The tBTC
+      # ceremonies do, and their records are refused without one, so for them
+      # the reading below is the whole of the mixed claim and the driver cannot
+      # supply it. The beacon ceremonies publish none yet, and there the
+      # driver's contributor list — reconciled against the fleet in both
+      # directions, but still its own word for who else was there — remains the
+      # only account of the prior share. That is a standing limit of this
+      # rehearsal, recorded as one in the README beside this control.
+      #
+      # TODO: drop the conditional once the beacon ceremonies author their own
+      # transcripts, so every required ceremony is held to the node-authored
+      # reading. Beacon DKG can derive the population from the GJKR result the
+      # same way tBTC DKG derives it from its own operating members, and beacon
+      # relay signing from the authenticated entry shares the local member
+      # combined; adding those two producers, and their ceremonies to the gate
+      # list that refuses a completion without a transcript, is what makes the
+      # branch below unreachable.
+      if [[ -n "$(authored_work_transcript "${audited}" "${authored}")" ]]; then
+        [[ -n "$(unaffiliated_transcript_members \
+          "${audited}" "${authored}")" ]] || continue
+      fi
       covered=1
       break
     done
