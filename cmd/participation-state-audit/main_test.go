@@ -1774,6 +1774,89 @@ func TestRunAudit_QuarantinedClaimWithoutQuarantineStateIsBlocking(
 	}
 }
 
+// TestRunAudit_BeaconQuarantineMembershipWithoutMetadataIsAFinding proves the
+// audit names preserved key material that no audit record explains.
+//
+// This is the state a metadata write failure leaves behind: preservation
+// attempts both records independently, so a namespace that took the share and
+// refused its metadata keeps the share. The share is the half worth keeping and
+// the node reports it as preserved, but nothing on disk says which ceremony
+// generated it or why it was withheld — so the audit has to raise it rather
+// than count it as an ordinary quarantined output.
+func TestRunAudit_BeaconQuarantineMembershipWithoutMetadataIsAFinding(
+	t *testing.T,
+) {
+	storageDir := newTestStorage(t)
+
+	diskStorage, err := storage.Initialize(
+		storage.Config{Dir: storageDir},
+		testPassword,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quarantineHandle, err := diskStorage.InitializeKeyStorePersistence(
+		"beacon-quarantine",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A group of its own, so the orphan is the only thing wrong with it: the
+	// fixture's quarantined output already occupies its own directory, and
+	// reusing that one would pair this membership with that metadata.
+	orphan := &registry.Membership{
+		Signer:      newTestSigner(t, group.MemberIndex(4), 44),
+		ChannelName: "test-channel",
+	}
+	orphanBytes, err := orphan.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := quarantineHandle.Save(
+		orphanBytes,
+		groupPublicKeyHex(orphan),
+		"/membership_4",
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	auditManifest, err := runAudit(
+		storageDir,
+		testPassword,
+		evidenceInputs{},
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if auditManifest.Consistent {
+		t.Error("expected an inconsistent manifest")
+	}
+	if !hasFinding(
+		auditManifest,
+		"has a membership record without audit metadata",
+	) {
+		t.Errorf(
+			"expected an unexplained-key-material finding, findings: %v",
+			auditManifest.Findings,
+		)
+	}
+
+	// The orphan is not published as a quarantined output: the manifest's
+	// records are built from the metadata, and there is none to build from.
+	// The finding is the whole account of it, which is why it must be raised.
+	for _, output := range auditManifest.BeaconQuarantinedOutputs {
+		if output.MemberIndex == 4 {
+			t.Error(
+				"an output with no audit metadata was published as a " +
+					"quarantined output",
+			)
+		}
+	}
+}
+
 func TestRunAudit_TBTCQuarantineMetadataWithoutMembershipIsAFinding(
 	t *testing.T,
 ) {
