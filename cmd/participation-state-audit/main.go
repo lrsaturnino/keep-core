@@ -6236,6 +6236,14 @@ type beaconQuarantineEntry struct {
 	// preserved that way is as complete a piece of evidence as a paired one.
 	handoffMetadata   *registry.QuarantinedSignerMetadata
 	handoffMembership *registry.Membership
+	// membershipBytes and handoffMembershipBytes are the key material as each
+	// form stored it. The two forms encode the membership identically, so when
+	// both name the same seat the stored bytes are what says whether they hold
+	// the same share — a question the decoded values cannot be asked, since a
+	// membership carries private scalars this audit must not compare field by
+	// field or report.
+	membershipBytes        []byte
+	handoffMembershipBytes []byte
 }
 
 // interpretBeaconQuarantineNamespace decodes the quarantine namespace, pairs
@@ -6321,11 +6329,13 @@ func interpretBeaconQuarantineNamespace(
 				)
 				continue
 			}
-			entryFor(
+			beaconEntry := entryFor(
 				descriptor.Directory(),
 				descriptor.Name(),
 				"membership_",
-			).membership = membership
+			)
+			beaconEntry.membership = membership
+			beaconEntry.membershipBytes = content
 		case strings.HasPrefix(descriptor.Name(), "handoff_"):
 			handoff, err := registry.DecodeQuarantinedSignerHandoff(content)
 			if err != nil {
@@ -6356,6 +6366,7 @@ func interpretBeaconQuarantineNamespace(
 			metadata := handoff.Metadata
 			entry.handoffMetadata = &metadata
 			entry.handoffMembership = membership
+			entry.handoffMembershipBytes = handoff.Membership
 		default:
 			run.finding(
 				"beacon quarantine record [%s/%s] has an unknown name",
@@ -6380,12 +6391,7 @@ func interpretBeaconQuarantineNamespace(
 		// audit reports what the namespace actually holds of an output rather
 		// than which of the two layouts it was written in.
 		hasHandoff := entry.handoffMembership != nil
-		if entry.metadata == nil {
-			entry.metadata = entry.handoffMetadata
-		}
-		if entry.membership == nil {
-			entry.membership = entry.handoffMembership
-		}
+		reconcileBeaconQuarantineForms(run, entry)
 
 		validateQuarantineEntry(run, entry, activeGroups)
 
@@ -6403,6 +6409,92 @@ func interpretBeaconQuarantineNamespace(
 	}
 
 	return nil
+}
+
+// reconcileBeaconQuarantineForms settles one output the namespace holds in both
+// preserved forms and fills whichever half the pair is missing from the handoff.
+//
+// Preservation writes the pair first and falls back on the combined record for
+// what the namespace would not take, so the two forms overlap by design: a run
+// that got the membership down, was refused the metadata, and then wrote the
+// handoff leaves a standalone half beside a handoff carrying its own copy of
+// that same half. Reading past the duplicate is not free. The forms are only
+// interchangeable while they agree, and preferring whichever one this scan
+// happened to decode first lets a stale or half-overwritten standalone record
+// stand in for a complete handoff that contradicts it — the audit answering
+// with evidence it never checked.
+//
+// So a duplicate is compared rather than deduplicated on sight, and a
+// disagreement is reported instead of resolved. Which copy is the true one is
+// not a question this tool can answer offline: it is what an operator has to
+// settle before a rollback trusts either.
+func reconcileBeaconQuarantineForms(
+	run *auditRun,
+	entry *beaconQuarantineEntry,
+) {
+	if entry.metadata != nil && entry.handoffMetadata != nil {
+		same, err := sameQuarantineDocument(entry.metadata, entry.handoffMetadata)
+		switch {
+		case err != nil:
+			run.finding(
+				"beacon quarantined output [%s/%s] carries audit metadata in "+
+					"both preserved forms and they cannot be compared: [%v]",
+				entry.directory,
+				entry.memberSuffix,
+				err,
+			)
+		case !same:
+			run.finding(
+				"beacon quarantined output [%s/%s] carries audit metadata in "+
+					"both preserved forms and they disagree; the standalone "+
+					"record and the handoff describe the same seat differently, "+
+					"so neither can be used as evidence until an operator "+
+					"establishes which one the namespace should keep",
+				entry.directory,
+				entry.memberSuffix,
+			)
+		}
+	}
+	if entry.metadata == nil {
+		entry.metadata = entry.handoffMetadata
+	}
+
+	if entry.membership != nil && entry.handoffMembership != nil &&
+		!bytes.Equal(entry.membershipBytes, entry.handoffMembershipBytes) {
+		run.finding(
+			"beacon quarantined output [%s/%s] carries key material in both "+
+				"preserved forms and the two copies differ; a rollback cannot "+
+				"tell which share this seat holds until an operator establishes "+
+				"which record the namespace should keep",
+			entry.directory,
+			entry.memberSuffix,
+		)
+	}
+	if entry.membership == nil {
+		entry.membership = entry.handoffMembership
+	}
+}
+
+// sameQuarantineDocument reports whether two decoded quarantine documents carry
+// the same values.
+//
+// They are compared through one encoder rather than field by field or as stored
+// bytes: the standalone record and the handoff's copy travel to disk by
+// different routes, so equal documents need not be equal bytes, and a
+// field-by-field comparison would silently stop covering any field a later
+// schema adds.
+func sameQuarantineDocument(left, right interface{}) (bool, error) {
+	leftBytes, err := json.Marshal(left)
+	if err != nil {
+		return false, err
+	}
+
+	rightBytes, err := json.Marshal(right)
+	if err != nil {
+		return false, err
+	}
+
+	return bytes.Equal(leftBytes, rightBytes), nil
 }
 
 // validateQuarantineEntry cross-validates one paired quarantine output. The
@@ -6750,6 +6842,14 @@ type tbtcQuarantineEntry struct {
 	// preserved that way is as complete a piece of evidence as a paired one.
 	handoffMetadata *tbtc.QuarantinedSignerMetadata
 	handoffSigner   *tbtc.SignerAuditRecord
+	// signerBytes and handoffSignerBytes are the key material as each form
+	// stored it. The two forms encode the signer identically, so when both name
+	// the same seat the stored bytes are what says whether they hold the same
+	// share — a question the decoded records cannot be asked, since the audit
+	// record deliberately carries only the public identity of a signer whose
+	// private half it must never compare or report.
+	signerBytes        []byte
+	handoffSignerBytes []byte
 }
 
 // interpretTBTCQuarantineNamespace decodes the tBTC quarantine namespace,
@@ -6834,11 +6934,13 @@ func interpretTBTCQuarantineNamespace(
 				)
 				continue
 			}
-			entryFor(
+			tbtcEntry := entryFor(
 				descriptor.Directory(),
 				descriptor.Name(),
 				"membership_",
-			).signer = record
+			)
+			tbtcEntry.signer = record
+			tbtcEntry.signerBytes = content
 		case strings.HasPrefix(descriptor.Name(), "handoff_"):
 			handoff, err := tbtc.DecodeQuarantinedSignerHandoff(content)
 			if err != nil {
@@ -6870,6 +6972,7 @@ func interpretTBTCQuarantineNamespace(
 			metadata := handoff.Metadata
 			entry.handoffMetadata = &metadata
 			entry.handoffSigner = record
+			entry.handoffSignerBytes = handoff.Signer
 		default:
 			run.finding(
 				"tbtc quarantine record [%s/%s] has an unknown name",
@@ -6894,12 +6997,7 @@ func interpretTBTCQuarantineNamespace(
 		// audit reports what the namespace actually holds of an output rather
 		// than which of the two layouts it was written in.
 		hasHandoff := entry.handoffSigner != nil
-		if entry.metadata == nil {
-			entry.metadata = entry.handoffMetadata
-		}
-		if entry.signer == nil {
-			entry.signer = entry.handoffSigner
-		}
+		reconcileTBTCQuarantineForms(run, entry)
 
 		validateTBTCQuarantineEntry(run, entry, activeWallets)
 
@@ -6926,6 +7024,71 @@ func interpretTBTCQuarantineNamespace(
 	}
 
 	return nil
+}
+
+// reconcileTBTCQuarantineForms settles one tBTC output the namespace holds in
+// both preserved forms and fills whichever half the pair is missing from the
+// handoff.
+//
+// Preservation writes the pair first and falls back on the combined record for
+// what the namespace would not take, so the two forms overlap by design: a run
+// that got the membership down, was refused the metadata, and then wrote the
+// handoff leaves a standalone half beside a handoff carrying its own copy of
+// that same half. Reading past the duplicate is not free. The forms are only
+// interchangeable while they agree, and preferring whichever one this scan
+// happened to decode first lets a stale or half-overwritten standalone record
+// stand in for a complete handoff that contradicts it — the audit answering
+// with evidence it never checked.
+//
+// So a duplicate is compared rather than deduplicated on sight, and a
+// disagreement is reported instead of resolved. Which copy is the true one is
+// not a question this tool can answer offline: it is what an operator has to
+// settle before a rollback trusts either.
+func reconcileTBTCQuarantineForms(
+	run *auditRun,
+	entry *tbtcQuarantineEntry,
+) {
+	if entry.metadata != nil && entry.handoffMetadata != nil {
+		same, err := sameQuarantineDocument(entry.metadata, entry.handoffMetadata)
+		switch {
+		case err != nil:
+			run.finding(
+				"tbtc quarantined output [%s/%s] carries audit metadata in "+
+					"both preserved forms and they cannot be compared: [%v]",
+				entry.directory,
+				entry.memberSuffix,
+				err,
+			)
+		case !same:
+			run.finding(
+				"tbtc quarantined output [%s/%s] carries audit metadata in "+
+					"both preserved forms and they disagree; the standalone "+
+					"record and the handoff describe the same seat differently, "+
+					"so neither can be used as evidence until an operator "+
+					"establishes which one the namespace should keep",
+				entry.directory,
+				entry.memberSuffix,
+			)
+		}
+	}
+	if entry.metadata == nil {
+		entry.metadata = entry.handoffMetadata
+	}
+
+	if entry.signer != nil && entry.handoffSigner != nil &&
+		!bytes.Equal(entry.signerBytes, entry.handoffSignerBytes) {
+		run.finding(
+			"tbtc quarantined output [%s/%s] carries key material in both "+
+				"preserved forms and the two copies differ; a rollback cannot "+
+				"tell which share this seat holds until an operator establishes "+
+				"which record the namespace should keep",
+			entry.directory,
+			entry.memberSuffix,
+		)
+	}
+	if entry.signer == nil {
+		entry.signer = entry.handoffSigner
+	}
 }
 
 // validateTBTCQuarantineEntry cross-validates one paired tBTC quarantine

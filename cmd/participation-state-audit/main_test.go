@@ -1794,6 +1794,264 @@ func TestRunAudit_QuarantinedClaimWithoutQuarantineStateIsBlocking(
 // the node reports it as preserved, but nothing on disk says which ceremony
 // generated it or why it was withheld — so the audit has to raise it rather
 // than count it as an ordinary quarantined output.
+// newBeaconQuarantineNamespace opens the beacon quarantine namespace of a fresh
+// storage snapshot, returning the snapshot directory and the handle to write
+// preserved records through.
+func newBeaconQuarantineNamespace(
+	t *testing.T,
+) (string, persistence.ProtectedHandle) {
+	t.Helper()
+
+	storageDir := newTestStorage(t)
+
+	diskStorage, err := storage.Initialize(
+		storage.Config{Dir: storageDir},
+		testPassword,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	quarantineHandle, err := diskStorage.InitializeKeyStorePersistence(
+		"beacon-quarantine",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return storageDir, quarantineHandle
+}
+
+// newBeaconQuarantineMembership builds the membership encoding a preserved
+// beacon output carries, together with the group directory it belongs under.
+//
+// The channel name is what a caller varies to get two records under one group
+// and seat whose stored bytes differ: it leaves the group public key alone, and
+// two copies of one output's key material only need comparing when they agree on
+// where they belong.
+func newBeaconQuarantineMembership(
+	t *testing.T,
+	memberIndex group.MemberIndex,
+	groupSecret int64,
+	channelName string,
+) ([]byte, string) {
+	t.Helper()
+
+	membership := &registry.Membership{
+		Signer:      newTestSigner(t, memberIndex, groupSecret),
+		ChannelName: channelName,
+	}
+
+	membershipBytes, err := membership.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return membershipBytes, groupPublicKeyHex(membership)
+}
+
+// newBeaconQuarantineMetadata builds the audit record a preserved beacon output
+// travels with, describing the seat of the given group.
+func newBeaconQuarantineMetadata(
+	memberIndex group.MemberIndex,
+	groupPublicKey string,
+) registry.QuarantinedSignerMetadata {
+	return registry.QuarantinedSignerMetadata{
+		SchemaVersion:       registry.QuarantineSchemaVersion,
+		ReleaseEpoch:        participation.CompiledEpoch.String(),
+		ProtocolMode:        "legacy",
+		CutoverBlock:        1_000,
+		CanonicalStartBlock: 900,
+		Ceremony:            string(participation.BeaconDKG),
+		SeedHash:            strings.Repeat("a", 64),
+		MemberIndex:         uint8(memberIndex),
+		GroupPublicKey:      groupPublicKey,
+		FailedOperation:     "beacon_dkg_group_registration",
+		LastObservedBlock:   950,
+	}
+}
+
+// storeBeaconQuarantineHandoffRecord writes one combined beacon handoff carrying
+// exactly the metadata and membership it is given, so a test can put a handoff
+// beside a standalone record that contradicts it.
+func storeBeaconQuarantineHandoffRecord(
+	t *testing.T,
+	handle persistence.ProtectedHandle,
+	groupDirectory string,
+	memberIndex group.MemberIndex,
+	metadata registry.QuarantinedSignerMetadata,
+	membership []byte,
+) {
+	t.Helper()
+
+	handoff, err := json.Marshal(registry.QuarantinedSignerHandoff{
+		SchemaVersion: registry.QuarantineHandoffSchemaVersion,
+		Metadata:      metadata,
+		Membership:    membership,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := handle.Save(
+		handoff,
+		groupDirectory,
+		"/handoff_"+fmt.Sprint(memberIndex),
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestRunAudit_BeaconQuarantineDisagreeingDuplicateKeyMaterialIsAFinding proves
+// the audit reports two copies of one beacon output's key material that do not
+// match, rather than picking one of them.
+//
+// The stake is higher here than for a wallet seat. A beacon group whose result
+// was already accepted on chain loses usable threshold for every member that
+// cannot produce its share, so which of two disagreeing copies is the real one
+// decides whether that group still signs. It is not a question this tool can
+// settle offline, and it is not one it may answer by preferring whichever record
+// it happened to decode first.
+func TestRunAudit_BeaconQuarantineDisagreeingDuplicateKeyMaterialIsAFinding(
+	t *testing.T,
+) {
+	storageDir, quarantineHandle := newBeaconQuarantineNamespace(t)
+
+	const memberIndex = group.MemberIndex(4)
+
+	handoffMembership, groupDirectory := newBeaconQuarantineMembership(
+		t,
+		memberIndex,
+		44,
+		"test-channel",
+	)
+
+	storeBeaconQuarantineHandoffRecord(
+		t,
+		quarantineHandle,
+		groupDirectory,
+		memberIndex,
+		newBeaconQuarantineMetadata(memberIndex, groupDirectory),
+		handoffMembership,
+	)
+
+	// The same group and the same seat, holding a different share.
+	standaloneMembership, standaloneDirectory := newBeaconQuarantineMembership(
+		t,
+		memberIndex,
+		44,
+		"a-different-channel",
+	)
+	if standaloneDirectory != groupDirectory {
+		t.Fatal("both copies must be filed under the same group")
+	}
+	if bytes.Equal(standaloneMembership, handoffMembership) {
+		t.Fatal("the two copies of the key material must differ")
+	}
+	if err := quarantineHandle.Save(
+		standaloneMembership,
+		groupDirectory,
+		"/membership_"+fmt.Sprint(memberIndex),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	auditManifest, err := runAudit(
+		storageDir,
+		testPassword,
+		evidenceInputs{},
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if auditManifest.Consistent {
+		t.Error("expected an inconsistent manifest")
+	}
+	if !hasFinding(
+		auditManifest,
+		"carries key material in both preserved forms and the two copies differ",
+	) {
+		t.Errorf(
+			"expected a disagreeing-duplicate-key-material finding, "+
+				"findings: %v",
+			auditManifest.Findings,
+		)
+	}
+}
+
+// TestRunAudit_BeaconQuarantineDisagreeingDuplicateMetadataIsAFinding proves the
+// audit reports two accounts of one beacon output that describe it differently.
+//
+// The metadata is what lets a rollback reconcile a preserved share against the
+// chain — the mode it was generated under, the anchor it was measured from, the
+// operation that refused it. Two records disagreeing about those describe two
+// different histories for one seat, and publishing either without saying so
+// would hand the rollback a settled answer it does not have.
+func TestRunAudit_BeaconQuarantineDisagreeingDuplicateMetadataIsAFinding(
+	t *testing.T,
+) {
+	storageDir, quarantineHandle := newBeaconQuarantineNamespace(t)
+
+	const memberIndex = group.MemberIndex(4)
+
+	membership, groupDirectory := newBeaconQuarantineMembership(
+		t,
+		memberIndex,
+		44,
+		"test-channel",
+	)
+
+	metadata := newBeaconQuarantineMetadata(memberIndex, groupDirectory)
+	storeBeaconQuarantineHandoffRecord(
+		t,
+		quarantineHandle,
+		groupDirectory,
+		memberIndex,
+		metadata,
+		membership,
+	)
+
+	// The same output, measured from a different anchor.
+	disagreeing := metadata
+	disagreeing.CanonicalStartBlock = metadata.CanonicalStartBlock + 17
+	disagreeingBytes, err := json.Marshal(disagreeing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := quarantineHandle.Save(
+		disagreeingBytes,
+		groupDirectory,
+		"/metadata_"+fmt.Sprint(memberIndex),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	auditManifest, err := runAudit(
+		storageDir,
+		testPassword,
+		evidenceInputs{},
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if auditManifest.Consistent {
+		t.Error("expected an inconsistent manifest")
+	}
+	if !hasFinding(
+		auditManifest,
+		"carries audit metadata in both preserved forms and they disagree",
+	) {
+		t.Errorf(
+			"expected a disagreeing-duplicate-metadata finding, findings: %v",
+			auditManifest.Findings,
+		)
+	}
+}
+
 func TestRunAudit_BeaconQuarantineMembershipWithoutMetadataIsAFinding(
 	t *testing.T,
 ) {
@@ -1991,6 +2249,30 @@ func newTBTCQuarantineMembership(
 ) ([]byte, string, *ecdsa.PublicKey) {
 	t.Helper()
 
+	return newTBTCQuarantineMembershipForOperators(
+		t,
+		memberIndex,
+		walletScalar,
+		[]string{"0xAA", "0xBB", "0xCC"},
+	)
+}
+
+// newTBTCQuarantineMembershipForOperators builds the same membership encoding
+// for a named signing group, so a test can put two records under one wallet and
+// seat whose stored bytes differ.
+//
+// The operators are what varies because they leave the wallet public key alone:
+// the directory a record is filed under and the seat it names both come out of
+// that key, and two copies of one output's key material only need comparing when
+// they agree on where they belong.
+func newTBTCQuarantineMembershipForOperators(
+	t *testing.T,
+	memberIndex group.MemberIndex,
+	walletScalar int64,
+	signingGroupOperators []string,
+) ([]byte, string, *ecdsa.PublicKey) {
+	t.Helper()
+
 	x, y := tecdsa.Curve.ScalarBaseMult(big.NewInt(walletScalar).Bytes())
 	walletPublicKey := &ecdsa.PublicKey{Curve: tecdsa.Curve, X: x, Y: y}
 
@@ -2009,7 +2291,7 @@ func newTBTCQuarantineMembership(
 	membership, err := proto.Marshal(&tbtcpb.Signer{
 		Wallet: &tbtcpb.Wallet{
 			PublicKey:             secp256k1.Marshal(walletPublicKey),
-			SigningGroupOperators: []string{"0xAA", "0xBB", "0xCC"},
+			SigningGroupOperators: signingGroupOperators,
 		},
 		SigningGroupMemberIndex: uint32(memberIndex),
 		PrivateKeyShare:         privateKeyShare,
@@ -2151,24 +2433,58 @@ func storeTBTCQuarantineHandoff(
 		walletScalar,
 	)
 
+	storeTBTCQuarantineHandoffRecord(
+		t,
+		handle,
+		walletStorageKey,
+		memberIndex,
+		newTBTCQuarantineMetadata(memberIndex, walletPublicKey),
+		membership,
+	)
+
+	return walletStorageKey
+}
+
+// newTBTCQuarantineMetadata builds the audit record a preserved tBTC signer
+// output travels with, describing the seat the given wallet key belongs to.
+func newTBTCQuarantineMetadata(
+	memberIndex group.MemberIndex,
+	walletPublicKey *ecdsa.PublicKey,
+) tbtc.QuarantinedSignerMetadata {
 	walletPublicKeyHash := bitcoin.PublicKeyHash(walletPublicKey)
+
+	return tbtc.QuarantinedSignerMetadata{
+		SchemaVersion:       tbtc.QuarantineSchemaVersion,
+		ReleaseEpoch:        participation.CompiledEpoch.String(),
+		ProtocolMode:        "legacy",
+		CutoverBlock:        1_000,
+		CanonicalStartBlock: 900,
+		Ceremony:            string(participation.TBTCDKG),
+		SeedHash:            strings.Repeat("a", 64),
+		MemberIndex:         uint8(memberIndex),
+		WalletPublicKeyHash: hex.EncodeToString(walletPublicKeyHash[:]),
+		FailedOperation:     "tbtc_dkg_signer_activation",
+		LastObservedBlock:   950,
+	}
+}
+
+// storeTBTCQuarantineHandoffRecord writes one combined tBTC handoff carrying
+// exactly the metadata and membership it is given, so a test can put a handoff
+// beside a standalone record that contradicts it.
+func storeTBTCQuarantineHandoffRecord(
+	t *testing.T,
+	handle persistence.ProtectedHandle,
+	walletStorageKey string,
+	memberIndex group.MemberIndex,
+	metadata tbtc.QuarantinedSignerMetadata,
+	membership []byte,
+) {
+	t.Helper()
 
 	handoff, err := json.Marshal(tbtc.QuarantinedSignerHandoff{
 		SchemaVersion: tbtc.QuarantineHandoffSchemaVersion,
-		Metadata: tbtc.QuarantinedSignerMetadata{
-			SchemaVersion:       tbtc.QuarantineSchemaVersion,
-			ReleaseEpoch:        participation.CompiledEpoch.String(),
-			ProtocolMode:        "legacy",
-			CutoverBlock:        1_000,
-			CanonicalStartBlock: 900,
-			Ceremony:            string(participation.TBTCDKG),
-			SeedHash:            strings.Repeat("a", 64),
-			MemberIndex:         uint8(memberIndex),
-			WalletPublicKeyHash: hex.EncodeToString(walletPublicKeyHash[:]),
-			FailedOperation:     "tbtc_dkg_signer_activation",
-			LastObservedBlock:   950,
-		},
-		Signer: membership,
+		Metadata:      metadata,
+		Signer:        membership,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -2181,8 +2497,256 @@ func storeTBTCQuarantineHandoff(
 	); err != nil {
 		t.Fatal(err)
 	}
+}
 
-	return walletStorageKey
+// newTBTCQuarantineNamespace opens the tBTC quarantine namespace of a fresh
+// storage snapshot, returning the snapshot directory and the handle to write
+// preserved records through.
+func newTBTCQuarantineNamespace(t *testing.T) (string, persistence.ProtectedHandle) {
+	t.Helper()
+
+	storageDir := newTestStorage(t)
+
+	diskStorage, err := storage.Initialize(
+		storage.Config{Dir: storageDir},
+		testPassword,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	quarantineHandle, err := diskStorage.InitializeKeyStorePersistence(
+		"tbtc-quarantine",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return storageDir, quarantineHandle
+}
+
+// TestRunAudit_TBTCQuarantineDisagreeingDuplicateKeyMaterialIsAFinding proves
+// the audit reports two copies of one output's key material that do not match,
+// rather than picking one of them.
+//
+// Preservation writes the record pair first and falls back on the combined
+// handoff for whatever the namespace refused, so an output can legitimately
+// leave a standalone membership beside a handoff carrying its own copy of that
+// same share. While they agree, either answers for the seat. When they do not —
+// a record left by an interrupted preservation, a name an operator's repair
+// wrote over — the namespace holds two different accounts of what this seat is,
+// and only one of them can be the share a rollback would have to settle. An
+// audit that preferred whichever record it decoded first would answer that
+// question with evidence it never compared, and would answer it the same way
+// whichever copy was stale.
+func TestRunAudit_TBTCQuarantineDisagreeingDuplicateKeyMaterialIsAFinding(
+	t *testing.T,
+) {
+	storageDir, quarantineHandle := newTBTCQuarantineNamespace(t)
+
+	const memberIndex = group.MemberIndex(3)
+
+	handoffMembership, walletStorageKey, walletPublicKey :=
+		newTBTCQuarantineMembership(t, memberIndex, 7)
+
+	storeTBTCQuarantineHandoffRecord(
+		t,
+		quarantineHandle,
+		walletStorageKey,
+		memberIndex,
+		newTBTCQuarantineMetadata(memberIndex, walletPublicKey),
+		handoffMembership,
+	)
+
+	// The same wallet and the same seat, holding a different share.
+	standaloneMembership, _, _ := newTBTCQuarantineMembershipForOperators(
+		t,
+		memberIndex,
+		7,
+		[]string{"0xDD", "0xEE", "0xFF"},
+	)
+	if bytes.Equal(standaloneMembership, handoffMembership) {
+		t.Fatal("the two copies of the key material must differ")
+	}
+	if err := quarantineHandle.Save(
+		standaloneMembership,
+		walletStorageKey,
+		"/membership_"+fmt.Sprint(memberIndex),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	auditManifest, err := runAudit(
+		storageDir,
+		testPassword,
+		evidenceInputs{},
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if auditManifest.Consistent {
+		t.Error("expected an inconsistent manifest")
+	}
+	if !hasFinding(
+		auditManifest,
+		"carries key material in both preserved forms and the two copies differ",
+	) {
+		t.Errorf(
+			"expected a disagreeing-duplicate-key-material finding, "+
+				"findings: %v",
+			auditManifest.Findings,
+		)
+	}
+}
+
+// TestRunAudit_TBTCQuarantineDisagreeingDuplicateMetadataIsAFinding proves the
+// audit reports two accounts of one output that describe it differently.
+//
+// The metadata is the whole of what lets a rollback reconcile a preserved share
+// against the chain: the mode it was generated under, the anchor it was measured
+// from, the operation that refused it. Two records disagreeing about those
+// describe two different histories for one seat, and an audit that published
+// either of them without saying so would be handing the rollback a settled
+// answer it does not have.
+func TestRunAudit_TBTCQuarantineDisagreeingDuplicateMetadataIsAFinding(
+	t *testing.T,
+) {
+	storageDir, quarantineHandle := newTBTCQuarantineNamespace(t)
+
+	const memberIndex = group.MemberIndex(3)
+
+	membership, walletStorageKey, walletPublicKey :=
+		newTBTCQuarantineMembership(t, memberIndex, 7)
+
+	metadata := newTBTCQuarantineMetadata(memberIndex, walletPublicKey)
+	storeTBTCQuarantineHandoffRecord(
+		t,
+		quarantineHandle,
+		walletStorageKey,
+		memberIndex,
+		metadata,
+		membership,
+	)
+
+	// The same output, measured from a different anchor.
+	disagreeing := metadata
+	disagreeing.CanonicalStartBlock = metadata.CanonicalStartBlock + 17
+	disagreeingBytes, err := json.Marshal(disagreeing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := quarantineHandle.Save(
+		disagreeingBytes,
+		walletStorageKey,
+		"/metadata_"+fmt.Sprint(memberIndex),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	auditManifest, err := runAudit(
+		storageDir,
+		testPassword,
+		evidenceInputs{},
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if auditManifest.Consistent {
+		t.Error("expected an inconsistent manifest")
+	}
+	if !hasFinding(
+		auditManifest,
+		"carries audit metadata in both preserved forms and they disagree",
+	) {
+		t.Errorf(
+			"expected a disagreeing-duplicate-metadata finding, findings: %v",
+			auditManifest.Findings,
+		)
+	}
+}
+
+// TestRunAudit_TBTCQuarantineAgreeingDuplicateFormsAreOneOutput proves the
+// duplicate check does not turn the layout preservation actually writes into a
+// finding.
+//
+// A namespace that took the membership, refused the metadata, and then took the
+// handoff holds both forms of the same output, and every copy in it agrees. That
+// is a preserved output with nothing wrong with it, filed once. Only a
+// comparison can tell it apart from the contradictory case, which is the reason
+// the comparison is made rather than assumed either way.
+func TestRunAudit_TBTCQuarantineAgreeingDuplicateFormsAreOneOutput(
+	t *testing.T,
+) {
+	storageDir, quarantineHandle := newTBTCQuarantineNamespace(t)
+
+	const memberIndex = group.MemberIndex(3)
+
+	membership, walletStorageKey, walletPublicKey :=
+		newTBTCQuarantineMembership(t, memberIndex, 7)
+
+	metadata := newTBTCQuarantineMetadata(memberIndex, walletPublicKey)
+	storeTBTCQuarantineHandoffRecord(
+		t,
+		quarantineHandle,
+		walletStorageKey,
+		memberIndex,
+		metadata,
+		membership,
+	)
+
+	if err := quarantineHandle.Save(
+		membership,
+		walletStorageKey,
+		"/membership_"+fmt.Sprint(memberIndex),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	metadataBytes, err := json.Marshal(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := quarantineHandle.Save(
+		metadataBytes,
+		walletStorageKey,
+		"/metadata_"+fmt.Sprint(memberIndex),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	auditManifest, err := runAudit(
+		storageDir,
+		testPassword,
+		evidenceInputs{},
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, disagreement := range []string{
+		"carries key material in both preserved forms",
+		"carries audit metadata in both preserved forms",
+	} {
+		if hasFinding(auditManifest, disagreement) {
+			t.Errorf(
+				"copies that agree must not be reported as a disagreement, "+
+					"findings: %v",
+				auditManifest.Findings,
+			)
+		}
+	}
+
+	if got := len(auditManifest.TBTCQuarantinedOutputs); got != 1 {
+		t.Fatalf(
+			"one seat preserved in both forms is one output, got [%d]",
+			got,
+		)
+	}
 }
 
 // TestRunAudit_TBTCQuarantineMembershipWithoutMetadataIsAFinding proves the

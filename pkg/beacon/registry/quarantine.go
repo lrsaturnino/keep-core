@@ -32,8 +32,10 @@ const QuarantineHandoffSchemaVersion uint32 = 1
 // disk, and the share is the half no ceremony can generate again — for a beacon
 // group whose result may already be accepted on chain, it is also a member the
 // group's usable threshold permanently loses. This document is the form that
-// cannot land in halves, and it is written under a name of its own, so a name
-// the namespace refuses does not decide whether the output survives.
+// cannot reach a reader in halves — a document a crash left half written fails
+// the encrypted handle's authentication rather than decoding as the part that
+// got through — and it is written under a name of its own, so a name the
+// namespace refuses does not decide whether the output survives.
 type QuarantinedSignerHandoff struct {
 	SchemaVersion uint32                    `json:"schema_version"`
 	Metadata      QuarantinedSignerMetadata `json:"metadata"`
@@ -358,10 +360,21 @@ func (q *Quarantine) Preserve(
 // The preferred form is the pair — a membership record beside its metadata —
 // because it is the layout the active namespace uses and the one every reader
 // already understands. A round that cannot complete the pair falls back on the
-// combined handoff record, which carries both halves in one write: one save
-// either takes the whole output or none of it, so no namespace that refuses one
-// particular record can leave key material with nowhere to go. A landed handoff
-// ends the attempt, since there is nothing left the namespace does not hold.
+// combined handoff record, which carries both halves under a name of its own, so
+// no namespace that refuses one particular record can leave key material with
+// nowhere to go. A landed handoff ends the attempt, since there is nothing left
+// the namespace does not hold.
+//
+// A record counts as landed on the namespace's word that it took the write, not
+// on a reader's. The disk persistence behind this handle creates the file,
+// writes the document, and syncs it, with no temporary record renamed into
+// place, so a write a crash interrupts leaves a truncated document behind — and
+// confirming each write by enumerating the namespace would put a share this node
+// is still holding behind a directory listing that may never return, which is
+// the more expensive way to lose it. What a torn write leaves is caught on the
+// way out instead: the document fails the encrypted handle's authentication, so
+// the offline audit reads it as an unreadable record and blocks on it rather
+// than any reader taking it for a preserved output.
 //
 // The state is updated in place as each record lands so that a caller reading it
 // after an interrupted preservation sees what the namespace actually has, and
