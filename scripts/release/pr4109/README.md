@@ -1029,6 +1029,23 @@ Running `validate-evidence` without a matching attestation is BLOCKED, not
 accepted — regenerate it by re-running `local-proofs` at the same commit.
 A receipt missing any one of its four files is a fragment, never a receipt.
 
+The two halves of that verdict are proved together.
+`test-validate-evidence.sh` hand-authors the verdict file, which holds the
+refusal but never runs the producer, so deleting the `--release-ready`
+invocation or hard-coding the word it writes would leave that whole suite
+green over a receipt nothing derived.
+`test-attest-release-manifest.sh` closes the seam: it runs the real producer
+and requires the recorded verdict to equal what an independent
+`--release-ready` invocation answers, then drives the produced receipt —
+unedited, and again with only the verdict flipped — through the consumer that
+gates on it. Pinning a fixture to `yes` is not possible while the mainnet
+cutover block is the zero placeholder, since `validate` requires the manifest
+to carry the compiled block and readiness requires that block to be nonzero;
+holding the producer to the binary is what covers the seam either way, and it
+keeps holding once the reviewed block lands and the answer flips. It runs from
+`local-proofs` rather than `shell-analysis` because asking the binary needs
+the Go toolchain.
+
 A receipt belongs to one run at one commit, and three rules keep it that
 way. `local-proofs` destroys the receipt it inherits — interrupted staging
 directories included — *before* it proves anything, so a run failing at any

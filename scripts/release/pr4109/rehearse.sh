@@ -2731,6 +2731,14 @@ run_local_proof_suite() {
   # on the dispatches that happen to produce records for validate-evidence
   # — and its verdicts land in this stage's archived log.
   "${SCRIPT_DIR}/test-validate-evidence.sh"
+  # The readiness verdict this stage is about to write is the one thing in the
+  # receipt the validator suite cannot prove: that suite hand-authors the
+  # verdict file, so it holds the refusal without ever running the producer.
+  # This proves the seam instead — the recorded verdict against the binary's
+  # own answer, and the produced receipt through the consumer that gates on it.
+  # It runs here rather than in the shell-analysis gate because it needs the Go
+  # toolchain to ask the binary, which is the whole point of the assertion.
+  "${SCRIPT_DIR}/test-attest-release-manifest.sh"
   verify_source_binding
   # The verifier's own build-context classification is what the binding check
   # just used to explain away every absence from the image, so its agreement
