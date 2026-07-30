@@ -4431,6 +4431,87 @@ fleet_terminal_outcomes() {
   printf '%s' "${out}"
 }
 
+# Whether each R1 node's account of closed permits can be followed at all,
+# rendered as "<service>=<gate instance>=<forgotten count>" tokens.
+#
+# The account lives in memory. Read once, an empty one is a node that closed no
+# permit and a node that closed one and lost the record — opposite answers about
+# whether that node did the work, and reading the second as the first attributes
+# its seats to whoever else was on the network. Two things make the difference
+# readable: the process the account belongs to, and how many records the account
+# has dropped to its own bound. Both are taken either side of a drive, because
+# what matters is whether the account that answers afterwards is the same one
+# that was there while the work ran.
+#
+# A node that cannot be read leaves the whole reading unusable rather than a
+# shorter list, exactly as the outcomes above: a fleet with one member missing
+# from the account is indistinguishable from a fleet whose permits all ended
+# unrecorded.
+fleet_account_provenance() {
+  local service instance forgotten out=""
+  for service in "${REHEARSAL_R1_SERVICES[@]}"; do
+    if ! instance="$(participation_field \
+      "${service}" gate_instance 2>/dev/null)"; then
+      printf 'unreadable on %s' "${service}"
+      return 0
+    fi
+    if ! forgotten="$(participation_field \
+      "${service}" forgotten_terminal_outcomes 2>/dev/null)"; then
+      printf 'unreadable on %s' "${service}"
+      return 0
+    fi
+    out="${out}${out:+ }${service}=${instance}=${forgotten}"
+  done
+  printf '%s' "${out}"
+}
+
+# Of the fleet, the nodes whose account of closed permits cannot be followed
+# across a drive, rendered as "<service> (<what changed>)".
+#
+# Either reading being unreadable takes the whole fleet, for the reason above. A
+# node answering from a different process than the one that ran the work has lost
+# every record the earlier one held; a node whose account dropped records while
+# the work ran has lost some of them and cannot say which. Both are the same thing
+# to a reader joining permits to endings, which is that this node's part in the
+# work is unknown — and an unknown must not be read as a node that took no part.
+unfollowable_account_nodes() {
+  local before="$1" after="$2"
+  local token service instance forgotten earlier was was_forgotten out=""
+  case "${before}" in
+    unreadable*)
+      printf '%s' "${before}"
+      return 0
+      ;;
+  esac
+  case "${after}" in
+    unreadable*)
+      printf '%s' "${after}"
+      return 0
+      ;;
+  esac
+  for token in ${after}; do
+    service="${token%%=*}"
+    instance="${token#*=}"
+    forgotten="${instance##*=}"
+    instance="${instance%%=*}"
+    for earlier in ${before}; do
+      [[ "${earlier%%=*}" == "${service}" ]] || continue
+      was="${earlier#*=}"
+      was_forgotten="${was##*=}"
+      was="${was%%=*}"
+      if [[ "${was}" != "${instance}" ]]; then
+        out="${out}${out:+, }${service} (answered from a different process \
+than the one the work ran on)"
+      elif [[ "${forgotten}" != "${was_forgotten}" ]]; then
+        out="${out}${out:+, }${service} (its account dropped \
+$((forgotten - was_forgotten)) closed permits while the work ran)"
+      fi
+      break
+    done
+  done
+  printf '%s' "${out}"
+}
+
 # The gate's own spelling of the two permit modes, which is what a scrape
 # filters on. The rehearsal writes the security-v2 half with a hyphen in step
 # names and metric suffixes; the gate does not.
@@ -9692,6 +9773,11 @@ PRECUTOVER_SIGHTINGS_AFTER=""
 # the disposition its own holder wrote down.
 PRECUTOVER_ORIGINATED=""
 PRECUTOVER_AUTHORED_ENDINGS=""
+# Which process each node answered the two readings above from, and how much
+# its account had already forgotten, taken either side of the drive. An
+# account read from a new process is missing every record the old one held.
+PRECUTOVER_ACCOUNTS_BEFORE=""
+PRECUTOVER_ACCOUNTS_AFTER=""
 
 # The ceremonies a pre-cutover step must see settle, named one by one.
 #
@@ -9717,6 +9803,8 @@ collect_precutover_work() {
   PRECUTOVER_STATES=""
   PRECUTOVER_ORIGINATED=""
   PRECUTOVER_AUTHORED_ENDINGS=""
+  PRECUTOVER_ACCOUNTS_BEFORE=""
+  PRECUTOVER_ACCOUNTS_AFTER=""
 
   # Every R1 node has to be on the legacy side of its own gate before the work
   # starts. A node already past C would run this work under security-v2 and
@@ -9749,6 +9837,13 @@ ${service} reported [${state:-unreadable}] at block [${block:-unreadable}]"
   # than inferred from the mode a permit pinned.
   PRECUTOVER_SIGHTINGS_BEFORE="$(fleet_metric_total \
     announcer_cross_format_peer_total)"
+  # Which process each node's account of closed permits belongs to, and how much
+  # that account has already forgotten, taken before the work starts so the
+  # reading afterwards can be held to it. Without the pair, a node that restarted
+  # mid-drive answers with an empty account and reads as a node that took no part
+  # in the work — which puts its seats outside the fleet and turns a homogeneous
+  # run into the mixed reading.
+  PRECUTOVER_ACCOUNTS_BEFORE="$(fleet_account_provenance)"
 
   if [[ -n "${PR4109_WORK_DRIVER:-}" ]]; then
     PRECUTOVER_DRIVER_SUPPLIED=1
@@ -9765,6 +9860,11 @@ ${service} reported [${state:-unreadable}] at block [${block:-unreadable}]"
     # the settlement identities and transactions the chain corroborates, which
     # a gate scrape does not know.
     PRECUTOVER_AUTHORED_ENDINGS="$(fleet_terminal_outcomes)"
+    # And the other side of the account's provenance, taken with it. A node that
+    # answered from a new process, or whose account dropped records while the work
+    # ran, has published an account that is missing permits rather than one that
+    # never had them.
+    PRECUTOVER_ACCOUNTS_AFTER="$(fleet_account_provenance)"
   fi
 
   PRECUTOVER_LEGACY_AFTER="$(fleet_metric_total \
@@ -9790,7 +9890,7 @@ precutover_verdict() {
 
   local failed_results missing_ceremonies settlements
   local uninteroperated stray unended invented uncredited unrecognized
-  local disowned unplaceable
+  local disowned unplaceable unfollowable
   local named_permits unauthored duplicated unresolved misended authored
   local malformed misevidenced disagreeing unclaimed result_population
   local unresolved_settlements
@@ -9810,6 +9910,12 @@ precutover_verdict() {
   # work; these are the holders' own records of closing the very permits this
   # fleet's gate issued for it.
   named_permits="$(held_permit_identities "${PRECUTOVER_ORIGINATED}")"
+  # Whether the account those records came out of is the one that was there
+  # while the work ran. Every join below reads it, so it is asked before any of
+  # them: a node that restarted mid-drive answers with an account missing every
+  # permit the old process held, which reads as a node that took no part.
+  unfollowable="$(unfollowable_account_nodes \
+    "${PRECUTOVER_ACCOUNTS_BEFORE}" "${PRECUTOVER_ACCOUNTS_AFTER}")"
   unauthored="$(unauthored_permits "${named_permits}" \
     "${PRECUTOVER_AUTHORED_ENDINGS}")"
   duplicated="$(duplicated_authored_permits "${named_permits}" \
@@ -9937,6 +10043,12 @@ the reading a mixed-fleet claim must not be decided by"
 permits it took for ${what} (${PRECUTOVER_AUTHORED_ENDINGS}); without that \
 reading the settlements above are the driver's account of its own ceremonies \
 and no node has vouched for one of them"
+  elif [[ -n "${unfollowable}" ]]; then
+    block_step "${step}" "${unfollowable}; the account of closed permits every \
+reading below rests on lives in memory, so a node answering from a new process \
+or dropping records while the work ran has published an account that is \
+missing permits rather than one that never held them — and a missing permit \
+reads as a node that took no part in work it may well have done"
   elif [[ -n "${unauthored}" ]]; then
     block_step "${step}" "no node recorded an ending for ${unauthored}, \
 though the driver named ${named_permits} as the permits issued for ${what}; a \

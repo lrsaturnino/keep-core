@@ -2,6 +2,8 @@ package participation
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"slices"
@@ -223,6 +225,23 @@ type Snapshot struct {
 	// record the quiescence journal carries, available while the node is still
 	// running rather than only from a quiescence transition onward.
 	RecentTerminalOutcomes []TerminalOutcomeRecord
+	// GateInstance identifies this gate, and so this process, for as long as it
+	// runs. It is generated once at construction and never persisted.
+	//
+	// It exists because the account above lives in memory. A reader that follows
+	// permits through a node has no way to tell an account that never held a
+	// record from one that held it and lost it to a restart, and those are
+	// opposite answers: the first says the node did not do that work, the second
+	// says nobody can say what it did. Two readings that disagree about this
+	// value are two different processes, and every record the earlier one held
+	// is gone.
+	GateInstance string
+	// ForgottenTerminalOutcomes counts the closed permits the bounded account
+	// has dropped to make room, for the same reason. An account at its bound has
+	// forgotten its oldest records rather than never having held them, and a
+	// reader joining permits to endings has to know which of those it is looking
+	// at.
+	ForgottenTerminalOutcomes uint64
 }
 
 // Gate issues per-ceremony participation permits with the protocol mode pinned
@@ -451,6 +470,15 @@ type chainGate struct {
 	// running, so a permit that appeared in a live reading can be followed to
 	// the outcome its owner recorded rather than to one claimed for it.
 	terminalOutcomes []TerminalOutcomeRecord
+	// forgottenTerminalOutcomes counts the records the bound above has dropped.
+	// A reader cannot otherwise tell an account that never held a permit from one
+	// that held it and forgot it.
+	forgottenTerminalOutcomes uint64
+	// instance identifies this gate for as long as the process runs. Written once
+	// at construction and read without the lock is deliberate: it never changes,
+	// and a reader comparing two readings of it is asking whether they came from
+	// the same process.
+	instance string
 }
 
 // retainedTerminalOutcomes bounds the gate's in-memory account of closed
@@ -458,6 +486,24 @@ type chainGate struct {
 // well past the permit population of any one cutover while staying a fixed
 // cost.
 const retainedTerminalOutcomes = 512
+
+// newGateInstance returns an identity for one gate, and so for one process.
+//
+// It is random rather than derived from the host, the release, or the start
+// time: nothing about it needs to be meaningful, and anything meaningful would
+// be another nonsecret field to keep out of the diagnostics. A reader only ever
+// compares two readings of it for equality. Randomness failing is not a reason
+// to refuse to construct the gate, but it must not be a reason to hand two
+// processes the same identity either, so the fallback says the identity is
+// unknown and every comparison of it reads as a process that cannot be
+// followed.
+func newGateInstance() string {
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(raw)
+}
 
 // NewGate constructs the production gate from a resolved schedule and the
 // shared chain block counter. It synchronously reads the current chain height
@@ -573,6 +619,7 @@ func newGate(
 		permits:           make(map[*permit]struct{}),
 		currentBlock:      currentBlock,
 		clockAvailable:    true,
+		instance:          newGateInstance(),
 	}
 
 	gate.initMetrics()
@@ -1425,6 +1472,8 @@ func (g *chainGate) State() Snapshot {
 		ActiveSecurityV2Ceremonies: g.activeSecurityV2,
 		ActivePermits:              g.permitSnapshotsLocked(),
 		RecentTerminalOutcomes:     g.terminalOutcomesLocked(),
+		GateInstance:               g.instance,
+		ForgottenTerminalOutcomes:  g.forgottenTerminalOutcomes,
 	}
 }
 
@@ -1435,6 +1484,7 @@ func (g *chainGate) retainTerminalOutcome(record TerminalOutcomeRecord) {
 	if len(g.terminalOutcomes) == retainedTerminalOutcomes {
 		copy(g.terminalOutcomes, g.terminalOutcomes[1:])
 		g.terminalOutcomes[len(g.terminalOutcomes)-1] = record
+		g.forgottenTerminalOutcomes++
 		return
 	}
 

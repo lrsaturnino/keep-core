@@ -294,6 +294,17 @@ func TestRegisterDiagnosticSources_EmitsGateStateContract(t *testing.T) {
 			},
 		},
 		"recent_terminal_outcomes": []interface{}{},
+		// What a reader needs in order to trust the account above. It lives in
+		// memory, so an empty one is either a node that closed no permit or a
+		// node that closed one and lost the record; the instance says whether two
+		// readings came from the same process, and the count says whether the
+		// account has dropped anything to its own bound.
+		"gate_instance":               snapshot.GateInstance,
+		"forgotten_terminal_outcomes": float64(0),
+	}
+
+	if snapshot.GateInstance == "" {
+		t.Error("the gate published no instance identity")
 	}
 
 	if !reflect.DeepEqual(decoded, expected) {

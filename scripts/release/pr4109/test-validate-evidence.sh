@@ -1744,6 +1744,34 @@ check_join "holders disagreeing about one final group are named" \
 check_join "disagreeing mappings render no mixed verdict" "" \
   "$(mixed_transcript_permits "${DKG_WORK}" "${DKG_SEAT1} ${DKG_DISAGREEING}")"
 
+# Whether the account all of the above is read out of is the one that was there
+# while the work ran. It lives in memory, so an account read from a new process
+# is missing every record the old one held and an account at its bound is missing
+# its oldest — and a missing permit reads as a node that took no part in work it
+# may well have done, which puts its seats outside the fleet.
+ACCOUNTS_BEFORE="r1-node-1=aa11=0 r1-node-2=bb22=3"
+check_join "one process answering both readings is followable" "" \
+  "$(unfollowable_account_nodes "${ACCOUNTS_BEFORE}" "${ACCOUNTS_BEFORE}")"
+check_join "a node answering from a new process is named" \
+  "r1-node-2 (answered from a different process than the one the work ran on)" \
+  "$(unfollowable_account_nodes "${ACCOUNTS_BEFORE}" \
+    "r1-node-1=aa11=0 r1-node-2=cc33=0")"
+check_join "a node whose account dropped records while it ran is named" \
+  "r1-node-2 (its account dropped 2 closed permits while the work ran)" \
+  "$(unfollowable_account_nodes "${ACCOUNTS_BEFORE}" \
+    "r1-node-1=aa11=0 r1-node-2=bb22=5")"
+# A node that cannot be asked takes the whole reading rather than shortening the
+# list, exactly as an unreadable outcome account does: a fleet with one member
+# missing is indistinguishable from a fleet whose permits all ended unrecorded.
+check_join "an unreadable reading before the work takes the fleet" \
+  "unreadable on r1-node-2" \
+  "$(unfollowable_account_nodes "unreadable on r1-node-2" \
+    "${ACCOUNTS_BEFORE}")"
+check_join "an unreadable reading after the work takes the fleet" \
+  "unreadable on r1-node-1" \
+  "$(unfollowable_account_nodes "${ACCOUNTS_BEFORE}" \
+    "unreadable on r1-node-1")"
+
 # A node that cannot be asked makes the whole reading unusable. A shorter list
 # would be indistinguishable from a fleet whose permits all ended unrecorded.
 SAVED_R1_SERVICES=("${REHEARSAL_R1_SERVICES[@]}")
@@ -4358,16 +4386,24 @@ check "one transcript holding both halves still covers the ceremony" 0 \
 # map is read off permits instead.
 #
 # Both seats in the signing result are R1 seats: r1-node-1 holds seat 1 and
-# r1-node-2 holds seat 7. r1-node-2 contributed and then closed its permit
-# without recording anything — a crash, a lost result, an owner that never got to
-# write — so no transcript of its anywhere names seat 7. Read from transcripts
-# alone, seat 7 belongs to nobody in the fleet, and r1-node-1's honest record of
-# incorporating seats 1 and 7 becomes a mixed prior/R1 transcript on a ceremony
-# the prior binary took no part in. The driver naming prior-node as the
-# contributor is what makes that reading look corroborated.
+# r1-node-2 holds seat 7. r1-node-2 contributed and then closed its permit with
+# nothing to record — a lost result, an owner that reached its deferred close
+# without ever writing an outcome — so no transcript of its anywhere names seat 7.
+# Read from transcripts alone, seat 7 belongs to nobody in the fleet, and
+# r1-node-1's honest record of incorporating seats 1 and 7 becomes a mixed
+# prior/R1 transcript on a ceremony the prior binary took no part in. The driver
+# naming prior-node as the contributor is what makes that reading look
+# corroborated.
 #
 # The permit r1-node-2 held says it was operating seat 7 whatever became of it,
 # so the seat resolves inside the fleet and the requirement stays uncovered.
+#
+# This is the orderly half of the case: the permit closed, so a record exists to
+# carry the seat. The half where the process is lost before it closes anything
+# leaves no record at all, and no reading of the account can recover a seat that
+# was never written to it — which is why the account's provenance is read either
+# side of the drive and a node answering from a new process blocks the step
+# outright rather than being read as a node that took no part.
 # shellcheck disable=SC2016
 run_verdict precutover_case eval '
   PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS} \
@@ -4571,6 +4607,26 @@ check "a compatibility control is not read off the work that survived" 1 \
 run_verdict precutover_case eval 'PRECUTOVER_ORIGINATED=""'
 check "settled ceremonies naming no permit holder identify no gate permit" 3 \
   "named no node holding a permit"
+
+# A node that answered the ending readings from a process other than the one the
+# work ran on. Its account of closed permits is missing every record the old
+# process held, so the readings below are not short of a permit — they are short
+# of a node, and the seats that node was operating fall outside the fleet map that
+# decides the mixed reading.
+run_verdict precutover_case eval '
+  PRECUTOVER_ACCOUNTS_BEFORE="r1-node-1=aa11=0 r1-node-2=bb22=0"
+  PRECUTOVER_ACCOUNTS_AFTER="r1-node-1=aa11=0 r1-node-2=cc33=0"'
+check "a restarted node leaves its part in the work unknown" 3 \
+  "answered from a different process than the one the work ran on"
+
+# And the bounded-account half of the same thing: the records were written and
+# then dropped to make room. A reader cannot tell which ones, so it cannot tell
+# which seats the fleet was sitting in.
+run_verdict precutover_case eval '
+  PRECUTOVER_ACCOUNTS_BEFORE="r1-node-1=aa11=0 r1-node-2=bb22=1"
+  PRECUTOVER_ACCOUNTS_AFTER="r1-node-1=aa11=0 r1-node-2=bb22=4"'
+check "an account that forgot while the work ran is not read past" 3 \
+  "its account dropped 3 closed permits while the work ran"
 
 run_verdict precutover_case eval \
   'PRECUTOVER_AUTHORED_ENDINGS="unreadable on r1-node-2"'

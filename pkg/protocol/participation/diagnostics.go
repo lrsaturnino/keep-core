@@ -118,6 +118,18 @@ func RegisterDiagnosticSources(
 			if terminalOutcomes == nil {
 				terminalOutcomes = []TerminalOutcomeRecord{}
 			}
+			// Whether the account above can be followed at all. It lives in
+			// memory, so a reader joining a permit it saw held to the ending its
+			// holder recorded has to be able to tell an account that never held
+			// the record from one that held it and lost it — to a restart, or to
+			// its own bound. Those are opposite answers: the first says this node
+			// did not do that work, the second says nobody can say what it did,
+			// and a reader that cannot distinguish them attributes the work to
+			// whoever else was on the network.
+			gateInstance := snapshot.GateInstance
+			if gateInstance == "" {
+				gateInstance = "unknown"
+			}
 			bytes, err := json.Marshal(map[string]interface{}{
 				"protocol_epoch":                CompiledEpoch.String(),
 				"ethereum_chain_id":             chainID.String(),
@@ -133,6 +145,9 @@ func RegisterDiagnosticSources(
 				"active_security_v2_ceremonies": snapshot.ActiveSecurityV2Ceremonies,
 				"active_permits":                permits,
 				"recent_terminal_outcomes":      terminalOutcomes,
+				"gate_instance":                 gateInstance,
+				"forgotten_terminal_outcomes": snapshot.
+					ForgottenTerminalOutcomes,
 			})
 			if err != nil {
 				diagnosticsLogger.Errorf(

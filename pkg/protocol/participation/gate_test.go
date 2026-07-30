@@ -448,6 +448,66 @@ func TestGate_TerminalOutcomeAccountIsBounded(t *testing.T) {
 		fmt.Sprintf("wallet-action-%d", retainedTerminalOutcomes+surplus-1) {
 		t.Errorf("the account did not keep the newest permit: [%s]", last)
 	}
+	// And it says how many it forgot. Without that a reader joining a permit it
+	// saw held to the ending its holder recorded cannot tell an account that
+	// never held the record from one that dropped it, and those are opposite
+	// answers about whether this node did the work.
+	if forgotten := gate.State().ForgottenTerminalOutcomes; forgotten !=
+		surplus {
+		t.Errorf(
+			"unexpected forgotten count\nexpected: [%d]\nactual:   [%d]",
+			surplus,
+			forgotten,
+		)
+	}
+}
+
+// TestGate_PublishesAProcessInstanceIdentity asserts each gate names itself, and
+// that two gates do not share a name.
+//
+// The gate's account of closed permits lives in memory. A reader following work
+// through a node has no way to tell an account that never held a record from one
+// that held it and lost it to a restart, and reading the second as the first
+// attributes that node's work to whoever else was on the network. The instance is
+// what separates the two: two readings that disagree about it came from different
+// processes, and every record the earlier one held is gone.
+func TestGate_PublishesAProcessInstanceIdentity(t *testing.T) {
+	const cutover = uint64(1_000)
+
+	instances := make(map[string]struct{})
+	for run := 0; run < 2; run++ {
+		gate, err := newGate(
+			context.Background(),
+			Schedule{CutoverBlock: cutover},
+			newGateBlockCounter(cutover),
+			newFakeMetrics(),
+			inertPollInterval,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(gate.Close)
+
+		instance := gate.State().GateInstance
+		if instance == "" {
+			t.Fatal("a gate published no instance identity")
+		}
+		// It has to be the same answer every time it is asked, or a single
+		// process would read as a restarting one and every reading of its
+		// account would be unusable.
+		if again := gate.State().GateInstance; again != instance {
+			t.Errorf(
+				"one gate named itself twice over: [%s] then [%s]",
+				instance,
+				again,
+			)
+		}
+		instances[instance] = struct{}{}
+	}
+
+	if len(instances) != 2 {
+		t.Error("two gates published one instance identity between them")
+	}
 }
 
 // TestGate_TerminalOutcomeAccountIsNotAliased asserts a reader cannot reach
