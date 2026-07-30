@@ -3935,6 +3935,23 @@ TERMINAL_OUTCOME_JS='
         "tbtc_dkg", "tbtc_signing", "tbtc_heartbeat",
         "beacon_dkg", "beacon_relay_signing",
       ];
+      // The ceremonies whose record speaks in a different membership index space
+      // than the permits issued for the same work, and whose transcript
+      // therefore carries the seat each of its own seats was rebuilt from. The
+      // list mirrors the one the gate keeps, and a self-test holds it there.
+      //
+      // Nothing else lets an ownership map span such a ceremony. A tBTC DKG
+      // group is rebuilt from the members a node saw operating, so every seat
+      // above a removed one shifts down; the permits name ceremony seats and the
+      // transcripts name final seats, and a reader joining the two by number
+      // attributes a final seat to whichever party holds that number in the
+      // other space. A missing list entry is read the wrong way twice over: the
+      // mapping the ceremony publishes is refused as one it cannot have, taking
+      // the whole snapshot with it, and the ceremony that omits one passes as a
+      // transcript nothing asked to be joinable.
+      const REMAPPED_CEREMONIES = [
+        "tbtc_dkg",
+      ];
       // The evidence kinds that name a persisted DKG membership. The gate
       // requires the membership index on exactly these and forbids it
       // elsewhere, so a reader that dropped it would lose the field that ties a
@@ -4074,7 +4091,50 @@ TERMINAL_OUTCOME_JS='
             JSON.stringify(record));
           process.exit(1);
         }
-        return (incorporated.join(",") || NONE) + "=" +
+        // The seat behind each seat above, in the index space the permits for
+        // this work were issued in. It is what lets an ownership map built from
+        // permits be read against a transcript at all where the two spaces
+        // differ.
+        //
+        // It rides on the incorporated field, after a "|", rather than as a
+        // field of its own. The alignment is position for position and is the
+        // whole encoding: a mapping read apart from the list it lines up with
+        // says which ceremony seats survived and not which seat each of them
+        // became, so keeping the two in one field is what makes losing the
+        // pairing impossible. A mapping of a different length is refused rather
+        // than truncated for the same reason — it would leave the seats past the
+        // shorter list unjoinable and the ones before it unverifiable.
+        let permitSpace = "";
+        const mapped = REMAPPED_CEREMONIES.includes(ceremony);
+        const declared = contribution.permit_space_members;
+        if (declared === undefined || declared === null ||
+          (Array.isArray(declared) && declared.length === 0)) {
+          if (mapped) {
+            console.error("a completed " + JSON.stringify(ceremony) +
+              " permit publishes a transcript in another index space than " +
+              "its own permits without saying how the two line up: " +
+              JSON.stringify(record));
+            process.exit(1);
+          }
+        } else if (!mapped) {
+          console.error("a " + JSON.stringify(ceremony) +
+            " permit maps between index spaces its record and its permits " +
+            "share: " + JSON.stringify(record));
+          process.exit(1);
+        } else {
+          const space = memberSetOf(
+            declared,
+            "the memberships behind the seats that produced the result",
+          );
+          if (space.length !== incorporated.length) {
+            console.error("a transcript names " + incorporated.length +
+              " memberships and maps " + space.length +
+              " of them back to its permits: " + JSON.stringify(record));
+            process.exit(1);
+          }
+          permitSpace = "|" + space.join(",");
+        }
+        return (incorporated.join(",") || NONE) + permitSpace + "=" +
           (local.join(",") || NONE);
       };
       const evidenceOf = (record) => {
@@ -6018,7 +6078,9 @@ present_tokens() {
 # "=" of its own. The node-authored side appends what its holder recorded:
 # "=<outcome>=<evidence kind>=<result>=<membership>=<incorporated>=<local>=
 # <settlement>=<operated>", with "-" wherever the gate carries no value. The
-# three membership sets are comma-joined ascending.
+# three membership sets are comma-joined ascending, and the incorporated one
+# carries the mapping back to its permits' index space after a "|" where the two
+# spaces differ.
 #
 # The last field is the permit's rather than the ending's: it is the seats the
 # holder said it was operating when the permit was issued, so it is there on
@@ -6088,6 +6150,15 @@ authored_membership() {
 # a reader holding only those cannot tell shares that combined from several
 # parties from one party that arrived at the common result alone.
 authored_incorporated() {
+  local field
+  field="$(authored_incorporated_field "$1")"
+  printf '%s' "${field%%|*}"
+}
+
+# The whole field those memberships share with the mapping back to the permits'
+# index space, "<memberships>" or "<memberships>|<mapping>". The two accessors
+# above split it; nothing else should read it directly.
+authored_incorporated_field() {
   local rest
   rest="${1#*=}"
   rest="${rest#*=}"
@@ -6112,6 +6183,33 @@ authored_local() {
   rest="${rest#*=}"
   rest="${rest#*=}"
   printf '%s' "${rest%%=*}"
+}
+
+# The seat in the index space this work's permits were issued in behind each of
+# the incorporated memberships above, comma-joined and aligned with them position
+# for position, or "-" for the records whose transcript already speaks in that
+# space.
+#
+# This is what makes an ownership map readable against a transcript at all where
+# the two index spaces differ. A tBTC DKG group is rebuilt from the members the
+# recording node saw operating, so every seat above a removed one shifts down:
+# the permits on that work name ceremony seats, the transcript names final seats,
+# and joining the two by number attributes a final seat to whichever party holds
+# that number in the other space. The mapping is the accepted result's own, and
+# the gate has already held it to the recording permit's own seat.
+#
+# It rides on the incorporated field after a "|" rather than occupying a field of
+# its own, because the two are one aligned pair: read apart from the list it
+# lines up with, a mapping says which ceremony seats survived and not which seat
+# each of them became. Keeping them together is what makes losing the pairing
+# impossible.
+authored_permit_space() {
+  local field
+  field="$(authored_incorporated_field "$1")"
+  case "${field}" in
+    *'|'*) printf '%s' "${field##*|}" ;;
+    *) printf '%s' '-' ;;
+  esac
 }
 
 # The chain side effect the same permit dispatched beyond its own protocol
@@ -6723,8 +6821,24 @@ uncredited_contributors() {
 # the mixed-release claim: an R1 node whose seat went into another R1 node's
 # result while its own permit ended with nothing to record leaves that seat
 # outside the map, and the reading below then calls an all-R1 transcript mixed.
+#
+# Where the transcripts on this work speak in a different index space than its
+# permits, the seats are placed in the transcripts' space before they enter the
+# map, through the mapping those transcripts publish. A map left in the permits'
+# space would read against the transcripts by number, which is the same false
+# attribution in a quieter form: with a middle ceremony member removed every
+# final seat shifts down, so the map's own seats land on the wrong side of the
+# reading and a homogeneous run presents a seat as outside the fleet.
+#
+# A seat that cannot be placed is left out of the map rather than guessed at, and
+# untranslatable_ownership_permits below is what stops the reading from treating
+# its absence as the fleet not having operated it.
 authored_work_local_members() {
-  local work="$1" authored="$2" token permit members out=""
+  local work="$1" authored="$2"
+  local token permit members member seat spaces transcript permits out=""
+  spaces="$(authored_work_seat_spaces "${work}" "${authored}")"
+  transcript="$(seat_spaces_transcript "${spaces}")"
+  permits="$(seat_spaces_permits "${spaces}")"
   for token in ${authored}; do
     authored_record_complete "${token}" || continue
     permit="$(authored_permit "${token}")"
@@ -6734,7 +6848,153 @@ authored_work_local_members() {
     # membership map: read as a token it would make an absent "-" look like an
     # operated seat.
     [[ "${members}" == "-" ]] && continue
-    out="${out}${out:+ }${members//,/ }"
+    if ! ceremony_remaps_permit_space "$(identity_ceremony "${permit}")"; then
+      out="${out}${out:+ }${members//,/ }"
+      continue
+    fi
+    for member in ${members//,/ }; do
+      seat="$(aligned_membership "${transcript}" "${permits}" "${member}")"
+      [[ -n "${seat}" ]] || continue
+      out="${out}${out:+ }${seat}"
+    done
+  done
+  printf '%s' "${out}"
+}
+
+# Whether a ceremony records its result in a different membership index space
+# than the permits issued for the same work, and so publishes the mapping between
+# them. The list mirrors the gate's and the snapshot reader's, and a self-test
+# holds all three together.
+ceremony_remaps_permit_space() {
+  case "$1" in
+    tbtc_dkg) return 0 ;;
+  esac
+  return 1
+}
+
+# The one pair of index spaces the completions on a piece of chain work agree on,
+# as "<transcript seats> <permit-space seats>" with each half comma-joined and
+# the two aligned position for position. "-" when no completion on this work
+# published a mapping at all, and "!" when two of them published different ones.
+#
+# One piece of DKG work has one final group, so its completions publish one
+# mapping. Two that disagree describe two different rebuildings of it, and there
+# is no rule for choosing between them that is not a guess — so the disagreement
+# is rendered rather than resolved, and the readings below refuse rather than pick
+# a side. The transcript half travels with the mapping because the alignment is
+# what carries the meaning: the mapping alone says which ceremony seats survived,
+# not which final seat each of them became.
+authored_work_seat_spaces() {
+  local work="$1" authored="$2" token permit mapping pair out=""
+  for token in ${authored}; do
+    authored_record_complete "${token}" || continue
+    [[ "$(authored_outcome "${token}")" == "completed" ]] || continue
+    permit="$(authored_permit "${token}")"
+    [[ "$(identity_work "${permit}")" == "${work}" ]] || continue
+    mapping="$(authored_permit_space "${token}")"
+    [[ "${mapping}" == "-" ]] && continue
+    pair="$(authored_incorporated "${token}") ${mapping}"
+    if [[ -z "${out}" ]]; then
+      out="${pair}"
+    elif [[ "${out}" != "${pair}" ]]; then
+      printf '!'
+      return 0
+    fi
+  done
+  printf '%s' "${out:--}"
+}
+
+# The membership one index space carries opposite a membership of another, given
+# the two as comma-joined lists aligned position for position: aligned_membership
+# "<wanted space>" "<given space>" "<membership of the given space>".
+#
+# Empty when the given space does not carry that membership at all, which is not
+# a fault on its own: a ceremony member the recording node did not see operating
+# is absent from the group that was rebuilt, so its seat has no place in the
+# transcript and never enters an ownership map. Empty also for the renderings that
+# say there is no usable mapping — none published, or two that disagreed — so a
+# caller that reads this as "no seat" gets the unknown rather than a guess.
+aligned_membership() {
+  local wanted="$1" given="$2" seat="$3" wanted_seats given_seats index
+  case "${wanted}" in
+    -|'!'|'') return 0 ;;
+  esac
+  case "${given}" in
+    -|'!'|'') return 0 ;;
+  esac
+  IFS=',' read -r -a wanted_seats <<<"${wanted}"
+  IFS=',' read -r -a given_seats <<<"${given}"
+  for ((index = 0; index < ${#given_seats[@]}; index++)); do
+    [[ "${given_seats[index]}" == "${seat}" ]] || continue
+    ((index < ${#wanted_seats[@]})) || return 0
+    printf '%s' "${wanted_seats[index]}"
+    return 0
+  done
+}
+
+# The transcript half of a pair authored_work_seat_spaces rendered, and its
+# permit-space half. Both are "-" when the pair says there is no usable mapping,
+# which every reader of them treats as an unknown rather than as an empty space.
+seat_spaces_transcript() {
+  case "$1" in
+    -|'!'|'') printf '%s' '-' ;;
+    *) printf '%s' "${1%% *}" ;;
+  esac
+}
+
+seat_spaces_permits() {
+  case "$1" in
+    -|'!'|'') printf '%s' '-' ;;
+    *) printf '%s' "${1##* }" ;;
+  esac
+}
+
+# Of the permits on one piece of chain work, the ones whose operated seats could
+# not be placed in the index space its transcripts speak in, rendered as
+# "<permit> (operated <seats>)".
+#
+# This is the gap the mixed reading must not read past. The ownership map is what
+# says which seats of a transcript the fleet was sitting in, and a seat missing
+# from it reads as a seat some other release supplied. Where this work published
+# no usable mapping at all — none of its completions carried one, or two of them
+# carried different ones — the honest answer is that the fleet's ownership of its
+# transcripts is unknown, and an unknown must not be spent as evidence that two
+# releases combined into one output.
+#
+# A holder whose own seat is simply absent from a mapping the work did publish is
+# not named here, and the difference is the whole point. That seat belongs to a
+# ceremony member the recording node did not see operating, so it was left out of
+# the group that was rebuilt and holds no final seat at all — which is a definite
+# answer rather than a missing one, and a normal outcome of every ceremony that
+# removed a member.
+untranslatable_ownership_permits() {
+  local work="$1" authored="$2" token permit members spaces out=""
+  spaces="$(authored_work_seat_spaces "${work}" "${authored}")"
+  case "${spaces}" in
+    -|'!') ;;
+    *) return 0 ;;
+  esac
+  for token in ${authored}; do
+    authored_record_complete "${token}" || continue
+    permit="$(authored_permit "${token}")"
+    [[ "$(identity_work "${permit}")" == "${work}" ]] || continue
+    ceremony_remaps_permit_space "$(identity_ceremony "${permit}")" || continue
+    members="$(authored_operated "${token}")"
+    [[ "${members}" == "-" ]] && continue
+    out="${out}${out:+, }${permit} (operated ${members})"
+  done
+  printf '%s' "${out}"
+}
+
+# The same across every piece of work a control covers, so a verdict can say the
+# fleet's ownership of a transcript was unreadable rather than reporting the
+# homogeneous reading that silence produces.
+unplaceable_authored_ownership() {
+  local authored="$1" works="$2" work found out=""
+  for work in ${works}; do
+    found="$(untranslatable_ownership_permits "${work}" "${authored}")"
+    [[ -n "${found}" ]] || continue
+    out="${out}${out:+, }${found}"
   done
   printf '%s' "${out}"
 }
@@ -6754,23 +7014,38 @@ authored_work_local_members() {
 # here reached a gate scrape by some other route. Either way it is a reason to
 # refuse the reading rather than to pick a side.
 #
-# tBTC DKG is deliberately not compared. Its permit names a DKG member index
-# while its transcript is in the final signing group's index space, rebuilt after
-# inactive and disqualified members are removed, so the same node legitimately
-# runs seat 9 of the ceremony and persists seat 7 of the group.
+# A record whose transcript is in another index space than its own permit is
+# compared through the mapping that record publishes, not exempted. Exempting it
+# left the comparison undone for the one ceremony that remaps, which is the one
+# whose two statements a reader most needs held together; comparing the raw
+# numbers instead would refuse every correct record. The seat named here is
+# always the permit's own, so a translation that fails to place it is itself the
+# contradiction: the holder published a mapping its own seat is not in.
 disowned_transcript_permits() {
   local work="$1" authored="$2"
-  local token permit operated local_members member out=""
+  local token permit operated local_members member seat out=""
   for token in ${authored}; do
     authored_record_complete "${token}" || continue
     permit="$(authored_permit "${token}")"
     [[ "$(identity_work "${permit}")" == "${work}" ]] || continue
-    [[ "$(identity_ceremony "${permit}")" == "tbtc_dkg" ]] && continue
     local_members="$(authored_local "${token}")"
     [[ "${local_members}" == "-" ]] && continue
     operated="$(authored_operated "${token}")"
     for member in ${local_members//,/ }; do
-      contains_token "${operated//,/ }" "${member}" && continue
+      seat="${member}"
+      if ceremony_remaps_permit_space "$(identity_ceremony "${permit}")"; then
+        # The record's own mapping, read the other way about: the operated set is
+        # in the permits' space, so the transcript seat is translated back into
+        # it. It is this record's mapping rather than the one the work's
+        # completions agree on, because what is being checked is whether one
+        # holder contradicted itself and only its own account may answer that.
+        seat="$(aligned_membership \
+          "$(authored_permit_space "${token}")" \
+          "$(authored_incorporated "${token}")" \
+          "${member}")"
+      fi
+      [[ -n "${seat}" ]] &&
+        contains_token "${operated//,/ }" "${seat}" && continue
       out="${out}${out:+, }${permit} (transcript ${local_members}, \
 operated ${operated})"
       break
@@ -6829,10 +7104,24 @@ disowned_authored_transcripts() {
 # A record whose transcript claims a seat its own permit never operated is not
 # read at all. The two statements would have to be reconciled before either could
 # be believed, and there is no rule for doing that which is not a guess.
+#
+# Nor is a work whose ownership map could not be placed in the index space its
+# transcripts speak in. The map is what says which seats of a transcript the
+# fleet was sitting in, and every seat missing from it reads as a seat some other
+# release supplied — so an unreadable map produces the mixed verdict rather than
+# no verdict, which is the one direction this reading must never fail in.
+#
+# An unplaceable map comes out empty, and the "some seat of this fleet" half below
+# already declines to read a transcript against an empty one. The refusal is
+# stated here anyway because it is the rule rather than a consequence: a later
+# reading that filled an unplaceable seat in from somewhere would satisfy that
+# half and arrive at exactly the verdict this must never produce.
 mixed_transcript_permits() {
   local work="$1" authored="$2"
   local owned token permit incorporated member fleet outside out=""
   [[ -z "$(disowned_transcript_permits "${work}" "${authored}")" ]] || return 0
+  [[ -z "$(untranslatable_ownership_permits "${work}" "${authored}")" ]] ||
+    return 0
   owned="$(authored_work_local_members "${work}" "${authored}")"
   for token in ${authored}; do
     authored_record_complete "${token}" || continue
@@ -9501,7 +9790,7 @@ precutover_verdict() {
 
   local failed_results missing_ceremonies settlements
   local uninteroperated stray unended invented uncredited unrecognized
-  local disowned
+  local disowned unplaceable
   local named_permits unauthored duplicated unresolved misended authored
   local malformed misevidenced disagreeing unclaimed result_population
   local unresolved_settlements
@@ -9573,6 +9862,13 @@ precutover_verdict() {
   uncredited="$(uncredited_contributors "${PRECUTOVER_CONTRIBUTORS}" \
     "${PRECUTOVER_AUTHORED_ENDINGS}" "$(identity_works "${named_permits}")")"
   disowned="$(disowned_authored_transcripts \
+    "${PRECUTOVER_AUTHORED_ENDINGS}" \
+    "$(identity_works "${named_permits}")")"
+  # And whether the ownership map the mixed reading is decided against could be
+  # placed in the index space the transcripts speak in at all. Where it could
+  # not, the reading below has no map to subtract and every seat reads as
+  # somebody else's — so the gap is named here rather than spent as evidence.
+  unplaceable="$(unplaceable_authored_ownership \
     "${PRECUTOVER_AUTHORED_ENDINGS}" \
     "$(identity_works "${named_permits}")")"
   uninteroperated="$(ceremonies_without_mixed_transcript \
@@ -9697,6 +9993,12 @@ operating when its permit was issued and then published a result produced with \
 a seat it never claimed, and the two accounts of one permit cannot both be \
 true; the fleet ownership map every mixed reading is decided against is built \
 from the first of them, so a record contradicting it settles nothing either way"
+  elif [[ -n "${unplaceable}" ]]; then
+    block_step "${step}" "${unplaceable}; the transcripts on that work are in a \
+different membership index space than its permits and no usable mapping between \
+the two was published, so which seats of those transcripts this fleet was \
+sitting in is unknown; an unknown ownership map cannot be read as the fleet \
+having operated none of them"
   elif [[ -n "${uninteroperated}" ]]; then
     block_step "${step}" "the work driver settled ${settlements}, but no \
 ${uninteroperated} transcript incorporated a share from both \

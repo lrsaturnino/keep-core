@@ -1408,25 +1408,57 @@ CASES
 # under one seat while the population that produced it names another, and each
 # account is internally consistent.
 persisted_signer_permit() {
-  local seat="$1" local_members="$2" evidence
+  local seat="$1" local_members="$2" mapping="${3-[2,9,11]}" evidence
   evidence="$(printf '"kind":"persisted_tbtc_signer","reference":"0xdkg",')"
   evidence="${evidence}$(printf '"membership_index":%s,' "${seat}")"
   evidence="${evidence}"'"contribution":{"incorporated_members":[1,3,7],'
+  # The seat behind each of those, in the DKG index space the permit was issued
+  # in. Final seat 3 was rebuilt from DKG seat 9, which is the seat this permit
+  # operates: the two spaces are different and the mapping is what lines them up.
+  # An empty mapping stands for a record that published none.
+  if [[ "${mapping}" != "-" ]]; then
+    evidence="${evidence}$(printf '"permit_space_members":%s,' "${mapping}")"
+  fi
   evidence="${evidence}$(printf '"local_members":[%s]}' "${local_members}")"
-  # The operated seat is a DKG index while the transcript above is in the final
-  # signing group index space, which is exactly why the two are not compared for
-  # this one ceremony.
   gate_state_with_outcomes "\"recent_terminal_outcomes\":[$(closed_permit \
     completed w-1 p-1 true "${evidence}" tbtc_dkg 10 9)]"
 }
 
-read_terminal_outcomes "$(persisted_signer_permit 3 '1,3')"
+read_terminal_outcomes "$(persisted_signer_permit 3 '3')"
 check "a persisted seat inside the transcript is carried with the ending" 0 \
-  "=completed=persisted_tbtc_signer=0xdkg=3=1,3,7=1,3=-=9$"
+  "=completed=persisted_tbtc_signer=0xdkg=3=1,3,7|2,9,11=3=-=9$"
 
-read_terminal_outcomes "$(persisted_signer_permit 7 '1,3')"
+read_terminal_outcomes "$(persisted_signer_permit 7 '3')"
 check "a persisted seat outside the transcript is refused" 1 \
   "outside the memberships it operated in the transcript"
+
+# The mapping a ceremony recording in another index space than its permits has to
+# publish. Without it the ownership map built from those permits and the
+# transcript read against it are lists of numbers from two different spaces, and
+# joining them attributes a final seat to whichever party holds that number in
+# the other one.
+read_terminal_outcomes "$(persisted_signer_permit 3 '3' -)"
+check "a remapped transcript with no mapping is refused" 1 \
+  "without saying how the two line up"
+
+# And a mapping that does not line up position for position. The alignment is the
+# whole encoding: a shorter mapping leaves the seats past its end unjoinable and
+# says nothing about the ones before it either, since a reader cannot tell which
+# of them the missing entries belonged to.
+read_terminal_outcomes "$(persisted_signer_permit 3 '3' '[2,9]')"
+check "a mapping that does not cover the transcript is refused" 1 \
+  "and maps 2 of them back to its permits"
+
+# The mirror: a ceremony whose record already speaks in the space its permits
+# name has nothing to map, and a mapping there is a second answer to a question
+# that already has one.
+read_terminal_outcomes "$(gate_state_with_outcomes \
+  "\"recent_terminal_outcomes\":[$(closed_permit completed w-1 p-1 true \
+    '"kind":"protocol_result","reference":"0xentry","contribution":{
+      "incorporated_members":[1,7],"permit_space_members":[1,7],
+      "local_members":[1]}')]")"
+check "a mapping on a ceremony that shares its permits' space is refused" 1 \
+  "maps between index spaces its record and its permits share"
 
 # And a side effect no ceremony in this release has a code path to dispatch. A
 # record naming one describes chain state it could not have created, which an
@@ -1488,7 +1520,7 @@ check_join "the endings a passing verdict quotes are the holders' own" \
 check_join "a record for the same work under another ceremony answers for none" \
   "${P1}" \
   "$(unauthored_permits "${P1}" \
-    "r1-node-1@tbtc_dkg@10@w-1#p-1=completed=persisted_tbtc_signer=0xr1=1=1=1\
+    "r1-node-1@tbtc_dkg@10@w-1#p-1=completed=persisted_tbtc_signer=0xr1=1=1|1=1\
 =-=-")"
 check_join "a record for the same work at another anchor answers for none" \
   "${P1}" \
@@ -1615,6 +1647,102 @@ ${S2} recorded 0xentry where the driver claims 0xsomethingelse" \
 check_join "a completion the driver never settled is named" \
   "${S1} recorded 0xentry where the driver claims no settlement at all" \
   "$(unclaimed_authored_results "${S1}" "${SHARED}" "")"
+
+# The one ceremony whose transcript is in a different index space than its
+# permits, read the way the mixed-release claim depends on.
+#
+# Four DKG seats were selected, all of them this fleet's, and seat 2 was not seen
+# operating. The nine-word version: every seat above a removed one shifts down, so
+# the three survivors 1, 3 and 4 become final seats 1, 2 and 3. Every final seat
+# in the transcript therefore belongs to a node under test, and the run is
+# homogeneous.
+#
+# Read by number instead — the fleet operating {1,3,4} against a transcript naming
+# {1,2,3} — final seat 2 sits outside the fleet, final seat 4 is a seat nobody
+# incorporated, and a homogeneous run reads as one two releases combined on. That
+# reading is what these cases exist to keep out, so the negative control is the
+# load-bearing one: it must stay homogeneous.
+DKG_WORK="tbtc_dkg@10@dkg-remap"
+DKG_SPACE="1,2,3|1,3,4"
+DKG_SEAT1="r1-node-1@${DKG_WORK}#1=completed\
+=persisted_tbtc_signer=0xdkg=1=${DKG_SPACE}=1=-=1"
+DKG_SEAT3="r1-node-2@${DKG_WORK}#3=completed\
+=persisted_tbtc_signer=0xdkg=2=${DKG_SPACE}=2=-=3"
+DKG_SEAT4="r1-node-3@${DKG_WORK}#4=completed\
+=persisted_tbtc_signer=0xdkg=3=${DKG_SPACE}=3=-=4"
+DKG_FLEET="${DKG_SEAT1} ${DKG_SEAT3} ${DKG_SEAT4}"
+check_join "surviving DKG seats enter the map in the transcript's own space" \
+  "1 2 3" \
+  "$(authored_work_local_members "${DKG_WORK}" "${DKG_FLEET}")"
+check_join "a removed middle DKG member leaves the run homogeneous" "" \
+  "$(mixed_transcript_permits "${DKG_WORK}" "${DKG_FLEET}")"
+check_join "a remapped transcript agrees with the permit that wrote it" "" \
+  "$(disowned_transcript_permits "${DKG_WORK}" "${DKG_FLEET}")"
+
+# The same work with the third survivor held by neither release under test. Its
+# final seat is then outside the fleet, and one transcript naming both a seat the
+# fleet operated and a seat it did not is the mixed reading — so the control that
+# has to fire still fires once the mapping is respected.
+# Both surviving holders publish the same transcript, so both of their records
+# name the same mixed population; the reading is per record and neither stands in
+# for the other.
+check_join "a final seat no permit in the fleet maps to is outside it" \
+  "r1-node-1@${DKG_WORK}#1 (fleet 1,2, outside 3), \
+r1-node-2@${DKG_WORK}#3 (fleet 1,2, outside 3)" \
+  "$(mixed_transcript_permits "${DKG_WORK}" "${DKG_SEAT1} ${DKG_SEAT3}")"
+
+# A holder the ceremony removed. Its DKG seat is absent from the survivor list the
+# transcripts publish, which says definitely that it holds no final seat rather
+# than leaving its ownership unknown — so it contributes nothing to the map, is
+# not named as unplaceable, and does not stop the reading.
+DKG_REMOVED="r1-node-4@${DKG_WORK}#2=exhausted=no_threshold=-=-=-=-=-=2"
+check_join "a removed member contributes no seat and blocks nothing" "" \
+  "$(untranslatable_ownership_permits "${DKG_WORK}" \
+    "${DKG_FLEET} ${DKG_REMOVED}")"
+check_join "a removed member leaves the homogeneous reading standing" "" \
+  "$(mixed_transcript_permits "${DKG_WORK}" "${DKG_FLEET} ${DKG_REMOVED}")"
+
+# A holder whose own permit-space seat is absent from the mapping it published.
+# The two accounts of one permit cannot both be true, and the gate refuses such a
+# record when it is written, so one reaching a scrape is a reason to refuse the
+# reading rather than to pick a side.
+check_join "a seat outside the mapping the holder published is named" \
+  "r1-node-1@${DKG_WORK}#9 (transcript 1, operated 9)" \
+  "$(disowned_transcript_permits "${DKG_WORK}" \
+    "r1-node-1@${DKG_WORK}#9=completed=persisted_tbtc_signer\
+=0xdkg=1=${DKG_SPACE}=1=-=9")"
+
+# And the two ways a work leaves the fleet's ownership of its transcripts unknown.
+#
+# The first is a transcript that published no mapping at all. The snapshot reader
+# refuses such a record where it can see it, so one reaching a verdict arrived by
+# another route — and the seats it names are then numbers from a space nothing
+# lines up with the permits, which is precisely when leaving a seat out of the map
+# would manufacture the mixed reading.
+DKG_UNMAPPED="r1-node-1@${DKG_WORK}#1=completed=persisted_tbtc_signer\
+=0xdkg=1=1,2,3=1=-=1"
+check_join "a transcript with no mapping leaves its ownership unknown" \
+  "r1-node-1@${DKG_WORK}#1 (operated 1)" \
+  "$(untranslatable_ownership_permits "${DKG_WORK}" "${DKG_UNMAPPED}")"
+check_join "an unplaceable ownership map renders no mixed verdict" "" \
+  "$(mixed_transcript_permits "${DKG_WORK}" "${DKG_UNMAPPED}")"
+
+# The second is two holders of one piece of work publishing different mappings.
+# One DKG has one final group, so the two describe two different rebuildings of
+# it, and there is no rule for choosing between them that is not a guess.
+#
+# Each record here agrees with its own permit, which is what leaves the
+# disagreement for this check rather than for the self-contradiction one above:
+# both holders place their own seat correctly under mappings that cannot both
+# describe the group.
+DKG_DISAGREEING="r1-node-2@${DKG_WORK}#3=completed=persisted_tbtc_signer\
+=0xdkg=2=1,2,3|1,3,5=2=-=3"
+check_join "holders disagreeing about one final group are named" \
+  "r1-node-1@${DKG_WORK}#1 (operated 1), r1-node-2@${DKG_WORK}#3 (operated 3)" \
+  "$(untranslatable_ownership_permits "${DKG_WORK}" \
+    "${DKG_SEAT1} ${DKG_DISAGREEING}")"
+check_join "disagreeing mappings render no mixed verdict" "" \
+  "$(mixed_transcript_permits "${DKG_WORK}" "${DKG_SEAT1} ${DKG_DISAGREEING}")"
 
 # A node that cannot be asked makes the whole reading unusable. A shorter list
 # would be indistinguishable from a fleet whose permits all ended unrecorded.
@@ -3908,7 +4036,7 @@ r1-node-1@tbtc_signing@840@wallet840#1=completed=bitcoin_transaction=0xbtc840\
 r1-node-1@beacon_relay_signing@841@entry841#1=completed=protocol_result\
 =0xentry841=-=1,7=1=-=1 \
 r1-node-1@tbtc_dkg@842@dkg842#1=completed=persisted_tbtc_signer=0xdkg842=1\
-=1,7=1=-=1 \
+=1,7|1,7=1=-=1 \
 r1-node-1@tbtc_signing@843@sign843#1=completed=bitcoin_transaction=0xsign843\
 =-=1,7=1=-=1 \
 r1-node-1@tbtc_heartbeat@844@beat844#1=completed=protocol_result=0xbeat844=-\
@@ -4059,10 +4187,28 @@ check "a driver-claimed prior party outside the transcript is refused" 3 \
   "no tbtc_dkg tbtc_signing tbtc_heartbeat beacon_dkg beacon_signing \
 tbtc_wallet_action transcript incorporated a share"
 
+# The same fixture with a second holder of the DKG publishing a different account
+# of how its final group was rebuilt. Each record agrees with its own permit, so
+# neither contradicts itself — but one ceremony has one final group, and two
+# irreconcilable mappings of it leave the fleet with no way to place its own seats
+# in the space the transcripts speak in. Which seats of those transcripts this
+# fleet was sitting in is then unknown, and the step has to say so rather than
+# report the coverage gap that silence produces: read the other way, an unknown
+# map places none of the seats and every seat of a homogeneous transcript sits
+# outside it.
+run_verdict precutover_case eval '
+  PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS} \
+r1-node-2@tbtc_dkg@842@dkg842#9=completed=persisted_tbtc_signer=0xdkg842=7\
+=1,7|1,9=7=-=9"'
+check "an ownership map that cannot be placed is named as unknown" 3 \
+  "which seats of those transcripts this fleet was sitting in is unknown"
+
 # And the reverse mutation on the same fixture: a seat the fleet does not claim
 # is what makes the reading mixed, so moving that seat into a node's own
 # memberships leaves a transcript this fleet produced alone.
 run_verdict precutover_case eval '
+  PRECUTOVER_AUTHORED_ENDINGS="\
+${PRECUTOVER_AUTHORED_ENDINGS//=1,7|1,7=1=-=1/=1,7|1,7=1,7=-=1,7}"
   PRECUTOVER_AUTHORED_ENDINGS="\
 ${PRECUTOVER_AUTHORED_ENDINGS//=1,7=1=-=1/=1,7=1,7=-=1,7}"'
 check "a fleet claiming every seat authored no mixed transcript" 3 \
@@ -4325,7 +4471,7 @@ check "a holder the contributor set omits is not left uncounted" 3 \
 run_verdict precutover_case eval '
   PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS/\
 r1-node-1@tbtc_dkg@842@dkg842#1=completed=persisted_tbtc_signer=0xdkg842=1\
-=1,7=1=-=1/\
+=1,7|1,7=1=-=1/\
 r1-node-1@tbtc_dkg@842@dkg842#1=exhausted=no_threshold=-=-=-=-=-=-}"'
 check "a permit that produced nothing is not a party to a transcript" 1 \
   "tbtc_dkg@842@dkg842#1=exhausted"
@@ -4488,7 +4634,7 @@ run_verdict precutover_case eval \
   'PRECUTOVER_AUTHORED_ENDINGS="\
 ${PRECUTOVER_AUTHORED_ENDINGS% *} \
 r1-node-1@tbtc_dkg@845@bdkg845#1=completed=persisted_tbtc_signer=0xbdkg845=1\
-=1,7=1=-=-"'
+=1,7|1,7=1=-=-"'
 check "an ending recorded under another ceremony answers for no permit" 3 \
   "no node recorded an ending for r1-node-1@beacon_dkg@845@bdkg845#1"
 
@@ -6176,6 +6322,43 @@ else
   printf 'FAIL the transcript-publishing list drifted from the gate: %s\n' \
     "$(diff <(printf '%s\n' "${GO_TRANSCRIPT_CEREMONIES}") \
       <(printf '%s\n' "${READER_TRANSCRIPT_CEREMONIES}") | tr '\n' ' ')"
+  FAILED=$((FAILED + 1))
+fi
+
+# The ceremonies whose record speaks in a different membership index space than
+# their permits, held to the gate's own list in both the snapshot reader and the
+# shell verdicts. Three copies of one list is two chances to drift, and each
+# direction is silent in its own way: a ceremony the readers omit has its
+# published mapping refused as one it cannot have, taking the whole snapshot
+# down, while a ceremony they add has its permits translated through a mapping
+# nothing published — which places none of its seats and turns every ownership
+# map on that work into an unknown.
+GO_REMAPPED_CEREMONIES="$(sed -n \
+  '/^var permitSpaceMappingCeremonies/,/^}/p' \
+  "${TEST_DIR}/../../../pkg/protocol/participation/quiescence.go" |
+  grep -oE '^\t[A-Za-z]+:' | tr -d '\t:' |
+  while IFS= read -r ceremony; do
+    grep -oE "\b${ceremony}\s+Ceremony = \"[a-z_]+\"" \
+      "${TEST_DIR}/../../../pkg/protocol/participation/gate.go" |
+      grep -oE '"[a-z_]+"' | tr -d '"'
+  done | sort)"
+READER_REMAPPED_CEREMONIES="$(sed -n \
+  '/const REMAPPED_CEREMONIES = \[/,/^ *\];/p' "${TEST_DIR}/rehearse.sh" |
+  grep -oE '"[a-z_]+"' | tr -d '"' | sort)"
+SHELL_REMAPPED_CEREMONIES="$(sed -n \
+  '/^ceremony_remaps_permit_space()/,/^}/p' "${TEST_DIR}/rehearse.sh" |
+  grep -oE '^ +[a-z_]+\)' | tr -d ' )' | sort)"
+if [[ -n "${GO_REMAPPED_CEREMONIES}" ]] &&
+  [[ "${GO_REMAPPED_CEREMONIES}" == "${READER_REMAPPED_CEREMONIES}" ]] &&
+  [[ "${GO_REMAPPED_CEREMONIES}" == "${SHELL_REMAPPED_CEREMONIES}" ]]; then
+  printf 'ok   the remapped-index-space list matches the gate\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL the remapped-index-space list drifted from the gate: %s / %s\n' \
+    "$(diff <(printf '%s\n' "${GO_REMAPPED_CEREMONIES}") \
+      <(printf '%s\n' "${READER_REMAPPED_CEREMONIES}") | tr '\n' ' ')" \
+    "$(diff <(printf '%s\n' "${GO_REMAPPED_CEREMONIES}") \
+      <(printf '%s\n' "${SHELL_REMAPPED_CEREMONIES}") | tr '\n' ' ')"
   FAILED=$((FAILED + 1))
 fi
 
