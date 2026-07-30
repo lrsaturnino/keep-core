@@ -1661,6 +1661,58 @@ func TestDkgExecutor_ReportQuarantinedSigners_PersistedShareSurvivesAnUnreadable
 	)
 }
 
+// TestDkgExecutor_ReportInitialQuarantinedSigners_CountsAShareTheNamespaceTookLate
+// proves the whole handoff survives a restart: a share the namespace refused for
+// far longer than a passing fault, and then accepted, is counted by the next
+// process that starts over the same namespace.
+//
+// The count is what a rollback decision reads, and it is taken by whichever
+// process comes next rather than by the one that wrote. A preservation only the
+// writing process knew about would leave the material invisible to exactly the
+// decision it exists for — which is the same reason the retry is allowed to
+// outlast any particular fault in the first place.
+func TestDkgExecutor_ReportInitialQuarantinedSigners_CountsAShareTheNamespaceTookLate(
+	t *testing.T,
+) {
+	de, result, gsr, _, _ := setupPreserveScenario(t)
+
+	handle := &flakyRecordHandle{
+		namePrefix: "/membership_",
+		refusals:   quarantineGraceAttempts * 5,
+	}
+	de.signerQuarantine = newTestSignerQuarantine(handle, 100)
+
+	preserveOneSigner(t, de, result, gsr, group.MemberIndex(1))
+
+	if got := savedNames(&handle.mockPersistenceHandle); !reflect.DeepEqual(
+		got,
+		[]string{"/metadata_1", "/membership_1"},
+	) {
+		t.Fatalf("namespace holds %v, expected both halves", got)
+	}
+
+	// The next process: a new executor over the namespace the last one left,
+	// sharing none of its state — no floor, no standing count, no cache of
+	// what was written.
+	restarted, _, _, _, _ := setupPreserveScenario(t)
+	recorder := newDispatchGaugeRecorder()
+	restarted.metricsRecorder = recorder
+	restarted.signerQuarantine = newTestSignerQuarantine(handle, 1)
+
+	if err := restarted.reportInitialQuarantinedSigners(); err != nil {
+		t.Fatal(err)
+	}
+
+	testutils.AssertIntsEqual(
+		t,
+		"preserved outputs the next process counts",
+		1,
+		int(recorder.gauge(
+			clientinfo.MetricParticipationQuarantinedTBTCSigners,
+		)),
+	)
+}
+
 // TestSignerQuarantine_PreservedOutputs_RestartSeesWhatEachWriteFailureLeft
 // proves what a later process finds in the namespace after each half of a
 // preserved output was refused. A refused metadata write still leaves the key
