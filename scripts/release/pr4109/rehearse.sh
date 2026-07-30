@@ -4467,6 +4467,18 @@ fleet_terminal_outcomes() {
 # shorter list, exactly as the outcomes above: a fleet with one member missing
 # from the account is indistinguishable from a fleet whose permits all ended
 # unrecorded.
+#
+# A node that answers with provenance it cannot stand behind is rendered "-" in
+# that half rather than verbatim. The gate composes its identity from the
+# system entropy source and says the identity is unknown when that source fails;
+# the diagnostics layer publishes the word "unknown" for it. Carried through as
+# text, two such nodes — or one node twice — compare equal, and an equality test
+# then reads the case that was meant to be unfollowable as the followable one.
+# The sentinel cannot be an instance, so it can only ever compare unequal.
+#
+# Rendering anything off-shape the same way is what keeps the token parse honest
+# besides: an instance carrying a separator would otherwise split into a
+# different node than the one that answered.
 fleet_account_provenance() {
   local service instance forgotten out=""
   for service in "${REHEARSAL_R1_SERVICES[@]}"; do
@@ -4480,6 +4492,8 @@ fleet_account_provenance() {
       printf 'unreadable on %s' "${service}"
       return 0
     fi
+    [[ "${instance}" =~ ^[0-9a-f]{32}$ ]] || instance="-"
+    [[ "${forgotten}" =~ ^[0-9]+$ ]] || forgotten="-"
     out="${out}${out:+ }${service}=${instance}=${forgotten}"
   done
   printf '%s' "${out}"
@@ -4494,9 +4508,23 @@ fleet_account_provenance() {
 # the work ran has lost some of them and cannot say which. Both are the same thing
 # to a reader joining permits to endings, which is that this node's part in the
 # work is unknown — and an unknown must not be read as a node that took no part.
+#
+# So is provenance the node declined to state. "-" is what the reading above puts
+# in place of an identity a gate could not compose or a count that arrived
+# off-shape, and it is unfollowable on sight rather than compared: the question
+# an equality test answers is whether two readings came from the same process,
+# and neither of two blanks answers it. A count that went backwards is the same
+# refusal — the account only ever forgets — and it must not be subtracted into a
+# negative number of dropped permits and reported as a drop of some kind.
+#
+# A node that answers afterwards with no reading of it beforehand is unfollowable
+# too. Both readings are taken over one fixed service list, so the only way to
+# lose the earlier one is for the pair to describe different fleets, and a node
+# whose account was never sampled while the work ran cannot be held to it.
 unfollowable_account_nodes() {
   local before="$1" after="$2"
   local token service instance forgotten earlier was was_forgotten out=""
+  local matched
   case "${before}" in
     unreadable*)
       printf '%s' "${before}"
@@ -4514,20 +4542,35 @@ unfollowable_account_nodes() {
     instance="${token#*=}"
     forgotten="${instance##*=}"
     instance="${instance%%=*}"
+    matched=0
     for earlier in ${before}; do
       [[ "${earlier%%=*}" == "${service}" ]] || continue
+      matched=1
       was="${earlier#*=}"
       was_forgotten="${was##*=}"
       was="${was%%=*}"
-      if [[ "${was}" != "${instance}" ]]; then
+      if [[ "${instance}" == "-" || "${was}" == "-" ]]; then
+        out="${out}${out:+, }${service} (does not say which process its \
+account of closed permits belongs to)"
+      elif [[ "${was}" != "${instance}" ]]; then
         out="${out}${out:+, }${service} (answered from a different process \
 than the one the work ran on)"
+      elif [[ "${forgotten}" == "-" || "${was_forgotten}" == "-" ]]; then
+        out="${out}${out:+, }${service} (does not say how many closed permits \
+its account has dropped)"
+      elif ((forgotten < was_forgotten)); then
+        out="${out}${out:+, }${service} (its account reports having dropped \
+fewer closed permits than it had already dropped before the work ran)"
       elif [[ "${forgotten}" != "${was_forgotten}" ]]; then
         out="${out}${out:+, }${service} (its account dropped \
 $((forgotten - was_forgotten)) closed permits while the work ran)"
       fi
       break
     done
+    if ((matched == 0)); then
+      out="${out}${out:+, }${service} (its account was not read before the \
+work ran)"
+    fi
   done
   printf '%s' "${out}"
 }

@@ -1814,6 +1814,69 @@ check_join "an unreadable reading after the work takes the fleet" \
   "unreadable on r1-node-1" \
   "$(unfollowable_account_nodes "${ACCOUNTS_BEFORE}" \
     "unreadable on r1-node-1")"
+# Provenance a node declined to state, on either side of the drive. This is the
+# case an equality test gets exactly backwards: two nodes that cannot say which
+# process they are compare equal, and the reading meant to be unfollowable comes
+# out as the followable one.
+check_join "a node that cannot say which process it is, is named" \
+  "r1-node-2 (does not say which process its account of closed permits \
+belongs to)" \
+  "$(unfollowable_account_nodes "r1-node-1=aa11=0 r1-node-2=-=0" \
+    "r1-node-1=aa11=0 r1-node-2=-=0")"
+check_join "a node that could not say which process it was, is named" \
+  "r1-node-1 (does not say which process its account of closed permits \
+belongs to)" \
+  "$(unfollowable_account_nodes "r1-node-1=-=0 r1-node-2=bb22=3" \
+    "${ACCOUNTS_BEFORE}")"
+check_join "a node that cannot say what it has dropped is named" \
+  "r1-node-2 (does not say how many closed permits its account has dropped)" \
+  "$(unfollowable_account_nodes "${ACCOUNTS_BEFORE}" \
+    "r1-node-1=aa11=0 r1-node-2=bb22=-")"
+# The account only ever forgets, so a count that went backwards is a reading no
+# gate produced. Subtracting it would report a negative drop as a drop of some
+# kind, which reads as a quantified loss rather than as an unusable answer.
+check_join "a node whose dropped count went backwards is named" \
+  "r1-node-2 (its account reports having dropped fewer closed permits than it \
+had already dropped before the work ran)" \
+  "$(unfollowable_account_nodes "${ACCOUNTS_BEFORE}" \
+    "r1-node-1=aa11=0 r1-node-2=bb22=1")"
+# Both readings are taken over one fixed service list, so a node present only
+# afterwards means the pair describes two different fleets.
+check_join "a node with no reading before the work is named" \
+  "r1-node-3 (its account was not read before the work ran)" \
+  "$(unfollowable_account_nodes "${ACCOUNTS_BEFORE}" \
+    "${ACCOUNTS_BEFORE} r1-node-3=dd44=0")"
+
+# What the gate publishes when its entropy source failed, and what the reading
+# has to make of it. The gate says the identity is unknown; the diagnostics layer
+# publishes the word. Carried through as text it is an ordinary token that
+# compares equal to itself, so the reading renders it as the one thing that
+# cannot be an identity and is refused on sight.
+SAVED_R1_SERVICES=("${REHEARSAL_R1_SERVICES[@]}")
+REHEARSAL_R1_SERVICES=("r1-node-1" "r1-node-2")
+PROVENANCE_OUT="$(
+  (
+    # shellcheck disable=SC2329
+    participation_field() {
+      if [[ "$2" != gate_instance ]]; then
+        printf '0'
+      elif [[ "$1" == r1-node-1 ]]; then
+        printf 'unknown'
+      else
+        printf '0123456789abcdef0123456789abcdef'
+      fi
+    }
+    fleet_account_provenance
+  ) 2>&1
+)"
+REHEARSAL_R1_SERVICES=("${SAVED_R1_SERVICES[@]}")
+check_join "an unknown gate identity is rendered as no identity at all" \
+  "r1-node-1=-=0 r1-node-2=0123456789abcdef0123456789abcdef=0" \
+  "${PROVENANCE_OUT}"
+check_join "two nodes that could not compose an identity are both named" \
+  "r1-node-1 (does not say which process its account of closed permits \
+belongs to)" \
+  "$(unfollowable_account_nodes "${PROVENANCE_OUT}" "${PROVENANCE_OUT}")"
 
 # A node that cannot be asked makes the whole reading unusable. A shorter list
 # would be indistinguishable from a fleet whose permits all ended unrecorded.
