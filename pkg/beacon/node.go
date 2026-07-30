@@ -10,6 +10,7 @@ import (
 	"math"
 	"math/big"
 	"slices"
+	"sync"
 
 	bn256 "github.com/ethereum/go-ethereum/crypto/bn256/cloudflare"
 	"github.com/ipfs/go-log/v2"
@@ -49,10 +50,27 @@ type node struct {
 	signerQuarantine *registry.Quarantine
 
 	// metricsRecorder publishes the fixed participation family shared with the
-	// cutover gate. In particular, it records a terminal quarantine
-	// preservation failure even when the namespace retained no share for the
-	// offline audit to enumerate.
+	// cutover gate. In particular, it records a live incomplete quarantine
+	// preservation even when the namespace retained no share for the offline
+	// audit to enumerate.
 	metricsRecorder participation.GateMetricsRecorder
+
+	// quarantineMetricsMutex guards incompleteQuarantineOutputs and serializes
+	// its gauge publication across concurrently preserving DKG members.
+	quarantineMetricsMutex sync.Mutex
+
+	// incompleteQuarantineOutputs names preservation attempts that exhausted
+	// their write-grace rounds and are still holding an output whose key
+	// material and audit record are not both durable.
+	incompleteQuarantineOutputs map[beaconQuarantinedSigner]struct{}
+}
+
+// beaconQuarantinedSigner is the public, nonsecret identity of one beacon
+// output in the quarantine namespace. It deduplicates repeated incomplete
+// notifications for the same group seat.
+type beaconQuarantinedSigner struct {
+	groupPublicKey string
+	memberIndex    group.MemberIndex
 }
 
 func beaconDKGPermitIdentity(
@@ -437,6 +455,10 @@ func (n *node) quarantineSigner(
 	channelName := hex.EncodeToString(
 		interrupted.Signer.GroupPublicKeyBytesCompressed(),
 	)
+	quarantineOutput := beaconQuarantinedSigner{
+		groupPublicKey: channelName,
+		memberIndex:    memberIndex,
+	}
 	seedHash := sha256.Sum256(dkgSeed.Bytes())
 
 	state, err := n.signerQuarantine.Preserve(
@@ -459,6 +481,7 @@ func (n *node) quarantineSigner(
 		// node stops taking new work while it is still holding an output the
 		// namespace does not fully have.
 		func(state registry.QuarantineState, cause error) {
+			n.markIncompleteQuarantine(quarantineOutput)
 			n.blockOnIncompleteQuarantine(
 				dkgLogger,
 				memberIndex,
@@ -468,17 +491,15 @@ func (n *node) quarantineSigner(
 		},
 	)
 
-	// The quarantine namespace may refuse every form of the output. In that
-	// case no audit record survives and the ordinary preserved-output reading
-	// remains indistinguishable from a node that quarantined nothing. Publish
-	// one terminal failure when the retry ends incomplete; a transient failure
-	// that recovers before Preserve returns does not increment the counter.
-	if err != nil && n.metricsRecorder != nil {
-		n.metricsRecorder.IncrementCounter(
-			clientinfo.
-				MetricParticipationBeaconQuarantinePreservationFailuresTotal,
-			1,
-		)
+	// The callback above normally reports an incomplete output while Preserve
+	// is still retrying. A failure before the retry loop begins has no grace
+	// callback, and a process lifetime that ends before grace can return without
+	// one too, so account for both here. A completed retry removes the output
+	// from the live gauge; the cumulative failure counter remains as history.
+	if state.Complete() {
+		n.resolveIncompleteQuarantine(quarantineOutput)
+	} else {
+		n.markIncompleteQuarantine(quarantineOutput)
 	}
 
 	// The terminal outcome needs the whole output. The audit record is what
@@ -502,6 +523,63 @@ func (n *node) quarantineSigner(
 			Kind: participation.TerminalEvidenceQuarantinedBeaconSigner,
 		},
 	)
+}
+
+// markIncompleteQuarantine publishes a newly observed incomplete preservation.
+// The normal call is the live grace-exhaustion callback; the return-time call
+// covers failures that reached no callback. The counter records each distinct
+// incomplete episode and the gauge remains nonzero for as long as the output
+// lacks either key material or its audit record.
+func (n *node) markIncompleteQuarantine(
+	output beaconQuarantinedSigner,
+) {
+	n.quarantineMetricsMutex.Lock()
+	defer n.quarantineMetricsMutex.Unlock()
+
+	if n.incompleteQuarantineOutputs == nil {
+		n.incompleteQuarantineOutputs =
+			make(map[beaconQuarantinedSigner]struct{})
+	}
+	if _, exists := n.incompleteQuarantineOutputs[output]; exists {
+		return
+	}
+
+	n.incompleteQuarantineOutputs[output] = struct{}{}
+	if n.metricsRecorder == nil {
+		return
+	}
+
+	n.metricsRecorder.IncrementCounter(
+		clientinfo.MetricParticipationBeaconQuarantinePreservationFailuresTotal,
+		1,
+	)
+	n.metricsRecorder.SetGauge(
+		clientinfo.MetricParticipationBeaconQuarantineIncompleteOutputs,
+		float64(len(n.incompleteQuarantineOutputs)),
+	)
+}
+
+// resolveIncompleteQuarantine clears the live incomplete-output signal only
+// after preservation has made the whole output durable. An output still
+// incomplete when the process lifetime ends deliberately remains nonzero in
+// the last readable sample; the cumulative counter is never decremented.
+func (n *node) resolveIncompleteQuarantine(
+	output beaconQuarantinedSigner,
+) {
+	n.quarantineMetricsMutex.Lock()
+	defer n.quarantineMetricsMutex.Unlock()
+
+	if _, exists := n.incompleteQuarantineOutputs[output]; !exists {
+		return
+	}
+
+	delete(n.incompleteQuarantineOutputs, output)
+	if n.metricsRecorder != nil {
+		n.metricsRecorder.SetGauge(
+			clientinfo.MetricParticipationBeaconQuarantineIncompleteOutputs,
+			float64(len(n.incompleteQuarantineOutputs)),
+		)
+	}
 }
 
 // blockOnIncompleteQuarantine stops this node from beginning new ceremonies

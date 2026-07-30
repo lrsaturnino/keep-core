@@ -338,6 +338,8 @@ func (pm *PerformanceMetrics) registerAllMetrics() {
 		MetricParticipationActiveCeremonies,
 		MetricParticipationActiveLegacyCeremonies,
 		MetricParticipationActiveSecurityV2Ceremonies,
+		MetricParticipationTBTCQuarantineIncompleteOutputs,
+		MetricParticipationBeaconQuarantineIncompleteOutputs,
 		MetricParticipationQuarantinedTBTCSigners,
 	}
 
@@ -764,15 +766,25 @@ const (
 	MetricParticipationQuiesceTotal                       = "participation_quiesce_total"
 	MetricParticipationQuiesceForcedAbortsTotal           = "participation_quiesce_forced_aborts_total"
 
-	// The quarantine-preservation failure counters distinguish a node that
-	// attempted to preserve generated key material but reached the end of its
-	// process lifetime with an incomplete output from one that had no
-	// quarantine work to report. They are protocol-specific fixed counters so
-	// the fleet and rollback evidence can identify which recovery path failed
-	// without introducing per-output labels.
+	// The quarantine-preservation failure counters increment as soon as an
+	// output remains incomplete after the write-grace rounds, while the process
+	// is still alive and retrying. An attempt that returns incomplete before
+	// that observer can run is counted on return. They are protocol-specific
+	// fixed counters so the fleet and rollback evidence can identify which
+	// recovery path failed without introducing per-output labels.
 	MetricParticipationTBTCQuarantinePreservationFailuresTotal   = "participation_tbtc_quarantine_preservation_failures_total"
 	MetricParticipationBeaconQuarantinePreservationFailuresTotal = "participation_beacon_quarantine_preservation_failures_total"
 	MetricHeartbeatPenaltySuppressedTotal                        = "heartbeat_penalty_suppressed_total"
+
+	// The quarantine-incomplete gauges report outputs the running process is
+	// still holding while their protected namespace lacks either key material
+	// or the audit record explaining it. A live retry raises them at the same
+	// grace-exhaustion transition as the counters above, and they return to zero
+	// only after the full output becomes durable. A total-write refusal
+	// therefore remains visible for the entire live retry instead of surfacing
+	// only during teardown.
+	MetricParticipationTBTCQuarantineIncompleteOutputs   = "participation_tbtc_quarantine_incomplete_outputs"
+	MetricParticipationBeaconQuarantineIncompleteOutputs = "participation_beacon_quarantine_incomplete_outputs"
 
 	// MetricParticipationQuarantinedTBTCSigners counts the tBTC signer outputs
 	// held in the protected quarantine namespace that this process has not

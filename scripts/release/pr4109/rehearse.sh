@@ -2915,6 +2915,11 @@ run_local_proof_suite() {
   # on the dispatches that happen to produce records for validate-evidence
   # — and its verdicts land in this stage's archived log.
   "${SCRIPT_DIR}/test-validate-evidence.sh"
+  # The workflow's own dispatch validator is extracted and driven over valid
+  # and hostile provenance/chain mappings. This keeps an invalid dispatch from
+  # reaching the expensive platform jobs merely because no container
+  # rehearsal happened to exercise that input shape.
+  "${SCRIPT_DIR}/test-rehearsal-matrix.sh"
   # The readiness verdict this stage is about to write is the one thing in the
   # receipt the validator suite cannot prove: that suite hand-authors the
   # verdict file, so it holds the refusal without ever running the producer.
@@ -3060,7 +3065,8 @@ stage_shell_analysis() {
   command -v npx >/dev/null 2>&1 ||
     blocked "npx (Node.js) is required by the evidence-validator self-test"
   command -v git >/dev/null 2>&1 ||
-    blocked "git is required by both validator self-tests"
+    blocked "git is required by the source-binding and evidence-record \
+validator self-tests"
 
   (
     cd "${REPO_ROOT}"
@@ -3109,6 +3115,8 @@ stage_shell_analysis() {
     "${SCRIPT_DIR}/test-source-binding.sh"
     note "evidence-record validator self-test"
     "${SCRIPT_DIR}/test-validate-evidence.sh"
+    note "native-runner matrix validator self-test"
+    "${SCRIPT_DIR}/test-rehearsal-matrix.sh"
   ) 2>&1 | tee "${log}"
 
   note "shell and workflow analysis recorded in ${log}"
@@ -3900,6 +3908,8 @@ PARTICIPATION_METRICS=(
   participation_quiesce_forced_aborts_total
   participation_tbtc_quarantine_preservation_failures_total
   participation_beacon_quarantine_preservation_failures_total
+  participation_tbtc_quarantine_incomplete_outputs
+  participation_beacon_quarantine_incomplete_outputs
   participation_quarantined_tbtc_signers
 )
 
@@ -9745,17 +9755,22 @@ rollback_quarantine_preservation_verdict() {
   local step="quarantine preservation failures remain zero through quiescence"
   local assertion="rollback quiescence loses no generated signer output to \
 an unwritable quarantine namespace"
-  local service tbtc_failures beacon_failures nodes=0
+  local service tbtc_failures beacon_failures tbtc_incomplete beacon_incomplete
+  local nodes=0
   local unread="" failed=""
 
-  while read -r service tbtc_failures beacon_failures; do
+  while read -r service tbtc_failures beacon_failures tbtc_incomplete \
+    beacon_incomplete; do
     [[ -n "${service}" ]] || continue
     nodes=$((nodes + 1))
 
     if [[ ! "${tbtc_failures}" =~ ^[0-9]+$ ]] ||
-      [[ ! "${beacon_failures}" =~ ^[0-9]+$ ]]; then
+      [[ ! "${beacon_failures}" =~ ^[0-9]+$ ]] ||
+      [[ ! "${tbtc_incomplete}" =~ ^[0-9]+$ ]] ||
+      [[ ! "${beacon_incomplete}" =~ ^[0-9]+$ ]]; then
       unread="${unread}${unread:+, }${service} (tBTC \
-${tbtc_failures}, beacon ${beacon_failures})"
+failures ${tbtc_failures}, beacon failures ${beacon_failures}, tBTC incomplete \
+${tbtc_incomplete}, beacon incomplete ${beacon_incomplete})"
       continue
     fi
 
@@ -9763,11 +9778,17 @@ ${tbtc_failures}, beacon ${beacon_failures})"
 \"${service}.participation_tbtc_quarantine_preservation_failures_total\":\
 ${tbtc_failures},\
 \"${service}.participation_beacon_quarantine_preservation_failures_total\":\
-${beacon_failures}"
+${beacon_failures},\
+\"${service}.participation_tbtc_quarantine_incomplete_outputs\":\
+${tbtc_incomplete},\
+\"${service}.participation_beacon_quarantine_incomplete_outputs\":\
+${beacon_incomplete}"
 
-    if ((tbtc_failures > 0 || beacon_failures > 0)); then
-      failed="${failed}${failed:+, }${service} (tBTC ${tbtc_failures}, \
-beacon ${beacon_failures})"
+    if ((tbtc_failures > 0 || beacon_failures > 0 ||
+      tbtc_incomplete > 0 || beacon_incomplete > 0)); then
+      failed="${failed}${failed:+, }${service} (tBTC failures \
+${tbtc_failures}, beacon failures ${beacon_failures}, tBTC incomplete \
+${tbtc_incomplete}, beacon incomplete ${beacon_incomplete})"
     fi
   done <<<"${ROLLBACK_QUARANTINE_PRESERVATION_FAILURES}"
 
@@ -9777,9 +9798,9 @@ captured while the fleet drained; an absent reading cannot say that no \
 generated share was lost"
     record_assertion "${assertion}" false "${step}"
   elif [[ -n "${unread}" ]]; then
-    block_step "${step}" "the terminal quarantine-preservation counters were \
-unreadable on ${unread}; zero must be a node-authored reading, not the value \
-assigned to a node that stopped answering"
+    block_step "${step}" "the quarantine-preservation counters or live \
+incomplete-output gauges were unreadable on ${unread}; zero must be a \
+node-authored reading, not the value assigned to a node that stopped answering"
     record_assertion "${assertion}" false "${step}"
   elif [[ -n "${failed}" ]]; then
     record_step "${step}" fail "generated signer output did not reach a \
@@ -9787,9 +9808,9 @@ complete protected quarantine on ${failed}; no offline audit can recover a \
 share the namespace retained nowhere"
     record_assertion "${assertion}" false "${step}"
   else
-    record_step "${step}" pass "every R1 node reported zero terminal tBTC and \
-beacon quarantine-preservation failures through its last readable drain \
-sample"
+    record_step "${step}" pass "every R1 node reported zero tBTC and beacon \
+quarantine-preservation failures and zero live incomplete outputs through its \
+last readable drain sample"
     record_assertion "${assertion}" true "${step}"
   fi
 }
@@ -11752,6 +11773,7 @@ nowhere to capture them to"
   # each permit rather than about the size of the population.
   local held_at_stop=() forced_before=() forced_after=() final_active=()
   local tbtc_preservation_failures=() beacon_preservation_failures=()
+  local tbtc_incomplete_outputs=() beacon_incomplete_outputs=()
   local authored_endings=()
   local svc reading
   for svc in "${REHEARSAL_R1_SERVICES[@]}"; do
@@ -11786,6 +11808,18 @@ nowhere to capture them to"
       2>/dev/null || printf 'unreadable')"
     [[ "${reading}" =~ ^[0-9]+$ ]] || reading="unreadable"
     beacon_preservation_failures+=("${reading}")
+
+    reading="$(metric_value "${svc}" \
+      participation_tbtc_quarantine_incomplete_outputs \
+      2>/dev/null || printf 'unreadable')"
+    [[ "${reading}" =~ ^[0-9]+$ ]] || reading="unreadable"
+    tbtc_incomplete_outputs+=("${reading}")
+
+    reading="$(metric_value "${svc}" \
+      participation_beacon_quarantine_incomplete_outputs \
+      2>/dev/null || printf 'unreadable')"
+    [[ "${reading}" =~ ^[0-9]+$ ]] || reading="unreadable"
+    beacon_incomplete_outputs+=("${reading}")
   done
 
   # The grace comes out of the reviewed manifest, which the Go drift test
@@ -11840,7 +11874,7 @@ nowhere to capture them to"
     # and not the endings, and the reconciliation would then read a drained
     # node beside the ending list from before that permit closed.
     local idx=0 snapshot_now active_now forced_now tbtc_failure_now
-    local beacon_failure_now
+    local beacon_failure_now tbtc_incomplete_now beacon_incomplete_now
     for svc in "${REHEARSAL_R1_SERVICES[@]}"; do
       if snapshot_now="$(service_gate_snapshot "${svc}" \
         active_security_v2_ceremonies 2>/dev/null)"; then
@@ -11872,6 +11906,20 @@ nowhere to capture them to"
         2>/dev/null || printf '')"
       if [[ "${beacon_failure_now}" =~ ^[0-9]+$ ]]; then
         beacon_preservation_failures[idx]="${beacon_failure_now}"
+      fi
+
+      tbtc_incomplete_now="$(metric_value "${svc}" \
+        participation_tbtc_quarantine_incomplete_outputs \
+        2>/dev/null || printf '')"
+      if [[ "${tbtc_incomplete_now}" =~ ^[0-9]+$ ]]; then
+        tbtc_incomplete_outputs[idx]="${tbtc_incomplete_now}"
+      fi
+
+      beacon_incomplete_now="$(metric_value "${svc}" \
+        participation_beacon_quarantine_incomplete_outputs \
+        2>/dev/null || printf '')"
+      if [[ "${beacon_incomplete_now}" =~ ^[0-9]+$ ]]; then
+        beacon_incomplete_outputs[idx]="${beacon_incomplete_now}"
       fi
       idx=$((idx + 1))
     done
@@ -11916,7 +11964,9 @@ ${ROLLBACK_NODE_ENDINGS:+$'\n'}${svc} ${authored_endings[${pos}]}"
 ${ROLLBACK_QUARANTINE_PRESERVATION_FAILURES}\
 ${ROLLBACK_QUARANTINE_PRESERVATION_FAILURES:+$'\n'}${svc} \
 ${tbtc_preservation_failures[${pos}]} \
-${beacon_preservation_failures[${pos}]}"
+${beacon_preservation_failures[${pos}]} \
+${tbtc_incomplete_outputs[${pos}]} \
+${beacon_incomplete_outputs[${pos}]}"
     pos=$((pos + 1))
   done
 
@@ -12719,7 +12769,8 @@ evidence_acceptance_findings() {
   local record="$1"
   node -e '
     const fs = require("fs");
-    const record = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    const [recordPath, ...expectedServices] = process.argv.slice(1);
+    const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
 
     const contracts = {
       single_release: {
@@ -12925,14 +12976,15 @@ evidence_acceptance_findings() {
         !Array.isArray(preservationStage.gauges)
           ? preservationStage.gauges
           : {};
-      // The reviewed compose harness has exactly these two R1 services.
-      // Requiring each name prevents the zero from one healthy node from
-      // standing in for another node that stopped answering before it
-      // published whether quarantine preservation failed.
-      const expectedServices = ["r1-node-1", "r1-node-2"];
+      // The shell roster drives the fleet and is held to the compose file by
+      // the validator self-test. Requiring every service in that same roster
+      // prevents one healthy node from standing in for another node that
+      // stopped answering before it published whether preservation failed.
       for (const metric of [
         "participation_tbtc_quarantine_preservation_failures_total",
         "participation_beacon_quarantine_preservation_failures_total",
+        "participation_tbtc_quarantine_incomplete_outputs",
+        "participation_beacon_quarantine_incomplete_outputs",
       ]) {
         for (const service of expectedServices) {
           const name = service + "." + metric;
@@ -13011,7 +13063,7 @@ evidence_acceptance_findings() {
     }
 
     process.stdout.write(findings.join("\n"));
-  ' "${record}"
+  ' "${record}" "${REHEARSAL_R1_SERVICES[@]}"
 }
 
 # Apply the acceptance contract to a caller-selected record set. The

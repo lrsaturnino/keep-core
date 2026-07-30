@@ -667,6 +667,7 @@ jobs:
           NODE
 
   container-rehearsal:
+    name: Container rehearsal (${{ matrix.platform }})
     # The container stages need the immutable digests, a rehearsal chain, the
     # per-node keys/configs, and the chain-side programs no repository can
     # derive — the driver that originates protocol work, and the generator that

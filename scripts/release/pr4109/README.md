@@ -43,7 +43,7 @@ from `packageManager` and a never-skipped `yarn install --immutable` before
 itself: `bash -n` and ShellCheck over every script here, actionlint v1.7.12
 over the scaffold's own workflows (scoped to them on purpose; the unrelated
 workflows carry pre-existing findings, and a gate that is red for reasons
-outside its scope stops being read), and both validator self-tests. That
+outside its scope stops being read), and all boundary self-tests. That
 last stage is the one CI runs unconditionally — see
 `.github/workflows/cutover-scaffold-lint.yml` below — because the checkers
 that admit rehearsal evidence must never be proved only by a manual
@@ -1147,6 +1147,15 @@ runs `validate-evidence` once in `aggregate-rehearsal-evidence` after all
 platform jobs. Full per-platform artifacts remain separate because their audit
 trees legitimately contain colliding filenames.
 
+The dispatch boundary is executable under fixtures too.
+`test-rehearsal-matrix.sh` extracts the Node program from the workflow step
+that builds the runner matrix and drives that exact program over accepted
+amd64/arm64 mappings plus malformed base64 and UTF-8, duplicate JSON members,
+bad endpoint and integer forms, unsupported or repeated provenance platforms,
+and missing or surplus platform inputs. The proof and shell-analysis stages run
+this test alongside the evidence validator, so changing the workflow changes
+the implementation under test rather than leaving a copied validator behind.
+
 A receipt belongs to one run at one commit, and three rules keep it that
 way. `local-proofs` destroys the receipt it inherits — interrupted staging
 directories included — *before* it proves anything, so a run failing at any
@@ -1331,8 +1340,8 @@ gate for the checkers that decide what may become release evidence. The
 (`.github/workflows/cutover-scaffold-lint.yml`) is what runs without being
 asked: on every push and pull request touching the scaffold it runs
 `./rehearse.sh shell-analysis`, which puts shell syntax, ShellCheck,
-actionlint, the build-context mirror check, and both validator self-tests over
-every change to `rehearse.sh`, to either self-test, and to the workflows
+actionlint, the build-context mirror check, and all three boundary self-tests
+over every change to `rehearse.sh`, to a self-test, and to the workflows
 themselves. Whether failing it also *blocks a merge* is a setting outside this
 repository, and one whose standing is recorded — not assumed — under "An
 enforcing ruleset behind the scaffold gate" in **Hard external dependencies**.
@@ -1951,14 +1960,22 @@ A namespace that refuses every membership, metadata, and combined-handoff
 write is the still narrower failure: no document survives for the offline
 audit to discover, and the tBTC quarantined-signer gauge correctly remains
 zero because the namespace retained no signer. The node now publishes that
-attempt separately. Every incomplete tBTC preservation increments
+attempt separately while the preservation retry and client-info endpoint are
+both still live. Every tBTC preservation that remains incomplete after its
+write-grace rounds increments
 `performance_participation_tbtc_quarantine_preservation_failures_total`, and
 the beacon path mirrors it with
 `performance_participation_beacon_quarantine_preservation_failures_total`.
-Both counters are pre-registered at zero. The rollback rehearsal samples them
-while each candidate drains and refuses a nonzero or unreadable value; zero
-means the node reported no terminal preservation failure, not that a missing
-share was counted as an empty quarantine.
+Both counters are pre-registered at zero and retain the incomplete episode as
+history. The accompanying
+`performance_participation_tbtc_quarantine_incomplete_outputs` and
+`performance_participation_beacon_quarantine_incomplete_outputs` gauges are
+also pre-registered at zero, rise for the whole live retry after grace is
+exhausted, and clear only when the full output becomes durable. The rollback
+rehearsal samples all four signals while each candidate drains and refuses a
+nonzero or unreadable value; zero means the node reported neither a
+grace-exhausting preservation failure nor an output currently incomplete, not
+that a missing share was counted as an empty quarantine.
 
 Two things would close it, and both are decisions rather than oversights. A
 `keep-common` change making `Write` write-temp-sync-rename-sync-dir is the

@@ -200,8 +200,12 @@ ROLLBACK_STAGES='
   { "name": "quarantine preservation failures remain zero through quiescence", "outcome": "pass", "gauges": {
       "r1-node-1.participation_tbtc_quarantine_preservation_failures_total": 0,
       "r1-node-1.participation_beacon_quarantine_preservation_failures_total": 0,
+      "r1-node-1.participation_tbtc_quarantine_incomplete_outputs": 0,
+      "r1-node-1.participation_beacon_quarantine_incomplete_outputs": 0,
       "r1-node-2.participation_tbtc_quarantine_preservation_failures_total": 0,
-      "r1-node-2.participation_beacon_quarantine_preservation_failures_total": 0
+      "r1-node-2.participation_beacon_quarantine_preservation_failures_total": 0,
+      "r1-node-2.participation_tbtc_quarantine_incomplete_outputs": 0,
+      "r1-node-2.participation_beacon_quarantine_incomplete_outputs": 0
     } },
   { "name": "no prior binary starts during quiescence", "outcome": "pass" },
   { "name": "a forced deadline quarantines rather than completing", "outcome": "pass" },
@@ -1142,8 +1146,9 @@ check "a record naming a review the control does not pin is rejected" 3 \
   "review record hashing to \[c{64}\]"
 
 # The rollback assertion is not accepted on its prose alone. Its designated
-# stage must carry both pre-registered protocol counters as node-authored
-# numeric readings; an absent series is an unread instrument, not a zero.
+# stage must carry both pre-registered protocol counters and both live
+# incomplete-output gauges as node-authored numeric readings; an absent series
+# is an unread instrument, not a zero.
 D="${WORK}/accept-rollback-missing-preservation-reading"
 mkdir -p "${D}"
 write_attestation "${D}"
@@ -1194,6 +1199,57 @@ node -e '
 run_validator "${D}"
 check "a reported quarantine-preservation failure refutes rollback" 1 \
   "quarantine-preservation reading.*tbtc.*is 1, not zero"
+
+# The live gauge is independently load-bearing. The counter records that an
+# output exhausted its grace rounds; the gauge proves a running node is not
+# still holding one incomplete when the rollback drain samples it.
+D="${WORK}/accept-rollback-missing-incomplete-reading"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z" "${FIXTURE_SHA}" "${ROLLBACK_STAGES}" \
+  "${ROLLBACK_ASSERTIONS}" "rollback"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  const stage = record.stages.find(
+    ({ name }) =>
+      name ===
+      "quarantine preservation failures remain zero through quiescence"
+  );
+  delete stage.gauges[
+    "r1-node-2.participation_beacon_quarantine_incomplete_outputs"
+  ];
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "rollback acceptance requires every live incomplete-output reading" 3 \
+  "carries no fleet reading of.*r1-node-2.*beacon_quarantine_incomplete_outputs"
+
+D="${WORK}/accept-rollback-incomplete-output"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z" "${FIXTURE_SHA}" "${ROLLBACK_STAGES}" \
+  "${ROLLBACK_ASSERTIONS}" "rollback"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  const stage = record.stages.find(
+    ({ name }) =>
+      name ===
+      "quarantine preservation failures remain zero through quiescence"
+  );
+  stage.gauges[
+    "r1-node-2.participation_tbtc_quarantine_incomplete_outputs"
+  ] = 1;
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "a live incomplete quarantine output refutes rollback" 1 \
+  "quarantine-preservation reading.*tbtc_quarantine_incomplete_outputs.*is 1"
 
 # Repetition and invention cannot manufacture a complete gate. These records
 # keep the canonical item count deliberately plausible so the decision cannot
@@ -7514,6 +7570,40 @@ if [[ -z "${UNDEFINED_HELPERS}" ]]; then
 else
   printf 'FAIL the container stages call undefined helpers:%s\n' \
     "${UNDEFINED_HELPERS}"
+  FAILED=$((FAILED + 1))
+fi
+
+# The rollback acceptance reader receives the same R1 service array every
+# fleet operation uses. Hold that array to the compose services whose image is
+# R1_IMAGE_DIGEST so adding or renaming a node cannot leave acceptance asking
+# for a stale pair of metric names (or silently stop asking for the new node).
+COMPOSE_R1_SERVICES="$(awk '
+  /^services:[[:space:]]*$/ {
+    in_services = 1
+    next
+  }
+  in_services && /^[^[:space:]#]/ {
+    exit
+  }
+  in_services && /^  [[:alnum:]_-]+:[[:space:]]*$/ {
+    service = $1
+    sub(/:$/, "", service)
+    next
+  }
+  in_services &&
+    /^    image:[[:space:]]*"\$\{R1_IMAGE_DIGEST\}"[[:space:]]*$/ {
+    print service
+  }
+' "${TEST_DIR}/compose.rehearsal.yaml")"
+SHELL_R1_SERVICES="$(printf '%s\n' "${REHEARSAL_R1_SERVICES[@]}")"
+if [[ -n "${COMPOSE_R1_SERVICES}" ]] &&
+  [[ "${COMPOSE_R1_SERVICES}" == "${SHELL_R1_SERVICES}" ]]; then
+  printf 'ok   the R1 service roster matches the compose fleet\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL the R1 service roster drifted from the compose fleet: %s\n' \
+    "$(diff <(printf '%s\n' "${COMPOSE_R1_SERVICES}") \
+      <(printf '%s\n' "${SHELL_R1_SERVICES}") | tr '\n' ' ')"
   FAILED=$((FAILED + 1))
 fi
 

@@ -8,7 +8,7 @@ name: Cutover Scaffold Lint
 # dispatched workflow. Nothing therefore proved a change to them until
 # somebody remembered to dispatch a rehearsal. This job runs on every push
 # and pull request that touches those files: shell syntax, ShellCheck,
-# actionlint over the scaffold's own workflows, both validator self-tests,
+# actionlint over the scaffold's own workflows, all boundary self-tests,
 # and the check holding the verifier's hand-written build-context
 # classification to the rules .dockerignore really carries. It is
 # deliberately cheap — no Docker image build, no Go test suite — so it can be

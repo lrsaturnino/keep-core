@@ -2166,6 +2166,116 @@ func TestDkgExecutor_PreserveInterruptedSigner_LostShareBlocksNewCeremonies(
 	}
 }
 
+// TestDkgExecutor_PreserveInterruptedSigner_PublishesIncompleteWhileProcessLives
+// proves total quarantine refusal is visible while the node can still answer a
+// scrape. The preservation retry is deliberately held inside a live process
+// lifetime after its grace notification; neither the counter nor the gauge may
+// wait for teardown to report the output the node still holds only in memory.
+func TestDkgExecutor_PreserveInterruptedSigner_PublishesIncompleteWhileProcessLives(
+	t *testing.T,
+) {
+	de, result, gsr, _, _ := setupPreserveScenario(t)
+
+	lifetime, cancelLifetime := context.WithCancel(context.Background())
+	defer cancelLifetime()
+
+	quarantine := newSignerQuarantine(
+		lifetime,
+		logger,
+		&unwritableRecordHandle{refusedNamePrefixes: []string{"/"}},
+	)
+	quarantine.graceAttempts = 1
+
+	waitingWithLiveOutput := make(chan struct{})
+	var notifyWaiting sync.Once
+	quarantine.wait = func(ctx context.Context, _ time.Duration) bool {
+		notifyWaiting.Do(func() { close(waitingWithLiveOutput) })
+		<-ctx.Done()
+		return false
+	}
+
+	de.signerQuarantine = quarantine
+	recorder := newDispatchGaugeRecorder()
+	de.metricsRecorder = recorder
+
+	preservationDone := make(chan struct{})
+	go func() {
+		defer close(preservationDone)
+		preserveOneSigner(t, de, result, gsr, group.MemberIndex(1))
+	}()
+
+	select {
+	case <-waitingWithLiveOutput:
+	case <-time.After(10 * time.Second):
+		t.Fatal("preservation did not reach its live incomplete retry")
+	}
+
+	if lifetime.Err() != nil {
+		t.Fatal("the process lifetime ended before the signal was inspected")
+	}
+	if got := recorder.counter(
+		clientinfo.MetricParticipationTBTCQuarantinePreservationFailuresTotal,
+	); got != 1 {
+		t.Errorf(
+			"tBTC quarantine-preservation failures = [%v] while live, want 1",
+			got,
+		)
+	}
+	if got := recorder.gauge(
+		clientinfo.MetricParticipationTBTCQuarantineIncompleteOutputs,
+	); got != 1 {
+		t.Errorf(
+			"tBTC incomplete quarantine outputs = [%v] while live, want 1",
+			got,
+		)
+	}
+
+	cancelLifetime()
+	select {
+	case <-preservationDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("preservation did not return after the process lifetime ended")
+	}
+}
+
+// TestDkgExecutor_PreserveInterruptedSigner_ClearsIncompleteAfterRecovery
+// proves the live gauge describes current incomplete outputs rather than
+// latching every historical failure. The counter retains the grace-exhausting
+// episode, while a namespace that recovers and takes the full output brings the
+// gauge back to zero.
+func TestDkgExecutor_PreserveInterruptedSigner_ClearsIncompleteAfterRecovery(
+	t *testing.T,
+) {
+	de, result, gsr, _, _ := setupPreserveScenario(t)
+
+	handle := &flakyRecordHandle{
+		namePrefixes: []string{"/membership_", "/handoff_"},
+		refusals:     quarantineGraceAttempts + 1,
+	}
+	de.signerQuarantine = newTestSignerQuarantine(handle, 50)
+	recorder := newDispatchGaugeRecorder()
+	de.metricsRecorder = recorder
+
+	preserveOneSigner(t, de, result, gsr, group.MemberIndex(1))
+
+	if got := recorder.counter(
+		clientinfo.MetricParticipationTBTCQuarantinePreservationFailuresTotal,
+	); got != 1 {
+		t.Errorf(
+			"tBTC quarantine-preservation failures after recovery = [%v], want 1",
+			got,
+		)
+	}
+	if got := recorder.gauge(
+		clientinfo.MetricParticipationTBTCQuarantineIncompleteOutputs,
+	); got != 0 {
+		t.Errorf(
+			"tBTC incomplete quarantine outputs after recovery = [%v], want 0",
+			got,
+		)
+	}
+}
+
 // TestDkgExecutor_PreserveInterruptedSigner_RefusedActiveSaveFallsBackToQuarantine
 // proves a registered wallet's share the active namespace refused is preserved
 // in the quarantine namespace rather than dropped, and that the audit record
@@ -2593,28 +2703,39 @@ func TestSignerQuarantine_PreservedOutputs_RestartSeesWhatEachWriteFailureLeft(
 	t *testing.T,
 ) {
 	tests := map[string]struct {
-		refusedNamePrefix string
-		expectedOutputs   int
-		expectedRecords   []string
-		expectedFailures  int
+		refusedNamePrefixes []string
+		expectedOutputs     int
+		expectedRecords     []string
+		expectedFailures    int
+		expectedIncomplete  int
 	}{
 		"the metadata write is refused": {
-			refusedNamePrefix: "/metadata_",
-			expectedOutputs:   1,
-			expectedRecords:   []string{"/membership_1", "/handoff_1"},
-			expectedFailures:  0,
+			refusedNamePrefixes: []string{"/metadata_"},
+			expectedOutputs:     1,
+			expectedRecords:     []string{"/membership_1", "/handoff_1"},
+			expectedFailures:    0,
+			expectedIncomplete:  0,
 		},
 		"the membership write is refused": {
-			refusedNamePrefix: "/membership_",
-			expectedOutputs:   1,
-			expectedRecords:   []string{"/metadata_1", "/handoff_1"},
-			expectedFailures:  0,
+			refusedNamePrefixes: []string{"/membership_"},
+			expectedOutputs:     1,
+			expectedRecords:     []string{"/metadata_1", "/handoff_1"},
+			expectedFailures:    0,
+			expectedIncomplete:  0,
+		},
+		"the share persists but both audit record forms are refused": {
+			refusedNamePrefixes: []string{"/metadata_", "/handoff_"},
+			expectedOutputs:     1,
+			expectedRecords:     []string{"/membership_1"},
+			expectedFailures:    1,
+			expectedIncomplete:  1,
 		},
 		"every write is refused": {
-			refusedNamePrefix: "/",
-			expectedOutputs:   0,
-			expectedRecords:   []string{},
-			expectedFailures:  1,
+			refusedNamePrefixes: []string{"/"},
+			expectedOutputs:     0,
+			expectedRecords:     []string{},
+			expectedFailures:    1,
+			expectedIncomplete:  1,
 		},
 	}
 
@@ -2623,7 +2744,7 @@ func TestSignerQuarantine_PreservedOutputs_RestartSeesWhatEachWriteFailureLeft(
 			de, result, gsr, _, _ := setupPreserveScenario(t)
 
 			handle := &unwritableRecordHandle{
-				refusedNamePrefixes: []string{test.refusedNamePrefix},
+				refusedNamePrefixes: test.refusedNamePrefixes,
 			}
 			de.signerQuarantine = newTestSignerQuarantine(handle, 1)
 			recorder := newDispatchGaugeRecorder()
@@ -2659,6 +2780,15 @@ func TestSignerQuarantine_PreservedOutputs_RestartSeesWhatEachWriteFailureLeft(
 				int(recorder.counter(
 					clientinfo.
 						MetricParticipationTBTCQuarantinePreservationFailuresTotal,
+				)),
+			)
+			testutils.AssertIntsEqual(
+				t,
+				"live incomplete quarantine outputs",
+				test.expectedIncomplete,
+				int(recorder.gauge(
+					clientinfo.
+						MetricParticipationTBTCQuarantineIncompleteOutputs,
 				)),
 			)
 		})

@@ -162,10 +162,16 @@ func (c *cutoverTestChain) SelectGroup(*big.Int) (chain.Addresses, error) {
 type cutoverGateMetrics struct {
 	mu       sync.Mutex
 	counters map[string]float64
+	gauges   map[string]float64
+	updates  chan struct{}
 }
 
 func newCutoverGateMetrics() *cutoverGateMetrics {
-	return &cutoverGateMetrics{counters: make(map[string]float64)}
+	return &cutoverGateMetrics{
+		counters: make(map[string]float64),
+		gauges:   make(map[string]float64),
+		updates:  make(chan struct{}, 1),
+	}
 }
 
 func (m *cutoverGateMetrics) IncrementCounter(name string, value float64) {
@@ -174,12 +180,27 @@ func (m *cutoverGateMetrics) IncrementCounter(name string, value float64) {
 	m.counters[name] += value
 }
 
-func (m *cutoverGateMetrics) SetGauge(string, float64) {}
+func (m *cutoverGateMetrics) SetGauge(name string, value float64) {
+	m.mu.Lock()
+	m.gauges[name] = value
+	m.mu.Unlock()
+
+	select {
+	case m.updates <- struct{}{}:
+	default:
+	}
+}
 
 func (m *cutoverGateMetrics) counter(name string) float64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.counters[name]
+}
+
+func (m *cutoverGateMetrics) gauge(name string) float64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.gauges[name]
 }
 
 // cutoverLocalChain is the local chain surface the harness needs: the full
@@ -828,6 +849,23 @@ func TestJoinDKGIfEligible_ForcedShutdownAfterKeyGenerationQuarantinesSigner(t *
 			forcedAborts,
 		)
 	}
+	if got := harness.gateMetrics.counter(
+		clientinfo.
+			MetricParticipationBeaconQuarantinePreservationFailuresTotal,
+	); got != 0 {
+		t.Errorf(
+			"successful beacon quarantine incremented preservation failures: [%v]",
+			got,
+		)
+	}
+	if got := harness.gateMetrics.gauge(
+		clientinfo.MetricParticipationBeaconQuarantineIncompleteOutputs,
+	); got != 0 {
+		t.Errorf(
+			"successful beacon quarantine left [%v] incomplete outputs",
+			got,
+		)
+	}
 }
 
 // TestJoinDKGIfEligible_RefusedQuarantineMembershipIsNotAQuarantinedOutcome
@@ -1241,8 +1279,10 @@ func TestJoinDKGIfEligible_LostShareQuiescesTheNode(t *testing.T) {
 	refusing := &cutoverRefusingPersistence{
 		refusedMarkers: []string{"/membership_", "/handoff_"},
 	}
+	lifetime, cancelLifetime := context.WithCancel(context.Background())
+	defer cancelLifetime()
 	harness.node.signerQuarantine = registry.NewQuarantine(
-		endedProcessLifetime(),
+		lifetime,
 		logger,
 		refusing,
 	)
@@ -1278,6 +1318,50 @@ func TestJoinDKGIfEligible_LostShareQuiescesTheNode(t *testing.T) {
 	harness.node.JoinDKGIfEligible(cutoverRandomSeed(t), harness.anchorBlock)
 
 	<-clockFailed
+
+	// Wait for every preserving member to exhaust the write-grace rounds while
+	// the process lifetime remains live. The metric update channel avoids
+	// polling sleeps and the values are rechecked after every unrelated gate
+	// gauge update.
+	signalDeadline := time.NewTimer(10 * time.Second)
+	defer signalDeadline.Stop()
+	for {
+		failures := harness.gateMetrics.counter(
+			clientinfo.
+				MetricParticipationBeaconQuarantinePreservationFailuresTotal,
+		)
+		incomplete := harness.gateMetrics.gauge(
+			clientinfo.MetricParticipationBeaconQuarantineIncompleteOutputs,
+		)
+		if failures == float64(harness.groupSize) &&
+			incomplete == float64(harness.groupSize) {
+			break
+		}
+
+		select {
+		case <-harness.gateMetrics.updates:
+		case <-signalDeadline.C:
+			t.Fatalf(
+				"beacon quarantine signal while live = failures [%v], "+
+					"incomplete [%v]; expected [%d] of each",
+				failures,
+				incomplete,
+				harness.groupSize,
+			)
+		}
+	}
+
+	if lifetime.Err() != nil {
+		t.Fatal("the process lifetime ended before the signal was inspected")
+	}
+	if active := harness.gate.State().ActiveCeremonies; active == 0 {
+		t.Error(
+			"the incomplete signal appeared only after all preserving permits " +
+				"had ended",
+		)
+	}
+
+	cancelLifetime()
 	harness.waitForPermitRelease(t)
 
 	if got := refusing.savesContaining("/membership_"); got != 0 {
@@ -1289,6 +1373,15 @@ func TestJoinDKGIfEligible_LostShareQuiescesTheNode(t *testing.T) {
 	); got != float64(harness.groupSize) {
 		t.Errorf(
 			"beacon quarantine-preservation failures = [%v], expected [%d]",
+			got,
+			harness.groupSize,
+		)
+	}
+	if got := harness.gateMetrics.gauge(
+		clientinfo.MetricParticipationBeaconQuarantineIncompleteOutputs,
+	); got != float64(harness.groupSize) {
+		t.Errorf(
+			"beacon incomplete quarantine outputs = [%v], expected [%d]",
 			got,
 			harness.groupSize,
 		)

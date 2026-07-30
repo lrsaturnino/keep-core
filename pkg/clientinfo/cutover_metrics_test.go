@@ -29,6 +29,8 @@ func TestCutoverMetrics_ExactExportedNames(t *testing.T) {
 		{MetricAnnouncerLegacyPeerEvictionsTotal, "performance_announcer_legacy_peer_evictions_total"},
 		{MetricParticipationTBTCQuarantinePreservationFailuresTotal, "performance_participation_tbtc_quarantine_preservation_failures_total"},
 		{MetricParticipationBeaconQuarantinePreservationFailuresTotal, "performance_participation_beacon_quarantine_preservation_failures_total"},
+		{MetricParticipationTBTCQuarantineIncompleteOutputs, "performance_participation_tbtc_quarantine_incomplete_outputs"},
+		{MetricParticipationBeaconQuarantineIncompleteOutputs, "performance_participation_beacon_quarantine_incomplete_outputs"},
 	}
 
 	for _, c := range cases {
@@ -124,6 +126,8 @@ var participationMetricFamily = []string{
 	MetricParticipationQuiesceForcedAbortsTotal,
 	MetricParticipationTBTCQuarantinePreservationFailuresTotal,
 	MetricParticipationBeaconQuarantinePreservationFailuresTotal,
+	MetricParticipationTBTCQuarantineIncompleteOutputs,
+	MetricParticipationBeaconQuarantineIncompleteOutputs,
 	MetricParticipationQuarantinedTBTCSigners,
 }
 
@@ -236,6 +240,54 @@ func TestParticipationMetrics_QuarantinePreservationFailuresRegisteredAtZero(
 		pm.IncrementCounter(name, 1)
 		if got := pm.GetCounterValue(name); got != 1 {
 			t.Errorf("quarantine-preservation counter %q = %v after increment, want 1", name, got)
+		}
+	}
+}
+
+// TestParticipationMetrics_QuarantineIncompleteOutputsRegisteredAtZero proves
+// both live incomplete-output gauges are present before any quarantine attempt.
+// A rollback sampler must be able to distinguish a running node reporting zero
+// incomplete outputs from one that never exposed the signal.
+func TestParticipationMetrics_QuarantineIncompleteOutputsRegisteredAtZero(
+	t *testing.T,
+) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	registry := &Registry{keepclientinfo.NewRegistry(), ctx}
+	pm := NewPerformanceMetrics(ctx, registry)
+
+	for _, name := range []string{
+		MetricParticipationTBTCQuarantineIncompleteOutputs,
+		MetricParticipationBeaconQuarantineIncompleteOutputs,
+	} {
+		pm.gaugesMutex.RLock()
+		_, preRegistered := pm.gauges[name]
+		pm.gaugesMutex.RUnlock()
+		if !preRegistered {
+			t.Errorf(
+				"quarantine-incomplete gauge %q must be registered before "+
+					"preservation starts",
+				name,
+			)
+			continue
+		}
+
+		if got := pm.GetGaugeValue(name); got != 0 {
+			t.Errorf(
+				"quarantine-incomplete gauge %q = %v at startup, want 0",
+				name,
+				got,
+			)
+		}
+
+		pm.SetGauge(name, 2)
+		if got := pm.GetGaugeValue(name); got != 2 {
+			t.Errorf(
+				"quarantine-incomplete gauge %q = %v after update, want 2",
+				name,
+				got,
+			)
 		}
 	}
 }

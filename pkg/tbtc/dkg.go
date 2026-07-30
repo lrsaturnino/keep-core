@@ -102,7 +102,7 @@ type dkgExecutor struct {
 
 	// quarantineReportMutex serializes recounting the quarantine namespace and
 	// publishing the count, so concurrently preserving members cannot leave an
-	// older, lower count as the published one. It also guards the three fields
+	// older, lower count as the published one. It also guards the four fields
 	// below.
 	quarantineReportMutex sync.Mutex
 
@@ -128,6 +128,13 @@ type dkgExecutor struct {
 	// failed recount can tell whether what it does know is already covered by
 	// the published number.
 	lastPublishedQuarantineCount int
+
+	// incompleteQuarantineOutputs names preservation attempts that exhausted
+	// their write-grace rounds and are still holding an output whose key
+	// material and audit record are not both durable. It is guarded by
+	// quarantineReportMutex and drives the live incomplete-output gauge. The
+	// map key deduplicates repeated notifications for the same wallet seat.
+	incompleteQuarantineOutputs map[quarantinedSigner]struct{}
 
 	// announcerMismatchLogLimiter bounds the volume of session-ID mismatch INFO
 	// logs to a burst of 5 with one line every 30 seconds, matching the
@@ -1133,6 +1140,10 @@ func (de *dkgExecutor) preserveInterruptedSigner(
 	if err == nil {
 		walletIDHex = hex.EncodeToString(walletID[:])
 	}
+	quarantineOutput := quarantinedSigner{
+		walletStorageKey: getWalletStorageKey(signer.wallet.publicKey),
+		memberIndex:      signer.signingGroupMemberIndex,
+	}
 
 	dkgLogger.Warnf(
 		"[member:%v] signer activation withheld at [%s]; quarantining the "+
@@ -1180,6 +1191,7 @@ func (de *dkgExecutor) preserveInterruptedSigner(
 			// would last, so the node stops taking new work while it is still
 			// holding an output the namespace does not fully have.
 			stillIncomplete: func(state quarantineState, cause error) {
+				de.markIncompleteQuarantine(quarantineOutput)
 				de.blockOnIncompleteQuarantine(
 					dkgLogger,
 					memberIndex,
@@ -1190,18 +1202,16 @@ func (de *dkgExecutor) preserveInterruptedSigner(
 		},
 	)
 
-	// A failed preservation must have a fleet-readable account of its own.
-	// The quarantined-signer gauge counts only key material the namespace
-	// actually holds, so a namespace refusing every write leaves that gauge at
-	// the same zero as a node that never attempted quarantine. This counter is
-	// recorded exactly once, when preservation returns incomplete at the end
-	// of the process lifetime; transient write failures that recover during
-	// the retry do not increment it.
-	if quarantineErr != nil && de.metricsRecorder != nil {
-		de.metricsRecorder.IncrementCounter(
-			clientinfo.MetricParticipationTBTCQuarantinePreservationFailuresTotal,
-			1,
-		)
+	// The observer above normally reports an incomplete output while Preserve
+	// is still retrying. A failure before the retry loop begins — for example,
+	// serialization failure — has no grace callback, and a process lifetime
+	// that ends before grace can return without one too, so account for both
+	// here. A completed retry removes the output from the live gauge; the
+	// cumulative failure counter remains as history.
+	if quarantineState.complete() {
+		de.resolveIncompleteQuarantine(quarantineOutput)
+	} else {
+		de.markIncompleteQuarantine(quarantineOutput)
 	}
 
 	// The preservation is over, so the namespace can be read without holding a
@@ -1276,6 +1286,63 @@ func (de *dkgExecutor) accountForPreservedKeyMaterial(signer *signer) {
 	}] = struct{}{}
 
 	de.publishKnownFloorLocked()
+}
+
+// markIncompleteQuarantine publishes a newly observed incomplete preservation.
+// The normal call is the live grace-exhaustion observer; the return-time call
+// covers failures that reached no observer. The counter records each distinct
+// incomplete episode and the gauge remains nonzero for as long as the output
+// lacks either key material or its audit record.
+func (de *dkgExecutor) markIncompleteQuarantine(
+	output quarantinedSigner,
+) {
+	de.quarantineReportMutex.Lock()
+	defer de.quarantineReportMutex.Unlock()
+
+	if de.incompleteQuarantineOutputs == nil {
+		de.incompleteQuarantineOutputs =
+			make(map[quarantinedSigner]struct{})
+	}
+	if _, exists := de.incompleteQuarantineOutputs[output]; exists {
+		return
+	}
+
+	de.incompleteQuarantineOutputs[output] = struct{}{}
+	if de.metricsRecorder == nil {
+		return
+	}
+
+	de.metricsRecorder.IncrementCounter(
+		clientinfo.MetricParticipationTBTCQuarantinePreservationFailuresTotal,
+		1,
+	)
+	de.metricsRecorder.SetGauge(
+		clientinfo.MetricParticipationTBTCQuarantineIncompleteOutputs,
+		float64(len(de.incompleteQuarantineOutputs)),
+	)
+}
+
+// resolveIncompleteQuarantine clears the live incomplete-output signal only
+// after preservation has made the whole output durable. An output still
+// incomplete when the process lifetime ends deliberately remains nonzero in
+// the last readable sample; the cumulative counter is never decremented.
+func (de *dkgExecutor) resolveIncompleteQuarantine(
+	output quarantinedSigner,
+) {
+	de.quarantineReportMutex.Lock()
+	defer de.quarantineReportMutex.Unlock()
+
+	if _, exists := de.incompleteQuarantineOutputs[output]; !exists {
+		return
+	}
+
+	delete(de.incompleteQuarantineOutputs, output)
+	if de.metricsRecorder != nil {
+		de.metricsRecorder.SetGauge(
+			clientinfo.MetricParticipationTBTCQuarantineIncompleteOutputs,
+			float64(len(de.incompleteQuarantineOutputs)),
+		)
+	}
 }
 
 // blockOnIncompleteQuarantine stops this node from beginning new ceremonies
