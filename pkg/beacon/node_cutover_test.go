@@ -292,7 +292,11 @@ func newCutoverNodeHarness(
 	)
 
 	quarantinePersistence := &cutoverRecordingPersistence{}
-	signerQuarantine := registry.NewQuarantine(logger, quarantinePersistence)
+	signerQuarantine := registry.NewQuarantine(
+		context.Background(),
+		logger,
+		quarantinePersistence,
+	)
 
 	node := newNode(
 		testChain,
@@ -850,7 +854,11 @@ func TestJoinDKGIfEligible_RefusedQuarantineMembershipIsNotAQuarantinedOutcome(
 	// The same forced-quiescence interruption as above, over a namespace that
 	// will not accept the key material.
 	refusing := &cutoverRefusingPersistence{refusedMarker: "/membership_"}
-	harness.node.signerQuarantine = registry.NewQuarantine(logger, refusing)
+	harness.node.signerQuarantine = registry.NewQuarantine(
+		endedProcessLifetime(),
+		logger,
+		refusing,
+	)
 
 	blockCounter, err := harness.localChain.BlockCounter()
 	if err != nil {
@@ -900,6 +908,184 @@ func TestJoinDKGIfEligible_RefusedQuarantineMembershipIsNotAQuarantinedOutcome(
 	}
 }
 
+// TestJoinDKGIfEligible_RefusedQuarantineMetadataIsNotAQuarantinedOutcome
+// proves the other incomplete pair: preserved key material with no audit record
+// explaining it does not end its permit as quarantined either.
+//
+// The share is on disk here, so nothing was lost — but the terminal outcome is
+// what the offline audit and the rollback decision read as "this material is
+// preserved and accounted for", and the accounting is exactly what is missing.
+// The mode, canonical anchor, ceremony, seat, and refused operation that would
+// let the audit match the share against the chain all live in the metadata that
+// the namespace would not take. Claiming the outcome on the strength of the key
+// material alone would call the inventory complete while it holds a quarantine
+// nothing explains.
+func TestJoinDKGIfEligible_RefusedQuarantineMetadataIsNotAQuarantinedOutcome(
+	t *testing.T,
+) {
+	harness := newCutoverNodeHarness(
+		t,
+		2,
+		2,
+		func(currentBlock uint64) uint64 { return currentBlock + 100_000 },
+		nil,
+	)
+
+	// The same forced-quiescence interruption as above, over a namespace that
+	// takes the key material but not the record explaining it.
+	refusing := &cutoverRefusingPersistence{refusedMarker: "/metadata_"}
+	harness.node.signerQuarantine = registry.NewQuarantine(
+		endedProcessLifetime(),
+		logger,
+		refusing,
+	)
+
+	blockCounter, err := harness.localChain.BlockCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	trigger, err := blockCounter.BlockHeightWaiter(
+		harness.anchorBlock + gjkr.ProtocolBlocks() + 2,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
+		<-trigger
+		harness.gate.Quiesce(fmt.Errorf("test shutdown"))
+		harness.gate.Close()
+	}()
+
+	harness.node.JoinDKGIfEligible(cutoverRandomSeed(t), harness.anchorBlock)
+
+	<-shutdownDone
+	harness.waitForPermitRelease(t)
+
+	// The key material still has to be preserved. Refusing the outcome is about
+	// what a rollback can conclude, not a reason to stop writing the share.
+	if got := refusing.savesContaining(
+		"/membership_",
+	); got != harness.groupSize {
+		t.Errorf(
+			"expected [%d] preserved memberships, got [%d]",
+			harness.groupSize,
+			got,
+		)
+	}
+	if got := refusing.savesContaining("/metadata_"); got != 0 {
+		t.Errorf("expected no metadata to be accepted, got [%d]", got)
+	}
+
+	for _, record := range harness.gate.State().RecentTerminalOutcomes {
+		if record.Outcome == participation.TerminalOutcomeQuarantined {
+			t.Errorf(
+				"a share with no audit record explaining it was reported as "+
+					"quarantined [%v]",
+				record,
+			)
+		}
+	}
+}
+
+// TestBlockOnIncompleteQuarantine_QuiescesOnEitherMissingHalf proves the node
+// stops taking new ceremonies for either incomplete pair, not only for the lost
+// share.
+//
+// A preserved share whose audit record did not land is on disk but unexplained,
+// and a rollback reconciles namespaces against the chain using precisely the
+// fields that record carries. Continuing to take work in that state builds more
+// state on a host whose inventory is already known to be incomplete — the same
+// reason the lost-share case blocks — so both halves have to reach the gate.
+func TestBlockOnIncompleteQuarantine_QuiescesOnEitherMissingHalf(t *testing.T) {
+	tests := map[string]registry.QuarantineState{
+		"the key material reached no namespace": {
+			MembershipPersisted: false,
+			MetadataPersisted:   true,
+		},
+		"the audit record reached no namespace": {
+			MembershipPersisted: true,
+			MetadataPersisted:   false,
+		},
+	}
+
+	for testName, state := range tests {
+		t.Run(testName, func(t *testing.T) {
+			localChain := local_v1.Connect(5, 3)
+
+			blockCounter, err := localChain.BlockCounter()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := blockCounter.WaitForBlockHeight(1); err != nil {
+				t.Fatal(err)
+			}
+			currentBlock, err := blockCounter.CurrentBlock()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			gate, err := participation.NewGate(
+				context.Background(),
+				participation.Schedule{CutoverBlock: currentBlock + 100_000},
+				blockCounter,
+				newCutoverGateMetrics(),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(gate.Close)
+
+			node := &node{participationGate: gate}
+
+			testutils.AssertBoolsEqual(
+				t,
+				"the gate issues permits before the incomplete pair",
+				true,
+				gate.State().Allowed,
+			)
+
+			node.blockOnIncompleteQuarantine(
+				logger,
+				group.MemberIndex(1),
+				state,
+				fmt.Errorf("namespace refused the write"),
+			)
+
+			testutils.AssertBoolsEqual(
+				t,
+				"the gate quiesced on the incomplete pair",
+				true,
+				gate.State().Quiescing,
+			)
+
+			// A quiescing gate refuses before it looks at the anchor at all,
+			// so the refusal is read by sentinel rather than by the fact that
+			// one happened. The identity is a well-formed one, since a
+			// malformed one is refused before quiescence is ever consulted.
+			seedHash := sha256.Sum256([]byte("beacon-dkg-seed"))
+			if _, err := gate.Begin(
+				participation.BeaconDKG,
+				currentBlock,
+				participation.PermitIdentity{
+					WorkID:          hex.EncodeToString(seedHash[:]),
+					PermitID:        "1",
+					OperatedMembers: participation.MemberIndexes{1},
+				},
+			); !errors.Is(err, participation.ErrQuiescing) {
+				t.Errorf(
+					"a node holding an incomplete quarantine must refuse new "+
+						"ceremonies, got [%v]",
+					err,
+				)
+			}
+		})
+	}
+}
+
 // TestJoinDKGIfEligible_LostShareQuiescesTheNode proves a beacon share that
 // reached no namespace stops this node from starting new ceremonies.
 //
@@ -925,7 +1111,11 @@ func TestJoinDKGIfEligible_LostShareQuiescesTheNode(t *testing.T) {
 	)
 
 	refusing := &cutoverRefusingPersistence{refusedMarker: "/membership_"}
-	harness.node.signerQuarantine = registry.NewQuarantine(logger, refusing)
+	harness.node.signerQuarantine = registry.NewQuarantine(
+		endedProcessLifetime(),
+		logger,
+		refusing,
+	)
 
 	blockCounter, err := harness.localChain.BlockCounter()
 	if err != nil {
@@ -983,6 +1173,20 @@ func TestJoinDKGIfEligible_LostShareQuiescesTheNode(t *testing.T) {
 			err,
 		)
 	}
+}
+
+// endedProcessLifetime is a process lifetime that has already ended.
+//
+// A quarantine store keeps trying to write the output it is holding for as long
+// as its process lives, because the key material cannot be generated again. A
+// test driving a namespace that never accepts the write has to supply that
+// ending itself, and an already-ended lifetime is the shortest honest one: the
+// store makes a single pass and reports what the namespace took.
+func endedProcessLifetime() context.Context {
+	lifetime, end := context.WithCancel(context.Background())
+	end()
+
+	return lifetime
 }
 
 // cutoverRefusingPersistence is a namespace that refuses one record name while

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"reflect"
 	"strings"
@@ -359,7 +360,11 @@ func setupPreserveScenario(t *testing.T) (
 		chain:             localChain,
 		walletRegistry:    walletRegistry,
 		participationGate: newTestGate(t, blockCounter),
-		signerQuarantine:  newSignerQuarantine(logger, quarantineHandle),
+		signerQuarantine: newSignerQuarantine(
+			context.Background(),
+			logger,
+			quarantineHandle,
+		),
 	}
 
 	result := &dkg.Result{
@@ -512,6 +517,7 @@ func TestDkgExecutor_ReportQuarantinedSigners_KeepsCountOnUnreadableNamespace(
 	)
 
 	de.signerQuarantine = newSignerQuarantine(
+		context.Background(),
 		logger,
 		&unreadableHandle{},
 	)
@@ -546,7 +552,11 @@ func TestDkgExecutor_ReportInitialQuarantinedSigners_BlocksOnUnreadableNamespace
 
 	recorder := newDispatchGaugeRecorder()
 	de.metricsRecorder = recorder
-	de.signerQuarantine = newSignerQuarantine(logger, &unreadableHandle{})
+	de.signerQuarantine = newSignerQuarantine(
+		context.Background(),
+		logger,
+		&unreadableHandle{},
+	)
 
 	err := de.reportInitialQuarantinedSigners()
 	if err == nil {
@@ -636,7 +646,7 @@ func TestDkgExecutor_ReportQuarantinedSigners_SerializesRecountAndPublication(
 		entered:               make(chan struct{}, reporterCount),
 		release:               make(chan struct{}),
 	}
-	de.signerQuarantine = newSignerQuarantine(logger, tracking)
+	de.signerQuarantine = newSignerQuarantine(context.Background(), logger, tracking)
 
 	var wg sync.WaitGroup
 	for range reporterCount {
@@ -728,7 +738,7 @@ func (h *scanTrackingHandle) ReadAll() (
 // there; none of them is a preserved share.
 func TestSignerQuarantine_PreservedOutputs_CountsMembershipsOnly(t *testing.T) {
 	handle := &mockPersistenceHandle{}
-	quarantine := newSignerQuarantine(logger, handle)
+	quarantine := newSignerQuarantine(context.Background(), logger, handle)
 
 	for _, name := range []string{
 		"/membership_1",
@@ -778,7 +788,11 @@ func TestSignerQuarantine_PreservedOutputs_CountsMembershipsOnly(t *testing.T) {
 // truncated count of preserved material is indistinguishable from an accurate
 // low one.
 func TestSignerQuarantine_PreservedOutputs_FailsOnUnreadableNamespace(t *testing.T) {
-	quarantine := newSignerQuarantine(logger, &unreadableHandle{})
+	quarantine := newSignerQuarantine(
+		context.Background(),
+		logger,
+		&unreadableHandle{},
+	)
 
 	outputs, err := quarantine.preservedOutputs()
 	if err == nil {
@@ -921,7 +935,10 @@ func TestSignerQuarantine_Preserve_AttemptsBothRecordsAndReportsWhatLanded(
 			handle := &unwritableRecordHandle{
 				refusedNamePrefix: test.refusedNamePrefix,
 			}
-			quarantine := newSignerQuarantine(logger, handle)
+			// One round, then the process is taken to have ended: this asks
+			// what a single pass writes and reports, not how long the retry
+			// behind it lasts.
+			quarantine := newTestSignerQuarantine(handle, 1)
 
 			state, err := quarantine.preserve(
 				signer,
@@ -929,6 +946,7 @@ func TestSignerQuarantine_Preserve_AttemptsBothRecordsAndReportsWhatLanded(
 					ReleaseEpoch: participation.CompiledEpoch.String(),
 					Ceremony:     string(participation.TBTCDKG),
 				},
+				nil,
 			)
 
 			expectedComplete := test.membershipPersisted &&
@@ -965,22 +983,24 @@ func TestSignerQuarantine_Preserve_AttemptsBothRecordsAndReportsWhatLanded(
 	}
 }
 
-// TestDkgExecutor_PreserveInterruptedSigner_RefusedMetadataStillAccountsForShare
-// proves a share the namespace accepted is accounted for even when its audit
-// metadata could not be written: the permit ends quarantined and the published
-// count includes the output.
+// TestDkgExecutor_PreserveInterruptedSigner_RefusedMetadataLeavesThePermitUnresolved
+// proves a share the namespace accepted without its audit record is counted but
+// not called resolved: the published count includes the output, the permit ends
+// with no terminal outcome, and the node stops taking new ceremonies.
 //
-// The key material is on disk either way, so a rollback has to account for it
-// either way. Reporting it as lost — the state the caller reported when the
-// metadata write decided the whole outcome — leaves preserved key material
-// that nothing claims.
-func TestDkgExecutor_PreserveInterruptedSigner_RefusedMetadataStillAccountsForShare(
+// The key material is on disk, so a rollback has to account for it — that is the
+// count. What is missing is everything that would let the offline audit match it
+// against the chain: the mode, the canonical anchor, the ceremony, the seat, and
+// the operation that was refused all live in the metadata. Recording the permit
+// as quarantined on the membership alone would hand the rollback decision a
+// preserved share nothing explains and call the inventory complete.
+func TestDkgExecutor_PreserveInterruptedSigner_RefusedMetadataLeavesThePermitUnresolved(
 	t *testing.T,
 ) {
 	de, result, gsr, _, _ := setupPreserveScenario(t)
 
 	handle := &unwritableRecordHandle{refusedNamePrefix: "/metadata_"}
-	de.signerQuarantine = newSignerQuarantine(logger, handle)
+	de.signerQuarantine = newTestSignerQuarantine(handle, 1)
 
 	recorder := newDispatchGaugeRecorder()
 	de.metricsRecorder = recorder
@@ -1019,6 +1039,79 @@ func TestDkgExecutor_PreserveInterruptedSigner_RefusedMetadataStillAccountsForSh
 		)
 	}
 
+	if outcomes := permit.recordedTerminalOutcomes(); len(outcomes) != 0 {
+		t.Errorf(
+			"a preserved share with no audit record explaining it must "+
+				"leave the permit unresolved, got %v",
+			outcomes,
+		)
+	}
+
+	value, published := recorder.gaugePublished(
+		clientinfo.MetricParticipationQuarantinedTBTCSigners,
+	)
+	if !published {
+		t.Fatal("expected the preserved share to be counted")
+	}
+	testutils.AssertIntsEqual(t, "reported quarantined signers", 1, int(value))
+
+	testutils.AssertBoolsEqual(
+		t,
+		"the gate quiesced on the unexplained share",
+		true,
+		de.participationGate.State().Quiescing,
+	)
+}
+
+// TestDkgExecutor_PreserveInterruptedSigner_ProlongedRefusalStillEndsQuarantined
+// proves the permit does resolve once both halves are durable, however long the
+// namespace took to accept them.
+//
+// The blocking state exists to keep an incomplete pair from being called
+// resolved, not to make every namespace hiccup permanent. A metadata write that
+// lands on a later round leaves an output the offline audit can reconcile, so
+// the permit ends quarantined — while the node still stops taking new work,
+// because it spent longer than a passing fault holding an output the namespace
+// did not have.
+func TestDkgExecutor_PreserveInterruptedSigner_ProlongedRefusalStillEndsQuarantined(
+	t *testing.T,
+) {
+	de, result, gsr, _, _ := setupPreserveScenario(t)
+
+	// Refused far past the grace budget, then accepted — the namespace an
+	// operator is repairing while the node holds the share.
+	handle := &flakyRecordHandle{
+		namePrefix: "/metadata_",
+		refusals:   quarantineGraceAttempts * 4,
+	}
+	de.signerQuarantine = newTestSignerQuarantine(handle, 50)
+
+	permit := newTestPermit(participation.TBTCDKG)
+
+	de.preserveInterruptedSigner(
+		logger.With(),
+		permit,
+		big.NewInt(1),
+		result,
+		group.MemberIndex(1),
+		gsr,
+		"tbtc_dkg_signer_activation",
+		fmt.Errorf("activation refused"),
+	)
+
+	if got := savedNames(&handle.mockPersistenceHandle); !reflect.DeepEqual(
+		got,
+		[]string{"/membership_1", "/metadata_1"},
+	) {
+		t.Errorf("namespace holds %v, expected both halves", got)
+	}
+	testutils.AssertIntsEqual(
+		t,
+		"metadata write attempts",
+		quarantineGraceAttempts*4+1,
+		handle.attemptCount(),
+	)
+
 	terminalOutcomes := permit.recordedTerminalOutcomes()
 	testutils.AssertIntsEqual(t, "terminal outcomes", 1, len(terminalOutcomes))
 	if len(terminalOutcomes) == 1 &&
@@ -1030,13 +1123,12 @@ func TestDkgExecutor_PreserveInterruptedSigner_RefusedMetadataStillAccountsForSh
 		)
 	}
 
-	value, published := recorder.gaugePublished(
-		clientinfo.MetricParticipationQuarantinedTBTCSigners,
+	testutils.AssertBoolsEqual(
+		t,
+		"the gate quiesced while the namespace was refusing",
+		true,
+		de.participationGate.State().Quiescing,
 	)
-	if !published {
-		t.Fatal("expected the preserved share to be counted")
-	}
-	testutils.AssertIntsEqual(t, "reported quarantined signers", 1, int(value))
 }
 
 // TestDkgExecutor_PreserveInterruptedSigner_RefusedMembershipIsNotQuarantined
@@ -1053,7 +1145,7 @@ func TestDkgExecutor_PreserveInterruptedSigner_RefusedMembershipIsNotQuarantined
 	de, result, gsr, _, _ := setupPreserveScenario(t)
 
 	handle := &unwritableRecordHandle{refusedNamePrefix: "/membership_"}
-	de.signerQuarantine = newSignerQuarantine(logger, handle)
+	de.signerQuarantine = newTestSignerQuarantine(handle, 1)
 
 	recorder := newDispatchGaugeRecorder()
 	de.metricsRecorder = recorder
@@ -1153,26 +1245,43 @@ func (h *flakyRecordHandle) attemptCount() int {
 }
 
 // newTestSignerQuarantine builds a quarantine store that retries exactly the way
-// the production one does but does not spend the wait between attempts, so a
-// test can exercise the whole budget without sleeping through it.
+// the production one does but ends its process lifetime after the given number
+// of rounds instead of spending the real waits between them.
+//
+// Production preservation stops only with the process, because the key material
+// it is holding cannot be generated again and no elapsed time makes discarding
+// it safe. A test driving a namespace that never accepts the write therefore has
+// to supply the ending itself: the round count is where this process is taken to
+// have gone away.
 func newTestSignerQuarantine(
 	handle persistence.ProtectedHandle,
+	roundsBeforeShutdown int,
 ) *signerQuarantine {
-	quarantine := newSignerQuarantine(logger, handle)
-	quarantine.sleep = func(time.Duration) {}
+	quarantine := newSignerQuarantine(context.Background(), logger, handle)
+
+	// Counted atomically because a store is shared by the members of a ceremony
+	// that quarantine concurrently.
+	var rounds atomic.Int64
+	quarantine.wait = func(context.Context, time.Duration) bool {
+		return rounds.Add(1) < int64(roundsBeforeShutdown)
+	}
 
 	return quarantine
 }
 
-// TestSignerQuarantine_Preserve_RetriesARefusedWrite proves key material is not
-// declared lost on the first refusal: a namespace that accepts the write on a
-// later attempt still preserves the share, and the caller is told it landed.
+// TestSignerQuarantine_Preserve_KeepsTryingThroughAProlongedRefusal proves key
+// material is not declared lost because a namespace stayed unwritable for a
+// while: preservation keeps the share in hand across far more refusals than a
+// passing fault produces, and still writes it when the namespace comes back.
 //
 // The material on this path cannot be generated again, and the conditions that
-// refuse a write are usually the ones that clear — a mount being restored, a
-// full disk being drained. Concluding permanent loss from a single attempt
-// throws away a share the very next write would have kept.
-func TestSignerQuarantine_Preserve_RetriesARefusedWrite(t *testing.T) {
+// refuse a write are the ones an operator repairs — a mount being restored, a
+// full disk being drained. A fixed attempt budget turns the length of that
+// repair into the difference between a preserved share and a lost one, which is
+// not a distinction the node is entitled to make.
+func TestSignerQuarantine_Preserve_KeepsTryingThroughAProlongedRefusal(
+	t *testing.T,
+) {
 	de, result, gsr, _, _ := setupPreserveScenario(t)
 
 	signer, err := de.buildFinalSigner(
@@ -1184,17 +1293,24 @@ func TestSignerQuarantine_Preserve_RetriesARefusedWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	const refusals = quarantineGraceAttempts * 8
+
 	handle := &flakyRecordHandle{
 		namePrefix: "/membership_",
-		refusals:   quarantineSaveAttempts - 1,
+		refusals:   refusals,
 	}
 
-	state, err := newTestSignerQuarantine(handle).preserve(
+	// The notification the node acts on fires once and does not end the
+	// attempt, so it is counted rather than allowed to stand in for a result.
+	notifications := 0
+
+	state, err := newTestSignerQuarantine(handle, refusals*2).preserve(
 		signer,
 		QuarantinedSignerMetadata{
 			ReleaseEpoch: participation.CompiledEpoch.String(),
 			Ceremony:     string(participation.TBTCDKG),
 		},
+		func(quarantineState, error) { notifications++ },
 	)
 	if err != nil {
 		t.Fatalf(
@@ -1212,24 +1328,102 @@ func TestSignerQuarantine_Preserve_RetriesARefusedWrite(t *testing.T) {
 	testutils.AssertIntsEqual(
 		t,
 		"membership write attempts",
-		quarantineSaveAttempts,
+		refusals+1,
 		handle.attemptCount(),
 	)
+	testutils.AssertIntsEqual(t, "block notifications", 1, notifications)
 
 	if got := savedNames(&handle.mockPersistenceHandle); !reflect.DeepEqual(
 		got,
-		[]string{"/membership_1", "/metadata_1"},
+		[]string{"/metadata_1", "/membership_1"},
 	) {
 		t.Errorf("namespace holds %v, expected both halves", got)
 	}
 }
 
-// TestSignerQuarantine_Preserve_SpendsTheWholeBudgetBeforeReportingLoss proves a
-// namespace that refuses every attempt is retried for the whole budget before
-// the loss stands, and that the error says how many attempts were spent — the
-// difference between one unlucky write and a namespace that will not take the
-// share at all.
-func TestSignerQuarantine_Preserve_SpendsTheWholeBudgetBeforeReportingLoss(
+// TestSignerQuarantine_Preserve_GivesUpOnlyWhenTheProcessEnds proves the retry
+// has no deadline of its own: a namespace that never accepts the write is
+// attempted every round until the process itself goes away, and the error says
+// that is what ended it.
+//
+// The node is told once, well before that, that it is holding key material the
+// namespace does not have — but being told is not the same as being finished,
+// and preservation carries on behind the notification.
+func TestSignerQuarantine_Preserve_GivesUpOnlyWhenTheProcessEnds(
+	t *testing.T,
+) {
+	de, result, gsr, _, _ := setupPreserveScenario(t)
+
+	signer, err := de.buildFinalSigner(
+		result,
+		group.MemberIndex(1),
+		gsr.OperatorsAddresses,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const roundsBeforeShutdown = quarantineGraceAttempts * 9
+
+	handle := &flakyRecordHandle{
+		namePrefix: "/membership_",
+		refusals:   math.MaxInt32,
+	}
+
+	notifications := 0
+
+	state, err := newTestSignerQuarantine(
+		handle,
+		roundsBeforeShutdown,
+	).preserve(
+		signer,
+		QuarantinedSignerMetadata{
+			ReleaseEpoch: participation.CompiledEpoch.String(),
+			Ceremony:     string(participation.TBTCDKG),
+		},
+		func(quarantineState, error) { notifications++ },
+	)
+	if err == nil {
+		t.Fatal("expected a preservation error")
+	}
+
+	testutils.AssertBoolsEqual(
+		t,
+		"membership persisted",
+		false,
+		state.membershipPersisted,
+	)
+	testutils.AssertBoolsEqual(
+		t,
+		"metadata persisted",
+		true,
+		state.metadataPersisted,
+	)
+	testutils.AssertIntsEqual(
+		t,
+		"membership write attempts",
+		roundsBeforeShutdown,
+		handle.attemptCount(),
+	)
+	testutils.AssertIntsEqual(t, "block notifications", 1, notifications)
+
+	if want := fmt.Sprintf(
+		"in %d rounds before the process ended",
+		roundsBeforeShutdown,
+	); !strings.Contains(err.Error(), want) {
+		t.Errorf(
+			"the error must say the process ending is what stopped the "+
+				"retry, got [%v]",
+			err,
+		)
+	}
+}
+
+// TestSignerQuarantine_Preserve_WritesOnlyTheHalfTheNamespaceLacks proves a
+// round does not rewrite a half that already landed. The retry exists for the
+// missing record, and rewriting the preserved one would keep touching key
+// material the namespace has already accepted.
+func TestSignerQuarantine_Preserve_WritesOnlyTheHalfTheNamespaceLacks(
 	t *testing.T,
 ) {
 	de, result, gsr, _, _ := setupPreserveScenario(t)
@@ -1244,40 +1438,28 @@ func TestSignerQuarantine_Preserve_SpendsTheWholeBudgetBeforeReportingLoss(
 	}
 
 	handle := &flakyRecordHandle{
-		namePrefix: "/membership_",
-		refusals:   quarantineSaveAttempts + 1,
+		namePrefix: "/metadata_",
+		refusals:   quarantineGraceAttempts + 2,
 	}
 
-	state, err := newTestSignerQuarantine(handle).preserve(
+	if _, err := newTestSignerQuarantine(handle, 50).preserve(
 		signer,
 		QuarantinedSignerMetadata{
 			ReleaseEpoch: participation.CompiledEpoch.String(),
 			Ceremony:     string(participation.TBTCDKG),
 		},
-	)
-	if err == nil {
-		t.Fatal("expected a preservation error")
+		nil,
+	); err != nil {
+		t.Fatalf("expected the retried write to preserve the share, got [%v]", err)
 	}
 
-	testutils.AssertBoolsEqual(
-		t,
-		"membership persisted",
-		false,
-		state.membershipPersisted,
-	)
-	testutils.AssertIntsEqual(
-		t,
-		"membership write attempts",
-		quarantineSaveAttempts,
-		handle.attemptCount(),
-	)
-	if want := fmt.Sprintf(
-		"in %d attempts",
-		quarantineSaveAttempts,
-	); !strings.Contains(err.Error(), want) {
+	if got := savedNames(&handle.mockPersistenceHandle); !reflect.DeepEqual(
+		got,
+		[]string{"/membership_1", "/metadata_1"},
+	) {
 		t.Errorf(
-			"the error must say the whole budget was spent, got [%v]",
-			err,
+			"namespace holds %v, expected each half written exactly once",
+			got,
 		)
 	}
 }
@@ -1298,6 +1480,7 @@ func TestDkgExecutor_PreserveInterruptedSigner_LostShareBlocksNewCeremonies(
 
 	de.signerQuarantine = newTestSignerQuarantine(
 		&unwritableRecordHandle{refusedNamePrefix: "/membership_"},
+		1,
 	)
 
 	before := de.participationGate.State()
@@ -1464,7 +1647,7 @@ func TestDkgExecutor_ReportQuarantinedSigners_PersistedShareSurvivesAnUnreadable
 	}
 
 	// A namespace that takes the write and then cannot be listed.
-	de.signerQuarantine = newTestSignerQuarantine(&unreadableHandle{})
+	de.signerQuarantine = newTestSignerQuarantine(&unreadableHandle{}, 1)
 
 	preserveOneSigner(t, de, result, gsr, group.MemberIndex(1))
 
@@ -1513,11 +1696,11 @@ func TestSignerQuarantine_PreservedOutputs_RestartSeesWhatEachWriteFailureLeft(
 			handle := &unwritableRecordHandle{
 				refusedNamePrefix: test.refusedNamePrefix,
 			}
-			de.signerQuarantine = newTestSignerQuarantine(handle)
+			de.signerQuarantine = newTestSignerQuarantine(handle, 1)
 
 			preserveOneSigner(t, de, result, gsr, group.MemberIndex(1))
 
-			outputs, err := newTestSignerQuarantine(handle).preservedOutputs()
+			outputs, err := newTestSignerQuarantine(handle, 1).preservedOutputs()
 			if err != nil {
 				t.Fatal(err)
 			}

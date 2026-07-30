@@ -445,36 +445,29 @@ func (n *node) quarantineSigner(
 			FailedOperation:     "beacon_dkg_result_publication",
 			LastObservedBlock:   gateSnapshot.CurrentBlock,
 		},
+		// Preservation keeps running behind this. It fires once the namespace
+		// has refused a half for longer than a passing fault would last, so the
+		// node stops taking new work while it is still holding an output the
+		// namespace does not fully have.
+		func(state registry.QuarantineState, cause error) {
+			n.blockOnIncompleteQuarantine(
+				dkgLogger,
+				memberIndex,
+				state,
+				cause,
+			)
+		},
 	)
-	if err != nil {
-		if state.MembershipPersisted {
-			dkgLogger.Errorf(
-				"[member:%v] quarantined the interrupted signer output "+
-					"without its audit metadata; the share is preserved and "+
-					"the offline state audit will report it unaccompanied: "+
-					"[%v]",
-				memberIndex,
-				err,
-			)
-		} else {
-			dkgLogger.Errorf(
-				"[member:%v] failed to quarantine the interrupted signer "+
-					"output; the share is only in memory "+
-					"[auditMetadataPreserved=%v]: [%v]",
-				memberIndex,
-				state.MetadataPersisted,
-				err,
-			)
-		}
-	}
 
-	// The terminal outcome follows the key material rather than the
-	// completeness of the record. A share the namespace holds is preserved
-	// material the offline audit reconciles against the chain even when its
-	// metadata write failed, and a share that never reached the namespace is
-	// not quarantined however much was written about it.
-	if !state.MembershipPersisted {
-		n.blockOnUnpreservedKeyMaterial(dkgLogger, memberIndex, err)
+	// The terminal outcome needs the whole pair. The metadata is what names the
+	// mode, canonical anchor, ceremony, seat, and refused operation of the
+	// preserved share; without it the offline audit cannot reconcile the
+	// material against the chain, so calling the permit resolved would hand the
+	// rollback decision a quarantine nothing explains. An incomplete pair leaves
+	// the permit unresolved instead, and the offline barrier keeps blocking on
+	// it until an operator repairs the missing half.
+	if !state.MembershipPersisted || !state.MetadataPersisted {
+		n.blockOnIncompleteQuarantine(dkgLogger, memberIndex, state, err)
 		return
 	}
 
@@ -488,44 +481,64 @@ func (n *node) quarantineSigner(
 	)
 }
 
-// blockOnUnpreservedKeyMaterial stops this node from beginning new ceremonies
-// after generated key material could not be written to any namespace.
+// blockOnIncompleteQuarantine stops this node from beginning new ceremonies
+// while a preserved output is missing a half the namespace was supposed to hold.
 //
-// The share is gone. It existed only in the goroutine that generated it, the
-// quarantine namespace refused it for the whole retry budget, and nothing an
-// operator or the offline audit can read accounts for it. A beacon share is
-// worse to lose than a tBTC one: the group it belongs to may already have an
-// accepted result, and a member that cannot produce its share permanently
-// reduces that group's usable threshold.
+// Either half missing leaves an inventory a rollback cannot reconcile, and a
+// beacon share is worse to be unsure about than a tBTC one: the group it belongs
+// to may already have an accepted result, and a member that cannot produce its
+// share permanently reduces that group's usable threshold. A share that reached
+// no namespace exists only in the goroutine that generated it. A share preserved
+// without its audit metadata is on disk but unexplained: the mode, canonical
+// anchor, ceremony, seat, and refused operation that would let the audit match
+// it against the chain are exactly what did not land.
 //
 // Quiescence is the blocking state rather than a new one of its own: it refuses
 // every new permit, it is already what the gate-state gauge and the quiesce
-// counter report, and it lets the permits still running finish normally. No
-// terminal outcome is recorded, so this permit closes unresolved and blocks the
-// offline barrier on its own — the state a lost share should leave behind.
+// counter report, and it lets the permits still running finish normally. It is
+// one-way by design — an operator restarts the node once the namespace is
+// repaired — which is also why the preservation behind it is given a grace
+// budget first, so a namespace that clears on its own does not cost the fleet a
+// node. No terminal outcome is recorded, so this permit closes unresolved and
+// blocks the offline barrier on its own.
 //
 // The returned channel is deliberately ignored. This caller holds a permit of
 // its own, so waiting for the active permit count to reach zero here would be
 // waiting for itself.
-func (n *node) blockOnUnpreservedKeyMaterial(
+func (n *node) blockOnIncompleteQuarantine(
 	dkgLogger log.StandardLogger,
 	memberIndex group.MemberIndex,
+	state registry.QuarantineState,
 	cause error,
 ) {
-	dkgLogger.Errorf(
-		"[member:%v] generated key material reached no namespace; refusing "+
-			"new ceremonies on this node until an operator resolves the "+
-			"quarantine namespace: [%v]",
-		memberIndex,
-		cause,
-	)
+	if state.MembershipPersisted {
+		dkgLogger.Errorf(
+			"[member:%v] the quarantined signer output has no audit record "+
+				"explaining it; the share is preserved but a rollback cannot "+
+				"reconcile it without the record; refusing new ceremonies on "+
+				"this node until an operator repairs the quarantine "+
+				"namespace: [%v]",
+			memberIndex,
+			cause,
+		)
+	} else {
+		dkgLogger.Errorf(
+			"[member:%v] generated key material reached no namespace; the "+
+				"share is only in memory [auditMetadataPreserved=%v]; "+
+				"refusing new ceremonies on this node until an operator "+
+				"resolves the quarantine namespace: [%v]",
+			memberIndex,
+			state.MetadataPersisted,
+			cause,
+		)
+	}
 
 	if n.participationGate == nil {
 		return
 	}
 
 	n.participationGate.Quiesce(fmt.Errorf(
-		"beacon key material could not be preserved: [%w]",
+		"beacon key material could not be preserved with its audit record: [%w]",
 		cause,
 	))
 }

@@ -1166,6 +1166,7 @@ func TestDkgExecutor_GenerateSigningGroup_DKGParametersError(t *testing.T) {
 		netProvider:       netProvider,
 		participationGate: newTestGate(t, blockCounter),
 		signerQuarantine: newSignerQuarantine(
+			context.Background(),
 			logger,
 			&mockPersistenceHandle{},
 		),
@@ -1222,6 +1223,7 @@ func TestDkgExecutor_GenerateSigningGroup_BroadcastChannelError(t *testing.T) {
 		netProvider:       &errNetProvider{},
 		participationGate: newTestGate(t, blockCounter),
 		signerQuarantine: newSignerQuarantine(
+			context.Background(),
 			logger,
 			&mockPersistenceHandle{},
 		),

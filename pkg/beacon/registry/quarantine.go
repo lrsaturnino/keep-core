@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -47,73 +48,83 @@ type Quarantine struct {
 	logger log.StandardLogger
 	handle persistence.ProtectedHandle
 
-	// saveAttempts and saveRetryDelay bound the retry budget spent on each half
-	// of a preserved output, and sleep waits between attempts. They are fields
-	// so a test does not have to spend the real delay.
-	saveAttempts   int
-	saveRetryDelay time.Duration
-	sleep          func(time.Duration)
+	// lifetime bounds how long a preservation keeps trying to write the output
+	// it is holding. It is the process lifetime rather than the ceremony's:
+	// the ceremony context is normally already canceled by the very refusal
+	// that sent the share here, and until the process itself is going away the
+	// generated key material is still this node's to write down. It is held on
+	// the store because the choke points that preserve run several call levels
+	// below the startup that knows the process context.
+	lifetime context.Context
+
+	// graceAttempts, retryDelay, and maxRetryDelay shape the retry, and wait
+	// pauses between rounds unless the lifetime ends first. They are fields so
+	// a test does not have to spend the real delays.
+	graceAttempts int
+	retryDelay    time.Duration
+	maxRetryDelay time.Duration
+	wait          func(context.Context, time.Duration) bool
 }
 
-// quarantineSaveAttempts bounds how many times each half of a preserved output
-// is written before its failure stands, and quarantineSaveRetryDelay is the wait
-// between attempts.
+// quarantineGraceAttempts bounds how many rounds a preservation makes before
+// the node is told it is holding key material the namespace does not have, and
+// quarantineRetryDelay and quarantineMaxRetryDelay bound the wait between
+// rounds.
 //
-// A refused write is often transient — a namespace being remounted, a disk an
-// operator is draining — and the key material this path is holding cannot be
-// regenerated, so a single attempt is not enough to conclude it is unwritable.
-// The budget stays small because the process is normally already quiescing
-// behind this write and its shutdown drain waits for it to finish.
+// The grace budget is not a deadline. A refused write is often transient — a
+// namespace being remounted, a disk an operator is draining — so the first
+// rounds pass without disturbing the fleet; what follows is a node that stops
+// taking new work while it keeps trying, not a node that gives the share up.
+// The material on this path cannot be generated again, so the retry ends only
+// with the process, and the backoff grows to keep a namespace that is down for
+// an operator's whole repair from being hammered.
 const (
-	quarantineSaveAttempts   = 3
-	quarantineSaveRetryDelay = 100 * time.Millisecond
+	quarantineGraceAttempts = 3
+	quarantineRetryDelay    = 100 * time.Millisecond
+	quarantineMaxRetryDelay = 30 * time.Second
 )
 
-// NewQuarantine creates a quarantine store over the given protected handle.
+// NewQuarantine creates a quarantine store over the given protected handle,
+// preserving outputs for as long as the given process lifetime lasts.
 func NewQuarantine(
+	lifetime context.Context,
 	logger log.StandardLogger,
 	handle persistence.ProtectedHandle,
 ) *Quarantine {
 	return &Quarantine{
-		logger:         logger,
-		handle:         handle,
-		saveAttempts:   quarantineSaveAttempts,
-		saveRetryDelay: quarantineSaveRetryDelay,
-		sleep:          time.Sleep,
+		logger:        logger,
+		handle:        handle,
+		lifetime:      lifetime,
+		graceAttempts: quarantineGraceAttempts,
+		retryDelay:    quarantineRetryDelay,
+		maxRetryDelay: quarantineMaxRetryDelay,
+		wait:          waitWithinLifetime,
 	}
 }
 
-// save writes one half of a preserved output, retrying a refused write within
-// the attempt budget and returning the last error if the budget runs out.
-func (q *Quarantine) save(
-	content []byte,
-	directory string,
-	name string,
-) error {
-	// A store assembled without a budget still gets one attempt, and one
-	// without a wait still waits: a zero budget would report a write that never
-	// happened as a success, which is the single outcome this path exists to
-	// prevent.
-	attempts := q.saveAttempts
-	if attempts < 1 {
-		attempts = 1
-	}
-	sleep := q.sleep
-	if sleep == nil {
-		sleep = time.Sleep
+// waitWithinLifetime pauses between preservation rounds, reporting whether the
+// process is still around to make another one.
+func waitWithinLifetime(lifetime context.Context, delay time.Duration) bool {
+	if lifetime == nil {
+		time.Sleep(delay)
+		return true
 	}
 
-	var err error
-	for attempt := 1; attempt <= attempts; attempt++ {
-		if attempt > 1 {
-			sleep(q.saveRetryDelay)
-		}
-		if err = q.handle.Save(content, directory, name); err == nil {
-			return nil
-		}
+	// Checked before the wait so a lifetime that has already ended stops the
+	// retry rather than racing the timer for it.
+	if lifetime.Err() != nil {
+		return false
 	}
 
-	return err
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-lifetime.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 // QuarantineState reports which halves of a preserved output reached the
@@ -132,27 +143,30 @@ type QuarantineState struct {
 }
 
 // Preserve durably saves the membership and its audit metadata under the
-// quarantine namespace. Preservation failure is surfaced to the caller: losing
-// generated key material is a protocol violation, so the caller must log it
-// unsuppressed.
+// quarantine namespace. It keeps ownership of the generated output until both
+// halves are durable, retrying for as long as the process lives, and returns
+// early only when the process is going away with a half still missing.
 //
-// Both records are attempted even when the first fails, and what actually
-// landed is returned beside the error. A half that could have been written is
-// evidence the offline audit would otherwise not have, and the audit already
-// reads either orphan as a finding — a membership without metadata is
-// unexplained key material, metadata without a membership is a share that was
-// lost. What must not happen is the node reporting a state the namespace
-// contradicts, so the caller is told which of the two it is.
+// Both records are attempted in every round and what actually landed is
+// returned beside the error, because the two halves mean different things and a
+// caller cannot infer either from the error alone. A membership without
+// metadata is unexplained key material; metadata without a membership is a
+// share that was lost. What must not happen is the node reporting a state the
+// namespace contradicts.
 //
 // The membership is attempted first so that a process killed between the two
 // writes leaves the key material behind rather than only the note describing
-// it: an unexplained share is recoverable, a lost one is not. Each half is
-// retried within a bounded budget before its failure stands, because a namespace
-// that refuses one write often accepts the next and the material being written
-// cannot be generated again.
+// it: an unexplained share is recoverable, a lost one is not.
+//
+// notifyIncomplete is called once, after graceAttempts rounds have left a half
+// unwritten, with what the namespace holds so far. It exists so the node can
+// stop taking new work while it is still holding an output no namespace fully
+// has — not to end the attempt, which continues behind it until the pair is
+// durable or the process ends.
 func (q *Quarantine) Preserve(
 	membership *Membership,
 	metadata QuarantinedSignerMetadata,
+	notifyIncomplete func(QuarantineState, error),
 ) (QuarantineState, error) {
 	var state QuarantineState
 
@@ -182,62 +196,144 @@ func (q *Quarantine) Preserve(
 	directory := metadata.GroupPublicKey
 	memberSuffix := fmt.Sprint(membership.Signer.MemberID())
 
-	var writeErrs []error
-
-	if err := q.save(
-		membershipBytes,
-		directory,
-		"/membership_"+memberSuffix,
-	); err != nil {
-		writeErrs = append(writeErrs, fmt.Errorf(
-			"could not persist the quarantined membership in %d attempts: [%v]",
-			q.saveAttempts,
-			err,
-		))
-	} else {
-		state.MembershipPersisted = true
-	}
-
-	if err := q.save(
-		metadataBytes,
-		directory,
-		"/metadata_"+memberSuffix,
-	); err != nil {
-		writeErrs = append(writeErrs, fmt.Errorf(
-			"could not persist the quarantine metadata in %d attempts: [%v]",
-			q.saveAttempts,
-			err,
-		))
-	} else {
-		state.MetadataPersisted = true
-	}
-
-	// One line names the output and what the namespace now holds of it, so the
+	// One line names the output and what the namespace holds of it, so the
 	// operator record and the namespace cannot drift apart. An incomplete pair
-	// is a finding the offline audit will raise, so it is logged as an error
-	// here rather than left to read like an ordinary quarantine.
-	logQuarantine := q.logger.Warnf
-	if len(writeErrs) > 0 {
-		logQuarantine = q.logger.Errorf
+	// is a finding the offline audit will raise, so it reads as an error rather
+	// than like an ordinary quarantine.
+	report := func(rounds int, complete bool) {
+		logQuarantine := q.logger.Warnf
+		if !complete {
+			logQuarantine = q.logger.Errorf
+		}
+		logQuarantine(
+			"quarantined a beacon signer output [group=0x%v] [member=%v] "+
+				"[mode=%s] [canonicalStartBlock=%d] [failedOperation=%s] "+
+				"[lastObservedBlock=%d] [keyMaterialPreserved=%v] "+
+				"[auditMetadataPreserved=%v] [rounds=%d]",
+			metadata.GroupPublicKey,
+			membership.Signer.MemberID(),
+			metadata.ProtocolMode,
+			metadata.CanonicalStartBlock,
+			metadata.FailedOperation,
+			metadata.LastObservedBlock,
+			state.MembershipPersisted,
+			state.MetadataPersisted,
+			rounds,
+		)
 	}
-	logQuarantine(
-		"quarantined a beacon signer output [group=0x%v] [member=%v] "+
-			"[mode=%s] [canonicalStartBlock=%d] [failedOperation=%s] "+
-			"[lastObservedBlock=%d] [keyMaterialPreserved=%v] "+
-			"[auditMetadataPreserved=%v]",
-		metadata.GroupPublicKey,
-		membership.Signer.MemberID(),
-		metadata.ProtocolMode,
-		metadata.CanonicalStartBlock,
-		metadata.FailedOperation,
-		metadata.LastObservedBlock,
+
+	rounds, lastErr := q.persistPair(
+		&state,
+		directory,
+		memberSuffix,
+		membershipBytes,
+		metadataBytes,
+		notifyIncomplete,
+	)
+	if lastErr == nil {
+		report(rounds, true)
+		return state, nil
+	}
+
+	report(rounds, false)
+
+	return state, fmt.Errorf(
+		"could not preserve the quarantined beacon signer output in %d rounds "+
+			"before the process ended [keyMaterialPreserved=%v] "+
+			"[auditMetadataPreserved=%v]: %w",
+		rounds,
 		state.MembershipPersisted,
 		state.MetadataPersisted,
+		lastErr,
 	)
+}
 
-	if len(writeErrs) > 0 {
-		return state, errors.Join(writeErrs...)
+// persistPair writes whichever halves of a preserved output the namespace has
+// not taken yet, round after round, until it holds both or the process ends.
+// It reports how many rounds were spent and the last round's failure, which is
+// nil exactly when both halves are durable.
+//
+// The state is updated in place as each half lands so that a caller reading it
+// after an interrupted preservation sees what the namespace actually has, and
+// so a half that succeeded is never rewritten by a later round.
+func (q *Quarantine) persistPair(
+	state *QuarantineState,
+	directory string,
+	memberSuffix string,
+	membershipBytes []byte,
+	metadataBytes []byte,
+	notifyIncomplete func(QuarantineState, error),
+) (int, error) {
+	graceAttempts := q.graceAttempts
+	if graceAttempts < 1 {
+		graceAttempts = 1
 	}
+	wait := q.wait
+	if wait == nil {
+		wait = waitWithinLifetime
+	}
+	delay := q.retryDelay
 
-	return state, nil
+	notified := false
+	var lastErr error
+
+	for round := 1; ; round++ {
+		var roundErrs []error
+
+		if !state.MembershipPersisted {
+			if err := q.handle.Save(
+				membershipBytes,
+				directory,
+				"/membership_"+memberSuffix,
+			); err != nil {
+				roundErrs = append(roundErrs, fmt.Errorf(
+					"could not persist the quarantined membership: [%v]",
+					err,
+				))
+			} else {
+				state.MembershipPersisted = true
+			}
+		}
+
+		if !state.MetadataPersisted {
+			if err := q.handle.Save(
+				metadataBytes,
+				directory,
+				"/metadata_"+memberSuffix,
+			); err != nil {
+				roundErrs = append(roundErrs, fmt.Errorf(
+					"could not persist the quarantine metadata: [%v]",
+					err,
+				))
+			} else {
+				state.MetadataPersisted = true
+			}
+		}
+
+		if len(roundErrs) == 0 {
+			return round, nil
+		}
+
+		lastErr = errors.Join(roundErrs...)
+
+		// The node is told once the grace rounds are spent, so a namespace that
+		// clears on its own does not take the node out of the fleet, and one
+		// that does not stops it from building further state it cannot account
+		// for. Preservation does not end here: the share is still in hand and
+		// the retry keeps running behind the notification.
+		if !notified && round >= graceAttempts {
+			notified = true
+			if notifyIncomplete != nil {
+				notifyIncomplete(*state, lastErr)
+			}
+		}
+
+		if !wait(q.lifetime, delay) {
+			return round, lastErr
+		}
+
+		if delay *= 2; delay > q.maxRetryDelay {
+			delay = q.maxRetryDelay
+		}
+	}
 }

@@ -2049,6 +2049,7 @@ func TestDKGCutover_GateQuiesceAbortSkipsOrdinaryDKGFailureMetrics(t *testing.T)
 		participationGate: gate,
 		metricsRecorder:   recorder,
 		signerQuarantine: newSignerQuarantine(
+			context.Background(),
 			logger,
 			&mockPersistenceHandle{},
 		),

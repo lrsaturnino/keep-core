@@ -58,7 +58,11 @@ func Initialize(
 	groupRegistry := registry.NewGroupRegistry(logger, beaconChain, persistence)
 	groupRegistry.LoadExistingGroups()
 
-	signerQuarantine := registry.NewQuarantine(logger, quarantinePersistence)
+	signerQuarantine := registry.NewQuarantine(
+		ctx,
+		logger,
+		quarantinePersistence,
+	)
 
 	node := newNode(
 		beaconChain,

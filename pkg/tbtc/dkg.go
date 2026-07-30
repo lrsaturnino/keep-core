@@ -1144,50 +1144,47 @@ func (de *dkgExecutor) preserveInterruptedSigner(
 			FailedOperation:     operation,
 			LastObservedBlock:   snapshot.CurrentBlock,
 		},
+		// Preservation keeps running behind this. It fires once the namespace
+		// has refused a half for longer than a passing fault would last, so the
+		// node stops taking new work while it is still holding an output the
+		// namespace does not fully have.
+		func(state quarantineState, cause error) {
+			de.accountForPreservedKeyMaterial(dkgLogger, signer, state)
+			de.blockOnIncompleteQuarantine(
+				dkgLogger,
+				memberIndex,
+				state,
+				cause,
+			)
+		},
 	)
-	if quarantineErr != nil {
-		if quarantineState.membershipPersisted {
-			dkgLogger.Errorf(
-				"[member:%v] quarantined the interrupted signer without its "+
-					"audit metadata; the share is preserved and the offline "+
-					"state audit will report it unaccompanied: [%v]",
-				memberIndex,
-				quarantineErr,
-			)
-		} else {
-			dkgLogger.Errorf(
-				"[member:%v] failed to quarantine the interrupted signer; the "+
-					"generated share is only in memory "+
-					"[auditMetadataPreserved=%v]: [%v]",
-				memberIndex,
-				quarantineState.metadataPersisted,
-				quarantineErr,
-			)
-		}
-	}
 
-	// The terminal outcome and the published count follow the key material
-	// rather than the completeness of the record. A share the namespace holds
-	// is preserved material a rollback has to account for even when its
-	// metadata write failed, and a share that never reached the namespace is
-	// not quarantined however much was written about it.
-	if !quarantineState.membershipPersisted {
-		de.blockOnUnpreservedKeyMaterial(
+	// The published count follows the key material alone: a share the namespace
+	// holds is material a rollback has to account for even when the record
+	// explaining it did not land, and a share that never reached the namespace
+	// is not quarantined however much was written about it. It is recorded
+	// before the count is published so the identity this process knows it
+	// persisted is already the count's floor by the time the namespace is
+	// recounted.
+	de.accountForPreservedKeyMaterial(dkgLogger, signer, quarantineState)
+
+	// The terminal outcome, unlike the count, needs the whole pair. The
+	// metadata is what names the mode, canonical anchor, ceremony, seat, and
+	// refused operation of the preserved share; without it the offline audit
+	// cannot reconcile the material against the chain, so calling the permit
+	// resolved would hand the rollback decision a quarantine nothing explains.
+	// An incomplete pair leaves the permit unresolved instead, and the offline
+	// barrier keeps blocking on it until an operator repairs the missing half.
+	if !quarantineState.membershipPersisted ||
+		!quarantineState.metadataPersisted {
+		de.blockOnIncompleteQuarantine(
 			dkgLogger,
 			memberIndex,
+			quarantineState,
 			quarantineErr,
 		)
 		return
 	}
-
-	// Recorded before the count is published so the identity this process knows
-	// it persisted is already the count's floor by the time the namespace is
-	// recounted. A scan that fails in between would otherwise have nothing to
-	// hold the published number up against.
-	de.noteQuarantinedOutput(quarantinedSigner{
-		walletStorageKey: getWalletStorageKey(signer.wallet.publicKey),
-		memberIndex:      signer.signingGroupMemberIndex,
-	})
 
 	de.recordPermitTerminalOutcome(
 		dkgLogger,
@@ -1197,47 +1194,89 @@ func (de *dkgExecutor) preserveInterruptedSigner(
 			Kind: participation.TerminalEvidenceQuarantinedTBTCSinger,
 		},
 	)
+}
+
+// accountForPreservedKeyMaterial adds key material this process durably wrote
+// to the count a rollback reads, as soon as the namespace is known to hold it.
+//
+// The audit metadata may still be missing. The count is of preserved shares,
+// and a share the namespace holds is one whether or not the record explaining
+// it landed — leaving it out until the pair completes would under-report exactly
+// the material a rollback most needs to find.
+func (de *dkgExecutor) accountForPreservedKeyMaterial(
+	dkgLogger log.StandardLogger,
+	signer *signer,
+	state quarantineState,
+) {
+	if !state.membershipPersisted {
+		return
+	}
+
+	de.noteQuarantinedOutput(quarantinedSigner{
+		walletStorageKey: getWalletStorageKey(signer.wallet.publicKey),
+		memberIndex:      signer.signingGroupMemberIndex,
+	})
 	de.reportQuarantinedSigners(dkgLogger)
 }
 
-// blockOnUnpreservedKeyMaterial stops this node from beginning new ceremonies
-// after generated key material could not be written to any namespace.
+// blockOnIncompleteQuarantine stops this node from beginning new ceremonies
+// while a preserved output is missing a half the namespace was supposed to hold.
 //
-// The share is gone. It existed only in the goroutine that generated it, the
-// quarantine namespace refused it for the whole retry budget, and nothing an
-// operator or the offline audit can read accounts for it. Taking on more work
-// would build further state on a host whose inventory is already known to be
-// incomplete, and the rollback audit reconciles namespaces against the chain —
-// it cannot reconcile a share that was never written down.
+// Either half missing leaves an inventory a rollback cannot reconcile. A share
+// that reached no namespace exists only in the goroutine that generated it and
+// nothing an operator or the offline audit can read accounts for it. A share
+// preserved without its audit metadata is on disk but unexplained: the mode,
+// canonical anchor, ceremony, seat, and refused operation that would let the
+// audit match it against the chain are exactly what did not land. Taking on more
+// work in either state builds further state on a host whose inventory is already
+// known to be incomplete.
 //
 // Quiescence is the blocking state rather than a new one of its own: it refuses
 // every new permit, it is already what the gate-state gauge and the quiesce
-// counter report, and it lets the permits still running finish normally. No
-// terminal outcome is recorded, so this permit closes unresolved and blocks the
-// offline barrier on its own — the state a lost share should leave behind.
+// counter report, and it lets the permits still running finish normally. It is
+// one-way by design — an operator restarts the node once the namespace is
+// repaired — which is also why the preservation behind it is given a grace
+// budget first, so a namespace that clears on its own does not cost the fleet a
+// node. No terminal outcome is recorded, so this permit closes unresolved and
+// blocks the offline barrier on its own.
 //
 // The returned channel is deliberately ignored. This caller holds a permit of
 // its own, so waiting for the active permit count to reach zero here would be
 // waiting for itself.
-func (de *dkgExecutor) blockOnUnpreservedKeyMaterial(
+func (de *dkgExecutor) blockOnIncompleteQuarantine(
 	dkgLogger log.StandardLogger,
 	memberIndex group.MemberIndex,
+	state quarantineState,
 	cause error,
 ) {
-	dkgLogger.Errorf(
-		"[member:%v] generated key material reached no namespace; refusing "+
-			"new ceremonies on this node until an operator resolves the "+
-			"quarantine namespace: [%v]",
-		memberIndex,
-		cause,
-	)
+	if state.membershipPersisted {
+		dkgLogger.Errorf(
+			"[member:%v] the quarantined signer has no audit record "+
+				"explaining it; the share is preserved but a rollback cannot "+
+				"reconcile it without the record; refusing new ceremonies on "+
+				"this node until an operator repairs the quarantine "+
+				"namespace: [%v]",
+			memberIndex,
+			cause,
+		)
+	} else {
+		dkgLogger.Errorf(
+			"[member:%v] generated key material reached no namespace; the "+
+				"share is only in memory [auditMetadataPreserved=%v]; "+
+				"refusing new ceremonies on this node until an operator "+
+				"resolves the quarantine namespace: [%v]",
+			memberIndex,
+			state.metadataPersisted,
+			cause,
+		)
+	}
 
 	if de.participationGate == nil {
 		return
 	}
 
 	de.participationGate.Quiesce(fmt.Errorf(
-		"tbtc key material could not be preserved: [%w]",
+		"tbtc key material could not be preserved with its audit record: [%w]",
 		cause,
 	))
 }

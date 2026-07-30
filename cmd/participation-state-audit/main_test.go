@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
@@ -22,7 +23,9 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	ethereumCrypto "github.com/ethereum/go-ethereum/crypto"
 	bn256 "github.com/ethereum/go-ethereum/crypto/bn256/cloudflare"
+	"google.golang.org/protobuf/proto"
 
+	"github.com/keep-network/keep-common/pkg/persistence"
 	"github.com/keep-network/keep-core/internal/testutils"
 	"github.com/keep-network/keep-core/pkg/altbn128"
 	"github.com/keep-network/keep-core/pkg/beacon/dkg"
@@ -31,10 +34,14 @@ import (
 	"github.com/keep-network/keep-core/pkg/chain"
 	beaconabi "github.com/keep-network/keep-core/pkg/chain/ethereum/beacon/gen/abi"
 	ecdsaabi "github.com/keep-network/keep-core/pkg/chain/ethereum/ecdsa/gen/abi"
+	"github.com/keep-network/keep-core/pkg/crypto/secp256k1"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/storage"
 	"github.com/keep-network/keep-core/pkg/tbtc"
+	tbtcpb "github.com/keep-network/keep-core/pkg/tbtc/gen/pb"
+	"github.com/keep-network/keep-core/pkg/tecdsa"
+	tecdsapb "github.com/keep-network/keep-core/pkg/tecdsa/gen/pb"
 )
 
 const testPassword = "audit-test-password"
@@ -176,6 +183,7 @@ func newTestStorageWithQuiescencePermits(
 		t.Fatal(err)
 	}
 	quarantine := registry.NewQuarantine(
+		context.Background(),
 		&testutils.MockLogger{},
 		quarantineHandle,
 	)
@@ -194,6 +202,7 @@ func newTestStorageWithQuiescencePermits(
 			FailedOperation:     "beacon_dkg_result_publication",
 			LastObservedBlock:   950,
 		},
+		nil,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -1934,21 +1943,168 @@ func TestRunAudit_TBTCQuarantineMetadataWithoutMembershipIsAFinding(
 	}
 }
 
-// TestValidateTBTCQuarantineEntry_MembershipWithoutMetadataIsAFinding proves the
+// storeTBTCQuarantineMembership writes one tBTC quarantine membership record
+// that decodes the way the wallet registry loader decodes it, and returns the
+// wallet storage key it was filed under.
+//
+// The record is assembled from the wire types the node persists rather than from
+// a signer built in memory: the tECDSA key-share fixtures live in an internal
+// package this command cannot import, and what the audit has to survive is the
+// encoding on disk, not the struct behind it. The private key share carries the
+// smallest payload that still decodes — the audit decodes it only to prove the
+// record parses in full, and never looks inside — while the wallet public key is
+// a real curve point, because every identity the audit derives from the record
+// comes out of it.
+func storeTBTCQuarantineMembership(
+	t *testing.T,
+	handle persistence.ProtectedHandle,
+	memberIndex group.MemberIndex,
+	walletScalar int64,
+) string {
+	t.Helper()
+
+	x, y := tecdsa.Curve.ScalarBaseMult(big.NewInt(walletScalar).Bytes())
+	walletPublicKey := &ecdsa.PublicKey{Curve: tecdsa.Curve, X: x, Y: y}
+
+	privateKeyShare, err := proto.Marshal(&tecdsapb.PrivateKeyShare{
+		Data: &tecdsapb.LocalPartySaveData{
+			EcdsaPub: &tecdsapb.LocalPartySaveData_ECPoint{
+				X: x.Bytes(),
+				Y: y.Bytes(),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	membership, err := proto.Marshal(&tbtcpb.Signer{
+		Wallet: &tbtcpb.Wallet{
+			PublicKey:             secp256k1.Marshal(walletPublicKey),
+			SigningGroupOperators: []string{"0xAA", "0xBB", "0xCC"},
+		},
+		SigningGroupMemberIndex: uint32(memberIndex),
+		PrivateKeyShare:         privateKeyShare,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The registry strips the uncompressed-point prefix to keep the directory
+	// name usable, and the audit compares the directory against the key it
+	// derives from the record itself.
+	walletStorageKey := hex.EncodeToString(
+		secp256k1.Marshal(walletPublicKey),
+	)[2:]
+
+	if err := handle.Save(
+		membership,
+		walletStorageKey,
+		"/membership_"+fmt.Sprint(memberIndex),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	return walletStorageKey
+}
+
+// TestRunAudit_TBTCQuarantineMembershipWithoutMetadataIsAFinding proves the
 // audit raises the other half of the incomplete-pair check: preserved key
 // material with no audit record explaining it.
 //
 // The two orphans are opposite states. Metadata without a membership is a share
 // that was lost; a membership without metadata is a share that survived while
-// the record naming it did not, which is exactly what a node reports after the
-// metadata write of a quarantine is refused. Nothing in the record itself says
-// which mode, anchor, or ceremony produced it, so a rollback cannot reconcile it
-// against the chain and the audit has to say so.
+// the record naming it did not, which is exactly what a node leaves behind when
+// the metadata write of a quarantine is refused. Nothing in the record itself
+// says which mode, anchor, or ceremony produced it, so a rollback cannot
+// reconcile it against the chain and the audit has to say so.
 //
-// The check is exercised directly rather than through a stored namespace: this
-// branch needs a membership record that decodes the way the wallet registry
-// loader decodes it, and building one takes the tECDSA key-share fixtures, which
-// live in an internal package this command cannot import.
+// It runs through the stored namespace rather than against the validator so the
+// whole path is covered: enumeration, decoding the membership the way the
+// wallet registry loader does, pairing it with the metadata that is not there,
+// and the blocking verdict.
+func TestRunAudit_TBTCQuarantineMembershipWithoutMetadataIsAFinding(
+	t *testing.T,
+) {
+	storageDir := newTestStorage(t)
+
+	diskStorage, err := storage.Initialize(
+		storage.Config{Dir: storageDir},
+		testPassword,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quarantineHandle, err := diskStorage.InitializeKeyStorePersistence(
+		"tbtc-quarantine",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	walletStorageKey := storeTBTCQuarantineMembership(
+		t,
+		quarantineHandle,
+		group.MemberIndex(3),
+		7,
+	)
+
+	auditManifest, err := runAudit(
+		storageDir,
+		testPassword,
+		evidenceInputs{},
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if auditManifest.Consistent {
+		t.Error("expected an inconsistent manifest")
+	}
+	if !hasFinding(
+		auditManifest,
+		fmt.Sprintf(
+			"tbtc quarantine output [%s/3] has a membership record without "+
+				"audit metadata",
+			walletStorageKey,
+		),
+	) {
+		t.Errorf(
+			"expected an unexplained-key-material finding, findings: %v",
+			auditManifest.Findings,
+		)
+	}
+
+	// The finding has to come from a record the audit actually read. A stored
+	// membership it could not decode, or filed under a wallet it could not
+	// match, raises its own finding — and would make the orphan finding above
+	// pass for reasons that have nothing to do with the missing metadata.
+	for _, finding := range auditManifest.Findings {
+		if strings.Contains(finding, "cannot be decoded") ||
+			strings.Contains(finding, "not the wallet its directory claims") ||
+			strings.Contains(finding, "not the member its file name claims") ||
+			strings.Contains(finding, "has an unknown name") {
+			t.Errorf("the stored membership was not read as one: %s", finding)
+		}
+	}
+
+	// The orphan is not published as a quarantined output: the manifest's
+	// records are built from the metadata, and there is none to build from.
+	// The finding is the whole account of it, which is why it must be raised.
+	for _, output := range auditManifest.TBTCQuarantinedOutputs {
+		if output.WalletStorageKey == walletStorageKey {
+			t.Error(
+				"an output with no audit metadata was published as a " +
+					"quarantined output",
+			)
+		}
+	}
+}
+
+// TestValidateTBTCQuarantineEntry_MembershipWithoutMetadataIsAFinding covers the
+// same incomplete pair at the validator, where the record's identity fields can
+// be varied without re-deriving a wallet for each one.
 func TestValidateTBTCQuarantineEntry_MembershipWithoutMetadataIsAFinding(
 	t *testing.T,
 ) {
@@ -2141,6 +2297,7 @@ func TestRunAudit_QuarantineMetadataCrossChecks(t *testing.T) {
 		t.Fatal(err)
 	}
 	quarantine := registry.NewQuarantine(
+		context.Background(),
 		&testutils.MockLogger{},
 		quarantineHandle,
 	)
@@ -2163,6 +2320,7 @@ func TestRunAudit_QuarantineMetadataCrossChecks(t *testing.T) {
 			FailedOperation:     "beacon_dkg_result_publication",
 			LastObservedBlock:   950,
 		},
+		nil,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -2208,6 +2366,7 @@ func TestRunAudit_QuarantinedGroupAlsoActiveIsAFinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	quarantine := registry.NewQuarantine(
+		context.Background(),
 		&testutils.MockLogger{},
 		quarantineHandle,
 	)
@@ -2228,6 +2387,7 @@ func TestRunAudit_QuarantinedGroupAlsoActiveIsAFinding(t *testing.T) {
 			FailedOperation:     "beacon_dkg_result_publication",
 			LastObservedBlock:   950,
 		},
+		nil,
 	); err != nil {
 		t.Fatal(err)
 	}

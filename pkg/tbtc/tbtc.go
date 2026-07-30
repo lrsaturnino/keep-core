@@ -186,6 +186,7 @@ func Initialize(
 	node.participationGate = participationGate
 	node.dkgExecutor.participationGate = participationGate
 	node.dkgExecutor.signerQuarantine = newSignerQuarantine(
+		ctx,
 		logger,
 		quarantinePersistence,
 	)
