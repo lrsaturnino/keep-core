@@ -2528,6 +2528,171 @@ check "release stamp: a commit carrying no release workflow fails closed" 1 \
   "carries no \.github/workflows/release\.yml"
 
 # ----------------------------------------------------------------------------
+# The release provenance wiring, held to the producer's contract.
+#
+# Acceptance refuses any release-ready receipt that names no artifact, and the
+# document that names one can only reach the receipt through the dispatch. A
+# workflow that lost any part of that path still passes every proof it runs and
+# archives a receipt that looks complete; what it cannot do is produce evidence
+# a release can be accepted on, and it finds that out at the end of the one
+# rehearsal that mattered. These cases are the alternative.
+
+# A rehearsal workflow carrying, or missing, each part of that path. Every
+# fixture is a whole workflow rather than a patch, because what the check reads
+# is a shape — an input declared where a dispatcher sees it, a job that
+# consumes it, a job that requires the result — and a patch could satisfy the
+# text of a check while the shape said something else.
+write_provenance_workflow() {
+  local repo="$1" declare_input="$2" read_input="$3" pass_env="$4"
+  local proof_member="$5" container_member="$6"
+  mkdir -p "${repo}/.github/workflows"
+  {
+    printf 'name: Cutover Rehearsal\non:\n  workflow_dispatch:\n    inputs:\n'
+    printf '      prior_image_digest:\n        required: false\n'
+    if [[ "${declare_input}" == "yes" ]]; then
+      printf '      %s:\n        required: false\n' \
+        "${RELEASE_PROVENANCE_INPUT}"
+    fi
+    printf 'jobs:\n'
+    printf '  %s:\n    runs-on: ubuntu-latest\n    steps:\n' \
+      "${REHEARSAL_PROOF_JOB}"
+    printf '      - uses: actions/checkout@v4\n'
+    printf '      - name: Provision the detached release provenance\n'
+    if [[ "${read_input}" == "yes" ]]; then
+      printf '        env:\n'
+      # The workflow's own literal text, which is the thing being read back.
+      # shellcheck disable=SC2016
+      printf '          RELEASE_PROVENANCE_B64: ${{ inputs.%s }}\n' \
+        "${RELEASE_PROVENANCE_INPUT}"
+    fi
+    printf '        run: |\n          echo provisioned\n'
+    printf '      - name: Run cutover gate local proofs\n        run: |\n'
+    case "${pass_env}" in
+      yes)
+        printf '          docker run -e %s=/p.json go-build-env true\n' \
+          "${RELEASE_PROVENANCE_ENV}"
+        ;;
+      comment)
+        # The name present only where the workflow parser reads nothing. A
+        # check satisfied by this would be satisfied by every workflow whose
+        # comments still describe wiring somebody removed.
+        printf '          # %s would be passed here\n' \
+          "${RELEASE_PROVENANCE_ENV}"
+        printf '          docker run go-build-env true\n'
+        ;;
+      *) printf '          docker run go-build-env true\n' ;;
+    esac
+    if [[ "${proof_member}" == "yes" ]]; then
+      printf '      - name: Require the receipt to carry it\n        run: |\n'
+      printf '          test -f rehearsal-evidence/attestation/%s\n' \
+        "${RELEASE_PROVENANCE_MEMBER}"
+    fi
+    printf '  %s:\n    runs-on: ubuntu-latest\n    steps:\n' \
+      "${REHEARSAL_CONTAINER_JOB}"
+    printf '      - name: Require the attestation\n        run: |\n'
+    if [[ "${container_member}" == "yes" ]]; then
+      # shellcheck disable=SC2016
+      printf '          test -f "$EVIDENCE_DIR/attestation/%s"\n' \
+        "${RELEASE_PROVENANCE_MEMBER}"
+    else
+      # shellcheck disable=SC2016
+      printf '          test -f "$EVIDENCE_DIR/attestation/source-commit.txt"\n'
+    fi
+  } >"${repo}/${REHEARSAL_WORKFLOW}"
+}
+
+make_provenance_repo() {
+  local repo="$1"
+  shift
+  mkdir -p "${repo}"
+  (
+    cd "${repo}"
+    git_q init -q
+    write_provenance_workflow "${repo}" "$@"
+    git_q add -Af
+    git_q commit -q -m 'provenance wiring fixture'
+  )
+}
+
+run_provenance_wiring() {
+  local root="$1"
+  set +e
+  CASE_OUT="$(
+    (
+      # shellcheck disable=SC2034
+      REPO_ROOT="${root}"
+      verify_release_provenance_wiring
+    ) 2>&1
+  )"
+  CASE_RC=$?
+  set -e
+}
+
+T="${WORK}/provenance-wired"
+make_provenance_repo "${T}" yes yes yes yes yes
+run_provenance_wiring "${T}"
+check "provenance wiring: a workflow carrying the whole path passes" 0 \
+  "offers ${RELEASE_PROVENANCE_INPUT}" \
+  "hands it to the proof stage as ${RELEASE_PROVENANCE_ENV}" \
+  "in both the producing and the consuming job"
+
+# The state this check was written for: the dispatch exposes the image digests
+# and no way to say which build produced them.
+T="${WORK}/provenance-no-input"
+make_provenance_repo "${T}" no yes yes yes yes
+run_provenance_wiring "${T}"
+check "provenance wiring: a dispatch offering no provenance input fails" 1 \
+  "declares no ${RELEASE_PROVENANCE_INPUT} input" \
+  "cannot produce admissible release evidence"
+
+# A field an operator fills in that reaches nothing is worse than no field:
+# the dispatch looks like it supplied the document.
+T="${WORK}/provenance-input-unread"
+make_provenance_repo "${T}" yes no yes yes yes
+run_provenance_wiring "${T}"
+check "provenance wiring: an input no job reads fails" 1 \
+  "never reads the ${RELEASE_PROVENANCE_INPUT} input" \
+  "a release nobody can identify"
+
+T="${WORK}/provenance-env-absent"
+make_provenance_repo "${T}" yes yes no yes yes
+run_provenance_wiring "${T}"
+check "provenance wiring: a proof stage never told where it is fails" 1 \
+  "never passes ${RELEASE_PROVENANCE_ENV}" \
+  "records none without it"
+
+# The same workflow with the variable named only in a comment. The producer
+# reads an environment variable, not a description of one, and a check that
+# could not tell them apart would pass every workflow whose comments outlived
+# the wiring they describe.
+T="${WORK}/provenance-env-commented"
+make_provenance_repo "${T}" yes yes comment yes yes
+run_provenance_wiring "${T}"
+check "provenance wiring: the variable named only in a comment fails" 1 \
+  "never passes ${RELEASE_PROVENANCE_ENV}"
+
+T="${WORK}/provenance-receipt-unchecked"
+make_provenance_repo "${T}" yes yes yes no yes
+run_provenance_wiring "${T}"
+check "provenance wiring: a receipt never checked for the document fails" 1 \
+  "never requires ${RELEASE_PROVENANCE_MEMBER} of the receipt it archives"
+
+T="${WORK}/provenance-container-unchecked"
+make_provenance_repo "${T}" yes yes yes yes no
+run_provenance_wiring "${T}"
+check "provenance wiring: a container job that never checks the receipt fails" \
+  1 "never checks the receipt it downloads for ${RELEASE_PROVENANCE_MEMBER}" \
+  "before its own emitter refuses the run"
+
+T="${WORK}/provenance-workflow-gone"
+make_provenance_repo "${T}" yes yes yes yes yes
+(cd "${T}" && git_q rm -q "${REHEARSAL_WORKFLOW}" &&
+  git_q commit -q -m 'drop the rehearsal workflow')
+run_provenance_wiring "${T}"
+check "provenance wiring: a commit carrying no rehearsal workflow fails" 1 \
+  "carries no \.github/workflows/cutover-rehearsal\.yml"
+
+# ----------------------------------------------------------------------------
 
 printf '%d passed, %d failed\n' "${PASS}" "${FAILED}"
 if [[ "${FAILED}" -ne 0 ]]; then

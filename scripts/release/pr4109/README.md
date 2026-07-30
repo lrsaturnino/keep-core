@@ -1046,6 +1046,18 @@ keeps holding once the reviewed block lands and the answer flips. It runs from
 `local-proofs` rather than `shell-analysis` because asking the binary needs
 the Go toolchain.
 
+The readiness and provenance success branches need a binary that compiles a
+real cutover, so the suite always runs one — and asks the compiler which it
+is rather than reading the source. `release-manifest derive` reports the
+compiled block; while it is the zero placeholder a Go build overlay supplies
+one for the duration of those cases, without touching the tree and with
+`GOFLAGS` carrying it into the `go run` invocations the producer makes on its
+own, and once the reviewed block is set the same cases run against the
+shipping binary with no substitution at all. The block the cases actually
+compile is then read back out of the binary, so a constant declared some other
+way fails loudly instead of quietly turning every ready case into a second
+copy of the "no" branch.
+
 Readiness says the reviewed manifest names a real cutover. It cannot say which
 artifact runs it, and no edit to that document could make it: the commit
 finally built and the image digests are outputs of a build over the manifest's
@@ -1065,6 +1077,24 @@ provenance against its shape, and the recorded hash against the reviewed
 bytes. `local-proofs` takes the verified document into the receipt when
 `PR4109_RELEASE_PROVENANCE` points at one, copying it rather than remembering
 a path, so acceptance reads the run's own sealed account.
+
+The dispatched workflow is what has to be able to hand it in. A release
+dispatch supplies the base64 of that document in the `release_provenance_b64`
+input; the `local-proofs` job decodes it into `RUNNER_TEMP` — outside the
+checkout, because the proof stage refuses to produce evidence from a tree that
+diverges from the dispatched commit, untracked files included — mounts it into
+the proof container at the container root, and passes
+`PR4109_RELEASE_PROVENANCE`. That job then requires the archived receipt to
+carry the document byte-for-byte, and `container-rehearsal` requires the
+receipt it downloads to carry one whenever it records a release-ready
+manifest, so a dispatch that cannot produce admissible evidence is refused
+before it pulls an image rather than at the emitter of a rehearsal that has
+already run every mandatory step. A development dispatch supplies none, runs
+everything, and produces a receipt acceptance refuses only once the reviewed
+cutover block is set. Every link in that path is read out of the workflow by
+`shell-analysis` (`verify_release_provenance_wiring`), because losing one has
+no local symptom: every proof still passes and the receipt still looks
+complete.
 
 `validate-evidence` then closes both bindings the manifest could not close
 alone. Once the receipt records a release-ready manifest, provenance is

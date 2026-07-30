@@ -20,6 +20,18 @@ name: Cutover Rehearsal
 # verification happens against the very bytes inside the image, not just
 # the runner checkout. Stage logs are archived even when a stage fails — a
 # red run's evidence is the most valuable kind.
+#
+# What the release was built into travels the other way. The reviewed manifest
+# names the cutover; it cannot name the commit finally built or the immutable
+# image digests, because those are outputs of a build over its own bytes. A
+# release dispatch supplies them as a detached document in
+# release_provenance_b64, which is decoded outside the checkout, mounted into
+# the proof container, sealed into the receipt by the producer after the
+# binary verifies it against the manifest, and required to be there — as the
+# document that was supplied — before the receipt is archived. The container
+# job checks the receipt it downloads for the same pairing before it pulls an
+# image, so a release-ready receipt that names no artifact is refused at the
+# dispatch boundary rather than after a fleet has run every mandatory step.
 
 on:
   workflow_dispatch:
@@ -62,6 +74,9 @@ on:
         required: false
       prior_revision:
         description: "Source revision the prior digest carries, as the rollback state audit must find it recorded"
+        required: false
+      release_provenance_b64:
+        description: "base64 of the detached release provenance: the commit built and the immutable per-platform image digests, generated after the release build and never committed to the tree it describes. Required for any dispatch whose reviewed manifest is release-ready — acceptance refuses records measured against a release that names no artifact — and legitimately empty on development dispatches"
         required: false
 
 permissions:
@@ -125,9 +140,63 @@ jobs:
           cache-to: type=local,dest=/tmp/.buildx-cache-new
           context: .
 
+      # The half of the release identity the reviewed manifest cannot state
+      # about itself: the commit finally built and the immutable per-platform
+      # image digests are outputs of a build over the manifest's own bytes, so
+      # recording them in the tree would require the tree to contain a hash of
+      # itself. They live in a detached document generated after the build,
+      # and this is where a release dispatch hands it to the proof stage.
+      #
+      # It lands in RUNNER_TEMP rather than the workspace for the same reason
+      # every other provisioned input does: the proof stage refuses to produce
+      # evidence from a tree that diverges from the dispatched commit,
+      # untracked files included, so a provenance document written into the
+      # checkout would fail the very check it exists to satisfy.
+      #
+      # A development dispatch supplies none and still runs everything. The
+      # receipt then carries no provenance, which the acceptance stage refuses
+      # only once the reviewed manifest is release-ready — that refusal is
+      # acceptance's to make, not this step's.
+      - name: Provision the detached release provenance
+        env:
+          RELEASE_PROVENANCE_B64: ${{ inputs.release_provenance_b64 }}
+        run: |
+          if [ -z "$RELEASE_PROVENANCE_B64" ]; then
+            echo "no detached release provenance supplied; the receipt will" \
+              "carry none, and acceptance refuses records measured against a" \
+              "release-ready manifest without it"
+            exit 0
+          fi
+          path="$RUNNER_TEMP/release-provenance.json"
+          printf '%s' "$RELEASE_PROVENANCE_B64" | base64 -d >"$path"
+          # Only that a document arrived at all. What it has to say is the
+          # binary's to judge inside the container, but a mis-pasted input is
+          # named here rather than surfacing as an unreadable file in a stage
+          # whose log nobody reads on the way to a red run.
+          node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' \
+            "$path" || {
+            echo "the supplied release_provenance_b64 does not decode to" >&2
+            echo "readable JSON; supply the base64 of the provenance" >&2
+            echo "document generated after the release build" >&2
+            exit 1
+          }
+          echo "RELEASE_PROVENANCE_FILE=$path" >>"$GITHUB_ENV"
+          echo "provisioned the detached release provenance"
+
       - name: Run cutover gate local proofs
         run: |
           mkdir -p ${{ github.workspace }}/rehearsal-evidence
+          # Mounted at the container root, not under the working directory:
+          # the stage verifies the image's own source tree against the
+          # dispatched SHA before producing evidence, and a document inside
+          # that tree would be an untracked file failing that check.
+          provenance_mount=()
+          if [ -n "${RELEASE_PROVENANCE_FILE:-}" ]; then
+            provenance_mount=(
+              -v "$RELEASE_PROVENANCE_FILE:/release-provenance.json:ro"
+              -e PR4109_RELEASE_PROVENANCE=/release-provenance.json
+            )
+          fi
           # .dockerignore keeps scripts/ and .git out of the build context,
           # so both are mounted read-only from the dispatched checkout: the
           # stage script runs at the dispatched revision, and rehearse.sh
@@ -143,10 +212,39 @@ jobs:
             -e EVIDENCE_DIR=/rehearsal-evidence \
             -e PR4109_EXPECTED_SOURCE_COMMIT=${{ github.sha }} \
             -e PR4109_SOURCE_BINDING_MODE=build-image \
+            "${provenance_mount[@]}" \
             go-build-env \
             bash -c 'git config --global --add safe.directory \
               /go/src/github.com/keep-network/keep-core && \
               exec ./scripts/release/pr4109/rehearse.sh local-proofs'
+
+      # The receipt is what the container job downloads and every record it
+      # produces is measured against, so a supplied provenance has to have
+      # survived into it — and be the document that was supplied, byte for
+      # byte. Without this a release dispatch could archive a receipt
+      # acceptance refuses while this job stayed green, and the only account
+      # of why would be a line in a log read by nobody on a passing run.
+      - name: Require the receipt to carry the supplied provenance
+        run: |
+          if [ -z "${RELEASE_PROVENANCE_FILE:-}" ]; then
+            echo "no provenance was supplied to this dispatch; nothing to" \
+              "require of the receipt"
+            exit 0
+          fi
+          recorded="${{ github.workspace }}/rehearsal-evidence/attestation/release-provenance.json"
+          if [ ! -f "$recorded" ]; then
+            echo "the local proofs recorded no detached release provenance" >&2
+            echo "although this dispatch supplied one; the archived receipt" >&2
+            echo "cannot admit container evidence for a release-ready" >&2
+            echo "manifest" >&2
+            exit 1
+          fi
+          if ! cmp -s "$RELEASE_PROVENANCE_FILE" "$recorded"; then
+            echo "the provenance recorded in the receipt is not the document" >&2
+            echo "this dispatch supplied and the binary verified" >&2
+            exit 1
+          fi
+          echo "the archived receipt carries the supplied release provenance"
 
       # The evidence validator's own self-test already ran unconditionally
       # inside the local-proofs stage above (its verdicts are part of the
@@ -436,7 +534,7 @@ jobs:
         run: |
           dir="$EVIDENCE_DIR/attestation"
           for part in derived-manifest.json reviewed-manifest.sha256 \
-            source-commit.txt; do
+            source-commit.txt release-ready.txt; do
             if [ ! -f "$dir/$part" ]; then
               echo "BLOCKED: the local-proofs attestation did not arrive:" >&2
               echo "$dir/$part is absent, so nothing here proves the" >&2
@@ -445,6 +543,24 @@ jobs:
               exit 3
             fi
           done
+
+          # A receipt recording a release-ready manifest is a
+          # release-acceptance receipt, and acceptance refuses one that names
+          # no artifact. Asked here, against the receipt this job actually
+          # downloaded and before an image is pulled or a node started,
+          # because the alternative is a rehearsal that drives a fleet through
+          # every mandatory step and is then refused at its own emitter for an
+          # input the dispatch could have been given.
+          if [ "$(tr -d '[:space:]' <"$dir/release-ready.txt")" = "yes" ] &&
+            [ ! -f "$dir/release-provenance.json" ]; then
+            echo "BLOCKED: the restored receipt records a release-ready" >&2
+            echo "manifest and carries no detached release provenance, so" >&2
+            echo "every record this rehearsal could produce would be" >&2
+            echo "measured against a release nothing identifies;" >&2
+            echo "re-dispatch with release_provenance_b64 set to the" >&2
+            echo "provenance generated after the release build" >&2
+            exit 3
+          fi
           echo "attestation restored for source $(cat "$dir/source-commit.txt")"
 
       - name: Preflight the rehearsal inputs

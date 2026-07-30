@@ -1010,6 +1010,112 @@ every artifact it builds ($(printf '%s\n' "${stamps}" | wc -l | tr -d ' ') \
 assignment(s))"
 }
 
+# The dispatch input a release run hands the detached provenance in, the
+# variable attest_release_provenance reads it from, and the member it writes
+# into the receipt. The producer and the acceptance consumer are what define
+# these three; they are named here so the check below can hold the dispatched
+# workflow to them.
+RELEASE_PROVENANCE_INPUT="release_provenance_b64"
+RELEASE_PROVENANCE_ENV="PR4109_RELEASE_PROVENANCE"
+RELEASE_PROVENANCE_MEMBER="release-provenance.json"
+
+# The job that produces the receipt, and the job that is judged by it.
+REHEARSAL_PROOF_JOB="local-proofs"
+REHEARSAL_CONTAINER_JOB="container-rehearsal"
+
+# Does any content line in [from, to) carry the given text? Comments and blank
+# lines are blanked by the indexer, so a check written on this can never be
+# satisfied by a line the workflow parser does not read — which matters here,
+# where every needle is a name a comment would naturally mention.
+yaml_body_carries() {
+  local from="$1" to="$2" needle="$3" i
+  for ((i = from; i < to; i++)); do
+    if [[ "${YAML_BODIES[i]}" == *"${needle}"* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# The dispatched rehearsal must be able to supply the half of the release
+# identity the reviewed manifest cannot state about itself.
+#
+# A reviewed manifest names the cutover. It cannot name the commit finally
+# built or the immutable image digests, because those are outputs of a build
+# over its own bytes, so acceptance requires them from a detached document
+# instead — and refuses, unconditionally, any release-ready receipt that
+# carries none. Every one of those requirements lives in this script, and none
+# of them is satisfiable by a dispatch with no way to hand the document in.
+#
+# That is a failure with no local symptom: every proof passes, the receipt is
+# archived, and the refusal arrives only on the one dispatch that matters, at
+# the end of a rehearsal that has already run every mandatory step. So the
+# wiring is read out of the workflow here, on the commit that changes it,
+# rather than discovered by the release it would block.
+verify_release_provenance_wiring() {
+  local content i
+  content="$(git -C "${REPO_ROOT}" show "HEAD:${REHEARSAL_WORKFLOW}" \
+    2>/dev/null)" ||
+    fail "the commit under test carries no ${REHEARSAL_WORKFLOW}; the \
+dispatch that supplies the detached release provenance is declared there, and \
+this script has nothing left to read it from"
+
+  yaml_index_lines "${REHEARSAL_WORKFLOW}" "${content}"
+  local total="${#YAML_BODIES[@]}"
+
+  # A mapping key of its own, matched whole: a step body mentioning the input
+  # is a use of it and not a declaration, and only the declaration puts the
+  # field in front of whoever dispatches the release.
+  local declared=""
+  for ((i = 0; i < total; i++)); do
+    if [[ "${YAML_BODIES[i]}" == "${RELEASE_PROVENANCE_INPUT}:" ]]; then
+      declared="yes"
+      break
+    fi
+  done
+  [[ -n "${declared}" ]] ||
+    fail "${REHEARSAL_WORKFLOW} declares no ${RELEASE_PROVENANCE_INPUT} \
+input; acceptance refuses every record measured against a release-ready \
+manifest whose receipt names no artifact, so a dispatch with nowhere to put \
+the detached provenance cannot produce admissible release evidence"
+
+  yaml_locate_job "${REHEARSAL_WORKFLOW}" "${REHEARSAL_PROOF_JOB}"
+  local proof_start="${YAML_JOB_START}" proof_end="${YAML_JOB_END}"
+
+  yaml_body_carries "${proof_start}" "${proof_end}" \
+    "inputs.${RELEASE_PROVENANCE_INPUT}" ||
+    fail "${REHEARSAL_WORKFLOW}'s ${REHEARSAL_PROOF_JOB} job never reads the \
+${RELEASE_PROVENANCE_INPUT} input; a declared input nothing consumes is a \
+field an operator fills in and a release nobody can identify"
+
+  yaml_body_carries "${proof_start}" "${proof_end}" \
+    "${RELEASE_PROVENANCE_ENV}" ||
+    fail "${REHEARSAL_WORKFLOW}'s ${REHEARSAL_PROOF_JOB} job never passes \
+${RELEASE_PROVENANCE_ENV} to the stage that writes the receipt; the producer \
+reads the document from that variable and records none without it, whatever \
+the dispatch supplied"
+
+  yaml_body_carries "${proof_start}" "${proof_end}" \
+    "${RELEASE_PROVENANCE_MEMBER}" ||
+    fail "${REHEARSAL_WORKFLOW}'s ${REHEARSAL_PROOF_JOB} job never requires \
+${RELEASE_PROVENANCE_MEMBER} of the receipt it archives; a supplied document \
+that did not reach the receipt leaves the archive unable to admit container \
+evidence, and a green job saying otherwise"
+
+  yaml_locate_job "${REHEARSAL_WORKFLOW}" "${REHEARSAL_CONTAINER_JOB}"
+  yaml_body_carries "${YAML_JOB_START}" "${YAML_JOB_END}" \
+    "${RELEASE_PROVENANCE_MEMBER}" ||
+    fail "${REHEARSAL_WORKFLOW}'s ${REHEARSAL_CONTAINER_JOB} job never checks \
+the receipt it downloads for ${RELEASE_PROVENANCE_MEMBER}; without it a \
+rehearsal drives a fleet through every mandatory step before its own emitter \
+refuses the run for an input the dispatch could have been given"
+
+  note "release provenance: ${REHEARSAL_WORKFLOW} offers \
+${RELEASE_PROVENANCE_INPUT}, hands it to the proof stage as \
+${RELEASE_PROVENANCE_ENV}, and requires ${RELEASE_PROVENANCE_MEMBER} of the \
+receipt in both the producing and the consuming job"
+}
+
 # The Dockerfile the rehearsal dispatch compiles and the context root it
 # compiles from, read out of the workflow that does the building rather than
 # restated here. The pair decides which ignore file the build applies, so a
@@ -2976,6 +3082,10 @@ stage_shell_analysis() {
     # of this scaffold. Same reason, same gate.
     verify_contracts_toolchain_pin
     verify_release_revision_stamp
+    # And the one piece of the release path whose absence has no local
+    # symptom: a dispatch that cannot hand in the detached provenance passes
+    # every proof and produces evidence acceptance refuses.
+    verify_release_provenance_wiring
 
     # The two validators gate every piece of rehearsal evidence, so the gate
     # that runs on every change to them runs their self-tests too — without
