@@ -3942,6 +3942,26 @@ TERMINAL_OUTCOME_JS='
       const MEMBERSHIP_EVIDENCE = [
         "persisted_tbtc_signer", "persisted_beacon_signer",
       ];
+      // The chain side effects a ceremony dispatches outside its own protocol
+      // result, each with the one rendering its resolved identity takes. A kind
+      // outside this set is a side effect no ceremony in this release has a
+      // code path to dispatch, so a record naming one is describing chain state
+      // it could not have created.
+      //
+      // The rendering is held exactly rather than loosely because the whole
+      // purpose of a resolved reference is to be joined to a single
+      // authenticated log. An inactivity claim is named by the wallet it was
+      // filed against and the nonce it settled at, which identifies one claim
+      // for all time since the registry accepts a claim only at the current
+      // nonce and increments it in the same call. An uppercase, 0x-prefixed,
+      // padded, or truncated spelling of that pair names the same claim on
+      // chain while failing every comparison an audit makes against the log,
+      // and a reader accepting it hands the audit a settlement it will not find
+      // — which reads afterwards as a penalty that never happened rather than
+      // as the misrendering it was.
+      const SETTLEMENT_REFERENCES = {
+        tbtc_inactivity_claim: /^[0-9a-f]{64}:(0|[1-9][0-9]*)$/,
+      };
       // A membership index as the journal renders it: 1 through 255, no leading
       // zeros, nothing else. Anything outside that is not a seat in a group.
       const memberIndexOf = (value, what) => {
@@ -4118,13 +4138,19 @@ TERMINAL_OUTCOME_JS='
             console.error("not a chain settlement: " + JSON.stringify(chain));
             process.exit(1);
           }
+          const rendering = SETTLEMENT_REFERENCES[chain.kind];
+          if (rendering === undefined) {
+            console.error("no ceremony dispatches the chain settlement " +
+              JSON.stringify(chain.kind));
+            process.exit(1);
+          }
           // An unresolved settlement carries no reference; the kind alone is
           // the node saying it dispatched something it could not resolve, and
           // that has to stay visible rather than read as no settlement at all.
           if (chain.reference === undefined || chain.reference === "") {
             settlement = chain.kind;
           } else if (typeof chain.reference !== "string" ||
-            !TOKEN.test(chain.reference)) {
+            !TOKEN.test(chain.reference) || !rendering.test(chain.reference)) {
             console.error("a chain settlement names no canonical identity: " +
               JSON.stringify(chain));
             process.exit(1);
@@ -6271,6 +6297,14 @@ result of that ceremony"
 # about work whose ending is known. It blocks rather than fails: nothing here
 # says the ceremony went wrong, only that its chain side effect is unaccounted
 # for, and the offline audit is where that is resolved.
+#
+# What a resolved identity has to look like is settled before this runs. The
+# reader that scrapes these records holds a settlement to the one kind its
+# ceremony can dispatch and to the exact rendering that kind names on chain, and
+# it refuses the snapshot rather than the permit when either is wrong — so every
+# step blocks on a misrendered settlement, not only the two that read this rung.
+# What is left here is the distinction that rung is about: a reference or no
+# reference.
 unresolved_authored_settlements() {
   local wanted="$1" authored="$2" permit record settlement out=""
   for permit in ${wanted}; do

@@ -1339,13 +1339,60 @@ check "a forwarder naming a transcript it cannot observe is refused" 1 \
 
 # A chain side effect the same permit dispatched, which travels beside the
 # result rather than in place of it.
-read_terminal_outcomes "$(gate_state_with_outcomes \
-  "\"recent_terminal_outcomes\":[$(closed_permit completed w-1 p-1 true \
-    '"kind":"protocol_result","reference":"0xentry",'\
-'"contribution":{"incorporated_members":[1,7],"local_members":[1]},'\
-'"chain_settlement":{"kind":"inactivity_claim","reference":"aabb:7"}')]")"
+#
+# The wallet identifier is 32 bytes of lowercase unprefixed hex, which with the
+# nonce beside it is what the registry lets exist exactly once: a claim is
+# accepted only at the wallet's current nonce and that nonce increments in the
+# same call. The pair is therefore joinable to a single authenticated log, and
+# the cases below are about the renderings that are not.
+CLAIM_WALLET="$(printf 'a%.0s' {1..64})"
+
+# One closed permit that dispatched a chain settlement of the given kind and
+# reference, everything else a record the gate would have written.
+settled_permit() {
+  local kind="$1" reference="$2" evidence
+  evidence='"kind":"protocol_result","reference":"0xentry",'
+  evidence="${evidence}"'"contribution":{"incorporated_members":[1,7],'
+  evidence="${evidence}"'"local_members":[1]},"chain_settlement":'
+  evidence="${evidence}$(printf '{"kind":"%s","reference":"%s"}' \
+    "${kind}" "${reference}")"
+  gate_state_with_outcomes "\"recent_terminal_outcomes\":[$(closed_permit \
+    completed w-1 p-1 true "${evidence}")]"
+}
+
+read_terminal_outcomes \
+  "$(settled_permit tbtc_inactivity_claim "${CLAIM_WALLET}:7")"
 check "a dispatched chain settlement is carried with the ending" 0 \
-  "=completed=protocol_result=0xentry=-=1,7=1=inactivity_claim:aabb:7$"
+  "=completed=protocol_result=0xentry=-=1,7=1=tbtc_inactivity_claim:\
+${CLAIM_WALLET}:7$"
+
+# The same claim under renderings that name it on chain and join to nothing. An
+# audit looks the reference up as the string the node wrote, so an uppercase,
+# 0x-prefixed, truncated, or zero-padded spelling of the same claim reads
+# afterwards as a penalty that never happened rather than as the misrendering it
+# was — and that reading must not be reachable, because it is also what a
+# fabricated settlement produces.
+while IFS='|' read -r WHAT REFERENCE; do
+  [[ -n "${WHAT}" ]] || continue
+  read_terminal_outcomes "$(settled_permit tbtc_inactivity_claim "${REFERENCE}")"
+  check "a claim named by ${WHAT} joins to no log" 1 \
+    "names no canonical identity"
+done <<CASES
+an uppercase wallet identifier|$(printf 'A%.0s' {1..64}):7
+a prefixed wallet identifier|0x${CLAIM_WALLET}:7
+a short wallet identifier|${CLAIM_WALLET#a}:7
+a padded nonce|${CLAIM_WALLET}:007
+a negative nonce|${CLAIM_WALLET}:-1
+no nonce at all|${CLAIM_WALLET}
+CASES
+
+# And a side effect no ceremony in this release has a code path to dispatch. A
+# record naming one describes chain state it could not have created, which an
+# audit then goes looking for.
+read_terminal_outcomes \
+  "$(settled_permit invented_claim "${CLAIM_WALLET}:7")"
+check "a settlement no ceremony dispatches is refused" 1 \
+  "no ceremony dispatches the chain settlement"
 
 # The joins. Each is asked about a named population and an account that does or
 # does not answer for it.
@@ -3993,7 +4040,7 @@ resolve" "tbtc_inactivity_claim"
 # the claim it filed leaves nothing for a later reader to resolve.
 run_verdict precutover_case eval '
   PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS/\
-0xbeat844=-=1,7=1=-/0xbeat844=-=1,7=1=tbtc_inactivity_claim:0xwallet844:3}"'
+0xbeat844=-=1,7=1=-/0xbeat844=-=1,7=1=tbtc_inactivity_claim:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:3}"'
 check "a resolved side effect leaves the step to its own claim" 0 \
   "issued 4 new legacy permits"
 
@@ -6037,6 +6084,30 @@ else
   printf 'FAIL the transcript-publishing list drifted from the gate: %s\n' \
     "$(diff <(printf '%s\n' "${GO_TRANSCRIPT_CEREMONIES}") \
       <(printf '%s\n' "${READER_TRANSCRIPT_CEREMONIES}") | tr '\n' ' ')"
+  FAILED=$((FAILED + 1))
+fi
+
+# The kinds of chain side effect the reader will accept a settlement for, held to
+# the closed set the gate defines. A kind the reader omits makes the snapshot
+# unreadable for a permit that dispatched a real side effect; a kind it keeps
+# after the gate dropped one is a settlement no ceremony can dispatch being read
+# as chain state to reconcile. Both are drifts a release notices at the worst
+# time, and the reader carries a rendering per kind, so the list cannot be
+# derived at runtime.
+GO_SETTLEMENT_KINDS="$(grep -oE 'ChainSettlementKind = "[a-z_]+"' \
+  "${TEST_DIR}/../../../pkg/protocol/participation/quiescence.go" |
+  grep -oE '"[a-z_]+"' | tr -d '"' | sort -u)"
+READER_SETTLEMENT_KINDS="$(sed -n \
+  '/const SETTLEMENT_REFERENCES = {/,/};/p' "${TEST_DIR}/rehearse.sh" |
+  grep -oE '^\s+[a-z_]+:' | tr -d ' :' | sort -u)"
+if [[ -n "${GO_SETTLEMENT_KINDS}" ]] &&
+  [[ "${GO_SETTLEMENT_KINDS}" == "${READER_SETTLEMENT_KINDS}" ]]; then
+  printf 'ok   the settlement-kind list matches the gate\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL the settlement-kind list drifted from the gate: %s\n' \
+    "$(diff <(printf '%s\n' "${GO_SETTLEMENT_KINDS}") \
+      <(printf '%s\n' "${READER_SETTLEMENT_KINDS}") | tr '\n' ' ')"
   FAILED=$((FAILED + 1))
 fi
 
