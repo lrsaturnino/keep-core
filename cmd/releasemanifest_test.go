@@ -1,8 +1,10 @@
 package cmd
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -21,6 +23,11 @@ const releaseManifestRepositoryPath = "../scripts/release/pr4109/release-manifes
 const releaseManifestDeployDirectory = "../scripts/release/pr4109/deploy"
 
 const releaseManifestSchemaPath = "../scripts/release/pr4109/release-manifest.schema.json"
+
+// releaseProvenanceSchemaPath is the published schema of the detached
+// provenance document: what the release was built into, recorded outside the
+// tree it describes.
+const releaseProvenanceSchemaPath = "../scripts/release/pr4109/release-provenance.schema.json"
 
 const rehearsalEvidenceSchemaPath = "../scripts/release/pr4109/rehearsal-evidence.schema.json"
 
@@ -44,31 +51,37 @@ func validReleaseManifestForTests(t *testing.T) releaseManifest {
 	}
 }
 
-// releaseReadyIdentityForTests is a fully recorded release identity: the
-// compiled chain and cutover block plus the build outputs a release commit
-// supplies. The cutover block is taken from the compiled constant rather than
-// invented, so this helper states a complete identity for as long as that
-// constant is a placeholder and keeps stating one after it is set.
-func releaseReadyIdentityForTests() releaseIdentity {
-	identity := deriveReleaseIdentity()
-	identity.SourceCommit = "0123456789abcdef0123456789abcdef01234567"
-	identity.Images = []releaseImage{
-		{
-			Platform: "linux/amd64",
-			Reference: "gcr.io/keep-test/keep-client@sha256:" +
-				strings.Repeat("a", 64),
-			Digest: "sha256:" + strings.Repeat("a", 64),
-		},
-		{
-			Platform: "linux/arm64",
-			Reference: "gcr.io/keep-test/keep-client@sha256:" +
-				strings.Repeat("b", 64),
-			Digest: "sha256:" + strings.Repeat("b", 64),
+// validReleaseProvenanceForTests is a complete detached provenance document
+// over a manifest hashing to manifestSHA256: the commit built and one image per
+// platform, pinned by digest.
+func validReleaseProvenanceForTests(manifestSHA256 string) releaseProvenance {
+	return releaseProvenance{
+		SchemaVersion:  releaseProvenanceSchemaVersion,
+		GeneratedAt:    "2026-07-27T23:11:28Z",
+		ManifestSHA256: manifestSHA256,
+		SourceCommit:   "0123456789abcdef0123456789abcdef01234567",
+		Images: []releaseImage{
+			{
+				Platform: "amd64",
+				Reference: "gcr.io/keep-test/keep-client@sha256:" +
+					strings.Repeat("a", 64),
+				Digest: "sha256:" + strings.Repeat("a", 64),
+			},
+			{
+				Platform: "arm64",
+				Reference: "gcr.io/keep-test/keep-client@sha256:" +
+					strings.Repeat("b", 64),
+				Digest: "sha256:" + strings.Repeat("b", 64),
+			},
 		},
 	}
-
-	return identity
 }
+
+// manifestSHAForTests is a well-formed manifest hash. Provenance is checked
+// against the hash of real manifest bytes wherever that is what the case is
+// about; this stands in where the case is about something else.
+const manifestSHAForTests = "1f" +
+	"00000000000000000000000000000000000000000000000000000000000000"
 
 // TestReleaseManifestDeriveMatchesCompiledBounds is the drift assertion for
 // the manifest derivation: every number the manifest records is pinned to a
@@ -315,21 +328,91 @@ func TestReleaseManifestDeploymentScaffoldMatchesManifest(t *testing.T) {
 // a document the release binary refuses, or — worse — reports a document
 // complete while a required section it never learned about is missing from it.
 func TestReleaseManifestSchemaMatchesTheDecodedDocument(t *testing.T) {
-	content, err := os.ReadFile(releaseManifestSchemaPath)
+	assertSchemaMatchesTypes(
+		t,
+		releaseManifestSchemaPath,
+		releaseManifestSchemaVersion,
+		[]schemaSection{
+			{"the manifest", nil, releaseManifest{}},
+			{
+				"release_identity",
+				[]string{"properties", "release_identity"},
+				releaseIdentity{},
+			},
+			{
+				"termination_grace",
+				[]string{"properties", "termination_grace"},
+				terminationGrace{},
+			},
+			{
+				"termination_grace.beacon_inputs",
+				[]string{
+					"properties", "termination_grace", "properties",
+					"beacon_inputs",
+				},
+				beaconCompletionInputs{},
+			},
+		},
+	)
+}
+
+// TestReleaseProvenanceSchemaMatchesTheDecodedDocument holds the detached
+// provenance schema to the same standard as the manifest's. The provenance
+// document is where the build outputs went when they could no longer live in
+// the tree they describe, so a schema drifting from the loader here is the same
+// failure as before, only relocated: a document every tool but the binary
+// accepts.
+func TestReleaseProvenanceSchemaMatchesTheDecodedDocument(t *testing.T) {
+	assertSchemaMatchesTypes(
+		t,
+		releaseProvenanceSchemaPath,
+		releaseProvenanceSchemaVersion,
+		[]schemaSection{
+			{"the provenance", nil, releaseProvenance{}},
+			{
+				"images entries",
+				[]string{"properties", "images", "items"},
+				releaseImage{},
+			},
+		},
+	)
+}
+
+// schemaSection names one object in a schema and the Go type that must decode
+// it, so one walk can check any number of documents.
+type schemaSection struct {
+	name     string
+	path     []string
+	recorded any
+}
+
+// assertSchemaMatchesTypes checks that a published JSON Schema describes
+// exactly what the loader decodes: the same members, required exactly where the
+// encoder cannot omit them, closed to anything else, and pinned to the schema
+// version the binary accepts.
+func assertSchemaMatchesTypes(
+	t *testing.T,
+	schemaPath string,
+	schemaVersion uint64,
+	sections []schemaSection,
+) {
+	t.Helper()
+
+	content, err := os.ReadFile(schemaPath)
 	if err != nil {
-		t.Fatalf("cannot read the manifest schema: [%v]", err)
+		t.Fatalf("cannot read the schema [%s]: [%v]", schemaPath, err)
 	}
 
 	// Decoded as an object graph rather than into a shape of its own: the check
-	// walks the same nesting the manifest types have, and a schema that renamed
+	// walks the same nesting the document types have, and a schema that renamed
 	// or moved a section must fail rather than decode into zero values.
 	var schema map[string]any
 	if err := json.Unmarshal(content, &schema); err != nil {
-		t.Fatalf("cannot decode the manifest schema: [%v]", err)
+		t.Fatalf("cannot decode the schema [%s]: [%v]", schemaPath, err)
 	}
 
 	if version := schemaObject(t, schema, "properties", "schema_version"); version != nil {
-		if got, want := version["const"], float64(releaseManifestSchemaVersion); got != want {
+		if got, want := version["const"], float64(schemaVersion); got != want {
 			t.Errorf(
 				"the schema pins schema_version to [%v], the binary accepts "+
 					"only [%v]",
@@ -339,39 +422,7 @@ func TestReleaseManifestSchemaMatchesTheDecodedDocument(t *testing.T) {
 		}
 	}
 
-	for _, section := range []struct {
-		name     string
-		path     []string
-		recorded any
-	}{
-		{"the manifest", nil, releaseManifest{}},
-		{
-			"release_identity",
-			[]string{"properties", "release_identity"},
-			releaseIdentity{},
-		},
-		{
-			"release_identity.images entries",
-			[]string{
-				"properties", "release_identity", "properties", "images",
-				"items",
-			},
-			releaseImage{},
-		},
-		{
-			"termination_grace",
-			[]string{"properties", "termination_grace"},
-			terminationGrace{},
-		},
-		{
-			"termination_grace.beacon_inputs",
-			[]string{
-				"properties", "termination_grace", "properties",
-				"beacon_inputs",
-			},
-			beaconCompletionInputs{},
-		},
-	} {
+	for _, section := range sections {
 		object := schemaObject(t, schema, section.path...)
 		if object == nil {
 			t.Errorf("the schema defines no [%s] section", section.name)
@@ -769,53 +820,11 @@ func TestReleaseManifestValidateBindsIdentityToTheCompiledClient(t *testing.T) {
 				10,
 			) + "]",
 		},
-		"abbreviated source commit": {
-			func(i *releaseIdentity) { i.SourceCommit = "0123456" },
-			"release_identity.source_commit must be a full 40-character",
-		},
-		"source commit that is not hexadecimal": {
-			func(i *releaseIdentity) {
-				i.SourceCommit = strings.Repeat("z", 40)
-			},
-			"release_identity.source_commit must be a full 40-character",
-		},
-		"image digest under another algorithm": {
-			func(i *releaseIdentity) {
-				i.Images[0].Digest = "sha512:" + strings.Repeat("a", 64)
-				i.Images[0].Reference = "gcr.io/keep-test/keep-client@" +
-					i.Images[0].Digest
-			},
-			"release_identity.images[0].digest must be a sha256 content digest",
-		},
-		"image reference carrying a tag instead of its digest": {
-			func(i *releaseIdentity) {
-				i.Images[0].Reference = "gcr.io/keep-test/keep-client:v2.1.0"
-			},
-			"release_identity.images[0].reference must be pinned to its digest",
-		},
-		"image reference pinned to a different digest": {
-			func(i *releaseIdentity) {
-				i.Images[0].Reference = "gcr.io/keep-test/keep-client@sha256:" +
-					strings.Repeat("c", 64)
-			},
-			"release_identity.images[0].reference must be pinned to its digest",
-		},
-		"image without a platform": {
-			func(i *releaseIdentity) { i.Images[0].Platform = "" },
-			"release_identity.images[0].platform must name the platform",
-		},
-		"two images for one platform": {
-			func(i *releaseIdentity) {
-				i.Images[1].Platform = i.Images[0].Platform
-			},
-			"release_identity.images[1] repeats platform [linux/amd64]",
-		},
 	}
 
 	for testName, test := range tests {
 		t.Run(testName, func(t *testing.T) {
 			manifest := validReleaseManifestForTests(t)
-			manifest.ReleaseIdentity = releaseReadyIdentityForTests()
 			test.mutate(&manifest.ReleaseIdentity)
 
 			err := validateReleaseManifest(manifest)
@@ -833,21 +842,248 @@ func TestReleaseManifestValidateBindsIdentityToTheCompiledClient(t *testing.T) {
 	}
 }
 
-// TestReleaseManifestValidateAcceptsAFullyRecordedIdentity proves a complete
-// identity passes, so the checks above reject what is wrong with a manifest
-// rather than the act of recording one.
-func TestReleaseManifestValidateAcceptsAFullyRecordedIdentity(t *testing.T) {
-	manifest := validReleaseManifestForTests(t)
-	manifest.ReleaseIdentity = releaseReadyIdentityForTests()
-
-	if err := validateReleaseManifest(manifest); err != nil {
-		t.Errorf("fully recorded manifest rejected: [%v]", err)
+// TestReleaseManifestRejectsRelocatedBuildOutputs is the standing refusal of
+// the shape this document used to have.
+//
+// A manifest naming the commit it is part of cannot be produced: writing the
+// hash changes the tree, so the value is stale the moment it is written. That
+// is why the build outputs moved to the detached provenance, and a manifest
+// still carrying them has to be refused with the one instruction that resolves
+// it rather than with an unknown-field complaint that reads like a typo.
+func TestReleaseManifestRejectsRelocatedBuildOutputs(t *testing.T) {
+	valid, err := json.Marshal(validReleaseManifestForTests(t))
+	if err != nil {
+		t.Fatalf("cannot encode the valid manifest: [%v]", err)
 	}
-	if violations := releaseReadyViolations(manifest); len(violations) > 0 &&
-		participation.MainnetCutoverBlock != 0 {
-		t.Errorf(
-			"fully recorded manifest is not release-ready: %v",
-			violations,
+
+	var document map[string]any
+	if err := json.Unmarshal(valid, &document); err != nil {
+		t.Fatalf("cannot decode the valid manifest: [%v]", err)
+	}
+
+	for _, field := range relocatedIdentityFields {
+		t.Run(field, func(t *testing.T) {
+			identity, ok := document["release_identity"].(map[string]any)
+			if !ok {
+				t.Fatal("the encoded manifest carries no release_identity")
+			}
+			// A fresh copy per case: the loop must not leave the previous
+			// field behind and test two relocations as one.
+			mutated := make(map[string]any, len(identity)+1)
+			for key, value := range identity {
+				mutated[key] = value
+			}
+			mutated[field] = "0123456789abcdef0123456789abcdef01234567"
+
+			withField := make(map[string]any, len(document))
+			for key, value := range document {
+				withField[key] = value
+			}
+			withField["release_identity"] = mutated
+
+			encoded, err := json.Marshal(withField)
+			if err != nil {
+				t.Fatalf("cannot encode the mutated manifest: [%v]", err)
+			}
+			path := filepath.Join(t.TempDir(), "release-manifest.json")
+			if err := os.WriteFile(path, encoded, 0o600); err != nil {
+				t.Fatalf("cannot write the mutated manifest: [%v]", err)
+			}
+
+			_, err = loadReleaseManifest(path)
+			if err == nil {
+				t.Fatalf(
+					"a manifest recording release_identity.%s was accepted; "+
+						"that value cannot be inside the tree it names",
+					field,
+				)
+			}
+			for _, expected := range []string{
+				"release_identity." + field,
+				"detached release provenance",
+			} {
+				if !strings.Contains(err.Error(), expected) {
+					t.Errorf(
+						"the refusal must say [%s] so the reviewer knows "+
+							"where the value went, got:\n%v",
+						expected,
+						err,
+					)
+				}
+			}
+		})
+	}
+}
+
+// TestReleaseProvenanceValidateAcceptsACompleteDocument proves a complete
+// provenance passes, so the refusals below reject what is wrong with a document
+// rather than the act of recording one.
+func TestReleaseProvenanceValidateAcceptsACompleteDocument(t *testing.T) {
+	provenance := validReleaseProvenanceForTests(manifestSHAForTests)
+
+	if err := validateReleaseProvenance(
+		provenance,
+		manifestSHAForTests,
+	); err != nil {
+		t.Errorf("complete provenance rejected: [%v]", err)
+	}
+}
+
+// TestReleaseProvenanceValidateFailsClosed drives every way a provenance
+// document can fail to name one artifact built under one set of reviewed
+// bounds. These are the checks that used to sit on the manifest identity, now
+// asked where the values actually live — plus the binding that only exists
+// because they live apart: the hash tying this document to the manifest it was
+// taken over.
+func TestReleaseProvenanceValidateFailsClosed(t *testing.T) {
+	tests := map[string]struct {
+		mutate          func(*releaseProvenance)
+		expectedMessage string
+	}{
+		"schema version the binary does not understand": {
+			func(p *releaseProvenance) {
+				p.SchemaVersion = releaseProvenanceSchemaVersion + 1
+			},
+			"schema_version must be",
+		},
+		"generation timestamp that is not RFC 3339": {
+			func(p *releaseProvenance) { p.GeneratedAt = "yesterday" },
+			"generated_at must be an RFC 3339 timestamp",
+		},
+		"unrecorded manifest hash": {
+			func(p *releaseProvenance) { p.ManifestSHA256 = "" },
+			"manifest_sha256 must be a 64-character lowercase hexadecimal",
+		},
+		"manifest hash that is not hexadecimal": {
+			func(p *releaseProvenance) {
+				p.ManifestSHA256 = strings.Repeat("z", 64)
+			},
+			"manifest_sha256 must be a 64-character lowercase hexadecimal",
+		},
+		"well-formed hash of some other reviewed manifest": {
+			func(p *releaseProvenance) {
+				p.ManifestSHA256 = strings.Repeat("c", 64)
+			},
+			"this provenance was taken over a different reviewed document",
+		},
+		"unrecorded source commit": {
+			func(p *releaseProvenance) { p.SourceCommit = "" },
+			"source_commit must be a full 40-character",
+		},
+		"abbreviated source commit": {
+			func(p *releaseProvenance) { p.SourceCommit = "0123456" },
+			"source_commit must be a full 40-character",
+		},
+		"source commit that is not hexadecimal": {
+			func(p *releaseProvenance) {
+				p.SourceCommit = strings.Repeat("z", 40)
+			},
+			"source_commit must be a full 40-character",
+		},
+		"no images at all": {
+			func(p *releaseProvenance) { p.Images = nil },
+			"images is empty",
+		},
+		"image digest under another algorithm": {
+			func(p *releaseProvenance) {
+				p.Images[0].Digest = "sha512:" + strings.Repeat("a", 64)
+				p.Images[0].Reference = "gcr.io/keep-test/keep-client@" +
+					p.Images[0].Digest
+			},
+			"images[0].digest must be a sha256 content digest",
+		},
+		"image reference carrying a tag instead of its digest": {
+			func(p *releaseProvenance) {
+				p.Images[0].Reference = "gcr.io/keep-test/keep-client:v2.1.0"
+			},
+			"images[0].reference must be pinned to its digest",
+		},
+		"image reference pinned to a different digest": {
+			func(p *releaseProvenance) {
+				p.Images[0].Reference = "gcr.io/keep-test/keep-client@sha256:" +
+					strings.Repeat("c", 64)
+			},
+			"images[0].reference must be pinned to its digest",
+		},
+		"image without a platform": {
+			func(p *releaseProvenance) { p.Images[0].Platform = "" },
+			"images[0].platform must name the platform",
+		},
+		"two images for one platform": {
+			func(p *releaseProvenance) {
+				p.Images[1].Platform = p.Images[0].Platform
+			},
+			"images[1] repeats platform [amd64]",
+		},
+	}
+
+	for testName, test := range tests {
+		t.Run(testName, func(t *testing.T) {
+			provenance := validReleaseProvenanceForTests(manifestSHAForTests)
+			test.mutate(&provenance)
+
+			err := validateReleaseProvenance(provenance, manifestSHAForTests)
+			if err == nil {
+				t.Fatal("expected the mutated provenance to be rejected")
+			}
+			if !strings.Contains(err.Error(), test.expectedMessage) {
+				t.Errorf(
+					"rejection must name the violation [%s], got:\n%v",
+					test.expectedMessage,
+					err,
+				)
+			}
+		})
+	}
+}
+
+// TestReleaseProvenanceBindsToTheReviewedManifestBytes closes the loop the two
+// documents exist in: the hash provenance records has to be the hash of the
+// exact reviewed bytes, so editing the manifest after provenance was taken over
+// it invalidates the pair rather than silently re-pointing it.
+func TestReleaseProvenanceBindsToTheReviewedManifestBytes(t *testing.T) {
+	manifestSHA, err := hashReleaseManifest(releaseManifestRepositoryPath)
+	if err != nil {
+		t.Fatalf("cannot hash the repository manifest: [%v]", err)
+	}
+
+	// The same digest the release scripts bind evidence records to, computed
+	// the same way: over the bytes on disk, not over a re-encoding of them.
+	raw, err := os.ReadFile(releaseManifestRepositoryPath)
+	if err != nil {
+		t.Fatalf("cannot read the repository manifest: [%v]", err)
+	}
+	if expected := fmt.Sprintf("%x", sha256.Sum256(raw)); manifestSHA != expected {
+		t.Fatalf(
+			"the manifest hash must be taken over the file bytes: got [%s], "+
+				"the bytes hash to [%s]",
+			manifestSHA,
+			expected,
+		)
+	}
+
+	provenance := validReleaseProvenanceForTests(manifestSHA)
+	if err := validateReleaseProvenance(provenance, manifestSHA); err != nil {
+		t.Errorf("provenance over the reviewed bytes rejected: [%v]", err)
+	}
+
+	// One byte of the reviewed document changing is enough: the pair is no
+	// longer one record, and nothing downstream may treat it as one.
+	edited := filepath.Join(t.TempDir(), "release-manifest.json")
+	if err := os.WriteFile(edited, append(raw, '\n'), 0o600); err != nil {
+		t.Fatalf("cannot write the edited manifest: [%v]", err)
+	}
+	editedSHA, err := hashReleaseManifest(edited)
+	if err != nil {
+		t.Fatalf("cannot hash the edited manifest: [%v]", err)
+	}
+	if editedSHA == manifestSHA {
+		t.Fatal("editing the manifest must change its hash")
+	}
+	if err := validateReleaseProvenance(provenance, editedSHA); err == nil {
+		t.Error(
+			"provenance taken over the reviewed manifest was accepted " +
+				"against an edited one",
 		)
 	}
 }
@@ -873,43 +1109,53 @@ func TestReleaseManifestRepositoryFileIsNotReleaseReady(t *testing.T) {
 	}
 
 	violations := releaseReadyViolations(manifest)
-	if len(violations) == 0 {
-		t.Fatal(
-			"the repository manifest passed release-readiness: either the " +
-				"release identity was recorded without this gate being " +
-				"revisited, or the readiness check stopped checking",
-		)
-	}
 
-	expected := []string{
-		"release_identity.source_commit is unrecorded",
-		"release_identity.images is empty",
-	}
-	// Named separately because it is the one blocker that lives in the client
-	// rather than in the document: no edit to the manifest can clear it, only a
-	// reviewed release commit setting C.
+	// The one blocker readiness can still report lives in the client rather
+	// than in the document: no edit to the manifest can clear it, only a
+	// reviewed release commit setting C. Once that commit lands the manifest is
+	// ready, and this test says so rather than failing — what it must never
+	// permit is readiness while the placeholder stands.
 	if participation.MainnetCutoverBlock == 0 {
-		expected = append(
-			expected,
+		if len(violations) == 0 {
+			t.Fatal(
+				"the repository manifest passed release-readiness over the " +
+					"compiled zero cutover block: the readiness check stopped " +
+					"checking the one value it owns",
+			)
+		}
+		joined := errors.Join(violations...).Error()
+		if !strings.Contains(
+			joined,
 			"release_identity.cutover_block is the zero placeholder",
-		)
-	}
-
-	joined := errors.Join(violations...).Error()
-	for _, expectedMessage := range expected {
-		if !strings.Contains(joined, expectedMessage) {
+		) {
 			t.Errorf(
-				"release-readiness must still report [%s], got:\n%s",
-				expectedMessage,
+				"release-readiness must still report the zero placeholder, "+
+					"got:\n%s",
 				joined,
 			)
 		}
+		return
+	}
+
+	if len(violations) != 0 {
+		t.Errorf(
+			"the reviewed cutover block is set, so the repository manifest "+
+				"must be release-ready, got: %v",
+			violations,
+		)
 	}
 }
 
 // TestReleaseManifestReleaseReadyIsSeparateFromValidity proves the two verdicts
 // stay apart: a document can be entirely valid and still not be something an
 // acceptance decision may be taken against.
+//
+// It also pins where the boundary now runs. Readiness answers only what the
+// manifest owns — that the reviewed cutover is a real one — and cannot be
+// reached by editing the file, because the value it turns on is compiled in.
+// Which artifact runs that cutover is not a question this verdict answers at
+// all; that is the detached provenance's, and a readiness check that started
+// answering it would be back to demanding the tree name its own commit.
 func TestReleaseManifestReleaseReadyIsSeparateFromValidity(t *testing.T) {
 	manifest := validReleaseManifestForTests(t)
 
@@ -918,42 +1164,29 @@ func TestReleaseManifestReleaseReadyIsSeparateFromValidity(t *testing.T) {
 	}
 
 	violations := releaseReadyViolations(manifest)
-	if len(violations) == 0 {
-		t.Fatal(
-			"a derived manifest records no build outputs and must not pass " +
-				"release-readiness",
-		)
-	}
-
-	// Recording the build outputs clears every blocker the document owns. What
-	// remains, until a reviewed release commit sets C, is the compiled
-	// placeholder — which is the point: release-readiness cannot be reached by
-	// editing this file.
-	manifest.ReleaseIdentity = releaseReadyIdentityForTests()
-	remaining := releaseReadyViolations(manifest)
 
 	if participation.MainnetCutoverBlock == 0 {
-		if len(remaining) != 1 {
+		if len(violations) != 1 {
 			t.Fatalf(
-				"the compiled zero cutover block must be the only blocker "+
-					"left, got: %v",
-				remaining,
+				"the compiled zero cutover block must be the only blocker, "+
+					"got: %v",
+				violations,
 			)
 		}
 		if !strings.Contains(
-			remaining[0].Error(),
+			violations[0].Error(),
 			"release_identity.cutover_block is the zero placeholder",
 		) {
-			t.Errorf("unexpected remaining blocker: [%v]", remaining[0])
+			t.Errorf("unexpected blocker: [%v]", violations[0])
 		}
 		return
 	}
 
-	if len(remaining) != 0 {
+	if len(violations) != 0 {
 		t.Errorf(
-			"a fully recorded identity over a set cutover block must be "+
-				"release-ready, got: %v",
-			remaining,
+			"a manifest over a set cutover block must be release-ready, "+
+				"got: %v",
+			violations,
 		)
 	}
 }

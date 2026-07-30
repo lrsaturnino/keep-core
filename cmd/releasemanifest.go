@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -79,25 +80,71 @@ type releaseImage struct {
 	Digest    string `json:"digest"`
 }
 
-// releaseIdentity names what the reviewed release is — the source it was built
-// from and the images it publishes — and the chain and block its cutover
-// happens at.
+// releaseIdentity names the chain and block the reviewed cutover happens at.
 //
 // The termination grace binds this document to the compiled bounds of the
 // binary validating it. That establishes the numbers are right for some build
-// of this source; it does not establish which build the fleet runs, nor which
-// chain and block the cutover it describes is for. Every statement made about
-// this release afterwards — smoke-gate evidence, the fleet inventory's
-// per-instance digest attestation, a rollback decision taken against a block
-// height — is stated against those identities, so the reviewed record carries
-// them and validation holds them against what the binary compiles in.
+// of this source; it does not establish which chain and block the cutover it
+// describes is for. Every statement made about this release afterwards —
+// smoke-gate evidence, the fleet inventory's per-instance digest attestation, a
+// rollback decision taken against a block height — is stated against those
+// identities, so the reviewed record carries them and validation holds them
+// against what the binary compiles in.
+//
+// What the release was built into is deliberately absent. The commit finally
+// built and the immutable image digests are outputs of a build over this
+// document's own bytes, so a manifest recording them would have to contain a
+// hash of the tree containing it: writing the value changes the commit the
+// value names. Those two live in the detached release provenance instead — a
+// document produced after the source commit and the images exist, bound back to
+// this one by its hash. See releaseProvenance.
 type releaseIdentity struct {
-	SourceCommit string         `json:"source_commit"`
-	ChainID      uint64         `json:"chain_id"`
-	CutoverBlock uint64         `json:"cutover_block"`
-	Images       []releaseImage `json:"images"`
-	Notes        string         `json:"notes,omitempty"`
+	ChainID      uint64 `json:"chain_id"`
+	CutoverBlock uint64 `json:"cutover_block"`
+	Notes        string `json:"notes,omitempty"`
 }
+
+// relocatedIdentityFields are the release-identity keys that used to live in
+// the manifest and now live in the detached provenance. Strict decoding already
+// rejects a manifest carrying them, but it rejects them as misspellings; naming
+// them here is what turns that into the one instruction a reviewer holding a
+// pre-relocation manifest needs.
+var relocatedIdentityFields = []string{"source_commit", "images"}
+
+// releaseProvenance is the detached record of what the reviewed release was
+// actually built into: the commit it was built from, and the immutable image
+// digests the fleet runs.
+//
+// It exists separately from the manifest because those values cannot be inside
+// the tree they describe. A reviewed manifest is part of the commit it would
+// have to name, so filling the field changes the answer — which is why the
+// manifest carries only what is reviewable ahead of the build, and this
+// document, generated afterwards and never committed to the tree it describes,
+// carries the rest.
+//
+// ManifestSHA256 is what keeps the two one record. Provenance naming a source
+// commit and a set of images says nothing on its own about which reviewed
+// bounds those artifacts were built under; hashing the manifest bytes into it
+// means acceptance can refuse provenance produced against some other reviewed
+// document, and refuse a manifest edited after provenance was taken over it.
+type releaseProvenance struct {
+	SchemaVersion  uint64         `json:"schema_version"`
+	GeneratedAt    string         `json:"generated_at"`
+	ManifestSHA256 string         `json:"manifest_sha256"`
+	SourceCommit   string         `json:"source_commit"`
+	Images         []releaseImage `json:"images"`
+	Notes          string         `json:"notes,omitempty"`
+}
+
+// releaseProvenanceSchemaVersion is the only provenance schema this binary
+// understands.
+const releaseProvenanceSchemaVersion = uint64(1)
+
+// manifestDigestPattern is the shape of the manifest hash provenance binds
+// itself to: the lowercase hexadecimal sha256 the release scripts compute over
+// the manifest bytes, bare rather than algorithm-prefixed because it names a
+// file rather than a registry object.
+var manifestDigestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 // beaconCompletionInputs records the beacon chain configuration from which
 // the beacon completion bound was derived, so a manifest reviewer can retrace
@@ -142,21 +189,19 @@ type releaseManifest struct {
 	TerminationGrace terminationGrace `json:"termination_grace"`
 }
 
-// deriveReleaseIdentity returns the part of the release identity this binary
-// can state on its own: the mainnet chain the compiled cutover constant is for,
-// and the cutover block compiled into it.
+// deriveReleaseIdentity returns the release identity this binary states on its
+// own: the mainnet chain the compiled cutover constant is for, and the cutover
+// block compiled into it.
 //
+// Both are compiled values, which is the whole of what the manifest records.
 // The source commit and the published image digests are outputs of the build
 // rather than values inside it — a binary cannot honestly name the tree it was
 // produced from or the registry content addresses it was packaged into — so
-// they are recorded by the release commit and checked here rather than derived.
+// they are recorded by the detached provenance and checked there.
 func deriveReleaseIdentity() releaseIdentity {
 	return releaseIdentity{
 		ChainID:      uint64(commonEthereum.Mainnet.ChainID()),
 		CutoverBlock: participation.MainnetCutoverBlock,
-		// An empty list rather than none, so the derived document says "no
-		// images recorded yet" in the same shape the filled-in one uses.
-		Images: []releaseImage{},
 	}
 }
 
@@ -268,6 +313,24 @@ func loadReleaseManifest(path string) (releaseManifest, error) {
 
 	var manifest releaseManifest
 	if err := decoder.Decode(&manifest); err != nil {
+		// A manifest predating the provenance split fails here as a set of
+		// unknown fields, which reads as a typo rather than as the one thing it
+		// is. Say what actually happened, and where those values went.
+		if relocated := relocatedIdentityKeys(path); len(relocated) > 0 {
+			return releaseManifest{}, fmt.Errorf(
+				"release manifest [%s] records release_identity.%s, which the "+
+					"manifest no longer carries: the commit built and the "+
+					"image digests are outputs of the build over this "+
+					"document's own bytes, so they moved to the detached "+
+					"release provenance generated after the build. Remove "+
+					"them here and record them there; "+
+					"`release-manifest verify-provenance` checks that "+
+					"document against this one. Decoding reported: [%v]",
+				path,
+				strings.Join(relocated, ", release_identity."),
+				err,
+			)
+		}
 		return releaseManifest{}, fmt.Errorf(
 			"cannot decode the release manifest [%s]: [%v]",
 			path,
@@ -288,6 +351,87 @@ func loadReleaseManifest(path string) (releaseManifest, error) {
 	}
 
 	return manifest, nil
+}
+
+// relocatedIdentityKeys reports which of the keys that moved to the detached
+// provenance a document still carries under release_identity. It is diagnostic
+// only — the caller has already refused the document — so an unreadable or
+// unparseable file simply reports nothing rather than masking the real error
+// with one about reading it a second time.
+func relocatedIdentityKeys(path string) []string {
+	raw, err := os.ReadFile(path) // #nosec G304 -- operator-supplied path
+	if err != nil {
+		return nil
+	}
+
+	var document struct {
+		ReleaseIdentity map[string]json.RawMessage `json:"release_identity"`
+	}
+	if err := json.Unmarshal(raw, &document); err != nil {
+		return nil
+	}
+
+	var found []string
+	for _, field := range relocatedIdentityFields {
+		if _, present := document.ReleaseIdentity[field]; present {
+			found = append(found, field)
+		}
+	}
+	return found
+}
+
+// hashReleaseManifest returns the sha256 the release scripts bind records to:
+// the digest of the exact manifest bytes, lowercase hexadecimal. Hashing the
+// bytes rather than a re-encoding of the decoded document is deliberate — the
+// binding has to be to the file a reviewer read and a record names, not to this
+// binary's idea of how that file should be formatted.
+func hashReleaseManifest(path string) (string, error) {
+	raw, err := os.ReadFile(path) // #nosec G304 -- operator-supplied path
+	if err != nil {
+		return "", fmt.Errorf(
+			"cannot read the release manifest [%s] to hash it: [%v]",
+			path,
+			err,
+		)
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(raw)), nil
+}
+
+// loadReleaseProvenance reads and strictly decodes a detached provenance
+// document, on the same terms as the manifest: unknown fields, trailing
+// content, and non-integer numbers are all rejected.
+func loadReleaseProvenance(path string) (releaseProvenance, error) {
+	file, err := os.Open(path) // #nosec G304 -- operator-supplied path
+	if err != nil {
+		return releaseProvenance{}, fmt.Errorf(
+			"cannot open the release provenance: [%v]",
+			err,
+		)
+	}
+	defer func() {
+		_ = file.Close()
+	}()
+
+	decoder := json.NewDecoder(file)
+	decoder.DisallowUnknownFields()
+
+	var provenance releaseProvenance
+	if err := decoder.Decode(&provenance); err != nil {
+		return releaseProvenance{}, fmt.Errorf(
+			"cannot decode the release provenance [%s]: [%v]",
+			path,
+			err,
+		)
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return releaseProvenance{}, fmt.Errorf(
+			"release provenance [%s] carries trailing content after the "+
+				"provenance object",
+			path,
+		)
+	}
+
+	return provenance, nil
 }
 
 // validateReleaseManifest checks a manifest against this binary's compiled
@@ -383,14 +527,11 @@ func validateReleaseManifest(manifest releaseManifest) error {
 }
 
 // releaseIdentityViolations holds the recorded identity against what this
-// binary compiles in, and against the shape a reference has to have to name one
-// immutable artifact.
+// binary compiles in.
 //
-// It does not require the identity to be filled in. A manifest is derived and
-// reviewed before the build it will name exists, so an unrecorded source commit
-// or an empty image list is a manifest that is not release-ready yet rather
-// than one contradicting the binary — the difference releaseReadyViolations
-// exists to state. What is recorded, however, has to be right.
+// Both fields are compiled values, so both are checked outright rather than
+// merely when present: unlike the build outputs that moved to the detached
+// provenance, neither has a legitimate unrecorded state.
 func releaseIdentityViolations(identity releaseIdentity) []error {
 	var violations []error
 
@@ -418,21 +559,24 @@ func releaseIdentityViolations(identity releaseIdentity) []error {
 		))
 	}
 
-	if identity.SourceCommit != "" &&
-		!sourceCommitPattern.MatchString(identity.SourceCommit) {
-		violations = append(violations, fmt.Errorf(
-			"release_identity.source_commit must be a full 40-character "+
-				"lowercase hexadecimal commit, got [%s]",
-			identity.SourceCommit,
-		))
-	}
+	return violations
+}
 
-	platforms := make(map[string]struct{}, len(identity.Images))
-	for index, image := range identity.Images {
+// releaseImageViolations checks a recorded image list against the shape a
+// reference has to have to name one immutable artifact. The field name is
+// passed in because the same list is checked in the detached provenance, and a
+// violation has to tell the reviewer which document to go edit.
+func releaseImageViolations(field string, images []releaseImage) []error {
+	var violations []error
+
+	platforms := make(map[string]struct{}, len(images))
+	for index, image := range images {
 		if image.Platform == "" {
 			violations = append(violations, fmt.Errorf(
-				"release_identity.images[%d].platform must name the platform "+
-					"the image was built for",
+				"%s[%d].platform must name the platform the image was built "+
+					"for, as the architecture[/variant] the registry manifest "+
+					"lists it under",
+				field,
 				index,
 			))
 		} else if _, duplicate := platforms[image.Platform]; duplicate {
@@ -440,7 +584,8 @@ func releaseIdentityViolations(identity releaseIdentity) []error {
 			// choosing between them would be choosing between artifacts, which
 			// is the decision this document exists to have already made.
 			violations = append(violations, fmt.Errorf(
-				"release_identity.images[%d] repeats platform [%s]",
+				"%s[%d] repeats platform [%s]",
+				field,
 				index,
 				image.Platform,
 			))
@@ -450,8 +595,8 @@ func releaseIdentityViolations(identity releaseIdentity) []error {
 
 		if !imageDigestPattern.MatchString(image.Digest) {
 			violations = append(violations, fmt.Errorf(
-				"release_identity.images[%d].digest must be a sha256 content "+
-					"digest, got [%s]",
+				"%s[%d].digest must be a sha256 content digest, got [%s]",
+				field,
 				index,
 				image.Digest,
 			))
@@ -462,12 +607,13 @@ func releaseIdentityViolations(identity releaseIdentity) []error {
 
 		// A tag is a name the registry may repoint at any time. A reference
 		// carrying one pulls whatever it resolves to at deployment time, which
-		// is not necessarily the artifact this manifest — or the acceptance
+		// is not necessarily the artifact this document — or the acceptance
 		// evidence stated against its digest — describes.
 		if !strings.HasSuffix(image.Reference, "@"+image.Digest) {
 			violations = append(violations, fmt.Errorf(
-				"release_identity.images[%d].reference must be pinned to its "+
-					"digest as [repository]@%s, got [%s]",
+				"%s[%d].reference must be pinned to its digest as "+
+					"[repository]@%s, got [%s]",
+				field,
 				index,
 				image.Digest,
 				image.Reference,
@@ -483,17 +629,19 @@ func releaseIdentityViolations(identity releaseIdentity) []error {
 //
 // The two are deliberately separate checks. Validity is a property of the
 // document and the binary reading it, and it holds throughout development;
-// readiness is a property of the release, and it cannot hold until values that
-// do not exist during development — the block the cutover happens at, the
-// commit finally built, the digests acceptance actually ran against — have been
-// reviewed and recorded. Answering them with one verdict would either fail
-// every development run or let a manifest with none of them pass as accepted.
+// readiness is a property of the release, and it cannot hold until the block
+// the cutover happens at — a value that does not exist during development — has
+// been reviewed and compiled in. Answering them with one verdict would either
+// fail every development run or let a placeholder manifest pass as accepted.
+//
+// Readiness is the whole of what the manifest can answer. It says the reviewed
+// document names a real cutover; it cannot say which artifact runs it, because
+// the artifact does not exist when this document is reviewed. That half is the
+// detached provenance's, and validateReleaseProvenance is where it is asked.
 func releaseReadyViolations(manifest releaseManifest) []error {
 	var violations []error
 
-	identity := manifest.ReleaseIdentity
-
-	if identity.CutoverBlock == 0 {
+	if manifest.ReleaseIdentity.CutoverBlock == 0 {
 		violations = append(violations, fmt.Errorf(
 			"release_identity.cutover_block is the zero placeholder: a "+
 				"reviewed release commit must set the mainnet cutover block "+
@@ -501,22 +649,80 @@ func releaseReadyViolations(manifest releaseManifest) []error {
 		))
 	}
 
-	if identity.SourceCommit == "" {
+	return violations
+}
+
+// validateReleaseProvenance checks a detached provenance document against the
+// reviewed manifest whose bytes hash to manifestSHA256, reporting every
+// violation rather than only the first.
+//
+// Unlike the manifest, provenance has no valid half-recorded state. It is
+// generated after the build it describes, so a document missing the commit or
+// the images is not an early draft — it is a claim about a release whose
+// artifacts its author did not have.
+func validateReleaseProvenance(
+	provenance releaseProvenance,
+	manifestSHA256 string,
+) error {
+	var violations []error
+
+	if provenance.SchemaVersion != releaseProvenanceSchemaVersion {
 		violations = append(violations, fmt.Errorf(
-			"release_identity.source_commit is unrecorded: the manifest must "+
-				"name the exact commit the accepted release was built from",
+			"schema_version must be [%d], got [%d]",
+			releaseProvenanceSchemaVersion,
+			provenance.SchemaVersion,
 		))
 	}
 
-	if len(identity.Images) == 0 {
+	if _, err := time.Parse(time.RFC3339, provenance.GeneratedAt); err != nil {
 		violations = append(violations, fmt.Errorf(
-			"release_identity.images is empty: the manifest must record the "+
-				"immutable image digests the acceptance evidence was "+
+			"generated_at must be an RFC 3339 timestamp: [%v]",
+			err,
+		))
+	}
+
+	// Both halves of the binding, separately reported. A malformed hash is a
+	// document that never named a manifest; a well-formed one naming another
+	// manifest is provenance for a release reviewed under different bounds, and
+	// telling those two apart is what tells the operator which file to fix.
+	switch {
+	case !manifestDigestPattern.MatchString(provenance.ManifestSHA256):
+		violations = append(violations, fmt.Errorf(
+			"manifest_sha256 must be a 64-character lowercase hexadecimal "+
+				"sha256 over the reviewed manifest bytes, got [%s]",
+			provenance.ManifestSHA256,
+		))
+	case provenance.ManifestSHA256 != manifestSHA256:
+		violations = append(violations, fmt.Errorf(
+			"manifest_sha256 is [%s], but the reviewed manifest hashes to "+
+				"[%s]; this provenance was taken over a different reviewed "+
+				"document, or the manifest was edited after it was taken",
+			provenance.ManifestSHA256,
+			manifestSHA256,
+		))
+	}
+
+	if !sourceCommitPattern.MatchString(provenance.SourceCommit) {
+		violations = append(violations, fmt.Errorf(
+			"source_commit must be a full 40-character lowercase hexadecimal "+
+				"commit naming the tree the release was built from, got [%s]",
+			provenance.SourceCommit,
+		))
+	}
+
+	if len(provenance.Images) == 0 {
+		violations = append(violations, fmt.Errorf(
+			"images is empty: provenance must record the immutable image " +
+				"digests the fleet runs and the acceptance evidence is " +
 				"collected against",
 		))
 	}
+	violations = append(
+		violations,
+		releaseImageViolations("images", provenance.Images)...,
+	)
 
-	return violations
+	return errors.Join(violations...)
 }
 
 // ReleaseManifestCommand contains the definition of the release-manifest
@@ -556,10 +762,10 @@ var releaseManifestDeriveCommand = &cobra.Command{
 			return err
 		}
 
-		// The identity is derived only as far as the binary can speak for it.
-		// The source commit and image digests come out empty, which is what a
-		// document generated before its own build has to say about them, and
-		// is exactly what release-readiness then refuses to accept.
+		// The identity is entirely compiled values. What the build produced is
+		// not derived here and is not recorded here at all: it belongs to the
+		// detached provenance, generated once the build this document is
+		// reviewed ahead of has actually happened.
 		manifest := releaseManifest{
 			SchemaVersion:    releaseManifestSchemaVersion,
 			GeneratedAt:      time.Now().UTC().Format(time.RFC3339),
@@ -625,6 +831,93 @@ var releaseManifestValidateCommand = &cobra.Command{
 	},
 }
 
+var releaseProvenancePath string
+
+// verify-provenance is the release-acceptance half the manifest cannot answer.
+// validate --release-ready says the reviewed document names a real cutover;
+// this says which artifact runs it, and that the artifact was built under those
+// same reviewed bounds.
+var releaseManifestVerifyProvenanceCommand = &cobra.Command{
+	Use:   "verify-provenance",
+	Short: "Verify detached release provenance against a reviewed manifest",
+	Long: "The verify-provenance command checks the detached provenance " +
+		"document — the commit the release was built from and the immutable " +
+		"image digests it publishes — against the reviewed release manifest " +
+		"it was taken over. Those values are outputs of a build over the " +
+		"manifest's own bytes, so they cannot live inside it: writing the " +
+		"commit into the tree changes the commit. Provenance is therefore " +
+		"generated after the build, never committed to the tree it describes, " +
+		"and bound back to the reviewed document by its hash.",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		manifest, err := loadReleaseManifest(releaseManifestPath)
+		if err != nil {
+			return err
+		}
+
+		// Provenance for a manifest this binary rejects is provenance for a
+		// release that would not pass its own validation, so the reviewed
+		// document is held to the compiled bounds first — and to readiness,
+		// because provenance exists only for a release being accepted.
+		if err := validateReleaseManifest(manifest); err != nil {
+			return fmt.Errorf(
+				"release manifest [%s] rejected:\n%v",
+				releaseManifestPath,
+				err,
+			)
+		}
+		if violations := releaseReadyViolations(manifest); len(violations) > 0 {
+			return fmt.Errorf(
+				"release manifest [%s] is valid but not release-ready, so no "+
+					"provenance can be verified against it:\n%v",
+				releaseManifestPath,
+				errors.Join(violations...),
+			)
+		}
+
+		manifestSHA256, err := hashReleaseManifest(releaseManifestPath)
+		if err != nil {
+			return err
+		}
+
+		provenance, err := loadReleaseProvenance(releaseProvenancePath)
+		if err != nil {
+			return err
+		}
+		if err := validateReleaseProvenance(
+			provenance,
+			manifestSHA256,
+		); err != nil {
+			return fmt.Errorf(
+				"release provenance [%s] rejected:\n%v",
+				releaseProvenancePath,
+				err,
+			)
+		}
+
+		fmt.Fprintf(
+			cmd.OutOrStdout(),
+			"release provenance [%s] verified against [%s]\n"+
+				"reviewed manifest sha256: %s\n"+
+				"source commit:            %s\n"+
+				"cutover block:            %d\n",
+			releaseProvenancePath,
+			releaseManifestPath,
+			manifestSHA256,
+			provenance.SourceCommit,
+			manifest.ReleaseIdentity.CutoverBlock,
+		)
+		for _, image := range provenance.Images {
+			fmt.Fprintf(
+				cmd.OutOrStdout(),
+				"image %-16s %s\n",
+				image.Platform,
+				image.Reference,
+			)
+		}
+		return nil
+	},
+}
+
 func init() {
 	releaseManifestValidateCommand.Flags().StringVar(
 		&releaseManifestPath,
@@ -636,16 +929,38 @@ func init() {
 		&releaseManifestRequireReleaseReady,
 		"release-ready",
 		false,
-		"Additionally require the release identity to be fully recorded: a "+
-			"nonzero compiled cutover block, the source commit built, and the "+
-			"immutable image digests acceptance ran against.",
+		"Additionally require the reviewed cutover block to be the nonzero "+
+			"block compiled into this binary. What the release was built "+
+			"into is checked separately, by verify-provenance.",
 	)
 	if err := releaseManifestValidateCommand.MarkFlagRequired("manifest"); err != nil {
 		logger.Fatalf("cannot mark the manifest flag required: [%v]", err)
 	}
 
+	releaseManifestVerifyProvenanceCommand.Flags().StringVar(
+		&releaseManifestPath,
+		"manifest",
+		"",
+		"Path to the reviewed release manifest JSON document.",
+	)
+	releaseManifestVerifyProvenanceCommand.Flags().StringVar(
+		&releaseProvenancePath,
+		"provenance",
+		"",
+		"Path to the detached release provenance JSON document, generated "+
+			"after the build and never committed to the tree it describes.",
+	)
+	for _, flag := range []string{"manifest", "provenance"} {
+		if err := releaseManifestVerifyProvenanceCommand.MarkFlagRequired(
+			flag,
+		); err != nil {
+			logger.Fatalf("cannot mark the %s flag required: [%v]", flag, err)
+		}
+	}
+
 	ReleaseManifestCommand.AddCommand(
 		releaseManifestDeriveCommand,
 		releaseManifestValidateCommand,
+		releaseManifestVerifyProvenanceCommand,
 	)
 }

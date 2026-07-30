@@ -72,6 +72,13 @@ MANIFEST="${TEST_DIR}/release-manifest.json"
 # them before the verdict was ever read.
 FIXTURE_SHA="cccccccccccccccccccccccccccccccccccccccc"
 
+# The reviewed manifest the consumer will recompute for itself, and a hash of
+# something else. Detached provenance names the manifest it was taken over, so
+# every case that supplies one needs both: the binding that agrees, and the
+# binding that does not.
+MANIFEST_SHA="$(hash_stdin <"${MANIFEST}")"
+OTHER_MANIFEST_SHA="$(printf 'd%.0s' {1..64})"
+
 # The binary's own answer, asked exactly the way the producer asks it and
 # entirely outside the producer. This is the reference every assertion below
 # compares against, so the suite tracks the release rather than pinning one
@@ -128,36 +135,56 @@ run_consumer() {
   set -e
 }
 
-# A copy of the script directory whose manifest names the given source commit,
-# with the receipt beside it regenerated for those bytes. The reviewed manifest
-# records no commit until the release build, so a case about the recorded one
-# being wrong has to supply a manifest that records one at all.
+# A copy of the produced receipt, forced to the ready verdict, so the cases
+# about what a release-acceptance run requires can be reached while the
+# reviewed manifest still names no release. Everything else in the receipt is
+# the producer's own output.
 #
-# Only the receipt's manifest hash is rebuilt: the derived bounds this consumer
-# also compares cover the chain id, the cutover block, and the termination
-# grace, and none of them moves when the release identity does.
-doctored_tree() {
-  local name="$1" declared="$2" receipt_source="$3"
-  local tree="${WORK}/${name}"
-  mkdir -p "${tree}"
-  cp -R "${TEST_DIR}/." "${tree}/tree"
-  cp -R "${D}/attestation" "${tree}/attestation"
+# Forcing the verdict is exactly what the flipped-verdict case above does, and
+# it is sound for the same reason: the verdict is one word the consumer reads,
+# the suite proves separately that the producer writes the binary's own answer
+# there, and no case here is about the verdict itself.
+ready_receipt() {
+  local name="$1"
+  local dir="${WORK}/${name}"
+  mkdir -p "${dir}"
+  cp -R "${D}/attestation" "${dir}/attestation"
+  printf 'yes\n' >"${dir}/attestation/release-ready.txt"
+  printf '%s\n' "${dir}"
+}
 
-  node -e '
-    const fs = require("fs");
-    const path = process.argv[1];
-    const doc = JSON.parse(fs.readFileSync(path, "utf8"));
-    doc.release_identity = doc.release_identity || {};
-    doc.release_identity.source_commit = process.argv[2];
-    fs.writeFileSync(path, JSON.stringify(doc, null, 2) + "\n");
-  ' "${tree}/tree/release-manifest.json" "${declared}"
+# A detached provenance document at the given path: written into a receipt
+# copy for the consumer cases, and left standing alone for the ones that hand
+# it to the producer.
+#
+# The producer builds its copy from a file the operator supplies and the binary
+# has verified. The consumer cases write shapes a verified document cannot have
+# — a different commit, a different reviewed manifest — because the consumer is
+# the only thing standing between a receipt assembled by hand and acceptance.
+write_provenance_file() {
+  local path="$1" manifest_sha="$2" source_commit="$3"
+  cat >"${path}" <<EOF
+{
+  "schema_version": 1,
+  "generated_at": "2026-07-28T00:00:00Z",
+  "manifest_sha256": "${manifest_sha}",
+  "source_commit": "${source_commit}",
+  "images": [
+    {
+      "platform": "amd64",
+      "reference": "ghcr.io/keep-network/keep-client@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    }
+  ]
+}
+EOF
+}
 
-  hash_stdin <"${tree}/tree/release-manifest.json" \
-    >"${tree}/attestation/reviewed-manifest.sha256"
-  printf '%s\n' "${receipt_source}" >"${tree}/attestation/source-commit.txt"
-  printf 'yes\n' >"${tree}/attestation/release-ready.txt"
-
-  printf '%s\n' "${tree}"
+# The same document, written into a receipt copy where the consumer reads it.
+write_case_provenance() {
+  local dir="$1"
+  shift
+  write_provenance_file "${dir}/attestation/release-provenance.json" "$@"
 }
 
 # Assert the captured rc and that the output matches every given pattern.
@@ -264,6 +291,10 @@ if [[ "${EXPECTED}" == "yes" ]]; then
     "records .* as not release-ready"
 else
   printf 'yes\n' >"${FLIPPED}/attestation/release-ready.txt"
+  # A ready receipt is a release-acceptance receipt, and one of those has to
+  # say which artifact runs the cutover. Supplied here so this case stays
+  # about the verdict; the receipt that omits it has its own case below.
+  write_case_provenance "${FLIPPED}" "${MANIFEST_SHA}" "${FIXTURE_SHA}"
   run_consumer "${FLIPPED}"
   check "the consumer accepts a receipt recording a ready release" 0 \
     "attestation binds .* to the compiled bounds of ${FIXTURE_SHA}"
@@ -280,34 +311,121 @@ check "the consumer refuses a receipt whose verdict is empty" 3 \
   "records .* as not release-ready"
 
 # ----------------------------------------------------------------------------
-# The commit the manifest names, against the commit the receipt was taken at.
-# Filling that field is an edit to the tree being built, so the reviewed value
-# is always written before the commit it names exists — and until the receipt
-# is required to agree, nothing notices when the value finally written is some
-# earlier commit that has nothing to do with the artifact under test.
+# The commit the release was built from, against the commit the receipt was
+# taken at.
+#
+# The manifest cannot make this statement about itself. It is part of the
+# commit it would have to name, so writing the value changes the answer, and a
+# check demanding the two agree can never be satisfied by any real checkout.
+# The detached provenance is generated after that commit exists and lives
+# outside the tree, so requiring it to name the commit under test asks for
+# something a release flow can actually produce — and refuses the case the
+# manifest never could: a release built from bytes no proof here measured.
 
 OTHER_SHA="dddddddddddddddddddddddddddddddddddddddd"
 
-TREE="$(doctored_tree "manifest-names-this-commit" "${FIXTURE_SHA}" \
-  "${FIXTURE_SHA}")"
-run_consumer "${TREE}" "${TREE}/tree"
-check "the consumer accepts a manifest naming the attested commit" 0 \
-  "attestation binds .* to the compiled bounds of ${FIXTURE_SHA}"
+CASE="$(ready_receipt "provenance-names-this-commit")"
+write_case_provenance "${CASE}" "${MANIFEST_SHA}" "${FIXTURE_SHA}"
+run_consumer "${CASE}"
+check "the consumer accepts provenance naming the attested commit" 0 \
+  "attestation binds .* to the compiled bounds of ${FIXTURE_SHA}" \
+  "detached provenance binds that commit to the images"
 
-TREE="$(doctored_tree "manifest-names-another-commit" "${OTHER_SHA}" \
-  "${FIXTURE_SHA}")"
-run_consumer "${TREE}" "${TREE}/tree"
-check "the consumer refuses a manifest naming another commit" 3 \
+CASE="$(ready_receipt "provenance-names-another-commit")"
+write_case_provenance "${CASE}" "${MANIFEST_SHA}" "${OTHER_SHA}"
+run_consumer "${CASE}"
+check "the consumer refuses provenance naming another commit" 3 \
   "names source commit \[${OTHER_SHA}\]" \
-  "names an artifact other than the one under test"
+  "built from bytes other than the ones under test"
 
-# The reviewed manifest as it stands records no commit, and that absence is
-# readiness's refusal to make rather than this one's. Duplicating it here would
-# answer a manifest naming no release with the wrong message.
-TREE="$(doctored_tree "manifest-names-no-commit" "" "${FIXTURE_SHA}")"
-run_consumer "${TREE}" "${TREE}/tree"
-check "an unrecorded commit is left to the readiness verdict" 0 \
-  "attestation binds .* to the compiled bounds of ${FIXTURE_SHA}"
+# Provenance for a release reviewed under other bounds. Naming the right
+# commit is not enough: the hash is what says these artifacts were built for
+# the manifest these records are measured against.
+CASE="$(ready_receipt "provenance-over-another-manifest")"
+write_case_provenance "${CASE}" "${OTHER_MANIFEST_SHA}" "${FIXTURE_SHA}"
+run_consumer "${CASE}"
+check "the consumer refuses provenance taken over another manifest" 3 \
+  "hashing to \[${OTHER_MANIFEST_SHA}\]" \
+  "built under reviewed bounds other than the ones"
+
+# A ready receipt carrying no provenance names a cutover and no artifact. The
+# release-acceptance run is exactly where that absence stops being acceptable,
+# so the refusal lives here rather than in the producer, which legitimately
+# writes provenance-free receipts on every development run.
+CASE="$(ready_receipt "ready-receipt-without-provenance")"
+rm -f "${CASE}/attestation/release-provenance.json"
+run_consumer "${CASE}"
+check "the consumer refuses a ready receipt carrying no provenance" 3 \
+  "carries no detached release provenance" \
+  "outside the checkout"
+
+# ----------------------------------------------------------------------------
+# The producer's own handling of the document it is handed.
+
+# The whole point of the split is that this document is not in the tree it
+# describes. A tracked file would put the commit back inside the commit it
+# names, and would do it quietly — every check downstream would still pass
+# against whatever stale value the tree happened to carry.
+run_producer_with_provenance() {
+  local dir="$1" provenance="$2"
+  mkdir -p "${dir}"
+  set +e
+  CASE_OUT="$(
+    (
+      cd "${REPO_ROOT}" || exit 1
+      # shellcheck disable=SC2030,SC2031,SC2034
+      EVIDENCE_DIR="${dir}"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      VERIFIED_SOURCE_COMMIT="${FIXTURE_SHA}"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      PR4109_RELEASE_PROVENANCE="${provenance}"
+      attest_release_manifest
+    ) 2>&1
+  )"
+  CASE_RC=$?
+  set -e
+}
+
+run_producer_with_provenance "${WORK}/tracked-provenance" "${MANIFEST}"
+check "the producer refuses provenance tracked in this repository" 1 \
+  "is tracked in this repository" \
+  "Generate it after the build, outside the checkout"
+
+run_producer_with_provenance "${WORK}/absent-provenance" \
+  "${WORK}/no-such-provenance.json"
+check "the producer refuses provenance it cannot read" 1 \
+  "which is not a readable file"
+
+# The document the binary has to reject, handed to the producer untracked so
+# the refusal can only come from the verification. While the reviewed manifest
+# names no release there is nothing to have provenance for, and that is the
+# answer; once the reviewed cutover block lands, the same case is refused for
+# the mismatched hash it carries. Either way the producer must not record a
+# document the binary did not accept.
+UNVERIFIABLE="${WORK}/unverifiable-provenance.json"
+write_provenance_file "${UNVERIFIABLE}" "${OTHER_MANIFEST_SHA}" \
+  "${FIXTURE_SHA}"
+run_producer_with_provenance "${WORK}/unverifiable" "${UNVERIFIABLE}"
+check "the producer refuses provenance the binary does not verify" 1 \
+  "does not verify against"
+if [[ -f "${WORK}/unverifiable/attestation/release-provenance.json" ]]; then
+  printf 'FAIL the producer recorded provenance the binary rejected\n'
+  FAILED=$((FAILED + 1))
+else
+  printf 'ok   a rejected provenance is recorded in no receipt\n'
+  PASS=$((PASS + 1))
+fi
+
+# A development run has no build to describe, and must still produce a
+# receipt. The absence is the acceptance stage's refusal to make, not this
+# one's.
+if [[ -f "${D}/attestation/release-provenance.json" ]]; then
+  printf 'FAIL the producer invented provenance nobody supplied\n'
+  FAILED=$((FAILED + 1))
+else
+  printf 'ok   a run supplied no provenance records none\n'
+  PASS=$((PASS + 1))
+fi
 
 # ----------------------------------------------------------------------------
 # A second run must replace the receipt rather than leave the first one's

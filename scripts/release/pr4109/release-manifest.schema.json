@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Release manifest: release identity and service-manager termination grace",
-  "description": "Reviewed record naming the release artifact and the chain and block its cutover happens at, and binding the external service-manager termination grace to the client's compiled protocol bounds. Schema validation alone is never sufficient: the document must also pass `keep-client release-manifest validate`, which re-derives every number from the compiled bounds of the exact release binary and holds the recorded chain id and cutover block against what that binary compiles in. A release-acceptance decision additionally requires `validate --release-ready`, which refuses a manifest whose cutover block is still the zero placeholder or whose source commit and image digests are unrecorded.",
+  "description": "Reviewed record naming the chain and block the cutover happens at, and binding the external service-manager termination grace to the client's compiled protocol bounds. Schema validation alone is never sufficient: the document must also pass `keep-client release-manifest validate`, which re-derives every number from the compiled bounds of the exact release binary and holds the recorded chain id and cutover block against what that binary compiles in. A release-acceptance decision additionally requires `validate --release-ready`, which refuses a manifest whose cutover block is still the zero placeholder. What the release was built into — the commit and the image digests — is deliberately not here: those are outputs of a build over this document's own bytes, so recording them would require this tree to contain a hash of itself. They live in the detached release provenance (release-provenance.schema.json), generated after the build and checked against this document by `release-manifest verify-provenance`.",
   "type": "object",
   "required": ["schema_version", "generated_at", "protocol_epoch", "release_identity", "termination_grace"],
   "additionalProperties": false,
@@ -10,16 +10,11 @@
     "generated_at": { "type": "string", "format": "date-time" },
     "protocol_epoch": { "const": "security_v2_cutover" },
     "release_identity": {
-      "description": "What the reviewed release is and what chain and block it is for. The chain id and cutover block are checked against the client's compiled constants by every validate run; the source commit and image digests are build outputs, unrecorded until the release commit, and are what `--release-ready` requires.",
+      "description": "What chain and block the reviewed cutover is for. Both are checked against the client's compiled constants by every validate run. Build outputs are not recorded here; see the detached release provenance.",
       "type": "object",
-      "required": ["source_commit", "chain_id", "cutover_block", "images"],
+      "required": ["chain_id", "cutover_block"],
       "additionalProperties": false,
       "properties": {
-        "source_commit": {
-          "description": "Full 40-character lowercase hexadecimal commit the accepted release was built from. Empty until the release commit; an abbreviated hash is rejected because it names a prefix rather than a commit.",
-          "type": "string",
-          "pattern": "^$|^[0-9a-f]{40}$"
-        },
         "chain_id": {
           "description": "Chain id the compiled mainnet cutover block is for. Validation re-derives it from the same network definition the client verifies the remote endpoint against at connect time.",
           "type": "integer",
@@ -29,32 +24,6 @@
           "description": "Mainnet cutover block C. Must equal participation.MainnetCutoverBlock as compiled into the release binary, so the reviewed document can never publish a height no node observes. Zero is the compiled placeholder and is refused by `--release-ready`.",
           "type": "integer",
           "minimum": 0
-        },
-        "images": {
-          "description": "Runtime images the release publishes, one per platform, each pinned by digest. Empty until the release build; `--release-ready` requires at least one.",
-          "type": "array",
-          "items": {
-            "type": "object",
-            "required": ["platform", "reference", "digest"],
-            "additionalProperties": false,
-            "properties": {
-              "platform": {
-                "description": "Platform the image was built for, in OCI form, e.g. linux/amd64. One image per platform.",
-                "type": "string",
-                "minLength": 1
-              },
-              "reference": {
-                "description": "Reference deployment pulls. Must be pinned as [repository]@[digest] and must end with exactly the digest recorded beside it: a tag is a name the registry may repoint, so a tagged reference would run whatever it resolves to at pull time rather than the artifact the acceptance evidence describes.",
-                "type": "string",
-                "minLength": 1
-              },
-              "digest": {
-                "description": "OCI content digest of the image. The algorithm is pinned to sha256 rather than taken from the document.",
-                "type": "string",
-                "pattern": "^sha256:[0-9a-f]{64}$"
-              }
-            }
-          }
         },
         "notes": { "type": "string" }
       }

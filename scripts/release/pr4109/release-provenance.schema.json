@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Release provenance: what the reviewed release was built into",
+  "description": "Detached record of the commit the release was built from and the immutable image digests it publishes, bound to the reviewed release manifest by that manifest's hash. It is a separate document because these values cannot be inside the tree they describe: a manifest is part of the commit it would have to name, so writing the commit into it changes the commit it names. Provenance is therefore generated after the build, MUST NOT be committed to the tree it describes, and is checked against the reviewed manifest by `keep-client release-manifest verify-provenance`. Schema validation alone is never sufficient — verify-provenance additionally re-hashes the reviewed manifest, holds that manifest to the compiled bounds and to `--release-ready`, and requires the recorded hash to be the hash of those exact bytes. The rehearsal acceptance stage goes further still: it requires the recorded source commit to be the commit its own attestation was taken at, and requires every evidence record's R1 image digests to be exactly the platform-to-reference set recorded here.",
+  "type": "object",
+  "required": ["schema_version", "generated_at", "manifest_sha256", "source_commit", "images"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "manifest_sha256": {
+      "description": "Lowercase hexadecimal sha256 over the exact reviewed release-manifest.json bytes this provenance was taken over. Bare rather than algorithm-prefixed because it names a file rather than a registry object. The hash is what makes the two documents one record: without it, provenance naming a commit and a set of images says nothing about which reviewed bounds those artifacts were built under.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "source_commit": {
+      "description": "Full 40-character lowercase hexadecimal commit the release was built from. An abbreviated hash is rejected because it names a prefix rather than a commit: prefixes collide, and the point of recording the source is that a reviewer can fetch exactly what was built.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "images": {
+      "description": "Runtime images the release publishes, one per platform, each pinned by digest. At least one is required: provenance is generated after the build, so an empty list is not an early draft but a claim about a release whose artifacts its author did not have.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["platform", "reference", "digest"],
+        "additionalProperties": false,
+        "properties": {
+          "platform": {
+            "description": "Platform the image was built for, named as the architecture[/variant] the registry manifest lists it under, e.g. amd64 or arm64/v8. One image per platform. This is the same namespace the rehearsal evidence records use for artifacts.r1_image_digests, because acceptance compares the two maps for exact equality; naming a platform any other way there fails that comparison rather than passing it silently.",
+            "type": "string",
+            "minLength": 1
+          },
+          "reference": {
+            "description": "Reference deployment pulls. Must be pinned as [repository]@[digest] and must end with exactly the digest recorded beside it: a tag is a name the registry may repoint, so a tagged reference would run whatever it resolves to at pull time rather than the artifact the acceptance evidence describes.",
+            "type": "string",
+            "minLength": 1
+          },
+          "digest": {
+            "description": "OCI content digest of the image. The algorithm is pinned to sha256 rather than taken from the document.",
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+          }
+        }
+      }
+    },
+    "notes": { "type": "string" }
+  }
+}

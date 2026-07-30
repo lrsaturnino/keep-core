@@ -1046,19 +1046,40 @@ keeps holding once the reviewed block lands and the answer flips. It runs from
 `local-proofs` rather than `shell-analysis` because asking the binary needs
 the Go toolchain.
 
-Readiness asks whether the manifest names a commit; it cannot ask whether it
-names *this* one. Filling that field edits the very tree being built, so the
-reviewed value always names a commit that does not exist yet, and an earlier
-commit written there would describe an artifact nobody built.
-`validate-evidence` therefore requires a recorded `source_commit` to equal the
-commit the attestation was taken at — already proved a clean id and, on a bound
-run, the dispatched one, and already required to equal every record's
-`source_sha`. An *unrecorded* commit is left to the readiness verdict, which is
-what refuses it; duplicating that refusal here would answer a manifest naming
-no release with the wrong message. The image digests remain pinned by the
-manifest hash alone: binding them to each record's `r1_image_digests` needs the
-complete reviewed platform set to be decided first, and this scaffold does not
-get to invent it.
+Readiness says the reviewed manifest names a real cutover. It cannot say which
+artifact runs it, and no edit to that document could make it: the commit
+finally built and the image digests are outputs of a build over the manifest's
+own bytes, so a manifest naming them would have to contain a hash of the tree
+containing it — writing the value changes the value. A check demanding the two
+agree is unsatisfiable by any real checkout rather than merely unsatisfied.
+
+That half of the identity therefore lives in a **detached release
+provenance**: a document generated after the build, recording the
+`manifest_sha256` it was taken over, the `source_commit` built, and one
+digest-pinned image `reference` per platform. It is never committed to the
+tree it describes — the producer refuses a provenance path tracked in this
+repository, because committing it would put the commit back inside the commit
+it names — and `release-manifest verify-provenance` checks the pair: the
+manifest against the compiled bounds and against `--release-ready`, the
+provenance against its shape, and the recorded hash against the reviewed
+bytes. `local-proofs` takes the verified document into the receipt when
+`PR4109_RELEASE_PROVENANCE` points at one, copying it rather than remembering
+a path, so acceptance reads the run's own sealed account.
+
+`validate-evidence` then closes both bindings the manifest could not close
+alone. Once the receipt records a release-ready manifest, provenance is
+mandatory: a ready receipt without it names a cutover and no artifact. Its
+`manifest_sha256` must be the reviewed manifest's hash, so it cannot be
+provenance for a release reviewed under other bounds; its `source_commit` must
+be the commit the attestation was taken at — already proved a clean id and, on
+a bound run, the dispatched one, and already required to equal every record's
+`source_sha`. And every record's `artifacts.r1_image_digests` must equal the
+provenance image set exactly, platform for platform and reference for
+reference: a missing platform is one the evidence says nothing about, an extra
+one is a fleet running something the release never shipped, and a substituted
+digest is a rehearsal of an artifact this release does not publish. The
+comparison is over references rather than bare digests, so the same content
+pulled from another repository is refused too.
 
 A receipt belongs to one run at one commit, and three rules keep it that
 way. `local-proofs` destroys the receipt it inherits — interrupted staging
@@ -1532,47 +1553,57 @@ inside that headroom. The client never reads the manifest at runtime; its
 bounds are compiled in, and the manifest exists so the SIGKILL deadline is
 derived from those same bounds.
 
-Beside the grace, the manifest names what the release *is*. The grace binds
-the document to the compiled bounds of the binary validating it, which
-establishes the numbers are right for some build of this source; it does not
-establish which build the fleet runs, nor which chain and block the cutover it
-describes is for. Every statement made about the release afterwards — smoke
-gate evidence, the inventory's per-instance digest attestation, a rollback
-decision taken against a block height — is stated against those identities, so
-`release_identity` carries them: the mainnet `chain_id`, the `cutover_block`
-C, the `source_commit` finally built, and one digest-pinned image `reference`
-per platform.
+Beside the grace, the manifest names which chain and block the cutover is
+for. The grace binds the document to the compiled bounds of the binary
+validating it, which establishes the numbers are right for some build of this
+source; it does not establish which chain and block the cutover it describes
+is for. Every statement made about the release afterwards — smoke gate
+evidence, the inventory's per-instance digest attestation, a rollback decision
+taken against a block height — is stated against those identities, so
+`release_identity` carries them: the mainnet `chain_id` and the
+`cutover_block` C.
 
-Two of those four are checked by every validate run. `chain_id` is re-derived
-from the same network definition the client verifies the remote endpoint
-against at connect time, and `cutover_block` must equal
-`participation.MainnetCutoverBlock` as compiled into the validating binary —
-so the reviewed document can never publish a height no node observes, and the
-release commit that sets C forces the manifest to be regenerated and
-re-reviewed. The other two are outputs of a build that does not exist when the
-manifest is first reviewed, so they are recorded by the release commit rather
-than derived, and each image reference must end with exactly the digest
-recorded beside it: a tag is a name the registry may repoint, so a tagged
-reference would run whatever it resolves to at pull time rather than the
-artifact the evidence describes.
+Both are checked by every validate run. `chain_id` is re-derived from the same
+network definition the client verifies the remote endpoint against at connect
+time, and `cutover_block` must equal `participation.MainnetCutoverBlock` as
+compiled into the validating binary — so the reviewed document can never
+publish a height no node observes, and the release commit that sets C forces
+the manifest to be regenerated and re-reviewed.
+
+What the release was *built into* is deliberately not in this document. The
+commit finally built and the immutable image digests are outputs of a build
+over these very bytes, so recording them here would require the file to
+contain a hash of the tree containing it. They live in the detached release
+provenance instead — generated after the build, never committed to the tree it
+describes, bound back to the reviewed manifest by its hash, and checked by
+`release-manifest verify-provenance`. Each image reference there must end with
+exactly the digest recorded beside it: a tag is a name the registry may
+repoint, so a tagged reference would run whatever it resolves to at pull time
+rather than the artifact the evidence describes. A manifest still carrying
+either relocated key is refused by the loader with that instruction, rather
+than as an unknown field.
 
 Validity and release-readiness are therefore separate verdicts.
 `release-manifest validate` asks whether the document contradicts the binary,
 which it must not at any point in development. `release-manifest validate
---release-ready` additionally asks whether the identity is complete, and it is
-the check a release-acceptance decision is taken against. The checked-in
-manifest passes the first and deliberately fails the second; the failure names
-what is outstanding, which today includes the zero cutover block — the one
+--release-ready` additionally asks whether the reviewed cutover block is set,
+and it is the check a release-acceptance decision is taken against — together
+with `verify-provenance`, which answers the half about the artifact. The
+checked-in manifest passes the first and deliberately fails the second; the
+failure names what is outstanding, which today is the zero cutover block — the
 blocker that lives in the client rather than in the document, clearable only
 by a reviewed release commit and not by any edit to this file. A `cmd` test
 holds that standing state in place from both directions: it fails if the
 manifest stops validating, and it fails if release-readiness starts passing
-while the identity is still empty.
+while the compiled placeholder stands.
 
-The second verdict is not advisory. `local-proofs` records it in the
-attestation receipt and `validate-evidence` refuses every record measured
-against a manifest the receipt reports as not release-ready, so the acceptance
-path cannot issue a verdict over a document that identifies no artifact.
+Neither verdict is advisory. `local-proofs` records the readiness answer in
+the attestation receipt and `validate-evidence` refuses every record measured
+against a manifest the receipt reports as not release-ready. Past that point
+the run is a release-acceptance run, so the same stage requires the receipt to
+carry detached provenance and holds every record to it — the commit built and
+the exact image set — which is what keeps the acceptance path from issuing a
+verdict over a document that identifies no artifact.
 
 The chain is enforced at three layers, each fail-closed:
 

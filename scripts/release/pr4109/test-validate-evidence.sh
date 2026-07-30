@@ -120,6 +120,35 @@ REVIEWED_ROLLBACK_GENERATOR_DIGEST="$(
 )"
 REVIEWED_TSSLIB_REVIEW_DIGEST="$(reviewed_input_digest tsslib-review)"
 
+# What the fixture release publishes, stated once in the two forms the two
+# documents use it in: the provenance's reviewed image list, and the
+# per-architecture map a record reports the fleet ran. Acceptance compares
+# these for exact equality, so both are derived from one reference here, and
+# the emitter cases below run against that same reference — a fixture whose
+# halves disagreed by accident would test the comparison against itself rather
+# than against a real disagreement.
+#
+# Two platforms because the interesting refusals are about the set and not
+# about one entry: a published platform nobody rehearsed and a rehearsed one
+# nobody published are both invisible to a check that only compares what the
+# two documents happen to have in common.
+FIXTURE_R1_DIGEST="sha256:1111111111111111111111111111111111111111111111111111111111111111"
+FIXTURE_R1_REFERENCE="ghcr.io/keep-network/keep-client@${FIXTURE_R1_DIGEST}"
+FIXTURE_R1_PLATFORMS=("amd64" "arm64")
+FIXTURE_R1_IMAGES="$(
+  printf '[{"platform": "%s", "reference": "%s", "digest": "%s"},
+    {"platform": "%s", "reference": "%s", "digest": "%s"}]' \
+    "${FIXTURE_R1_PLATFORMS[0]}" "${FIXTURE_R1_REFERENCE}" \
+    "${FIXTURE_R1_DIGEST}" \
+    "${FIXTURE_R1_PLATFORMS[1]}" "${FIXTURE_R1_REFERENCE}" \
+    "${FIXTURE_R1_DIGEST}"
+)"
+FIXTURE_R1_DIGEST_MAP="$(
+  printf '{"%s": "%s", "%s": "%s"}' \
+    "${FIXTURE_R1_PLATFORMS[0]}" "${FIXTURE_R1_REFERENCE}" \
+    "${FIXTURE_R1_PLATFORMS[1]}" "${FIXTURE_R1_REFERENCE}"
+)"
+
 # A schema-complete record bound to the given manifest hash, grace,
 # generation timestamp, and source commit. The negative cases change exactly
 # one argument each, so a rejection can only come from that change.
@@ -185,6 +214,7 @@ write_record() {
   local stages="${6:-${STAGE_PASSED}}"
   local assertions="${7:-${ASSERTION_HOLDS}}"
   local gate="${8:-single_release}"
+  local r1_images="${9:-${FIXTURE_R1_DIGEST_MAP}}"
   cat >"${path}" <<EOF
 {
   "schema_version": 1,
@@ -192,9 +222,7 @@ write_record() {
   "generated_at": "${generated_at}",
   "source_sha": "${source_sha}",
   "artifacts": {
-    "r1_image_digests": {
-      "linux/amd64": "ghcr.io/keep-network/keep-client@sha256:1111111111111111111111111111111111111111111111111111111111111111"
-    },
+    "r1_image_digests": ${r1_images},
     "prior_image_digests": {
       "linux/amd64": "ghcr.io/keep-network/keep-client@sha256:2222222222222222222222222222222222222222222222222222222222222222"
     },
@@ -229,17 +257,47 @@ EOF
 # before any of the comparisons below is reached, so leaving it at the
 # checked-in placeholder's own verdict would make every case test the same
 # refusal.
+#
+# The detached provenance defaults to one that agrees with everything else the
+# fixtures say — taken over the reviewed manifest, naming the fixture commit,
+# publishing exactly the image write_record evidences — for the same reason:
+# once the manifest is ready, a receipt without agreeing provenance is refused
+# before any later comparison is reached.
 write_attestation() {
   local dir="$1/attestation"
   local sha="${2:-${MANIFEST_SHA}}"
   local derived="${3:-${TEST_DIR}/release-manifest.json}"
   local source_sha="${4:-${FIXTURE_SHA}}"
   local ready="${5:-yes}"
+  local provenance_sha="${6:-${sha}}"
+  local provenance_source="${7:-${source_sha}}"
+  local provenance_images="${8:-${FIXTURE_R1_IMAGES}}"
   mkdir -p "${dir}"
   printf '%s\n' "${sha}" >"${dir}/reviewed-manifest.sha256"
   cp "${derived}" "${dir}/derived-manifest.json"
   printf '%s\n' "${source_sha}" >"${dir}/source-commit.txt"
   printf '%s\n' "${ready}" >"${dir}/release-ready.txt"
+  write_provenance "${dir}" "${provenance_sha}" "${provenance_source}" \
+    "${provenance_images}"
+}
+
+# The detached provenance a receipt carries: what the release was built from
+# and what it publishes, recorded outside the tree it describes. Written as a
+# separate helper so a case can build a receipt without one — which is itself
+# a refusal this suite has to cover, because that receipt names no artifact.
+write_provenance() {
+  local dir="$1" sha="$2" source_sha="$3" images="$4"
+  cat >"${dir}/release-provenance.json" <<EOF
+{
+  "schema_version": 1,
+  "generated_at": "2026-07-28T00:00:00Z",
+  "manifest_sha256": "${sha}",
+  "source_commit": "${source_sha}",
+  "images": ${images}
+}
+EOF
+  hash_stdin <"${dir}/release-provenance.json" \
+    >"${dir}/release-provenance.sha256"
 }
 
 # Run stage_validate_evidence against a fixture directory in an isolated
@@ -395,6 +453,122 @@ write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
 run_validator "${D}"
 check "an attestation missing its readiness verdict is not a receipt" 3 \
   "no complete release-manifest attestation"
+
+# The manifest names a real cutover and the receipt says nothing about what
+# was built to run it. That is the gap the detached provenance exists to fill,
+# and it cannot be filled by the manifest: the commit built and the images are
+# outputs of a build over the manifest's own bytes, so a manifest naming them
+# would have to contain a hash of the tree containing it. A ready receipt
+# without provenance therefore names no artifact at all, and nothing measured
+# against it may be accepted.
+D="${WORK}/attestation-without-provenance"
+mkdir -p "${D}"
+write_attestation "${D}"
+rm "${D}/attestation/release-provenance.json"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+run_validator "${D}"
+check "a ready receipt carrying no detached provenance is refused" 3 \
+  "carries no detached release provenance" "outside the checkout"
+
+# Provenance taken over some other reviewed manifest describes an artifact
+# built under bounds these records were never measured against. The hash is
+# what tells the two apart; without this comparison any provenance naming the
+# right commit would vouch for a release reviewed somewhere else entirely.
+D="${WORK}/provenance-over-another-manifest"
+mkdir -p "${D}"
+write_attestation "${D}" "${MANIFEST_SHA}" "${TEST_DIR}/release-manifest.json" \
+  "${FIXTURE_SHA}" "yes" \
+  "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+run_validator "${D}"
+check "provenance taken over another reviewed manifest is refused" 3 \
+  "reviewed bounds other than the ones these records are measured against"
+
+# The replacement for the check that could never be satisfied: the commit is
+# named by a document outside the tree, so requiring it to be the commit under
+# test asks something achievable. A provenance naming any other commit is a
+# release built from bytes no proof here measured.
+D="${WORK}/provenance-from-another-commit"
+mkdir -p "${D}"
+write_attestation "${D}" "${MANIFEST_SHA}" "${TEST_DIR}/release-manifest.json" \
+  "${FIXTURE_SHA}" "yes" "${MANIFEST_SHA}" "${OTHER_SHA}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+run_validator "${D}"
+check "provenance naming a commit other than the one under test is refused" 3 \
+  "was built from bytes other than the ones under test"
+
+# Presence was never the question. A record naming a digest the release does
+# not publish is a rehearsal of an artifact this release does not ship, and
+# nothing about the rest of the record can make it evidence for one.
+D="${WORK}/record-ran-another-image"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z" "${FIXTURE_SHA}" "${STAGE_PASSED}" \
+  "${ASSERTION_HOLDS}" "single_release" \
+  "$(printf '{"%s": "ghcr.io/keep-network/keep-client@sha256:9999999999999999999999999999999999999999999999999999999999999999", "%s": "%s"}' \
+    "${FIXTURE_R1_PLATFORMS[0]}" "${FIXTURE_R1_PLATFORMS[1]}" \
+    "${FIXTURE_R1_REFERENCE}")"
+run_validator "${D}"
+check "a record naming a digest the release does not publish is refused" 3 \
+  "was not produced against the images this release publishes" \
+  "but the release publishes"
+
+# The same content pulled from another repository is a different supply chain
+# reaching the same bytes, for exactly as long as nobody repoints it. The
+# comparison is over references and not bare digests so that this fails.
+D="${WORK}/record-ran-another-repository"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z" "${FIXTURE_SHA}" "${STAGE_PASSED}" \
+  "${ASSERTION_HOLDS}" "single_release" \
+  "$(printf '{"%s": "docker.io/someone-else/keep-client@%s", "%s": "%s"}' \
+    "${FIXTURE_R1_PLATFORMS[0]}" "${FIXTURE_R1_DIGEST}" \
+    "${FIXTURE_R1_PLATFORMS[1]}" "${FIXTURE_R1_REFERENCE}")"
+run_validator "${D}"
+check "a record naming the release digest from another repository is refused" \
+  3 "was not produced against the images this release publishes"
+
+# A published platform nobody rehearsed is a platform the acceptance evidence
+# says nothing about, however complete the record looks for the ones it does
+# cover.
+D="${WORK}/record-missing-a-published-platform"
+mkdir -p "${D}"
+write_attestation "${D}" "${MANIFEST_SHA}" "${TEST_DIR}/release-manifest.json" \
+  "${FIXTURE_SHA}" "yes" "${MANIFEST_SHA}" "${FIXTURE_SHA}" \
+  "$(printf '[{"platform": "%s", "reference": "%s", "digest": "%s"},
+    {"platform": "%s", "reference": "%s", "digest": "%s"},
+    {"platform": "riscv64", "reference": "%s", "digest": "%s"}]' \
+    "${FIXTURE_R1_PLATFORMS[0]}" "${FIXTURE_R1_REFERENCE}" \
+    "${FIXTURE_R1_DIGEST}" \
+    "${FIXTURE_R1_PLATFORMS[1]}" "${FIXTURE_R1_REFERENCE}" \
+    "${FIXTURE_R1_DIGEST}" \
+    "ghcr.io/keep-network/keep-client@sha256:3333333333333333333333333333333333333333333333333333333333333333" \
+    "sha256:3333333333333333333333333333333333333333333333333333333333333333")"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+run_validator "${D}"
+check "a record leaving a published platform unrehearsed is refused" 3 \
+  "which this record does not evidence"
+
+# And the other direction: a record evidencing an image the release does not
+# publish describes a fleet running something the release never shipped.
+D="${WORK}/record-ran-an-unpublished-platform"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z" "${FIXTURE_SHA}" "${STAGE_PASSED}" \
+  "${ASSERTION_HOLDS}" "single_release" \
+  "$(printf '{"%s": "%s", "%s": "%s", "riscv64": "ghcr.io/keep-network/keep-client@sha256:3333333333333333333333333333333333333333333333333333333333333333"}' \
+    "${FIXTURE_R1_PLATFORMS[0]}" "${FIXTURE_R1_REFERENCE}" \
+    "${FIXTURE_R1_PLATFORMS[1]}" "${FIXTURE_R1_REFERENCE}")"
+run_validator "${D}"
+check "a record evidencing an image the release does not publish is refused" \
+  3 "which the release does not publish"
 
 # The manifest is internally valid and every comparison in the stage agrees
 # with it — and it still names no release. Records measured against it
@@ -991,8 +1165,12 @@ run_rehearsal() {
       PR4109_EXPECTED_SOURCE_COMMIT="${FIXTURE_SHA}"
       # shellcheck disable=SC2030,SC2031,SC2034
       PR4109_SOURCE_BINDING_MODE="exact"
+      # The same reference the fixture provenance publishes. Acceptance
+      # compares the images in an emitted record against that document, so an
+      # emitter running some other artifact would fail these cases on the
+      # image comparison rather than on what they are about.
       # shellcheck disable=SC2030,SC2031,SC2034
-      R1_IMAGE_DIGEST="keep/keep-client@sha256:$(printf 'a%.0s' {1..64})"
+      R1_IMAGE_DIGEST="${FIXTURE_R1_REFERENCE}"
       # shellcheck disable=SC2030,SC2031,SC2034
       PRIOR_IMAGE_DIGEST="keep/keep-client@sha256:$(printf 'b%.0s' {1..64})"
       # shellcheck disable=SC2030,SC2031,SC2034

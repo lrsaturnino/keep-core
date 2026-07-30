@@ -2708,11 +2708,75 @@ attest_release_manifest() {
   attested_source_identity >"${staging}/source-commit.txt"
   printf '\n' >>"${staging}/source-commit.txt"
 
+  attest_release_provenance "${manifest}" "${staging}"
+
   rm -rf "${dir}"
   mv "${staging}" "${dir}"
 
   note "release-manifest attestation written to ${dir} for source \
 $(tr -d '[:space:]' <"${dir}/source-commit.txt")"
+}
+
+# Take the detached provenance into the receipt, when the operator supplied
+# one.
+#
+# The reviewed manifest names the cutover; it cannot name what was built to run
+# it. Those values are outputs of a build over the manifest's own bytes, so
+# recording them in the tree would require the tree to contain a hash of itself
+# — write the commit and the commit changes. They live in a document generated
+# after the build instead, and PR4109_RELEASE_PROVENANCE is where a release run
+# points at it.
+#
+# Copied into the receipt rather than read from its original path at acceptance
+# time: the receipt is the run's own sealed account, and a path re-read later
+# is a file that may have been rewritten in between. The hash goes in beside it
+# so the acceptance stage can say which document this was.
+#
+# A run without provenance writes none and is not refused here. Development
+# runs legitimately have no build to describe, and the acceptance stage is
+# where the absence becomes a refusal — for the same reason the readiness
+# verdict is recorded rather than enforced here.
+attest_release_provenance() {
+  local manifest="$1" staging="$2"
+  local provenance="${PR4109_RELEASE_PROVENANCE:-}"
+
+  if [[ -z "${provenance}" ]]; then
+    note "no detached release provenance supplied \
+(PR4109_RELEASE_PROVENANCE); the receipt will carry none, and the acceptance \
+stage refuses release evidence without it"
+    return
+  fi
+
+  [[ -f "${provenance}" ]] ||
+    fail "PR4109_RELEASE_PROVENANCE names [${provenance}], which is not a \
+readable file"
+
+  # The whole point of the document is that it is not in the tree it
+  # describes. A tracked file would put the source commit back inside the
+  # commit it names, which is the impossibility this split exists to remove —
+  # and it would do it quietly, since every check downstream would still pass
+  # against whatever stale hash the tree happened to carry.
+  if git -C "${REPO_ROOT}" ls-files --error-unmatch "${provenance}" \
+    >/dev/null 2>&1; then
+    fail "the detached release provenance [${provenance}] is tracked in this \
+repository; it records the commit built from this tree and the images built \
+out of it, so committing it would require the tree to contain a hash of \
+itself. Generate it after the build, outside the checkout"
+  fi
+
+  # The binary's own reviewed check: the manifest against the compiled bounds
+  # and against readiness, the provenance against its shape, and the pair
+  # against the manifest hash recorded inside the provenance.
+  go run . release-manifest verify-provenance \
+    --manifest "${manifest}" --provenance "${provenance}" ||
+    fail "the detached release provenance [${provenance}] does not verify \
+against ${manifest}"
+
+  cp "${provenance}" "${staging}/release-provenance.json"
+  hash_stdin <"${provenance}" >"${staging}/release-provenance.sha256"
+
+  note "detached release provenance recorded in the receipt \
+(sha256 $(tr -d '[:space:]' <"${staging}/release-provenance.sha256"))"
 }
 
 # Everything stage_local_proofs proves, in one seam. The stage around it owns
@@ -11779,6 +11843,14 @@ stage_verify_source_binding() {
   note "source binding recorded in ${log}"
 }
 
+# The image set the receipt's detached provenance records, as a JSON object
+# from platform to pinned reference. Published by require_manifest_attestation
+# and read by the record comparison, so both speak from the receipt's own
+# sealed copy of that document rather than re-reading a path that may have
+# been rewritten between them. Empty until an attestation carrying provenance
+# has been required, which is exactly the runs where no record may be accepted.
+ATTESTED_PROVENANCE_IMAGES=""
+
 # Every record comparison below measures a record against the checked-in
 # release manifest, so that manifest has to be the compiled bounds' own
 # manifest and not a document that has since drifted away from them. The
@@ -11904,41 +11976,79 @@ measured against this manifest can be accepted — run \
 \`keep-client release-manifest validate --release-ready\` for what is missing"
   fi
 
-  # Readiness asks whether the manifest names a commit at all; it cannot ask
-  # whether it names this one. Filling the field is an edit to the very tree
-  # being built, so a reviewed release commit is always naming a commit that
-  # does not exist yet, and nothing downstream noticed if what was finally
-  # written there was some earlier commit instead. Records would then be
-  # accepted against a document describing an artifact nobody built.
+  # Readiness says the reviewed manifest names a real cutover. It says nothing
+  # about which artifact runs it, and it cannot: the commit built and the
+  # images are outputs of a build over the manifest's own bytes, so a manifest
+  # naming them would have to contain a hash of the tree containing it.
   #
-  # The receipt is where that closes. Its own commit was proved to be a clean
-  # id and, on a bound run, the dispatched one, and every record below is
-  # required to match it — so requiring the manifest to name that same commit
-  # binds the reviewed identity to the artifact under test rather than to
-  # itself.
-  #
-  # An unrecorded commit is left to readiness, which is what refuses it. This
-  # check is about a recorded one being the right one, and reaching past an
-  # empty field here would only duplicate that refusal in a worse message.
-  local declared_source
-  declared_source="$(node -e '
-    const fs = require("fs");
-    const doc = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-    process.stdout.write(
-      String((doc.release_identity || {}).source_commit || "")
-    );
-  ' "${manifest}")"
-  if [[ -n "${declared_source}" &&
-    "${declared_source}" != "${attested_source}" ]]; then
-    blocked "the reviewed release manifest names source commit \
-[${declared_source}], but the attestation measuring these records was taken \
-at [${attested_source}]; the manifest names an artifact other than the one \
-under test, so re-record the built commit or re-run the local-proofs stage at \
-the commit the manifest names"
+  # The detached provenance is that half, and this is where it becomes
+  # mandatory. Past this point the run is a release-acceptance run, so a
+  # receipt carrying no provenance is a rehearsal of code that names no
+  # artifact — and every record below would be measured against a release
+  # nobody can identify.
+  local provenance="${dir}/release-provenance.json"
+  if [[ ! -f "${provenance}" ]]; then
+    blocked "the release-manifest attestation under ${dir} carries no \
+detached release provenance, but ${manifest} is release-ready: acceptance \
+needs the commit built and the immutable image digests, which cannot live in \
+the reviewed manifest because they are outputs of a build over its own bytes. \
+Generate the provenance after the build, outside the checkout, and re-run the \
+local-proofs stage with PR4109_RELEASE_PROVENANCE pointing at it"
   fi
 
+  # Two bindings, and the pair is what closes the loop the manifest could not
+  # close alone. The provenance names the manifest it was taken over, so it
+  # cannot be provenance for a release reviewed under other bounds; and it
+  # names the commit built, which is required to be the commit this receipt
+  # was taken at — already proved a clean id and, on a bound run, the
+  # dispatched one. Neither statement is self-referential, because neither
+  # document is inside the other's bytes.
+  local provenance_manifest_sha provenance_source
+  provenance_manifest_sha="$(node -e '
+    const fs = require("fs");
+    const doc = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    process.stdout.write(String(doc.manifest_sha256 || ""));
+  ' "${provenance}")" ||
+    blocked "cannot read the detached release provenance under ${dir}"
+  if [[ "${provenance_manifest_sha}" != "${manifest_sha}" ]]; then
+    blocked "the detached release provenance was taken over a manifest \
+hashing to [${provenance_manifest_sha:-absent}], but ${manifest} hashes to \
+[${manifest_sha}]; the artifact it names was built under reviewed bounds \
+other than the ones these records are measured against"
+  fi
+
+  provenance_source="$(node -e '
+    const fs = require("fs");
+    const doc = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    process.stdout.write(String(doc.source_commit || ""));
+  ' "${provenance}")" ||
+    blocked "cannot read the detached release provenance under ${dir}"
+  if [[ "${provenance_source}" != "${attested_source}" ]]; then
+    blocked "the detached release provenance names source commit \
+[${provenance_source:-absent}], but the attestation measuring these records \
+was taken at [${attested_source}]; the release was built from bytes other \
+than the ones under test, so re-generate the provenance for the commit \
+actually built or re-run the local-proofs stage at the commit it names"
+  fi
+
+  # The reviewed image set, published for the record comparison. Read once
+  # here, from the receipt's own sealed copy, so every record below is held to
+  # one answer rather than to whatever the file says at the moment it is read.
+  ATTESTED_PROVENANCE_IMAGES="$(node -e '
+    const fs = require("fs");
+    const doc = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    const images = {};
+    for (const image of doc.images || []) {
+      images[String(image.platform)] = String(image.reference);
+    }
+    process.stdout.write(JSON.stringify(images));
+  ' "${provenance}")" ||
+    blocked "cannot read the image set from the detached release provenance \
+under ${dir}"
+
   note "release-manifest attestation binds ${manifest} to the compiled \
-bounds of ${attested_source}"
+bounds of ${attested_source}, and the detached provenance binds that commit \
+to the images ${ATTESTED_PROVENANCE_IMAGES}"
 }
 
 # The commit the receipt was taken at, for the record comparison below.
@@ -12052,6 +12162,53 @@ measured against was taken at [${attested_source}]; a record and the \
 compiled bounds judging it must come from the same commit"
     fi
 
+    # The images the record says the fleet ran, against the ones the release
+    # published. Presence was never the question: a record naming some other
+    # build's digests is a rehearsal of an artifact this release does not
+    # ship, and one naming a subset is a rehearsal that left a published
+    # platform untested. Exact equality of the whole platform-to-reference map
+    # is what refuses all three — missing, extra, and substituted.
+    #
+    # Comparing references rather than bare digests also refuses the same
+    # digest pulled from another repository, which is a different supply chain
+    # reaching the same content only for as long as nobody repoints it.
+    local image_disagreement
+    image_disagreement="$(node -e '
+      const fs = require("fs");
+      const record = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      const reviewed = JSON.parse(process.argv[2]);
+      const ran = (record.artifacts || {}).r1_image_digests || {};
+      const differences = [];
+      for (const platform of Object.keys(reviewed).sort()) {
+        if (!(platform in ran)) {
+          differences.push(
+            "the release publishes [" + platform + "] as " +
+              reviewed[platform] + ", which this record does not evidence"
+          );
+        } else if (ran[platform] !== reviewed[platform]) {
+          differences.push(
+            "[" + platform + "] ran " + ran[platform] +
+              ", but the release publishes " + reviewed[platform]
+          );
+        }
+      }
+      for (const platform of Object.keys(ran).sort()) {
+        if (!(platform in reviewed)) {
+          differences.push(
+            "this record evidences [" + platform + "] as " + ran[platform] +
+              ", which the release does not publish"
+          );
+        }
+      }
+      process.stdout.write(differences.join("; "));
+    ' "${record}" "${ATTESTED_PROVENANCE_IMAGES}")" ||
+      blocked "cannot compare the images in evidence record ${record} against \
+the reviewed release provenance"
+    if [[ -n "${image_disagreement}" ]]; then
+      blocked "evidence record ${record} was not produced against the images \
+this release publishes: ${image_disagreement}"
+    fi
+
     recorded_sha="$(node -e '
       const fs = require("fs");
       const record = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
@@ -12142,8 +12299,8 @@ repository never took"
   done
 
   note "all evidence records conform to the schema, were produced at \
-${attested_source}, and bind the reviewed release manifest's hash and \
-termination grace"
+${attested_source}, ran exactly the images the release publishes, and bind \
+the reviewed release manifest's hash and termination grace"
 }
 
 # Render every acceptance-relevant finding in one record. The gate contracts
