@@ -1575,6 +1575,137 @@ check_join "the endings a passing verdict quotes are the holders' own" \
   "${P1}=completed, ${P2}=completed" \
   "$(authored_endings "${NAMED}" "${BOTH}")"
 
+# The collector those readings are taken by, driven by sequenced fleet
+# responses.
+#
+# Everything above tests the joins once the readings exist. This tests how a
+# reading is taken at all: the driver settling its own side of a ceremony is not
+# the holder closing the permit it ran under, so the account is retaken until the
+# permits this work was driven under are gone — and retaking stops for three
+# separate reasons that mean three different things downstream. Injecting a final
+# reading proves none of that. A collector that stopped retrying, ignored a
+# provenance change, or read past its deadline would leave every join above
+# passing over the wrong reading.
+#
+# The fleet and the named population are stubbed at their own seams; the identity
+# renderer and the held-permit match they stand in for have their own cases
+# above. The wait is stubbed into a clock: it is the collector's only pause, so
+# advancing the shell's own second counter there lands the deadline case on an
+# exact number of rounds without spending any of them.
+ACCOUNT_ORIGINAL_FLEET_SNAPSHOT="$(declare -f fleet_account_snapshot)"
+ACCOUNT_ORIGINAL_HELD_IDENTITIES="$(declare -f held_permit_identities)"
+ACCOUNT_ORIGINAL_TIMEOUT="${ACCOUNT_SETTLE_TIMEOUT}"
+
+ACCOUNT_SEQ="${WORK}/settled-account"
+mkdir -p "${ACCOUNT_SEQ}"
+
+# One round of the sequence per call, the last response repeating for as long as
+# the collector keeps asking. The tally lives on disk because every reading is
+# taken inside its own command substitution, where a variable would not survive.
+fleet_account_snapshot() {
+  local round
+  round=$(($(cat "${ACCOUNT_SEQ}/tally") + 1))
+  printf '%s' "${round}" >"${ACCOUNT_SEQ}/tally"
+  if [[ ! -f "${ACCOUNT_SEQ}/r${round}" ]]; then
+    round="$(cat "${ACCOUNT_SEQ}/last")"
+  fi
+  cat "${ACCOUNT_SEQ}/r${round}"
+}
+
+held_permit_identities() {
+  printf '%s' "${ACCOUNT_NAMED}"
+}
+
+# The collector reaches this by name rather than through anything an analyzer
+# can follow from here, which is the whole point of overriding it.
+# shellcheck disable=SC2329
+sleep() {
+  SECONDS=$((SECONDS + 60))
+}
+
+# One fleet reading: which process each node answers from, what it still holds,
+# and the endings it recorded.
+account_response() {
+  printf 'provenance=%s\nheld=%s\noutcomes=%s\n' "$1" "$2" "$3"
+}
+
+# Loads a sequence of responses and resets the tally.
+stage_account_responses() {
+  local response round=0
+  rm -f "${ACCOUNT_SEQ}"/r[0-9]*
+  for response in "$@"; do
+    round=$((round + 1))
+    printf '%s' "${response}" >"${ACCOUNT_SEQ}/r${round}"
+  done
+  printf '%s' "${round}" >"${ACCOUNT_SEQ}/last"
+  printf '0' >"${ACCOUNT_SEQ}/tally"
+}
+
+account_rounds() {
+  cat "${ACCOUNT_SEQ}/tally"
+}
+
+ACCOUNT_NAMED="${P1}"
+ACCOUNT_BEFORE="r1-node-1=i-1=0"
+ACCOUNT_SETTLE_TIMEOUT=180
+
+# Held, then closed: the mid-close reading is waited out and the one the permit
+# closed in is the one returned.
+stage_account_responses \
+  "$(account_response "${ACCOUNT_BEFORE}" "${P1}=1" "")" \
+  "$(account_response "${ACCOUNT_BEFORE}" "" "${DONE1}")"
+ACCOUNT_SETTLED="$(settled_account_snapshot "" "${ACCOUNT_BEFORE}")"
+check_join "a permit still closing is waited out rather than read as open" "" \
+  "$(snapshot_field "${ACCOUNT_SETTLED}" held)"
+check_join "the reading the wait returns is the one the permit closed in" \
+  "${DONE1}" \
+  "$(snapshot_field "${ACCOUNT_SETTLED}" outcomes)"
+check_join "a permit closing took a second reading" "2" "$(account_rounds)"
+
+# Held, then a different process answering. The account can no longer be
+# followed to the one that ran the work, so waiting stops there: waiting past it
+# would be waiting for an account that cannot answer for the work at all. The
+# reading is returned unchanged for the verdict's own rung to refuse.
+stage_account_responses \
+  "$(account_response "${ACCOUNT_BEFORE}" "${P1}=1" "")" \
+  "$(account_response "r1-node-1=i-2=0" "${P1}=1" "")"
+ACCOUNT_SETTLED="$(settled_account_snapshot "" "${ACCOUNT_BEFORE}")"
+check_join "a node answering from another process stops the wait" "2" \
+  "$(account_rounds)"
+check_join "the unfollowable reading is returned as it was read" \
+  "r1-node-1=i-2=0" \
+  "$(snapshot_field "${ACCOUNT_SETTLED}" provenance)"
+check_join "the permit it still held is returned still held" "${P1}=1" \
+  "$(snapshot_field "${ACCOUNT_SETTLED}" held)"
+
+# A fleet that cannot be read at all. There is nothing to wait for, and the
+# unreadable reading has to reach the verdict as one rather than as a fleet
+# holding nothing.
+stage_account_responses \
+  "$(account_response "unreadable on r1-node-1" "unreadable on r1-node-1" \
+    "unreadable on r1-node-1")"
+ACCOUNT_SETTLED="$(settled_account_snapshot "" "${ACCOUNT_BEFORE}")"
+check_join "an unreadable fleet is not waited on" "1" "$(account_rounds)"
+check_join "the unreadable reading reaches the verdict" \
+  "unreadable on r1-node-1" \
+  "$(snapshot_field "${ACCOUNT_SETTLED}" held)"
+
+# A permit that never closes. The collector retries to its deadline and then
+# returns it still held: a ceremony that does not end is a finding this rehearsal
+# exists to surface, and it has to arrive as one rather than as a reading that
+# ran out of time.
+stage_account_responses "$(account_response "${ACCOUNT_BEFORE}" "${P1}=1" "")"
+ACCOUNT_SETTLED="$(settled_account_snapshot "" "${ACCOUNT_BEFORE}")"
+check_join "a permit that never closes is retried to the deadline" "4" \
+  "$(account_rounds)"
+check_join "what is still held at the deadline is returned held" "${P1}=1" \
+  "$(snapshot_field "${ACCOUNT_SETTLED}" held)"
+
+ACCOUNT_SETTLE_TIMEOUT="${ACCOUNT_ORIGINAL_TIMEOUT}"
+unset -f sleep account_response stage_account_responses account_rounds
+eval "${ACCOUNT_ORIGINAL_FLEET_SNAPSHOT}"
+eval "${ACCOUNT_ORIGINAL_HELD_IDENTITIES}"
+
 # The collisions the whole identity exists for. A work id and a local permit id
 # are unique only within one ceremony and one anchor — a member index is "1" in
 # every group a node ever joins — so an account that reused them under a
