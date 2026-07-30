@@ -4009,7 +4009,7 @@ TERMINAL_OUTCOME_JS='
       // difference can be attributed elsewhere: memberships the whole fleet
       // says it did not operate are memberships some node outside the fleet
       // supplied.
-      const contributionOf = (record, kind) => {
+      const contributionOf = (record, kind, membership) => {
         const ceremony = (record.permit || {}).ceremony;
         const authored = TRANSCRIPT_CEREMONIES.includes(ceremony);
         const contribution = record.evidence.contribution;
@@ -4059,6 +4059,20 @@ TERMINAL_OUTCOME_JS='
               JSON.stringify(record));
             process.exit(1);
           }
+        }
+        // The persisted membership and the transcript are two statements about
+        // one ceremony, and the gate refuses a record whose seat is not among
+        // the ones it says it operated. A reader that skipped it would carry a
+        // persisted signer out to the joins under a seat its own transcript
+        // places elsewhere: the audit then looks the key material up against
+        // one seat while the population that produced it names another, and
+        // both accounts are internally consistent.
+        const seat = membership === NONE ? 0 : Number(membership);
+        if (seat !== 0 && !local.includes(seat)) {
+          console.error("a node persisted membership " + seat +
+            " outside the memberships it operated in the transcript: " +
+            JSON.stringify(record));
+          process.exit(1);
         }
         return (incorporated.join(",") || NONE) + "=" +
           (local.join(",") || NONE);
@@ -4159,7 +4173,7 @@ TERMINAL_OUTCOME_JS='
           }
         }
         return kind + "=" + reference + "=" + membership + "=" +
-          contributionOf(record, kind) + "=" + settlement;
+          contributionOf(record, kind, membership) + "=" + settlement;
       };
       const terminalOutcome = (service, record) => {
         if (record === null || typeof record !== "object" ||

@@ -1386,6 +1386,31 @@ a negative nonce|${CLAIM_WALLET}:-1
 no nonce at all|${CLAIM_WALLET}
 CASES
 
+# The seat a DKG persisted, against the transcript it published. The final
+# signing group index can differ from the index the permit ran under, so this
+# field is what joins persisted key material to the seat the chain knows it by —
+# and the gate refuses a record naming a seat that is not among the ones the node
+# says it operated. Read without that check, the audit looks the key material up
+# under one seat while the population that produced it names another, and each
+# account is internally consistent.
+persisted_signer_permit() {
+  local seat="$1" local_members="$2" evidence
+  evidence="$(printf '"kind":"persisted_tbtc_signer","reference":"0xdkg",')"
+  evidence="${evidence}$(printf '"membership_index":%s,' "${seat}")"
+  evidence="${evidence}"'"contribution":{"incorporated_members":[1,3,7],'
+  evidence="${evidence}$(printf '"local_members":[%s]}' "${local_members}")"
+  gate_state_with_outcomes "\"recent_terminal_outcomes\":[$(closed_permit \
+    completed w-1 p-1 true "${evidence}" tbtc_dkg)]"
+}
+
+read_terminal_outcomes "$(persisted_signer_permit 3 '1,3')"
+check "a persisted seat inside the transcript is carried with the ending" 0 \
+  "=completed=persisted_tbtc_signer=0xdkg=3=1,3,7=1,3=-$"
+
+read_terminal_outcomes "$(persisted_signer_permit 7 '1,3')"
+check "a persisted seat outside the transcript is refused" 1 \
+  "outside the memberships it operated in the transcript"
+
 # And a side effect no ceremony in this release has a code path to dispatch. A
 # record naming one describes chain state it could not have created, which an
 # audit then goes looking for.
