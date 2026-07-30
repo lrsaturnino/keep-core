@@ -3647,14 +3647,18 @@ metric_value() {
 
 # The participation metrics an evidence step snapshots, by their internal names.
 #
-# All but the last are the gate's own, registered at zero when it is constructed,
-# so a node running any gated application exposes them from the start. The
-# quarantined-signer count is published by tBTC instead — the protected namespace
-# it counts and the wallet cache it compares against are both owned there — so a
-# service running no tBTC legitimately exposes it at no point. That is why a
-# metric this list names and a node does not answer for is skipped rather than
-# treated as a fleet reporting zero, and why only reading none of them at all is
-# read as a broken instrument.
+# Every one of them is registered at zero with the rest of the fixed metric
+# family, so a node with a client-info endpoint exposes all of them from startup
+# whether or not it has anything to report — which is what makes a zero here a
+# reading rather than an absence. The quarantined-signer count is the one whose
+# value only tBTC can move: the protected namespace it counts and the wallet
+# cache it compares against are both owned there, so it stays at zero on a
+# service running none.
+#
+# A metric this list names and a node does not answer for is still skipped
+# rather than treated as a fleet reporting zero — a service that publishes no
+# participation family at all is not a fleet member reporting nothing — and only
+# reading none of them at all is read as a broken instrument.
 PARTICIPATION_METRICS=(
   participation_gate_state
   participation_current_block
@@ -4589,6 +4593,62 @@ fleet_account_snapshot() {
 # decides whether every join below it can be believed.
 fleet_account_provenance() {
   snapshot_field "$(fleet_account_snapshot)" provenance
+}
+
+# How long a reading waits for the permits its driver named to close before
+# reporting whatever is still open. The driver returns when its own side of a
+# ceremony settled, and the holder's close follows within a coordination window
+# or two; this is several of those, so a permit still open at the end of it is
+# one that stopped closing rather than one that had not got there yet.
+ACCOUNT_SETTLE_TIMEOUT=300
+
+# One atomic fleet account in which no permit the driver named is still open,
+# or the last one taken before waiting stopped being honest.
+#
+# The driver reports when its own side of a ceremony settled; the holder closes
+# the permit it ran under some time after that. A reading taken at the instant
+# the driver returns therefore catches permits mid-close, and a permit still
+# open is in the held list and in no ending — which the ownership joins read as
+# a holder that would not vouch for how its permit ended. That is a real
+# finding about a different fleet: one that authored nothing. Here it is a race
+# with a ceremony that is still running, and a control that cannot tell them
+# apart fails every run of a fleet that is working.
+#
+# So the account is retaken until those permits are gone. Retaking is only
+# sound while it stays the same account: a node that restarts between two reads
+# answers from a process holding none of the old permits, which is a permit
+# closed by being forgotten rather than by ending. The provenance taken before
+# the drive is carried into every round, and the first reading that no longer
+# follows it is returned unchanged for the verdict's own rung to refuse —
+# waiting past that point would be waiting for an account that cannot answer
+# for the work.
+#
+# What is still held when the wait ends is returned as it was read. A ceremony
+# that never ends is a finding this rehearsal exists to surface, and it has to
+# reach the verdict as one rather than as a reading that ran out of time.
+settled_account_snapshot() {
+  local originated="$1" before="$2" deadline account named held
+  named="$(held_permit_identities "${originated}")"
+  deadline=$((SECONDS + ACCOUNT_SETTLE_TIMEOUT))
+  while :; do
+    account="$(fleet_account_snapshot)"
+    held="$(snapshot_field "${account}" held)"
+    if [[ "${held}" == "unreadable on "* ]]; then
+      break
+    fi
+    if [[ -z "$(held_open_permits "${named}" "${held}")" ]]; then
+      break
+    fi
+    if [[ -n "$(unfollowable_account_nodes "${before}" \
+      "$(snapshot_field "${account}" provenance)")" ]]; then
+      break
+    fi
+    if ((SECONDS >= deadline)); then
+      break
+    fi
+    sleep 5
+  done
+  printf '%s' "${account}"
 }
 
 # Of the fleet, the nodes whose account of closed permits cannot be followed
@@ -6478,6 +6538,26 @@ authored_operated() {
   printf '%s' "${1##*=}"
 }
 
+# Of the permits a control named, the ones a node still reports holding open,
+# comma-joined.
+#
+# A permit is held or closed and never both, so a named permit in the held list
+# has no ending anywhere for a reader to find. Read by the check below it comes
+# out as a permit whose holder would not say how it ended, which is a finding
+# about a fleet that authored nothing — the opposite of a fleet whose ceremony
+# is still running. The two have to be told apart before either is reported.
+held_open_permits() {
+  local wanted="$1" held="$2" permit token out=""
+  for permit in ${wanted}; do
+    for token in ${held}; do
+      [[ "${token%%=*}" == "${permit}" ]] || continue
+      out="${out}${out:+, }${permit}"
+      break
+    done
+  done
+  printf '%s' "${out}"
+}
+
 # Of the permits a control named, the ones no node recorded an ending for,
 # comma-joined.
 #
@@ -6486,6 +6566,10 @@ authored_operated() {
 # mentioned by any node. It is also how eviction surfaces — the gate's account
 # is bounded and forgets its oldest first — and both endings are the same thing
 # to a reader, which is that no node will vouch for how this permit ended.
+#
+# A permit still open is not one of them, and the check above names it first:
+# asked of a held permit this would report exactly what it reports of a
+# forgotten one.
 unauthored_permits() {
   local wanted="$1" authored="$2" token permits=""
   for token in ${authored}; do
@@ -10093,7 +10177,14 @@ ${service} reported [${state:-unreadable}] at block [${block:-unreadable}]"
     # either list can be believed — so taken at three instants a permit closing
     # between two of them is in none of them, which is a seat missing from the
     # fleet with nothing anywhere saying it went missing.
-    account="$(fleet_account_snapshot)"
+    #
+    # Retaken until the permits this work was driven under have closed. The
+    # driver settling its own side is not the holder closing the permit it ran
+    # under, so the first reading after the driver returns catches permits
+    # mid-close — and every ownership join below reads a still-open permit as
+    # one whose holder refused to say how it ended.
+    account="$(settled_account_snapshot "${PRECUTOVER_ORIGINATED}" \
+      "${PRECUTOVER_ACCOUNTS_BEFORE}")"
     PRECUTOVER_AUTHORED_ENDINGS="$(snapshot_field "${account}" outcomes)"
     PRECUTOVER_HELD_AFTER="$(snapshot_field "${account}" held)"
     PRECUTOVER_ACCOUNTS_AFTER="$(snapshot_field "${account}" provenance)"
@@ -10125,7 +10216,7 @@ precutover_verdict() {
   local disowned unplaceable unfollowable
   local named_permits unauthored duplicated unresolved misended authored
   local malformed misevidenced disagreeing unclaimed result_population
-  local unresolved_settlements
+  local unresolved_settlements stillheld
   failed_results="$(unsuccessful_results "${PRECUTOVER_RESULTS}")"
   missing_ceremonies="$(missing_bound_ceremonies \
     "${PRECUTOVER_BOUND}" "${required_ceremonies}")"
@@ -10148,6 +10239,11 @@ precutover_verdict() {
   # permit the old process held, which reads as a node that took no part.
   unfollowable="$(unfollowable_account_nodes \
     "${PRECUTOVER_ACCOUNTS_BEFORE}" "${PRECUTOVER_ACCOUNTS_AFTER}")"
+  # And whether the reading caught this work still running. The reading above
+  # waits for the driver's permits to close, so one still open here stayed open;
+  # asked of the check below it would come out as a permit nobody would vouch
+  # for, which is a different fleet's finding reported against this one.
+  stillheld="$(held_open_permits "${named_permits}" "${PRECUTOVER_HELD_AFTER}")"
   unauthored="$(unauthored_permits "${named_permits}" \
     "${PRECUTOVER_AUTHORED_ENDINGS}")"
   duplicated="$(duplicated_authored_permits "${named_permits}" \
@@ -10292,6 +10388,11 @@ reading below rests on lives in memory, so a node answering from a new process \
 or dropping records while the work ran has published an account that is \
 missing permits rather than one that never held them — and a missing permit \
 reads as a node that took no part in work it may well have done"
+  elif [[ -n "${stillheld}" ]]; then
+    block_step "${step}" "the R1 fleet was still holding ${stillheld} \
+${ACCOUNT_SETTLE_TIMEOUT}s after the work driver reported ${what} settled; a \
+permit that never closed has no ending for the readings below to join to, and \
+waiting past that is waiting for a ceremony that stopped finishing"
   elif [[ -n "${unauthored}" ]]; then
     block_step "${step}" "no node recorded an ending for ${unauthored}, \
 though the driver named ${named_permits} as the permits issued for ${what}; a \

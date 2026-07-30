@@ -528,6 +528,85 @@ func TestDkgExecutor_ReportQuarantinedSigners_KeepsCountOnUnreadableNamespace(
 	)
 }
 
+// TestDkgExecutor_ReportInitialQuarantinedSigners_BlocksOnUnreadableNamespace
+// proves a process that cannot enumerate its quarantine namespace at startup
+// reports the failure to its caller and publishes no count at all.
+//
+// Keeping the last published count is the right answer at runtime, where a
+// number somebody published exists. On a cold start there is none: the gauge is
+// registered at zero with the rest of the fixed family, so a scan that gives up
+// quietly leaves that zero as the process's only word on the subject, and a
+// fleet reading it concludes there is nothing left to account for. This is the
+// one direction the count must never invent, so it is watched from a recorder
+// that can tell a published zero from an unpublished one.
+func TestDkgExecutor_ReportInitialQuarantinedSigners_BlocksOnUnreadableNamespace(
+	t *testing.T,
+) {
+	de, _, _, _, _ := setupPreserveScenario(t)
+
+	recorder := newDispatchGaugeRecorder()
+	de.metricsRecorder = recorder
+	de.signerQuarantine = newSignerQuarantine(logger, &unreadableHandle{})
+
+	err := de.reportInitialQuarantinedSigners()
+	if err == nil {
+		t.Fatal(
+			"an unreadable quarantine namespace must stop a cold start, not " +
+				"leave the registered zero standing as the count",
+		)
+	}
+	if !strings.Contains(err.Error(), "unreadable") {
+		t.Errorf("expected the underlying read error, got [%v]", err)
+	}
+
+	if value, published := recorder.gaugePublished(
+		clientinfo.MetricParticipationQuarantinedTBTCSigners,
+	); published {
+		t.Errorf(
+			"a count that could not be established was published as [%v]",
+			value,
+		)
+	}
+}
+
+// TestDkgExecutor_ReportInitialQuarantinedSigners_PublishesWhatIsPreserved
+// proves a readable namespace is counted and published at startup, so a
+// restart inherits the outputs earlier processes on this host preserved rather
+// than starting the count over.
+func TestDkgExecutor_ReportInitialQuarantinedSigners_PublishesWhatIsPreserved(
+	t *testing.T,
+) {
+	de, result, gsr, _, _ := setupPreserveScenario(t)
+
+	recorder := newDispatchGaugeRecorder()
+	de.metricsRecorder = recorder
+
+	preserveOneSigner(t, de, result, gsr, group.MemberIndex(1))
+	preserveOneSigner(t, de, result, gsr, group.MemberIndex(2))
+
+	// A restart's first scan: the same namespace, a recorder that has
+	// published nothing yet.
+	restarted := newDispatchGaugeRecorder()
+	de.metricsRecorder = restarted
+
+	if err := de.reportInitialQuarantinedSigners(); err != nil {
+		t.Fatal(err)
+	}
+
+	value, published := restarted.gaugePublished(
+		clientinfo.MetricParticipationQuarantinedTBTCSigners,
+	)
+	if !published {
+		t.Fatal("expected the inherited outputs to be counted at startup")
+	}
+	testutils.AssertIntsEqual(
+		t,
+		"quarantined signers a restart inherits",
+		2,
+		int(value),
+	)
+}
+
 // TestDkgExecutor_ReportQuarantinedSigners_SerializesRecountAndPublication
 // proves no two reporters recount the namespace at the same time, and that
 // concurrent reporters agree on what they publish.

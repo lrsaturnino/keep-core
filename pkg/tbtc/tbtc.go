@@ -220,7 +220,14 @@ func Initialize(
 		// informs is about all of it; reporting nothing until this process
 		// happens to quarantine its own output would show an empty namespace as
 		// long as it never does.
-		node.dkgExecutor.reportQuarantinedSigners(logger)
+		//
+		// A namespace this first scan cannot read stops startup. There is no
+		// earlier count to fall back on, so the registered zero would stand as
+		// the answer, and preserved key material would be invisible to the
+		// fleet that has to account for it.
+		if err := node.dkgExecutor.reportInitialQuarantinedSigners(); err != nil {
+			return fmt.Errorf("cannot set up TBTC node: [%w]", err)
+		}
 
 		// Register coordination windows as a diagnostic source
 		clientInfo.RegisterApplicationSource(

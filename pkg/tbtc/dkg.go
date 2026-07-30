@@ -1179,15 +1179,7 @@ func (de *dkgExecutor) preserveInterruptedSigner(
 // publish out of order, leaving the older, lower count as the last word — the
 // direction that reads as an all-clear.
 func (de *dkgExecutor) reportQuarantinedSigners(dkgLogger log.StandardLogger) {
-	if de.metricsRecorder == nil || de.signerQuarantine == nil {
-		return
-	}
-
-	de.quarantineReportMutex.Lock()
-	defer de.quarantineReportMutex.Unlock()
-
-	outputs, err := de.signerQuarantine.preservedOutputs()
-	if err != nil {
+	if err := de.publishQuarantinedSignerCount(); err != nil {
 		// The last published count stands. Publishing a zero here would say the
 		// namespace is empty, which is precisely what could not be established.
 		dkgLogger.Errorf(
@@ -1195,7 +1187,51 @@ func (de *dkgExecutor) reportQuarantinedSigners(dkgLogger log.StandardLogger) {
 				"stays as last published: [%v]",
 			err,
 		)
-		return
+	}
+}
+
+// reportInitialQuarantinedSigners publishes the count this process starts with
+// and refuses to start when the namespace cannot be enumerated.
+//
+// Keeping the last published count is the right answer at runtime because there
+// is one: a scan that fails after an earlier scan succeeded leaves a number
+// somebody published. At startup there is none. The gauge is registered at zero
+// with the rest of the fixed family, so a startup scan that gives up quietly
+// leaves that zero as this process's first and only word on the subject, and a
+// rollback decision reads it as nothing left to account for — the one answer
+// the count must never invent.
+//
+// So the failure is raised to the caller rather than logged. A node that will
+// not start is a visible fault an operator resolves against a namespace whose
+// contents are still on disk; a node that starts and reports an empty
+// quarantine is an invisible one.
+func (de *dkgExecutor) reportInitialQuarantinedSigners() error {
+	if err := de.publishQuarantinedSignerCount(); err != nil {
+		return fmt.Errorf(
+			"cannot count the quarantined signer outputs this process "+
+				"starts with: [%w]",
+			err,
+		)
+	}
+
+	return nil
+}
+
+// publishQuarantinedSignerCount recounts the namespace and publishes how many
+// preserved outputs this process holds without having activated them. It
+// publishes nothing when the namespace cannot be enumerated: how the caller
+// treats that is what tells a startup apart from a later recount.
+func (de *dkgExecutor) publishQuarantinedSignerCount() error {
+	if de.metricsRecorder == nil || de.signerQuarantine == nil {
+		return nil
+	}
+
+	de.quarantineReportMutex.Lock()
+	defer de.quarantineReportMutex.Unlock()
+
+	outputs, err := de.signerQuarantine.preservedOutputs()
+	if err != nil {
+		return err
 	}
 
 	withheld := 0
@@ -1213,6 +1249,8 @@ func (de *dkgExecutor) reportQuarantinedSigners(dkgLogger log.StandardLogger) {
 		clientinfo.MetricParticipationQuarantinedTBTCSigners,
 		float64(withheld),
 	)
+
+	return nil
 }
 
 func (de *dkgExecutor) recordPermitTerminalOutcome(

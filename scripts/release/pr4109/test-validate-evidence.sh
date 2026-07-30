@@ -1536,6 +1536,25 @@ check_join "a permit no gate recorded an ending for is named" \
   "$(unauthored_permits "${NAMED}" "${DONE1}")"
 check_join "a fully answered population leaves nothing unauthored" "" \
   "$(unauthored_permits "${NAMED}" "${BOTH}")"
+
+# The two readings a still-open permit sits between. It is in the held list and
+# in no ending, so the check above reports it exactly as it reports a permit
+# whose record was forgotten — and the two are opposite findings.
+check_join "a named permit a node still holds is named as held" \
+  "${P2}" \
+  "$(held_open_permits "${NAMED}" "${P2}=1")"
+check_join "a closed population holds nothing open" "" \
+  "$(held_open_permits "${NAMED}" "")"
+# The seat suffix is not part of the identity, and a held token carries one. A
+# reading that compared whole tokens would find no match and report a fleet
+# holding nothing while it held everything.
+check_join "a held permit is matched past the seats it announced" \
+  "${P1}, ${P2}" \
+  "$(held_open_permits "${NAMED}" "${P1}=1,7 ${P2}=3")"
+# Held permits of work this control did not drive belong to other ceremonies.
+check_join "a permit held for other work is not this control's to wait on" "" \
+  "$(held_open_permits "${NAMED}" \
+    "r1-node-9@tbtc_dkg@99@w-9#p-9=1")"
 check_join "one permit ending twice is named with its count" \
   "${P1} (2 records)" \
   "$(duplicated_authored_permits "${NAMED}" \
@@ -4875,6 +4894,34 @@ run_verdict precutover_case eval \
   'PRECUTOVER_AUTHORED_ENDINGS="unreadable on r1-node-2"'
 check "a fleet that cannot be asked has vouched for no settlement" 3 \
   "could not be asked what became of the permits"
+
+# The driver settling its own side of a ceremony is not the holder closing the
+# permit it ran under. A permit still open when the reading was taken is in no
+# ending list, and the unauthored check below would report it as a permit
+# nobody will vouch for — the finding for a fleet that authored nothing, raised
+# against one whose ceremony is still running.
+# shellcheck disable=SC2016
+run_verdict precutover_case eval \
+  'PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS% *}"
+  PRECUTOVER_HELD_AFTER="r1-node-1@beacon_dkg@845@bdkg845#1=1"'
+check "a permit that never closed is named as held, not as unvouched for" 3 \
+  "still holding r1-node-1@beacon_dkg@845@bdkg845#1" \
+  "waiting past that is waiting for a ceremony that stopped finishing"
+
+# And the reading the wait is for: the same work, with the last permit closed
+# by the time the account was taken. Nothing is still held, so the ladder walks
+# past this rung to the endings the holders authored.
+run_verdict precutover_case eval 'PRECUTOVER_HELD_AFTER=""'
+check "work whose permits all closed is read off their endings" 0 \
+  "issued 4 new legacy permits"
+
+# A permit open on the fleet that this work was not driven under belongs to
+# some other ceremony. Blocking on it would make every control wait for a fleet
+# to be idle rather than for its own work to finish.
+run_verdict precutover_case eval \
+  'PRECUTOVER_HELD_AFTER="r1-node-2@tbtc_dkg@900@other900#1=2"'
+check "another ceremony still running does not hold up this reading" 0 \
+  "issued 4 new legacy permits"
 
 # The partial population: five permits ended with a record and the sixth simply
 # never mentioned, which is also what eviction from a bounded account looks
