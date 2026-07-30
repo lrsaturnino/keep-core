@@ -1243,9 +1243,9 @@ read_terminal_outcomes() {
 }
 
 read_terminal_outcomes "$(gate_state_with_outcomes \
-  "\"recent_terminal_outcomes\":[$(closed_permit completed w-1 p-1)]")"
+  "\"recent_terminal_outcomes\":[$(closed_permit completed w-1 1)]")"
 check "a closed permit is rendered with the identity the held list carries" 0 \
-  "^r1-node-1@beacon_relay_signing@10@w-1#p-1=completed=protocol_result\
+  "^r1-node-1@beacon_relay_signing@10@w-1#1=completed=protocol_result\
 =0xentry=-=1,7=1=-=1$"
 
 # The gate writes this itself when a permit is closed by an owner that recorded
@@ -1253,10 +1253,53 @@ check "a closed permit is rendered with the identity the held list carries" 0 \
 # an absence reads exactly like a permit still in flight — and it is the one
 # ending that names no evidence, because there was no owner to author any.
 read_terminal_outcomes "$(gate_state_with_outcomes \
-  "\"recent_terminal_outcomes\":[$(closed_permit unresolved w-1 p-1 true \
+  "\"recent_terminal_outcomes\":[$(closed_permit unresolved w-1 1 true \
     '"kind":""')]")"
 check "an owner that recorded nothing is read as a disposition, not a gap" 0 \
-  "^r1-node-1@beacon_relay_signing@10@w-1#p-1=unresolved=-=-=-=-=-=-=1$"
+  "^r1-node-1@beacon_relay_signing@10@w-1#1=unresolved=-=-=-=-=-=-=1$"
+
+# And the seat such a record puts into the ownership map, which is the one claim
+# in it nothing else can check. A permit that recorded no transcript is held to
+# no transcript, so a seat widened after the fact travels into the map unopposed
+# — and there it is subtracted from the R1 node whose permit really held that
+# seat, leaving the seat outside the fleet and the run reading as mixed. The
+# permit ID is the only other statement about the same seat, so the record is
+# held to it.
+read_terminal_outcomes "$(gate_state_with_outcomes \
+  "\"recent_terminal_outcomes\":[$(closed_permit unresolved w-1 1 true \
+    '"kind":""' beacon_relay_signing 10 4)]")"
+check "an unresolved permit claiming another node's seat is refused" 1 \
+  "runs one seat and must operate its permit ID alone"
+
+read_terminal_outcomes "$(gate_state_with_outcomes \
+  "\"recent_terminal_outcomes\":[$(closed_permit unresolved w-1 1 true \
+    '"kind":""' beacon_relay_signing 10 '1,4')]")"
+check "a one-seat permit claiming a second seat is refused" 1 \
+  "runs one seat and must operate its permit ID alone"
+
+# The same rule on the remapping ceremony, whose operated set is in the permits'
+# own space and so is nothing but the permit ID either.
+read_terminal_outcomes "$(gate_state_with_outcomes \
+  "\"recent_terminal_outcomes\":[$(closed_permit unresolved w-1 9 true \
+    '"kind":""' tbtc_dkg 10 3)]")"
+check "an unresolved DKG permit claiming another seat is refused" 1 \
+  "runs one seat and must operate its permit ID alone"
+
+# The mirror, so the rule cannot be satisfied by refusing every one-seat record:
+# a permit operating exactly the seat it was issued for is read straight through.
+read_terminal_outcomes "$(gate_state_with_outcomes \
+  "\"recent_terminal_outcomes\":[$(closed_permit unresolved w-1 4 true \
+    '"kind":""' beacon_relay_signing 10 4)]")"
+check "a one-seat permit operating its own seat is read" 0 \
+  "^r1-node-1@beacon_relay_signing@10@w-1#4=unresolved=-=-=-=-=-=-=4$"
+
+# And a ceremony outside the rule keeps its several seats: a wallet action covers
+# every seat this node holds in the signing group, so a list there is ordinary.
+read_terminal_outcomes "$(gate_state_with_outcomes \
+  "\"recent_terminal_outcomes\":[$(closed_permit unresolved w-1 p-1 true \
+    '"kind":""' tbtc_signing 10 '2,5')]")"
+check "a ceremony that runs several seats keeps them" 0 \
+  "^r1-node-1@tbtc_signing@10@w-1#p-1=unresolved=-=-=-=-=-=-=2,5$"
 
 # A release that stopped publishing the account would otherwise leave every
 # control reading an empty list, which is what a fleet that closed nothing
@@ -1371,7 +1414,7 @@ settled_permit() {
   evidence="${evidence}$(printf '{"kind":"%s","reference":"%s"}' \
     "${kind}" "${reference}")"
   gate_state_with_outcomes "\"recent_terminal_outcomes\":[$(closed_permit \
-    completed w-1 p-1 true "${evidence}")]"
+    completed w-1 1 true "${evidence}")]"
 }
 
 read_terminal_outcomes \
@@ -1421,7 +1464,7 @@ persisted_signer_permit() {
   fi
   evidence="${evidence}$(printf '"local_members":[%s]}' "${local_members}")"
   gate_state_with_outcomes "\"recent_terminal_outcomes\":[$(closed_permit \
-    completed w-1 p-1 true "${evidence}" tbtc_dkg 10 9)]"
+    completed w-1 9 true "${evidence}" tbtc_dkg 10 9)]"
 }
 
 read_terminal_outcomes "$(persisted_signer_permit 3 '3')"
@@ -6468,6 +6511,40 @@ else
   printf 'FAIL the seatless-ceremony list drifted from the gate: %s\n' \
     "$(diff <(printf '%s\n' "${GO_SEATLESS_CEREMONIES}") \
       <(printf '%s\n' "${READER_SEATLESS_CEREMONIES}") | tr '\n' ' ')"
+  FAILED=$((FAILED + 1))
+fi
+
+# The other half of the same shape rule: the ceremonies that run one seat per
+# permit and name it in the permit ID. Read out of the shape validator's own
+# body, because the identity validator states the same case list for a different
+# purpose and a test anchored on the label alone would pass off one for the other.
+#
+# A ceremony the reader omits lets a record claim a seat its permit was never
+# issued for — and the records that need the rule are exactly the ones supplying
+# no transcript to check instead, so the claim goes unopposed, takes the seat from
+# the permit that held it, and reads that seat as supplied from outside the fleet.
+# A ceremony the reader adds refuses a permit the gate issued and takes the whole
+# snapshot with it.
+GO_SINGLE_SEAT_CEREMONIES="$(sed -n \
+  '/^func ValidatePermitOperatedShape(/,/^}/p' \
+  "${TEST_DIR}/../../../pkg/protocol/participation/quiescence.go" |
+  grep -m1 -E '^\tcase .*:$' | grep -oE '\b(Beacon|TBTC)[A-Za-z]+' |
+  while IFS= read -r ceremony; do
+    grep -oE "\b${ceremony}\s+Ceremony = \"[a-z_]+\"" \
+      "${TEST_DIR}/../../../pkg/protocol/participation/gate.go" |
+      grep -oE '"[a-z_]+"' | tr -d '"'
+  done | sort)"
+READER_SINGLE_SEAT_CEREMONIES="$(sed -n \
+  '/const SINGLE_SEAT_CEREMONIES = \[/,/\];/p' "${TEST_DIR}/rehearse.sh" |
+  grep -oE '"[a-z_]+"' | tr -d '"' | sort)"
+if [[ -n "${GO_SINGLE_SEAT_CEREMONIES}" ]] &&
+  [[ "${GO_SINGLE_SEAT_CEREMONIES}" == "${READER_SINGLE_SEAT_CEREMONIES}" ]]; then
+  printf 'ok   the one-seat-per-permit ceremony list matches the gate\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL the one-seat-per-permit list drifted from the gate: %s\n' \
+    "$(diff <(printf '%s\n' "${GO_SINGLE_SEAT_CEREMONIES}") \
+      <(printf '%s\n' "${READER_SINGLE_SEAT_CEREMONIES}") | tr '\n' ' ')"
   FAILED=$((FAILED + 1))
 fi
 

@@ -4243,15 +4243,16 @@ TERMINAL_OUTCOME_JS='
       const SEATLESS_CEREMONIES = [
         "beacon_relay_forwarding", "beacon_timeout_report",
       ];
+      // The ceremonies that run exactly one seat per permit, and name that seat
+      // in the permit ID. The gate refuses any other operated set on them at
+      // issuance, for the reason it states there: the permit ID and the operated
+      // set are two node-authored statements about one permit, and a reader
+      // shown disagreeing ones has to choose between them.
+      const SINGLE_SEAT_CEREMONIES = [
+        "tbtc_dkg", "beacon_dkg", "beacon_relay_signing",
+      ];
       // The seats the holder of a permit says it operates, comma-joined, as
       // published when the permit was issued.
-      //
-      // The one-seat-per-permit rule the gate applies to a DKG or relay signing
-      // membership is deliberately not mirrored here. The gate refuses such an
-      // identity at issuance, and the shell reader holds every transcript to the
-      // operated set of its own permit, so a third copy of the rule would buy
-      // nothing and would take a whole snapshot down the moment it drifted from
-      // the gate by one ceremony.
       //
       // This is the half of an ownership map that a transcript cannot supply. A
       // transcript exists only where a ceremony produced a result, so an
@@ -4260,8 +4261,19 @@ TERMINAL_OUTCOME_JS='
       // out, or ended with nothing — and a seat omitted from the ownership map
       // of a fleet is a seat attributed to whoever else was on the network.
       // Reading it off the permit covers every holder whatever became of it.
-      const operatedOf = (record) => {
-        const permit = record.permit;
+      //
+      // Which is why the shape rules are mirrored here rather than left to the
+      // gate that enforces them. Holding a transcript to the operated set of its
+      // own permit only constrains the permits that published a transcript, and
+      // the records this reading exists to cover are the ones that did not: an
+      // unresolved DKG permit supplying no transcript is checked against nothing
+      // at all, so a record claiming a seat its permit was never issued for
+      // enters the map unopposed. It takes that seat away from the R1 node whose
+      // permit really held it, and the seat then reads as supplied from outside
+      // the fleet — which turns a homogeneous run into the mixed one. A rule
+      // that only binds the records that came with their own evidence is not a
+      // rule about the records that did not.
+      const operatedOf = (permit) => {
         const ceremony = permit.ceremony;
         const operated = memberSetOf(
           permit.operated_members === undefined ?
@@ -4271,7 +4283,15 @@ TERMINAL_OUTCOME_JS='
         if (SEATLESS_CEREMONIES.includes(ceremony) && operated.length > 0) {
           console.error("a " + JSON.stringify(ceremony) +
             " permit claims seats it operates none of: " +
-            JSON.stringify(record));
+            JSON.stringify(permit));
+          process.exit(1);
+        }
+        if (SINGLE_SEAT_CEREMONIES.includes(ceremony) &&
+          (operated.length !== 1 ||
+            String(operated[0]) !== permit.permit_id)) {
+          console.error("a " + JSON.stringify(ceremony) +
+            " permit runs one seat and must operate its permit ID alone: " +
+            JSON.stringify(permit));
           process.exit(1);
         }
         return operated.join(",") || NONE;
@@ -4295,7 +4315,7 @@ TERMINAL_OUTCOME_JS='
         }
         return permitIdentity(service, record.permit, "a closed permit") +
           "=" + record.outcome + "=" + evidenceOf(record) +
-          "=" + operatedOf(record);
+          "=" + operatedOf(record.permit);
       };
 '
 
