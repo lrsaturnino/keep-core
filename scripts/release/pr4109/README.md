@@ -442,7 +442,10 @@ therefore records the seats each holder operates when the permit is *issued* —
 before any outcome exists — and carries them on every reading of that permit,
 live, quiesced and terminal, whatever the ending; the field is
 `operated_members` on each permit in the diagnostics scrape and in the terminal
-journal, which is what version 5 of that journal adds. A map missing those seats
+journal, which is what version 5 of that journal and version 2 of the gate
+snapshot add. The snapshot side is not redundant: it is the issuance-time copy of
+the same set, so the offline audit reconciles the two rather than taking the
+journal's own account of what it was issued. A map missing those seats
 has one false positive and it is in the direction the control is used: an all-R1
 ceremony one of whose contributors never published an ending presents that
 contributor's seat as outside the fleet, and a homogeneous run then satisfies a
@@ -452,11 +455,43 @@ The two node-authored accounts of one permit are held against each other. A
 completed record whose transcript claims a seat its own permit was not issued to
 operate is refused at the moment it is written and refused again by the offline
 audit, and the mixed reading declines to classify the work at all rather than
-choose between them. tBTC DKG is the one exception to the comparison: its permit
-names a DKG member index while its transcript and persisted membership are in the
-final signing group's index space, rebuilt after inactive and disqualified
-members are removed, so the same node legitimately runs seat 9 of the ceremony
-and persists seat 7 of the group.
+choose between them.
+
+tBTC DKG is compared through a mapping rather than exempted from the comparison.
+Its permit names a DKG member index while its transcript and persisted membership
+are in the final signing group's index space, rebuilt after inactive and
+disqualified members are removed, so the same node legitimately runs seat 9 of
+the ceremony and lands in seat 8 of the group. The transcript therefore carries
+the ceremony seat behind each of its own seats, positionally aligned with them
+and taken from the accepted result's own operating members — the field is
+`permit_space_members` on the transcript contribution, which is what version 6 of
+the terminal journal adds. It is required for that ceremony and refused for the
+ones whose record already speaks in the space their permits name.
+
+The mapping is what makes an ownership map readable against such a transcript at
+all. Without it the map's seats and the transcript's seats are numbers from two
+unrelated spaces, and with a middle ceremony member removed every final seat
+shifts down: joining the two by number attributes a final seat to whichever party
+holds that number in the other space, which manufactures the mixed reading out of
+a homogeneous run. Where a work published no usable mapping — none at all, or two
+holders disagreeing about how one final group was rebuilt — the fleet's ownership
+of its transcripts is reported as unknown and the step blocks, rather than the
+reading treating the seats it could not place as seats the fleet never operated. A
+holder the ceremony removed is a separate case and not an unknown: its seat is
+absent from the survivor list, which says definitely that it holds no final seat.
+
+The account those readings come out of lives in memory, so whether it can be
+followed is published with it. The gate names the process the account belongs to
+at `protocol_participation.gate_instance` and counts the records its bounded
+account has dropped at `forgotten_terminal_outcomes`. Both are read either side of
+a drive: a node answering from a different process than the one the work ran on
+has lost every record the old process held, and a node whose account forgot
+records while the work ran has lost some of them and cannot say which. Either
+blocks the step, because an account missing a permit reads exactly like a node
+that took no part in work it may well have done. A process lost before it closes
+anything writes no record at any point, and no reading of the account recovers a
+seat that was never written to it — the provenance check is what keeps that
+silence from being spent as evidence.
 
 Completing a ceremony and contributing to it are held apart. A wallet action owns
 its permit and records the signature it saw settle even when the attempt that
