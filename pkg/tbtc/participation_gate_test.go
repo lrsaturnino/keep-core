@@ -630,6 +630,73 @@ func TestDkgExecutor_ReportQuarantinedSigners_CountsARepreservedSeatOnce(
 	)
 }
 
+// TestDkgExecutor_ReportQuarantinedSigners_DoesNotResurrectAClearedOutput
+// proves an output a successful scan found gone is not brought back by the next
+// scan that fails.
+//
+// What this process wrote is only a floor until the namespace can be asked
+// about it. Once a scan does succeed, it has enumerated the namespace after
+// every one of those writes, so a write it does not find is a record an
+// operator cleared or a seat that was activated. Carrying that identity forward
+// would let the next unreadable namespace raise the count back over an output
+// nobody holds — a rollback sent looking for material that is not there, from a
+// node that is otherwise reporting correctly.
+func TestDkgExecutor_ReportQuarantinedSigners_DoesNotResurrectAClearedOutput(
+	t *testing.T,
+) {
+	de, result, gsr, _, _ := setupPreserveScenario(t)
+
+	recorder := newDispatchGaugeRecorder()
+	de.metricsRecorder = recorder
+
+	// Two enumerations: the one preservation takes when it is done, and the one
+	// that follows the operator's repair. Everything after that fails.
+	handle := &scanBudgetHandle{readableScans: 2}
+	de.signerQuarantine = newTestSignerQuarantine(handle, 1)
+
+	walletStorageKey := preserveOneSigner(t, de, result, gsr, group.MemberIndex(1))
+
+	testutils.AssertIntsEqual(
+		t,
+		"reported quarantined signers after preserving one output",
+		1,
+		int(recorder.gauge(
+			clientinfo.MetricParticipationQuarantinedTBTCSigners,
+		)),
+	)
+
+	// The operator clears the preserved record, having accounted for the share
+	// by hand, and the recount that follows sees the namespace without it.
+	if err := handle.Delete(walletStorageKey, "/membership_1"); err != nil {
+		t.Fatal(err)
+	}
+
+	de.reportQuarantinedSigners(logger.With())
+
+	testutils.AssertIntsEqual(
+		t,
+		"reported quarantined signers after the record was cleared",
+		0,
+		int(recorder.gauge(
+			clientinfo.MetricParticipationQuarantinedTBTCSigners,
+		)),
+	)
+
+	// The namespace stops being readable. What this process wrote is no longer
+	// its own to vouch for: a scan already established the namespace does not
+	// hold it.
+	de.reportQuarantinedSigners(logger.With())
+
+	testutils.AssertIntsEqual(
+		t,
+		"reported quarantined signers once the namespace stops answering",
+		0,
+		int(recorder.gauge(
+			clientinfo.MetricParticipationQuarantinedTBTCSigners,
+		)),
+	)
+}
+
 // scanBudgetHandle is a protected namespace that serves a fixed number of
 // enumerations and fails every one after that, as a namespace does when its
 // directory stops being readable while the process runs. Its writes always
@@ -653,6 +720,13 @@ func (h *scanBudgetHandle) Save(
 	defer h.mu.Unlock()
 
 	return h.mockPersistenceHandle.Save(data, directory, name)
+}
+
+func (h *scanBudgetHandle) Delete(directory string, name string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return h.mockPersistenceHandle.Delete(directory, name)
 }
 
 func (h *scanBudgetHandle) ReadAll() (

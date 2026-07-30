@@ -107,10 +107,13 @@ type dkgExecutor struct {
 	quarantineReportMutex sync.Mutex
 
 	// preservedOutputFloor names the key material this process wrote to the
-	// quarantine namespace itself. The namespace is the authority on how much
-	// preserved material a rollback has to account for, but a scan that fails
-	// cannot take away what this process knows it persisted, and the published
-	// count must never fall below that.
+	// quarantine namespace itself and no successful scan has ruled on yet. The
+	// namespace is the authority on how much preserved material a rollback has
+	// to account for, but a scan that fails cannot take away what this process
+	// knows it persisted, and the published count must never fall below that.
+	// A scan that does succeed settles every entry — it enumerated the namespace
+	// after each was written — so it empties this, and what the namespace still
+	// held is carried by lastScannedOutputs instead.
 	preservedOutputFloor map[quarantinedSigner]struct{}
 
 	// lastScannedOutputs names what the last successful enumeration found. A
@@ -1414,6 +1417,16 @@ func (de *dkgExecutor) publishQuarantinedSignerCount() error {
 		de.lastScannedOutputs[output] = struct{}{}
 	}
 
+	// The floor exists to name what this process wrote and no scan has ruled on
+	// yet. This scan ruled on all of it: every entry was added after the
+	// namespace had taken the record, and this enumeration ran later still,
+	// under the same lock, so the namespace was asked about every one of them.
+	// Whatever it did not answer for — a seat an operator activated, a record
+	// they cleared — is gone, and keeping the identity would let the next failed
+	// scan union it back in and raise the count over an output that no longer
+	// exists.
+	de.preservedOutputFloor = nil
+
 	de.publishQuarantineCountLocked(de.withheldCount(outputs))
 
 	return nil
@@ -1466,6 +1479,10 @@ func (de *dkgExecutor) withheldCount(outputs []quarantinedSigner) int {
 // The two overlap freely — a scan taken after a write finds that write — so
 // they are merged as identities rather than added as counts, and an output
 // named by both is one output.
+//
+// Only writes a successful scan has not already ruled on survive in the floor,
+// so this can name an output the namespace has since let go of only for as long
+// as no scan has succeeded to say otherwise.
 func (de *dkgExecutor) knownOutputsLocked() []quarantinedSigner {
 	known := make(
 		map[quarantinedSigner]struct{},
