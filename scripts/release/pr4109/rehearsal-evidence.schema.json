@@ -33,7 +33,7 @@
       "required": ["r1_image_digests", "prior_image_digests", "version", "revision", "protocol_epoch"],
       "properties": {
         "r1_image_digests": {
-          "description": "Immutable R1 digests by architecture.",
+          "description": "The immutable R1 image this rehearsal ran, keyed by the platform its runner resolved. One runner executes one child of a published digest, so a record names one platform; covering everything the release publishes is checked across the record set.",
           "type": "object",
           "additionalProperties": { "type": "string", "pattern": "@sha256:[0-9a-f]{64}$" }
         },

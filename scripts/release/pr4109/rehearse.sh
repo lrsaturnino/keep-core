@@ -5108,51 +5108,80 @@ record_assertion() {
   [[ "${holds}" == "true" ]] || REHEARSAL_REFUTED_ASSERTIONS+=("${assertion}")
 }
 
-# The architectures an immutable digest actually carries, mapped to the
-# per-architecture digest the schema wants. A multi-architecture digest names
-# a manifest list whose children are the real runtime images, and recording
-# only the list digest would leave the record silent about which binaries ran.
-# A single-architecture digest has no list, so its own architecture is read
-# from the pulled image instead.
-image_digests_by_architecture() {
+# The one published image a rehearsal actually ran, as the platform map the
+# schema wants.
+#
+# A multi-architecture digest names a manifest list whose children are the real
+# runtime images, and exactly one of them is on this daemon: the pull resolved
+# the child matching the runner's own platform, and every container the fleet
+# started came from that child. Naming the whole list would put architectures
+# this run never executed into a record that speaks only for what it observed
+# — and the acceptance comparison downstream would then read an amd64
+# rehearsal as evidence for the arm64 artifact too. A release publishing
+# several platforms is evidenced by rehearsing on each of them, which
+# acceptance checks across the record set rather than inside any one record.
+#
+# A single-architecture digest has no list, so the reference is the image.
+executed_image_digest() {
   local reference="$1" repository="${1%@*}"
-  local manifest
+  local manifest platform
   if ! manifest="$(docker manifest inspect "${reference}" 2>/dev/null)"; then
     blocked "cannot read the manifest of ${reference}; the digest must be \
-readable to record which architectures the rehearsal ran"
+readable to record which published image the rehearsal ran"
   fi
-  local architecture
-  architecture="$(docker image inspect --format '{{.Architecture}}' \
-    "${reference}" 2>/dev/null || true)"
+  # Asked of the local image rather than of the runner: what a record names has
+  # to be what the containers were created from, and the daemon is the only
+  # party that knows which child that pull resolved to.
+  platform="$(docker image inspect \
+    --format '{{.Os}}|{{.Architecture}}|{{.Variant}}' "${reference}" \
+    2>/dev/null)" ||
+    blocked "cannot read the platform ${reference} resolved to on this \
+daemon; without it a record cannot say which of the release's images ran"
   node -e '
     const manifest = JSON.parse(process.argv[1]);
     const repository = process.argv[2];
-    const localArchitecture = process.argv[3];
+    const parts = String(process.argv[3]).split("|");
+    const os = parts[0] || "";
+    const architecture = parts[1] || "";
+    // An engine too old to report one renders the field as the template
+    // placeholder rather than as an empty string.
+    const variant =
+      !parts[2] || parts[2] === "<no value>" ? "" : parts[2];
+    const reference = process.argv[4];
+    if (!architecture) {
+      console.error("no architecture readable for " + reference);
+      process.exit(1);
+    }
+    const name = architecture + (variant ? "/" + variant : "");
     const out = {};
     if (Array.isArray(manifest.manifests)) {
-      for (const entry of manifest.manifests) {
+      const children = manifest.manifests.filter((entry) => {
         const platform = entry.platform || {};
         // Attestation manifests ride in the same list as the runtime images
-        // and carry the placeholder architecture; recording them would name
-        // an architecture no node ever ran.
+        // and carry the placeholder architecture; one of those is never what
+        // a container was created from.
         if (!platform.architecture || platform.architecture === "unknown") {
-          continue;
+          return false;
         }
-        const name =
-          platform.architecture + (platform.variant ? "/" + platform.variant : "");
-        out[name] = repository + "@" + entry.digest;
-      }
-    }
-    if (Object.keys(out).length === 0) {
-      if (!localArchitecture) {
-        console.error("no architecture readable for " + repository);
+        if (platform.architecture !== architecture) return false;
+        if ((platform.variant || "") !== variant) return false;
+        return !os || !platform.os || platform.os === os;
+      });
+      if (children.length !== 1) {
+        console.error(
+          "the manifest of " + reference + " carries " + children.length +
+            " runtime child(ren) for " + name + ", the platform this daemon " +
+            "resolved it to; a record names the one image that ran"
+        );
         process.exit(1);
       }
-      out[localArchitecture] = process.argv[4];
+      out[name] = repository + "@" + children[0].digest;
+    } else {
+      out[name] = reference;
     }
     process.stdout.write(JSON.stringify(out));
-  ' "${manifest}" "${repository}" "${architecture}" "${reference}" ||
-    blocked "cannot resolve the architectures of ${reference}"
+  ' "${manifest}" "${repository}" "${platform}" "${reference}" ||
+    blocked "cannot resolve which child of ${reference} this rehearsal ran"
 }
 
 # What one node says it is: the artifact it was built from, and the schedule
@@ -5423,8 +5452,8 @@ clean commit; a record built from bytes no commit accounts for is not evidence"
 record binds the rehearsal to what the running nodes reported, and a gate \
 that never captured it has nothing to bind"
   fi
-  r1_digests="$(image_digests_by_architecture "${R1_IMAGE_DIGEST}")"
-  prior_digests="$(image_digests_by_architecture "${PRIOR_IMAGE_DIGEST}")"
+  r1_digests="$(executed_image_digest "${R1_IMAGE_DIGEST}")"
+  prior_digests="$(executed_image_digest "${PRIOR_IMAGE_DIGEST}")"
 
   local steps assertions
   steps="$(
@@ -11961,6 +11990,10 @@ stage_verify_source_binding() {
 # has been required, which is exactly the runs where no record may be accepted.
 ATTESTED_PROVENANCE_IMAGES=""
 
+# The [gate, platform] pairs the record loop observed, one JSON array per line
+# per entry, for the archive-wide coverage question the loop cannot answer.
+EVIDENCED_GATE_PLATFORMS=()
+
 # Every record comparison below measures a record against the checked-in
 # release manifest, so that manifest has to be the compiled bounds' own
 # manifest and not a document that has since drifted away from them. The
@@ -12245,6 +12278,10 @@ run that produced no record cannot be accepted"
   ' "${manifest}")" ||
     fail "cannot read the termination grace from ${manifest}"
 
+  # Filled in per record and settled once, after the loop, because the question
+  # it answers is not one any single record can be asked.
+  EVIDENCED_GATE_PLATFORMS=()
+
   for record in "${EVIDENCE_RECORDS[@]}"; do
     note "validating ${record}"
     # ajv needs the formats plugin loaded explicitly or it rejects the
@@ -12273,40 +12310,40 @@ compiled bounds judging it must come from the same commit"
     fi
 
     # The images the record says the fleet ran, against the ones the release
-    # published. Presence was never the question: a record naming some other
-    # build's digests is a rehearsal of an artifact this release does not
-    # ship, and one naming a subset is a rehearsal that left a published
-    # platform untested. Exact equality of the whole platform-to-reference map
-    # is what refuses all three — missing, extra, and substituted.
+    # published. A record naming some other build's digest is a rehearsal of an
+    # artifact this release does not ship, and one naming a platform the
+    # release does not publish is a fleet that ran something no reviewer ever
+    # saw. Both are refused here.
+    #
+    # What the record does not name is not asked of it. One runner executes one
+    # platform, so a record honestly speaks for that platform alone; whether
+    # the published set was covered is a property of the whole archive, and it
+    # is asked once below, over every record. Demanding it of each record would
+    # make every rehearsal that could actually be run refuse itself.
     #
     # Comparing references rather than bare digests also refuses the same
     # digest pulled from another repository, which is a different supply chain
     # reaching the same content only for as long as nobody repoints it.
-    local image_disagreement
+    local image_disagreement recorded_platforms
     image_disagreement="$(node -e '
       const fs = require("fs");
       const record = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
       const reviewed = JSON.parse(process.argv[2]);
       const ran = (record.artifacts || {}).r1_image_digests || {};
       const differences = [];
-      for (const platform of Object.keys(reviewed).sort()) {
-        if (!(platform in ran)) {
-          differences.push(
-            "the release publishes [" + platform + "] as " +
-              reviewed[platform] + ", which this record does not evidence"
-          );
-        } else if (ran[platform] !== reviewed[platform]) {
-          differences.push(
-            "[" + platform + "] ran " + ran[platform] +
-              ", but the release publishes " + reviewed[platform]
-          );
-        }
+      if (Object.keys(ran).length === 0) {
+        differences.push("it names no image at all");
       }
       for (const platform of Object.keys(ran).sort()) {
         if (!(platform in reviewed)) {
           differences.push(
             "this record evidences [" + platform + "] as " + ran[platform] +
               ", which the release does not publish"
+          );
+        } else if (ran[platform] !== reviewed[platform]) {
+          differences.push(
+            "[" + platform + "] ran " + ran[platform] +
+              ", but the release publishes " + reviewed[platform]
           );
         }
       }
@@ -12317,6 +12354,27 @@ the reviewed release provenance"
     if [[ -n "${image_disagreement}" ]]; then
       blocked "evidence record ${record} was not produced against the images \
 this release publishes: ${image_disagreement}"
+    fi
+
+    # What this record covers, for the archive-wide question below. Collected
+    # as the gate it evidences paired with each platform it ran, because
+    # coverage is owed per gate: a release rehearsed on two architectures with
+    # the rollback gate run on only one has an artifact nobody rolled back.
+    recorded_platforms="$(node -e '
+      const fs = require("fs");
+      const record = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      const gate = String(record.gate || "");
+      const ran = (record.artifacts || {}).r1_image_digests || {};
+      const lines = Object.keys(ran)
+        .sort()
+        .map((platform) => JSON.stringify([gate, platform]));
+      process.stdout.write(lines.join("\n"));
+    ' "${record}")" ||
+      blocked "cannot read the platforms evidence record ${record} covers"
+    # An `if` and not a `&&`: a false test as a loop body's last statement
+    # carries its status out under errexit.
+    if [[ -n "${recorded_platforms}" ]]; then
+      EVIDENCED_GATE_PLATFORMS+=("${recorded_platforms}")
     fi
 
     recorded_sha="$(node -e '
@@ -12408,9 +12466,80 @@ repository never took"
     fi
   done
 
+  require_evidenced_platform_coverage
+
   note "all evidence records conform to the schema, were produced at \
-${attested_source}, ran exactly the images the release publishes, and bind \
-the reviewed release manifest's hash and termination grace"
+${attested_source}, ran only images the release publishes, and bind the \
+reviewed release manifest's hash and termination grace"
+}
+
+# Was every published image actually rehearsed?
+#
+# Each record names the one platform its runner executed, which is the only
+# honest thing a record can say and is exactly why no record can answer this.
+# A release publishing two architectures and rehearsed on one has a shipped
+# artifact that no gate ever ran, and every record in that archive is
+# individually correct. So the question is asked here, over the record set,
+# once per gate: a rollback rehearsal that covered one architecture leaves the
+# other with no evidence that it can be rolled back, however thoroughly the
+# cutover gate covered both.
+#
+# Gates are taken from the records rather than from a roster, because this is a
+# coverage question and not a completeness one — which gates a release must
+# produce at all is the acceptance contract's to require, and duplicating it
+# here would put two answers to one question in two places.
+require_evidenced_platform_coverage() {
+  local pairs="" missing
+  # bash 3.2 refuses to expand an empty array under `set -u`, and the per-record
+  # check has already blocked every record that named no image, so an empty set
+  # here means no record at all — which the caller refused before this ran.
+  if ((${#EVIDENCED_GATE_PLATFORMS[@]} > 0)); then
+    pairs="$(
+      IFS=$'\n'
+      printf '%s' "${EVIDENCED_GATE_PLATFORMS[*]}"
+    )"
+  fi
+
+  missing="$(printf '%s' "${pairs}" | node -e '
+    const reviewed = Object.keys(JSON.parse(process.argv[1])).sort();
+    let raw = "";
+    process.stdin.on("data", (d) => (raw += d));
+    process.stdin.on("end", () => {
+      const covered = new Map();
+      for (const line of raw.split("\n")) {
+        if (!line) continue;
+        const [gate, platform] = JSON.parse(line);
+        if (!covered.has(gate)) covered.set(gate, new Set());
+        covered.get(gate).add(platform);
+      }
+      const gaps = [];
+      for (const gate of Array.from(covered.keys()).sort()) {
+        const ran = covered.get(gate);
+        const absent = reviewed.filter((platform) => !ran.has(platform));
+        if (absent.length > 0) {
+          gaps.push(
+            "the " + gate + " gate evidences [" +
+              Array.from(ran).sort().join(", ") + "] and not [" +
+              absent.join(", ") + "]"
+          );
+        }
+      }
+      process.stdout.write(gaps.join("; "));
+    });
+  ' "${ATTESTED_PROVENANCE_IMAGES}")" ||
+    blocked "cannot determine which of the release's platforms these records \
+evidence"
+
+  if [[ -n "${missing}" ]]; then
+    blocked "these records do not rehearse every image this release \
+publishes: ${missing}; a published platform no gate ran is an artifact this \
+release would ship untested, and no single record can report that because \
+each one honestly names only the platform its runner executed — rehearse the \
+gate on the missing platform and validate the records together"
+  fi
+
+  note "every platform the release publishes is evidenced by every gate these \
+records cover"
 }
 
 # Render every acceptance-relevant finding in one record. The gate contracts

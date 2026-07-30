@@ -1103,13 +1103,32 @@ mandatory: a ready receipt without it names a cutover and no artifact. Its
 provenance for a release reviewed under other bounds; its `source_commit` must
 be the commit the attestation was taken at — already proved a clean id and, on
 a bound run, the dispatched one, and already required to equal every record's
-`source_sha`. And every record's `artifacts.r1_image_digests` must equal the
-provenance image set exactly, platform for platform and reference for
-reference: a missing platform is one the evidence says nothing about, an extra
-one is a fleet running something the release never shipped, and a substituted
-digest is a rehearsal of an artifact this release does not publish. The
-comparison is over references rather than bare digests, so the same content
-pulled from another repository is refused too.
+`source_sha`. And the images are checked in two places, because they answer two
+different questions.
+
+Per record, every platform in `artifacts.r1_image_digests` must be one the
+provenance publishes, at exactly the reference it publishes: an extra platform
+is a fleet running something the release never shipped, a substituted digest is
+a rehearsal of an artifact this release does not publish, and a record naming
+no image at all would agree with every release by having nothing to disagree
+about. The comparison is over references rather than bare digests, so the same
+content pulled from another repository is refused too.
+
+What a record does *not* name is not asked of it. A multi-architecture digest
+names a manifest list whose children are the real runtime images, and a runner
+resolves exactly one of them: every container the fleet started came from that
+child, so a record honestly names one platform. Recording the whole list would
+put architectures nothing executed into a record — an amd64 rehearsal claiming
+the arm64 artifact — so the resolver names only the child the daemon actually
+ran, refusing rather than guessing when the index publishes none for that
+platform, more than one, or nothing readable at all.
+
+Covering the published set is therefore a property of the archive, checked once
+over every record and asked per gate: a release publishing two architectures is
+evidenced by rehearsing on each, and a rollback gate that ran on one of them
+leaves the other with no evidence it can be rolled back, however thoroughly the
+cutover gate covered both. Which gates a release must produce at all stays the
+acceptance contract's question; this one is only about coverage.
 
 A receipt belongs to one run at one commit, and three rules keep it that
 way. `local-proofs` destroys the receipt it inherits — interrupted staging

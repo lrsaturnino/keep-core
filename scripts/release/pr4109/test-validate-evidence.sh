@@ -121,21 +121,35 @@ REVIEWED_ROLLBACK_GENERATOR_DIGEST="$(
 REVIEWED_TSSLIB_REVIEW_DIGEST="$(reviewed_input_digest tsslib-review)"
 
 # What the fixture release publishes, stated once in the two forms the two
-# documents use it in: the provenance's reviewed image list, and the
-# per-architecture map a record reports the fleet ran. Acceptance compares
-# these for exact equality, so both are derived from one reference here, and
-# the emitter cases below run against that same reference — a fixture whose
+# documents use it in: the provenance's reviewed image list, and the platform
+# map a record reports the fleet ran. Both are derived from one reference here,
+# and the emitter cases below run against that same reference — a fixture whose
 # halves disagreed by accident would test the comparison against itself rather
 # than against a real disagreement.
 #
-# Two platforms because the interesting refusals are about the set and not
-# about one entry: a published platform nobody rehearsed and a rehearsed one
-# nobody published are both invisible to a check that only compares what the
-# two documents happen to have in common.
+# One published platform by default, because that is the shape a real rehearsal
+# produces: a runner resolves one child of the published digest and every
+# container it starts comes from that child, so a record names one platform and
+# a release publishing more is covered by rehearsing on each. The cases about a
+# record's own images use this; the cases about covering the published set use
+# the two-platform release below.
 FIXTURE_R1_DIGEST="sha256:1111111111111111111111111111111111111111111111111111111111111111"
 FIXTURE_R1_REFERENCE="ghcr.io/keep-network/keep-client@${FIXTURE_R1_DIGEST}"
 FIXTURE_R1_PLATFORMS=("amd64" "arm64")
 FIXTURE_R1_IMAGES="$(
+  printf '[{"platform": "%s", "reference": "%s", "digest": "%s"}]' \
+    "${FIXTURE_R1_PLATFORMS[0]}" "${FIXTURE_R1_REFERENCE}" \
+    "${FIXTURE_R1_DIGEST}"
+)"
+FIXTURE_R1_DIGEST_MAP="$(
+  printf '{"%s": "%s"}' \
+    "${FIXTURE_R1_PLATFORMS[0]}" "${FIXTURE_R1_REFERENCE}"
+)"
+
+# The same release published for both architectures, and the second platform's
+# own record map. A release like this is only evidenced by more than one
+# rehearsal, which is the whole subject of the coverage cases.
+FIXTURE_R1_IMAGES_BOTH="$(
   printf '[{"platform": "%s", "reference": "%s", "digest": "%s"},
     {"platform": "%s", "reference": "%s", "digest": "%s"}]' \
     "${FIXTURE_R1_PLATFORMS[0]}" "${FIXTURE_R1_REFERENCE}" \
@@ -143,9 +157,8 @@ FIXTURE_R1_IMAGES="$(
     "${FIXTURE_R1_PLATFORMS[1]}" "${FIXTURE_R1_REFERENCE}" \
     "${FIXTURE_R1_DIGEST}"
 )"
-FIXTURE_R1_DIGEST_MAP="$(
-  printf '{"%s": "%s", "%s": "%s"}' \
-    "${FIXTURE_R1_PLATFORMS[0]}" "${FIXTURE_R1_REFERENCE}" \
+FIXTURE_R1_SECOND_DIGEST_MAP="$(
+  printf '{"%s": "%s"}' \
     "${FIXTURE_R1_PLATFORMS[1]}" "${FIXTURE_R1_REFERENCE}"
 )"
 
@@ -509,13 +522,25 @@ write_attestation "${D}"
 write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
   "2026-07-28T00:00:00Z" "${FIXTURE_SHA}" "${STAGE_PASSED}" \
   "${ASSERTION_HOLDS}" "single_release" \
-  "$(printf '{"%s": "ghcr.io/keep-network/keep-client@sha256:9999999999999999999999999999999999999999999999999999999999999999", "%s": "%s"}' \
-    "${FIXTURE_R1_PLATFORMS[0]}" "${FIXTURE_R1_PLATFORMS[1]}" \
-    "${FIXTURE_R1_REFERENCE}")"
+  "$(printf '{"%s": "ghcr.io/keep-network/keep-client@sha256:9999999999999999999999999999999999999999999999999999999999999999"}' \
+    "${FIXTURE_R1_PLATFORMS[0]}")"
 run_validator "${D}"
 check "a record naming a digest the release does not publish is refused" 3 \
   "was not produced against the images this release publishes" \
   "but the release publishes"
+
+# A record naming nothing at all. The comparison is over what a record claims,
+# so a record claiming no image would agree with every release by having
+# nothing to disagree about.
+D="${WORK}/record-names-no-image"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z" "${FIXTURE_SHA}" "${STAGE_PASSED}" \
+  "${ASSERTION_HOLDS}" "single_release" "{}"
+run_validator "${D}"
+check "a record naming no image at all is refused" 3 \
+  "it names no image at all"
 
 # The same content pulled from another repository is a different supply chain
 # reaching the same bytes, for exactly as long as nobody repoints it. The
@@ -526,49 +551,88 @@ write_attestation "${D}"
 write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
   "2026-07-28T00:00:00Z" "${FIXTURE_SHA}" "${STAGE_PASSED}" \
   "${ASSERTION_HOLDS}" "single_release" \
-  "$(printf '{"%s": "docker.io/someone-else/keep-client@%s", "%s": "%s"}' \
-    "${FIXTURE_R1_PLATFORMS[0]}" "${FIXTURE_R1_DIGEST}" \
-    "${FIXTURE_R1_PLATFORMS[1]}" "${FIXTURE_R1_REFERENCE}")"
+  "$(printf '{"%s": "docker.io/someone-else/keep-client@%s"}' \
+    "${FIXTURE_R1_PLATFORMS[0]}" "${FIXTURE_R1_DIGEST}")"
 run_validator "${D}"
 check "a record naming the release digest from another repository is refused" \
   3 "was not produced against the images this release publishes"
 
-# A published platform nobody rehearsed is a platform the acceptance evidence
-# says nothing about, however complete the record looks for the ones it does
-# cover.
-D="${WORK}/record-missing-a-published-platform"
-mkdir -p "${D}"
-write_attestation "${D}" "${MANIFEST_SHA}" "${TEST_DIR}/release-manifest.json" \
-  "${FIXTURE_SHA}" "yes" "${MANIFEST_SHA}" "${FIXTURE_SHA}" \
-  "$(printf '[{"platform": "%s", "reference": "%s", "digest": "%s"},
-    {"platform": "%s", "reference": "%s", "digest": "%s"},
-    {"platform": "riscv64", "reference": "%s", "digest": "%s"}]' \
-    "${FIXTURE_R1_PLATFORMS[0]}" "${FIXTURE_R1_REFERENCE}" \
-    "${FIXTURE_R1_DIGEST}" \
-    "${FIXTURE_R1_PLATFORMS[1]}" "${FIXTURE_R1_REFERENCE}" \
-    "${FIXTURE_R1_DIGEST}" \
-    "ghcr.io/keep-network/keep-client@sha256:3333333333333333333333333333333333333333333333333333333333333333" \
-    "sha256:3333333333333333333333333333333333333333333333333333333333333333")"
-write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
-  "2026-07-28T00:00:00Z"
-run_validator "${D}"
-check "a record leaving a published platform unrehearsed is refused" 3 \
-  "which this record does not evidence"
-
-# And the other direction: a record evidencing an image the release does not
-# publish describes a fleet running something the release never shipped.
+# A record evidencing an image the release does not publish describes a fleet
+# running something the release never shipped. This is asked of the record
+# itself, unlike coverage below, because no other record can excuse it.
 D="${WORK}/record-ran-an-unpublished-platform"
 mkdir -p "${D}"
 write_attestation "${D}"
 write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
   "2026-07-28T00:00:00Z" "${FIXTURE_SHA}" "${STAGE_PASSED}" \
   "${ASSERTION_HOLDS}" "single_release" \
-  "$(printf '{"%s": "%s", "%s": "%s", "riscv64": "ghcr.io/keep-network/keep-client@sha256:3333333333333333333333333333333333333333333333333333333333333333"}' \
-    "${FIXTURE_R1_PLATFORMS[0]}" "${FIXTURE_R1_REFERENCE}" \
-    "${FIXTURE_R1_PLATFORMS[1]}" "${FIXTURE_R1_REFERENCE}")"
+  "$(printf '{"%s": "%s", "riscv64": "ghcr.io/keep-network/keep-client@sha256:3333333333333333333333333333333333333333333333333333333333333333"}' \
+    "${FIXTURE_R1_PLATFORMS[0]}" "${FIXTURE_R1_REFERENCE}")"
 run_validator "${D}"
 check "a record evidencing an image the release does not publish is refused" \
   3 "which the release does not publish"
+
+# ----------------------------------------------------------------------------
+# Covering the published set, which is a question about the archive.
+#
+# A runner resolves one child of a published digest and every container it
+# starts comes from that child, so an honest record names one platform. That
+# makes coverage unanswerable inside any single record: a two-architecture
+# release rehearsed only on amd64 produces a record that is individually
+# perfect and an arm64 artifact no gate ever ran. The cases below are about
+# the set of records, and about asking per gate, since a cutover rehearsed on
+# both architectures says nothing about rolling back the one the rollback gate
+# never touched.
+
+# The release publishes two platforms and one record evidences one of them.
+D="${WORK}/coverage-one-platform-rehearsed"
+mkdir -p "${D}"
+write_attestation "${D}" "${MANIFEST_SHA}" "${TEST_DIR}/release-manifest.json" \
+  "${FIXTURE_SHA}" "yes" "${MANIFEST_SHA}" "${FIXTURE_SHA}" \
+  "${FIXTURE_R1_IMAGES_BOTH}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+run_validator "${D}"
+check "a release platform no record rehearsed is refused" 3 \
+  "do not rehearse every image this release publishes" \
+  "the single_release gate evidences \[${FIXTURE_R1_PLATFORMS[0]}\] and not \[${FIXTURE_R1_PLATFORMS[1]}\]" \
+  "each one honestly names only the platform its runner executed"
+
+# The same release, rehearsed on both. Two records, each naming the one
+# platform its runner ran, and together they cover what the release ships.
+D="${WORK}/coverage-both-platforms-rehearsed"
+mkdir -p "${D}"
+write_attestation "${D}" "${MANIFEST_SHA}" "${TEST_DIR}/release-manifest.json" \
+  "${FIXTURE_SHA}" "yes" "${MANIFEST_SHA}" "${FIXTURE_SHA}" \
+  "${FIXTURE_R1_IMAGES_BOTH}"
+write_record "${D}/first.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+write_record "${D}/second.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T01:00:00Z" "${FIXTURE_SHA}" "${STAGE_PASSED}" \
+  "${ASSERTION_HOLDS}" "single_release" "${FIXTURE_R1_SECOND_DIGEST_MAP}"
+run_validator "${D}"
+check "one record per published platform covers the release" 0 \
+  "every platform the release publishes is evidenced by every gate"
+
+# And the gap a whole-archive union would miss: every published platform
+# appears somewhere, so the union is complete, and the rollback gate still
+# never ran on one of them.
+D="${WORK}/coverage-gate-specific-gap"
+mkdir -p "${D}"
+write_attestation "${D}" "${MANIFEST_SHA}" "${TEST_DIR}/release-manifest.json" \
+  "${FIXTURE_SHA}" "yes" "${MANIFEST_SHA}" "${FIXTURE_SHA}" \
+  "${FIXTURE_R1_IMAGES_BOTH}"
+write_record "${D}/cutover-first.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+write_record "${D}/cutover-second.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T01:00:00Z" "${FIXTURE_SHA}" "${STAGE_PASSED}" \
+  "${ASSERTION_HOLDS}" "single_release" "${FIXTURE_R1_SECOND_DIGEST_MAP}"
+write_record "${D}/rollback.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T02:00:00Z" "${FIXTURE_SHA}" "${STAGE_PASSED}" \
+  "${ASSERTION_HOLDS}" "rollback"
+run_validator "${D}"
+check "a gate that skipped a platform the other gate covered is refused" 3 \
+  "the rollback gate evidences \[${FIXTURE_R1_PLATFORMS[0]}\] and not \[${FIXTURE_R1_PLATFORMS[1]}\]"
 
 # The manifest is internally valid and every comparison in the stage agrees
 # with it — and it still names no release. Records measured against it
@@ -1024,6 +1088,188 @@ run_validator "${D}"
 check "a passing record does not cover for a failing one beside it" 1 \
   "the evidence refutes the gate it records" "b-failed.json"
 
+# ----------------------------------------------------------------------------
+# Which published image a record names.
+#
+# A record attributes everything it observed to the image it names, and the
+# resolver decides which one that is. A multi-architecture digest names a
+# manifest list whose children are the real runtime images, and only one of
+# them is on the daemon that ran the fleet: naming the others would put
+# architectures nothing executed into a record, and acceptance would then read
+# one runner's rehearsal as evidence for every artifact the release ships.
+#
+# These cases run before the emitter fixtures below replace the resolver with a
+# stub, so what answers here is the shipped code.
+
+RESOLVER_REPOSITORY="ghcr.io/keep-network/keep-client"
+RESOLVER_INDEX_DIGEST="sha256:$(printf '1%.0s' {1..64})"
+RESOLVER_AMD64_DIGEST="sha256:$(printf 'a%.0s' {1..64})"
+RESOLVER_ARM64_DIGEST="sha256:$(printf 'b%.0s' {1..64})"
+RESOLVER_ARM64V8_DIGEST="sha256:$(printf 'c%.0s' {1..64})"
+RESOLVER_ATTESTATION_DIGEST="sha256:$(printf 'd%.0s' {1..64})"
+RESOLVER_REFERENCE="${RESOLVER_REPOSITORY}@${RESOLVER_INDEX_DIGEST}"
+
+# A published index in the shape a real registry serves one: runtime children
+# per platform, one of them carrying a variant, and the attestation manifest
+# that rides in the same list under the placeholder architecture.
+RESOLVER_INDEX="$(
+  printf '{"manifests": [
+    {"digest": "%s", "platform": {"architecture": "amd64", "os": "linux"}},
+    {"digest": "%s", "platform": {"architecture": "arm64", "os": "linux"}},
+    {"digest": "%s", "platform": {"architecture": "arm64", "os": "linux",
+      "variant": "v8"}},
+    {"digest": "%s", "platform": {"architecture": "unknown",
+      "os": "unknown"}}]}' \
+    "${RESOLVER_AMD64_DIGEST}" "${RESOLVER_ARM64_DIGEST}" \
+    "${RESOLVER_ARM64V8_DIGEST}" "${RESOLVER_ATTESTATION_DIGEST}"
+)"
+
+RESOLVER_MANIFEST="${RESOLVER_INDEX}"
+RESOLVER_MANIFEST_RC=0
+RESOLVER_PLATFORM="linux|amd64|"
+RESOLVER_PLATFORM_RC=0
+
+# The two questions the resolver asks the daemon, answered from nothing but the
+# fixture above.
+# shellcheck disable=SC2329
+docker() {
+  case "$1 $2" in
+  "manifest inspect")
+    [[ "${RESOLVER_MANIFEST_RC}" -eq 0 ]] || return "${RESOLVER_MANIFEST_RC}"
+    printf '%s\n' "${RESOLVER_MANIFEST}"
+    ;;
+  "image inspect")
+    [[ "${RESOLVER_PLATFORM_RC}" -eq 0 ]] || return "${RESOLVER_PLATFORM_RC}"
+    printf '%s\n' "${RESOLVER_PLATFORM}"
+    ;;
+  *) return 1 ;;
+  esac
+}
+
+run_resolver() {
+  local reference="${1:-${RESOLVER_REFERENCE}}"
+  set +e
+  CASE_OUT="$(executed_image_digest "${reference}" 2>&1)"
+  CASE_RC=$?
+  set -e
+}
+
+# The whole output, not a pattern in it: what this resolver must not do is
+# name a platform, and a substring match cannot see an extra entry.
+check_resolved() {
+  local desc="$1" want="$2"
+  if [[ "${CASE_RC}" -ne 0 ]]; then
+    printf 'FAIL %s: rc %s, want 0\n--- output ---\n%s\n--------------\n' \
+      "${desc}" "${CASE_RC}" "${CASE_OUT}"
+    FAILED=$((FAILED + 1))
+    return
+  fi
+  if [[ "${CASE_OUT}" != "${want}" ]]; then
+    printf 'FAIL %s: resolved [%s], want [%s]\n' "${desc}" "${CASE_OUT}" \
+      "${want}"
+    FAILED=$((FAILED + 1))
+    return
+  fi
+  printf 'ok   %s\n' "${desc}"
+  PASS=$((PASS + 1))
+}
+
+RESOLVER_PLATFORM="linux|amd64|"
+run_resolver
+check_resolved "the resolver names the child the daemon ran and no other" \
+  "$(printf '{"amd64":"%s@%s"}' "${RESOLVER_REPOSITORY}" \
+    "${RESOLVER_AMD64_DIGEST}")"
+
+# A variant is part of the platform, not decoration on it: an index publishing
+# both arm64 and arm64/v8 has two children a check comparing architectures
+# alone would confuse for one another.
+RESOLVER_PLATFORM="linux|arm64|v8"
+run_resolver
+check_resolved "the resolver distinguishes a variant from its base platform" \
+  "$(printf '{"arm64/v8":"%s@%s"}' "${RESOLVER_REPOSITORY}" \
+    "${RESOLVER_ARM64V8_DIGEST}")"
+
+RESOLVER_PLATFORM="linux|arm64|"
+run_resolver
+check_resolved "the resolver names the variantless child for a plain platform" \
+  "$(printf '{"arm64":"%s@%s"}' "${RESOLVER_REPOSITORY}" \
+    "${RESOLVER_ARM64_DIGEST}")"
+
+# An engine too old to report a variant renders the field as the template
+# placeholder. Read literally it would look for a child with a variant named
+# "<no value>" and find none.
+RESOLVER_PLATFORM="linux|amd64|<no value>"
+run_resolver
+check_resolved "the resolver reads an unreported variant as no variant" \
+  "$(printf '{"amd64":"%s@%s"}' "${RESOLVER_REPOSITORY}" \
+    "${RESOLVER_AMD64_DIGEST}")"
+
+# A digest published for one architecture has no list at all, so the reference
+# is the image and there is nothing to select.
+RESOLVER_MANIFEST='{"schemaVersion": 2, "config": {}, "layers": []}'
+RESOLVER_PLATFORM="linux|amd64|"
+run_resolver
+check_resolved "a single-architecture digest resolves to itself" \
+  "$(printf '{"amd64":"%s"}' "${RESOLVER_REFERENCE}")"
+RESOLVER_MANIFEST="${RESOLVER_INDEX}"
+
+# The daemon resolved a platform the index does not publish. Guessing a child
+# here would attribute a fleet's every observation to an artifact it did not
+# run, which is the failure this resolver exists to make impossible.
+RESOLVER_PLATFORM="linux|riscv64|"
+run_resolver
+check "a platform the index does not publish is refused" 3 \
+  "carries 0 runtime child\(ren\) for riscv64" \
+  "a record names the one image that ran"
+
+# Two children for one platform: the index cannot say which one a pull
+# resolved to, so neither can a record.
+RESOLVER_MANIFEST="$(
+  printf '{"manifests": [
+    {"digest": "%s", "platform": {"architecture": "amd64", "os": "linux"}},
+    {"digest": "%s", "platform": {"architecture": "amd64", "os": "linux"}}]}' \
+    "${RESOLVER_AMD64_DIGEST}" "${RESOLVER_ARM64_DIGEST}"
+)"
+RESOLVER_PLATFORM="linux|amd64|"
+run_resolver
+check "an index publishing one platform twice is refused" 3 \
+  "carries 2 runtime child\(ren\) for amd64"
+
+# The attestation manifest alone, under the placeholder architecture no node
+# ever runs. A resolver reading the list without filtering it would name a
+# child that is not an image.
+RESOLVER_MANIFEST="$(
+  printf '{"manifests": [
+    {"digest": "%s", "platform": {"architecture": "unknown",
+      "os": "unknown"}}]}' "${RESOLVER_ATTESTATION_DIGEST}"
+)"
+RESOLVER_PLATFORM="unknown|unknown|"
+run_resolver
+check "the placeholder architecture is never named as an image" 3 \
+  "carries 0 runtime child\(ren\) for unknown"
+RESOLVER_MANIFEST="${RESOLVER_INDEX}"
+
+RESOLVER_MANIFEST_RC=1
+RESOLVER_PLATFORM="linux|amd64|"
+run_resolver
+check "an unreadable manifest blocks rather than naming a guess" 3 \
+  "cannot read the manifest of" \
+  "which published image the rehearsal ran"
+RESOLVER_MANIFEST_RC=0
+
+RESOLVER_PLATFORM_RC=1
+run_resolver
+check "a daemon that cannot say what it ran blocks the record" 3 \
+  "cannot read the platform" \
+  "which of the release's images ran"
+RESOLVER_PLATFORM_RC=0
+
+RESOLVER_PLATFORM="linux||"
+run_resolver
+check "a platform with no architecture blocks the record" 3 \
+  "no architecture readable for"
+RESOLVER_PLATFORM="linux|amd64|"
+
 # The lifecycle a reused evidence directory depends on. local-proofs runs
 # invalidate_release_manifest_attestation before it proves anything, so a run
 # that fails at any proof leaves no receipt behind: the acceptance stage then
@@ -1129,8 +1375,10 @@ EOF
 
 probe_diagnostics() { diagnostics_document; }
 
-image_digests_by_architecture() {
-  printf '{"amd64":"%s","arm64":"%s"}' "$1" "$1"
+# One runner, one child of the published digest — the shape the real resolver
+# produces, and the shape acceptance measures a record by.
+executed_image_digest() {
+  printf '{"%s":"%s"}' "${FIXTURE_R1_PLATFORMS[0]}" "$1"
 }
 
 # The exposition a node serves, in the shape keep-common's gauge writes it:
