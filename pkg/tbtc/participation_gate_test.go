@@ -534,6 +534,155 @@ func TestDkgExecutor_ReportQuarantinedSigners_KeepsCountOnUnreadableNamespace(
 	)
 }
 
+// TestDkgExecutor_ReportQuarantinedSigners_AddsANewOutputToWhatTheLastScanFound
+// proves a recount that fails after a new share was preserved reports the
+// inherited outputs and the new one together.
+//
+// The material this process wrote and the material it inherited are known from
+// different places: the first from its own confirmed writes, the second only
+// from a scan. A node holding both that falls back to its own writes alone
+// reports fewer preserved outputs than the namespace held before it started —
+// and the more an earlier process left behind, the further under the truth the
+// number lands.
+func TestDkgExecutor_ReportQuarantinedSigners_AddsANewOutputToWhatTheLastScanFound(
+	t *testing.T,
+) {
+	de, result, gsr, _, _ := setupPreserveScenario(t)
+
+	recorder := newDispatchGaugeRecorder()
+	de.metricsRecorder = recorder
+
+	// Two outputs an earlier process on this host preserved, in a namespace
+	// that serves the startup scan and nothing after it.
+	handle := &scanBudgetHandle{readableScans: 1}
+	for _, name := range []string{"/membership_1", "/membership_2"} {
+		if err := handle.Save([]byte("x"), "inherited-wallet", name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	de.signerQuarantine = newTestSignerQuarantine(handle, 1)
+
+	if err := de.reportInitialQuarantinedSigners(); err != nil {
+		t.Fatal(err)
+	}
+	testutils.AssertIntsEqual(
+		t,
+		"quarantined signers this process inherited",
+		2,
+		int(recorder.gauge(
+			clientinfo.MetricParticipationQuarantinedTBTCSigners,
+		)),
+	)
+
+	// A third, distinct output, preserved once the namespace can no longer be
+	// enumerated: the write is confirmed, every recount around it fails.
+	preserveOneSigner(t, de, result, gsr, group.MemberIndex(1))
+
+	testutils.AssertIntsEqual(
+		t,
+		"reported quarantined signers after preserving a third output",
+		3,
+		int(recorder.gauge(
+			clientinfo.MetricParticipationQuarantinedTBTCSigners,
+		)),
+	)
+}
+
+// TestDkgExecutor_ReportQuarantinedSigners_CountsARepreservedSeatOnce proves
+// preserving the same output twice does not raise the count twice.
+//
+// The count is of preserved shares, not of preservations. One seat of one
+// wallet is one share however many times it is written — a retry, a second
+// interruption of the same ceremony — and a count that adds a share the
+// namespace holds one copy of describes a namespace this host does not have.
+func TestDkgExecutor_ReportQuarantinedSigners_CountsARepreservedSeatOnce(
+	t *testing.T,
+) {
+	de, result, gsr, _, _ := setupPreserveScenario(t)
+
+	recorder := newDispatchGaugeRecorder()
+	de.metricsRecorder = recorder
+
+	handle := &scanBudgetHandle{readableScans: 1}
+	for _, name := range []string{"/membership_1", "/membership_2"} {
+		if err := handle.Save([]byte("x"), "inherited-wallet", name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	de.signerQuarantine = newTestSignerQuarantine(handle, 1)
+
+	if err := de.reportInitialQuarantinedSigners(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The same wallet and the same seat, preserved twice while the namespace
+	// cannot be read back to settle what it holds.
+	preserveOneSigner(t, de, result, gsr, group.MemberIndex(1))
+	preserveOneSigner(t, de, result, gsr, group.MemberIndex(1))
+
+	testutils.AssertIntsEqual(
+		t,
+		"reported quarantined signers after re-preserving one seat",
+		3,
+		int(recorder.gauge(
+			clientinfo.MetricParticipationQuarantinedTBTCSigners,
+		)),
+	)
+}
+
+// scanBudgetHandle is a protected namespace that serves a fixed number of
+// enumerations and fails every one after that, as a namespace does when its
+// directory stops being readable while the process runs. Its writes always
+// succeed: what it models is a node that can still preserve material it can no
+// longer count.
+type scanBudgetHandle struct {
+	mockPersistenceHandle
+
+	readableScans int
+
+	mu    sync.Mutex
+	scans int
+}
+
+func (h *scanBudgetHandle) Save(
+	data []byte,
+	directory string,
+	name string,
+) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return h.mockPersistenceHandle.Save(data, directory, name)
+}
+
+func (h *scanBudgetHandle) ReadAll() (
+	<-chan persistence.DataDescriptor,
+	<-chan error,
+) {
+	h.mu.Lock()
+	h.scans++
+	readable := h.scans <= h.readableScans
+	saved := append([]persistence.DataDescriptor(nil), h.saved...)
+	h.mu.Unlock()
+
+	descriptors := make(chan persistence.DataDescriptor, len(saved))
+	errs := make(chan error, 1)
+
+	defer close(descriptors)
+	defer close(errs)
+
+	if !readable {
+		errs <- fmt.Errorf("the quarantine directory is unreadable")
+		return descriptors, errs
+	}
+
+	for _, descriptor := range saved {
+		descriptors <- descriptor
+	}
+
+	return descriptors, errs
+}
+
 // TestDkgExecutor_ReportInitialQuarantinedSigners_BlocksOnUnreadableNamespace
 // proves a process that cannot enumerate its quarantine namespace at startup
 // reports the failure to its caller and publishes no count at all.
@@ -1600,6 +1749,170 @@ func TestDkgExecutor_PreserveInterruptedSigner_CountsTheShareTheNamespaceTakesMi
 			outcomes,
 		)
 	}
+}
+
+// TestDkgExecutor_PreserveInterruptedSigner_WritesTheAuditRecordAheadOfAnyScan
+// proves the audit record is written without waiting on a namespace-wide read,
+// and that no such read happens until both halves of the output are down.
+//
+// The share and the record explaining it are written in one round, the share
+// first. Everything that runs between them delays the record, and a
+// namespace-wide read is the slowest thing a node does to that namespace: the
+// same directory trouble that makes an enumeration hang is what a preservation
+// is racing in the first place. A share whose record was held up behind a scan
+// is preserved material an offline audit cannot reconcile — the state this node
+// quiesces over — reached because of the count rather than because the
+// namespace refused the write.
+func TestDkgExecutor_PreserveInterruptedSigner_WritesTheAuditRecordAheadOfAnyScan(
+	t *testing.T,
+) {
+	de, result, gsr, _, _ := setupPreserveScenario(t)
+
+	recorder := newDispatchGaugeRecorder()
+	de.metricsRecorder = recorder
+
+	handle := &heldScanHandle{release: make(chan struct{})}
+	releaseScans := sync.OnceFunc(func() { close(handle.release) })
+	defer releaseScans()
+
+	de.signerQuarantine = newTestSignerQuarantine(handle, 1)
+
+	preserved := make(chan struct{})
+	go func() {
+		defer close(preserved)
+		de.preserveInterruptedSigner(
+			logger.With(),
+			newTestPermit(participation.TBTCDKG),
+			big.NewInt(1),
+			result,
+			group.MemberIndex(1),
+			gsr,
+			"tbtc_dkg_signer_activation",
+			fmt.Errorf("activation refused"),
+		)
+	}()
+
+	// Both halves must land while every enumeration this namespace is asked for
+	// is still held open. The bound decides how long the test waits for a write
+	// that is not blocked, never whether an unblocked implementation passes.
+	deadline := time.After(10 * time.Second)
+	for {
+		written := handle.written()
+		if reflect.DeepEqual(
+			written,
+			[]string{"/membership_1", "/metadata_1"},
+		) {
+			break
+		}
+
+		select {
+		case <-deadline:
+			t.Fatalf(
+				"the quarantine pair was not written while the namespace scan "+
+					"was held open; namespace holds %v",
+				written,
+			)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	releaseScans()
+	<-preserved
+
+	// The recount still happens — it is what brings the count back to what the
+	// namespace holds — but only once the output it is counting is complete.
+	if writes := handle.writesBeforeScans(); len(writes) == 0 {
+		t.Fatal("the namespace was never enumerated after the preservation")
+	} else {
+		for scan, written := range writes {
+			testutils.AssertIntsEqual(
+				t,
+				fmt.Sprintf("records written when enumeration %d began", scan+1),
+				2,
+				written,
+			)
+		}
+	}
+
+	testutils.AssertIntsEqual(
+		t,
+		"reported quarantined signers",
+		1,
+		int(recorder.gauge(
+			clientinfo.MetricParticipationQuarantinedTBTCSigners,
+		)),
+	)
+}
+
+// heldScanHandle is a protected namespace whose enumerations are all held open
+// until released, while its writes go through immediately — the shape of a
+// namespace whose directory listing hangs. It records how many records had been
+// written by the time each enumeration began, which is what says whether a
+// write was waiting behind a scan or the other way round.
+type heldScanHandle struct {
+	mockPersistenceHandle
+
+	release chan struct{}
+
+	mu               sync.Mutex
+	names            []string
+	writesAtScanTime []int
+}
+
+func (h *heldScanHandle) Save(
+	data []byte,
+	directory string,
+	name string,
+) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.names = append(h.names, name)
+
+	return h.mockPersistenceHandle.Save(data, directory, name)
+}
+
+func (h *heldScanHandle) written() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return append([]string(nil), h.names...)
+}
+
+func (h *heldScanHandle) writesBeforeScans() []int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return append([]int(nil), h.writesAtScanTime...)
+}
+
+func (h *heldScanHandle) ReadAll() (
+	<-chan persistence.DataDescriptor,
+	<-chan error,
+) {
+	h.mu.Lock()
+	h.writesAtScanTime = append(h.writesAtScanTime, len(h.names))
+	h.mu.Unlock()
+
+	descriptors := make(chan persistence.DataDescriptor)
+	errs := make(chan error)
+
+	go func() {
+		defer close(descriptors)
+		defer close(errs)
+
+		<-h.release
+
+		h.mu.Lock()
+		saved := append([]persistence.DataDescriptor(nil), h.saved...)
+		h.mu.Unlock()
+
+		for _, descriptor := range saved {
+			descriptors <- descriptor
+		}
+	}()
+
+	return descriptors, errs
 }
 
 // TestSignerQuarantine_Preserve_WritesOnlyTheHalfTheNamespaceLacks proves a

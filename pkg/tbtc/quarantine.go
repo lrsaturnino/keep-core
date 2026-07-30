@@ -158,6 +158,13 @@ type quarantineObserver struct {
 	// share the namespace already holds unreported for exactly as long as the
 	// metadata keeps being refused — the stale all-clear the count exists to
 	// prevent.
+	//
+	// It runs between the two writes of the round the material landed in, so
+	// it must do only what belongs on that path. Anything slow here — a
+	// namespace-wide read above all — delays the audit record that turns the
+	// preserved share into an explained one, and delays it for as long as
+	// whatever it waited on takes. Reconciliation that can wait belongs after
+	// preserve returns.
 	keyMaterialPreserved func()
 
 	// stillIncomplete is called once, after graceAttempts rounds have left a

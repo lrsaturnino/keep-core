@@ -102,7 +102,7 @@ type dkgExecutor struct {
 
 	// quarantineReportMutex serializes recounting the quarantine namespace and
 	// publishing the count, so concurrently preserving members cannot leave an
-	// older, lower count as the published one. It also guards the two fields
+	// older, lower count as the published one. It also guards the three fields
 	// below.
 	quarantineReportMutex sync.Mutex
 
@@ -113,9 +113,17 @@ type dkgExecutor struct {
 	// count must never fall below that.
 	preservedOutputFloor map[quarantinedSigner]struct{}
 
+	// lastScannedOutputs names what the last successful enumeration found. A
+	// quarantined output outlives the process that wrote it, so the material
+	// this process inherited is not its own to remember any other way, and
+	// dropping it the moment a scan fails would leave everything an earlier
+	// process preserved out of the count exactly when the namespace can no
+	// longer be asked about it.
+	lastScannedOutputs map[quarantinedSigner]struct{}
+
 	// lastPublishedQuarantineCount is the count that currently stands, so a
-	// failed recount can tell whether the floor it does know is already covered
-	// by the published number.
+	// failed recount can tell whether what it does know is already covered by
+	// the published number.
 	lastPublishedQuarantineCount int
 
 	// announcerMismatchLogLimiter bounds the volume of session-ID mismatch INFO
@@ -1155,8 +1163,14 @@ func (de *dkgExecutor) preserveInterruptedSigner(
 			// rather than from what preserve returns. A preservation whose
 			// other half keeps being refused runs until the process ends, so
 			// the return is not a moment this count can wait for.
+			//
+			// What runs here is only what this handoff can afford. The audit
+			// record is written next, in this same round, and enumerating the
+			// namespace between the two writes would put a namespace-wide read
+			// on the path of the one write that turns preserved material into
+			// explained material.
 			keyMaterialPreserved: func() {
-				de.accountForPreservedKeyMaterial(dkgLogger, signer)
+				de.accountForPreservedKeyMaterial(signer)
 			},
 			// Preservation keeps running behind this. It fires once the
 			// namespace has refused a half for longer than a passing fault
@@ -1172,6 +1186,16 @@ func (de *dkgExecutor) preserveInterruptedSigner(
 			},
 		},
 	)
+
+	// The preservation is over, so the namespace can be read without holding a
+	// write up behind it. What the write-time accounting published is a floor —
+	// what this process can vouch for — and this is where it is reconciled
+	// against what the namespace actually holds, which is the only reading that
+	// can bring the count back down once a seat has been activated or an
+	// operator has cleared a record.
+	if quarantineState.membershipPersisted {
+		de.reportQuarantinedSigners(dkgLogger)
+	}
 
 	// The terminal outcome, unlike the count, needs the whole pair. The
 	// metadata is what names the mode, canonical anchor, ceremony, seat, and
@@ -1209,15 +1233,31 @@ func (de *dkgExecutor) preserveInterruptedSigner(
 // and a share the namespace holds is one whether or not the record explaining
 // it landed — leaving it out until the pair completes would under-report exactly
 // the material a rollback most needs to find.
-func (de *dkgExecutor) accountForPreservedKeyMaterial(
-	dkgLogger log.StandardLogger,
-	signer *signer,
-) {
-	de.noteQuarantinedOutput(quarantinedSigner{
+//
+// The namespace is not enumerated here. This runs between the two writes of one
+// preservation round, and a scan that hangs there would hold up the audit record
+// the share still needs — the half whose absence leaves preserved material
+// unexplained. What it publishes instead is the floor this process can vouch
+// for without asking anyone: everything the last successful scan found plus
+// everything written since. That floor is never above the truth, so the reading
+// it leaves standing until the post-preservation recount cannot be an
+// all-clear.
+func (de *dkgExecutor) accountForPreservedKeyMaterial(signer *signer) {
+	de.quarantineReportMutex.Lock()
+	defer de.quarantineReportMutex.Unlock()
+
+	if de.preservedOutputFloor == nil {
+		de.preservedOutputFloor = make(map[quarantinedSigner]struct{})
+	}
+	// Keyed by wallet and seat, so preserving the same output twice — a retry,
+	// a second interruption of the same seat — names it once rather than
+	// counting the same share as two.
+	de.preservedOutputFloor[quarantinedSigner{
 		walletStorageKey: getWalletStorageKey(signer.wallet.publicKey),
 		memberIndex:      signer.signingGroupMemberIndex,
-	})
-	de.reportQuarantinedSigners(dkgLogger)
+	}] = struct{}{}
+
+	de.publishKnownFloorLocked()
 }
 
 // blockOnIncompleteQuarantine stops this node from beginning new ceremonies
@@ -1343,12 +1383,12 @@ func (de *dkgExecutor) reportInitialQuarantinedSigners() error {
 // from a later recount, so that failure is returned rather than decided here.
 //
 // A failed scan still publishes when this process knows more than the standing
-// count does. The namespace is the authority on the total, but the outputs this
-// process wrote are not in doubt: a share it persisted and has not activated is
-// held whatever the namespace can be read to say. Without that floor, a startup
-// that published zero followed by a first post-write scan that failed would
-// leave the zero standing over a namespace holding key material — the one
-// answer the count must never invent.
+// count does. The namespace is the authority on the total, but what a scan
+// already found and what this process wrote itself are not in doubt: a share
+// held and not activated stays held whatever the namespace can be read to say.
+// Without that floor, a startup that published zero followed by a first
+// post-write scan that failed would leave the zero standing over a namespace
+// holding key material — the one answer the count must never invent.
 //
 // The namespace is enumerated whether or not a recorder is configured. An
 // unreadable quarantine is a fault in its own right, and a node that only
@@ -1364,13 +1404,14 @@ func (de *dkgExecutor) publishQuarantinedSignerCount() error {
 
 	outputs, err := de.signerQuarantine.preservedOutputs()
 	if err != nil {
-		if floor := de.withheldCount(
-			de.preservedFloorLocked(),
-		); floor > de.lastPublishedQuarantineCount {
-			de.publishQuarantineCountLocked(floor)
-		}
+		de.publishKnownFloorLocked()
 
 		return err
+	}
+
+	de.lastScannedOutputs = make(map[quarantinedSigner]struct{}, len(outputs))
+	for _, output := range outputs {
+		de.lastScannedOutputs[output] = struct{}{}
 	}
 
 	de.publishQuarantineCountLocked(de.withheldCount(outputs))
@@ -1378,21 +1419,20 @@ func (de *dkgExecutor) publishQuarantinedSignerCount() error {
 	return nil
 }
 
-// noteQuarantinedOutput records key material this process durably wrote to the
-// quarantine namespace, so a later scan that cannot read the namespace still
-// reports at least what this process put there.
+// publishKnownFloorLocked publishes what this process can still account for
+// without reading the namespace, when the namespace is what it could not read.
+// The caller must hold quarantineReportMutex.
 //
-// Only a confirmed membership write belongs here. The audit metadata explains
-// preserved material; it is not the material, and a metadata-only record is a
-// share that was lost rather than one the count has to account for.
-func (de *dkgExecutor) noteQuarantinedOutput(output quarantinedSigner) {
-	de.quarantineReportMutex.Lock()
-	defer de.quarantineReportMutex.Unlock()
-
-	if de.preservedOutputFloor == nil {
-		de.preservedOutputFloor = make(map[quarantinedSigner]struct{})
+// It only ever raises the count. A floor is a lower bound — the namespace may
+// hold outputs neither the last scan nor this process saw — so letting it lower
+// a higher standing count would turn what could not be established into a
+// smaller number somebody reads as progress.
+func (de *dkgExecutor) publishKnownFloorLocked() {
+	if floor := de.withheldCount(
+		de.knownOutputsLocked(),
+	); floor > de.lastPublishedQuarantineCount {
+		de.publishQuarantineCountLocked(floor)
 	}
-	de.preservedOutputFloor[output] = struct{}{}
 }
 
 // withheldCount counts the preserved outputs whose seat this process has not
@@ -1413,11 +1453,33 @@ func (de *dkgExecutor) withheldCount(outputs []quarantinedSigner) int {
 	return withheld
 }
 
-// preservedFloorLocked lists the outputs this process persisted itself. The
-// caller must hold quarantineReportMutex.
-func (de *dkgExecutor) preservedFloorLocked() []quarantinedSigner {
-	outputs := make([]quarantinedSigner, 0, len(de.preservedOutputFloor))
+// knownOutputsLocked lists the preserved outputs this process can name without
+// reading the namespace: everything the last successful scan found together
+// with everything this process has persisted since. The caller must hold
+// quarantineReportMutex.
+//
+// Both are needed and neither is enough. The scan is the only account of what
+// earlier processes on this host left behind, and it says nothing about a share
+// written after it; this process's own writes say nothing about what it
+// inherited. Reporting either alone leaves out material that is on disk.
+//
+// The two overlap freely — a scan taken after a write finds that write — so
+// they are merged as identities rather than added as counts, and an output
+// named by both is one output.
+func (de *dkgExecutor) knownOutputsLocked() []quarantinedSigner {
+	known := make(
+		map[quarantinedSigner]struct{},
+		len(de.lastScannedOutputs)+len(de.preservedOutputFloor),
+	)
+	for output := range de.lastScannedOutputs {
+		known[output] = struct{}{}
+	}
 	for output := range de.preservedOutputFloor {
+		known[output] = struct{}{}
+	}
+
+	outputs := make([]quarantinedSigner, 0, len(known))
+	for output := range known {
 		outputs = append(outputs, output)
 	}
 
