@@ -2596,21 +2596,25 @@ func TestSignerQuarantine_PreservedOutputs_RestartSeesWhatEachWriteFailureLeft(
 		refusedNamePrefix string
 		expectedOutputs   int
 		expectedRecords   []string
+		expectedFailures  int
 	}{
 		"the metadata write is refused": {
 			refusedNamePrefix: "/metadata_",
 			expectedOutputs:   1,
 			expectedRecords:   []string{"/membership_1", "/handoff_1"},
+			expectedFailures:  0,
 		},
 		"the membership write is refused": {
 			refusedNamePrefix: "/membership_",
 			expectedOutputs:   1,
 			expectedRecords:   []string{"/metadata_1", "/handoff_1"},
+			expectedFailures:  0,
 		},
 		"every write is refused": {
 			refusedNamePrefix: "/",
 			expectedOutputs:   0,
 			expectedRecords:   []string{},
+			expectedFailures:  1,
 		},
 	}
 
@@ -2622,6 +2626,8 @@ func TestSignerQuarantine_PreservedOutputs_RestartSeesWhatEachWriteFailureLeft(
 				refusedNamePrefixes: []string{test.refusedNamePrefix},
 			}
 			de.signerQuarantine = newTestSignerQuarantine(handle, 1)
+			recorder := newDispatchGaugeRecorder()
+			de.metricsRecorder = recorder
 
 			preserveOneSigner(t, de, result, gsr, group.MemberIndex(1))
 
@@ -2645,6 +2651,16 @@ func TestSignerQuarantine_PreservedOutputs_RestartSeesWhatEachWriteFailureLeft(
 					test.expectedRecords,
 				)
 			}
+
+			testutils.AssertIntsEqual(
+				t,
+				"terminal quarantine-preservation failures",
+				test.expectedFailures,
+				int(recorder.counter(
+					clientinfo.
+						MetricParticipationTBTCQuarantinePreservationFailuresTotal,
+				)),
+			)
 		})
 	}
 }

@@ -58,41 +58,8 @@ on:
       probe_image_digest:
         description: "Immutable digest of the wget-carrying probe image every evidence reading is scraped with (repo@sha256:...); a mutable tag would leave the reading instrument outside the record's provenance"
         required: false
-      eth_ws_url:
-        description: "amd64 runner's isolated rehearsal-chain websocket endpoint"
-        required: false
-      eth_rpc_url:
-        description: "The same isolated amd64 chain's JSON-RPC endpoint. Every transaction a work driver reports is confirmed against it — mined, successful, and no later than the anchor claimed for the work it started — because an unconfirmed report is the driver's own account of itself"
-        required: false
-      cutover_block:
-        description: "Rehearsed cutover block C on the isolated amd64 chain"
-        required: false
-      chain_id:
-        description: "Numeric chain id of the amd64 rehearsal chain"
-        required: false
-      arm64_eth_ws_url:
-        description: "arm64 runner's isolated rehearsal-chain websocket endpoint; this chain must begin below its own C because every platform crosses C"
-        required: false
-      arm64_eth_rpc_url:
-        description: "JSON-RPC endpoint for the same isolated arm64 rehearsal chain"
-        required: false
-      arm64_cutover_block:
-        description: "Rehearsed cutover block C on the isolated arm64 chain"
-        required: false
-      arm64_chain_id:
-        description: "Numeric chain id of the isolated arm64 rehearsal chain"
-        required: false
-      arm64_v8_eth_ws_url:
-        description: "arm64/v8 runner's isolated rehearsal-chain websocket endpoint; required separately when provenance publishes both arm64 and arm64/v8"
-        required: false
-      arm64_v8_eth_rpc_url:
-        description: "JSON-RPC endpoint for the same isolated arm64/v8 rehearsal chain"
-        required: false
-      arm64_v8_cutover_block:
-        description: "Rehearsed cutover block C on the isolated arm64/v8 chain"
-        required: false
-      arm64_v8_chain_id:
-        description: "Numeric chain id of the isolated arm64/v8 rehearsal chain"
+      rehearsal_chain_inputs_b64:
+        description: "Base64 of one JSON object keyed by every published platform, each value exactly {eth_ws_url,eth_rpc_url,cutover_block,chain_id}. The platform job validates the one-to-one mapping against detached provenance and emits the values into the native-runner matrix; each platform needs its own isolated pre-C chain"
         required: false
       bitcoin_network:
         description: "Bitcoin network the rollback state audit reconciles against (e.g. testnet)"
@@ -403,6 +370,7 @@ jobs:
         id: matrix
         env:
           RECEIPT_DIR: ${{ runner.temp }}/rehearsal-evidence/attestation
+          REHEARSAL_CHAIN_INPUTS_B64: ${{ inputs.rehearsal_chain_inputs_b64 }}
         run: |
           provenance="$RECEIPT_DIR/release-provenance.json"
           if [ ! -f "$provenance" ]; then
@@ -422,27 +390,216 @@ jobs:
             amd64: {
               runner: "ubuntu-latest",
               artifact_key: "amd64",
-              eth_ws_input: "eth_ws_url",
-              eth_rpc_input: "eth_rpc_url",
-              cutover_input: "cutover_block",
-              chain_id_input: "chain_id",
             },
             arm64: {
               runner: "ubuntu-24.04-arm",
               artifact_key: "arm64",
-              eth_ws_input: "arm64_eth_ws_url",
-              eth_rpc_input: "arm64_eth_rpc_url",
-              cutover_input: "arm64_cutover_block",
-              chain_id_input: "arm64_chain_id",
             },
             "arm64/v8": {
               runner: "ubuntu-24.04-arm",
               artifact_key: "arm64-v8",
-              eth_ws_input: "arm64_v8_eth_ws_url",
-              eth_rpc_input: "arm64_v8_eth_rpc_url",
-              cutover_input: "arm64_v8_cutover_block",
-              chain_id_input: "arm64_v8_chain_id",
             },
+          };
+
+          const encoded = String(
+            process.env.REHEARSAL_CHAIN_INPUTS_B64 || ""
+          );
+          if (!encoded) {
+            console.error(
+              "BLOCKED: rehearsal_chain_inputs_b64 is absent; supply one " +
+                "base64-encoded platform-to-chain JSON document"
+            );
+            process.exit(3);
+          }
+          if (
+            !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/
+              .test(encoded)
+          ) {
+            console.error(
+              "BLOCKED: rehearsal_chain_inputs_b64 is not canonical base64"
+            );
+            process.exit(3);
+          }
+
+          const decoded = Buffer.from(encoded, "base64");
+          if (
+            decoded.toString("base64").replace(/=+$/, "") !==
+            encoded.replace(/=+$/, "")
+          ) {
+            console.error(
+              "BLOCKED: rehearsal_chain_inputs_b64 does not round-trip as " +
+                "canonical base64"
+            );
+            process.exit(3);
+          }
+
+          const decodedJSON = decoded.toString("utf8");
+          if (!Buffer.from(decodedJSON, "utf8").equals(decoded)) {
+            console.error(
+              "BLOCKED: rehearsal_chain_inputs_b64 is not valid UTF-8"
+            );
+            process.exit(3);
+          }
+          let chainInputs;
+          try {
+            chainInputs = JSON.parse(decodedJSON);
+          } catch (error) {
+            console.error(
+              "BLOCKED: rehearsal_chain_inputs_b64 does not decode to JSON: " +
+                error.message
+            );
+            process.exit(3);
+          }
+
+          // JSON.parse keeps only the final value of a duplicate object
+          // member. Scan the already-validated JSON text with one key set per
+          // object so neither a repeated platform nor a repeated chain field
+          // can silently overwrite the value a reviewer thought was supplied.
+          const containers = [];
+          const duplicateInputKeys = [];
+          for (let index = 0; index < decodedJSON.length; index++) {
+            const character = decodedJSON[index];
+            if (character === "\"") {
+              const start = index;
+              for (index++; index < decodedJSON.length; index++) {
+                if (decodedJSON[index] === "\\") {
+                  index++;
+                  continue;
+                }
+                if (decodedJSON[index] === "\"") break;
+              }
+              let next = index + 1;
+              while (/\s/.test(decodedJSON[next] || "")) next++;
+              if (decodedJSON[next] === ":") {
+                const key = JSON.parse(
+                  decodedJSON.slice(start, index + 1)
+                );
+                const keys = containers[containers.length - 1];
+                if (keys.has(key)) {
+                  duplicateInputKeys.push(key);
+                } else {
+                  keys.add(key);
+                }
+              }
+              continue;
+            }
+            if (character === "{") containers.push(new Set());
+            if (character === "[") containers.push(null);
+            if (character === "}" || character === "]") containers.pop();
+          }
+          if (duplicateInputKeys.length > 0) {
+            console.error(
+              "BLOCKED: the rehearsal chain-input document repeats " +
+                "object member(s) [" +
+                Array.from(new Set(duplicateInputKeys)).sort().join(", ") +
+                "]"
+            );
+            process.exit(3);
+          }
+
+          if (
+            !chainInputs ||
+            typeof chainInputs !== "object" ||
+            Array.isArray(chainInputs)
+          ) {
+            console.error(
+              "BLOCKED: the rehearsal chain-input document must be an " +
+                "object keyed by published platform"
+            );
+            process.exit(3);
+          }
+
+          const requiredChainFields = [
+            "chain_id",
+            "cutover_block",
+            "eth_rpc_url",
+            "eth_ws_url",
+          ];
+          const validateEndpoint = (platform, field, value, protocols) => {
+            if (
+              typeof value !== "string" ||
+              value.length === 0 ||
+              value.trim() !== value ||
+              /[\r\n\0]/.test(value)
+            ) {
+              console.error(
+                "BLOCKED: chain input [" + platform + "]." + field +
+                  " must be one nonempty endpoint string"
+              );
+              process.exit(3);
+            }
+            let endpoint;
+            try {
+              endpoint = new URL(value);
+            } catch (_) {
+              console.error(
+                "BLOCKED: chain input [" + platform + "]." + field +
+                  " is not a URL"
+              );
+              process.exit(3);
+            }
+            if (!protocols.includes(endpoint.protocol)) {
+              console.error(
+                "BLOCKED: chain input [" + platform + "]." + field +
+                  " uses protocol [" + endpoint.protocol + "], expected " +
+                  protocols.join(" or ")
+              );
+              process.exit(3);
+            }
+          };
+          const validateChain = (platform, chain) => {
+            if (!chain || typeof chain !== "object" || Array.isArray(chain)) {
+              console.error(
+                "BLOCKED: chain input [" + platform + "] must be an object"
+              );
+              process.exit(3);
+            }
+            const fields = Object.keys(chain).sort();
+            if (
+              fields.length !== requiredChainFields.length ||
+              fields.some(
+                (field, index) => field !== requiredChainFields[index]
+              )
+            ) {
+              console.error(
+                "BLOCKED: chain input [" + platform + "] must contain " +
+                  "exactly {" + requiredChainFields.join(",") + "}, got {" +
+                  fields.join(",") + "}"
+              );
+              process.exit(3);
+            }
+            validateEndpoint(
+              platform,
+              "eth_ws_url",
+              chain.eth_ws_url,
+              ["ws:", "wss:"]
+            );
+            validateEndpoint(
+              platform,
+              "eth_rpc_url",
+              chain.eth_rpc_url,
+              ["http:", "https:"]
+            );
+            if (
+              !Number.isSafeInteger(chain.cutover_block) ||
+              chain.cutover_block < 1
+            ) {
+              console.error(
+                "BLOCKED: chain input [" + platform +
+                  "].cutover_block must be a positive safe integer"
+              );
+              process.exit(3);
+            }
+            if (
+              typeof chain.chain_id !== "string" ||
+              !/^[1-9][0-9]*$/.test(chain.chain_id)
+            ) {
+              console.error(
+                "BLOCKED: chain input [" + platform +
+                  "].chain_id must be a positive decimal string"
+              );
+              process.exit(3);
+            }
           };
 
           const include = [];
@@ -466,7 +623,23 @@ jobs:
               );
               process.exit(3);
             }
-            include.push({ platform, ...config });
+            const chain = chainInputs[platform];
+            if (chain === undefined) {
+              console.error(
+                "BLOCKED: the rehearsal chain-input document has no entry " +
+                  "for published platform [" + platform + "]"
+              );
+              process.exit(3);
+            }
+            validateChain(platform, chain);
+            include.push({
+              platform,
+              ...config,
+              eth_ws_url: chain.eth_ws_url,
+              eth_rpc_url: chain.eth_rpc_url,
+              cutover_block: String(chain.cutover_block),
+              chain_id: chain.chain_id,
+            });
           }
           if (include.length === 0) {
             console.error(
@@ -474,6 +647,19 @@ jobs:
             );
             process.exit(3);
           }
+
+          const unpublishedInputs = Object.keys(chainInputs)
+            .filter((platform) => !seen.has(platform))
+            .sort();
+          if (unpublishedInputs.length > 0) {
+            console.error(
+              "BLOCKED: the rehearsal chain-input document contains " +
+                "unpublished platform(s) [" + unpublishedInputs.join(", ") +
+                "]; the mapping must match detached provenance one-to-one"
+            );
+            process.exit(3);
+          }
+
           fs.appendFileSync(
             outputPath,
             "matrix=" + JSON.stringify({ include }) + "\n"
@@ -499,10 +685,15 @@ jobs:
       PRIOR_IMAGE_DIGEST: ${{ inputs.prior_image_digest }}
       R1_IMAGE_DIGEST: ${{ inputs.r1_image_digest }}
       PROBE_IMAGE_DIGEST: ${{ inputs.probe_image_digest }}
-      ETH_WS_URL: ${{ inputs[matrix.eth_ws_input] }}
-      ETH_RPC_URL: ${{ inputs[matrix.eth_rpc_input] }}
-      CUTOVER_BLOCK: ${{ inputs[matrix.cutover_input] }}
-      CHAIN_ID: ${{ inputs[matrix.chain_id_input] }}
+      ETH_WS_URL: ${{ matrix.eth_ws_url }}
+      ETH_RPC_URL: ${{ matrix.eth_rpc_url }}
+      CUTOVER_BLOCK: ${{ matrix.cutover_block }}
+      CHAIN_ID: ${{ matrix.chain_id }}
+      # arm64 and arm64/v8 are separate published artifacts when both appear
+      # in provenance. Force Docker/Compose to resolve the exact matrix
+      # platform so two jobs on the same native runner do not silently execute
+      # the same child image.
+      DOCKER_DEFAULT_PLATFORM: linux/${{ matrix.platform }}
       KEEP_ETHEREUM_PASSWORD: ${{ secrets.REHEARSAL_KEEP_ETHEREUM_PASSWORD }}
       PR4109_BITCOIN_NETWORK: ${{ inputs.bitcoin_network }}
       PR4109_PRIOR_VERSION: ${{ inputs.prior_version }}

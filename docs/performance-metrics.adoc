@@ -349,11 +349,10 @@ anchor. These metrics are the evidence the cutover go/no-go and rollback
 decisions are made on: what format the node is issuing, what it is still running,
 and what it refused.
 
-Every metric below except the quarantined-signer gauge is registered at its zero
-value when the gate is constructed, so a scraper sees the complete set from
-process start and an absent metric means the gate is absent — not that nothing
-has happened yet. None of them carries an operator, session, wallet, or peer
-label.
+Every metric below is registered at its zero value with the fixed performance
+family, so a scraper sees the complete set from process start and an absent
+metric means the instrument is absent — not that nothing has happened yet. None
+of them carries an operator, session, wallet, or peer label.
 
 ==== `performance_participation_gate_state`
 *Type*: Gauge
@@ -440,9 +439,19 @@ label.
 *Description*: Permits still held when the shutdown deadline expired and were canceled by it
 *Labels*: None
 
+==== `performance_participation_tbtc_quarantine_preservation_failures_total`
+*Type*: Counter
+*Description*: tBTC signer-output quarantine attempts that reached the end of the process lifetime without persisting a complete output. Unlike the quarantined-signer gauge, this counter also moves when the protected namespace refuses every write and therefore retains no share for the offline audit to enumerate. A nonzero value blocks rollback acceptance
+*Labels*: None
+
+==== `performance_participation_beacon_quarantine_preservation_failures_total`
+*Type*: Counter
+*Description*: Beacon signer-output quarantine attempts that reached the end of the process lifetime without persisting a complete output. It is the fleet-visible account of generated beacon key material whose protected namespace retained no complete, auditable copy. A nonzero value blocks rollback acceptance
+*Labels*: None
+
 ==== `performance_participation_quarantined_tbtc_signers`
 *Type*: Gauge
-*Description*: tBTC signer outputs held in the protected quarantine namespace that this process has not activated in its wallet cache — generated key material a gate refusal preserved, which a rollback still has to account for. Published by tBTC rather than by the gate, and recounted from the namespace, so it covers what earlier processes on the host preserved and not only this one's. A node running no tBTC does not expose it
+*Description*: tBTC signer outputs held in the protected quarantine namespace that this process has not activated in its wallet cache — generated key material a gate refusal preserved, which a rollback still has to account for. Published by tBTC rather than by the gate, and recounted from the namespace, so it covers what earlier processes on the host preserved and not only this one's. It remains at its pre-registered zero on a process running no tBTC
 *Labels*: None
 
 ==== `performance_heartbeat_penalty_suppressed_total`

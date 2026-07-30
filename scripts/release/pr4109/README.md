@@ -1509,12 +1509,45 @@ outside this repository, and arrives the same way. The dispatch inputs name
 the artifacts and the chain: the prior, R1, and probe digests (all three
 immutable — every evidence reading is a scrape through the probe, so a
 mutable probe tag would leave the reading instrument outside the record's
-provenance), the rehearsal chain's websocket endpoint and numeric chain id,
-its JSON-RPC endpoint — the one every transaction a driver reports is
-confirmed against, and which preflight refuses unless it answers with the
-rehearsed chain id — the rehearsed `C`, with a separate endpoint/C/id tuple for
-each published platform, and the Bitcoin network, prior version, and prior
-revision the rollback state audit binds its verdict to. The
+provenance), the Bitcoin network, and the prior version/revision the rollback
+state audit binds its verdict to.
+
+All platform chain coordinates travel in the single
+`rehearsal_chain_inputs_b64` dispatch input. Decode it as one JSON object whose
+keys match detached provenance one-to-one and whose values contain exactly
+`eth_ws_url`, `eth_rpc_url`, `cutover_block`, and `chain_id`; `cutover_block`
+is a positive JSON integer and `chain_id` is a positive decimal string. For
+example, prepare (with real isolated endpoints):
+
+```json
+{
+  "amd64": {
+    "eth_ws_url": "wss://chain-amd64.invalid/ws",
+    "eth_rpc_url": "https://chain-amd64.invalid/rpc",
+    "cutover_block": 124000,
+    "chain_id": "1337"
+  }
+}
+```
+
+Then encode the document as one base64 line. The matrix builder refuses
+missing, extra, malformed, or duplicate platform entries — and duplicate
+fields inside an entry — before it schedules a native runner. This one
+structured input removes the workflow dispatch input ceiling: adding a
+reviewed platform requires a runner mapping and one document member, not four
+new top-level inputs. Every platform still needs its own chain beginning below
+its own `C`; the JSON-RPC endpoint is where every transaction a driver reports
+is confirmed and preflight requires it to answer with the recorded chain id.
+
+`arm64` and `arm64/v8` are distinct coverage slots when detached provenance
+publishes both. They therefore owe two single-release and two rollback records,
+two isolated chains, and separate keystore/trust subtrees (`arm64` and
+`arm64-v8`) even though both jobs use `ubuntu-24.04-arm`. The workflow sets
+`DOCKER_DEFAULT_PLATFORM` to the exact provenance platform so those jobs
+cannot both resolve and rehearse the same child image. A release that intends
+one arm64 artifact should publish one spelling, not duplicate it under both.
+
+The
 `REHEARSAL_CHAIN_INPUTS_BUNDLE_B64` secret carries two executables, not data:
 a base64-encoded tar.gz holding `work-driver` — called with the phase name,
 because the fleet only reacts to chain events and without something
@@ -1913,6 +1946,19 @@ release has instead is detection — a torn document fails the encrypted
 handle's authentication, so the offline state audit reads it as an unreadable
 record and blocks rather than any reader taking it for a preserved output.
 Detection is not preservation: the audit reports the loss it cannot undo.
+
+A namespace that refuses every membership, metadata, and combined-handoff
+write is the still narrower failure: no document survives for the offline
+audit to discover, and the tBTC quarantined-signer gauge correctly remains
+zero because the namespace retained no signer. The node now publishes that
+attempt separately. Every incomplete tBTC preservation increments
+`performance_participation_tbtc_quarantine_preservation_failures_total`, and
+the beacon path mirrors it with
+`performance_participation_beacon_quarantine_preservation_failures_total`.
+Both counters are pre-registered at zero. The rollback rehearsal samples them
+while each candidate drains and refuses a nonzero or unreadable value; zero
+means the node reported no terminal preservation failure, not that a missing
+share was counted as an empty quarantine.
 
 Two things would close it, and both are decisions rather than oversights. A
 `keep-common` change making `Write` write-temp-sync-rename-sync-dir is the

@@ -22,6 +22,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/beacon/event"
 	"github.com/keep-network/keep-core/pkg/beacon/registry"
 	"github.com/keep-network/keep-core/pkg/chain"
+	"github.com/keep-network/keep-core/pkg/clientinfo"
 	"github.com/keep-network/keep-core/pkg/generator"
 	"github.com/keep-network/keep-core/pkg/net"
 	"github.com/keep-network/keep-core/pkg/protocol/compatibility"
@@ -46,6 +47,12 @@ type node struct {
 	// interrupted before an accepted on-chain publication was observed. It
 	// writes to a dedicated protected namespace outside the active-group scan.
 	signerQuarantine *registry.Quarantine
+
+	// metricsRecorder publishes the fixed participation family shared with the
+	// cutover gate. In particular, it records a terminal quarantine
+	// preservation failure even when the namespace retained no share for the
+	// offline audit to enumerate.
+	metricsRecorder participation.GateMetricsRecorder
 }
 
 func beaconDKGPermitIdentity(
@@ -88,6 +95,7 @@ func newNode(
 	scheduler *generator.Scheduler,
 	participationGate participation.Gate,
 	signerQuarantine *registry.Quarantine,
+	metricsRecorder participation.GateMetricsRecorder,
 ) *node {
 	latch := generator.NewProtocolLatch()
 	scheduler.RegisterProtocol(latch)
@@ -99,6 +107,7 @@ func newNode(
 		protocolLatch:     latch,
 		participationGate: participationGate,
 		signerQuarantine:  signerQuarantine,
+		metricsRecorder:   metricsRecorder,
 	}
 }
 
@@ -458,6 +467,19 @@ func (n *node) quarantineSigner(
 			)
 		},
 	)
+
+	// The quarantine namespace may refuse every form of the output. In that
+	// case no audit record survives and the ordinary preserved-output reading
+	// remains indistinguishable from a node that quarantined nothing. Publish
+	// one terminal failure when the retry ends incomplete; a transient failure
+	// that recovers before Preserve returns does not increment the counter.
+	if err != nil && n.metricsRecorder != nil {
+		n.metricsRecorder.IncrementCounter(
+			clientinfo.
+				MetricParticipationBeaconQuarantinePreservationFailuresTotal,
+			1,
+		)
+	}
 
 	// The terminal outcome needs the whole output. The audit record is what
 	// names the mode, canonical anchor, ceremony, seat, and refused operation of

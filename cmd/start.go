@@ -348,6 +348,7 @@ func start(cmd *cobra.Command) error {
 			beaconQuarantinePersistence,
 			scheduler,
 			participationGate,
+			gateMetrics,
 		)
 		if err != nil {
 			return fmt.Errorf("error initializing beacon: [%v]", err)

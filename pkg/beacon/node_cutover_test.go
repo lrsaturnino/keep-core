@@ -305,6 +305,7 @@ func newCutoverNodeHarness(
 		generator.StartScheduler(),
 		gate,
 		signerQuarantine,
+		gateMetrics,
 	)
 
 	return &cutoverNodeHarness{
@@ -1281,6 +1282,16 @@ func TestJoinDKGIfEligible_LostShareQuiescesTheNode(t *testing.T) {
 
 	if got := refusing.savesContaining("/membership_"); got != 0 {
 		t.Errorf("expected no membership to be accepted, got [%d]", got)
+	}
+	if got := harness.gateMetrics.counter(
+		clientinfo.
+			MetricParticipationBeaconQuarantinePreservationFailuresTotal,
+	); got != float64(harness.groupSize) {
+		t.Errorf(
+			"beacon quarantine-preservation failures = [%v], expected [%d]",
+			got,
+			harness.groupSize,
+		)
 	}
 	testutils.AssertBoolsEqual(
 		t,

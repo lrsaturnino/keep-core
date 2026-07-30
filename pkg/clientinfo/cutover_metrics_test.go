@@ -27,6 +27,8 @@ func TestCutoverMetrics_ExactExportedNames(t *testing.T) {
 		{MetricAnnouncerLegacyPeerRosterRevision, "performance_announcer_legacy_peer_roster_revision"},
 		{MetricAnnouncerLegacyPeerAdditionsTotal, "performance_announcer_legacy_peer_additions_total"},
 		{MetricAnnouncerLegacyPeerEvictionsTotal, "performance_announcer_legacy_peer_evictions_total"},
+		{MetricParticipationTBTCQuarantinePreservationFailuresTotal, "performance_participation_tbtc_quarantine_preservation_failures_total"},
+		{MetricParticipationBeaconQuarantinePreservationFailuresTotal, "performance_participation_beacon_quarantine_preservation_failures_total"},
 	}
 
 	for _, c := range cases {
@@ -120,6 +122,8 @@ var participationMetricFamily = []string{
 	MetricParticipationClockAbortsTotal,
 	MetricParticipationQuiesceTotal,
 	MetricParticipationQuiesceForcedAbortsTotal,
+	MetricParticipationTBTCQuarantinePreservationFailuresTotal,
+	MetricParticipationBeaconQuarantinePreservationFailuresTotal,
 	MetricParticipationQuarantinedTBTCSigners,
 }
 
@@ -204,5 +208,34 @@ func TestParticipationMetrics_QuarantinedSignersRegisteredAtZero(t *testing.T) {
 		MetricParticipationQuarantinedTBTCSigners,
 	); got != 2 {
 		t.Errorf("quarantined-signer gauge = %v after update, want 2", got)
+	}
+}
+
+// TestParticipationMetrics_QuarantinePreservationFailuresRegisteredAtZero
+// proves both protocol-specific failure counters are present before a
+// quarantine attempt. Zero must be a published reading rather than an absent
+// series: the rollback gate distinguishes "no preservation failed" from "this
+// node never reported whether preservation failed".
+func TestParticipationMetrics_QuarantinePreservationFailuresRegisteredAtZero(
+	t *testing.T,
+) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	registry := &Registry{keepclientinfo.NewRegistry(), ctx}
+	pm := NewPerformanceMetrics(ctx, registry)
+
+	for _, name := range []string{
+		MetricParticipationTBTCQuarantinePreservationFailuresTotal,
+		MetricParticipationBeaconQuarantinePreservationFailuresTotal,
+	} {
+		if got := pm.GetCounterValue(name); got != 0 {
+			t.Errorf("quarantine-preservation counter %q = %v at startup, want 0", name, got)
+		}
+
+		pm.IncrementCounter(name, 1)
+		if got := pm.GetCounterValue(name); got != 1 {
+			t.Errorf("quarantine-preservation counter %q = %v after increment, want 1", name, got)
+		}
 	}
 }

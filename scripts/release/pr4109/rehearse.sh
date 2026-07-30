@@ -3898,6 +3898,8 @@ PARTICIPATION_METRICS=(
   participation_clock_aborts_total
   participation_quiesce_total
   participation_quiesce_forced_aborts_total
+  participation_tbtc_quarantine_preservation_failures_total
+  participation_beacon_quarantine_preservation_failures_total
   participation_quarantined_tbtc_signers
 )
 
@@ -9729,6 +9731,7 @@ ROLLBACK_ORIGINATED=""
 ROLLBACK_INFLIGHT=""
 ROLLBACK_DRAIN_RC=""
 ROLLBACK_GRACE=""
+ROLLBACK_QUARANTINE_PRESERVATION_FAILURES=""
 # The kinds of work a rollback has to be authorized over, both in flight at
 # once. A rollback decision is taken over a fleet that was holding whatever it
 # was holding, and the two classes fail differently under an interrupted
@@ -9737,6 +9740,59 @@ ROLLBACK_GRACE=""
 # that only ever held one class evidences the rollback path for that class and
 # says nothing about the other, and a permit total cannot tell them apart.
 ROLLBACK_REQUIRED_CLASSES="threshold_ceremony bitcoin_action"
+
+rollback_quarantine_preservation_verdict() {
+  local step="quarantine preservation failures remain zero through quiescence"
+  local assertion="rollback quiescence loses no generated signer output to \
+an unwritable quarantine namespace"
+  local service tbtc_failures beacon_failures nodes=0
+  local unread="" failed=""
+
+  while read -r service tbtc_failures beacon_failures; do
+    [[ -n "${service}" ]] || continue
+    nodes=$((nodes + 1))
+
+    if [[ ! "${tbtc_failures}" =~ ^[0-9]+$ ]] ||
+      [[ ! "${beacon_failures}" =~ ^[0-9]+$ ]]; then
+      unread="${unread}${unread:+, }${service} (tBTC \
+${tbtc_failures}, beacon ${beacon_failures})"
+      continue
+    fi
+
+    STEP_GAUGES="${STEP_GAUGES}${STEP_GAUGES:+,}\
+\"${service}.participation_tbtc_quarantine_preservation_failures_total\":\
+${tbtc_failures},\
+\"${service}.participation_beacon_quarantine_preservation_failures_total\":\
+${beacon_failures}"
+
+    if ((tbtc_failures > 0 || beacon_failures > 0)); then
+      failed="${failed}${failed:+, }${service} (tBTC ${tbtc_failures}, \
+beacon ${beacon_failures})"
+    fi
+  done <<<"${ROLLBACK_QUARANTINE_PRESERVATION_FAILURES}"
+
+  if ((nodes == 0)); then
+    block_step "${step}" "no R1 node's quarantine-preservation counters were \
+captured while the fleet drained; an absent reading cannot say that no \
+generated share was lost"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ -n "${unread}" ]]; then
+    block_step "${step}" "the terminal quarantine-preservation counters were \
+unreadable on ${unread}; zero must be a node-authored reading, not the value \
+assigned to a node that stopped answering"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ -n "${failed}" ]]; then
+    record_step "${step}" fail "generated signer output did not reach a \
+complete protected quarantine on ${failed}; no offline audit can recover a \
+share the namespace retained nowhere"
+    record_assertion "${assertion}" false "${step}"
+  else
+    record_step "${step}" pass "every R1 node reported zero terminal tBTC and \
+beacon quarantine-preservation failures through its last readable drain \
+sample"
+    record_assertion "${assertion}" true "${step}"
+  fi
+}
 
 rollback_drain_verdict() {
   local step="quiesce every R1 node with work represented"
@@ -11695,6 +11751,7 @@ nowhere to capture them to"
   # node held to what became of them, and the reconciliation below is about
   # each permit rather than about the size of the population.
   local held_at_stop=() forced_before=() forced_after=() final_active=()
+  local tbtc_preservation_failures=() beacon_preservation_failures=()
   local authored_endings=()
   local svc reading
   for svc in "${REHEARSAL_R1_SERVICES[@]}"; do
@@ -11717,6 +11774,18 @@ nowhere to capture them to"
     [[ "${reading}" =~ ^[0-9]+$ ]] || reading="unreadable"
     forced_before+=("${reading}")
     forced_after+=("${reading}")
+
+    reading="$(metric_value "${svc}" \
+      participation_tbtc_quarantine_preservation_failures_total \
+      2>/dev/null || printf 'unreadable')"
+    [[ "${reading}" =~ ^[0-9]+$ ]] || reading="unreadable"
+    tbtc_preservation_failures+=("${reading}")
+
+    reading="$(metric_value "${svc}" \
+      participation_beacon_quarantine_preservation_failures_total \
+      2>/dev/null || printf 'unreadable')"
+    [[ "${reading}" =~ ^[0-9]+$ ]] || reading="unreadable"
+    beacon_preservation_failures+=("${reading}")
   done
 
   # The grace comes out of the reviewed manifest, which the Go drift test
@@ -11770,7 +11839,8 @@ nowhere to capture them to"
     # closes its last permit and exits: asked separately it answers the count
     # and not the endings, and the reconciliation would then read a drained
     # node beside the ending list from before that permit closed.
-    local idx=0 snapshot_now active_now forced_now
+    local idx=0 snapshot_now active_now forced_now tbtc_failure_now
+    local beacon_failure_now
     for svc in "${REHEARSAL_R1_SERVICES[@]}"; do
       if snapshot_now="$(service_gate_snapshot "${svc}" \
         active_security_v2_ceremonies 2>/dev/null)"; then
@@ -11788,6 +11858,20 @@ nowhere to capture them to"
         participation_quiesce_forced_aborts_total 2>/dev/null || printf '')"
       if [[ "${forced_now}" =~ ^[0-9]+$ ]]; then
         forced_after[idx]="${forced_now}"
+      fi
+
+      tbtc_failure_now="$(metric_value "${svc}" \
+        participation_tbtc_quarantine_preservation_failures_total \
+        2>/dev/null || printf '')"
+      if [[ "${tbtc_failure_now}" =~ ^[0-9]+$ ]]; then
+        tbtc_preservation_failures[idx]="${tbtc_failure_now}"
+      fi
+
+      beacon_failure_now="$(metric_value "${svc}" \
+        participation_beacon_quarantine_preservation_failures_total \
+        2>/dev/null || printf '')"
+      if [[ "${beacon_failure_now}" =~ ^[0-9]+$ ]]; then
+        beacon_preservation_failures[idx]="${beacon_failure_now}"
       fi
       idx=$((idx + 1))
     done
@@ -11811,6 +11895,7 @@ nowhere to capture them to"
   # not permits this drain force-canceled.
   ROLLBACK_NODE_ACCOUNTS=""
   ROLLBACK_NODE_ENDINGS=""
+  ROLLBACK_QUARANTINE_PRESERVATION_FAILURES=""
   local pos=0 forced_delta
   for svc in "${REHEARSAL_R1_SERVICES[@]}"; do
     if [[ "${forced_before[${pos}]}" =~ ^[0-9]+$ ]] &&
@@ -11827,11 +11912,19 @@ ${forced_delta} ${final_active[${pos}]}"
     # endings carry spaces, and the accounting is read field by field.
     ROLLBACK_NODE_ENDINGS="${ROLLBACK_NODE_ENDINGS}\
 ${ROLLBACK_NODE_ENDINGS:+$'\n'}${svc} ${authored_endings[${pos}]}"
+    ROLLBACK_QUARANTINE_PRESERVATION_FAILURES="\
+${ROLLBACK_QUARANTINE_PRESERVATION_FAILURES}\
+${ROLLBACK_QUARANTINE_PRESERVATION_FAILURES:+$'\n'}${svc} \
+${tbtc_preservation_failures[${pos}]} \
+${beacon_preservation_failures[${pos}]}"
     pos=$((pos + 1))
   done
 
   ROLLBACK_DRAIN_RC="${drain_rc}"
   rollback_drain_verdict
+
+  begin_step "quarantine preservation failures remain zero through quiescence"
+  rollback_quarantine_preservation_verdict
 
   begin_step "no prior binary starts during quiescence"
   prior_absence_verdict "no prior binary starts during quiescence" \
@@ -12210,8 +12303,14 @@ actually built or re-run the local-proofs stage at the commit it names"
   ATTESTED_PROVENANCE_IMAGES="$(node -e '
     const fs = require("fs");
     const doc = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    if (!Array.isArray(doc.images) || doc.images.length === 0) {
+      console.error(
+        "the detached release provenance publishes no runtime image"
+      );
+      process.exit(1);
+    }
     const images = {};
-    for (const image of doc.images || []) {
+    for (const image of doc.images) {
       images[String(image.platform)] = String(image.reference);
     }
     process.stdout.write(JSON.stringify(images));
@@ -12692,6 +12791,7 @@ evidence_acceptance_findings() {
       rollback: {
         stages: [
           "quiesce every R1 node with work represented",
+          "quarantine preservation failures remain zero through quiescence",
           "no prior binary starts during quiescence",
           "a forced deadline quarantines rather than completing",
           "every release candidate is stopped or network-quarantined",
@@ -12707,6 +12807,12 @@ evidence_acceptance_findings() {
             name:
               "every R1 node drains to a stop within the reviewed termination grace",
             stage: "quiesce every R1 node with work represented",
+          },
+          {
+            name:
+              "rollback quiescence loses no generated signer output to an unwritable quarantine namespace",
+            stage:
+              "quarantine preservation failures remain zero through quiescence",
           },
           {
             name:
@@ -12806,6 +12912,53 @@ evidence_acceptance_findings() {
         add("refuted", "step " + JSON.stringify(name));
       } else if (stage.outcome === "blocked") {
         add("unrehearsed", "step " + JSON.stringify(name));
+      }
+    }
+
+    if (record.gate === "rollback") {
+      const preservationStageName =
+        "quarantine preservation failures remain zero through quiescence";
+      const preservationStage = stageByName.get(preservationStageName) || {};
+      const gauges =
+        preservationStage.gauges &&
+        typeof preservationStage.gauges === "object" &&
+        !Array.isArray(preservationStage.gauges)
+          ? preservationStage.gauges
+          : {};
+      // The reviewed compose harness has exactly these two R1 services.
+      // Requiring each name prevents the zero from one healthy node from
+      // standing in for another node that stopped answering before it
+      // published whether quarantine preservation failed.
+      const expectedServices = ["r1-node-1", "r1-node-2"];
+      for (const metric of [
+        "participation_tbtc_quarantine_preservation_failures_total",
+        "participation_beacon_quarantine_preservation_failures_total",
+      ]) {
+        for (const service of expectedServices) {
+          const name = service + "." + metric;
+          if (!Object.prototype.hasOwnProperty.call(gauges, name)) {
+            add(
+              "unrehearsed",
+              "rollback step " + JSON.stringify(preservationStageName) +
+                " carries no fleet reading of " + JSON.stringify(name)
+            );
+            continue;
+          }
+          const value = gauges[name];
+          if (!Number.isFinite(value)) {
+            add(
+              "unrehearsed",
+              "rollback quarantine-preservation reading " +
+                JSON.stringify(name) + " is not numeric"
+            );
+          } else if (value !== 0) {
+            add(
+              "refuted",
+              "rollback quarantine-preservation reading " +
+                JSON.stringify(name) + " is " + value + ", not zero"
+            );
+          }
+        }
       }
     }
 

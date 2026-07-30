@@ -1190,6 +1190,20 @@ func (de *dkgExecutor) preserveInterruptedSigner(
 		},
 	)
 
+	// A failed preservation must have a fleet-readable account of its own.
+	// The quarantined-signer gauge counts only key material the namespace
+	// actually holds, so a namespace refusing every write leaves that gauge at
+	// the same zero as a node that never attempted quarantine. This counter is
+	// recorded exactly once, when preservation returns incomplete at the end
+	// of the process lifetime; transient write failures that recover during
+	// the retry do not increment it.
+	if quarantineErr != nil && de.metricsRecorder != nil {
+		de.metricsRecorder.IncrementCounter(
+			clientinfo.MetricParticipationTBTCQuarantinePreservationFailuresTotal,
+			1,
+		)
+	}
+
 	// The preservation is over, so the namespace can be read without holding a
 	// write up behind it. What the write-time accounting published is a floor —
 	// what this process can vouch for — and this is where it is reconciled

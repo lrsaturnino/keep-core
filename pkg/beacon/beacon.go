@@ -35,6 +35,11 @@ const ProtocolName = "beacon"
 // beacon ceremony's protocol mode must derive from a permit issued by the
 // shared gate.
 //
+// The metrics recorder is the same fixed participation recorder supplied to
+// the gate. It remains non-nil when client-info is disabled (as a no-op sink),
+// so the beacon quarantine path never needs an optional instrumentation
+// branch in production.
+//
 // The quarantine persistence must be a dedicated protected namespace that no
 // release's active-group scan reads: it preserves signer outputs whose
 // completion the gate interrupted before an accepted on-chain publication was
@@ -47,9 +52,13 @@ func Initialize(
 	quarantinePersistence persistence.ProtectedHandle,
 	scheduler *generator.Scheduler,
 	participationGate participation.Gate,
+	metricsRecorder participation.GateMetricsRecorder,
 ) error {
 	if participationGate == nil {
 		return fmt.Errorf("the participation gate is required")
+	}
+	if metricsRecorder == nil {
+		return fmt.Errorf("the participation metrics recorder is required")
 	}
 	if quarantinePersistence == nil {
 		return fmt.Errorf("the signer quarantine persistence is required")
@@ -71,6 +80,7 @@ func Initialize(
 		scheduler,
 		participationGate,
 		signerQuarantine,
+		metricsRecorder,
 	)
 
 	err := sortition.MonitorPool(

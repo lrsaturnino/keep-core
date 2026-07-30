@@ -197,6 +197,12 @@ SINGLE_RELEASE_ASSERTIONS='
   { "assertion": "a finished cutover rehearsal leaves no candidate able to act", "holds": true, "evidence_stage": "the cutover fleet leaves no release candidate running" }'
 ROLLBACK_STAGES='
   { "name": "quiesce every R1 node with work represented", "outcome": "pass" },
+  { "name": "quarantine preservation failures remain zero through quiescence", "outcome": "pass", "gauges": {
+      "r1-node-1.participation_tbtc_quarantine_preservation_failures_total": 0,
+      "r1-node-1.participation_beacon_quarantine_preservation_failures_total": 0,
+      "r1-node-2.participation_tbtc_quarantine_preservation_failures_total": 0,
+      "r1-node-2.participation_beacon_quarantine_preservation_failures_total": 0
+    } },
   { "name": "no prior binary starts during quiescence", "outcome": "pass" },
   { "name": "a forced deadline quarantines rather than completing", "outcome": "pass" },
   { "name": "every release candidate is stopped or network-quarantined", "outcome": "pass" },
@@ -208,6 +214,7 @@ ROLLBACK_STAGES='
   { "name": "the prior binary loads and signs with a wallet created after C", "outcome": "pass" }'
 ROLLBACK_ASSERTIONS='
   { "assertion": "every R1 node drains to a stop within the reviewed termination grace", "holds": true, "evidence_stage": "quiesce every R1 node with work represented" },
+  { "assertion": "rollback quiescence loses no generated signer output to an unwritable quarantine namespace", "holds": true, "evidence_stage": "quarantine preservation failures remain zero through quiescence" },
   { "assertion": "no prior binary participates before every R1 node is down", "holds": true, "evidence_stage": "no prior binary starts during quiescence" },
   { "assertion": "all R1 is down or quarantined before any prior binary participates", "holds": true, "evidence_stage": "every release candidate is stopped or network-quarantined" },
   { "assertion": "the offline state audit passes before rollback", "holds": true, "evidence_stage": "offline state audit produces a rollback-safe manifest" },
@@ -574,6 +581,21 @@ run_validator "${D}"
 check "a ready receipt carrying no detached provenance is refused" 3 \
   "carries no detached release provenance" "outside the checkout"
 
+# A present provenance document with an empty reviewed image set is not a
+# release artifact identity. The producer schema already refuses it; the
+# archive validator states the same boundary explicitly instead of relying on
+# every possible record to disagree with an empty map.
+D="${WORK}/provenance-with-empty-image-set"
+mkdir -p "${D}"
+write_attestation "${D}" "${MANIFEST_SHA}" "${TEST_DIR}/release-manifest.json" \
+  "${FIXTURE_SHA}" "yes" "${MANIFEST_SHA}" "${FIXTURE_SHA}" "[]"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+run_validator_as_is "${D}"
+check "provenance publishing no runtime image is explicitly refused" 3 \
+  "detached release provenance publishes no runtime image" \
+  "cannot read the image set from the detached release provenance"
+
 # Provenance taken over some other reviewed manifest describes an artifact
 # built under bounds these records were never measured against. The hash is
 # what tells the two apart; without this comparison any provenance naming the
@@ -743,6 +765,34 @@ write_record "${D}/rollback.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
 run_validator_as_is "${D}"
 check "a gate that skipped a platform the other gate covered is refused" 3 \
   "the rollback gate evidences \[${FIXTURE_R1_PLATFORMS[0]}\] and not \[${FIXTURE_R1_PLATFORMS[1]}\]"
+
+# arm64 and arm64/v8 can resolve on the same native runner, but provenance
+# naming both publishes two artifact slots. The archive must not normalize one
+# away: each gate owes a record for each exact platform spelling.
+D="${WORK}/coverage-arm64-variant-is-distinct"
+mkdir -p "${D}"
+ARM_VARIANT_IMAGES="$(
+  printf '[{"platform": "arm64", "reference": "%s", "digest": "%s"},
+    {"platform": "arm64/v8", "reference": "%s", "digest": "%s"}]' \
+    "${FIXTURE_R1_REFERENCE}" "${FIXTURE_R1_DIGEST}" \
+    "${FIXTURE_R1_REFERENCE}" "${FIXTURE_R1_DIGEST}"
+)"
+write_attestation "${D}" "${MANIFEST_SHA}" "${TEST_DIR}/release-manifest.json" \
+  "${FIXTURE_SHA}" "yes" "${MANIFEST_SHA}" "${FIXTURE_SHA}" \
+  "${ARM_VARIANT_IMAGES}"
+write_record "${D}/single-release.json" "${MANIFEST_SHA}" \
+  "${MANIFEST_GRACE}" "2026-07-28T00:00:00Z" "${FIXTURE_SHA}" \
+  "${SINGLE_RELEASE_STAGES}" "${SINGLE_RELEASE_ASSERTIONS}" \
+  "single_release" \
+  "$(printf '{"arm64": "%s"}' "${FIXTURE_R1_REFERENCE}")"
+write_record "${D}/rollback.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T01:00:00Z" "${FIXTURE_SHA}" "${ROLLBACK_STAGES}" \
+  "${ROLLBACK_ASSERTIONS}" "rollback" \
+  "$(printf '{"arm64": "%s"}' "${FIXTURE_R1_REFERENCE}")"
+run_validator_as_is "${D}"
+check "arm64 does not cover a separately published arm64/v8 artifact" 3 \
+  "single_release gate evidences \[arm64\] and not \[arm64/v8\]" \
+  "rollback gate evidences \[arm64\] and not \[arm64/v8\]"
 
 # A gate that is absent altogether used to disappear from the coverage map.
 # Both directions matter: neither gate may stand in for the other.
@@ -1090,6 +1140,60 @@ node -e '
 run_validator "${D}"
 check "a record naming a review the control does not pin is rejected" 3 \
   "review record hashing to \[c{64}\]"
+
+# The rollback assertion is not accepted on its prose alone. Its designated
+# stage must carry both pre-registered protocol counters as node-authored
+# numeric readings; an absent series is an unread instrument, not a zero.
+D="${WORK}/accept-rollback-missing-preservation-reading"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z" "${FIXTURE_SHA}" "${ROLLBACK_STAGES}" \
+  "${ROLLBACK_ASSERTIONS}" "rollback"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  const stage = record.stages.find(
+    ({ name }) =>
+      name ===
+      "quarantine preservation failures remain zero through quiescence"
+  );
+  delete stage.gauges[
+    "r1-node-1.participation_beacon_quarantine_preservation_failures_total"
+  ];
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "rollback acceptance requires both preservation-failure readings" 3 \
+  "carries no fleet reading of.*r1-node-1.*beacon_quarantine_preservation_failures_total"
+
+# A complete reading that is nonzero refutes rollback rather than leaving it
+# merely unrehearsed: the node reported that generated material did not reach a
+# complete auditable namespace.
+D="${WORK}/accept-rollback-preservation-failure"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z" "${FIXTURE_SHA}" "${ROLLBACK_STAGES}" \
+  "${ROLLBACK_ASSERTIONS}" "rollback"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  const stage = record.stages.find(
+    ({ name }) =>
+      name ===
+      "quarantine preservation failures remain zero through quiescence"
+  );
+  stage.gauges[
+    "r1-node-1.participation_tbtc_quarantine_preservation_failures_total"
+  ] = 1;
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "a reported quarantine-preservation failure refutes rollback" 1 \
+  "quarantine-preservation reading.*tbtc.*is 1, not zero"
 
 # Repetition and invention cannot manufacture a complete gate. These records
 # keep the canonical item count deliberately plausible so the decision cannot

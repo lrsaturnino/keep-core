@@ -153,6 +153,8 @@ func (pm *PerformanceMetrics) registerAllMetrics() {
 		MetricParticipationClockAbortsTotal,
 		MetricParticipationQuiesceTotal,
 		MetricParticipationQuiesceForcedAbortsTotal,
+		MetricParticipationTBTCQuarantinePreservationFailuresTotal,
+		MetricParticipationBeaconQuarantinePreservationFailuresTotal,
 		MetricHeartbeatPenaltySuppressedTotal,
 	}
 
@@ -761,7 +763,16 @@ const (
 	MetricParticipationClockAbortsTotal                   = "participation_clock_aborts_total"
 	MetricParticipationQuiesceTotal                       = "participation_quiesce_total"
 	MetricParticipationQuiesceForcedAbortsTotal           = "participation_quiesce_forced_aborts_total"
-	MetricHeartbeatPenaltySuppressedTotal                 = "heartbeat_penalty_suppressed_total"
+
+	// The quarantine-preservation failure counters distinguish a node that
+	// attempted to preserve generated key material but reached the end of its
+	// process lifetime with an incomplete output from one that had no
+	// quarantine work to report. They are protocol-specific fixed counters so
+	// the fleet and rollback evidence can identify which recovery path failed
+	// without introducing per-output labels.
+	MetricParticipationTBTCQuarantinePreservationFailuresTotal   = "participation_tbtc_quarantine_preservation_failures_total"
+	MetricParticipationBeaconQuarantinePreservationFailuresTotal = "participation_beacon_quarantine_preservation_failures_total"
+	MetricHeartbeatPenaltySuppressedTotal                        = "heartbeat_penalty_suppressed_total"
 
 	// MetricParticipationQuarantinedTBTCSigners counts the tBTC signer outputs
 	// held in the protected quarantine namespace that this process has not
