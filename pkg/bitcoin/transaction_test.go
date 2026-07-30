@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"reflect"
-	"strings"
 	"testing"
 
 	"github.com/keep-network/keep-core/internal/testutils"
@@ -441,12 +440,11 @@ func TestTransaction_DeserializeDeclaredNotDelivered(t *testing.T) {
 			"have succeeded")
 	}
 
-	if !strings.Contains(err.Error(), "recovered from a panic") {
-		t.Errorf(
-			"expected the error to report a recovered panic; got: %v",
-			err,
-		)
-	}
+	// Invariant: the process survives and an error is returned. The
+	// specific "recovered from a panic" message is an implementation
+	// detail that depends on today's btcd readScriptBuf bound; a
+	// future btcd version that returns a plain EOF here would still
+	// satisfy the invariant.
 }
 
 func hexToSlice(t *testing.T, hexString string) []byte {

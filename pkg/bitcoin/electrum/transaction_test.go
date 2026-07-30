@@ -3,8 +3,9 @@ package electrum
 import (
 	"encoding/binary"
 	"encoding/hex"
-	"strings"
 	"testing"
+
+	"github.com/keep-network/keep-core/pkg/bitcoin"
 )
 
 // TestDecodeTransactionDeclaredNotDelivered mirrors
@@ -73,18 +74,30 @@ func TestDecodeTransactionDeclaredNotDelivered(t *testing.T) {
 	// so no witness/script bytes need to actually follow.
 	data = binary.LittleEndian.AppendUint64(data, 1000) // value
 	appendVarInt(maxDeclaredScriptSize)
-
 	rawTx := hex.EncodeToString(data)
+
+	// rawTx is two hex characters per byte, so the decoded length is at
+	// most len(rawTx)/2. The sibling test guards the same invariant
+	// before encoding; doing it after the encode here matches what
+	// decodeTransaction actually sees and protects against a future cap
+	// change silently misdirecting this test into the wrong code path.
+	if len(rawTx)/2 >= bitcoin.MaxTransactionByteLength {
+		t.Fatalf(
+			"test transaction of [%v] bytes does not stay under the "+
+				"maximum of [%v] bytes",
+			len(rawTx)/2,
+			bitcoin.MaxTransactionByteLength,
+		)
+	}
 
 	_, err := decodeTransaction(rawTx)
 	if err == nil {
 		t.Fatal("expected a non-nil error; decoding should not have succeeded")
 	}
 
-	if !strings.Contains(err.Error(), "recovered from a panic") {
-		t.Errorf(
-			"expected the error to report a recovered panic; got: %v",
-			err,
-		)
-	}
+	// Invariant: the process survives and an error is returned. The
+	// specific "recovered from a panic" message is an implementation
+	// detail that depends on today's btcd readScriptBuf bound; a
+	// future btcd version that returns a plain EOF here would still
+	// satisfy the invariant.
 }

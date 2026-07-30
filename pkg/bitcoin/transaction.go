@@ -30,7 +30,6 @@ const (
 // `3*base_size + total_size` and cannot exceed the maximum block weight of
 // 4,000,000 weight units, so its serialized length is always strictly below
 // that number.
-//
 // Rejecting longer input keeps deserialization defensive against grossly
 // oversized, untrusted input, but this cap alone does NOT close the
 // underlying btcd decoder's panic. btcd slices every script and witness
@@ -41,9 +40,11 @@ const (
 // length does not need to be backed by that many delivered bytes for the
 // panicking slice expression to be evaluated, a transaction whose real
 // wire length is far below this cap can still reach the panic once earlier
-// scripts have consumed enough of the shared buffer. See the recover() in
-// Deserialize below, which is what actually turns that panic into an
-// error.
+// scripts have consumed enough of the shared buffer. The recover() in
+// Deserialize below turns that slice-bounds panic into an error; it does
+// NOT cover fatal runtime errors such as out-of-memory from attacker-
+// declared varint counts that btcd's wire decoder honors before
+// reading backing bytes.
 const MaxTransactionByteLength = 4_000_000
 
 // Transaction represents a Bitcoin transaction. For reference, see:
@@ -184,8 +185,10 @@ func (t *Transaction) Deserialize(data []byte) (err error) {
 	// data ultimately originates from an untrusted source (e.g. an Electrum
 	// server) and the underlying btcd decoder can panic on carefully
 	// crafted input that stays well under MaxTransactionByteLength (see the
-	// doc comment on that constant). Recover from any such panic and return
-	// it as a plain error instead of letting it crash the process.
+	// doc comment on that constant). The recover() below turns that
+	// slice-bounds panic into an error; it does NOT cover fatal runtime
+	// errors such as out-of-memory from attacker-declared varint counts
+	// that btcd's wire decoder honors before reading backing bytes.
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf(

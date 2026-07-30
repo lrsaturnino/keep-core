@@ -24,6 +24,14 @@ type TransactionBuilder struct {
 	// prevOuts holds the locking script and value of the UTXO pointed by
 	// each added input. The txscript sighash pre-computation consults it
 	// to determine the witness version of the spent outputs.
+	//
+	// The field is intentionally typed as the concrete
+	// *txscript.MultiPrevOutFetcher rather than the txscript.PrevOutputFetcher
+	// interface because the completeness check in ComputeSignatureHashes
+	// relies on MultiPrevOutFetcher.FetchPrevOutput returning nil for an
+	// outpoint that was never registered; the sibling CannedPrevOutputFetcher
+	// always returns a zero TxOut instead, which would silently turn the
+	// check into a no-op.
 	prevOuts *txscript.MultiPrevOutFetcher
 }
 
@@ -186,8 +194,9 @@ func (tb *TransactionBuilder) ComputeSignatureHashes() ([]*big.Int, error) {
 	// sighash fragments can be pre-computed upfront and reused. The previous
 	// outputs of all added inputs must be provided so the pre-computation can
 	// determine the witness version of the spent outputs. A missing entry
-	// makes the pre-computation panic, so make sure the builder's state is
-	// consistent before handing it over.
+	// makes the pre-computation panic (except for coinbase-shaped inputs, which
+	// the pre-computation skips, and which the two Add* methods never produce),
+	// so make sure the builder's state is consistent before handing it over.
 	for i, input := range tb.internal.TxIn {
 		if tb.prevOuts.FetchPrevOutput(input.PreviousOutPoint) == nil {
 			return nil, fmt.Errorf(
