@@ -1859,6 +1859,40 @@ that tag immutable — and the analyzer that pin binds. A record naming this
 repository as the source, carrying a `ref` where the `sha` belongs, or leaving
 the conditions unresolved, records something that does not close the boundary.
 
+### A non-atomic storage backend under the quarantine handoff
+
+Section 6.4's preservation is the last thing standing between a refused
+ceremony and a key share that exists nowhere else, and the write it depends on
+cannot be made crash-atomic from this repository.
+
+The backend is not here. `pkg/tbtc/quarantine.go` and
+`pkg/beacon/registry/quarantine.go` write through
+`github.com/keep-network/keep-common/pkg/persistence`, resolved by `go.mod`'s
+replace directive to `github.com/threshold-network/keep-common
+v1.7.1-tlabs.1`. That module's `Write` is `os.Create`, `Write`, `Sync` — no
+temporary file renamed into place — so a crash during the write leaves a
+truncated document, and `os.Create` truncates any record already at that name
+before the new bytes are written, which means a rewrite of a landed record is
+itself a window where the good copy is gone.
+
+Nor can it be worked around through the interface. `ProtectedHandle` is
+`Save`, `ReadAll`, `Archive` and `Snapshot`: no rename and no delete, so there
+is no primitive out of which record-level atomicity can be built. What the
+release has instead is detection — a torn document fails the encrypted
+handle's authentication, so the offline state audit reads it as an unreadable
+record and blocks rather than any reader taking it for a preserved output.
+Detection is not preservation: the audit reports the loss it cannot undo.
+
+Two things would close it, and both are decisions rather than oversights. A
+`keep-common` change making `Write` write-temp-sync-rename-sync-dir is the
+real fix and lands in another repository and another release. Inside this one,
+the available primitive is `Snapshot`, which writes under a generated name
+`Save` never truncates: writing each output's key material through both would
+leave a complete copy behind whatever a crash tore, at the cost of a second
+copy of the material on disk and of teaching the audit which copy to prefer.
+Neither is done here, and the release is entitled to know that what it has is
+a detected loss and not a recoverable one.
+
 ### Dual-mode tss-lib fork and independent-review gate
 
 R1's per-ceremony compatibility bundle covers all four wire- and
