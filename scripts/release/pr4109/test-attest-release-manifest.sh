@@ -107,19 +107,57 @@ run_producer() {
   set -e
 }
 
-# Run the real consumer over a receipt, in the same isolated way.
+# Run the real consumer over a receipt, in the same isolated way. A case may
+# point it at a copied script directory so it judges a doctored manifest; the
+# assignment stays in the subshell, and the real checked-in manifest is never
+# written to.
 run_consumer() {
   local dir="$1"
+  local script_dir="${2:-${TEST_DIR}}"
   set +e
   CASE_OUT="$(
     (
       # shellcheck disable=SC2030,SC2034
       EVIDENCE_DIR="${dir}"
+      # shellcheck disable=SC2030,SC2034
+      SCRIPT_DIR="${script_dir}"
       require_manifest_attestation
     ) 2>&1
   )"
   CASE_RC=$?
   set -e
+}
+
+# A copy of the script directory whose manifest names the given source commit,
+# with the receipt beside it regenerated for those bytes. The reviewed manifest
+# records no commit until the release build, so a case about the recorded one
+# being wrong has to supply a manifest that records one at all.
+#
+# Only the receipt's manifest hash is rebuilt: the derived bounds this consumer
+# also compares cover the chain id, the cutover block, and the termination
+# grace, and none of them moves when the release identity does.
+doctored_tree() {
+  local name="$1" declared="$2" receipt_source="$3"
+  local tree="${WORK}/${name}"
+  mkdir -p "${tree}"
+  cp -R "${TEST_DIR}/." "${tree}/tree"
+  cp -R "${D}/attestation" "${tree}/attestation"
+
+  node -e '
+    const fs = require("fs");
+    const path = process.argv[1];
+    const doc = JSON.parse(fs.readFileSync(path, "utf8"));
+    doc.release_identity = doc.release_identity || {};
+    doc.release_identity.source_commit = process.argv[2];
+    fs.writeFileSync(path, JSON.stringify(doc, null, 2) + "\n");
+  ' "${tree}/tree/release-manifest.json" "${declared}"
+
+  hash_stdin <"${tree}/tree/release-manifest.json" \
+    >"${tree}/attestation/reviewed-manifest.sha256"
+  printf '%s\n' "${receipt_source}" >"${tree}/attestation/source-commit.txt"
+  printf 'yes\n' >"${tree}/attestation/release-ready.txt"
+
+  printf '%s\n' "${tree}"
 }
 
 # Assert the captured rc and that the output matches every given pattern.
@@ -240,6 +278,36 @@ cp -R "${D}/attestation" "${GARBLED}/attestation"
 run_consumer "${GARBLED}"
 check "the consumer refuses a receipt whose verdict is empty" 3 \
   "records .* as not release-ready"
+
+# ----------------------------------------------------------------------------
+# The commit the manifest names, against the commit the receipt was taken at.
+# Filling that field is an edit to the tree being built, so the reviewed value
+# is always written before the commit it names exists — and until the receipt
+# is required to agree, nothing notices when the value finally written is some
+# earlier commit that has nothing to do with the artifact under test.
+
+OTHER_SHA="dddddddddddddddddddddddddddddddddddddddd"
+
+TREE="$(doctored_tree "manifest-names-this-commit" "${FIXTURE_SHA}" \
+  "${FIXTURE_SHA}")"
+run_consumer "${TREE}" "${TREE}/tree"
+check "the consumer accepts a manifest naming the attested commit" 0 \
+  "attestation binds .* to the compiled bounds of ${FIXTURE_SHA}"
+
+TREE="$(doctored_tree "manifest-names-another-commit" "${OTHER_SHA}" \
+  "${FIXTURE_SHA}")"
+run_consumer "${TREE}" "${TREE}/tree"
+check "the consumer refuses a manifest naming another commit" 3 \
+  "names source commit \[${OTHER_SHA}\]" \
+  "names an artifact other than the one under test"
+
+# The reviewed manifest as it stands records no commit, and that absence is
+# readiness's refusal to make rather than this one's. Duplicating it here would
+# answer a manifest naming no release with the wrong message.
+TREE="$(doctored_tree "manifest-names-no-commit" "" "${FIXTURE_SHA}")"
+run_consumer "${TREE}" "${TREE}/tree"
+check "an unrecorded commit is left to the readiness verdict" 0 \
+  "attestation binds .* to the compiled bounds of ${FIXTURE_SHA}"
 
 # ----------------------------------------------------------------------------
 # A second run must replace the receipt rather than leave the first one's

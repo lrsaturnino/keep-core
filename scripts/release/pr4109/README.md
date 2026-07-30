@@ -1046,6 +1046,20 @@ keeps holding once the reviewed block lands and the answer flips. It runs from
 `local-proofs` rather than `shell-analysis` because asking the binary needs
 the Go toolchain.
 
+Readiness asks whether the manifest names a commit; it cannot ask whether it
+names *this* one. Filling that field edits the very tree being built, so the
+reviewed value always names a commit that does not exist yet, and an earlier
+commit written there would describe an artifact nobody built.
+`validate-evidence` therefore requires a recorded `source_commit` to equal the
+commit the attestation was taken at — already proved a clean id and, on a bound
+run, the dispatched one, and already required to equal every record's
+`source_sha`. An *unrecorded* commit is left to the readiness verdict, which is
+what refuses it; duplicating that refusal here would answer a manifest naming
+no release with the wrong message. The image digests remain pinned by the
+manifest hash alone: binding them to each record's `r1_image_digests` needs the
+complete reviewed platform set to be decided first, and this scaffold does not
+get to invent it.
+
 A receipt belongs to one run at one commit, and three rules keep it that
 way. `local-proofs` destroys the receipt it inherits — interrupted staging
 directories included — *before* it proves anything, so a run failing at any

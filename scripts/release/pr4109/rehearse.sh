@@ -11904,6 +11904,39 @@ measured against this manifest can be accepted — run \
 \`keep-client release-manifest validate --release-ready\` for what is missing"
   fi
 
+  # Readiness asks whether the manifest names a commit at all; it cannot ask
+  # whether it names this one. Filling the field is an edit to the very tree
+  # being built, so a reviewed release commit is always naming a commit that
+  # does not exist yet, and nothing downstream noticed if what was finally
+  # written there was some earlier commit instead. Records would then be
+  # accepted against a document describing an artifact nobody built.
+  #
+  # The receipt is where that closes. Its own commit was proved to be a clean
+  # id and, on a bound run, the dispatched one, and every record below is
+  # required to match it — so requiring the manifest to name that same commit
+  # binds the reviewed identity to the artifact under test rather than to
+  # itself.
+  #
+  # An unrecorded commit is left to readiness, which is what refuses it. This
+  # check is about a recorded one being the right one, and reaching past an
+  # empty field here would only duplicate that refusal in a worse message.
+  local declared_source
+  declared_source="$(node -e '
+    const fs = require("fs");
+    const doc = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    process.stdout.write(
+      String((doc.release_identity || {}).source_commit || "")
+    );
+  ' "${manifest}")"
+  if [[ -n "${declared_source}" &&
+    "${declared_source}" != "${attested_source}" ]]; then
+    blocked "the reviewed release manifest names source commit \
+[${declared_source}], but the attestation measuring these records was taken \
+at [${attested_source}]; the manifest names an artifact other than the one \
+under test, so re-record the built commit or re-run the local-proofs stage at \
+the commit the manifest names"
+  fi
+
   note "release-manifest attestation binds ${manifest} to the compiled \
 bounds of ${attested_source}"
 }
