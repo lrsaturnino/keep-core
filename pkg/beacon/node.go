@@ -459,14 +459,15 @@ func (n *node) quarantineSigner(
 		},
 	)
 
-	// The terminal outcome needs the whole pair. The metadata is what names the
-	// mode, canonical anchor, ceremony, seat, and refused operation of the
-	// preserved share; without it the offline audit cannot reconcile the
+	// The terminal outcome needs the whole output. The audit record is what
+	// names the mode, canonical anchor, ceremony, seat, and refused operation of
+	// the preserved share; without it the offline audit cannot reconcile the
 	// material against the chain, so calling the permit resolved would hand the
-	// rollback decision a quarantine nothing explains. An incomplete pair leaves
-	// the permit unresolved instead, and the offline barrier keeps blocking on
-	// it until an operator repairs the missing half.
-	if !state.MembershipPersisted || !state.MetadataPersisted {
+	// rollback decision a quarantine nothing explains. Either form the namespace
+	// took it whole in settles this — the record pair or the single handoff
+	// carrying both. Anything less leaves the permit unresolved, and the offline
+	// barrier keeps blocking on it until an operator repairs the namespace.
+	if !state.Complete() {
 		n.blockOnIncompleteQuarantine(dkgLogger, memberIndex, state, err)
 		return
 	}
@@ -511,7 +512,7 @@ func (n *node) blockOnIncompleteQuarantine(
 	state registry.QuarantineState,
 	cause error,
 ) {
-	if state.MembershipPersisted {
+	if state.KeyMaterialPersisted() {
 		dkgLogger.Errorf(
 			"[member:%v] the quarantined signer output has no audit record "+
 				"explaining it; the share is preserved but a rollback cannot "+

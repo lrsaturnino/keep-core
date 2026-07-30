@@ -1196,19 +1196,20 @@ func (de *dkgExecutor) preserveInterruptedSigner(
 	// against what the namespace actually holds, which is the only reading that
 	// can bring the count back down once a seat has been activated or an
 	// operator has cleared a record.
-	if quarantineState.membershipPersisted {
+	if quarantineState.keyMaterialPersisted() {
 		de.reportQuarantinedSigners(dkgLogger)
 	}
 
-	// The terminal outcome, unlike the count, needs the whole pair. The
-	// metadata is what names the mode, canonical anchor, ceremony, seat, and
+	// The terminal outcome, unlike the count, needs the whole output. The
+	// audit record is what names the mode, canonical anchor, ceremony, seat, and
 	// refused operation of the preserved share; without it the offline audit
 	// cannot reconcile the material against the chain, so calling the permit
 	// resolved would hand the rollback decision a quarantine nothing explains.
-	// An incomplete pair leaves the permit unresolved instead, and the offline
-	// barrier keeps blocking on it until an operator repairs the missing half.
-	if !quarantineState.membershipPersisted ||
-		!quarantineState.metadataPersisted {
+	// Either form the namespace took it whole in settles this — the record pair
+	// or the single handoff carrying both. Anything less leaves the permit
+	// unresolved, and the offline barrier keeps blocking on it until an operator
+	// repairs the namespace.
+	if !quarantineState.complete() {
 		de.blockOnIncompleteQuarantine(
 			dkgLogger,
 			memberIndex,
@@ -1293,7 +1294,7 @@ func (de *dkgExecutor) blockOnIncompleteQuarantine(
 	state quarantineState,
 	cause error,
 ) {
-	if state.membershipPersisted {
+	if state.keyMaterialPersisted() {
 		dkgLogger.Errorf(
 			"[member:%v] the quarantined signer has no audit record "+
 				"explaining it; the share is preserved but a rollback cannot "+

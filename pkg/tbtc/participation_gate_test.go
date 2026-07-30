@@ -956,9 +956,10 @@ func (h *scanTrackingHandle) ReadAll() (
 }
 
 // TestSignerQuarantine_PreservedOutputs_CountsMembershipsOnly proves only the
-// membership records are read as signer outputs. The namespace also holds the
-// audit metadata, and a later schema or an operator may leave other names
-// there; none of them is a preserved share.
+// records carrying key material are read as signer outputs — the membership of
+// a pair and the combined handoff — and that a seat named by both is one
+// output. The namespace also holds the audit metadata, and a later schema or an
+// operator may leave other names there; none of them is a preserved share.
 func TestSignerQuarantine_PreservedOutputs_CountsMembershipsOnly(t *testing.T) {
 	handle := &mockPersistenceHandle{}
 	quarantine := newSignerQuarantine(context.Background(), logger, handle)
@@ -966,12 +967,18 @@ func TestSignerQuarantine_PreservedOutputs_CountsMembershipsOnly(t *testing.T) {
 	for _, name := range []string{
 		"/membership_1",
 		"/metadata_1",
+		// The same seat, written again as one record when the namespace would
+		// not complete the pair. One share, however many times it was offered.
+		"/handoff_1",
 		"/membership_17",
 		"/metadata_17",
+		// A seat the namespace only ever took whole.
+		"/handoff_23",
 		// Not signer outputs: seat zero is no seat, an unparsable seat names
 		// none, and neither a later schema's record nor a stray file is a share.
 		"/membership_0",
 		"/membership_two",
+		"/handoff_0",
 		"/attestation_1",
 		"/notes.txt",
 	} {
@@ -985,13 +992,13 @@ func TestSignerQuarantine_PreservedOutputs_CountsMembershipsOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	testutils.AssertIntsEqual(t, "preserved outputs", 2, len(outputs))
+	testutils.AssertIntsEqual(t, "preserved outputs", 3, len(outputs))
 
 	seats := make(map[group.MemberIndex]string)
 	for _, output := range outputs {
 		seats[output.memberIndex] = output.walletStorageKey
 	}
-	for _, seat := range []group.MemberIndex{1, 17} {
+	for _, seat := range []group.MemberIndex{1, 17, 23} {
 		directory, found := seats[seat]
 		if !found {
 			t.Errorf("seat [%v] was not read as a preserved output", seat)
@@ -1049,14 +1056,28 @@ func (h *unreadableHandle) ReadAll() (
 	return descriptors, errs
 }
 
-// unwritableRecordHandle is a protected namespace that refuses one record name
-// while writing its neighbours, as a disk namespace does when a single file
-// cannot be written.
+// unwritableRecordHandle is a protected namespace that refuses the record names
+// it is given while writing their neighbours, as a disk namespace does when
+// particular files cannot be written.
+//
+// The names are a list because a preserved output is offered under more than
+// one of them: refusing the record pair and refusing the output are different
+// namespaces, and only the second one costs the node a share.
 type unwritableRecordHandle struct {
 	mockPersistenceHandle
 
-	// refusedNamePrefix names the record this namespace will not accept.
-	refusedNamePrefix string
+	// refusedNamePrefixes name the records this namespace will not accept.
+	refusedNamePrefixes []string
+}
+
+func (h *unwritableRecordHandle) refuses(name string) bool {
+	for _, prefix := range h.refusedNamePrefixes {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (h *unwritableRecordHandle) Save(
@@ -1064,7 +1085,7 @@ func (h *unwritableRecordHandle) Save(
 	directory string,
 	name string,
 ) error {
-	if strings.HasPrefix(name, h.refusedNamePrefix) {
+	if h.refuses(name) {
 		return fmt.Errorf("cannot write [%s]", name)
 	}
 
@@ -1121,14 +1142,18 @@ func savedNames(handle *mockPersistenceHandle) []string {
 }
 
 // TestSignerQuarantine_Preserve_AttemptsBothRecordsAndReportsWhatLanded proves
-// neither half of a quarantine record is skipped because the other failed, and
-// that the caller is told which of them the namespace actually holds.
+// no record of a quarantined output is skipped because another failed, and that
+// the caller is told which of them the namespace actually holds.
 //
-// The two halves mean different things — the membership is the key material a
-// rollback has to account for, the metadata is the record explaining it — and
-// the error alone cannot say which one is on disk. A caller that guesses is how
-// the operator log, the published count, and the offline audit come to describe
-// the same directory differently.
+// The records mean different things — the membership is the key material a
+// rollback has to account for, the metadata is the record explaining it, the
+// handoff is both at once — and the error alone cannot say which are on disk. A
+// caller that guesses is how the operator log, the published count, and the
+// offline audit come to describe the same directory differently.
+//
+// A name the namespace refuses does not decide the outcome: a round that cannot
+// complete the pair offers the output whole under a name of its own, so only a
+// namespace refusing everything leaves a share with nowhere to go.
 func TestSignerQuarantine_Preserve_AttemptsBothRecordsAndReportsWhatLanded(
 	t *testing.T,
 ) {
@@ -1148,6 +1173,7 @@ func TestSignerQuarantine_Preserve_AttemptsBothRecordsAndReportsWhatLanded(
 		expectedSaved       []string
 		membershipPersisted bool
 		metadataPersisted   bool
+		handoffPersisted    bool
 	}{
 		"both records land": {
 			refusedNamePrefix:   "/nothing_is_refused",
@@ -1157,22 +1183,28 @@ func TestSignerQuarantine_Preserve_AttemptsBothRecordsAndReportsWhatLanded(
 		},
 		"the metadata is refused": {
 			refusedNamePrefix:   "/metadata_",
-			expectedSaved:       []string{"/membership_1"},
+			expectedSaved:       []string{"/membership_1", "/handoff_1"},
 			membershipPersisted: true,
 			metadataPersisted:   false,
+			handoffPersisted:    true,
 		},
 		"the membership is refused": {
 			refusedNamePrefix:   "/membership_",
-			expectedSaved:       []string{"/metadata_1"},
+			expectedSaved:       []string{"/metadata_1", "/handoff_1"},
 			membershipPersisted: false,
 			metadataPersisted:   true,
+			handoffPersisted:    true,
+		},
+		"the namespace refuses every record": {
+			refusedNamePrefix: "/",
+			expectedSaved:     []string{},
 		},
 	}
 
 	for testName, test := range tests {
 		t.Run(testName, func(t *testing.T) {
 			handle := &unwritableRecordHandle{
-				refusedNamePrefix: test.refusedNamePrefix,
+				refusedNamePrefixes: []string{test.refusedNamePrefix},
 			}
 			// One round, then the process is taken to have ended: this asks
 			// what a single pass writes and reports, not how long the retry
@@ -1188,8 +1220,8 @@ func TestSignerQuarantine_Preserve_AttemptsBothRecordsAndReportsWhatLanded(
 				quarantineObserver{},
 			)
 
-			expectedComplete := test.membershipPersisted &&
-				test.metadataPersisted
+			expectedComplete := test.handoffPersisted ||
+				(test.membershipPersisted && test.metadataPersisted)
 			if expectedComplete && err != nil {
 				t.Fatalf("expected no error, got [%v]", err)
 			}
@@ -1209,6 +1241,12 @@ func TestSignerQuarantine_Preserve_AttemptsBothRecordsAndReportsWhatLanded(
 				test.metadataPersisted,
 				state.metadataPersisted,
 			)
+			testutils.AssertBoolsEqual(
+				t,
+				"handoff persisted",
+				test.handoffPersisted,
+				state.handoffPersisted,
+			)
 
 			got := savedNames(&handle.mockPersistenceHandle)
 			if !reflect.DeepEqual(got, test.expectedSaved) {
@@ -1223,22 +1261,27 @@ func TestSignerQuarantine_Preserve_AttemptsBothRecordsAndReportsWhatLanded(
 }
 
 // TestDkgExecutor_PreserveInterruptedSigner_RefusedMetadataLeavesThePermitUnresolved
-// proves a share the namespace accepted without its audit record is counted but
+// proves a share the namespace accepted without any audit record is counted but
 // not called resolved: the published count includes the output, the permit ends
 // with no terminal outcome, and the node stops taking new ceremonies.
 //
 // The key material is on disk, so a rollback has to account for it — that is the
 // count. What is missing is everything that would let the offline audit match it
 // against the chain: the mode, the canonical anchor, the ceremony, the seat, and
-// the operation that was refused all live in the metadata. Recording the permit
-// as quarantined on the membership alone would hand the rollback decision a
-// preserved share nothing explains and call the inventory complete.
+// the operation that was refused. Recording the permit as quarantined on the key
+// material alone would hand the rollback decision a preserved share nothing
+// explains and call the inventory complete.
+//
+// Both records that carry the audit fields are refused here, because either one
+// of them landing is enough to explain the share.
 func TestDkgExecutor_PreserveInterruptedSigner_RefusedMetadataLeavesThePermitUnresolved(
 	t *testing.T,
 ) {
 	de, result, gsr, _, _ := setupPreserveScenario(t)
 
-	handle := &unwritableRecordHandle{refusedNamePrefix: "/metadata_"}
+	handle := &unwritableRecordHandle{
+		refusedNamePrefixes: []string{"/metadata_", "/handoff_"},
+	}
 	de.signerQuarantine = newTestSignerQuarantine(handle, 1)
 
 	recorder := newDispatchGaugeRecorder()
@@ -1306,7 +1349,7 @@ func TestDkgExecutor_PreserveInterruptedSigner_RefusedMetadataLeavesThePermitUnr
 // proves the permit does resolve once both halves are durable, however long the
 // namespace took to accept them.
 //
-// The blocking state exists to keep an incomplete pair from being called
+// The blocking state exists to keep an incomplete output from being called
 // resolved, not to make every namespace hiccup permanent. A metadata write that
 // lands on a later round leaves an output the offline audit can reconcile, so
 // the permit ends quarantined — while the node still stops taking new work,
@@ -1318,10 +1361,11 @@ func TestDkgExecutor_PreserveInterruptedSigner_ProlongedRefusalStillEndsQuaranti
 	de, result, gsr, _, _ := setupPreserveScenario(t)
 
 	// Refused far past the grace budget, then accepted — the namespace an
-	// operator is repairing while the node holds the share.
+	// operator is repairing while the node holds the share. The handoff is
+	// refused for as long, so what the retry is waiting on is the pair itself.
 	handle := &flakyRecordHandle{
-		namePrefix: "/metadata_",
-		refusals:   quarantineGraceAttempts * 4,
+		namePrefixes: []string{"/metadata_", "/handoff_"},
+		refusals:     quarantineGraceAttempts * 4,
 	}
 	de.signerQuarantine = newTestSignerQuarantine(handle, 50)
 
@@ -1371,19 +1415,25 @@ func TestDkgExecutor_PreserveInterruptedSigner_ProlongedRefusalStillEndsQuaranti
 }
 
 // TestDkgExecutor_PreserveInterruptedSigner_RefusedMembershipIsNotQuarantined
-// proves a share the namespace refused is not reported as quarantined: the
-// permit records no terminal outcome and no count is published, while the audit
-// metadata naming the lost share is still written.
+// proves a share no record of the namespace took is not reported as
+// quarantined: the permit records no terminal outcome and no count is
+// published, while the audit metadata naming the lost share is still written.
 //
 // The metadata is what tells the offline audit a share was generated and not
-// preserved. Skipping it because the membership failed first would leave the
-// loss with no record at all.
+// preserved. Skipping it because the records carrying key material failed first
+// would leave the loss with no record at all.
+//
+// Both of those records are refused here. A namespace that turns down only the
+// membership still has the handoff to take the share in, and this is about the
+// state where nothing did.
 func TestDkgExecutor_PreserveInterruptedSigner_RefusedMembershipIsNotQuarantined(
 	t *testing.T,
 ) {
 	de, result, gsr, _, _ := setupPreserveScenario(t)
 
-	handle := &unwritableRecordHandle{refusedNamePrefix: "/membership_"}
+	handle := &unwritableRecordHandle{
+		refusedNamePrefixes: []string{"/membership_", "/handoff_"},
+	}
 	de.signerQuarantine = newTestSignerQuarantine(handle, 1)
 
 	recorder := newDispatchGaugeRecorder()
@@ -1449,8 +1499,12 @@ func TestDkgExecutor_PreserveInterruptedSigner_RefusedMembershipIsNotQuarantined
 type flakyRecordHandle struct {
 	mockPersistenceHandle
 
-	namePrefix string
-	refusals   int
+	// namePrefixes name the records this namespace refuses while it is
+	// unwritable. The first of them is the one whose attempts are counted:
+	// preservation writes it once per round for as long as it has not landed,
+	// so its attempt number is the round number.
+	namePrefixes []string
+	refusals     int
 
 	mu       sync.Mutex
 	attempts int
@@ -1461,12 +1515,21 @@ func (h *flakyRecordHandle) Save(
 	directory string,
 	name string,
 ) error {
-	if !strings.HasPrefix(name, h.namePrefix) {
+	refused := false
+	for _, prefix := range h.namePrefixes {
+		if strings.HasPrefix(name, prefix) {
+			refused = true
+			break
+		}
+	}
+	if !refused {
 		return h.mockPersistenceHandle.Save(data, directory, name)
 	}
 
 	h.mu.Lock()
-	h.attempts++
+	if strings.HasPrefix(name, h.namePrefixes[0]) {
+		h.attempts++
+	}
 	attempt := h.attempts
 	h.mu.Unlock()
 
@@ -1534,9 +1597,12 @@ func TestSignerQuarantine_Preserve_KeepsTryingThroughAProlongedRefusal(
 
 	const refusals = quarantineGraceAttempts * 8
 
+	// The handoff is refused for as long as the membership, so what is being
+	// held across the repair is the key material itself and not a record that
+	// already put it somewhere.
 	handle := &flakyRecordHandle{
-		namePrefix: "/membership_",
-		refusals:   refusals,
+		namePrefixes: []string{"/membership_", "/handoff_"},
+		refusals:     refusals,
 	}
 
 	// The notification the node acts on fires once and does not end the
@@ -1629,8 +1695,8 @@ func TestSignerQuarantine_Preserve_GivesUpOnlyWhenTheProcessEnds(
 	const roundsBeforeShutdown = quarantineGraceAttempts * 9
 
 	handle := &flakyRecordHandle{
-		namePrefix: "/membership_",
-		refusals:   math.MaxInt32,
+		namePrefixes: []string{"/membership_", "/handoff_"},
+		refusals:     math.MaxInt32,
 	}
 
 	notifications := 0
@@ -1663,6 +1729,12 @@ func TestSignerQuarantine_Preserve_GivesUpOnlyWhenTheProcessEnds(
 		"metadata persisted",
 		true,
 		state.metadataPersisted,
+	)
+	testutils.AssertBoolsEqual(
+		t,
+		"handoff persisted",
+		false,
+		state.handoffPersisted,
 	)
 	testutils.AssertIntsEqual(
 		t,
@@ -2008,8 +2080,8 @@ func TestSignerQuarantine_Preserve_WritesOnlyTheHalfTheNamespaceLacks(
 	}
 
 	handle := &flakyRecordHandle{
-		namePrefix: "/metadata_",
-		refusals:   quarantineGraceAttempts + 2,
+		namePrefixes: []string{"/metadata_", "/handoff_"},
+		refusals:     quarantineGraceAttempts + 2,
 	}
 
 	if _, err := newTestSignerQuarantine(handle, 50).preserve(
@@ -2049,7 +2121,9 @@ func TestDkgExecutor_PreserveInterruptedSigner_LostShareBlocksNewCeremonies(
 	de, result, gsr, _, _ := setupPreserveScenario(t)
 
 	de.signerQuarantine = newTestSignerQuarantine(
-		&unwritableRecordHandle{refusedNamePrefix: "/membership_"},
+		&unwritableRecordHandle{
+			refusedNamePrefixes: []string{"/membership_", "/handoff_"},
+		},
 		1,
 	)
 
@@ -2118,7 +2192,7 @@ func TestDkgExecutor_PreserveInterruptedSigner_RefusedActiveSaveFallsBackToQuara
 	)
 
 	// The active namespace refuses the very record the registered wallet needs.
-	activeHandle := &unwritableRecordHandle{refusedNamePrefix: "/membership_"}
+	activeHandle := &unwritableRecordHandle{refusedNamePrefixes: []string{"/membership_"}}
 	de.walletRegistry, err = newWalletRegistry(
 		activeHandle,
 		de.chain.CalculateWalletID,
@@ -2247,8 +2321,8 @@ func TestDkgExecutor_ReportInitialQuarantinedSigners_CountsAShareTheNamespaceToo
 	de, result, gsr, _, _ := setupPreserveScenario(t)
 
 	handle := &flakyRecordHandle{
-		namePrefix: "/membership_",
-		refusals:   quarantineGraceAttempts * 5,
+		namePrefixes: []string{"/membership_", "/handoff_"},
+		refusals:     quarantineGraceAttempts * 5,
 	}
 	de.signerQuarantine = newTestSignerQuarantine(handle, 100)
 
@@ -2283,19 +2357,22 @@ func TestDkgExecutor_ReportInitialQuarantinedSigners_CountsAShareTheNamespaceToo
 	)
 }
 
-// TestDkgExecutor_ReportInitialQuarantinedSigners_RecoversAHandoffTheProcessEndCutOff
-// proves what survives a handoff the process end interrupted: a namespace that
-// took the key material while it kept refusing the record explaining it, left
-// behind by a process that retried until it was taken away.
+// TestDkgExecutor_ReportInitialQuarantinedSigners_RecoversAWholeOutputTheNamespaceWouldNotPair
+// proves what a later process recovers when the namespace refuses the key
+// material's own record for good: the combined handoff carries the share and
+// everything that explains it, and the next process over the same namespace
+// finds all of it.
 //
-// The distinction being tested is between a preservation that finished and one
-// that only stopped. The writing process never saw the pair complete, recorded no
-// terminal outcome, and quiesced; the next process shares none of its state and
-// still has to find the share, count it, and be able to read it back. What it
-// cannot recover is the explanation — that half exists only in the process that
-// generated it — which is why the incomplete pair blocks the offline barrier
-// instead of being repaired here.
-func TestDkgExecutor_ReportInitialQuarantinedSigners_RecoversAHandoffTheProcessEndCutOff(
+// This is the state that used to cost a node a share. The membership record is
+// where preservation prefers to put the material, the metadata beside it is only
+// the explanation, and a namespace that took the second while refusing the first
+// left a note about a share that reached no disk — the one half no ceremony can
+// generate a second time. The handoff is one write carrying both, so the output
+// survives under a name the namespace will take, and a process that starts over
+// that namespace can read back the material, the seat and wallet it belongs to,
+// and the mode, canonical anchor, ceremony, and refused operation the offline
+// audit reconciles against the chain.
+func TestDkgExecutor_ReportInitialQuarantinedSigners_RecoversAWholeOutputTheNamespaceWouldNotPair(
 	t *testing.T,
 ) {
 	de, result, gsr, _, _ := setupPreserveScenario(t)
@@ -2303,12 +2380,15 @@ func TestDkgExecutor_ReportInitialQuarantinedSigners_RecoversAHandoffTheProcessE
 	recorder := newDispatchGaugeRecorder()
 	de.metricsRecorder = recorder
 
-	// A namespace that takes key material and never takes the record beside it,
-	// under a process that goes away long after the grace rounds are spent.
-	handle := &unwritableRecordHandle{refusedNamePrefix: "/metadata_"}
+	// A namespace that will not take the key material's own record at all, and
+	// takes the combined one only well after the grace rounds are spent — so the
+	// node has already been told it is holding a share nothing has, and the
+	// process is on its way out when the namespace finally comes back.
+	const handoffTakenAtRound = quarantineGraceAttempts * 2
+	handle := &latchedHandoffHandle{handoffTakenAtRound: handoffTakenAtRound}
 	de.signerQuarantine = newTestSignerQuarantine(
 		handle,
-		quarantineGraceAttempts*4,
+		handoffTakenAtRound+1,
 	)
 
 	permit := newTestPermit(participation.TBTCDKG)
@@ -2326,23 +2406,30 @@ func TestDkgExecutor_ReportInitialQuarantinedSigners_RecoversAHandoffTheProcessE
 
 	if got := savedNames(&handle.mockPersistenceHandle); !reflect.DeepEqual(
 		got,
-		[]string{"/membership_1"},
+		[]string{"/metadata_1", "/handoff_1"},
 	) {
-		t.Fatalf("namespace holds %v, expected only the key material", got)
-	}
-
-	// The handoff was cut off rather than completed, so the permit this process
-	// leaves behind is unresolved and the offline barrier still blocks on it.
-	if outcomes := permit.recordedTerminalOutcomes(); len(outcomes) != 0 {
-		t.Errorf(
-			"an interrupted handoff must not end the permit, got %v",
-			outcomes,
+		t.Fatalf(
+			"namespace holds %v, expected the output preserved whole",
+			got,
 		)
 	}
 
-	// The next process: a new executor over the namespace the interrupted one
-	// left, sharing none of its state — no floor, no standing count, no memory
-	// of what was written.
+	// The namespace holds the material and its explanation, so this permit is
+	// resolved rather than left for the offline barrier to block on.
+	terminalOutcomes := permit.recordedTerminalOutcomes()
+	testutils.AssertIntsEqual(t, "terminal outcomes", 1, len(terminalOutcomes))
+	if len(terminalOutcomes) == 1 &&
+		terminalOutcomes[0].outcome !=
+			participation.TerminalOutcomeQuarantined {
+		t.Errorf(
+			"unexpected terminal outcome [%s]",
+			terminalOutcomes[0].outcome,
+		)
+	}
+
+	// The next process: a new executor over the namespace the last one left,
+	// sharing none of its state — no floor, no standing count, no memory of what
+	// was written.
 	restarted, _, _, _, _ := setupPreserveScenario(t)
 	restartedRecorder := newDispatchGaugeRecorder()
 	restarted.metricsRecorder = restartedRecorder
@@ -2366,16 +2453,20 @@ func TestDkgExecutor_ReportInitialQuarantinedSigners_RecoversAHandoffTheProcessE
 	)
 
 	// Counting the record is not the same as being able to use it. The material
-	// is recovery evidence, so the next process has to be able to read back the
-	// seat and wallet it belongs to, which is what the offline audit reconciles
-	// against the chain.
-	preserved := handle.saved[0]
+	// is recovery evidence, so the next process has to be able to read back both
+	// what was preserved and what explains it.
+	preserved := handle.savedRecord(t, "/handoff_1")
 	content, err := preserved.Content()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	record, err := DecodeSignerAuditRecord(content)
+	handoff, err := DecodeQuarantinedSignerHandoff(content)
+	if err != nil {
+		t.Fatalf("the preserved output cannot be read back: [%v]", err)
+	}
+
+	record, err := DecodeSignerAuditRecord(handoff.Signer)
 	if err != nil {
 		t.Fatalf("the preserved key material cannot be read back: [%v]", err)
 	}
@@ -2395,13 +2486,106 @@ func TestDkgExecutor_ReportInitialQuarantinedSigners_RecoversAHandoffTheProcessE
 			expected,
 		)
 	}
+
+	// The fields the offline audit matches against the chain travel with the
+	// material, so a share recovered this way is reconcilable rather than just
+	// countable.
+	metadata := handoff.Metadata
+	testutils.AssertStringsEqual(
+		t,
+		"protocol mode the preserved output was generated under",
+		permit.Mode().String(),
+		metadata.ProtocolMode,
+	)
+	testutils.AssertUintsEqual(
+		t,
+		"canonical anchor the preserved output was generated under",
+		permit.CanonicalStartBlock(),
+		metadata.CanonicalStartBlock,
+	)
+	testutils.AssertStringsEqual(
+		t,
+		"ceremony the preserved output was generated in",
+		string(participation.TBTCDKG),
+		metadata.Ceremony,
+	)
+	testutils.AssertStringsEqual(
+		t,
+		"operation that was refused",
+		"tbtc_dkg_signer_activation",
+		metadata.FailedOperation,
+	)
+	testutils.AssertStringsEqual(
+		t,
+		"release epoch that preserved the output",
+		participation.CompiledEpoch.String(),
+		metadata.ReleaseEpoch,
+	)
+}
+
+// latchedHandoffHandle refuses the record carrying key material for good and
+// takes the combined handoff only from the given round, as a namespace does when
+// one particular file cannot be written and the rest of the directory is
+// part-way through an operator's repair.
+type latchedHandoffHandle struct {
+	mockPersistenceHandle
+
+	// handoffTakenAtRound is the round from which the combined record is
+	// accepted. The membership is attempted once per round for as long as it has
+	// not landed, and it never lands here, so its attempt count is the round
+	// number.
+	handoffTakenAtRound int
+
+	mu                 sync.Mutex
+	membershipAttempts int
+}
+
+func (h *latchedHandoffHandle) Save(
+	data []byte,
+	directory string,
+	name string,
+) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if strings.HasPrefix(name, "/membership_") {
+		h.membershipAttempts++
+		return fmt.Errorf("cannot write [%s]", name)
+	}
+
+	if strings.HasPrefix(name, "/handoff_") &&
+		h.membershipAttempts < h.handoffTakenAtRound {
+		return fmt.Errorf("cannot write [%s] yet", name)
+	}
+
+	return h.mockPersistenceHandle.Save(data, directory, name)
+}
+
+// savedRecord returns the record the namespace holds under the given name.
+func (h *latchedHandoffHandle) savedRecord(
+	t *testing.T,
+	name string,
+) persistence.DataDescriptor {
+	t.Helper()
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	for _, descriptor := range h.saved {
+		if descriptor.Name() == name {
+			return descriptor
+		}
+	}
+
+	t.Fatalf("the namespace holds no record named [%s]", name)
+	return nil
 }
 
 // TestSignerQuarantine_PreservedOutputs_RestartSeesWhatEachWriteFailureLeft
-// proves what a later process finds in the namespace after each half of a
-// preserved output was refused. A refused metadata write still leaves the key
-// material a restart has to account for; a refused membership write leaves
-// nothing to count, only the audit record naming the loss.
+// proves what a later process finds in the namespace after a refused write.
+// Whichever record of the pair the namespace would not take, the handoff
+// carries the output whole, so the restart still finds one preserved share to
+// account for. Only a namespace that refuses every record leaves nothing.
 //
 // The count is read by whichever process comes next, not by the one that wrote,
 // so it is taken here by a store that shares nothing with the one that failed.
@@ -2416,12 +2600,17 @@ func TestSignerQuarantine_PreservedOutputs_RestartSeesWhatEachWriteFailureLeft(
 		"the metadata write is refused": {
 			refusedNamePrefix: "/metadata_",
 			expectedOutputs:   1,
-			expectedRecords:   []string{"/membership_1"},
+			expectedRecords:   []string{"/membership_1", "/handoff_1"},
 		},
 		"the membership write is refused": {
 			refusedNamePrefix: "/membership_",
+			expectedOutputs:   1,
+			expectedRecords:   []string{"/metadata_1", "/handoff_1"},
+		},
+		"every write is refused": {
+			refusedNamePrefix: "/",
 			expectedOutputs:   0,
-			expectedRecords:   []string{"/metadata_1"},
+			expectedRecords:   []string{},
 		},
 	}
 
@@ -2430,7 +2619,7 @@ func TestSignerQuarantine_PreservedOutputs_RestartSeesWhatEachWriteFailureLeft(
 			de, result, gsr, _, _ := setupPreserveScenario(t)
 
 			handle := &unwritableRecordHandle{
-				refusedNamePrefix: test.refusedNamePrefix,
+				refusedNamePrefixes: []string{test.refusedNamePrefix},
 			}
 			de.signerQuarantine = newTestSignerQuarantine(handle, 1)
 

@@ -30,6 +30,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/altbn128"
 	"github.com/keep-network/keep-core/pkg/beacon/dkg"
 	"github.com/keep-network/keep-core/pkg/beacon/registry"
+	"github.com/keep-network/keep-core/pkg/bitcoin"
 	"github.com/keep-network/keep-core/pkg/bls"
 	"github.com/keep-network/keep-core/pkg/chain"
 	beaconabi "github.com/keep-network/keep-core/pkg/chain/ethereum/beacon/gen/abi"
@@ -1963,6 +1964,33 @@ func storeTBTCQuarantineMembership(
 ) string {
 	t.Helper()
 
+	membership, walletStorageKey, _ := newTBTCQuarantineMembership(
+		t,
+		memberIndex,
+		walletScalar,
+	)
+
+	if err := handle.Save(
+		membership,
+		walletStorageKey,
+		"/membership_"+fmt.Sprint(memberIndex),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	return walletStorageKey
+}
+
+// newTBTCQuarantineMembership builds the membership encoding a preserved tBTC
+// signer output carries, together with the wallet directory it belongs under
+// and the wallet public key every identity in it is derived from.
+func newTBTCQuarantineMembership(
+	t *testing.T,
+	memberIndex group.MemberIndex,
+	walletScalar int64,
+) ([]byte, string, *ecdsa.PublicKey) {
+	t.Helper()
+
 	x, y := tecdsa.Curve.ScalarBaseMult(big.NewInt(walletScalar).Bytes())
 	walletPublicKey := &ecdsa.PublicKey{Curve: tecdsa.Curve, X: x, Y: y}
 
@@ -1997,10 +2025,159 @@ func storeTBTCQuarantineMembership(
 		secp256k1.Marshal(walletPublicKey),
 	)[2:]
 
+	return membership, walletStorageKey, walletPublicKey
+}
+
+// TestRunAudit_TBTCQuarantineHandoffIsAWholeOutput proves an output preserved
+// as the single combined record is read as complete evidence, not as an
+// incomplete pair.
+//
+// A namespace that will not take one of the two records preservation prefers
+// leaves the node writing the output whole under a name of its own. What is on
+// disk afterwards is one record rather than two, and it carries both the key
+// material a rollback has to account for and the mode, anchor, ceremony, and
+// refused operation that let the audit reconcile it against the chain. An audit
+// that only knew the pair would report exactly the opposite of the truth here:
+// a missing half, over an output nothing is missing from.
+func TestRunAudit_TBTCQuarantineHandoffIsAWholeOutput(t *testing.T) {
+	storageDir := newTestStorage(t)
+
+	diskStorage, err := storage.Initialize(
+		storage.Config{Dir: storageDir},
+		testPassword,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quarantineHandle, err := diskStorage.InitializeKeyStorePersistence(
+		"tbtc-quarantine",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	walletStorageKey := storeTBTCQuarantineHandoff(
+		t,
+		quarantineHandle,
+		group.MemberIndex(3),
+		7,
+	)
+
+	auditManifest, err := runAudit(
+		storageDir,
+		testPassword,
+		evidenceInputs{},
+		testExpectedIdentity(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, orphan := range []string{
+		"has a membership record without audit metadata",
+		"has audit metadata without a membership record",
+	} {
+		if hasFinding(auditManifest, orphan) {
+			t.Errorf(
+				"an output preserved whole must not be reported as an "+
+					"incomplete pair, findings: %v",
+				auditManifest.Findings,
+			)
+		}
+	}
+
+	if got := len(auditManifest.TBTCQuarantinedOutputs); got != 1 {
+		t.Fatalf("expected [1] tbtc quarantined output, got [%d]", got)
+	}
+	quarantined := auditManifest.TBTCQuarantinedOutputs[0]
+
+	if !quarantined.HasMembershipRecord {
+		t.Error(
+			"the combined record carries key material, so the output must " +
+				"report it as preserved",
+		)
+	}
+	if !quarantined.HasHandoffRecord {
+		t.Error("expected the output to report how it was preserved")
+	}
+	if quarantined.WalletStorageKey != walletStorageKey {
+		t.Errorf(
+			"quarantined output filed under wallet [%s], expected [%s]",
+			quarantined.WalletStorageKey,
+			walletStorageKey,
+		)
+	}
+	if quarantined.SignerWalletID == "" {
+		t.Error(
+			"the identity chain reconciliation matches must be derived from " +
+				"the key material the combined record carries",
+		)
+	}
+	if quarantined.ProtocolMode != "legacy" {
+		t.Errorf(
+			"expected the quarantined mode [legacy], got [%s]",
+			quarantined.ProtocolMode,
+		)
+	}
+	if quarantined.CanonicalStartBlock != 900 {
+		t.Errorf(
+			"expected the canonical start block [900], got [%d]",
+			quarantined.CanonicalStartBlock,
+		)
+	}
+	if quarantined.FailedOperation != "tbtc_dkg_signer_activation" {
+		t.Errorf(
+			"expected the refused operation to travel with the material, "+
+				"got [%s]",
+			quarantined.FailedOperation,
+		)
+	}
+}
+
+// storeTBTCQuarantineHandoff writes one tBTC quarantine output as the single
+// combined record, carrying the same membership encoding the pair would have
+// used, and returns the wallet storage key it was filed under.
+func storeTBTCQuarantineHandoff(
+	t *testing.T,
+	handle persistence.ProtectedHandle,
+	memberIndex group.MemberIndex,
+	walletScalar int64,
+) string {
+	t.Helper()
+
+	membership, walletStorageKey, walletPublicKey := newTBTCQuarantineMembership(
+		t,
+		memberIndex,
+		walletScalar,
+	)
+
+	walletPublicKeyHash := bitcoin.PublicKeyHash(walletPublicKey)
+
+	handoff, err := json.Marshal(tbtc.QuarantinedSignerHandoff{
+		SchemaVersion: tbtc.QuarantineHandoffSchemaVersion,
+		Metadata: tbtc.QuarantinedSignerMetadata{
+			SchemaVersion:       tbtc.QuarantineSchemaVersion,
+			ReleaseEpoch:        participation.CompiledEpoch.String(),
+			ProtocolMode:        "legacy",
+			CutoverBlock:        1_000,
+			CanonicalStartBlock: 900,
+			Ceremony:            string(participation.TBTCDKG),
+			SeedHash:            strings.Repeat("a", 64),
+			MemberIndex:         uint8(memberIndex),
+			WalletPublicKeyHash: hex.EncodeToString(walletPublicKeyHash[:]),
+			FailedOperation:     "tbtc_dkg_signer_activation",
+			LastObservedBlock:   950,
+		},
+		Signer: membership,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	if err := handle.Save(
-		membership,
+		handoff,
 		walletStorageKey,
-		"/membership_"+fmt.Sprint(memberIndex),
+		"/handoff_"+fmt.Sprint(memberIndex),
 	); err != nil {
 		t.Fatal(err)
 	}

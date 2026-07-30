@@ -441,6 +441,11 @@ type beaconQuarantineRecord struct {
 	// accompany the metadata; metadata without the membership means the key
 	// material was lost and the record is evidence only.
 	HasMembershipRecord bool `json:"has_membership_record"`
+	// HasHandoffRecord reports whether the output was preserved as the single
+	// combined record rather than as the pair. It says how the namespace took
+	// the output, not how complete it is: a handoff carries both halves, and
+	// the fields above are filled from it when the pair is missing one.
+	HasHandoffRecord bool `json:"has_handoff_record"`
 }
 
 // tbtcWalletRecord summarizes the decoded signer records of one wallet in the
@@ -482,6 +487,11 @@ type tbtcQuarantineRecord struct {
 	// accompany the metadata; metadata without the signer means the key
 	// material was lost and the record is evidence only.
 	HasMembershipRecord bool `json:"has_membership_record"`
+	// HasHandoffRecord reports whether the output was preserved as the single
+	// combined record rather than as the pair. It says how the namespace took
+	// the output, not how complete it is: a handoff carries both halves, and
+	// the fields above are filled from it when the pair is missing one.
+	HasHandoffRecord bool `json:"has_handoff_record"`
 }
 
 type manifest struct {
@@ -6220,6 +6230,12 @@ type beaconQuarantineEntry struct {
 	memberSuffix string
 	metadata     *registry.QuarantinedSignerMetadata
 	membership   *registry.Membership
+	// handoffMetadata and handoffMembership are the halves carried by the
+	// combined record preservation writes when the namespace would not take the
+	// pair. They stand in for whichever half the pair is missing, so an output
+	// preserved that way is as complete a piece of evidence as a paired one.
+	handoffMetadata   *registry.QuarantinedSignerMetadata
+	handoffMembership *registry.Membership
 }
 
 // interpretBeaconQuarantineNamespace decodes the quarantine namespace, pairs
@@ -6310,6 +6326,36 @@ func interpretBeaconQuarantineNamespace(
 				descriptor.Name(),
 				"membership_",
 			).membership = membership
+		case strings.HasPrefix(descriptor.Name(), "handoff_"):
+			handoff, err := registry.DecodeQuarantinedSignerHandoff(content)
+			if err != nil {
+				run.finding(
+					"beacon quarantine handoff [%s/%s] cannot be decoded: [%v]",
+					descriptor.Directory(),
+					descriptor.Name(),
+					err,
+				)
+				continue
+			}
+			membership := &registry.Membership{}
+			if err := membership.Unmarshal(handoff.Membership); err != nil {
+				run.finding(
+					"beacon quarantine handoff [%s/%s] carries key material "+
+						"that cannot be decoded: [%v]",
+					descriptor.Directory(),
+					descriptor.Name(),
+					err,
+				)
+				continue
+			}
+			entry := entryFor(
+				descriptor.Directory(),
+				descriptor.Name(),
+				"handoff_",
+			)
+			metadata := handoff.Metadata
+			entry.handoffMetadata = &metadata
+			entry.handoffMembership = membership
 		default:
 			run.finding(
 				"beacon quarantine record [%s/%s] has an unknown name",
@@ -6329,6 +6375,18 @@ func interpretBeaconQuarantineNamespace(
 	for _, key := range keys {
 		entry := quarantineEntries[key]
 
+		// The combined record stands in for whichever half of the pair the
+		// namespace would not take. It is resolved before validation so the
+		// audit reports what the namespace actually holds of an output rather
+		// than which of the two layouts it was written in.
+		hasHandoff := entry.handoffMembership != nil
+		if entry.metadata == nil {
+			entry.metadata = entry.handoffMetadata
+		}
+		if entry.membership == nil {
+			entry.membership = entry.handoffMembership
+		}
+
 		validateQuarantineEntry(run, entry, activeGroups)
 
 		if entry.metadata == nil {
@@ -6339,6 +6397,7 @@ func interpretBeaconQuarantineNamespace(
 			beaconQuarantineRecord{
 				QuarantinedSignerMetadata: *entry.metadata,
 				HasMembershipRecord:       entry.membership != nil,
+				HasHandoffRecord:          hasHandoff,
 			},
 		)
 	}
@@ -6685,6 +6744,12 @@ type tbtcQuarantineEntry struct {
 	memberSuffix string
 	metadata     *tbtc.QuarantinedSignerMetadata
 	signer       *tbtc.SignerAuditRecord
+	// handoffMetadata and handoffSigner are the halves carried by the combined
+	// record preservation writes when the namespace would not take the pair.
+	// They stand in for whichever half the pair is missing, so an output
+	// preserved that way is as complete a piece of evidence as a paired one.
+	handoffMetadata *tbtc.QuarantinedSignerMetadata
+	handoffSigner   *tbtc.SignerAuditRecord
 }
 
 // interpretTBTCQuarantineNamespace decodes the tBTC quarantine namespace,
@@ -6774,6 +6839,37 @@ func interpretTBTCQuarantineNamespace(
 				descriptor.Name(),
 				"membership_",
 			).signer = record
+		case strings.HasPrefix(descriptor.Name(), "handoff_"):
+			handoff, err := tbtc.DecodeQuarantinedSignerHandoff(content)
+			if err != nil {
+				run.finding(
+					"tbtc quarantine handoff [%s/%s] cannot be decoded: [%v]",
+					descriptor.Directory(),
+					descriptor.Name(),
+					err,
+				)
+				continue
+			}
+			record, err := tbtc.DecodeSignerAuditRecord(handoff.Signer)
+			if err != nil {
+				run.finding(
+					"tbtc quarantine handoff [%s/%s] carries key material that "+
+						"cannot be decoded the way the wallet registry loader "+
+						"decodes it: [%v]",
+					descriptor.Directory(),
+					descriptor.Name(),
+					err,
+				)
+				continue
+			}
+			entry := entryFor(
+				descriptor.Directory(),
+				descriptor.Name(),
+				"handoff_",
+			)
+			metadata := handoff.Metadata
+			entry.handoffMetadata = &metadata
+			entry.handoffSigner = record
 		default:
 			run.finding(
 				"tbtc quarantine record [%s/%s] has an unknown name",
@@ -6792,6 +6888,18 @@ func interpretTBTCQuarantineNamespace(
 
 	for _, key := range keys {
 		entry := quarantineEntries[key]
+
+		// The combined record stands in for whichever half of the pair the
+		// namespace would not take. It is resolved before validation so the
+		// audit reports what the namespace actually holds of an output rather
+		// than which of the two layouts it was written in.
+		hasHandoff := entry.handoffSigner != nil
+		if entry.metadata == nil {
+			entry.metadata = entry.handoffMetadata
+		}
+		if entry.signer == nil {
+			entry.signer = entry.handoffSigner
+		}
 
 		validateTBTCQuarantineEntry(run, entry, activeWallets)
 
@@ -6812,6 +6920,7 @@ func interpretTBTCQuarantineNamespace(
 				SignerWalletID:            signerWalletID,
 				SignerWalletPublicKeyHash: signerWalletPublicKeyHash,
 				HasMembershipRecord:       entry.signer != nil,
+				HasHandoffRecord:          hasHandoff,
 			},
 		)
 	}

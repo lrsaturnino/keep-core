@@ -22,6 +22,66 @@ import (
 // for the offline state-audit tooling.
 const QuarantineSchemaVersion uint32 = 1
 
+// QuarantineHandoffSchemaVersion versions the combined handoff document for the
+// offline state-audit tooling.
+const QuarantineHandoffSchemaVersion uint32 = 1
+
+// QuarantinedSignerHandoff carries one quarantined signer output whole: the key
+// material and the audit record that explains it, in a single document written
+// with a single save.
+//
+// The membership and metadata records preservation prefers are two independent
+// writes, and a namespace that takes one but refuses the other leaves the output
+// split. One of those halves cannot be split off harmlessly: a refused
+// membership write leaves an audit record describing a share that reached no
+// disk, and the share is the half no ceremony can generate again. This document
+// is the form that cannot land in halves — every field an audit needs and the
+// material it explains land in the same save or neither does — and it is written
+// under a name of its own, so a name the namespace refuses does not decide
+// whether the output survives.
+type QuarantinedSignerHandoff struct {
+	SchemaVersion uint32                    `json:"schema_version"`
+	Metadata      QuarantinedSignerMetadata `json:"metadata"`
+	// Signer is the marshaled signer, byte for byte what the membership record
+	// holds, so a reader decodes either form the same way.
+	Signer []byte `json:"signer"`
+}
+
+// DecodeQuarantinedSignerHandoff reads a combined handoff record back into the
+// halves it carries, for a later process and for the offline state audit.
+//
+// A document naming a schema this binary does not know is refused rather than
+// read past. The handoff is the only account of an output preserved this way,
+// so a reader that guessed at unknown fields would be inventing the evidence a
+// rollback decision is made on.
+func DecodeQuarantinedSignerHandoff(
+	recordBytes []byte,
+) (*QuarantinedSignerHandoff, error) {
+	handoff := &QuarantinedSignerHandoff{}
+	if err := json.Unmarshal(recordBytes, handoff); err != nil {
+		return nil, fmt.Errorf(
+			"could not decode the quarantine handoff: [%v]",
+			err,
+		)
+	}
+
+	if handoff.SchemaVersion != QuarantineHandoffSchemaVersion {
+		return nil, fmt.Errorf(
+			"quarantine handoff has schema version [%d], expected [%d]",
+			handoff.SchemaVersion,
+			QuarantineHandoffSchemaVersion,
+		)
+	}
+
+	if len(handoff.Signer) == 0 {
+		return nil, fmt.Errorf(
+			"quarantine handoff carries no key material",
+		)
+	}
+
+	return handoff, nil
+}
+
 // QuarantinedSignerMetadata describes one quarantined tBTC signer output for
 // the offline state audit, without any private material: the key share itself
 // stays only inside the encrypted membership record it accompanies. The seed
@@ -143,6 +203,27 @@ func waitWithinLifetime(lifetime context.Context, delay time.Duration) bool {
 type quarantineState struct {
 	membershipPersisted bool
 	metadataPersisted   bool
+	// handoffPersisted reports whether the namespace holds the combined record
+	// carrying both halves at once. It is written only when the pair could not
+	// be completed, and once it lands the output is whole whatever the pair is
+	// still missing.
+	handoffPersisted bool
+}
+
+// keyMaterialPersisted reports whether the namespace holds the generated share
+// in either of the forms preservation writes it in. This is what the count of
+// preserved material follows: a share on disk is material a rollback has to
+// account for however it got written down.
+func (s quarantineState) keyMaterialPersisted() bool {
+	return s.membershipPersisted || s.handoffPersisted
+}
+
+// complete reports whether the namespace holds the whole output — the key
+// material and the audit record explaining it. The pair says so when both its
+// halves landed, and the combined record says so on its own, since it carries
+// both.
+func (s quarantineState) complete() bool {
+	return (s.membershipPersisted && s.metadataPersisted) || s.handoffPersisted
 }
 
 // quarantineObserver receives what a preservation learns while it is still
@@ -197,6 +278,12 @@ type quarantineObserver struct {
 // writes leaves the key material behind rather than only the note describing
 // it: an unexplained share is recoverable, a lost one is not.
 //
+// A round that cannot complete the pair falls back on the combined handoff
+// record, which carries both halves in one write under a name of its own. It is
+// what keeps a namespace refusing one particular record from costing the node a
+// share it can never generate again, and once it lands the output is whole
+// however little of the pair the namespace took.
+//
 // The observer is told what the namespace takes while the preservation is still
 // running, because a caller that only reads the returned state learns nothing
 // until an attempt that may outlast the process is over.
@@ -230,6 +317,18 @@ func (q *signerQuarantine) preserve(
 		)
 	}
 
+	handoffBytes, err := json.Marshal(QuarantinedSignerHandoff{
+		SchemaVersion: QuarantineHandoffSchemaVersion,
+		Metadata:      metadata,
+		Signer:        signerBytes,
+	})
+	if err != nil {
+		return state, fmt.Errorf(
+			"could not marshal the quarantine handoff: [%v]",
+			err,
+		)
+	}
+
 	directory := getWalletStorageKey(signer.wallet.publicKey)
 	memberSuffix := fmt.Sprint(signer.signingGroupMemberIndex)
 
@@ -246,25 +345,28 @@ func (q *signerQuarantine) preserve(
 			"quarantined a tbtc signer output [walletPKH=0x%s] [member=%v] "+
 				"[mode=%s] [canonicalStartBlock=%d] [failedOperation=%s] "+
 				"[lastObservedBlock=%d] [keyMaterialPreserved=%v] "+
-				"[auditMetadataPreserved=%v] [rounds=%d]",
+				"[auditMetadataPreserved=%v] [preservedAsOneRecord=%v] "+
+				"[rounds=%d]",
 			metadata.WalletPublicKeyHash,
 			signer.signingGroupMemberIndex,
 			metadata.ProtocolMode,
 			metadata.CanonicalStartBlock,
 			metadata.FailedOperation,
 			metadata.LastObservedBlock,
-			state.membershipPersisted,
-			state.metadataPersisted,
+			state.keyMaterialPersisted(),
+			state.metadataPersisted || state.handoffPersisted,
+			state.handoffPersisted,
 			rounds,
 		)
 	}
 
-	rounds, lastErr := q.persistPair(
+	rounds, lastErr := q.persistOutput(
 		&state,
 		directory,
 		memberSuffix,
 		signerBytes,
 		metadataBytes,
+		handoffBytes,
 		observer,
 	)
 	if lastErr == nil {
@@ -279,26 +381,35 @@ func (q *signerQuarantine) preserve(
 			"before the process ended [keyMaterialPreserved=%v] "+
 			"[auditMetadataPreserved=%v]: %w",
 		rounds,
-		state.membershipPersisted,
-		state.metadataPersisted,
+		state.keyMaterialPersisted(),
+		state.metadataPersisted || state.handoffPersisted,
 		lastErr,
 	)
 }
 
-// persistPair writes whichever halves of a preserved output the namespace has
-// not taken yet, round after round, until it holds both or the process ends.
-// It reports how many rounds were spent and the last round's failure, which is
-// nil exactly when both halves are durable.
+// persistOutput writes whichever records of a preserved output the namespace
+// has not taken yet, round after round, until it holds the whole output or the
+// process ends. It reports how many rounds were spent and the last round's
+// failure, which is nil exactly when the output is durable.
 //
-// The state is updated in place as each half lands so that a caller reading it
+// The preferred form is the pair — a membership record beside its metadata —
+// because it is the layout the active namespace uses and the one every reader
+// already understands. A round that cannot complete the pair falls back on the
+// combined handoff record, which carries both halves in one write: one save
+// either takes the whole output or none of it, so no namespace that refuses one
+// particular record can leave key material with nowhere to go. A landed handoff
+// ends the attempt, since there is nothing left the namespace does not hold.
+//
+// The state is updated in place as each record lands so that a caller reading it
 // after an interrupted preservation sees what the namespace actually has, and
-// so a half that succeeded is never rewritten by a later round.
-func (q *signerQuarantine) persistPair(
+// so a record that succeeded is never rewritten by a later round.
+func (q *signerQuarantine) persistOutput(
 	state *quarantineState,
 	directory string,
 	memberSuffix string,
 	signerBytes []byte,
 	metadataBytes []byte,
+	handoffBytes []byte,
 	observer quarantineObserver,
 ) (int, error) {
 	graceAttempts := q.graceAttempts
@@ -321,6 +432,38 @@ func (q *signerQuarantine) persistPair(
 
 	var lastErr error
 
+	// materialAccountedFor keeps the observer's count of preserved shares to one
+	// notification per output. The material can reach the namespace as the
+	// membership record or inside the handoff, and it is the same share either
+	// way.
+	materialAccountedFor := false
+	accountForMaterial := func(round int) {
+		if announcedLostMaterial {
+			announcedLostMaterial = false
+			// Named by the directory the record lives under rather than by the
+			// wallet hash the other quarantine lines carry: an operator reading
+			// this is going to the namespace to confirm the material is there.
+			q.logger.Warnf(
+				"the quarantine namespace took the tbtc key material it had "+
+					"been refusing [walletStorageKey=%s] [member=%s] "+
+					"[round=%d]; the share this node reported as only in "+
+					"memory is on disk",
+				directory,
+				memberSuffix,
+				round,
+			)
+		}
+
+		if materialAccountedFor {
+			return
+		}
+		materialAccountedFor = true
+
+		if observer.keyMaterialPreserved != nil {
+			observer.keyMaterialPreserved()
+		}
+	}
+
 	for round := 1; ; round++ {
 		var roundErrs []error
 
@@ -341,26 +484,7 @@ func (q *signerQuarantine) persistPair(
 				// caller is guaranteed to see.
 				state.membershipPersisted = true
 
-				if announcedLostMaterial {
-					announcedLostMaterial = false
-					// Named by the directory the record lives under rather
-					// than by the wallet hash the other quarantine lines
-					// carry: an operator reading this is going to the
-					// namespace to confirm the material is there.
-					q.logger.Warnf(
-						"the quarantine namespace took the tbtc key material "+
-							"it had been refusing [walletStorageKey=%s] "+
-							"[member=%s] [round=%d]; the share this node "+
-							"reported as only in memory is on disk",
-						directory,
-						memberSuffix,
-						round,
-					)
-				}
-
-				if observer.keyMaterialPreserved != nil {
-					observer.keyMaterialPreserved()
-				}
+				accountForMaterial(round)
 			}
 		}
 
@@ -379,7 +503,46 @@ func (q *signerQuarantine) persistPair(
 			}
 		}
 
-		if len(roundErrs) == 0 {
+		// The pair is what this round could not finish, so the output is
+		// offered whole under a name of its own. A namespace refusing one
+		// particular record — a leftover file nothing can overwrite, a name an
+		// operator's repair left behind — still has somewhere to put a share
+		// that cannot be generated a second time.
+		//
+		// When the half that did land was the membership, the namespace ends up
+		// holding the material twice. That is the cheaper mistake: both copies
+		// are the same encrypted bytes under the same handle, readers count the
+		// seat once, and the alternative is choosing which refusals are worth
+		// leaving an output incomplete for.
+		if len(roundErrs) > 0 && !state.handoffPersisted {
+			if err := q.handle.Save(
+				handoffBytes,
+				directory,
+				"/handoff_"+memberSuffix,
+			); err != nil {
+				roundErrs = append(roundErrs, fmt.Errorf(
+					"could not persist the quarantine handoff: [%v]",
+					err,
+				))
+			} else {
+				state.handoffPersisted = true
+
+				q.logger.Warnf(
+					"preserved a tbtc signer output as a single handoff record "+
+						"[walletStorageKey=%s] [member=%s] [round=%d]; the "+
+						"namespace would not take the record pair, and the key "+
+						"material and its audit record are held together "+
+						"instead",
+					directory,
+					memberSuffix,
+					round,
+				)
+
+				accountForMaterial(round)
+			}
+		}
+
+		if state.complete() {
 			return round, nil
 		}
 
@@ -392,7 +555,7 @@ func (q *signerQuarantine) persistPair(
 		// the retry keeps running behind the notification.
 		if !notified && round >= graceAttempts {
 			notified = true
-			announcedLostMaterial = !state.membershipPersisted
+			announcedLostMaterial = !state.keyMaterialPersisted()
 			if observer.stillIncomplete != nil {
 				observer.stillIncomplete(*state, lastErr)
 			}
@@ -420,12 +583,19 @@ type quarantinedSigner struct {
 // preservedOutputs lists the signer outputs currently held in the quarantine
 // namespace.
 //
-// Only the membership records are counted. Each preserved output writes a
-// membership beside its audit metadata, and counting both would report every
-// output twice; the membership is the output itself, so it is the one that
-// decides. Nothing here reads a record's content: the pair identifying an
-// output is carried by the wallet directory and the membership name, and the
-// share inside stays encrypted and unread.
+// Only the records carrying key material are counted. A preserved output is
+// written either as a membership beside its audit metadata or as a single
+// handoff carrying both, and in each form exactly one record holds the share;
+// counting the metadata beside it would report the same output twice. Nothing
+// here reads a record's content: the pair identifying an output is carried by
+// the wallet directory and the record name, and the share inside stays
+// encrypted and unread.
+//
+// The same seat can be named by both forms — a preservation that wrote the
+// membership, was refused the metadata, and fell back on the handoff leaves
+// both on disk — so outputs are collected as identities rather than counted per
+// record. One seat of one wallet is one share whatever it took to write it
+// down.
 //
 // A namespace that cannot be enumerated returns an error rather than a short
 // list. The count exists to say how much preserved material a rollback still
@@ -440,7 +610,7 @@ func (q *signerQuarantine) preservedOutputs() ([]quarantinedSigner, error) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	var outputs []quarantinedSigner
+	found := make(map[quarantinedSigner]struct{})
 	go func() {
 		defer wg.Done()
 		for descriptor := range descriptorsChan {
@@ -448,10 +618,10 @@ func (q *signerQuarantine) preservedOutputs() ([]quarantinedSigner, error) {
 			if !ok {
 				continue
 			}
-			outputs = append(outputs, quarantinedSigner{
+			found[quarantinedSigner{
 				walletStorageKey: descriptor.Directory(),
 				memberIndex:      memberIndex,
-			})
+			}] = struct{}{}
 		}
 	}()
 
@@ -472,16 +642,23 @@ func (q *signerQuarantine) preservedOutputs() ([]quarantinedSigner, error) {
 		)
 	}
 
+	outputs := make([]quarantinedSigner, 0, len(found))
+	for output := range found {
+		outputs = append(outputs, output)
+	}
+
 	return outputs, nil
 }
 
-// quarantinedMemberIndex reads the seat a preserved membership record was
-// written for out of its name, reporting whether the name is one at all.
+// quarantinedMemberIndex reads the seat a preserved record was written for out
+// of its name, reporting whether the name belongs to a record holding key
+// material at all.
 //
-// The name is this package's own: preserve writes "membership_<seat>" beside
-// "metadata_<seat>". Anything else in the namespace — the metadata documents, a
-// name a later schema adds, an operator's stray file — is not a signer output
-// and is not counted as one.
+// The names are this package's own: preserve writes "membership_<seat>" beside
+// "metadata_<seat>", and falls back on "handoff_<seat>" carrying both. The two
+// that hold the share count; anything else in the namespace — the metadata
+// documents, a name a later schema adds, an operator's stray file — is not a
+// signer output and is not counted as one.
 //
 // A leading separator is tolerated because the name is written with one and not
 // every handle hands it back the same way: the disk implementation joins it into
@@ -489,10 +666,16 @@ func (q *signerQuarantine) preservedOutputs() ([]quarantinedSigner, error) {
 // was given returns the name as this package wrote it. Both spell the same
 // record, so neither is allowed to decide whether it counts.
 func quarantinedMemberIndex(name string) (group.MemberIndex, bool) {
-	const prefix = "membership_"
+	bare := strings.TrimPrefix(name, "/")
 
-	suffix, found := strings.CutPrefix(strings.TrimPrefix(name, "/"), prefix)
-	if !found {
+	var suffix string
+	for _, prefix := range []string{"membership_", "handoff_"} {
+		if cut, found := strings.CutPrefix(bare, prefix); found {
+			suffix = cut
+			break
+		}
+	}
+	if suffix == "" {
 		return 0, false
 	}
 

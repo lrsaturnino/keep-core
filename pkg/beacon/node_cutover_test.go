@@ -852,8 +852,10 @@ func TestJoinDKGIfEligible_RefusedQuarantineMembershipIsNotAQuarantinedOutcome(
 	)
 
 	// The same forced-quiescence interruption as above, over a namespace that
-	// will not accept the key material.
-	refusing := &cutoverRefusingPersistence{refusedMarker: "/membership_"}
+	// will not accept the key material in any of the forms it is offered in.
+	refusing := &cutoverRefusingPersistence{
+		refusedMarkers: []string{"/membership_", "/handoff_"},
+	}
 	harness.node.signerQuarantine = registry.NewQuarantine(
 		endedProcessLifetime(),
 		logger,
@@ -932,8 +934,10 @@ func TestJoinDKGIfEligible_RefusedQuarantineMetadataIsNotAQuarantinedOutcome(
 	)
 
 	// The same forced-quiescence interruption as above, over a namespace that
-	// takes the key material but not the record explaining it.
-	refusing := &cutoverRefusingPersistence{refusedMarker: "/metadata_"}
+	// takes the key material but no record explaining it.
+	refusing := &cutoverRefusingPersistence{
+		refusedMarkers: []string{"/metadata_", "/handoff_"},
+	}
 	harness.node.signerQuarantine = registry.NewQuarantine(
 		endedProcessLifetime(),
 		logger,
@@ -989,6 +993,129 @@ func TestJoinDKGIfEligible_RefusedQuarantineMetadataIsNotAQuarantinedOutcome(
 			)
 		}
 	}
+}
+
+// TestJoinDKGIfEligible_RefusedMembershipStillPreservesTheOutputWhole proves a
+// namespace that will not take the key material's own record does not cost this
+// node its shares: the combined handoff carries every interrupted output, the
+// permits end quarantined, and the node keeps taking work.
+//
+// This is the state a beacon node can least afford to lose. The group whose
+// share was generated here may already have an accepted result, and a member
+// that cannot produce its share leaves that group permanently short of it. The
+// membership record is only where preservation prefers to put the material —
+// when that name is refused, the output still has a name it can land under, and
+// what lands carries the mode, anchor, ceremony, and refused operation the
+// offline audit reconciles against the chain.
+func TestJoinDKGIfEligible_RefusedMembershipStillPreservesTheOutputWhole(
+	t *testing.T,
+) {
+	harness := newCutoverNodeHarness(
+		t,
+		2,
+		2,
+		func(currentBlock uint64) uint64 { return currentBlock + 100_000 },
+		nil,
+	)
+
+	// Only the key material's own record is refused. The rest of the namespace
+	// works, which is what leaves the output somewhere to go.
+	refusing := &cutoverRefusingPersistence{
+		refusedMarkers: []string{"/membership_"},
+	}
+	harness.node.signerQuarantine = registry.NewQuarantine(
+		endedProcessLifetime(),
+		logger,
+		refusing,
+	)
+
+	blockCounter, err := harness.localChain.BlockCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	trigger, err := blockCounter.BlockHeightWaiter(
+		harness.anchorBlock + gjkr.ProtocolBlocks() + 2,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clockFailed := make(chan struct{})
+	go func() {
+		defer close(clockFailed)
+		<-trigger
+		harness.gateClock.failing.Store(true)
+	}()
+
+	harness.node.JoinDKGIfEligible(cutoverRandomSeed(t), harness.anchorBlock)
+
+	<-clockFailed
+	harness.waitForPermitRelease(t)
+
+	if got := refusing.savesContaining("/membership_"); got != 0 {
+		t.Errorf("expected no membership to be accepted, got [%d]", got)
+	}
+	if got := refusing.savesContaining("/handoff_"); got != harness.groupSize {
+		t.Fatalf(
+			"expected [%d] outputs preserved whole, got [%d]",
+			harness.groupSize,
+			got,
+		)
+	}
+
+	// Every preserved output has to read back as a share with its explanation,
+	// which is what makes the permit resolvable rather than a finding.
+	for _, preserved := range refusing.savedDataContaining("/handoff_") {
+		handoff, err := registry.DecodeQuarantinedSignerHandoff(preserved)
+		if err != nil {
+			t.Fatalf("a preserved output cannot be read back: [%v]", err)
+		}
+
+		membership := &registry.Membership{}
+		if err := membership.Unmarshal(handoff.Membership); err != nil {
+			t.Fatalf(
+				"a preserved output carries key material that cannot be read "+
+					"back: [%v]",
+				err,
+			)
+		}
+		if handoff.Metadata.Ceremony != string(participation.BeaconDKG) {
+			t.Errorf(
+				"a preserved output names ceremony [%s]",
+				handoff.Metadata.Ceremony,
+			)
+		}
+		if handoff.Metadata.CanonicalStartBlock != harness.anchorBlock {
+			t.Errorf(
+				"a preserved output names canonical anchor [%d], expected [%d]",
+				handoff.Metadata.CanonicalStartBlock,
+				harness.anchorBlock,
+			)
+		}
+	}
+
+	quarantined := 0
+	for _, record := range harness.gate.State().RecentTerminalOutcomes {
+		if record.Outcome == participation.TerminalOutcomeQuarantined {
+			quarantined++
+		}
+	}
+	if quarantined != harness.groupSize {
+		t.Errorf(
+			"expected [%d] outputs reported as quarantined, got [%d]",
+			harness.groupSize,
+			quarantined,
+		)
+	}
+
+	// Nothing was lost, so there is no inventory gap for the node to stop on.
+	testutils.AssertBoolsEqual(
+		t,
+		"the gate quiesced over an output the namespace holds whole",
+		false,
+		harness.gate.State().Quiescing,
+	)
 }
 
 // TestBlockOnIncompleteQuarantine_QuiescesOnEitherMissingHalf proves the node
@@ -1110,7 +1237,9 @@ func TestJoinDKGIfEligible_LostShareQuiescesTheNode(t *testing.T) {
 		nil,
 	)
 
-	refusing := &cutoverRefusingPersistence{refusedMarker: "/membership_"}
+	refusing := &cutoverRefusingPersistence{
+		refusedMarkers: []string{"/membership_", "/handoff_"},
+	}
 	harness.node.signerQuarantine = registry.NewQuarantine(
 		endedProcessLifetime(),
 		logger,
@@ -1195,7 +1324,11 @@ func endedProcessLifetime() context.Context {
 type cutoverRefusingPersistence struct {
 	cutoverRecordingPersistence
 
-	refusedMarker string
+	// refusedMarkers name the records this namespace will not accept. They are
+	// a list because a preserved output is offered under more than one name:
+	// refusing the record pair and refusing the output are different
+	// namespaces, and only the second one costs the node a share.
+	refusedMarkers []string
 }
 
 func (p *cutoverRefusingPersistence) Save(
@@ -1203,8 +1336,10 @@ func (p *cutoverRefusingPersistence) Save(
 	directory string,
 	name string,
 ) error {
-	if strings.Contains(name, p.refusedMarker) {
-		return fmt.Errorf("cannot write [%s]", name)
+	for _, marker := range p.refusedMarkers {
+		if strings.Contains(name, marker) {
+			return fmt.Errorf("cannot write [%s]", name)
+		}
 	}
 
 	return p.cutoverRecordingPersistence.Save(data, directory, name)
