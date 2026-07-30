@@ -1716,9 +1716,9 @@ DKG_SEAT4="r1-node-3@${DKG_WORK}#4=completed\
 DKG_FLEET="${DKG_SEAT1} ${DKG_SEAT3} ${DKG_SEAT4}"
 check_join "surviving DKG seats enter the map in the transcript's own space" \
   "1 2 3" \
-  "$(authored_work_local_members "${DKG_WORK}" "${DKG_FLEET}")"
+  "$(authored_work_local_members "${DKG_WORK}" "${DKG_FLEET}" "")"
 check_join "a removed middle DKG member leaves the run homogeneous" "" \
-  "$(mixed_transcript_permits "${DKG_WORK}" "${DKG_FLEET}")"
+  "$(mixed_transcript_permits "${DKG_WORK}" "${DKG_FLEET}" "")"
 check_join "a remapped transcript agrees with the permit that wrote it" "" \
   "$(disowned_transcript_permits "${DKG_WORK}" "${DKG_FLEET}")"
 
@@ -1732,7 +1732,7 @@ check_join "a remapped transcript agrees with the permit that wrote it" "" \
 check_join "a final seat no permit in the fleet maps to is outside it" \
   "r1-node-1@${DKG_WORK}#1 (fleet 1,2, outside 3), \
 r1-node-2@${DKG_WORK}#3 (fleet 1,2, outside 3)" \
-  "$(mixed_transcript_permits "${DKG_WORK}" "${DKG_SEAT1} ${DKG_SEAT3}")"
+  "$(mixed_transcript_permits "${DKG_WORK}" "${DKG_SEAT1} ${DKG_SEAT3}" "")"
 
 # A holder the ceremony removed. Its DKG seat is absent from the survivor list the
 # transcripts publish, which says definitely that it holds no final seat rather
@@ -1741,9 +1741,9 @@ r1-node-2@${DKG_WORK}#3 (fleet 1,2, outside 3)" \
 DKG_REMOVED="r1-node-4@${DKG_WORK}#2=exhausted=no_threshold=-=-=-=-=-=2"
 check_join "a removed member contributes no seat and blocks nothing" "" \
   "$(untranslatable_ownership_permits "${DKG_WORK}" \
-    "${DKG_FLEET} ${DKG_REMOVED}")"
+    "${DKG_FLEET} ${DKG_REMOVED}" "")"
 check_join "a removed member leaves the homogeneous reading standing" "" \
-  "$(mixed_transcript_permits "${DKG_WORK}" "${DKG_FLEET} ${DKG_REMOVED}")"
+  "$(mixed_transcript_permits "${DKG_WORK}" "${DKG_FLEET} ${DKG_REMOVED}" "")"
 
 # A holder whose own permit-space seat is absent from the mapping it published.
 # The two accounts of one permit cannot both be true, and the gate refuses such a
@@ -1766,9 +1766,9 @@ DKG_UNMAPPED="r1-node-1@${DKG_WORK}#1=completed=persisted_tbtc_signer\
 =0xdkg=1=1,2,3=1=-=1"
 check_join "a transcript with no mapping leaves its ownership unknown" \
   "r1-node-1@${DKG_WORK}#1 (operated 1)" \
-  "$(untranslatable_ownership_permits "${DKG_WORK}" "${DKG_UNMAPPED}")"
+  "$(untranslatable_ownership_permits "${DKG_WORK}" "${DKG_UNMAPPED}" "")"
 check_join "an unplaceable ownership map renders no mixed verdict" "" \
-  "$(mixed_transcript_permits "${DKG_WORK}" "${DKG_UNMAPPED}")"
+  "$(mixed_transcript_permits "${DKG_WORK}" "${DKG_UNMAPPED}" "")"
 
 # The second is two holders of one piece of work publishing different mappings.
 # One DKG has one final group, so the two describe two different rebuildings of
@@ -1783,9 +1783,54 @@ DKG_DISAGREEING="r1-node-2@${DKG_WORK}#3=completed=persisted_tbtc_signer\
 check_join "holders disagreeing about one final group are named" \
   "r1-node-1@${DKG_WORK}#1 (operated 1), r1-node-2@${DKG_WORK}#3 (operated 3)" \
   "$(untranslatable_ownership_permits "${DKG_WORK}" \
-    "${DKG_SEAT1} ${DKG_DISAGREEING}")"
+    "${DKG_SEAT1} ${DKG_DISAGREEING}" "")"
 check_join "disagreeing mappings render no mixed verdict" "" \
-  "$(mixed_transcript_permits "${DKG_WORK}" "${DKG_SEAT1} ${DKG_DISAGREEING}")"
+  "$(mixed_transcript_permits "${DKG_WORK}" "${DKG_SEAT1} ${DKG_DISAGREEING}" "")"
+
+# The permit that was still open when the reading was taken. A driver reports
+# when the chain settles and a holder closes on its own schedule, so this is the
+# ordinary outcome of a race rather than a fault: nothing restarted, nothing was
+# evicted, and no counter anywhere moved. Read off the endings alone the fleet
+# looks like one that never operated that seat, and the seat then reads as
+# supplied by the only other release on the network.
+DKG_HELD3="r1-node-2@${DKG_WORK}#3=3"
+DKG_HELD4="r1-node-3@${DKG_WORK}#4=4"
+check_join "a permit still open puts its seats in the map" "1 2 3" \
+  "$(authored_work_local_members "${DKG_WORK}" "${DKG_SEAT1}" \
+    "${DKG_HELD3} ${DKG_HELD4}")"
+check_join "contributors that had not closed yet read as mixed without them" \
+  "r1-node-1@${DKG_WORK}#1 (fleet 1, outside 2,3)" \
+  "$(mixed_transcript_permits "${DKG_WORK}" "${DKG_SEAT1}" "")"
+check_join "contributors that had not closed yet leave the run homogeneous" \
+  "" \
+  "$(mixed_transcript_permits "${DKG_WORK}" "${DKG_SEAT1}" \
+    "${DKG_HELD3} ${DKG_HELD4}")"
+
+# A held permit on other work contributes nothing here. The map is per piece of
+# chain work, and a seat number carried across from another ceremony would cover
+# a seat this fleet really did not operate.
+check_join "a permit held on other work stays out of this map" "1" \
+  "$(authored_work_local_members "${DKG_WORK}" "${DKG_SEAT1}" \
+    "r1-node-2@tbtc_dkg@10@other-work#3=3")"
+
+# A held token that is not the whole held shape is not read. An ending arriving
+# in the live list would otherwise put a permit that has already closed back into
+# the open account, and the two are joined to each other.
+check_join "a truncated held token is not read as a permit" "1" \
+  "$(authored_work_local_members "${DKG_WORK}" "${DKG_SEAT1}" \
+    "r1-node-2@${DKG_WORK}#3")"
+check_join "an ending arriving in the held list is not read as one" "1" \
+  "$(authored_work_local_members "${DKG_WORK}" "${DKG_SEAT1}" \
+    "${DKG_SEAT3}")"
+
+# And a held permit whose seats cannot be placed is named rather than dropped.
+# Left out, a work whose only remapping holder had not closed yet would read as
+# one with nothing to place, and the mixed reading would proceed against a map
+# missing that holder entirely.
+check_join "a held permit that cannot be placed is named" \
+  "r1-node-1@${DKG_WORK}#1 (operated 1), r1-node-2@${DKG_WORK}#3 (operated 3)" \
+  "$(untranslatable_ownership_permits "${DKG_WORK}" "${DKG_UNMAPPED}" \
+    "${DKG_HELD3}")"
 
 # Whether the account all of the above is read out of is the one that was there
 # while the work ran. It lives in memory, so an account read from a new process
@@ -1857,14 +1902,15 @@ REHEARSAL_R1_SERVICES=("r1-node-1" "r1-node-2")
 PROVENANCE_OUT="$(
   (
     # shellcheck disable=SC2329
-    participation_field() {
-      if [[ "$2" != gate_instance ]]; then
-        printf '0'
-      elif [[ "$1" == r1-node-1 ]]; then
-        printf 'unknown'
-      else
-        printf '0123456789abcdef0123456789abcdef'
+    probe_diagnostics() {
+      local instance="0123456789abcdef0123456789abcdef"
+      if [[ "$1" == r1-node-1 ]]; then
+        instance="unknown"
       fi
+      printf '{"protocol_participation":{"active_permits":[],'
+      printf '"recent_terminal_outcomes":[],"gate_instance":"%s",' \
+        "${instance}"
+      printf '"forgotten_terminal_outcomes":0}}'
     }
     fleet_account_provenance
   ) 2>&1
@@ -1877,6 +1923,97 @@ check_join "two nodes that could not compose an identity are both named" \
   "r1-node-1 (does not say which process its account of closed permits \
 belongs to)" \
   "$(unfollowable_account_nodes "${PROVENANCE_OUT}" "${PROVENANCE_OUT}")"
+
+# The four readings the post-drive joins rest on, out of one response. A permit
+# is in the held list or in the closed account and never in both, so asked at
+# separate instants a permit closing between two requests is in neither — and a
+# permit in neither is a seat missing from the fleet with no counter anywhere
+# saying it went missing.
+SAVED_R1_SERVICES=("${REHEARSAL_R1_SERVICES[@]}")
+REHEARSAL_R1_SERVICES=("r1-node-1" "r1-node-2")
+ACCOUNT_OUT="$(
+  (
+    # shellcheck disable=SC2329
+    probe_diagnostics() {
+      printf '{"protocol_participation":{"active_permits":['
+      if [[ "$1" == r1-node-1 ]]; then
+        printf '{"ceremony":"tbtc_dkg","mode":"legacy",'
+        printf '"canonical_start_block":10,"work_id":"w-1","permit_id":"3",'
+        printf '"identity_bound":true,"operated_members":[3]}'
+      fi
+      printf '],"recent_terminal_outcomes":['
+      if [[ "$1" == r1-node-2 ]]; then
+        printf '{"permit":{"ceremony":"tbtc_dkg","mode":"legacy",'
+        printf '"canonical_start_block":10,"work_id":"w-1","permit_id":"1",'
+        printf '"identity_bound":true,"operated_members":[1]},'
+        printf '"outcome":"unresolved","evidence":{"kind":""}}'
+      fi
+      printf '],"gate_instance":"0123456789abcdef0123456789abcdef",'
+      printf '"forgotten_terminal_outcomes":2}}'
+    }
+    fleet_account_snapshot
+  ) 2>&1
+)"
+REHEARSAL_R1_SERVICES=("${SAVED_R1_SERVICES[@]}")
+check_join "one response carries the provenance of both nodes" \
+  "r1-node-1=0123456789abcdef0123456789abcdef=2 \
+r1-node-2=0123456789abcdef0123456789abcdef=2" \
+  "$(snapshot_field "${ACCOUNT_OUT}" provenance)"
+check_join "one response carries the permits still held" \
+  "r1-node-1@tbtc_dkg@10@w-1#3=3" \
+  "$(snapshot_field "${ACCOUNT_OUT}" held)"
+check_join "one response carries the endings recorded beside them" \
+  "r1-node-2@tbtc_dkg@10@w-1#1=unresolved=-=-=-=-=-=-=1" \
+  "$(snapshot_field "${ACCOUNT_OUT}" outcomes)"
+
+# A node that cannot be asked takes all three lines rather than shortening one:
+# a fleet short one member's held permits looks exactly like a fleet that
+# released them, and one short its endings like a fleet whose permits all closed
+# unrecorded.
+SAVED_R1_SERVICES=("${REHEARSAL_R1_SERVICES[@]}")
+REHEARSAL_R1_SERVICES=("r1-node-1")
+ACCOUNT_OUT="$(
+  (
+    # shellcheck disable=SC2329
+    probe_diagnostics() { return 1; }
+    fleet_account_snapshot
+  ) 2>/dev/null
+)"
+REHEARSAL_R1_SERVICES=("${SAVED_R1_SERVICES[@]}")
+check_join "a gate that cannot be asked leaves its provenance unusable" \
+  "unreadable on r1-node-1" "$(snapshot_field "${ACCOUNT_OUT}" provenance)"
+check_join "a gate that cannot be asked leaves its held permits unusable" \
+  "unreadable on r1-node-1" "$(snapshot_field "${ACCOUNT_OUT}" held)"
+check_join "a gate that cannot be asked leaves its endings unusable" \
+  "unreadable on r1-node-1" "$(snapshot_field "${ACCOUNT_OUT}" outcomes)"
+
+# The held list is held to the same permit shape the closed account is. A live
+# permit naming no chain work matches nothing a driver put on the chain, and
+# reading it as a match would be reading the active count again under another
+# name.
+SAVED_R1_SERVICES=("${REHEARSAL_R1_SERVICES[@]}")
+REHEARSAL_R1_SERVICES=("r1-node-1")
+set +e
+CASE_OUT="$(
+  (
+    # shellcheck disable=SC2329
+    probe_diagnostics() {
+      printf '{"protocol_participation":{"active_permits":['
+      printf '{"ceremony":"tbtc_dkg","mode":"legacy",'
+      printf '"canonical_start_block":10,"work_id":"w-1","permit_id":"3",'
+      printf '"identity_bound":false,"operated_members":[3]}'
+      printf '],"recent_terminal_outcomes":[],'
+      printf '"gate_instance":"0123456789abcdef0123456789abcdef",'
+      printf '"forgotten_terminal_outcomes":0}}'
+    }
+    fleet_account_snapshot
+  ) 2>&1
+)"
+CASE_RC=$?
+set -e
+REHEARSAL_R1_SERVICES=("${SAVED_R1_SERVICES[@]}")
+check "an unbound held permit leaves the account unreadable" 0 \
+  "^provenance=unreadable on r1-node-1$"
 
 # A node that cannot be asked makes the whole reading unusable. A shorter list
 # would be indistinguishable from a fleet whose permits all ended unrecorded.

@@ -4451,6 +4451,98 @@ fleet_terminal_outcomes() {
   printf '%s' "${out}"
 }
 
+# Everything one node's gate says about the permits it has been issued, out of a
+# single response: which process is answering, how much that account has already
+# forgotten, the permits it is still holding, and the endings it recorded for the
+# ones it is not. Rendered as "provenance=", "held=" and "outcomes=" lines.
+#
+# The four readings have to describe one instant because they are joined to each
+# other. A permit is in the held list or in the closed account and never in both,
+# so asked one at a time a permit that closes between the two requests appears in
+# neither — and a permit in neither is a seat missing from the fleet's ownership
+# map, which is the seat that reads as supplied by the other release. The
+# provenance is on the same response for the same reason: it is what says whether
+# the account those two lists came out of is the one that held the work, and read
+# from a different instant it vouches for lists it never saw.
+#
+# The gate composes the whole object from one state snapshot, so this is one
+# instant by construction. A node that stops mid-read fails the fetch outright
+# rather than answering part of it.
+service_account_snapshot() {
+  local service="$1"
+  probe_diagnostics "${service}" |
+    node -e "
+      ${PERMIT_IDENTITY_JS}
+      ${TERMINAL_OUTCOME_JS}"'
+      let raw = "";
+      process.stdin.on("data", (d) => (raw += d));
+      process.stdin.on("end", () => {
+        const state = (JSON.parse(raw).protocol_participation) || {};
+        const service = process.argv[1];
+        const permits = state.active_permits;
+        if (!Array.isArray(permits)) {
+          console.error("no active_permits in the gate state");
+          process.exit(1);
+        }
+        const outcomes = state.recent_terminal_outcomes;
+        if (!Array.isArray(outcomes)) {
+          console.error("no recent_terminal_outcomes in the gate state");
+          process.exit(1);
+        }
+        // A held permit is rendered out of the same fields a closed one is, so
+        // the two lists enter the ownership map on identical terms: each names
+        // seats of its own holder, published at issuance, and what became of
+        // the permit afterwards is a question the map does not ask.
+        const held = [];
+        for (const permit of permits) {
+          held.push(permitIdentity(service, permit, "a held permit") +
+            "=" + operatedOf(permit));
+        }
+        const ended = [];
+        for (const record of outcomes) {
+          ended.push(terminalOutcome(service, record));
+        }
+        // An identity a gate could not compose, and a count that is not one,
+        // are rendered as the one token that can be neither. Carried through
+        // verbatim they compare equal to themselves, and the reading that has to
+        // be unfollowable comes out as the followable one.
+        const instance = state.gate_instance;
+        const forgotten = state.forgotten_terminal_outcomes;
+        process.stdout.write("provenance=" + service + "=" +
+          (/^[0-9a-f]{32}$/.test(instance) ? instance : "-") + "=" +
+          (Number.isInteger(forgotten) && forgotten >= 0 ?
+            String(forgotten) : "-") + "\n" +
+          "held=" + held.join(" ") + "\n" +
+          "outcomes=" + ended.join(" ") + "\n");
+      });
+    ' "${service}"
+}
+
+# The same across the R1 fleet, on the unreadable-is-unusable convention every
+# reading above uses. A node that cannot be asked takes all three lines rather
+# than shortening one: a fleet short one member's held permits is exactly what a
+# fleet that released them looks like, and a fleet short one member's endings is
+# what one whose permits all closed unrecorded looks like.
+fleet_account_snapshot() {
+  local service snapshot part provenance="" held="" outcomes=""
+  for service in "${REHEARSAL_R1_SERVICES[@]}"; do
+    if ! snapshot="$(service_account_snapshot "${service}" 2>/dev/null)"; then
+      printf 'provenance=unreadable on %s\nheld=unreadable on %s\n' \
+        "${service}" "${service}"
+      printf 'outcomes=unreadable on %s\n' "${service}"
+      return 0
+    fi
+    part="$(snapshot_field "${snapshot}" provenance)"
+    provenance="${provenance}${provenance:+ }${part}"
+    part="$(snapshot_field "${snapshot}" held)"
+    [[ -z "${part}" ]] || held="${held}${held:+ }${part}"
+    part="$(snapshot_field "${snapshot}" outcomes)"
+    [[ -z "${part}" ]] || outcomes="${outcomes}${outcomes:+ }${part}"
+  done
+  printf 'provenance=%s\nheld=%s\noutcomes=%s\n' \
+    "${provenance}" "${held}" "${outcomes}"
+}
+
 # Whether each R1 node's account of closed permits can be followed at all,
 # rendered as "<service>=<gate instance>=<forgotten count>" tokens.
 #
@@ -4479,24 +4571,14 @@ fleet_terminal_outcomes() {
 # Rendering anything off-shape the same way is what keeps the token parse honest
 # besides: an instance carrying a separator would otherwise split into a
 # different node than the one that answered.
+#
+# It is taken out of the whole-account reading rather than asked for on its own,
+# so the reading before a drive and the reading after it are produced by one
+# renderer. Two renderers of one token shape is one chance for the two halves of
+# an equality test to disagree about what an identity even is, and that test
+# decides whether every join below it can be believed.
 fleet_account_provenance() {
-  local service instance forgotten out=""
-  for service in "${REHEARSAL_R1_SERVICES[@]}"; do
-    if ! instance="$(participation_field \
-      "${service}" gate_instance 2>/dev/null)"; then
-      printf 'unreadable on %s' "${service}"
-      return 0
-    fi
-    if ! forgotten="$(participation_field \
-      "${service}" forgotten_terminal_outcomes 2>/dev/null)"; then
-      printf 'unreadable on %s' "${service}"
-      return 0
-    fi
-    [[ "${instance}" =~ ^[0-9a-f]{32}$ ]] || instance="-"
-    [[ "${forgotten}" =~ ^[0-9]+$ ]] || forgotten="-"
-    out="${out}${out:+ }${service}=${instance}=${forgotten}"
-  done
-  printf '%s' "${out}"
+  snapshot_field "$(fleet_account_snapshot)" provenance
 }
 
 # Of the fleet, the nodes whose account of closed permits cannot be followed
@@ -6974,12 +7056,21 @@ uncredited_contributors() {
 # final seat shifts down, so the map's own seats land on the wrong side of the
 # reading and a homogeneous run presents a seat as outside the fleet.
 #
+# A permit still held when the reading was taken counts toward it too, and that
+# is the other half of the same rule. An ending is the only thing that puts a
+# permit in the closed account, so a contributor whose permit was still open when
+# the driver reported settlement — the ordinary case, since a driver watches the
+# chain and a holder closes on its own schedule — is in neither the endings nor
+# anywhere else, and its seat leaves the map without any counter moving. Read on
+# its own the fleet looks like one that never operated that seat, which is the
+# mixed verdict again, off a run where nothing went wrong at all.
+#
 # A seat that cannot be placed is left out of the map rather than guessed at, and
 # untranslatable_ownership_permits below is what stops the reading from treating
 # its absence as the fleet not having operated it.
 authored_work_local_members() {
-  local work="$1" authored="$2"
-  local token permit members member seat spaces transcript permits out=""
+  local work="$1" authored="$2" held="$3"
+  local token permit spaces transcript permits placed out=""
   spaces="$(authored_work_seat_spaces "${work}" "${authored}")"
   transcript="$(seat_spaces_transcript "${spaces}")"
   permits="$(seat_spaces_permits "${spaces}")"
@@ -6987,22 +7078,66 @@ authored_work_local_members() {
     authored_record_complete "${token}" || continue
     permit="$(authored_permit "${token}")"
     [[ "$(identity_work "${permit}")" == "${work}" ]] || continue
-    members="$(authored_operated "${token}")"
-    # "-" is how the gate renders an absent set, and it must not survive into a
-    # membership map: read as a token it would make an absent "-" look like an
-    # operated seat.
-    [[ "${members}" == "-" ]] && continue
-    if ! ceremony_remaps_permit_space "$(identity_ceremony "${permit}")"; then
-      out="${out}${out:+ }${members//,/ }"
-      continue
-    fi
-    for member in ${members//,/ }; do
-      seat="$(aligned_membership "${transcript}" "${permits}" "${member}")"
-      [[ -n "${seat}" ]] || continue
-      out="${out}${out:+ }${seat}"
-    done
+    placed="$(placed_permit_seats "${permit}" "$(authored_operated "${token}")" \
+      "${transcript}" "${permits}")"
+    [[ -n "${placed}" ]] || continue
+    out="${out}${out:+ }${placed}"
+  done
+  for token in ${held}; do
+    held_record_complete "${token}" || continue
+    permit="$(authored_permit "${token}")"
+    [[ "$(identity_work "${permit}")" == "${work}" ]] || continue
+    placed="$(placed_permit_seats "${permit}" "$(authored_operated "${token}")" \
+      "${transcript}" "${permits}")"
+    [[ -n "${placed}" ]] || continue
+    out="${out}${out:+ }${placed}"
   done
   printf '%s' "${out}"
+}
+
+# The seats one permit contributes to its work's ownership map, space-joined, in
+# the index space that work's transcripts speak in. Empty where the permit
+# operates none, or where a remapping ceremony's seats cannot be placed.
+#
+# The permit identity is what says which space its seats are in, so the same
+# rendering serves a permit read out of the closed account and one read off the
+# live list — the two differ in what became of the permit, which the map does not
+# ask about.
+placed_permit_seats() {
+  local permit="$1" members="$2" transcript="$3" permits="$4"
+  local member seat out=""
+  # "-" is how the gate renders an absent set, and it must not survive into a
+  # membership map: read as a token it would make an absent "-" look like an
+  # operated seat.
+  [[ "${members}" == "-" ]] && return 0
+  if ! ceremony_remaps_permit_space "$(identity_ceremony "${permit}")"; then
+    printf '%s' "${members//,/ }"
+    return 0
+  fi
+  for member in ${members//,/ }; do
+    seat="$(aligned_membership "${transcript}" "${permits}" "${member}")"
+    [[ -n "${seat}" ]] || continue
+    out="${out}${out:+ }${seat}"
+  done
+  printf '%s' "${out}"
+}
+
+# Whether one live-permit token carries the whole shape a held reading has: the
+# permit identity and the seats it was issued to operate, and nothing else.
+#
+# The count is exact for the reason the ending shape's is. A held token and an
+# ending token are read out of the same fields by the same accessors, so a
+# truncated ending arriving in the held list would be read as a permit still open
+# — putting a permit that has already closed back into the live account — and a
+# held token carrying extra fields comes from a release this rehearsal cannot
+# read.
+held_record_complete() {
+  local rest="$1" count=0
+  while [[ "${rest}" == *=* ]]; do
+    rest="${rest#*=}"
+    count=$((count + 1))
+  done
+  ((count == 1))
 }
 
 # Whether a ceremony records its result in a different membership index space
@@ -7112,7 +7247,7 @@ seat_spaces_permits() {
 # answer rather than a missing one, and a normal outcome of every ceremony that
 # removed a member.
 untranslatable_ownership_permits() {
-  local work="$1" authored="$2" token permit members spaces out=""
+  local work="$1" authored="$2" held="$3" token permit members spaces out=""
   spaces="$(authored_work_seat_spaces "${work}" "${authored}")"
   case "${spaces}" in
     -|'!') ;;
@@ -7127,6 +7262,18 @@ untranslatable_ownership_permits() {
     [[ "${members}" == "-" ]] && continue
     out="${out}${out:+, }${permit} (operated ${members})"
   done
+  # A permit still open is in the map on the same terms as a closed one, so its
+  # seats go unplaced on the same terms too. Left out here, a work whose only
+  # remapping holder had not yet closed would read as one with nothing to place.
+  for token in ${held}; do
+    held_record_complete "${token}" || continue
+    permit="$(authored_permit "${token}")"
+    [[ "$(identity_work "${permit}")" == "${work}" ]] || continue
+    ceremony_remaps_permit_space "$(identity_ceremony "${permit}")" || continue
+    members="$(authored_operated "${token}")"
+    [[ "${members}" == "-" ]] && continue
+    out="${out}${out:+, }${permit} (operated ${members})"
+  done
   printf '%s' "${out}"
 }
 
@@ -7134,9 +7281,10 @@ untranslatable_ownership_permits() {
 # fleet's ownership of a transcript was unreadable rather than reporting the
 # homogeneous reading that silence produces.
 unplaceable_authored_ownership() {
-  local authored="$1" works="$2" work found out=""
+  local authored="$1" works="$2" held="$3" work found out=""
   for work in ${works}; do
-    found="$(untranslatable_ownership_permits "${work}" "${authored}")"
+    found="$(untranslatable_ownership_permits "${work}" "${authored}" \
+      "${held}")"
     [[ -n "${found}" ]] || continue
     out="${out}${out:+, }${found}"
   done
@@ -7261,12 +7409,12 @@ disowned_authored_transcripts() {
 # reading that filled an unplaceable seat in from somewhere would satisfy that
 # half and arrive at exactly the verdict this must never produce.
 mixed_transcript_permits() {
-  local work="$1" authored="$2"
+  local work="$1" authored="$2" held="$3"
   local owned token permit incorporated member fleet outside out=""
   [[ -z "$(disowned_transcript_permits "${work}" "${authored}")" ]] || return 0
-  [[ -z "$(untranslatable_ownership_permits "${work}" "${authored}")" ]] ||
-    return 0
-  owned="$(authored_work_local_members "${work}" "${authored}")"
+  [[ -z "$(untranslatable_ownership_permits "${work}" "${authored}" \
+    "${held}")" ]] || return 0
+  owned="$(authored_work_local_members "${work}" "${authored}" "${held}")"
   for token in ${authored}; do
     authored_record_complete "${token}" || continue
     [[ "$(authored_outcome "${token}")" == "completed" ]] || continue
@@ -7483,7 +7631,7 @@ missing_bound_families() {
 # watched leaves no record with a seat of its own, whatever the report says about
 # either.
 ceremonies_without_mixed_transcript() {
-  local claimed="$1" authored="$2" required="$3" prior="$4"
+  local claimed="$1" authored="$2" required="$3" prior="$4" held="$5"
   local ceremony record work audited covered uncovered=""
   for ceremony in ${required}; do
     covered=0
@@ -7519,8 +7667,8 @@ ceremonies_without_mixed_transcript() {
       # honestly, claims no seat of its own in it, and so supplies neither half —
       # its transcript is prior-only, and the R1-only transcript of an actual
       # contributor beside it is still prior-free.
-      [[ -n "$(mixed_transcript_permits "${audited}" "${authored}")" ]] ||
-        continue
+      [[ -n "$(mixed_transcript_permits "${audited}" "${authored}" \
+        "${held}")" ]] || continue
       covered=1
       break
     done
@@ -9836,7 +9984,12 @@ PRECUTOVER_SIGHTINGS_AFTER=""
 # the disposition its own holder wrote down.
 PRECUTOVER_ORIGINATED=""
 PRECUTOVER_AUTHORED_ENDINGS=""
-# Which process each node answered the two readings above from, and how much
+# And the permits still open when that reading was taken. A driver reports when
+# the chain settles and a holder closes on its own schedule, so a contributor
+# whose permit outlives the report is in neither the endings nor anywhere else —
+# and a seat in neither is one the fleet reads as never having operated.
+PRECUTOVER_HELD_AFTER=""
+# Which process each node answered the readings above from, and how much
 # its account had already forgotten, taken either side of the drive. An
 # account read from a new process is missing every record the old one held.
 PRECUTOVER_ACCOUNTS_BEFORE=""
@@ -9855,7 +10008,7 @@ PRECUTOVER_REQUIRED_CEREMONIES="tbtc_dkg tbtc_signing tbtc_heartbeat \
 beacon_dkg beacon_signing"
 
 collect_precutover_work() {
-  local phase="$1" service state block
+  local phase="$1" service state block account
 
   PRECUTOVER_DRIVER_SUPPLIED=0
   PRECUTOVER_DRIVER_RC=0
@@ -9866,6 +10019,7 @@ collect_precutover_work() {
   PRECUTOVER_STATES=""
   PRECUTOVER_ORIGINATED=""
   PRECUTOVER_AUTHORED_ENDINGS=""
+  PRECUTOVER_HELD_AFTER=""
   PRECUTOVER_ACCOUNTS_BEFORE=""
   PRECUTOVER_ACCOUNTS_AFTER=""
 
@@ -9922,12 +10076,17 @@ ${service} reported [${state:-unreadable}] at block [${block:-unreadable}]"
     # The driver's account is kept beside it rather than replaced: it carries
     # the settlement identities and transactions the chain corroborates, which
     # a gate scrape does not know.
-    PRECUTOVER_AUTHORED_ENDINGS="$(fleet_terminal_outcomes)"
-    # And the other side of the account's provenance, taken with it. A node that
-    # answered from a new process, or whose account dropped records while the work
-    # ran, has published an account that is missing permits rather than one that
-    # never had them.
-    PRECUTOVER_ACCOUNTS_AFTER="$(fleet_account_provenance)"
+    #
+    # One reading per node, carrying the endings, the permits still open, and the
+    # provenance of the account all three are read out of. They answer each other
+    # — a permit is held or closed and never both, and the provenance says whether
+    # either list can be believed — so taken at three instants a permit closing
+    # between two of them is in none of them, which is a seat missing from the
+    # fleet with nothing anywhere saying it went missing.
+    account="$(fleet_account_snapshot)"
+    PRECUTOVER_AUTHORED_ENDINGS="$(snapshot_field "${account}" outcomes)"
+    PRECUTOVER_HELD_AFTER="$(snapshot_field "${account}" held)"
+    PRECUTOVER_ACCOUNTS_AFTER="$(snapshot_field "${account}" provenance)"
   fi
 
   PRECUTOVER_LEGACY_AFTER="$(fleet_metric_total \
@@ -10039,10 +10198,16 @@ precutover_verdict() {
   # somebody else's — so the gap is named here rather than spent as evidence.
   unplaceable="$(unplaceable_authored_ownership \
     "${PRECUTOVER_AUTHORED_ENDINGS}" \
-    "$(identity_works "${named_permits}")")"
+    "$(identity_works "${named_permits}")" "${PRECUTOVER_HELD_AFTER}")"
+  # The permits still open enter the map beside the closed ones. A holder that
+  # was contributing when the reading was taken operated its seats exactly as one
+  # that had already closed did; what separates them is only whether the driver
+  # or the holder finished first, and a map that turned on that reads a race as
+  # the other release having supplied the seat.
   uninteroperated="$(ceremonies_without_mixed_transcript \
     "${PRECUTOVER_CONTRIBUTORS}" "${PRECUTOVER_AUTHORED_ENDINGS}" \
-    "${required_ceremonies}" "${REHEARSAL_PRIOR_SERVICE}")"
+    "${required_ceremonies}" "${REHEARSAL_PRIOR_SERVICE}" \
+    "${PRECUTOVER_HELD_AFTER}")"
 
   if ((PRECUTOVER_DRIVER_SUPPLIED == 0)); then
     block_step "${step}" "no PR4109_WORK_DRIVER was supplied, so no \
@@ -10106,6 +10271,11 @@ the reading a mixed-fleet claim must not be decided by"
 permits it took for ${what} (${PRECUTOVER_AUTHORED_ENDINGS}); without that \
 reading the settlements above are the driver's account of its own ceremonies \
 and no node has vouched for one of them"
+  elif [[ "${PRECUTOVER_HELD_AFTER}" == "unreadable on "* ]]; then
+    block_step "${step}" "the R1 fleet could not be asked which permits it was \
+still holding for ${what} (${PRECUTOVER_HELD_AFTER}); a permit open when the \
+driver reported is in neither account, and its seats then read as operated by \
+whatever else was on the network"
   elif [[ -n "${unfollowable}" ]]; then
     block_step "${step}" "${unfollowable}; the account of closed permits every \
 reading below rests on lives in memory, so a node answering from a new process \
