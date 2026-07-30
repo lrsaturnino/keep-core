@@ -67,7 +67,7 @@ jobs:
     # cannot reach third_party/btcsuite/btcec (it is its own Go
     # module), so this job is the only automated gate. Cheap (checkout
     # + go install + two short steps) and runs on every event, every
-    # branch — gating by path was producing broken `if:` combinations
+    # branch - gating by path was producing broken `if:` combinations
     # with no upside.
     runs-on: ubuntu-latest
     steps:
