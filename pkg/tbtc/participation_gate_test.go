@@ -834,6 +834,30 @@ func (h *unwritableRecordHandle) Save(
 	return h.mockPersistenceHandle.Save(data, directory, name)
 }
 
+// quarantineLogCapture records the error lines a preservation path emits, so a
+// test can hold the operator's account of what was preserved to what the
+// namespace actually holds. The operator log is the only account of a
+// quarantine an operator reads at the time, and it is the one that was
+// reporting a preserved share as lost.
+type quarantineLogCapture struct {
+	testutils.MockLogger
+
+	mu     sync.Mutex
+	errors []string
+}
+
+func (c *quarantineLogCapture) Errorf(format string, args ...interface{}) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.errors = append(c.errors, fmt.Sprintf(format, args...))
+}
+
+func (c *quarantineLogCapture) joined() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return strings.Join(c.errors, "\n")
+}
+
 // savedNames lists the record names a namespace accepted, in write order.
 func savedNames(handle *mockPersistenceHandle) []string {
 	names := make([]string, 0, len(handle.saved))
@@ -962,9 +986,10 @@ func TestDkgExecutor_PreserveInterruptedSigner_RefusedMetadataStillAccountsForSh
 	de.metricsRecorder = recorder
 
 	permit := newTestPermit(participation.TBTCDKG)
+	operatorLog := &quarantineLogCapture{}
 
 	de.preserveInterruptedSigner(
-		logger.With(),
+		operatorLog,
 		permit,
 		big.NewInt(1),
 		result,
@@ -979,6 +1004,19 @@ func TestDkgExecutor_PreserveInterruptedSigner_RefusedMetadataStillAccountsForSh
 		[]string{"/membership_1"},
 	) {
 		t.Errorf("namespace holds %v, expected only the membership", got)
+	}
+
+	// What the operator is told has to be what the namespace holds. Reporting
+	// a preserved share as lost is how key material ends up on a host that
+	// nobody goes looking on.
+	if logged := operatorLog.joined(); strings.Contains(
+		logged,
+		"only in memory",
+	) || !strings.Contains(logged, "the share is preserved") {
+		t.Errorf(
+			"the operator log must report the share as preserved, got [%s]",
+			logged,
+		)
 	}
 
 	terminalOutcomes := permit.recordedTerminalOutcomes()
@@ -1021,9 +1059,10 @@ func TestDkgExecutor_PreserveInterruptedSigner_RefusedMembershipIsNotQuarantined
 	de.metricsRecorder = recorder
 
 	permit := newTestPermit(participation.TBTCDKG)
+	operatorLog := &quarantineLogCapture{}
 
 	de.preserveInterruptedSigner(
-		logger.With(),
+		operatorLog,
 		permit,
 		big.NewInt(1),
 		result,
@@ -1038,6 +1077,20 @@ func TestDkgExecutor_PreserveInterruptedSigner_RefusedMembershipIsNotQuarantined
 		[]string{"/metadata_1"},
 	) {
 		t.Errorf("namespace holds %v, expected only the metadata", got)
+	}
+
+	// The share really is only in memory here, and the operator log has to say
+	// so — and say that the audit record naming it did survive, since that is
+	// the only thing left pointing at the loss.
+	if logged := operatorLog.joined(); !strings.Contains(
+		logged,
+		"only in memory",
+	) || !strings.Contains(logged, "auditMetadataPreserved=true") {
+		t.Errorf(
+			"the operator log must report the share as lost beside the "+
+				"record that survived it, got [%s]",
+			logged,
+		)
 	}
 
 	if outcomes := permit.recordedTerminalOutcomes(); len(outcomes) != 0 {
