@@ -3964,6 +3964,94 @@ func TestValidateChainReconciliationEvidence_TBTCDKGPermitLineage(
 		}
 	})
 
+	// The seat map is one statement about every seat of the final group, not
+	// only about the one its author sat in. A rewrite that leaves the author's
+	// own entry alone, and the length alone, satisfies every other check here:
+	// the seed, the anchor and the persisted membership all still agree, the
+	// author's operated seat still maps to its own final seat, and the map is
+	// still an ascending set of the right size. What it changes is who the other
+	// final seats belonged to — and a fleet-wide ownership map translated through
+	// it hands those seats to original members that never held them, which reads
+	// afterwards as seats some other release supplied.
+	t.Run("rewritten remote seat mapping", func(t *testing.T) {
+		run, record := newRunAndRecord(
+			group.MemberIndex(1),
+			group.MemberIndex(2),
+			canonicalSeed,
+		)
+		outcome := &run.manifest.ParticipationTerminalOutcomes.Outcomes[0]
+		mapping := outcome.Evidence.Contribution.PermitSpaceMembers
+		if !slices.Equal(
+			mapping,
+			participation.MemberIndexes{2, 3, 4},
+		) {
+			t.Fatalf(
+				"fixture no longer maps the canonical survivors, got: %v",
+				mapping,
+			)
+		}
+		// Only the last entry moves. The author sits in final seat 1, so its own
+		// mapping is the first entry and is left exactly as it was.
+		mapping[len(mapping)-1] = group.MemberIndex(5)
+
+		// Everything the audit checked before this still passes, which is what
+		// makes the rewrite worth refusing rather than a shape error.
+		if violations := validateNodeTerminalOutcomes(run.manifest); len(violations) != 0 {
+			t.Fatalf(
+				"expected a rewritten remote entry to survive node-local "+
+					"validation, got: %v",
+				violations,
+			)
+		}
+
+		content, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		violations := run.validateChainReconciliationEvidence(content)
+		if !containsSubstring(
+			violations,
+			"maps its final signing group back to original members [2 3 5], "+
+				"but canonical result ["+resultHash+"] leaves survivors [2 3 4]",
+		) {
+			t.Fatalf(
+				"expected a rewritten-seat-map violation, got: %v",
+				violations,
+			)
+		}
+	})
+
+	// And the other half of the same map. A record naming a final group the
+	// accepted result did not rebuild describes a different ceremony, however
+	// well its own seat lines up inside it.
+	t.Run("final signing group the result did not rebuild", func(t *testing.T) {
+		run, record := newRunAndRecord(
+			group.MemberIndex(1),
+			group.MemberIndex(2),
+			canonicalSeed,
+		)
+		contribution := run.manifest.
+			ParticipationTerminalOutcomes.Outcomes[0].Evidence.Contribution
+		contribution.IncorporatedMembers = participation.MemberIndexes{1, 2}
+		contribution.PermitSpaceMembers = participation.MemberIndexes{2, 3}
+
+		content, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		violations := run.validateChainReconciliationEvidence(content)
+		if !containsSubstring(
+			violations,
+			"names final signing group [1 2], but canonical result ["+
+				resultHash+"] rebuilds group [1 2 3] from its 3 accepted members",
+		) {
+			t.Fatalf(
+				"expected a rebuilt-group violation, got: %v",
+				violations,
+			)
+		}
+	})
+
 	t.Run("unrelated approved wallet", func(t *testing.T) {
 		run, record := newRunAndRecord(
 			group.MemberIndex(1),

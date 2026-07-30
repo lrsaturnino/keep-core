@@ -4355,9 +4355,115 @@ func validateTBTCDKGTerminalLineage(
 				outcome.Evidence.MembershipIndex,
 			))
 		}
+
+		violations = append(violations, validateTBTCDKGTranscriptLineage(
+			i,
+			outcome,
+			resultHash,
+			originalGroupSize,
+			misbehavedMemberIndexes,
+		)...)
 	}
 
 	return violations
+}
+
+// validateTBTCDKGTranscriptLineage holds the whole seat map a completed tBTC
+// DKG record publishes against the one the canonical accepted result implies.
+//
+// Checking only this permit's own entry leaves the rest of the map unchecked,
+// and the rest of the map is what says who the other seats belonged to. A record
+// whose remote entries were rewritten still names the right seed, the right
+// anchor, the right length and the right local seat, so every other check here
+// passes — while a reader translating the transcript through it attributes final
+// seats to original members that never held them. That reader is the fleet-wide
+// ownership map, and a seat moved in it is a seat some other release appears to
+// have supplied.
+//
+// The expected map is derived rather than trusted: the final signing group is
+// the accepted result's members with its misbehaved seats removed, ascending, so
+// final seat i came from the i-th survivor and nothing about that is the
+// recording node's to state.
+func validateTBTCDKGTranscriptLineage(
+	index int,
+	outcome participation.TerminalOutcomeRecord,
+	resultHash string,
+	originalGroupSize uint16,
+	misbehavedMemberIndexes []uint8,
+) []string {
+	contribution := outcome.Evidence.Contribution
+	if contribution == nil {
+		return nil
+	}
+
+	survivors := canonicalTBTCDKGSurvivors(
+		originalGroupSize,
+		misbehavedMemberIndexes,
+	)
+	expectedFinal := make(participation.MemberIndexes, 0, len(survivors))
+	for seat := 1; seat <= len(survivors); seat++ {
+		expectedFinal = append(expectedFinal, group.MemberIndex(seat))
+	}
+
+	violations := make([]string, 0)
+	if !slices.Equal(contribution.IncorporatedMembers, expectedFinal) {
+		violations = append(violations, fmt.Sprintf(
+			"node-authored completed tbtc DKG outcome [%d] names final "+
+				"signing group %v, but canonical result [%s] rebuilds group "+
+				"%v from its %d accepted members",
+			index,
+			contribution.IncorporatedMembers,
+			resultHash,
+			expectedFinal,
+			len(survivors),
+		))
+	}
+	if !slices.Equal(contribution.PermitSpaceMembers, survivors) {
+		violations = append(violations, fmt.Sprintf(
+			"node-authored completed tbtc DKG outcome [%d] maps its final "+
+				"signing group back to original members %v, but canonical "+
+				"result [%s] leaves survivors %v after removing its "+
+				"misbehaved seats",
+			index,
+			contribution.PermitSpaceMembers,
+			resultHash,
+			survivors,
+		))
+	}
+
+	return violations
+}
+
+// canonicalTBTCDKGSurvivors returns the original DKG memberships an accepted
+// result's final signing group was rebuilt from, ascending: entry i is the
+// membership that became final seat i+1.
+//
+// A misbehaved index outside the original group, and a repeat of one already
+// counted, are ignored rather than treated as removing a seat, exactly as the
+// final-membership derivation beside this does. Counting either would shorten
+// the expected group and make every record of a perfectly ordinary result
+// disagree with it.
+func canonicalTBTCDKGSurvivors(
+	originalGroupSize uint16,
+	misbehavedMemberIndexes []uint8,
+) participation.MemberIndexes {
+	misbehaved := make(map[uint8]struct{}, len(misbehavedMemberIndexes))
+	for _, rawMisbehaved := range misbehavedMemberIndexes {
+		if rawMisbehaved == 0 || uint16(rawMisbehaved) > originalGroupSize {
+			continue
+		}
+		misbehaved[rawMisbehaved] = struct{}{}
+	}
+
+	survivors := make(participation.MemberIndexes, 0, originalGroupSize)
+	for index := uint16(1); index <= originalGroupSize; index++ {
+		if _, removed := misbehaved[uint8(index)]; removed {
+			continue
+		}
+		survivors = append(survivors, group.MemberIndex(index))
+	}
+
+	return survivors
 }
 
 func finalTBTCDKGMembership(
