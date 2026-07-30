@@ -135,6 +135,54 @@ func TestWireMaintainerMetricsEnabled(t *testing.T) {
 			)
 		}
 	}
+
+	// The cutover participation family must be scrapeable at zero from the
+	// same startup. These series are the evidence the exact-image rehearsal
+	// reads off a running node, and a recorder that only creates a series on
+	// first use publishes nothing until the event it is meant to warn about
+	// has already happened. Asserting them here is what proves the production
+	// registry exports them: the recorder's own getters answer for a name it
+	// was never asked to register, so only the exposition settles it.
+	for _, name := range participationSeriesExposedAtZero {
+		series := "performance_" + name
+		value, ok := metricValue(metrics, series)
+		if !ok {
+			t.Errorf("expected series [%s] to be exposed at /metrics", series)
+			continue
+		}
+		if value != "0" {
+			t.Errorf(
+				"expected series [%s] to be zero at startup, got [%s]",
+				series,
+				value,
+			)
+		}
+	}
+}
+
+// participationSeriesExposedAtZero is the cutover observability contract as an
+// operator scraping a node sees it. It mirrors the rehearsal's
+// PARTICIPATION_METRICS list; the quarantined-signer count is included because
+// it is registered with the rest of the fixed family, so a node exposes it from
+// startup whether or not it ever quarantines an output.
+var participationSeriesExposedAtZero = []string{
+	clientinfo.MetricParticipationGateState,
+	clientinfo.MetricParticipationCurrentBlock,
+	clientinfo.MetricParticipationCutoverBlock,
+	clientinfo.MetricParticipationAllowed,
+	clientinfo.MetricParticipationActiveCeremonies,
+	clientinfo.MetricParticipationActiveLegacyCeremonies,
+	clientinfo.MetricParticipationActiveSecurityV2Ceremonies,
+	clientinfo.MetricParticipationModeLegacyTotal,
+	clientinfo.MetricParticipationModeSecurityV2Total,
+	clientinfo.MetricParticipationLegacyCompletionsAfterCutoverTotal,
+	clientinfo.MetricParticipationRefusalsTotal,
+	clientinfo.MetricParticipationCommitRefusalsTotal,
+	clientinfo.MetricParticipationClockErrorsTotal,
+	clientinfo.MetricParticipationClockAbortsTotal,
+	clientinfo.MetricParticipationQuiesceTotal,
+	clientinfo.MetricParticipationQuiesceForcedAbortsTotal,
+	clientinfo.MetricParticipationQuarantinedTBTCSigners,
 }
 
 // scrapeMetricsEndpoint fetches the /metrics body from the client-info endpoint,

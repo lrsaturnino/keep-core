@@ -97,3 +97,112 @@ func TestCutoverMetrics_RegisteredAtZeroAndRecordable(t *testing.T) {
 		t.Errorf("roster revision gauge = %v, want 7", got)
 	}
 }
+
+// participationMetricFamily is the observability contract of the cutover gate:
+// every series the rehearsal's evidence steps snapshot by name. It is the
+// pre-image of the PARTICIPATION_METRICS list the exact-image rehearsal reads
+// off a running node, so a series missing from the production registration
+// fails here rather than at rehearsal time.
+var participationMetricFamily = []string{
+	MetricParticipationGateState,
+	MetricParticipationCurrentBlock,
+	MetricParticipationCutoverBlock,
+	MetricParticipationAllowed,
+	MetricParticipationActiveCeremonies,
+	MetricParticipationActiveLegacyCeremonies,
+	MetricParticipationActiveSecurityV2Ceremonies,
+	MetricParticipationModeLegacyTotal,
+	MetricParticipationModeSecurityV2Total,
+	MetricParticipationLegacyCompletionsAfterCutoverTotal,
+	MetricParticipationRefusalsTotal,
+	MetricParticipationCommitRefusalsTotal,
+	MetricParticipationClockErrorsTotal,
+	MetricParticipationClockAbortsTotal,
+	MetricParticipationQuiesceTotal,
+	MetricParticipationQuiesceForcedAbortsTotal,
+	MetricParticipationQuarantinedTBTCSigners,
+}
+
+// TestParticipationMetrics_RegisteredWithTheExposingRegistry proves every
+// participation series is registered with the client-info registry that backs
+// /metrics, not merely readable back through the recorder.
+//
+// The distinction is the whole point. GetGaugeValue and GetCounterValue read
+// the recorder's own maps, and SetGauge inserts into those maps for a name it
+// was never asked to register — so a series omitted from registerAllMetrics
+// reads back correctly through the recorder while being absent from the
+// exposition entirely. Membership is asserted by re-registering the exported
+// name: the registry refuses a name it already holds, which is exactly the set
+// the exposition enumerates.
+func TestParticipationMetrics_RegisteredWithTheExposingRegistry(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	registry := &Registry{keepclientinfo.NewRegistry(), ctx}
+	NewPerformanceMetrics(ctx, registry)
+
+	for _, name := range participationMetricFamily {
+		exported := fmt.Sprintf("performance_%s", name)
+		if _, err := registry.NewMetricGauge(exported); err == nil {
+			t.Errorf(
+				"metric %q is not registered with the registry, so it is "+
+					"absent from /metrics until something records it",
+				exported,
+			)
+		}
+	}
+
+	// A name nothing registered must register cleanly, otherwise the loop
+	// above would pass against any registry that refuses everything.
+	if _, err := registry.NewMetricGauge(
+		"performance_participation_absent_control",
+	); err != nil {
+		t.Fatalf(
+			"an unregistered name must be registrable, otherwise the "+
+				"membership assertion above is vacuous: %v",
+			err,
+		)
+	}
+}
+
+// TestParticipationMetrics_QuarantinedSignersRegisteredAtZero proves the
+// quarantined-signer gauge is pre-registered at zero rather than created on
+// first use by SetGauge, and that it then records through the production
+// recorder the tBTC quarantine reporter holds.
+//
+// Pre-registration is what makes an empty quarantine distinguishable from an
+// unreported one: a node that never quarantines anything must still publish a
+// zero, or a rollback decision cannot tell "nothing preserved" from "nothing
+// said".
+func TestParticipationMetrics_QuarantinedSignersRegisteredAtZero(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	registry := &Registry{keepclientinfo.NewRegistry(), ctx}
+	pm := NewPerformanceMetrics(ctx, registry)
+
+	pm.gaugesMutex.RLock()
+	_, preRegistered := pm.gauges[MetricParticipationQuarantinedTBTCSigners]
+	pm.gaugesMutex.RUnlock()
+
+	if !preRegistered {
+		t.Fatal(
+			"the quarantined-signer gauge must be registered before any " +
+				"quarantine occurs, not created by the first SetGauge",
+		)
+	}
+
+	if got := pm.GetGaugeValue(
+		MetricParticipationQuarantinedTBTCSigners,
+	); got != 0 {
+		t.Errorf("quarantined-signer gauge = %v at startup, want 0", got)
+	}
+
+	pm.SetGauge(MetricParticipationQuarantinedTBTCSigners, 2)
+
+	if got := pm.GetGaugeValue(
+		MetricParticipationQuarantinedTBTCSigners,
+	); got != 2 {
+		t.Errorf("quarantined-signer gauge = %v after update, want 2", got)
+	}
+}

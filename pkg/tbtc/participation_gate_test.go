@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -730,6 +731,251 @@ func (h *unreadableHandle) ReadAll() (
 	close(errs)
 
 	return descriptors, errs
+}
+
+// unwritableRecordHandle is a protected namespace that refuses one record name
+// while writing its neighbours, as a disk namespace does when a single file
+// cannot be written.
+type unwritableRecordHandle struct {
+	mockPersistenceHandle
+
+	// refusedNamePrefix names the record this namespace will not accept.
+	refusedNamePrefix string
+}
+
+func (h *unwritableRecordHandle) Save(
+	data []byte,
+	directory string,
+	name string,
+) error {
+	if strings.HasPrefix(name, h.refusedNamePrefix) {
+		return fmt.Errorf("cannot write [%s]", name)
+	}
+
+	return h.mockPersistenceHandle.Save(data, directory, name)
+}
+
+// savedNames lists the record names a namespace accepted, in write order.
+func savedNames(handle *mockPersistenceHandle) []string {
+	names := make([]string, 0, len(handle.saved))
+	for _, descriptor := range handle.saved {
+		names = append(names, descriptor.Name())
+	}
+	return names
+}
+
+// TestSignerQuarantine_Preserve_AttemptsBothRecordsAndReportsWhatLanded proves
+// neither half of a quarantine record is skipped because the other failed, and
+// that the caller is told which of them the namespace actually holds.
+//
+// The two halves mean different things — the membership is the key material a
+// rollback has to account for, the metadata is the record explaining it — and
+// the error alone cannot say which one is on disk. A caller that guesses is how
+// the operator log, the published count, and the offline audit come to describe
+// the same directory differently.
+func TestSignerQuarantine_Preserve_AttemptsBothRecordsAndReportsWhatLanded(
+	t *testing.T,
+) {
+	de, result, gsr, _, _ := setupPreserveScenario(t)
+
+	signer, err := de.buildFinalSigner(
+		result,
+		group.MemberIndex(1),
+		gsr.OperatorsAddresses,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := map[string]struct {
+		refusedNamePrefix   string
+		expectedSaved       []string
+		membershipPersisted bool
+		metadataPersisted   bool
+	}{
+		"both records land": {
+			refusedNamePrefix:   "/nothing_is_refused",
+			expectedSaved:       []string{"/membership_1", "/metadata_1"},
+			membershipPersisted: true,
+			metadataPersisted:   true,
+		},
+		"the metadata is refused": {
+			refusedNamePrefix:   "/metadata_",
+			expectedSaved:       []string{"/membership_1"},
+			membershipPersisted: true,
+			metadataPersisted:   false,
+		},
+		"the membership is refused": {
+			refusedNamePrefix:   "/membership_",
+			expectedSaved:       []string{"/metadata_1"},
+			membershipPersisted: false,
+			metadataPersisted:   true,
+		},
+	}
+
+	for testName, test := range tests {
+		t.Run(testName, func(t *testing.T) {
+			handle := &unwritableRecordHandle{
+				refusedNamePrefix: test.refusedNamePrefix,
+			}
+			quarantine := newSignerQuarantine(logger, handle)
+
+			state, err := quarantine.preserve(
+				signer,
+				QuarantinedSignerMetadata{
+					ReleaseEpoch: participation.CompiledEpoch.String(),
+					Ceremony:     string(participation.TBTCDKG),
+				},
+			)
+
+			expectedComplete := test.membershipPersisted &&
+				test.metadataPersisted
+			if expectedComplete && err != nil {
+				t.Fatalf("expected no error, got [%v]", err)
+			}
+			if !expectedComplete && err == nil {
+				t.Fatal("expected a preservation error")
+			}
+
+			testutils.AssertBoolsEqual(
+				t,
+				"membership persisted",
+				test.membershipPersisted,
+				state.membershipPersisted,
+			)
+			testutils.AssertBoolsEqual(
+				t,
+				"metadata persisted",
+				test.metadataPersisted,
+				state.metadataPersisted,
+			)
+
+			got := savedNames(&handle.mockPersistenceHandle)
+			if !reflect.DeepEqual(got, test.expectedSaved) {
+				t.Errorf(
+					"namespace holds %v, expected %v",
+					got,
+					test.expectedSaved,
+				)
+			}
+		})
+	}
+}
+
+// TestDkgExecutor_PreserveInterruptedSigner_RefusedMetadataStillAccountsForShare
+// proves a share the namespace accepted is accounted for even when its audit
+// metadata could not be written: the permit ends quarantined and the published
+// count includes the output.
+//
+// The key material is on disk either way, so a rollback has to account for it
+// either way. Reporting it as lost — the state the caller reported when the
+// metadata write decided the whole outcome — leaves preserved key material
+// that nothing claims.
+func TestDkgExecutor_PreserveInterruptedSigner_RefusedMetadataStillAccountsForShare(
+	t *testing.T,
+) {
+	de, result, gsr, _, _ := setupPreserveScenario(t)
+
+	handle := &unwritableRecordHandle{refusedNamePrefix: "/metadata_"}
+	de.signerQuarantine = newSignerQuarantine(logger, handle)
+
+	recorder := newDispatchGaugeRecorder()
+	de.metricsRecorder = recorder
+
+	permit := newTestPermit(participation.TBTCDKG)
+
+	de.preserveInterruptedSigner(
+		logger.With(),
+		permit,
+		big.NewInt(1),
+		result,
+		group.MemberIndex(1),
+		gsr,
+		"tbtc_dkg_signer_activation",
+		fmt.Errorf("activation refused"),
+	)
+
+	if got := savedNames(&handle.mockPersistenceHandle); !reflect.DeepEqual(
+		got,
+		[]string{"/membership_1"},
+	) {
+		t.Errorf("namespace holds %v, expected only the membership", got)
+	}
+
+	terminalOutcomes := permit.recordedTerminalOutcomes()
+	testutils.AssertIntsEqual(t, "terminal outcomes", 1, len(terminalOutcomes))
+	if len(terminalOutcomes) == 1 &&
+		terminalOutcomes[0].outcome !=
+			participation.TerminalOutcomeQuarantined {
+		t.Errorf(
+			"unexpected terminal outcome [%s]",
+			terminalOutcomes[0].outcome,
+		)
+	}
+
+	value, published := recorder.gaugePublished(
+		clientinfo.MetricParticipationQuarantinedTBTCSigners,
+	)
+	if !published {
+		t.Fatal("expected the preserved share to be counted")
+	}
+	testutils.AssertIntsEqual(t, "reported quarantined signers", 1, int(value))
+}
+
+// TestDkgExecutor_PreserveInterruptedSigner_RefusedMembershipIsNotQuarantined
+// proves a share the namespace refused is not reported as quarantined: the
+// permit records no terminal outcome and no count is published, while the audit
+// metadata naming the lost share is still written.
+//
+// The metadata is what tells the offline audit a share was generated and not
+// preserved. Skipping it because the membership failed first would leave the
+// loss with no record at all.
+func TestDkgExecutor_PreserveInterruptedSigner_RefusedMembershipIsNotQuarantined(
+	t *testing.T,
+) {
+	de, result, gsr, _, _ := setupPreserveScenario(t)
+
+	handle := &unwritableRecordHandle{refusedNamePrefix: "/membership_"}
+	de.signerQuarantine = newSignerQuarantine(logger, handle)
+
+	recorder := newDispatchGaugeRecorder()
+	de.metricsRecorder = recorder
+
+	permit := newTestPermit(participation.TBTCDKG)
+
+	de.preserveInterruptedSigner(
+		logger.With(),
+		permit,
+		big.NewInt(1),
+		result,
+		group.MemberIndex(1),
+		gsr,
+		"tbtc_dkg_signer_activation",
+		fmt.Errorf("activation refused"),
+	)
+
+	if got := savedNames(&handle.mockPersistenceHandle); !reflect.DeepEqual(
+		got,
+		[]string{"/metadata_1"},
+	) {
+		t.Errorf("namespace holds %v, expected only the metadata", got)
+	}
+
+	if outcomes := permit.recordedTerminalOutcomes(); len(outcomes) != 0 {
+		t.Errorf(
+			"a share that never reached the namespace must not end the "+
+				"permit, got %v",
+			outcomes,
+		)
+	}
+
+	if _, published := recorder.gaugePublished(
+		clientinfo.MetricParticipationQuarantinedTBTCSigners,
+	); published {
+		t.Error(
+			"no count may be published for a share the namespace refused",
+		)
+	}
 }
 
 // TestHeartbeatAction_PenaltySuppressedByFence proves a refused penalty
@@ -1588,6 +1834,16 @@ func (r *dispatchGaugeRecorder) gauge(name string) float64 {
 	r.gaugeMu.Lock()
 	defer r.gaugeMu.Unlock()
 	return r.gauges[name]
+}
+
+// gaugePublished reports the value alongside whether the gauge was published at
+// all. A gauge nobody set reads back as zero, which is the one value a
+// quarantine count must never be confused with.
+func (r *dispatchGaugeRecorder) gaugePublished(name string) (float64, bool) {
+	r.gaugeMu.Lock()
+	defer r.gaugeMu.Unlock()
+	value, published := r.gauges[name]
+	return value, published
 }
 
 // TestWalletDispatcher_Dispatch_GateRefusalSkipsFailureMetrics proves a

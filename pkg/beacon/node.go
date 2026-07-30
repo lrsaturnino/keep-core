@@ -430,7 +430,7 @@ func (n *node) quarantineSigner(
 	)
 	seedHash := sha256.Sum256(dkgSeed.Bytes())
 
-	err := n.signerQuarantine.Preserve(
+	state, err := n.signerQuarantine.Preserve(
 		&registry.Membership{
 			Signer:      interrupted.Signer,
 			ChannelName: channelName,
@@ -447,22 +447,44 @@ func (n *node) quarantineSigner(
 		},
 	)
 	if err != nil {
-		dkgLogger.Errorf(
-			"[member:%v] failed to quarantine the interrupted signer "+
-				"output; the share is only in memory: [%v]",
-			memberIndex,
-			err,
-		)
-	} else {
-		recordBeaconPermitTerminalOutcome(
-			dkgLogger,
-			permit,
-			participation.TerminalOutcomeQuarantined,
-			participation.TerminalEvidence{
-				Kind: participation.TerminalEvidenceQuarantinedBeaconSigner,
-			},
-		)
+		if state.MembershipPersisted {
+			dkgLogger.Errorf(
+				"[member:%v] quarantined the interrupted signer output "+
+					"without its audit metadata; the share is preserved and "+
+					"the offline state audit will report it unaccompanied: "+
+					"[%v]",
+				memberIndex,
+				err,
+			)
+		} else {
+			dkgLogger.Errorf(
+				"[member:%v] failed to quarantine the interrupted signer "+
+					"output; the share is only in memory "+
+					"[auditMetadataPreserved=%v]: [%v]",
+				memberIndex,
+				state.MetadataPersisted,
+				err,
+			)
+		}
 	}
+
+	// The terminal outcome follows the key material rather than the
+	// completeness of the record. A share the namespace holds is preserved
+	// material the offline audit reconciles against the chain even when its
+	// metadata write failed, and a share that never reached the namespace is
+	// not quarantined however much was written about it.
+	if !state.MembershipPersisted {
+		return
+	}
+
+	recordBeaconPermitTerminalOutcome(
+		dkgLogger,
+		permit,
+		participation.TerminalOutcomeQuarantined,
+		participation.TerminalEvidence{
+			Kind: participation.TerminalEvidenceQuarantinedBeaconSigner,
+		},
+	)
 }
 
 // beaconDKGTranscriptContribution renders the memberships that produced a DKG

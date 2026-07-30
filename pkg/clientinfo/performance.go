@@ -336,6 +336,7 @@ func (pm *PerformanceMetrics) registerAllMetrics() {
 		MetricParticipationActiveCeremonies,
 		MetricParticipationActiveLegacyCeremonies,
 		MetricParticipationActiveSecurityV2Ceremonies,
+		MetricParticipationQuarantinedTBTCSigners,
 	}
 
 	// First, initialize all gauges in the map

@@ -3,6 +3,7 @@ package registry
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -58,17 +59,46 @@ func NewQuarantine(
 	}
 }
 
+// QuarantineState reports which halves of a preserved output reached the
+// namespace. A caller cannot infer this from the error alone, and the two
+// halves mean different things: the membership is the key material a rollback
+// has to account for, while the metadata is the audit record explaining it.
+// Reporting the wrong one is how an operator log, a published count, and the
+// offline audit come to disagree about the same directory.
+type QuarantineState struct {
+	// MembershipPersisted reports whether the key material reached the
+	// namespace.
+	MembershipPersisted bool
+	// MetadataPersisted reports whether the audit record reached the
+	// namespace.
+	MetadataPersisted bool
+}
+
 // Preserve durably saves the membership and its audit metadata under the
 // quarantine namespace. Preservation failure is surfaced to the caller: losing
 // generated key material is a protocol violation, so the caller must log it
 // unsuppressed.
+//
+// Both records are attempted even when the first fails, and what actually
+// landed is returned beside the error. A half that could have been written is
+// evidence the offline audit would otherwise not have, and the audit already
+// reads either orphan as a finding — a membership without metadata is
+// unexplained key material, metadata without a membership is a share that was
+// lost. What must not happen is the node reporting a state the namespace
+// contradicts, so the caller is told which of the two it is.
+//
+// The membership is attempted first so that a process killed between the two
+// writes leaves the key material behind rather than only the note describing
+// it: an unexplained share is recoverable, a lost one is not.
 func (q *Quarantine) Preserve(
 	membership *Membership,
 	metadata QuarantinedSignerMetadata,
-) error {
+) (QuarantineState, error) {
+	var state QuarantineState
+
 	membershipBytes, err := membership.Marshal()
 	if err != nil {
-		return fmt.Errorf(
+		return state, fmt.Errorf(
 			"could not marshal the quarantined membership: [%v]",
 			err,
 		)
@@ -83,7 +113,7 @@ func (q *Quarantine) Preserve(
 
 	metadataBytes, err := json.Marshal(metadata)
 	if err != nil {
-		return fmt.Errorf(
+		return state, fmt.Errorf(
 			"could not marshal the quarantine metadata: [%v]",
 			err,
 		)
@@ -92,15 +122,19 @@ func (q *Quarantine) Preserve(
 	directory := metadata.GroupPublicKey
 	memberSuffix := fmt.Sprint(membership.Signer.MemberID())
 
+	var writeErrs []error
+
 	if err := q.handle.Save(
 		membershipBytes,
 		directory,
 		"/membership_"+memberSuffix,
 	); err != nil {
-		return fmt.Errorf(
+		writeErrs = append(writeErrs, fmt.Errorf(
 			"could not persist the quarantined membership: [%v]",
 			err,
-		)
+		))
+	} else {
+		state.MembershipPersisted = true
 	}
 
 	if err := q.handle.Save(
@@ -108,23 +142,40 @@ func (q *Quarantine) Preserve(
 		directory,
 		"/metadata_"+memberSuffix,
 	); err != nil {
-		return fmt.Errorf(
+		writeErrs = append(writeErrs, fmt.Errorf(
 			"could not persist the quarantine metadata: [%v]",
 			err,
-		)
+		))
+	} else {
+		state.MetadataPersisted = true
 	}
 
-	q.logger.Warnf(
+	// One line names the output and what the namespace now holds of it, so the
+	// operator record and the namespace cannot drift apart. An incomplete pair
+	// is a finding the offline audit will raise, so it is logged as an error
+	// here rather than left to read like an ordinary quarantine.
+	logQuarantine := q.logger.Warnf
+	if len(writeErrs) > 0 {
+		logQuarantine = q.logger.Errorf
+	}
+	logQuarantine(
 		"quarantined a beacon signer output [group=0x%v] [member=%v] "+
 			"[mode=%s] [canonicalStartBlock=%d] [failedOperation=%s] "+
-			"[lastObservedBlock=%d]",
+			"[lastObservedBlock=%d] [keyMaterialPreserved=%v] "+
+			"[auditMetadataPreserved=%v]",
 		metadata.GroupPublicKey,
 		membership.Signer.MemberID(),
 		metadata.ProtocolMode,
 		metadata.CanonicalStartBlock,
 		metadata.FailedOperation,
 		metadata.LastObservedBlock,
+		state.MembershipPersisted,
+		state.MetadataPersisted,
 	)
 
-	return nil
+	if len(writeErrs) > 0 {
+		return state, errors.Join(writeErrs...)
+	}
+
+	return state, nil
 }

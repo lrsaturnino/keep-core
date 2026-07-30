@@ -67,18 +67,43 @@ func newSignerQuarantine(
 	}
 }
 
+// quarantineState reports which halves of a preserved output reached the
+// namespace. A caller cannot infer this from the error alone, and the two
+// halves mean different things: the membership is the key material a rollback
+// has to account for, while the metadata is the audit record explaining it.
+// Reporting the wrong one is how an operator log, a published count, and the
+// offline audit come to disagree about the same directory.
+type quarantineState struct {
+	membershipPersisted bool
+	metadataPersisted   bool
+}
+
 // preserve durably saves the signer membership and its audit metadata under
 // the quarantine namespace, mirroring the active storage layout so the same
 // decoding path can interpret both. Preservation failure is surfaced to the
 // caller: losing generated key material is a protocol violation, so the
 // caller must log it unsuppressed.
+//
+// Both records are attempted even when the first fails, and what actually
+// landed is returned beside the error. A half that could have been written is
+// evidence the offline audit would otherwise not have, and the audit already
+// reads either orphan as a finding — a membership without metadata is
+// unexplained key material, metadata without a membership is a share that was
+// lost. What must not happen is the node reporting a state the namespace
+// contradicts, so the caller is told which of the two it is.
+//
+// The membership is attempted first so that a process killed between the two
+// writes leaves the key material behind rather than only the note describing
+// it: an unexplained share is recoverable, a lost one is not.
 func (q *signerQuarantine) preserve(
 	signer *signer,
 	metadata QuarantinedSignerMetadata,
-) error {
+) (quarantineState, error) {
+	var state quarantineState
+
 	signerBytes, err := signer.Marshal()
 	if err != nil {
-		return fmt.Errorf(
+		return state, fmt.Errorf(
 			"could not marshal the quarantined signer: [%v]",
 			err,
 		)
@@ -93,7 +118,7 @@ func (q *signerQuarantine) preserve(
 
 	metadataBytes, err := json.Marshal(metadata)
 	if err != nil {
-		return fmt.Errorf(
+		return state, fmt.Errorf(
 			"could not marshal the quarantine metadata: [%v]",
 			err,
 		)
@@ -102,15 +127,19 @@ func (q *signerQuarantine) preserve(
 	directory := getWalletStorageKey(signer.wallet.publicKey)
 	memberSuffix := fmt.Sprint(signer.signingGroupMemberIndex)
 
+	var writeErrs []error
+
 	if err := q.handle.Save(
 		signerBytes,
 		directory,
 		"/membership_"+memberSuffix,
 	); err != nil {
-		return fmt.Errorf(
+		writeErrs = append(writeErrs, fmt.Errorf(
 			"could not persist the quarantined signer: [%v]",
 			err,
-		)
+		))
+	} else {
+		state.membershipPersisted = true
 	}
 
 	if err := q.handle.Save(
@@ -118,25 +147,42 @@ func (q *signerQuarantine) preserve(
 		directory,
 		"/metadata_"+memberSuffix,
 	); err != nil {
-		return fmt.Errorf(
+		writeErrs = append(writeErrs, fmt.Errorf(
 			"could not persist the quarantine metadata: [%v]",
 			err,
-		)
+		))
+	} else {
+		state.metadataPersisted = true
 	}
 
-	q.logger.Warnf(
+	// One line names the output and what the namespace now holds of it, so the
+	// operator record and the namespace cannot drift apart. An incomplete pair
+	// is a finding the offline audit will raise, so it is logged as an error
+	// here rather than left to read like an ordinary quarantine.
+	logQuarantine := q.logger.Warnf
+	if len(writeErrs) > 0 {
+		logQuarantine = q.logger.Errorf
+	}
+	logQuarantine(
 		"quarantined a tbtc signer output [walletPKH=0x%s] [member=%v] "+
 			"[mode=%s] [canonicalStartBlock=%d] [failedOperation=%s] "+
-			"[lastObservedBlock=%d]",
+			"[lastObservedBlock=%d] [keyMaterialPreserved=%v] "+
+			"[auditMetadataPreserved=%v]",
 		metadata.WalletPublicKeyHash,
 		signer.signingGroupMemberIndex,
 		metadata.ProtocolMode,
 		metadata.CanonicalStartBlock,
 		metadata.FailedOperation,
 		metadata.LastObservedBlock,
+		state.membershipPersisted,
+		state.metadataPersisted,
 	)
 
-	return nil
+	if len(writeErrs) > 0 {
+		return state, errors.Join(writeErrs...)
+	}
+
+	return state, nil
 }
 
 // quarantinedSigner names one preserved signer output by the wallet it belongs

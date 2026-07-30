@@ -178,7 +178,7 @@ func newTestStorageWithQuiescencePermits(
 		&testutils.MockLogger{},
 		quarantineHandle,
 	)
-	if err := quarantine.Preserve(
+	if _, err := quarantine.Preserve(
 		&registry.Membership{
 			Signer:      newTestSigner(t, group.MemberIndex(2), 43),
 			ChannelName: "test-channel",
@@ -1976,7 +1976,7 @@ func TestRunAudit_QuarantineMetadataCrossChecks(t *testing.T) {
 	// Written through the production quarantine path, so directory, group,
 	// and member all pair up — but the metadata's own fields contradict the
 	// release identity and the cutover arithmetic.
-	if err := quarantine.Preserve(
+	if _, err := quarantine.Preserve(
 		&registry.Membership{
 			Signer:      newTestSigner(t, group.MemberIndex(4), 44),
 			ChannelName: "test-channel",
@@ -2041,7 +2041,7 @@ func TestRunAudit_QuarantinedGroupAlsoActiveIsAFinding(t *testing.T) {
 	)
 
 	// Group secret 42 is the group the fixture also activates.
-	if err := quarantine.Preserve(
+	if _, err := quarantine.Preserve(
 		&registry.Membership{
 			Signer:      newTestSigner(t, group.MemberIndex(5), 42),
 			ChannelName: "test-channel",

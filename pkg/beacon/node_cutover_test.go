@@ -822,6 +822,102 @@ func TestJoinDKGIfEligible_ForcedShutdownAfterKeyGenerationQuarantinesSigner(t *
 	}
 }
 
+// TestJoinDKGIfEligible_RefusedQuarantineMembershipIsNotAQuarantinedOutcome
+// proves a share the quarantine namespace refused does not end its permit as
+// quarantined, while the audit metadata naming the lost share is still
+// written.
+//
+// The terminal outcome is what the offline audit and the rollback decision
+// read as "this material is preserved and accounted for". A namespace that
+// took the metadata but not the key material has preserved nothing, so
+// claiming the outcome on the strength of the record alone would report key
+// material that no namespace holds. The metadata is still attempted because it
+// is the only thing that tells the audit a share was generated and lost.
+func TestJoinDKGIfEligible_RefusedQuarantineMembershipIsNotAQuarantinedOutcome(
+	t *testing.T,
+) {
+	harness := newCutoverNodeHarness(
+		t,
+		2,
+		2,
+		func(currentBlock uint64) uint64 { return currentBlock + 100_000 },
+		nil,
+	)
+
+	// The same forced-quiescence interruption as above, over a namespace that
+	// will not accept the key material.
+	refusing := &cutoverRefusingPersistence{refusedMarker: "/membership_"}
+	harness.node.signerQuarantine = registry.NewQuarantine(logger, refusing)
+
+	blockCounter, err := harness.localChain.BlockCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	trigger, err := blockCounter.BlockHeightWaiter(
+		harness.anchorBlock + gjkr.ProtocolBlocks() + 2,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
+		<-trigger
+		harness.gate.Quiesce(fmt.Errorf("test shutdown"))
+		harness.gate.Close()
+	}()
+
+	harness.node.JoinDKGIfEligible(cutoverRandomSeed(t), harness.anchorBlock)
+
+	<-shutdownDone
+	harness.waitForPermitRelease(t)
+
+	if got := refusing.savesContaining("/membership_"); got != 0 {
+		t.Errorf("expected no membership to be accepted, got [%d]", got)
+	}
+	if got := refusing.savesContaining("/metadata_"); got != harness.groupSize {
+		t.Errorf(
+			"expected [%d] quarantine metadata records naming the lost "+
+				"shares, got [%d]",
+			harness.groupSize,
+			got,
+		)
+	}
+
+	for _, record := range harness.gate.State().RecentTerminalOutcomes {
+		if record.Outcome == participation.TerminalOutcomeQuarantined {
+			t.Errorf(
+				"a share the namespace refused was reported as quarantined "+
+					"[%v]",
+				record,
+			)
+		}
+	}
+}
+
+// cutoverRefusingPersistence is a namespace that refuses one record name while
+// recording its neighbours, as a disk namespace does when a single file cannot
+// be written.
+type cutoverRefusingPersistence struct {
+	cutoverRecordingPersistence
+
+	refusedMarker string
+}
+
+func (p *cutoverRefusingPersistence) Save(
+	data []byte,
+	directory string,
+	name string,
+) error {
+	if strings.Contains(name, p.refusedMarker) {
+		return fmt.Errorf("cannot write [%s]", name)
+	}
+
+	return p.cutoverRecordingPersistence.Save(data, directory, name)
+}
+
 // TestJoinDKGIfEligible_ClockFailureAfterKeyGenerationQuarantinesSigner proves
 // the chain-clock-failure path after share generation: the gate's synchronous
 // clock reads start failing inside the result publication window. The commit

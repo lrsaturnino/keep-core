@@ -1107,7 +1107,7 @@ func (de *dkgExecutor) preserveInterruptedSigner(
 		fenceErr,
 	)
 
-	if quarantineErr := de.signerQuarantine.preserve(
+	quarantineState, quarantineErr := de.signerQuarantine.preserve(
 		signer,
 		QuarantinedSignerMetadata{
 			ReleaseEpoch:        participation.CompiledEpoch.String(),
@@ -1120,24 +1120,46 @@ func (de *dkgExecutor) preserveInterruptedSigner(
 			FailedOperation:     operation,
 			LastObservedBlock:   snapshot.CurrentBlock,
 		},
-	); quarantineErr != nil {
-		dkgLogger.Errorf(
-			"[member:%v] failed to quarantine the interrupted signer; the "+
-				"generated share is only in memory: [%v]",
-			memberIndex,
-			quarantineErr,
-		)
-	} else {
-		de.recordPermitTerminalOutcome(
-			dkgLogger,
-			permit,
-			participation.TerminalOutcomeQuarantined,
-			participation.TerminalEvidence{
-				Kind: participation.TerminalEvidenceQuarantinedTBTCSinger,
-			},
-		)
-		de.reportQuarantinedSigners(dkgLogger)
+	)
+	if quarantineErr != nil {
+		if quarantineState.membershipPersisted {
+			dkgLogger.Errorf(
+				"[member:%v] quarantined the interrupted signer without its "+
+					"audit metadata; the share is preserved and the offline "+
+					"state audit will report it unaccompanied: [%v]",
+				memberIndex,
+				quarantineErr,
+			)
+		} else {
+			dkgLogger.Errorf(
+				"[member:%v] failed to quarantine the interrupted signer; the "+
+					"generated share is only in memory "+
+					"[auditMetadataPreserved=%v]: [%v]",
+				memberIndex,
+				quarantineState.metadataPersisted,
+				quarantineErr,
+			)
+		}
 	}
+
+	// The terminal outcome and the published count follow the key material
+	// rather than the completeness of the record. A share the namespace holds
+	// is preserved material a rollback has to account for even when its
+	// metadata write failed, and a share that never reached the namespace is
+	// not quarantined however much was written about it.
+	if !quarantineState.membershipPersisted {
+		return
+	}
+
+	de.recordPermitTerminalOutcome(
+		dkgLogger,
+		permit,
+		participation.TerminalOutcomeQuarantined,
+		participation.TerminalEvidence{
+			Kind: participation.TerminalEvidenceQuarantinedTBTCSinger,
+		},
+	)
+	de.reportQuarantinedSigners(dkgLogger)
 }
 
 // reportQuarantinedSigners publishes how many preserved signer outputs this
