@@ -998,19 +998,36 @@ under `EVIDENCE_DIR/attestation` as its last step, after every proof has
 passed: `release-manifest validate` accepts the reviewed file against the
 compiled bounds, `release-manifest derive` records the bounds themselves in
 `derived-manifest.json`, `reviewed-manifest.sha256` names the exact bytes
-that were validated, and `source-commit.txt` names the commit those bounds
-were compiled from. `validate-evidence` requires all three files, the hash
+that were validated, `source-commit.txt` names the commit those bounds
+were compiled from, and `release-ready.txt` records whether the manifest
+names a release at all. `validate-evidence` requires all four files, the hash
 to match the manifest as it stands now, and the derived bounds to match the
 reviewed ones field by field — hash-matching alone would accept an
 attestation and a manifest regenerated together around numbers no compiled
-binary produces. Only the free-form notes and the generation stamp may
-differ, and keys are canonically ordered so reformatting a reviewed
-manifest cannot read as drift. The attestation lives in a subdirectory
+binary produces. The comparison covers the compiled cutover block and chain
+id beside the termination grace; the source commit and image digests are
+outputs of a build that happens after the manifest is reviewed, so `derive`
+cannot speak for them and the manifest hash is what pins them. Only the
+free-form notes and the generation stamp may differ, and keys are canonically
+ordered so reformatting a reviewed manifest cannot read as drift.
+
+The readiness verdict is why a placeholder manifest cannot anchor accepted
+evidence. `local-proofs` records what `release-manifest validate
+--release-ready` says without failing on it — a development run legitimately
+has a manifest naming no release, and what that stage proves is the code —
+and `validate-evidence` BLOCKS on a receipt reading `no`. Records measured
+against a manifest with a zero cutover block, no source commit, and no image
+digests describe a rehearsal of the code rather than a release anything could
+be accepted as, and the checked-in manifest is in exactly that state today:
+until a reviewed release commit sets the mainnet cutover block and the built
+commit and image digests are recorded, `validate-evidence` refuses, by
+design. The attestation lives in a subdirectory
 because the record glob and the workflow's record probe both look at the
 top level of `EVIDENCE_DIR` only: writing the receipt never makes a
 dispatch that produced no rehearsal record look like it produced one.
 Running `validate-evidence` without a matching attestation is BLOCKED, not
 accepted — regenerate it by re-running `local-proofs` at the same commit.
+A receipt missing any one of its four files is a fragment, never a receipt.
 
 A receipt belongs to one run at one commit, and three rules keep it that
 way. `local-proofs` destroys the receipt it inherits — interrupted staging
@@ -1520,6 +1537,11 @@ by a reviewed release commit and not by any edit to this file. A `cmd` test
 holds that standing state in place from both directions: it fails if the
 manifest stops validating, and it fails if release-readiness starts passing
 while the identity is still empty.
+
+The second verdict is not advisory. `local-proofs` records it in the
+attestation receipt and `validate-evidence` refuses every record measured
+against a manifest the receipt reports as not release-ready, so the acceptance
+path cannot issue a verdict over a document that identifies no artifact.
 
 The chain is enforced at three layers, each fail-closed:
 

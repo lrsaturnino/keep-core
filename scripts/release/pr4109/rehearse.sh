@@ -2668,6 +2668,32 @@ attest_release_manifest() {
   # allowance the runtime actually waits included.
   go run . release-manifest validate --manifest "${manifest}"
 
+  # Validity is not readiness. A manifest is valid throughout development, but
+  # it cannot anchor a release-acceptance decision until the values that do not
+  # exist during development — the cutover block, the commit finally built, the
+  # image digests acceptance ran against — have been reviewed and recorded. The
+  # binary's own --release-ready mode is what answers that, and the answer is
+  # recorded here, inside the source-bound tree where the toolchain is, so the
+  # acceptance stage can refuse a placeholder without carrying one of its own.
+  #
+  # A manifest that is not ready does not fail this stage. Development runs
+  # legitimately have one, and everything proved above is about the code rather
+  # than about the release identity. The verdict is written down instead, and
+  # refusing on it is the acceptance stage's decision to take.
+  if go run . release-manifest validate --manifest "${manifest}" \
+    --release-ready >"${staging}/release-ready.log" 2>&1; then
+    printf 'yes\n' >"${staging}/release-ready.txt"
+  else
+    printf 'no\n' >"${staging}/release-ready.txt"
+    note "ATTENTION: the reviewed release manifest is not release-ready;" \
+      "no release-acceptance decision may be taken against it:"
+    # Only the violations. The whole log stays in the receipt, but the
+    # command-line usage the failing subcommand prints after them would
+    # bury the lines an operator is reading this for.
+    sed '/^Usage:/,$d' "${staging}/release-ready.log" |
+      sed 's/^/>>   /'
+  fi
+
   # derive emits the manifest the compiled bounds produce, so the receipt
   # carries those bounds themselves rather than an assertion about them, and
   # the hash names the exact reviewed bytes validate just accepted.
@@ -11755,16 +11781,18 @@ stage_verify_source_binding() {
 # beside an edited manifest.
 require_manifest_attestation() {
   local manifest="${SCRIPT_DIR}/release-manifest.json"
-  local dir derived reviewed_hash source_file
+  local dir derived reviewed_hash source_file ready_file
   dir="$(attestation_dir)"
   derived="${dir}/derived-manifest.json"
   reviewed_hash="${dir}/reviewed-manifest.sha256"
   source_file="${dir}/source-commit.txt"
+  ready_file="${dir}/release-ready.txt"
 
-  # All three or none: a receipt missing any part is a fragment, and a
+  # All four or none: a receipt missing any part is a fragment, and a
   # fragment must never be read as a receipt — which is also what keeps an
   # interrupted staging directory from ever standing in for one.
-  if [[ ! -f "${derived}" || ! -f "${reviewed_hash}" || ! -f "${source_file}" ]]; then
+  if [[ ! -f "${derived}" || ! -f "${reviewed_hash}" ||
+    ! -f "${source_file}" || ! -f "${ready_file}" ]]; then
     blocked "no complete release-manifest attestation under ${dir}; run the \
 local-proofs stage at the same commit first — without it nothing here \
 proves the manifest these records are measured against still matches the \
@@ -11824,9 +11852,19 @@ hashing to [${attested_sha:-absent}], but ${manifest} now hashes to \
       const doc = JSON.parse(fs.readFileSync(path, "utf8"));
       const grace = Object.assign({}, doc.termination_grace);
       delete grace.notes;
+      // Only the half of the identity the binary derives. The source commit
+      // and the image digests are outputs of a build that happens after this
+      // document is reviewed, so derive cannot produce them and a comparison
+      // demanding they match would fail on every manifest that records them.
+      // The manifest hash covers those two; what belongs here is what the
+      // compiled binary itself claims — the chain the cutover block is for,
+      // and the block.
+      const identity = doc.release_identity || {};
       return JSON.stringify(canon({
         schema_version: doc.schema_version,
         protocol_epoch: doc.protocol_epoch,
+        chain_id: identity.chain_id,
+        cutover_block: identity.cutover_block,
         termination_grace: grace,
       }));
     };
@@ -11841,6 +11879,22 @@ hashing to [${attested_sha:-absent}], but ${manifest} now hashes to \
     blocked "the reviewed release manifest disagrees with the compiled \
 bounds recorded in ${derived} (differences above); these records are \
 measured against a manifest this release would reject"
+
+  # The manifest may be internally valid and still name no release. Records
+  # measured against one of those describe a rehearsal of the code, not a
+  # release these bytes could be accepted as: nothing in them names the block
+  # the cutover happens at, the commit built, or the images acceptance ran
+  # against. Accepting them would put a receipt over a document that identifies
+  # no artifact — which is exactly what the acceptance stage exists to refuse.
+  local attested_ready
+  attested_ready="$(tr -d '[:space:]' <"${ready_file}")"
+  if [[ "${attested_ready}" != "yes" ]]; then
+    blocked "the release-manifest attestation records ${manifest} as not \
+release-ready; a reviewed release commit must set the mainnet cutover block \
+and record the built commit and the immutable image digests before evidence \
+measured against this manifest can be accepted — run \
+\`keep-client release-manifest validate --release-ready\` for what is missing"
+  fi
 
   note "release-manifest attestation binds ${manifest} to the compiled \
 bounds of ${attested_source}"

@@ -223,15 +223,23 @@ EOF
 # — so the fixtures stay correct across manifest regenerations and this
 # script needs no Go toolchain. The negative cases override one argument
 # each.
+#
+# The readiness verdict defaults to a ready release, because that is the state
+# every other case here is about: a manifest naming no release is refused
+# before any of the comparisons below is reached, so leaving it at the
+# checked-in placeholder's own verdict would make every case test the same
+# refusal.
 write_attestation() {
   local dir="$1/attestation"
   local sha="${2:-${MANIFEST_SHA}}"
   local derived="${3:-${TEST_DIR}/release-manifest.json}"
   local source_sha="${4:-${FIXTURE_SHA}}"
+  local ready="${5:-yes}"
   mkdir -p "${dir}"
   printf '%s\n' "${sha}" >"${dir}/reviewed-manifest.sha256"
   cp "${derived}" "${dir}/derived-manifest.json"
   printf '%s\n' "${source_sha}" >"${dir}/source-commit.txt"
+  printf '%s\n' "${ready}" >"${dir}/release-ready.txt"
 }
 
 # Run stage_validate_evidence against a fixture directory in an isolated
@@ -375,6 +383,35 @@ run_validator "${D}"
 check "an attestation missing its source stamp is not a receipt" 3 \
   "no complete release-manifest attestation"
 
+# A receipt without the readiness verdict is as much a fragment as one
+# without its source stamp: what it leaves out is the one thing that says
+# whether these bytes name a release at all.
+D="${WORK}/attestation-without-readiness"
+mkdir -p "${D}"
+write_attestation "${D}"
+rm "${D}/attestation/release-ready.txt"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+run_validator "${D}"
+check "an attestation missing its readiness verdict is not a receipt" 3 \
+  "no complete release-manifest attestation"
+
+# The manifest is internally valid and every comparison in the stage agrees
+# with it — and it still names no release. Records measured against it
+# describe a rehearsal of the code, not a release anything could be accepted
+# as, so the stage refuses them rather than issuing a verdict over a document
+# that identifies no artifact. This is the checked-in manifest's own state
+# today.
+D="${WORK}/manifest-not-release-ready"
+mkdir -p "${D}"
+write_attestation "${D}" "${MANIFEST_SHA}" "${TEST_DIR}/release-manifest.json" \
+  "${FIXTURE_SHA}" "no"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+run_validator "${D}"
+check "records measured against a manifest naming no release are refused" 3 \
+  "not release-ready" "must set the mainnet cutover block"
+
 D="${WORK}/staging-leftover"
 mkdir -p "${D}"
 write_attestation "${D}"
@@ -413,6 +450,26 @@ run_validator "${D}"
 check "attested bounds contradicting the reviewed manifest are rejected" 3 \
   "disagrees with the compiled bounds"
 
+# The reviewed manifest and the attestation agree on the hash, but the
+# attested compiled bounds name a different cutover block: the number the
+# client resolves its schedule from, so a receipt carrying another one vouches
+# for a release these records were never measured against.
+D="${WORK}/attested-identity-differs"
+mkdir -p "${D}"
+node -e '
+  const fs = require("fs");
+  const manifest = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  manifest.release_identity.cutover_block += 1;
+  fs.writeFileSync(process.argv[2], JSON.stringify(manifest, null, 2));
+' "${TEST_DIR}/release-manifest.json" "${WORK}/other-identity.json"
+write_attestation "${D}" "${MANIFEST_SHA}" "${WORK}/other-identity.json"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+run_validator "${D}"
+check "an attested cutover block contradicting the reviewed manifest is \
+rejected" 3 \
+  "disagrees with the compiled bounds"
+
 # Reformatting and re-stamping a reviewed manifest must not read as drift:
 # only the bounds are compared, canonically ordered.
 D="${WORK}/reformatted-attestation"
@@ -422,6 +479,8 @@ node -e '
   const manifest = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
   manifest.generated_at = "2000-01-01T00:00:00Z";
   manifest.termination_grace.notes = "attestation-side note";
+  manifest.release_identity.notes = "attestation-side identity note";
+  manifest.release_identity.source_commit = "a".repeat(40);
   const reordered = Object.keys(manifest).sort().reduce((o, k) => {
     o[k] = manifest[k];
     return o;
