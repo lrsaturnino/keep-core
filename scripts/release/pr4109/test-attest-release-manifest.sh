@@ -428,6 +428,156 @@ else
 fi
 
 # ----------------------------------------------------------------------------
+# The producer against a binary that compiles a real cutover block.
+#
+# Every case above runs against this repository as it stands, where the
+# compiled C is the zero placeholder: validate requires the manifest to carry
+# the compiled block and readiness requires that block to be nonzero, so no
+# manifest satisfies both and the producer can only ever answer "no". The
+# agreement assertion covers that direction, but a producer hard-coded to
+# "no" satisfies it too, and neither the readiness nor the provenance success
+# branch is reached at all.
+#
+# So the binary is rebuilt with a nonzero C. A Go build overlay replaces the
+# release constant for the duration of these cases without touching the tree,
+# and GOFLAGS carries it into the `go run` invocations the producer makes on
+# its own — so what answers here is a real binary that compiles a real
+# release, not a stub and not a hand-written verdict. This is what the whole
+# release looks like the day the reviewed block lands.
+
+READY_BLOCK="23400000"
+OVERLAY_DIR="${WORK}/ready-binary"
+mkdir -p "${OVERLAY_DIR}/participation"
+RELEASE_SOURCE="${REPO_ROOT}/pkg/protocol/participation/release.go"
+sed "s/^const MainnetCutoverBlock = uint64(0)/const MainnetCutoverBlock = uint64(${READY_BLOCK})/" \
+  "${RELEASE_SOURCE}" >"${OVERLAY_DIR}/participation/release.go"
+
+# The substitution is the whole seam. If the constant is ever declared some
+# other way this must fail loudly rather than quietly compile the placeholder
+# and turn every case below into a second copy of the "no" branch.
+if grep -q "uint64(${READY_BLOCK})" \
+  "${OVERLAY_DIR}/participation/release.go"; then
+  printf 'ok   the readiness seam compiles a nonzero cutover block\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL the readiness seam did not replace the compiled cutover block\n'
+  FAILED=$((FAILED + 1))
+fi
+
+cat >"${OVERLAY_DIR}/overlay.json" <<EOF
+{"Replace": {"${RELEASE_SOURCE}": "${OVERLAY_DIR}/participation/release.go"}}
+EOF
+
+# The reviewed manifest that binary would accept, derived by that binary. A
+# manifest naming any other block is invalid against it, so this is the only
+# document the ready case can be about.
+READY_TREE="${OVERLAY_DIR}/tree"
+cp -R "${TEST_DIR}/." "${READY_TREE}"
+(
+  cd "${REPO_ROOT}" &&
+    GOFLAGS="-overlay=${OVERLAY_DIR}/overlay.json" \
+      go run . release-manifest derive
+) >"${READY_TREE}/release-manifest.json"
+READY_MANIFEST_SHA="$(hash_stdin <"${READY_TREE}/release-manifest.json")"
+
+# The same producer, the same consumer, one constant different.
+run_ready_producer() {
+  local dir="$1" provenance="${2:-}"
+  mkdir -p "${dir}"
+  set +e
+  CASE_OUT="$(
+    (
+      cd "${REPO_ROOT}" || exit 1
+      # shellcheck disable=SC2030,SC2031,SC2034
+      EVIDENCE_DIR="${dir}"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      SCRIPT_DIR="${READY_TREE}"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      VERIFIED_SOURCE_COMMIT="${FIXTURE_SHA}"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      PR4109_RELEASE_PROVENANCE="${provenance}"
+      # Exported, not merely assigned: the producer makes its own `go run`
+      # calls, and the toolchain reads this out of the environment. A local
+      # assignment would leave those compiling the placeholder constant while
+      # everything around them used the patched one.
+      export GOFLAGS="-overlay=${OVERLAY_DIR}/overlay.json"
+      attest_release_manifest
+    ) 2>&1
+  )"
+  CASE_RC=$?
+  set -e
+}
+
+# The binary asked outside the producer, the same way expected_verdict asks
+# it, so the verdict below is compared against an independent answer here too.
+if (cd "${REPO_ROOT}" && GOFLAGS="-overlay=${OVERLAY_DIR}/overlay.json" \
+  go run . release-manifest validate \
+  --manifest "${READY_TREE}/release-manifest.json" \
+  --release-ready >/dev/null 2>&1); then
+  printf 'ok   the binary reports a real cutover block release-ready\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL the binary refuses readiness for a manifest it derived\n'
+  FAILED=$((FAILED + 1))
+fi
+
+READY_RUN="${WORK}/ready-run"
+READY_PROVENANCE="${WORK}/ready-provenance.json"
+write_provenance_file "${READY_PROVENANCE}" "${READY_MANIFEST_SHA}" \
+  "${FIXTURE_SHA}"
+run_ready_producer "${READY_RUN}" "${READY_PROVENANCE}"
+check "the producer attests a release-ready manifest with its provenance" 0 \
+  "release-manifest attestation written to" \
+  "detached release provenance recorded in the receipt"
+
+READY_VERDICT="$(tr -d '[:space:]' \
+  <"${READY_RUN}/attestation/release-ready.txt")"
+check_equal "the producer writes yes when the binary says release-ready" \
+  "${READY_VERDICT}" "yes"
+
+# The document the producer recorded must be the one it was handed, byte for
+# byte: the receipt is what acceptance reads, and a copy that drifted from
+# the verified original would carry a claim nothing verified.
+if cmp -s "${READY_PROVENANCE}" \
+  "${READY_RUN}/attestation/release-provenance.json"; then
+  printf 'ok   the recorded provenance is the verified document\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL the recorded provenance is not the document handed in\n'
+  FAILED=$((FAILED + 1))
+fi
+
+# And the seam closes: the receipt the producer just wrote, read by the
+# consumer that gates acceptance on it, with nothing hand-authored in
+# between and a real release on both sides.
+run_consumer "${READY_RUN}" "${READY_TREE}"
+check "the consumer accepts the produced release-ready receipt" 0 \
+  "attestation binds .* to the compiled bounds of ${FIXTURE_SHA}" \
+  "detached provenance binds that commit to the images"
+
+# A ready release whose provenance was never supplied is the one thing the
+# producer cannot fix and the consumer must refuse — proved here against a
+# produced receipt rather than a forced verdict.
+READY_BARE="${WORK}/ready-run-bare"
+run_ready_producer "${READY_BARE}"
+check "the producer attests a ready manifest without provenance" 0 \
+  "no detached release provenance supplied"
+run_consumer "${READY_BARE}" "${READY_TREE}"
+check "the consumer refuses a produced ready receipt carrying no provenance" \
+  3 "carries no detached release provenance"
+
+# Provenance the binary rejects, against a manifest that is release-ready:
+# the case the placeholder tree could only reach through the readiness
+# refusal. Here the refusal can only come from the binding itself.
+READY_WRONG="${WORK}/ready-run-wrong-provenance"
+WRONG_PROVENANCE="${WORK}/ready-wrong-provenance.json"
+write_provenance_file "${WRONG_PROVENANCE}" "${OTHER_MANIFEST_SHA}" \
+  "${FIXTURE_SHA}"
+run_ready_producer "${READY_WRONG}" "${WRONG_PROVENANCE}"
+check "the producer refuses provenance over another reviewed manifest" 1 \
+  "does not verify against"
+
+# ----------------------------------------------------------------------------
 # A second run must replace the receipt rather than leave the first one's
 # verdict standing beside it, since the acceptance stage reads whatever is on
 # disk and cannot tell which run wrote it.
