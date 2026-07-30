@@ -266,10 +266,17 @@ fi
 # The seam itself: the receipt the producer wrote, read by the consumer that
 # gates acceptance on it, with nothing hand-authored in between.
 
+# Whichever state this repository is in, that receipt has to be refused, and
+# the reason is what changes: a development binary produces one recording no
+# release, and the release binary produces one that is ready and — because
+# this run supplied none — names no artifact. Both refusals are asserted over
+# a receipt the producer actually wrote, which is what a hand-authored one
+# cannot stand in for. The accepting direction is reached below, where the
+# producer is given the provenance a release run supplies.
 run_consumer "${D}"
 if [[ "${EXPECTED}" == "yes" ]]; then
-  check "the consumer accepts the produced receipt" 0 \
-    "attestation binds .* to the compiled bounds of ${FIXTURE_SHA}"
+  check "the consumer refuses a produced ready receipt naming no artifact" 3 \
+    "carries no detached release provenance"
 else
   check "the consumer refuses the produced not-release-ready receipt" 3 \
     "records .* as not release-ready"
@@ -430,43 +437,75 @@ fi
 # ----------------------------------------------------------------------------
 # The producer against a binary that compiles a real cutover block.
 #
-# Every case above runs against this repository as it stands, where the
-# compiled C is the zero placeholder: validate requires the manifest to carry
-# the compiled block and readiness requires that block to be nonzero, so no
-# manifest satisfies both and the producer can only ever answer "no". The
-# agreement assertion covers that direction, but a producer hard-coded to
-# "no" satisfies it too, and neither the readiness nor the provenance success
-# branch is reached at all.
+# While the compiled C is the zero placeholder every case above runs against a
+# binary that can only ever answer "no": validate requires the manifest to
+# carry the compiled block and readiness requires that block to be nonzero, so
+# no manifest satisfies both. The agreement assertion covers that direction,
+# but a producer hard-coded to "no" satisfies it too, and neither the readiness
+# nor the provenance success branch is reached at all.
 #
-# So the binary is rebuilt with a nonzero C. A Go build overlay replaces the
-# release constant for the duration of these cases without touching the tree,
-# and GOFLAGS carries it into the `go run` invocations the producer makes on
-# its own — so what answers here is a real binary that compiles a real
-# release, not a stub and not a hand-written verdict. This is what the whole
-# release looks like the day the reviewed block lands.
+# So the cases below always run against a binary compiling a real release,
+# whichever state this repository is in. On the reviewed release commit that is
+# the repository's own binary and nothing is substituted. Until then a Go build
+# overlay replaces the release constant for the duration of these cases without
+# touching the tree, and GOFLAGS carries it into the `go run` invocations the
+# producer makes on its own. Either way what answers is a real binary, not a
+# stub and not a hand-written verdict — and the section keeps working on the
+# day the reviewed block lands instead of failing on it, which a fixture
+# pinned to the placeholder declaration could not.
 
-READY_BLOCK="23400000"
+# The cutover block a binary built under the given GOFLAGS compiles in, asked
+# of the binary rather than read out of the source. The branch below has to
+# turn on what actually compiles, and once the overlay exists this is also what
+# proves the substitution reached the compiler.
+compiled_cutover_block() {
+  (
+    cd "${REPO_ROOT}" || exit 1
+    GOFLAGS="${1:-}" go run . release-manifest derive
+  ) | node -e '
+    let raw = "";
+    process.stdin.on("data", (d) => (raw += d));
+    process.stdin.on("end", () => {
+      const doc = JSON.parse(raw);
+      process.stdout.write(String((doc.release_identity || {}).cutover_block));
+    });
+  '
+}
+
+COMPILED_BLOCK="$(compiled_cutover_block)"
 OVERLAY_DIR="${WORK}/ready-binary"
-mkdir -p "${OVERLAY_DIR}/participation"
-RELEASE_SOURCE="${REPO_ROOT}/pkg/protocol/participation/release.go"
-sed "s/^const MainnetCutoverBlock = uint64(0)/const MainnetCutoverBlock = uint64(${READY_BLOCK})/" \
-  "${RELEASE_SOURCE}" >"${OVERLAY_DIR}/participation/release.go"
+mkdir -p "${OVERLAY_DIR}"
 
-# The substitution is the whole seam. If the constant is ever declared some
-# other way this must fail loudly rather than quietly compile the placeholder
-# and turn every case below into a second copy of the "no" branch.
-if grep -q "uint64(${READY_BLOCK})" \
-  "${OVERLAY_DIR}/participation/release.go"; then
+if [[ "${COMPILED_BLOCK}" == "0" ]]; then
+  READY_BLOCK="23400000"
+  RELEASE_SOURCE="${REPO_ROOT}/pkg/protocol/participation/release.go"
+  mkdir -p "${OVERLAY_DIR}/participation"
+  sed -E "s/^(const MainnetCutoverBlock = uint64\()[0-9]+\)/\1${READY_BLOCK})/" \
+    "${RELEASE_SOURCE}" >"${OVERLAY_DIR}/participation/release.go"
+  cat >"${OVERLAY_DIR}/overlay.json" <<EOF
+{"Replace": {"${RELEASE_SOURCE}": "${OVERLAY_DIR}/participation/release.go"}}
+EOF
+  READY_GOFLAGS="-overlay=${OVERLAY_DIR}/overlay.json"
+else
+  READY_BLOCK="${COMPILED_BLOCK}"
+  READY_GOFLAGS=""
+fi
+
+# The seam itself, confirmed by the compiler rather than by the text that was
+# edited. A constant declared some other way would leave the overlay compiling
+# the placeholder and turn every case below into a second copy of the "no"
+# branch; grepping the patched source would not notice, and asking the binary
+# does — in either repository state, and without knowing which one it is in.
+READY_COMPILED_BLOCK="$(compiled_cutover_block "${READY_GOFLAGS}")"
+check_equal "the ready cases run against a binary compiling the cutover block" \
+  "${READY_COMPILED_BLOCK}" "${READY_BLOCK}"
+if [[ "${READY_BLOCK}" != "0" ]]; then
   printf 'ok   the readiness seam compiles a nonzero cutover block\n'
   PASS=$((PASS + 1))
 else
   printf 'FAIL the readiness seam did not replace the compiled cutover block\n'
   FAILED=$((FAILED + 1))
 fi
-
-cat >"${OVERLAY_DIR}/overlay.json" <<EOF
-{"Replace": {"${RELEASE_SOURCE}": "${OVERLAY_DIR}/participation/release.go"}}
-EOF
 
 # The reviewed manifest that binary would accept, derived by that binary. A
 # manifest naming any other block is invalid against it, so this is the only
@@ -475,12 +514,13 @@ READY_TREE="${OVERLAY_DIR}/tree"
 cp -R "${TEST_DIR}/." "${READY_TREE}"
 (
   cd "${REPO_ROOT}" &&
-    GOFLAGS="-overlay=${OVERLAY_DIR}/overlay.json" \
-      go run . release-manifest derive
+    GOFLAGS="${READY_GOFLAGS}" go run . release-manifest derive
 ) >"${READY_TREE}/release-manifest.json"
 READY_MANIFEST_SHA="$(hash_stdin <"${READY_TREE}/release-manifest.json")"
 
-# The same producer, the same consumer, one constant different.
+# The same producer and the same consumer, running against the release binary:
+# on the reviewed release commit that is this repository's own, and before it
+# the overlay's.
 run_ready_producer() {
   local dir="$1" provenance="${2:-}"
   mkdir -p "${dir}"
@@ -499,8 +539,9 @@ run_ready_producer() {
       # Exported, not merely assigned: the producer makes its own `go run`
       # calls, and the toolchain reads this out of the environment. A local
       # assignment would leave those compiling the placeholder constant while
-      # everything around them used the patched one.
-      export GOFLAGS="-overlay=${OVERLAY_DIR}/overlay.json"
+      # everything around them used the patched one. Set unconditionally, so
+      # an ambient GOFLAGS cannot decide what these cases compile either.
+      export GOFLAGS="${READY_GOFLAGS}"
       attest_release_manifest
     ) 2>&1
   )"
@@ -510,7 +551,7 @@ run_ready_producer() {
 
 # The binary asked outside the producer, the same way expected_verdict asks
 # it, so the verdict below is compared against an independent answer here too.
-if (cd "${REPO_ROOT}" && GOFLAGS="-overlay=${OVERLAY_DIR}/overlay.json" \
+if (cd "${REPO_ROOT}" && GOFLAGS="${READY_GOFLAGS}" \
   go run . release-manifest validate \
   --manifest "${READY_TREE}/release-manifest.json" \
   --release-ready >/dev/null 2>&1); then
