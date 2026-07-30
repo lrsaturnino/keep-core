@@ -451,11 +451,31 @@ ceremony one of whose contributors never published an ending presents that
 contributor's seat as outside the fleet, and a homogeneous run then satisfies a
 control whose whole claim is that two releases combined into one output.
 
+The map spans the permits a node still holds as well as the ones it closed, and
+both halves come out of one gate response. An ending is the only thing that puts
+a permit in the closed account, while the driver reports when the chain settles
+and a holder closes on its own schedule — so a contributor whose permit outlives
+the report appears in neither list, its seat leaves the map with no counter
+moving anywhere, and the ordinary outcome of that race reads as a seat the other
+release supplied. Splitting the two readings across separate requests has the
+same effect on a permit that closes between them, which is why the held permits,
+the endings, and the provenance of the account they came from are read together.
+
 The two node-authored accounts of one permit are held against each other. A
 completed record whose transcript claims a seat its own permit was not issued to
 operate is refused at the moment it is written and refused again by the offline
 audit, and the mixed reading declines to classify the work at all rather than
 choose between them.
+
+The shape rules on `operated_members` are applied by the evidence reader as well
+as by the gate that enforces them at issuance. Holding a transcript to its own
+permit only binds the permits that published a transcript, and the records the
+ownership map most depends on are the ones that did not: a DKG or relay signing
+permit ending unresolved carries no transcript to be checked against, so a seat
+widened after the fact would enter the map unopposed, take that seat from the
+node whose permit really held it, and leave the seat reading as supplied from
+outside the fleet. Those ceremonies run one seat per permit and name it in the
+permit ID, which is the statement the reader holds the operated set to.
 
 tBTC DKG is compared through a mapping rather than exempted from the comparison.
 Its permit names a DKG member index while its transcript and persisted membership
@@ -480,6 +500,24 @@ reading treating the seats it could not place as seats the fleet never operated.
 holder the ceremony removed is a separate case and not an unknown: its seat is
 absent from the survivor list, which says definitely that it holds no final seat.
 
+Offline, the whole mapping is derived from the accepted result rather than
+checked at the recording node's own seat. A final signing group is the accepted
+result's members with its misbehaved seats removed, ascending, so final seat *i*
+came from the *i*-th survivor and none of the map is the recording node's to
+state. Checking only the author's own entry left every other entry — which is
+precisely the part that says who the other seats belonged to — accepted on the
+author's word: a record whose remote entries were rewritten still names the right
+seed, the right anchor, the right length and the right local seat, and the
+fleet-wide map translated through it hands final seats to members that never held
+them.
+
+The runtime side of the same binding is what a node activates against. A DKG
+signer is activated only when the result observed to settle on chain is the
+result this member generated — same ceremony, same key, same members removed —
+rather than when any result settled at all. A mismatch takes the path a
+publication window closing empty already takes: the share is preserved without
+activation, for the offline audit to reconcile.
+
 The account those readings come out of lives in memory, so whether it can be
 followed is published with it. The gate names the process the account belongs to
 at `protocol_participation.gate_instance` and counts the records its bounded
@@ -492,6 +530,16 @@ that took no part in work it may well have done. A process lost before it closes
 anything writes no record at any point, and no reading of the account recovers a
 seat that was never written to it — the provenance check is what keeps that
 silence from being spent as evidence.
+
+Provenance a node declined to state blocks on sight rather than being compared.
+The gate composes its identity from the system entropy source and says the
+identity is unknown when that source fails, and a comparison carrying that
+answer through as text finds the two readings equal — which is the followable
+verdict, drawn on the case that was meant to be unfollowable. The reader renders
+an identity that is not one, and a dropped-permit count that is not a count, as
+the one token that can be neither. A count that went backwards is refused the
+same way: the account only ever forgets, so a smaller number is a reading no gate
+produced rather than a negative quantity of dropped permits.
 
 Completing a ceremony and contributing to it are held apart. A wallet action owns
 its permit and records the signature it saw settle even when the attempt that
