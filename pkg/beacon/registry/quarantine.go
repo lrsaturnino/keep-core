@@ -46,7 +46,28 @@ type QuarantinedSignerMetadata struct {
 type Quarantine struct {
 	logger log.StandardLogger
 	handle persistence.ProtectedHandle
+
+	// saveAttempts and saveRetryDelay bound the retry budget spent on each half
+	// of a preserved output, and sleep waits between attempts. They are fields
+	// so a test does not have to spend the real delay.
+	saveAttempts   int
+	saveRetryDelay time.Duration
+	sleep          func(time.Duration)
 }
+
+// quarantineSaveAttempts bounds how many times each half of a preserved output
+// is written before its failure stands, and quarantineSaveRetryDelay is the wait
+// between attempts.
+//
+// A refused write is often transient — a namespace being remounted, a disk an
+// operator is draining — and the key material this path is holding cannot be
+// regenerated, so a single attempt is not enough to conclude it is unwritable.
+// The budget stays small because the process is normally already quiescing
+// behind this write and its shutdown drain waits for it to finish.
+const (
+	quarantineSaveAttempts   = 3
+	quarantineSaveRetryDelay = 100 * time.Millisecond
+)
 
 // NewQuarantine creates a quarantine store over the given protected handle.
 func NewQuarantine(
@@ -54,9 +75,45 @@ func NewQuarantine(
 	handle persistence.ProtectedHandle,
 ) *Quarantine {
 	return &Quarantine{
-		logger: logger,
-		handle: handle,
+		logger:         logger,
+		handle:         handle,
+		saveAttempts:   quarantineSaveAttempts,
+		saveRetryDelay: quarantineSaveRetryDelay,
+		sleep:          time.Sleep,
 	}
+}
+
+// save writes one half of a preserved output, retrying a refused write within
+// the attempt budget and returning the last error if the budget runs out.
+func (q *Quarantine) save(
+	content []byte,
+	directory string,
+	name string,
+) error {
+	// A store assembled without a budget still gets one attempt, and one
+	// without a wait still waits: a zero budget would report a write that never
+	// happened as a success, which is the single outcome this path exists to
+	// prevent.
+	attempts := q.saveAttempts
+	if attempts < 1 {
+		attempts = 1
+	}
+	sleep := q.sleep
+	if sleep == nil {
+		sleep = time.Sleep
+	}
+
+	var err error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if attempt > 1 {
+			sleep(q.saveRetryDelay)
+		}
+		if err = q.handle.Save(content, directory, name); err == nil {
+			return nil
+		}
+	}
+
+	return err
 }
 
 // QuarantineState reports which halves of a preserved output reached the
@@ -89,7 +146,10 @@ type QuarantineState struct {
 //
 // The membership is attempted first so that a process killed between the two
 // writes leaves the key material behind rather than only the note describing
-// it: an unexplained share is recoverable, a lost one is not.
+// it: an unexplained share is recoverable, a lost one is not. Each half is
+// retried within a bounded budget before its failure stands, because a namespace
+// that refuses one write often accepts the next and the material being written
+// cannot be generated again.
 func (q *Quarantine) Preserve(
 	membership *Membership,
 	metadata QuarantinedSignerMetadata,
@@ -124,26 +184,28 @@ func (q *Quarantine) Preserve(
 
 	var writeErrs []error
 
-	if err := q.handle.Save(
+	if err := q.save(
 		membershipBytes,
 		directory,
 		"/membership_"+memberSuffix,
 	); err != nil {
 		writeErrs = append(writeErrs, fmt.Errorf(
-			"could not persist the quarantined membership: [%v]",
+			"could not persist the quarantined membership in %d attempts: [%v]",
+			q.saveAttempts,
 			err,
 		))
 	} else {
 		state.MembershipPersisted = true
 	}
 
-	if err := q.handle.Save(
+	if err := q.save(
 		metadataBytes,
 		directory,
 		"/metadata_"+memberSuffix,
 	); err != nil {
 		writeErrs = append(writeErrs, fmt.Errorf(
-			"could not persist the quarantine metadata: [%v]",
+			"could not persist the quarantine metadata in %d attempts: [%v]",
+			q.saveAttempts,
 			err,
 		))
 	} else {

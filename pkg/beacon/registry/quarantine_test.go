@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/keep-network/keep-core/internal/testutils"
 
@@ -96,6 +97,153 @@ func TestQuarantine_Preserve_AttemptsBothRecordsAndReportsWhatLanded(
 				)
 			}
 		})
+	}
+}
+
+// flakyRecordHandle refuses the first refusals writes of the named record and
+// accepts every write after that, counting the attempts made on it. It stands
+// for a namespace that is momentarily unwritable — a mount being restored, a
+// disk an operator is draining — which is the condition a single-attempt write
+// would report as permanently lost key material.
+type flakyRecordHandle struct {
+	unwritableRecordHandle
+
+	namePrefix string
+	refusals   int
+
+	attempts int
+}
+
+func (h *flakyRecordHandle) Save(
+	data []byte,
+	directory string,
+	name string,
+) error {
+	if !strings.HasPrefix(name, h.namePrefix) {
+		return h.unwritableRecordHandle.Save(data, directory, name)
+	}
+
+	h.attempts++
+	if h.attempts <= h.refusals {
+		return fmt.Errorf("cannot write [%s] yet", name)
+	}
+
+	return h.unwritableRecordHandle.Save(data, directory, name)
+}
+
+// newTestQuarantine builds a quarantine store that retries exactly the way the
+// production one does but does not spend the wait between attempts, so a test
+// can exercise the whole budget without sleeping through it.
+func newTestQuarantine(handle persistence.ProtectedHandle) *Quarantine {
+	quarantine := NewQuarantine(&testutils.MockLogger{}, handle)
+	quarantine.sleep = func(time.Duration) {}
+
+	return quarantine
+}
+
+// TestQuarantine_Preserve_RetriesARefusedWrite proves key material is not
+// declared lost on the first refusal: a namespace that accepts the write on a
+// later attempt still preserves the share, and the caller is told it landed.
+//
+// A beacon share is worse to lose than most: the group it belongs to may already
+// have an accepted result, so a member that cannot produce its share permanently
+// reduces that group's usable threshold. The conditions that refuse a write are
+// usually the ones that clear, and concluding permanent loss from one attempt
+// throws away a share the very next write would have kept.
+func TestQuarantine_Preserve_RetriesARefusedWrite(t *testing.T) {
+	handle := &flakyRecordHandle{
+		unwritableRecordHandle: unwritableRecordHandle{
+			refusedNamePrefix: "/nothing_is_refused",
+		},
+		namePrefix: "/membership_",
+		refusals:   quarantineSaveAttempts - 1,
+	}
+
+	state, err := newTestQuarantine(handle).Preserve(
+		&Membership{Signer: signer1, ChannelName: channelName1},
+		QuarantinedSignerMetadata{
+			ReleaseEpoch: "security_v2_cutover",
+			Ceremony:     "beacon_dkg",
+		},
+	)
+	if err != nil {
+		t.Fatalf(
+			"expected the retried write to preserve the share, got [%v]",
+			err,
+		)
+	}
+
+	testutils.AssertBoolsEqual(
+		t,
+		"membership persisted",
+		true,
+		state.MembershipPersisted,
+	)
+	testutils.AssertIntsEqual(
+		t,
+		"membership write attempts",
+		quarantineSaveAttempts,
+		handle.attempts,
+	)
+
+	if !reflect.DeepEqual(
+		handle.savedNames,
+		[]string{"/membership_1", "/metadata_1"},
+	) {
+		t.Errorf(
+			"namespace holds %v, expected both halves",
+			handle.savedNames,
+		)
+	}
+}
+
+// TestQuarantine_Preserve_SpendsTheWholeBudgetBeforeReportingLoss proves a
+// namespace that refuses every attempt is retried for the whole budget before
+// the loss stands, and that the error says how many attempts were spent — the
+// difference between one unlucky write and a namespace that will not take the
+// share at all.
+func TestQuarantine_Preserve_SpendsTheWholeBudgetBeforeReportingLoss(
+	t *testing.T,
+) {
+	handle := &flakyRecordHandle{
+		unwritableRecordHandle: unwritableRecordHandle{
+			refusedNamePrefix: "/nothing_is_refused",
+		},
+		namePrefix: "/membership_",
+		refusals:   quarantineSaveAttempts + 1,
+	}
+
+	state, err := newTestQuarantine(handle).Preserve(
+		&Membership{Signer: signer1, ChannelName: channelName1},
+		QuarantinedSignerMetadata{
+			ReleaseEpoch: "security_v2_cutover",
+			Ceremony:     "beacon_dkg",
+		},
+	)
+	if err == nil {
+		t.Fatal("expected a preservation error")
+	}
+
+	testutils.AssertBoolsEqual(
+		t,
+		"membership persisted",
+		false,
+		state.MembershipPersisted,
+	)
+	testutils.AssertIntsEqual(
+		t,
+		"membership write attempts",
+		quarantineSaveAttempts,
+		handle.attempts,
+	)
+	if want := fmt.Sprintf(
+		"in %d attempts",
+		quarantineSaveAttempts,
+	); !strings.Contains(err.Error(), want) {
+		t.Errorf(
+			"the error must say the whole budget was spent, got [%v]",
+			err,
+		)
 	}
 }
 

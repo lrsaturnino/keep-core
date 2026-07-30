@@ -1110,6 +1110,437 @@ func TestDkgExecutor_PreserveInterruptedSigner_RefusedMembershipIsNotQuarantined
 	}
 }
 
+// flakyRecordHandle refuses the first refusals writes of the named record and
+// accepts every write after that, counting the attempts made on it. It stands
+// for a namespace that is momentarily unwritable — a mount being restored, a
+// disk an operator is draining — which is the condition a single-attempt write
+// would report as permanently lost key material.
+type flakyRecordHandle struct {
+	mockPersistenceHandle
+
+	namePrefix string
+	refusals   int
+
+	mu       sync.Mutex
+	attempts int
+}
+
+func (h *flakyRecordHandle) Save(
+	data []byte,
+	directory string,
+	name string,
+) error {
+	if !strings.HasPrefix(name, h.namePrefix) {
+		return h.mockPersistenceHandle.Save(data, directory, name)
+	}
+
+	h.mu.Lock()
+	h.attempts++
+	attempt := h.attempts
+	h.mu.Unlock()
+
+	if attempt <= h.refusals {
+		return fmt.Errorf("cannot write [%s] yet", name)
+	}
+
+	return h.mockPersistenceHandle.Save(data, directory, name)
+}
+
+func (h *flakyRecordHandle) attemptCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.attempts
+}
+
+// newTestSignerQuarantine builds a quarantine store that retries exactly the way
+// the production one does but does not spend the wait between attempts, so a
+// test can exercise the whole budget without sleeping through it.
+func newTestSignerQuarantine(
+	handle persistence.ProtectedHandle,
+) *signerQuarantine {
+	quarantine := newSignerQuarantine(logger, handle)
+	quarantine.sleep = func(time.Duration) {}
+
+	return quarantine
+}
+
+// TestSignerQuarantine_Preserve_RetriesARefusedWrite proves key material is not
+// declared lost on the first refusal: a namespace that accepts the write on a
+// later attempt still preserves the share, and the caller is told it landed.
+//
+// The material on this path cannot be generated again, and the conditions that
+// refuse a write are usually the ones that clear — a mount being restored, a
+// full disk being drained. Concluding permanent loss from a single attempt
+// throws away a share the very next write would have kept.
+func TestSignerQuarantine_Preserve_RetriesARefusedWrite(t *testing.T) {
+	de, result, gsr, _, _ := setupPreserveScenario(t)
+
+	signer, err := de.buildFinalSigner(
+		result,
+		group.MemberIndex(1),
+		gsr.OperatorsAddresses,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	handle := &flakyRecordHandle{
+		namePrefix: "/membership_",
+		refusals:   quarantineSaveAttempts - 1,
+	}
+
+	state, err := newTestSignerQuarantine(handle).preserve(
+		signer,
+		QuarantinedSignerMetadata{
+			ReleaseEpoch: participation.CompiledEpoch.String(),
+			Ceremony:     string(participation.TBTCDKG),
+		},
+	)
+	if err != nil {
+		t.Fatalf(
+			"expected the retried write to preserve the share, got [%v]",
+			err,
+		)
+	}
+
+	testutils.AssertBoolsEqual(
+		t,
+		"membership persisted",
+		true,
+		state.membershipPersisted,
+	)
+	testutils.AssertIntsEqual(
+		t,
+		"membership write attempts",
+		quarantineSaveAttempts,
+		handle.attemptCount(),
+	)
+
+	if got := savedNames(&handle.mockPersistenceHandle); !reflect.DeepEqual(
+		got,
+		[]string{"/membership_1", "/metadata_1"},
+	) {
+		t.Errorf("namespace holds %v, expected both halves", got)
+	}
+}
+
+// TestSignerQuarantine_Preserve_SpendsTheWholeBudgetBeforeReportingLoss proves a
+// namespace that refuses every attempt is retried for the whole budget before
+// the loss stands, and that the error says how many attempts were spent — the
+// difference between one unlucky write and a namespace that will not take the
+// share at all.
+func TestSignerQuarantine_Preserve_SpendsTheWholeBudgetBeforeReportingLoss(
+	t *testing.T,
+) {
+	de, result, gsr, _, _ := setupPreserveScenario(t)
+
+	signer, err := de.buildFinalSigner(
+		result,
+		group.MemberIndex(1),
+		gsr.OperatorsAddresses,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	handle := &flakyRecordHandle{
+		namePrefix: "/membership_",
+		refusals:   quarantineSaveAttempts + 1,
+	}
+
+	state, err := newTestSignerQuarantine(handle).preserve(
+		signer,
+		QuarantinedSignerMetadata{
+			ReleaseEpoch: participation.CompiledEpoch.String(),
+			Ceremony:     string(participation.TBTCDKG),
+		},
+	)
+	if err == nil {
+		t.Fatal("expected a preservation error")
+	}
+
+	testutils.AssertBoolsEqual(
+		t,
+		"membership persisted",
+		false,
+		state.membershipPersisted,
+	)
+	testutils.AssertIntsEqual(
+		t,
+		"membership write attempts",
+		quarantineSaveAttempts,
+		handle.attemptCount(),
+	)
+	if want := fmt.Sprintf(
+		"in %d attempts",
+		quarantineSaveAttempts,
+	); !strings.Contains(err.Error(), want) {
+		t.Errorf(
+			"the error must say the whole budget was spent, got [%v]",
+			err,
+		)
+	}
+}
+
+// TestDkgExecutor_PreserveInterruptedSigner_LostShareBlocksNewCeremonies proves
+// a share that reached no namespace stops this node from starting new work.
+//
+// The share existed only in the goroutine that generated it and the namespace
+// refused it for the whole retry budget, so nothing an operator or the offline
+// audit can read accounts for it. A node that keeps taking ceremonies after that
+// builds further state on a host whose inventory is already known to be
+// incomplete, and the rollback audit reconciles namespaces against the chain —
+// it cannot reconcile a share nobody wrote down.
+func TestDkgExecutor_PreserveInterruptedSigner_LostShareBlocksNewCeremonies(
+	t *testing.T,
+) {
+	de, result, gsr, _, _ := setupPreserveScenario(t)
+
+	de.signerQuarantine = newTestSignerQuarantine(
+		&unwritableRecordHandle{refusedNamePrefix: "/membership_"},
+	)
+
+	before := de.participationGate.State()
+	testutils.AssertBoolsEqual(
+		t,
+		"the gate issues permits before the loss",
+		true,
+		before.Allowed,
+	)
+
+	preserveOneSigner(t, de, result, gsr, group.MemberIndex(1))
+
+	after := de.participationGate.State()
+	testutils.AssertBoolsEqual(
+		t,
+		"the gate quiesced on the lost share",
+		true,
+		after.Quiescing,
+	)
+	testutils.AssertBoolsEqual(
+		t,
+		"the gate still issues permits",
+		false,
+		after.Allowed,
+	)
+
+	// A quiescing gate refuses before it looks at the anchor at all, which is
+	// why the refusal has to be read by sentinel rather than by the fact that
+	// one happened.
+	if _, err := de.participationGate.Begin(
+		participation.TBTCDKG,
+		before.CurrentBlock,
+		tbtcDKGPermitIdentity(big.NewInt(2), group.MemberIndex(1)),
+	); !errors.Is(err, participation.ErrQuiescing) {
+		t.Errorf(
+			"a node holding a lost share must refuse new ceremonies, got [%v]",
+			err,
+		)
+	}
+}
+
+// TestDkgExecutor_PreserveInterruptedSigner_RefusedActiveSaveFallsBackToQuarantine
+// proves a registered wallet's share the active namespace refused is preserved
+// in the quarantine namespace rather than dropped, and that the audit record
+// says the active save is what was refused.
+//
+// The active namespace is where a restart would load the share from, so a write
+// refused there leaves a registered wallet short a signer. The quarantine
+// namespace is a separate namespace with its own failure modes: a share
+// preserved there is recoverable and the offline audit reports it, where a
+// dropped one is neither.
+func TestDkgExecutor_PreserveInterruptedSigner_RefusedActiveSaveFallsBackToQuarantine(
+	t *testing.T,
+) {
+	de, result, gsr, _, quarantineHandle := setupPreserveScenario(t)
+
+	walletPublicKey := result.PrivateKeyShare.PublicKey()
+	walletID, err := de.chain.CalculateWalletID(walletPublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	de.chain.(*localChain).setWallet(
+		bitcoin.PublicKeyHash(walletPublicKey),
+		&WalletChainData{EcdsaWalletID: walletID, State: StateLive},
+	)
+
+	// The active namespace refuses the very record the registered wallet needs.
+	activeHandle := &unwritableRecordHandle{refusedNamePrefix: "/membership_"}
+	de.walletRegistry, err = newWalletRegistry(
+		activeHandle,
+		de.chain.CalculateWalletID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	permit := newTestPermit(participation.TBTCDKG)
+
+	de.preserveInterruptedSigner(
+		logger.With(),
+		permit,
+		big.NewInt(1),
+		result,
+		group.MemberIndex(1),
+		gsr,
+		"tbtc_dkg_signer_activation",
+		fmt.Errorf("activation refused"),
+	)
+
+	if got := savedNames(quarantineHandle); !reflect.DeepEqual(
+		got,
+		[]string{"/membership_1", "/metadata_1"},
+	) {
+		t.Errorf(
+			"quarantine namespace holds %v, expected the refused share",
+			got,
+		)
+	}
+
+	metadata := &QuarantinedSignerMetadata{}
+	for _, descriptor := range quarantineHandle.saved {
+		if descriptor.Name() != "/metadata_1" {
+			continue
+		}
+		content, err := descriptor.Content()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(content, metadata); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if want := "tbtc_dkg_signer_activation_after_refused_active_save"; metadata.
+		FailedOperation != want {
+		t.Errorf(
+			"audit record says [%s], expected [%s]",
+			metadata.FailedOperation,
+			want,
+		)
+	}
+
+	terminalOutcomes := permit.recordedTerminalOutcomes()
+	testutils.AssertIntsEqual(t, "terminal outcomes", 1, len(terminalOutcomes))
+	if len(terminalOutcomes) == 1 &&
+		terminalOutcomes[0].outcome !=
+			participation.TerminalOutcomeQuarantined {
+		t.Errorf(
+			"unexpected terminal outcome [%s]",
+			terminalOutcomes[0].outcome,
+		)
+	}
+}
+
+// TestDkgExecutor_ReportQuarantinedSigners_PersistedShareSurvivesAnUnreadableRecount
+// proves a share this process durably persisted is still counted when the
+// recount that follows the write cannot read the namespace.
+//
+// Keeping the last published count is right when that count came from a scan
+// that saw the namespace. It is wrong immediately after a write: the standing
+// number is a cold start's zero, the namespace now holds key material, and
+// leaving the zero up says a rollback has nothing to account for. What the scan
+// failure cannot take away is what this process itself wrote.
+func TestDkgExecutor_ReportQuarantinedSigners_PersistedShareSurvivesAnUnreadableRecount(
+	t *testing.T,
+) {
+	de, result, gsr, _, _ := setupPreserveScenario(t)
+
+	recorder := newDispatchGaugeRecorder()
+	de.metricsRecorder = recorder
+
+	// The cold start an operator reads first: an empty, readable namespace
+	// counted and published as zero.
+	if err := de.reportInitialQuarantinedSigners(); err != nil {
+		t.Fatal(err)
+	}
+	if value, published := recorder.gaugePublished(
+		clientinfo.MetricParticipationQuarantinedTBTCSigners,
+	); !published || value != 0 {
+		t.Fatalf(
+			"expected a published zero to start from, got [%v] published=[%v]",
+			value,
+			published,
+		)
+	}
+
+	// A namespace that takes the write and then cannot be listed.
+	de.signerQuarantine = newTestSignerQuarantine(&unreadableHandle{})
+
+	preserveOneSigner(t, de, result, gsr, group.MemberIndex(1))
+
+	testutils.AssertIntsEqual(
+		t,
+		"reported quarantined signers after the recount failed",
+		1,
+		int(recorder.gauge(
+			clientinfo.MetricParticipationQuarantinedTBTCSigners,
+		)),
+	)
+}
+
+// TestSignerQuarantine_PreservedOutputs_RestartSeesWhatEachWriteFailureLeft
+// proves what a later process finds in the namespace after each half of a
+// preserved output was refused. A refused metadata write still leaves the key
+// material a restart has to account for; a refused membership write leaves
+// nothing to count, only the audit record naming the loss.
+//
+// The count is read by whichever process comes next, not by the one that wrote,
+// so it is taken here by a store that shares nothing with the one that failed.
+func TestSignerQuarantine_PreservedOutputs_RestartSeesWhatEachWriteFailureLeft(
+	t *testing.T,
+) {
+	tests := map[string]struct {
+		refusedNamePrefix string
+		expectedOutputs   int
+		expectedRecords   []string
+	}{
+		"the metadata write is refused": {
+			refusedNamePrefix: "/metadata_",
+			expectedOutputs:   1,
+			expectedRecords:   []string{"/membership_1"},
+		},
+		"the membership write is refused": {
+			refusedNamePrefix: "/membership_",
+			expectedOutputs:   0,
+			expectedRecords:   []string{"/metadata_1"},
+		},
+	}
+
+	for testName, test := range tests {
+		t.Run(testName, func(t *testing.T) {
+			de, result, gsr, _, _ := setupPreserveScenario(t)
+
+			handle := &unwritableRecordHandle{
+				refusedNamePrefix: test.refusedNamePrefix,
+			}
+			de.signerQuarantine = newTestSignerQuarantine(handle)
+
+			preserveOneSigner(t, de, result, gsr, group.MemberIndex(1))
+
+			outputs, err := newTestSignerQuarantine(handle).preservedOutputs()
+			if err != nil {
+				t.Fatal(err)
+			}
+			testutils.AssertIntsEqual(
+				t,
+				"preserved outputs a restart finds",
+				test.expectedOutputs,
+				len(outputs),
+			)
+
+			if got := savedNames(
+				&handle.mockPersistenceHandle,
+			); !reflect.DeepEqual(got, test.expectedRecords) {
+				t.Errorf(
+					"namespace holds %v, expected %v",
+					got,
+					test.expectedRecords,
+				)
+			}
+		})
+	}
+}
+
 // TestHeartbeatAction_PenaltySuppressedByFence proves a refused penalty
 // fence suppresses the whole inactivity penalty path of a low-activity
 // heartbeat: the consecutive-failure counter is not incremented, no claim is

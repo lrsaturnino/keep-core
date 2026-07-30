@@ -191,6 +191,37 @@ func Initialize(
 	)
 	node.setCutoverPeerRoster(cutoverRoster)
 
+	// The recorder is wired before the first quarantine scan so that scan has
+	// somewhere to publish, and both happen before the coordination layer
+	// starts.
+	if clientInfo != nil {
+		if perfMetrics == nil {
+			perfMetrics = clientinfo.NewPerformanceMetrics(ctx, clientInfo)
+		}
+		node.setPerformanceMetrics(perfMetrics)
+	}
+
+	// Published once here so the count covers what earlier processes on this
+	// host preserved, not only what this one goes on to preserve. A restart
+	// inherits the quarantine namespace and the rollback decision the count
+	// informs is about all of it; reporting nothing until this process happens
+	// to quarantine its own output would show an empty namespace as long as it
+	// never does.
+	//
+	// A namespace this first scan cannot read stops startup. There is no
+	// earlier count to fall back on, so the registered zero would stand as the
+	// answer, and preserved key material would be invisible to the fleet that
+	// has to account for it.
+	//
+	// The scan runs before runCoordinationLayer, which installs the block
+	// watchers a coordination procedure begins from. A startup that fails
+	// closed has to fail before any ceremony can be issued a permit, otherwise
+	// the node does the very work it refused to start for — and the coordination
+	// layer is the first thing here that can reach a choke point.
+	if err := node.dkgExecutor.reportInitialQuarantinedSigners(); err != nil {
+		return fmt.Errorf("cannot set up TBTC node: [%w]", err)
+	}
+
 	err = node.runCoordinationLayer(ctx)
 	if err != nil {
 		return fmt.Errorf("cannot run coordination layer: [%w]", err)
@@ -208,26 +239,6 @@ func Initialize(
 				},
 			},
 		)
-
-		if perfMetrics == nil {
-			perfMetrics = clientinfo.NewPerformanceMetrics(ctx, clientInfo)
-		}
-		node.setPerformanceMetrics(perfMetrics)
-
-		// Published once here so the count covers what earlier processes on this
-		// host preserved, not only what this one goes on to preserve. A restart
-		// inherits the quarantine namespace and the rollback decision the count
-		// informs is about all of it; reporting nothing until this process
-		// happens to quarantine its own output would show an empty namespace as
-		// long as it never does.
-		//
-		// A namespace this first scan cannot read stops startup. There is no
-		// earlier count to fall back on, so the registered zero would stand as
-		// the answer, and preserved key material would be invisible to the
-		// fleet that has to account for it.
-		if err := node.dkgExecutor.reportInitialQuarantinedSigners(); err != nil {
-			return fmt.Errorf("cannot set up TBTC node: [%w]", err)
-		}
 
 		// Register coordination windows as a diagnostic source
 		clientInfo.RegisterApplicationSource(

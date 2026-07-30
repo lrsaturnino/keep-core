@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
@@ -17,6 +18,8 @@ import (
 
 	bn256 "github.com/ethereum/go-ethereum/crypto/bn256/cloudflare"
 	"github.com/keep-network/keep-common/pkg/persistence"
+
+	"github.com/keep-network/keep-core/internal/testutils"
 
 	beaconchain "github.com/keep-network/keep-core/pkg/beacon/chain"
 	"github.com/keep-network/keep-core/pkg/beacon/dkg"
@@ -894,6 +897,91 @@ func TestJoinDKGIfEligible_RefusedQuarantineMembershipIsNotAQuarantinedOutcome(
 				record,
 			)
 		}
+	}
+}
+
+// TestJoinDKGIfEligible_LostShareQuiescesTheNode proves a beacon share that
+// reached no namespace stops this node from starting new ceremonies.
+//
+// The chain clock fails after key generation, so the gate cancels the permits
+// and every generated share goes to the quarantine namespace — which refuses it.
+// The share existed only in the goroutine that generated it, and nothing an
+// operator or the offline audit can read accounts for it. A beacon group whose
+// member cannot produce its share is permanently short of it, and the rollback
+// audit reconciles namespaces against the chain — it cannot reconcile a share
+// nobody wrote down. Taking on further work after that builds more state on a
+// host whose inventory is already known to be incomplete.
+//
+// The clock failure is what interrupts the ceremony here rather than a
+// quiescence, so the gate is not already quiescing when the loss happens: the
+// transition proves the node's own response to the loss.
+func TestJoinDKGIfEligible_LostShareQuiescesTheNode(t *testing.T) {
+	harness := newCutoverNodeHarness(
+		t,
+		2,
+		2,
+		func(currentBlock uint64) uint64 { return currentBlock + 100_000 },
+		nil,
+	)
+
+	refusing := &cutoverRefusingPersistence{refusedMarker: "/membership_"}
+	harness.node.signerQuarantine = registry.NewQuarantine(logger, refusing)
+
+	blockCounter, err := harness.localChain.BlockCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The trigger fires inside the result publication signing window: after the
+	// last GJKR protocol block, before the earliest possible submission.
+	trigger, err := blockCounter.BlockHeightWaiter(
+		harness.anchorBlock + gjkr.ProtocolBlocks() + 2,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	testutils.AssertBoolsEqual(
+		t,
+		"the gate is quiescing before the ceremony",
+		false,
+		harness.gate.State().Quiescing,
+	)
+
+	clockFailed := make(chan struct{})
+	go func() {
+		defer close(clockFailed)
+		<-trigger
+		harness.gateClock.failing.Store(true)
+	}()
+
+	harness.node.JoinDKGIfEligible(cutoverRandomSeed(t), harness.anchorBlock)
+
+	<-clockFailed
+	harness.waitForPermitRelease(t)
+
+	if got := refusing.savesContaining("/membership_"); got != 0 {
+		t.Errorf("expected no membership to be accepted, got [%d]", got)
+	}
+	testutils.AssertBoolsEqual(
+		t,
+		"the gate quiesced on the lost shares",
+		true,
+		harness.gate.State().Quiescing,
+	)
+
+	// A quiescing gate refuses before it looks at the clock or the anchor, which
+	// is why the refusal has to be read by sentinel rather than by the fact that
+	// one happened.
+	if _, err := harness.gate.Begin(
+		participation.BeaconDKG,
+		harness.anchorBlock,
+		beaconDKGPermitIdentity(big.NewInt(7), group.MemberIndex(1)),
+	); !errors.Is(err, participation.ErrQuiescing) {
+		t.Errorf(
+			"a node holding a lost share must refuse new ceremonies, got [%v]",
+			err,
+		)
 	}
 }
 

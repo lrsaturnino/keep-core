@@ -102,8 +102,21 @@ type dkgExecutor struct {
 
 	// quarantineReportMutex serializes recounting the quarantine namespace and
 	// publishing the count, so concurrently preserving members cannot leave an
-	// older, lower count as the published one.
+	// older, lower count as the published one. It also guards the two fields
+	// below.
 	quarantineReportMutex sync.Mutex
+
+	// preservedOutputFloor names the key material this process wrote to the
+	// quarantine namespace itself. The namespace is the authority on how much
+	// preserved material a rollback has to account for, but a scan that fails
+	// cannot take away what this process knows it persisted, and the published
+	// count must never fall below that.
+	preservedOutputFloor map[quarantinedSigner]struct{}
+
+	// lastPublishedQuarantineCount is the count that currently stands, so a
+	// failed recount can tell whether the floor it does know is already covered
+	// by the published number.
+	lastPublishedQuarantineCount int
 
 	// announcerMismatchLogLimiter bounds the volume of session-ID mismatch INFO
 	// logs to a burst of 5 with one line every 30 seconds, matching the
@@ -1066,14 +1079,8 @@ func (de *dkgExecutor) preserveInterruptedSigner(
 			operation,
 			fenceErr,
 		)
-		if saveErr := de.walletRegistry.saveSigner(signer); saveErr != nil {
-			dkgLogger.Errorf(
-				"[member:%v] failed to save the interrupted signer; the "+
-					"share is only in memory: [%v]",
-				memberIndex,
-				saveErr,
-			)
-		} else {
+		saveErr := de.walletRegistry.saveSigner(signer)
+		if saveErr == nil {
 			de.recordPermitTerminalOutcome(
 				dkgLogger,
 				permit,
@@ -1087,8 +1094,25 @@ func (de *dkgExecutor) preserveInterruptedSigner(
 					Contribution:    dkgTranscriptContribution(signer, result),
 				},
 			)
+			return
 		}
-		return
+
+		// The active namespace refused the share, so the quarantine namespace is
+		// tried rather than the share being dropped: it is a separate namespace
+		// with its own failure modes, and a preserved share the audit reports as
+		// unexpected is recoverable where a lost one is not. The recorded
+		// operation says the active save was refused, so the audit reads the
+		// record as what it is — a registered wallet's share that did not reach
+		// the namespace a restart would load it from — rather than as an
+		// ordinary pre-registration quarantine.
+		dkgLogger.Errorf(
+			"[member:%v] failed to save the interrupted signer for a "+
+				"registered wallet; preserving it in the quarantine namespace "+
+				"instead: [%v]",
+			memberIndex,
+			saveErr,
+		)
+		operation += "_after_refused_active_save"
 	}
 
 	seedHash := sha256.Sum256(seed.Bytes())
@@ -1148,8 +1172,22 @@ func (de *dkgExecutor) preserveInterruptedSigner(
 	// metadata write failed, and a share that never reached the namespace is
 	// not quarantined however much was written about it.
 	if !quarantineState.membershipPersisted {
+		de.blockOnUnpreservedKeyMaterial(
+			dkgLogger,
+			memberIndex,
+			quarantineErr,
+		)
 		return
 	}
+
+	// Recorded before the count is published so the identity this process knows
+	// it persisted is already the count's floor by the time the namespace is
+	// recounted. A scan that fails in between would otherwise have nothing to
+	// hold the published number up against.
+	de.noteQuarantinedOutput(quarantinedSigner{
+		walletStorageKey: getWalletStorageKey(signer.wallet.publicKey),
+		memberIndex:      signer.signingGroupMemberIndex,
+	})
 
 	de.recordPermitTerminalOutcome(
 		dkgLogger,
@@ -1160,6 +1198,48 @@ func (de *dkgExecutor) preserveInterruptedSigner(
 		},
 	)
 	de.reportQuarantinedSigners(dkgLogger)
+}
+
+// blockOnUnpreservedKeyMaterial stops this node from beginning new ceremonies
+// after generated key material could not be written to any namespace.
+//
+// The share is gone. It existed only in the goroutine that generated it, the
+// quarantine namespace refused it for the whole retry budget, and nothing an
+// operator or the offline audit can read accounts for it. Taking on more work
+// would build further state on a host whose inventory is already known to be
+// incomplete, and the rollback audit reconciles namespaces against the chain —
+// it cannot reconcile a share that was never written down.
+//
+// Quiescence is the blocking state rather than a new one of its own: it refuses
+// every new permit, it is already what the gate-state gauge and the quiesce
+// counter report, and it lets the permits still running finish normally. No
+// terminal outcome is recorded, so this permit closes unresolved and blocks the
+// offline barrier on its own — the state a lost share should leave behind.
+//
+// The returned channel is deliberately ignored. This caller holds a permit of
+// its own, so waiting for the active permit count to reach zero here would be
+// waiting for itself.
+func (de *dkgExecutor) blockOnUnpreservedKeyMaterial(
+	dkgLogger log.StandardLogger,
+	memberIndex group.MemberIndex,
+	cause error,
+) {
+	dkgLogger.Errorf(
+		"[member:%v] generated key material reached no namespace; refusing "+
+			"new ceremonies on this node until an operator resolves the "+
+			"quarantine namespace: [%v]",
+		memberIndex,
+		cause,
+	)
+
+	if de.participationGate == nil {
+		return
+	}
+
+	de.participationGate.Quiesce(fmt.Errorf(
+		"tbtc key material could not be preserved: [%w]",
+		cause,
+	))
 }
 
 // reportQuarantinedSigners publishes how many preserved signer outputs this
@@ -1218,11 +1298,24 @@ func (de *dkgExecutor) reportInitialQuarantinedSigners() error {
 }
 
 // publishQuarantinedSignerCount recounts the namespace and publishes how many
-// preserved outputs this process holds without having activated them. It
-// publishes nothing when the namespace cannot be enumerated: how the caller
-// treats that is what tells a startup apart from a later recount.
+// preserved outputs this process holds without having activated them. How the
+// caller treats a namespace it cannot enumerate is what tells a startup apart
+// from a later recount, so that failure is returned rather than decided here.
+//
+// A failed scan still publishes when this process knows more than the standing
+// count does. The namespace is the authority on the total, but the outputs this
+// process wrote are not in doubt: a share it persisted and has not activated is
+// held whatever the namespace can be read to say. Without that floor, a startup
+// that published zero followed by a first post-write scan that failed would
+// leave the zero standing over a namespace holding key material — the one
+// answer the count must never invent.
+//
+// The namespace is enumerated whether or not a recorder is configured. An
+// unreadable quarantine is a fault in its own right, and a node that only
+// notices it when the client-info endpoint happens to be enabled would start
+// over preserved material nobody can account for.
 func (de *dkgExecutor) publishQuarantinedSignerCount() error {
-	if de.metricsRecorder == nil || de.signerQuarantine == nil {
+	if de.signerQuarantine == nil {
 		return nil
 	}
 
@@ -1231,9 +1324,41 @@ func (de *dkgExecutor) publishQuarantinedSignerCount() error {
 
 	outputs, err := de.signerQuarantine.preservedOutputs()
 	if err != nil {
+		if floor := de.withheldCount(
+			de.preservedFloorLocked(),
+		); floor > de.lastPublishedQuarantineCount {
+			de.publishQuarantineCountLocked(floor)
+		}
+
 		return err
 	}
 
+	de.publishQuarantineCountLocked(de.withheldCount(outputs))
+
+	return nil
+}
+
+// noteQuarantinedOutput records key material this process durably wrote to the
+// quarantine namespace, so a later scan that cannot read the namespace still
+// reports at least what this process put there.
+//
+// Only a confirmed membership write belongs here. The audit metadata explains
+// preserved material; it is not the material, and a metadata-only record is a
+// share that was lost rather than one the count has to account for.
+func (de *dkgExecutor) noteQuarantinedOutput(output quarantinedSigner) {
+	de.quarantineReportMutex.Lock()
+	defer de.quarantineReportMutex.Unlock()
+
+	if de.preservedOutputFloor == nil {
+		de.preservedOutputFloor = make(map[quarantinedSigner]struct{})
+	}
+	de.preservedOutputFloor[output] = struct{}{}
+}
+
+// withheldCount counts the preserved outputs whose seat this process has not
+// activated from the active namespace. An activated seat stopped being withheld
+// material the moment it became a working signer.
+func (de *dkgExecutor) withheldCount(outputs []quarantinedSigner) int {
 	withheld := 0
 	for _, output := range outputs {
 		if de.walletRegistry.isSignerActive(
@@ -1245,12 +1370,38 @@ func (de *dkgExecutor) publishQuarantinedSignerCount() error {
 		withheld++
 	}
 
+	return withheld
+}
+
+// preservedFloorLocked lists the outputs this process persisted itself. The
+// caller must hold quarantineReportMutex.
+func (de *dkgExecutor) preservedFloorLocked() []quarantinedSigner {
+	outputs := make([]quarantinedSigner, 0, len(de.preservedOutputFloor))
+	for output := range de.preservedOutputFloor {
+		outputs = append(outputs, output)
+	}
+
+	return outputs
+}
+
+// publishQuarantineCountLocked publishes the count and remembers it as the one
+// that stands. The caller must hold quarantineReportMutex.
+//
+// Nothing is remembered when there is no recorder to publish to. The remembered
+// value is what a failed recount compares its floor against, and a number that
+// never reached a gauge would hold that comparison up against a reading nobody
+// can see.
+func (de *dkgExecutor) publishQuarantineCountLocked(count int) {
+	if de.metricsRecorder == nil {
+		return
+	}
+
+	de.lastPublishedQuarantineCount = count
+
 	de.metricsRecorder.SetGauge(
 		clientinfo.MetricParticipationQuarantinedTBTCSigners,
-		float64(withheld),
+		float64(count),
 	)
-
-	return nil
 }
 
 func (de *dkgExecutor) recordPermitTerminalOutcome(

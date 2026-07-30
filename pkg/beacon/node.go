@@ -474,6 +474,7 @@ func (n *node) quarantineSigner(
 	// metadata write failed, and a share that never reached the namespace is
 	// not quarantined however much was written about it.
 	if !state.MembershipPersisted {
+		n.blockOnUnpreservedKeyMaterial(dkgLogger, memberIndex, err)
 		return
 	}
 
@@ -485,6 +486,48 @@ func (n *node) quarantineSigner(
 			Kind: participation.TerminalEvidenceQuarantinedBeaconSigner,
 		},
 	)
+}
+
+// blockOnUnpreservedKeyMaterial stops this node from beginning new ceremonies
+// after generated key material could not be written to any namespace.
+//
+// The share is gone. It existed only in the goroutine that generated it, the
+// quarantine namespace refused it for the whole retry budget, and nothing an
+// operator or the offline audit can read accounts for it. A beacon share is
+// worse to lose than a tBTC one: the group it belongs to may already have an
+// accepted result, and a member that cannot produce its share permanently
+// reduces that group's usable threshold.
+//
+// Quiescence is the blocking state rather than a new one of its own: it refuses
+// every new permit, it is already what the gate-state gauge and the quiesce
+// counter report, and it lets the permits still running finish normally. No
+// terminal outcome is recorded, so this permit closes unresolved and blocks the
+// offline barrier on its own — the state a lost share should leave behind.
+//
+// The returned channel is deliberately ignored. This caller holds a permit of
+// its own, so waiting for the active permit count to reach zero here would be
+// waiting for itself.
+func (n *node) blockOnUnpreservedKeyMaterial(
+	dkgLogger log.StandardLogger,
+	memberIndex group.MemberIndex,
+	cause error,
+) {
+	dkgLogger.Errorf(
+		"[member:%v] generated key material reached no namespace; refusing "+
+			"new ceremonies on this node until an operator resolves the "+
+			"quarantine namespace: [%v]",
+		memberIndex,
+		cause,
+	)
+
+	if n.participationGate == nil {
+		return
+	}
+
+	n.participationGate.Quiesce(fmt.Errorf(
+		"beacon key material could not be preserved: [%w]",
+		cause,
+	))
 }
 
 // beaconDKGTranscriptContribution renders the memberships that produced a DKG

@@ -34,6 +34,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/protocol/group"
 	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/storage"
+	"github.com/keep-network/keep-core/pkg/tbtc"
 )
 
 const testPassword = "audit-test-password"
@@ -1930,6 +1931,94 @@ func TestRunAudit_TBTCQuarantineMetadataWithoutMembershipIsAFinding(
 	}
 	if auditManifest.TBTCQuarantinedOutputs[0].HasMembershipRecord {
 		t.Error("expected the output to report its missing membership record")
+	}
+}
+
+// TestValidateTBTCQuarantineEntry_MembershipWithoutMetadataIsAFinding proves the
+// audit raises the other half of the incomplete-pair check: preserved key
+// material with no audit record explaining it.
+//
+// The two orphans are opposite states. Metadata without a membership is a share
+// that was lost; a membership without metadata is a share that survived while
+// the record naming it did not, which is exactly what a node reports after the
+// metadata write of a quarantine is refused. Nothing in the record itself says
+// which mode, anchor, or ceremony produced it, so a rollback cannot reconcile it
+// against the chain and the audit has to say so.
+//
+// The check is exercised directly rather than through a stored namespace: this
+// branch needs a membership record that decodes the way the wallet registry
+// loader decodes it, and building one takes the tECDSA key-share fixtures, which
+// live in an internal package this command cannot import.
+func TestValidateTBTCQuarantineEntry_MembershipWithoutMetadataIsAFinding(
+	t *testing.T,
+) {
+	run := &auditRun{
+		manifest: &manifest{},
+		expected: testExpectedIdentity(),
+	}
+
+	validateTBTCQuarantineEntry(
+		run,
+		&tbtcQuarantineEntry{
+			directory:    "orphaned-wallet-directory",
+			memberSuffix: "3",
+			signer: &tbtc.SignerAuditRecord{
+				WalletStorageKey:    "orphaned-wallet-directory",
+				WalletID:            "aa",
+				WalletPublicKeyHash: "bb",
+				MemberIndex:         group.MemberIndex(3),
+				SigningGroupSize:    2,
+			},
+		},
+		map[string]struct{}{},
+	)
+
+	if !hasFinding(
+		run.manifest,
+		"tbtc quarantine output [orphaned-wallet-directory/3] has a "+
+			"membership record without audit metadata",
+	) {
+		t.Errorf(
+			"expected an unexplained-key-material finding, findings: %v",
+			run.manifest.Findings,
+		)
+	}
+}
+
+// TestValidateTBTCQuarantineEntry_CompletePairIsNotAFinding proves the
+// incomplete-pair checks do not fire on a record whose halves both landed, so
+// the finding above reports the missing record rather than every quarantine.
+func TestValidateTBTCQuarantineEntry_CompletePairIsNotAFinding(t *testing.T) {
+	run := &auditRun{
+		manifest: &manifest{},
+		expected: testExpectedIdentity(),
+	}
+
+	validateTBTCQuarantineEntry(
+		run,
+		&tbtcQuarantineEntry{
+			directory:    "paired-wallet-directory",
+			memberSuffix: "3",
+			signer: &tbtc.SignerAuditRecord{
+				WalletStorageKey:    "paired-wallet-directory",
+				WalletID:            "aa",
+				WalletPublicKeyHash: "bb",
+				MemberIndex:         group.MemberIndex(3),
+				SigningGroupSize:    2,
+			},
+			metadata: &tbtc.QuarantinedSignerMetadata{
+				SchemaVersion: tbtc.QuarantineSchemaVersion,
+				MemberIndex:   3,
+			},
+		},
+		map[string]struct{}{},
+	)
+
+	for _, finding := range run.manifest.Findings {
+		if strings.Contains(finding, "membership record without audit metadata") ||
+			strings.Contains(finding, "audit metadata without a membership record") {
+			t.Errorf("a complete pair raised an incomplete-pair finding: %s", finding)
+		}
 	}
 }
 
