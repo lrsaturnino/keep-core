@@ -3,13 +3,18 @@ package tbtc
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/ipfs/go-log/v2"
 
 	"github.com/keep-network/keep-common/pkg/persistence"
 	"github.com/keep-network/keep-core/pkg/bitcoin"
+	"github.com/keep-network/keep-core/pkg/protocol/group"
 )
 
 // QuarantineSchemaVersion versions the quarantined-signer metadata document
@@ -132,4 +137,100 @@ func (q *signerQuarantine) preserve(
 	)
 
 	return nil
+}
+
+// quarantinedSigner names one preserved signer output by the wallet it belongs
+// to and the seat it was generated for — the pair an active signer is also
+// identified by, so the two namespaces can be compared without decoding either
+// side's key material.
+type quarantinedSigner struct {
+	walletStorageKey string
+	memberIndex      group.MemberIndex
+}
+
+// preservedOutputs lists the signer outputs currently held in the quarantine
+// namespace.
+//
+// Only the membership records are counted. Each preserved output writes a
+// membership beside its audit metadata, and counting both would report every
+// output twice; the membership is the output itself, so it is the one that
+// decides. Nothing here reads a record's content: the pair identifying an
+// output is carried by the wallet directory and the membership name, and the
+// share inside stays encrypted and unread.
+//
+// A namespace that cannot be enumerated returns an error rather than a short
+// list. The count exists to say how much preserved material a rollback still
+// has to account for, and a truncated one reads as an all-clear — the single
+// answer this must never invent.
+func (q *signerQuarantine) preservedOutputs() ([]quarantinedSigner, error) {
+	descriptorsChan, errorsChan := q.handle.ReadAll()
+
+	// The descriptor and error channels are unbuffered and written to in an
+	// order this side cannot predict, so both are drained concurrently. This
+	// mirrors the active wallet storage scan.
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	var outputs []quarantinedSigner
+	go func() {
+		defer wg.Done()
+		for descriptor := range descriptorsChan {
+			memberIndex, ok := quarantinedMemberIndex(descriptor.Name())
+			if !ok {
+				continue
+			}
+			outputs = append(outputs, quarantinedSigner{
+				walletStorageKey: descriptor.Directory(),
+				memberIndex:      memberIndex,
+			})
+		}
+	}()
+
+	var readErrs []error
+	go func() {
+		defer wg.Done()
+		for err := range errorsChan {
+			readErrs = append(readErrs, err)
+		}
+	}()
+
+	wg.Wait()
+
+	if len(readErrs) > 0 {
+		return nil, fmt.Errorf(
+			"could not enumerate the signer quarantine namespace: %w",
+			errors.Join(readErrs...),
+		)
+	}
+
+	return outputs, nil
+}
+
+// quarantinedMemberIndex reads the seat a preserved membership record was
+// written for out of its name, reporting whether the name is one at all.
+//
+// The name is this package's own: preserve writes "membership_<seat>" beside
+// "metadata_<seat>". Anything else in the namespace — the metadata documents, a
+// name a later schema adds, an operator's stray file — is not a signer output
+// and is not counted as one.
+//
+// A leading separator is tolerated because the name is written with one and not
+// every handle hands it back the same way: the disk implementation joins it into
+// a path and enumerates the bare file name, while a handle that keeps what it
+// was given returns the name as this package wrote it. Both spell the same
+// record, so neither is allowed to decide whether it counts.
+func quarantinedMemberIndex(name string) (group.MemberIndex, bool) {
+	const prefix = "membership_"
+
+	suffix, found := strings.CutPrefix(strings.TrimPrefix(name, "/"), prefix)
+	if !found {
+		return 0, false
+	}
+
+	seat, err := strconv.ParseUint(suffix, 10, 8)
+	if err != nil || seat == 0 {
+		return 0, false
+	}
+
+	return group.MemberIndex(seat), true
 }

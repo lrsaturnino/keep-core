@@ -214,6 +214,14 @@ func Initialize(
 		}
 		node.setPerformanceMetrics(perfMetrics)
 
+		// Published once here so the count covers what earlier processes on this
+		// host preserved, not only what this one goes on to preserve. A restart
+		// inherits the quarantine namespace and the rollback decision the count
+		// informs is about all of it; reporting nothing until this process
+		// happens to quarantine its own output would show an empty namespace as
+		// long as it never does.
+		node.dkgExecutor.reportQuarantinedSigners(logger)
+
 		// Register coordination windows as a diagnostic source
 		clientInfo.RegisterApplicationSource(
 			"coordination_windows",

@@ -8,6 +8,7 @@ import (
 
 	"github.com/keep-network/keep-core/pkg/bitcoin"
 	"github.com/keep-network/keep-core/pkg/crypto/secp256k1"
+	"github.com/keep-network/keep-core/pkg/protocol/group"
 
 	"github.com/keep-network/keep-common/pkg/persistence"
 )
@@ -191,6 +192,35 @@ func (wr *walletRegistry) getSigners(
 	}
 
 	return nil
+}
+
+// isSignerActive reports whether the wallet cache holds an active signer for
+// the given wallet storage key and signing group seat.
+//
+// It answers the question the quarantine count is about, and it is asked in the
+// cache's own terms: a preserved output is identified by the wallet directory it
+// was written under and the seat it was generated for, which is the pair the
+// cache is keyed and its signers indexed by. Comparing the two namespaces this
+// way needs neither side's key material.
+func (wr *walletRegistry) isSignerActive(
+	walletStorageKey string,
+	memberIndex group.MemberIndex,
+) bool {
+	wr.mutex.Lock()
+	defer wr.mutex.Unlock()
+
+	value, ok := wr.walletCache[walletStorageKey]
+	if !ok {
+		return false
+	}
+
+	for _, signer := range value.signers {
+		if signer.signingGroupMemberIndex == memberIndex {
+			return true
+		}
+	}
+
+	return false
 }
 
 // getWalletByPublicKeyHash gets the given wallet by its 20-byte wallet

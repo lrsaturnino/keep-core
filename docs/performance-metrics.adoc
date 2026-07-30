@@ -296,10 +296,9 @@ mismatch observer and the node-local cutover peer roster
 sighting down to the normalized operator address; they never carry operator,
 session, or peer labels.
 
-NOTE: These observability metrics do not require the block-height cutover gate
-and are exposed today. The gate itself, and its `performance_participation_*`
-gate-state metrics, are a separate future change and are NOT exposed by this
-build.
+NOTE: These observability metrics do not require the block-height cutover gate.
+The gate ships in this build as well; its `performance_participation_*` metrics
+are documented in the Protocol Participation Gate Metrics section below.
 
 ==== `performance_announcer_session_id_mismatch_total`
 *Type*: Counter
@@ -341,3 +340,112 @@ aggregator (`cmd/cutover-roster`), which exposes its own
 `performance_cutover_fleet_*` and `performance_cutover_operator_*` metrics on a
 monitoring-only endpoint. Those metrics are documented with that tool and are
 not served from a node's `/metrics` endpoint.
+
+=== Protocol Participation Gate Metrics
+
+The chain-clocked participation gate (`pkg/protocol/participation`) decides which
+cryptographic format each ceremony runs, from the ceremony's own canonical chain
+anchor. These metrics are the evidence the cutover go/no-go and rollback
+decisions are made on: what format the node is issuing, what it is still running,
+and what it refused.
+
+Every metric below except the quarantined-signer gauge is registered at its zero
+value when the gate is constructed, so a scraper sees the complete set from
+process start and an absent metric means the gate is absent — not that nothing
+has happened yet. None of them carries an operator, session, wallet, or peer
+label.
+
+==== `performance_participation_gate_state`
+*Type*: Gauge
+*Description*: Current participation state: `0` disabled, `1` open_legacy, `2` open_security_v2, `3` quiescing, `4` clock_unavailable
+*Labels*: None
+
+==== `performance_participation_current_block`
+*Type*: Gauge
+*Description*: Latest successfully read Ethereum block height
+*Labels*: None
+
+==== `performance_participation_cutover_block`
+*Type*: Gauge
+*Description*: Resolved cutover block at and above which ceremonies run the hardened format
+*Labels*: None
+
+==== `performance_participation_allowed`
+*Type*: Gauge
+*Description*: `1` when a new permit can be issued, `0` while quiescing or without a usable chain clock
+*Labels*: None
+
+==== `performance_participation_active_ceremonies`
+*Type*: Gauge
+*Description*: Permits currently held, in either format
+*Labels*: None
+
+==== `performance_participation_active_legacy_ceremonies`
+*Type*: Gauge
+*Description*: Permits currently held that were issued in the legacy format
+*Labels*: None
+
+==== `performance_participation_active_security_v2_ceremonies`
+*Type*: Gauge
+*Description*: Permits currently held that were issued in the hardened format
+*Labels*: None
+
+==== `performance_participation_mode_legacy_total`
+*Type*: Counter
+*Description*: Permits issued in the legacy format
+*Labels*: None
+
+==== `performance_participation_mode_security_v2_total`
+*Type*: Counter
+*Description*: Permits issued in the hardened format
+*Labels*: None
+
+==== `performance_participation_legacy_completions_after_cutover_total`
+*Type*: Counter
+*Description*: Legacy-format completions committed at or after the cutover block — a ceremony that began before it and was allowed to finish
+*Labels*: None
+
+==== `performance_participation_refusals_total`
+*Type*: Counter
+*Description*: Permits refused for an invalid anchor, an unusable chain clock, or quiescence
+*Labels*: None
+
+==== `performance_participation_refusals_<ceremony>_total`
+*Type*: Counter
+*Description*: The aggregate refusal counter broken out per gated ceremony, as one fixed counter for each: `tbtc_dkg`, `tbtc_wallet_coordination`, `tbtc_signing`, `tbtc_heartbeat`, `tbtc_inactivity_claim`, `beacon_dkg`, `beacon_relay_signing`, `beacon_relay_forwarding`, `beacon_timeout_report`. The ceremony is part of the metric name rather than a label, so the set is closed and a refusal is always attributable
+*Labels*: None
+
+==== `performance_participation_commit_refusals_total`
+*Type*: Counter
+*Description*: Completion commit fences that failed, refusing to record a result under a format the chain anchor does not permit
+*Labels*: None
+
+==== `performance_participation_clock_errors_total`
+*Type*: Counter
+*Description*: Failed chain-clock reads, from the block waiter, the supervisor poll, or a synchronous per-operation read
+*Labels*: None
+
+==== `performance_participation_clock_aborts_total`
+*Type*: Counter
+*Description*: Held permits canceled because the chain clock became unusable
+*Labels*: None
+
+==== `performance_participation_quiesce_total`
+*Type*: Counter
+*Description*: Transitions into process quiescence
+*Labels*: None
+
+==== `performance_participation_quiesce_forced_aborts_total`
+*Type*: Counter
+*Description*: Permits still held when the shutdown deadline expired and were canceled by it
+*Labels*: None
+
+==== `performance_participation_quarantined_tbtc_signers`
+*Type*: Gauge
+*Description*: tBTC signer outputs held in the protected quarantine namespace that this process has not activated in its wallet cache — generated key material a gate refusal preserved, which a rollback still has to account for. Published by tBTC rather than by the gate, and recounted from the namespace, so it covers what earlier processes on the host preserved and not only this one's. A node running no tBTC does not expose it
+*Labels*: None
+
+==== `performance_heartbeat_penalty_suppressed_total`
+*Type*: Counter
+*Description*: Inactivity penalties for a low-activity heartbeat that were suppressed because the ceremony ran the legacy format after the cutover block, or because the process was quiescing
+*Labels*: None

@@ -761,6 +761,15 @@ const (
 	MetricParticipationQuiesceTotal                       = "participation_quiesce_total"
 	MetricParticipationQuiesceForcedAbortsTotal           = "participation_quiesce_forced_aborts_total"
 	MetricHeartbeatPenaltySuppressedTotal                 = "heartbeat_penalty_suppressed_total"
+
+	// MetricParticipationQuarantinedTBTCSigners counts the tBTC signer outputs
+	// held in the protected quarantine namespace that this process has not
+	// activated in its wallet cache. It belongs to the participation family
+	// because a quarantined output is a gate refusal that outlived the ceremony,
+	// but only tBTC can report it: the namespace and the wallet cache it is
+	// compared against are both owned there, so it is published from
+	// pkg/tbtc rather than by the gate itself.
+	MetricParticipationQuarantinedTBTCSigners = "participation_quarantined_tbtc_signers"
 )
 
 // Network join request failure reasons. These are the low-cardinality

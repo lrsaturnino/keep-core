@@ -10,6 +10,7 @@ import (
 	"math/big"
 	"slices"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -98,6 +99,11 @@ type dkgExecutor struct {
 	// DKG without it is refused fail-closed: a gate interruption after key
 	// generation would otherwise have to drop the generated share.
 	signerQuarantine *signerQuarantine
+
+	// quarantineReportMutex serializes recounting the quarantine namespace and
+	// publishing the count, so concurrently preserving members cannot leave an
+	// older, lower count as the published one.
+	quarantineReportMutex sync.Mutex
 
 	// announcerMismatchLogLimiter bounds the volume of session-ID mismatch INFO
 	// logs to a burst of 5 with one line every 30 seconds, matching the
@@ -1130,7 +1136,61 @@ func (de *dkgExecutor) preserveInterruptedSigner(
 				Kind: participation.TerminalEvidenceQuarantinedTBTCSinger,
 			},
 		)
+		de.reportQuarantinedSigners(dkgLogger)
 	}
+}
+
+// reportQuarantinedSigners publishes how many preserved signer outputs this
+// process is holding without having activated them.
+//
+// The value is recounted from the namespace on every call rather than tracked as
+// this process's own tally of preservations. A quarantined output outlives the
+// process that wrote it: the count a rollback decision needs is of everything
+// preserved on this host, and a tally that starts at zero every restart reports
+// none of what an earlier one left behind. Recounting also keeps the comparison
+// honest in the other direction — an output whose seat this process did activate
+// from the active namespace stops being counted, which a tally could not
+// express.
+//
+// Recount and publication are serialized. Concurrent members of the same
+// ceremony quarantine independently, and two interleaved scans could otherwise
+// publish out of order, leaving the older, lower count as the last word — the
+// direction that reads as an all-clear.
+func (de *dkgExecutor) reportQuarantinedSigners(dkgLogger log.StandardLogger) {
+	if de.metricsRecorder == nil || de.signerQuarantine == nil {
+		return
+	}
+
+	de.quarantineReportMutex.Lock()
+	defer de.quarantineReportMutex.Unlock()
+
+	outputs, err := de.signerQuarantine.preservedOutputs()
+	if err != nil {
+		// The last published count stands. Publishing a zero here would say the
+		// namespace is empty, which is precisely what could not be established.
+		dkgLogger.Errorf(
+			"cannot count the quarantined signer outputs; the reported count "+
+				"stays as last published: [%v]",
+			err,
+		)
+		return
+	}
+
+	withheld := 0
+	for _, output := range outputs {
+		if de.walletRegistry.isSignerActive(
+			output.walletStorageKey,
+			output.memberIndex,
+		) {
+			continue
+		}
+		withheld++
+	}
+
+	de.metricsRecorder.SetGauge(
+		clientinfo.MetricParticipationQuarantinedTBTCSigners,
+		float64(withheld),
+	)
 }
 
 func (de *dkgExecutor) recordPermitTerminalOutcome(

@@ -10,9 +10,11 @@ import (
 	"math/big"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/keep-network/keep-common/pkg/persistence"
 	"github.com/keep-network/keep-core/internal/testutils"
 	"github.com/keep-network/keep-core/pkg/bitcoin"
 	"github.com/keep-network/keep-core/pkg/chain"
@@ -373,6 +375,361 @@ func setupPreserveScenario(t *testing.T) (
 	}
 
 	return de, result, gsr, registryHandle, quarantineHandle
+}
+
+// preserveOneSigner quarantines the signer the preserve scenario generates for
+// the given seat and returns the wallet directory it was written under.
+func preserveOneSigner(
+	t *testing.T,
+	de *dkgExecutor,
+	result *dkg.Result,
+	gsr *GroupSelectionResult,
+	memberIndex group.MemberIndex,
+) string {
+	t.Helper()
+
+	de.preserveInterruptedSigner(
+		logger.With(),
+		newTestPermit(participation.TBTCDKG),
+		big.NewInt(1),
+		result,
+		memberIndex,
+		gsr,
+		"tbtc_dkg_signer_activation",
+		fmt.Errorf("activation refused"),
+	)
+
+	return getWalletStorageKey(result.PrivateKeyShare.PublicKey())
+}
+
+// TestDkgExecutor_ReportQuarantinedSigners_CountsOutputsNotRecords proves the
+// reported count is of preserved signer outputs, not of the records preservation
+// writes: each output is stored as a membership beside its audit metadata, and
+// counting both would report every quarantined share twice.
+func TestDkgExecutor_ReportQuarantinedSigners_CountsOutputsNotRecords(t *testing.T) {
+	de, result, gsr, _, quarantineHandle := setupPreserveScenario(t)
+
+	recorder := newDispatchGaugeRecorder()
+	de.metricsRecorder = recorder
+
+	preserveOneSigner(t, de, result, gsr, group.MemberIndex(1))
+
+	testutils.AssertIntsEqual(
+		t,
+		"records written for one preserved output",
+		2,
+		len(quarantineHandle.saved),
+	)
+	testutils.AssertIntsEqual(
+		t,
+		"reported quarantined signers",
+		1,
+		int(recorder.gauge(
+			clientinfo.MetricParticipationQuarantinedTBTCSigners,
+		)),
+	)
+}
+
+// TestDkgExecutor_ReportQuarantinedSigners_ExcludesActivatedSeat proves an
+// output whose seat this process has activated stops being counted. The metric
+// is of preserved material a rollback still has to account for, and a share the
+// running node holds active is accounted for by the wallet cache itself.
+func TestDkgExecutor_ReportQuarantinedSigners_ExcludesActivatedSeat(t *testing.T) {
+	de, result, gsr, _, _ := setupPreserveScenario(t)
+
+	recorder := newDispatchGaugeRecorder()
+	de.metricsRecorder = recorder
+
+	walletStorageKey := preserveOneSigner(t, de, result, gsr, group.MemberIndex(1))
+
+	testutils.AssertIntsEqual(
+		t,
+		"reported quarantined signers before activation",
+		1,
+		int(recorder.gauge(
+			clientinfo.MetricParticipationQuarantinedTBTCSigners,
+		)),
+	)
+
+	// The same wallet and the same seat, now activated from the active
+	// namespace — the state a restart that adopted the share would be in.
+	signer, err := de.buildFinalSigner(
+		result,
+		group.MemberIndex(1),
+		gsr.OperatorsAddresses,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := de.walletRegistry.registerSigner(signer); err != nil {
+		t.Fatal(err)
+	}
+	testutils.AssertBoolsEqual(
+		t,
+		"the preserved seat reads as active",
+		true,
+		de.walletRegistry.isSignerActive(
+			walletStorageKey,
+			group.MemberIndex(1),
+		),
+	)
+
+	de.reportQuarantinedSigners(logger.With())
+
+	testutils.AssertIntsEqual(
+		t,
+		"reported quarantined signers after activation",
+		0,
+		int(recorder.gauge(
+			clientinfo.MetricParticipationQuarantinedTBTCSigners,
+		)),
+	)
+}
+
+// TestDkgExecutor_ReportQuarantinedSigners_KeepsCountOnUnreadableNamespace
+// proves a namespace that cannot be enumerated leaves the last published count
+// standing. Publishing zero there would report an empty quarantine, which is
+// precisely what could not be established, and it is the one answer that reads
+// as nothing left to account for.
+func TestDkgExecutor_ReportQuarantinedSigners_KeepsCountOnUnreadableNamespace(
+	t *testing.T,
+) {
+	de, result, gsr, _, _ := setupPreserveScenario(t)
+
+	recorder := newDispatchGaugeRecorder()
+	de.metricsRecorder = recorder
+
+	preserveOneSigner(t, de, result, gsr, group.MemberIndex(1))
+
+	testutils.AssertIntsEqual(
+		t,
+		"reported quarantined signers before the namespace fails",
+		1,
+		int(recorder.gauge(
+			clientinfo.MetricParticipationQuarantinedTBTCSigners,
+		)),
+	)
+
+	de.signerQuarantine = newSignerQuarantine(
+		logger,
+		&unreadableHandle{},
+	)
+
+	de.reportQuarantinedSigners(logger.With())
+
+	testutils.AssertIntsEqual(
+		t,
+		"reported quarantined signers after the namespace fails",
+		1,
+		int(recorder.gauge(
+			clientinfo.MetricParticipationQuarantinedTBTCSigners,
+		)),
+	)
+}
+
+// TestDkgExecutor_ReportQuarantinedSigners_SerializesRecountAndPublication
+// proves no two reporters recount the namespace at the same time, and that
+// concurrent reporters agree on what they publish.
+//
+// Members of one ceremony quarantine independently, so reports can be raised
+// concurrently. Interleaved scans do not corrupt anything — every piece of state
+// they touch is individually guarded — but they can publish out of order and
+// leave an earlier, smaller scan's count as the last word, which is the
+// direction that reads as an all-clear. Serializing the scan with its
+// publication is what rules that out, so the enumeration itself is what this
+// watches: a scan that begins while another is open is the interleaving.
+func TestDkgExecutor_ReportQuarantinedSigners_SerializesRecountAndPublication(
+	t *testing.T,
+) {
+	de, result, gsr, _, quarantineHandle := setupPreserveScenario(t)
+
+	recorder := newDispatchGaugeRecorder()
+	de.metricsRecorder = recorder
+
+	preserveOneSigner(t, de, result, gsr, group.MemberIndex(1))
+	preserveOneSigner(t, de, result, gsr, group.MemberIndex(2))
+
+	// The same records, behind a namespace that holds every enumeration open
+	// until released and reports how many were ever open at once.
+	tracking := &scanTrackingHandle{
+		mockPersistenceHandle: *quarantineHandle,
+		entered:               make(chan struct{}, reporterCount),
+		release:               make(chan struct{}),
+	}
+	de.signerQuarantine = newSignerQuarantine(logger, tracking)
+
+	var wg sync.WaitGroup
+	for range reporterCount {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			de.reportQuarantinedSigners(logger.With())
+		}()
+	}
+
+	// One reporter is inside its enumeration; the wait then gives every other
+	// reporter time to reach its own before any of them can finish. Reporters
+	// that recount one at a time cannot join it there however long they are
+	// given, so this bound decides how much evidence of interleaving the test
+	// collects, never whether a serialized implementation passes.
+	<-tracking.entered
+	time.Sleep(100 * time.Millisecond)
+	close(tracking.release)
+	wg.Wait()
+
+	testutils.AssertIntsEqual(
+		t,
+		"greatest number of enumerations open at once",
+		1,
+		int(tracking.peak.Load()),
+	)
+	testutils.AssertIntsEqual(
+		t,
+		"reported quarantined signers after concurrent reports",
+		2,
+		int(recorder.gauge(
+			clientinfo.MetricParticipationQuarantinedTBTCSigners,
+		)),
+	)
+}
+
+// reporterCount is how many concurrent reporters the serialization test raises.
+const reporterCount = 4
+
+// scanTrackingHandle is a protected namespace that holds every enumeration open
+// until released and records the greatest number that were open at once.
+type scanTrackingHandle struct {
+	mockPersistenceHandle
+
+	entered  chan struct{}
+	release  chan struct{}
+	inFlight atomic.Int32
+	peak     atomic.Int32
+}
+
+func (h *scanTrackingHandle) ReadAll() (
+	<-chan persistence.DataDescriptor,
+	<-chan error,
+) {
+	descriptors := make(chan persistence.DataDescriptor)
+	errs := make(chan error)
+
+	open := h.inFlight.Add(1)
+	for {
+		peak := h.peak.Load()
+		if open <= peak || h.peak.CompareAndSwap(peak, open) {
+			break
+		}
+	}
+
+	select {
+	case h.entered <- struct{}{}:
+	default:
+	}
+
+	go func() {
+		defer close(descriptors)
+		defer close(errs)
+		defer h.inFlight.Add(-1)
+
+		<-h.release
+
+		for _, descriptor := range h.saved {
+			descriptors <- descriptor
+		}
+	}()
+
+	return descriptors, errs
+}
+
+// TestSignerQuarantine_PreservedOutputs_CountsMembershipsOnly proves only the
+// membership records are read as signer outputs. The namespace also holds the
+// audit metadata, and a later schema or an operator may leave other names
+// there; none of them is a preserved share.
+func TestSignerQuarantine_PreservedOutputs_CountsMembershipsOnly(t *testing.T) {
+	handle := &mockPersistenceHandle{}
+	quarantine := newSignerQuarantine(logger, handle)
+
+	for _, name := range []string{
+		"/membership_1",
+		"/metadata_1",
+		"/membership_17",
+		"/metadata_17",
+		// Not signer outputs: seat zero is no seat, an unparsable seat names
+		// none, and neither a later schema's record nor a stray file is a share.
+		"/membership_0",
+		"/membership_two",
+		"/attestation_1",
+		"/notes.txt",
+	} {
+		if err := handle.Save([]byte("x"), "wallet", name); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	outputs, err := quarantine.preservedOutputs()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	testutils.AssertIntsEqual(t, "preserved outputs", 2, len(outputs))
+
+	seats := make(map[group.MemberIndex]string)
+	for _, output := range outputs {
+		seats[output.memberIndex] = output.walletStorageKey
+	}
+	for _, seat := range []group.MemberIndex{1, 17} {
+		directory, found := seats[seat]
+		if !found {
+			t.Errorf("seat [%v] was not read as a preserved output", seat)
+			continue
+		}
+		testutils.AssertStringsEqual(
+			t,
+			fmt.Sprintf("wallet directory of seat [%v]", seat),
+			"wallet",
+			directory,
+		)
+	}
+}
+
+// TestSignerQuarantine_PreservedOutputs_FailsOnUnreadableNamespace proves an
+// enumeration error is returned rather than absorbed into a shorter list: a
+// truncated count of preserved material is indistinguishable from an accurate
+// low one.
+func TestSignerQuarantine_PreservedOutputs_FailsOnUnreadableNamespace(t *testing.T) {
+	quarantine := newSignerQuarantine(logger, &unreadableHandle{})
+
+	outputs, err := quarantine.preservedOutputs()
+	if err == nil {
+		t.Fatalf("expected an error, got [%d] outputs", len(outputs))
+	}
+	if outputs != nil {
+		t.Errorf("expected no outputs beside the error, got [%v]", outputs)
+	}
+	if !strings.Contains(err.Error(), "unreadable") {
+		t.Errorf("expected the underlying read error, got [%v]", err)
+	}
+}
+
+// unreadableHandle is a protected namespace whose enumeration fails, as a disk
+// namespace does when its directory cannot be read.
+type unreadableHandle struct {
+	mockPersistenceHandle
+}
+
+func (h *unreadableHandle) ReadAll() (
+	<-chan persistence.DataDescriptor,
+	<-chan error,
+) {
+	descriptors := make(chan persistence.DataDescriptor)
+	errs := make(chan error, 1)
+
+	errs <- fmt.Errorf("the quarantine directory is unreadable")
+	close(descriptors)
+	close(errs)
+
+	return descriptors, errs
 }
 
 // TestHeartbeatAction_PenaltySuppressedByFence proves a refused penalty

@@ -3645,7 +3645,16 @@ metric_value() {
     '
 }
 
-# The gate metrics an evidence step snapshots, by their internal names.
+# The participation metrics an evidence step snapshots, by their internal names.
+#
+# All but the last are the gate's own, registered at zero when it is constructed,
+# so a node running any gated application exposes them from the start. The
+# quarantined-signer count is published by tBTC instead — the protected namespace
+# it counts and the wallet cache it compares against are both owned there — so a
+# service running no tBTC legitimately exposes it at no point. That is why a
+# metric this list names and a node does not answer for is skipped rather than
+# treated as a fleet reporting zero, and why only reading none of them at all is
+# read as a broken instrument.
 PARTICIPATION_METRICS=(
   participation_gate_state
   participation_current_block
@@ -3663,6 +3672,7 @@ PARTICIPATION_METRICS=(
   participation_clock_aborts_total
   participation_quiesce_total
   participation_quiesce_forced_aborts_total
+  participation_quarantined_tbtc_signers
 )
 
 # The announcer's own account of a cross-format sighting, which is a different
