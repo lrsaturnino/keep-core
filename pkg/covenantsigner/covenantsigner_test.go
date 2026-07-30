@@ -4043,7 +4043,7 @@ func TestServiceAcceptsSignerApprovalCertificateWithEndBlockAboveUint32Range(t *
 	request := structuredSignerApprovalRequest(TemplateSelfV1)
 	request.SignerApproval.EndBlock = &endBlock
 
-	normalized, err := normalizeSignerApprovalCertificate(request)
+	normalized, err := normalizeSignerApprovalCertificate(request, testEIP712ChainID, testEIP712Salt)
 	if err != nil {
 		t.Fatalf("expected EndBlock above math.MaxUint32 to normalize, got %v", err)
 	}
@@ -4791,7 +4791,7 @@ func TestNormalizeSignerApprovalCertificateRejectsV1CertificateVersion(t *testin
 	request := structuredSignerApprovalRequest(TemplateSelfV1)
 	request.SignerApproval.CertificateVersion = 1
 
-	_, err := normalizeSignerApprovalCertificate(request)
+	_, err := normalizeSignerApprovalCertificate(request, testEIP712ChainID, testEIP712Salt)
 	if err == nil || !strings.Contains(err.Error(), "request.signerApproval.certificateVersion must equal 2") {
 		t.Fatalf("expected v1 certificate version rejection, got %v", err)
 	}

@@ -42,7 +42,7 @@ func newCovenantActionScaffold(t *testing.T) covenantActionScaffold {
 
 	service, err := covenantsigner.NewService(
 		newCovenantSignerMemoryHandle(),
-		newCovenantSignerEngine(node, 0, testEIP712ChainID, testEIP712Salt),
+		newCovenantSignerEngine(node, 0, true, testEIP712ChainID, testEIP712Salt),
 	)
 	if err != nil {
 		t.Fatal(err)

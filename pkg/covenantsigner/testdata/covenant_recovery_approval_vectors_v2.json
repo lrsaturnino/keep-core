@@ -3,12 +3,11 @@
   "scope": "covenant_recovery_approval_contract_v2",
   "vectors": {
     "qc_v1": {
-      "expectedApprovalDigest": "0xb6fca0f533f54f4918502215bd82d10d06a073ca6c7c0f869cc90fb43ad0e602",
       "canonicalSubmitRequest": {
         "facadeRequestId": "rf_vector_qc_v1",
         "idempotencyKey": "idem-qc-vector-v1",
-        "route": "qc_v1",
         "requestType": "reconstruct",
+        "route": "qc_v1",
         "strategy": "0x1111111111111111111111111111111111111111",
         "reserve": "0x2222222222222222222222222222222222222222",
         "epoch": 12,
@@ -99,15 +98,15 @@
           "custodianRequired": true
         }
       },
-      "expectedRequestDigest": "0x0c5e6fefa41a925fc9d14f45c1e8bb8249727bf0314ce4a60539bae4847e64f7"
+      "expectedApprovalDigest": "0xb6fca0f533f54f4918502215bd82d10d06a073ca6c7c0f869cc90fb43ad0e602",
+      "expectedRequestDigest": "0x70eba111184d4eb43a2eb9ca7a6c4219eca4a13fe63d41fce5b4e45c894953c4"
     },
     "self_v1": {
-      "expectedApprovalDigest": "0x76d32f60185526f68eb132094599ddaae8d592efc4eff0f2d008c5386350041d",
       "canonicalSubmitRequest": {
         "facadeRequestId": "rf_vector_self_v1",
         "idempotencyKey": "idem-self-vector-v1",
-        "route": "self_v1",
         "requestType": "reconstruct",
+        "route": "self_v1",
         "strategy": "0x1111111111111111111111111111111111111111",
         "reserve": "0x2222222222222222222222222222222222222222",
         "epoch": 12,
@@ -191,15 +190,15 @@
           "custodianRequired": false
         }
       },
-      "expectedRequestDigest": "0x806b7f88c3fb9d904227b42184ae1c033a19b023336c010980705cdf66bb0025"
+      "expectedApprovalDigest": "0x76d32f60185526f68eb132094599ddaae8d592efc4eff0f2d008c5386350041d",
+      "expectedRequestDigest": "0x0e043ce0fdead8dce09a75014558e12e1416c1386100b79a5bdbe227b2e1ddbc"
     },
     "self_v1_presign": {
-      "expectedApprovalDigest": "0x76d32f60185526f68eb132094599ddaae8d592efc4eff0f2d008c5386350041d",
       "canonicalSubmitRequest": {
         "facadeRequestId": "rf_vector_self_v1_presign",
         "idempotencyKey": "idem-self-presign-vector-v1",
-        "route": "self_v1",
         "requestType": "presign_self_v1",
+        "route": "self_v1",
         "strategy": "0x1111111111111111111111111111111111111111",
         "reserve": "0x2222222222222222222222222222222222222222",
         "epoch": 12,
@@ -283,7 +282,8 @@
           "custodianRequired": false
         }
       },
-      "expectedRequestDigest": "0x2485bbf5d1cf6c8a6b01b678dd509de2422532a769fbede7cb4d7b77874a9226"
+      "expectedApprovalDigest": "0x76d32f60185526f68eb132094599ddaae8d592efc4eff0f2d008c5386350041d",
+      "expectedRequestDigest": "0x2fd19995dcccf23591dc1340fb0dc3735255ed7d0876ea76236e7473cbc344c0"
     }
   }
 }
