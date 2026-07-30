@@ -3924,8 +3924,16 @@ TERMINAL_OUTCOME_JS='
       // record for one of these ceremonies without a transcript is the case
       // this reader has to refuse: it reads exactly like a ceremony that
       // authored one and leaves the population to whoever wrote the report.
+      //
+      // Both halves of the mirror matter, which is why a self-test holds this
+      // list to the one the gate keeps. A ceremony missing here is read the
+      // wrong way twice over: the record it publishes is refused as a
+      // transcript it cannot observe, taking the whole snapshot with it, and
+      // the record it omits passes as a completion nothing asked a population
+      // of.
       const TRANSCRIPT_CEREMONIES = [
         "tbtc_dkg", "tbtc_signing", "tbtc_heartbeat",
+        "beacon_dkg", "beacon_relay_signing",
       ];
       // The evidence kinds that name a persisted DKG membership. The gate
       // requires the membership index on exactly these and forbids it

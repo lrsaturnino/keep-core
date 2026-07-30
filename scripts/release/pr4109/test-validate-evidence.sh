@@ -1185,12 +1185,23 @@ gate_state_with_outcomes() {
 }
 
 # One closed-permit record as the gate serves it. The evidence defaults to the
-# class a relay signing's result actually lives in, so a case that is about
-# something else can vary one field and leave the rest a record the gate would
-# really have written.
+# class a relay signing's result actually lives in, and to a population behind
+# it, because a relay signing is one of the ceremonies whose completed record the
+# gate refuses without one — so a case that is about something else can vary one
+# field and leave the rest a record the gate would really have written.
 closed_permit() {
   local outcome="$1" work="$2" permit="$3" bound="${4:-true}"
-  local evidence="${5-\"kind\":\"protocol_result\",\"reference\":\"0xentry\"}"
+  # Built rather than defaulted in place: an object brace inside a
+  # ${5-...} default ends the expansion where it sits, which appends the rest of
+  # the default to every case that passes its own evidence.
+  local evidence
+  if (($# >= 5)); then
+    evidence="$5"
+  else
+    evidence='"kind":"protocol_result","reference":"0xentry",'
+    evidence="${evidence}"'"contribution":{"incorporated_members":[1,7],'
+    evidence="${evidence}"'"local_members":[1]}'
+  fi
   local ceremony="${6-beacon_relay_signing}"
   local anchor="${7-10}"
   printf '{"recorded_at":"2026-07-28T00:00:00Z",'
@@ -1221,7 +1232,7 @@ read_terminal_outcomes "$(gate_state_with_outcomes \
   "\"recent_terminal_outcomes\":[$(closed_permit completed w-1 p-1)]")"
 check "a closed permit is rendered with the identity the held list carries" 0 \
   "^r1-node-1@beacon_relay_signing@10@w-1#p-1=completed=protocol_result\
-=0xentry=-=-=-=-$"
+=0xentry=-=1,7=1=-$"
 
 # The gate writes this itself when a permit is closed by an owner that recorded
 # nothing. It has to arrive as a disposition rather than as an absence, because
@@ -1302,14 +1313,39 @@ read_terminal_outcomes "$(gate_state_with_outcomes \
 check "an unresolved permit that also names evidence is refused" 1 \
   "an unresolved permit names terminal evidence"
 
+# The transcript half, on a beacon ceremony. Every gated ceremony that reaches a
+# threshold result publishes the population behind it — the relay from the
+# authenticated shares it combined — and the gate refuses a completed record for
+# one of them that names none. A reader accepting such a record passes on a
+# completion whose population nothing ever asked for, which is the exact record a
+# mixed-release claim cannot be read off; the case above is the same seam from
+# the other side, where a reader whose ceremony list lagged the gate would refuse
+# a relay round that went perfectly and take the whole snapshot with it.
+read_terminal_outcomes "$(gate_state_with_outcomes \
+  "\"recent_terminal_outcomes\":[$(closed_permit completed w-1 p-1 true \
+    '"kind":"protocol_result","reference":"0xentry"')]")"
+check "a beacon completion naming no population is refused" 1 \
+  "names nobody who produced its result"
+
+# A ceremony that authenticates no peers publishes none, and inventing one for it
+# would be the self-attestation the transcript exists to remove.
+read_terminal_outcomes "$(gate_state_with_outcomes \
+  "\"recent_terminal_outcomes\":[$(closed_permit completed w-1 p-1 true \
+    '"kind":"forwarder_closed","contribution":'\
+'{"incorporated_members":[1,7],"local_members":[1]}' \
+    beacon_relay_forwarding)]")"
+check "a forwarder naming a transcript it cannot observe is refused" 1 \
+  "named a transcript it cannot observe"
+
 # A chain side effect the same permit dispatched, which travels beside the
 # result rather than in place of it.
 read_terminal_outcomes "$(gate_state_with_outcomes \
   "\"recent_terminal_outcomes\":[$(closed_permit completed w-1 p-1 true \
     '"kind":"protocol_result","reference":"0xentry",'\
+'"contribution":{"incorporated_members":[1,7],"local_members":[1]},'\
 '"chain_settlement":{"kind":"inactivity_claim","reference":"aabb:7"}')]")"
 check "a dispatched chain settlement is carried with the ending" 0 \
-  "=completed=protocol_result=0xentry=-=-=-=inactivity_claim:aabb:7$"
+  "=completed=protocol_result=0xentry=-=1,7=1=inactivity_claim:aabb:7$"
 
 # The joins. Each is asked about a named population and an account that does or
 # does not answer for it.
@@ -5971,6 +6007,36 @@ else
   printf 'FAIL the refusal-counter list drifted from the gated set: %s\n' \
     "$(diff <(printf '%s\n' "${GO_CEREMONIES}") \
       <(printf '%s\n' "${SHELL_CEREMONIES}") | tr '\n' ' ')"
+  FAILED=$((FAILED + 1))
+fi
+
+# The reader's list of the ceremonies whose owners publish the population behind
+# their result, held to the gate's own for the same reason and with worse
+# consequences on either side of a drift. A ceremony the reader omits publishes a
+# transcript the reader refuses as one it cannot observe, and a refusal there
+# takes the whole snapshot with it, so every verdict reading closed permits
+# blocks on work that went perfectly. A ceremony the reader adds is one whose
+# completion it then demands a population from that the gate never asks for.
+GO_TRANSCRIPT_CEREMONIES="$(sed -n \
+  '/^var transcriptContributionCeremonies/,/^}/p' \
+  "${TEST_DIR}/../../../pkg/protocol/participation/quiescence.go" |
+  grep -oE '^\t[A-Za-z]+:' | tr -d '\t:' |
+  while IFS= read -r ceremony; do
+    grep -oE "\b${ceremony}\s+Ceremony = \"[a-z_]+\"" \
+      "${TEST_DIR}/../../../pkg/protocol/participation/gate.go" |
+      grep -oE '"[a-z_]+"' | tr -d '"'
+  done | sort)"
+READER_TRANSCRIPT_CEREMONIES="$(sed -n \
+  '/const TRANSCRIPT_CEREMONIES = \[/,/\];/p' "${TEST_DIR}/rehearse.sh" |
+  grep -oE '"[a-z_]+"' | tr -d '"' | sort)"
+if [[ -n "${GO_TRANSCRIPT_CEREMONIES}" ]] &&
+  [[ "${GO_TRANSCRIPT_CEREMONIES}" == "${READER_TRANSCRIPT_CEREMONIES}" ]]; then
+  printf 'ok   the transcript-publishing list matches the gate\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL the transcript-publishing list drifted from the gate: %s\n' \
+    "$(diff <(printf '%s\n' "${GO_TRANSCRIPT_CEREMONIES}") \
+      <(printf '%s\n' "${READER_TRANSCRIPT_CEREMONIES}") | tr '\n' ' ')"
   FAILED=$((FAILED + 1))
 fi
 
