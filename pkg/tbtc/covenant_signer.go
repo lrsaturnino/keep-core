@@ -231,11 +231,22 @@ func (cse *covenantSignerEngine) VerifySignerApproval(
 }
 
 // isCovenantSigningEligibleState reports whether a wallet in the given state is
-// eligible to receive covenant signatures. Covenant migrations are only
-// expected for live wallets, so covenant signing fails closed for every other
-// state (including closed and terminated wallets that the closure path intends
-// to deauthorize). If covenant signing must be allowed for another state in the
-// future, add it here explicitly together with justification and tests.
+// eligible to receive covenant signatures. The rule is uniform across every
+// covenant action - migration, redeem, and renew: all three are only expected
+// for live wallets, so covenant signing fails closed for every other state
+// (including closed and terminated wallets that the closure path intends to
+// deauthorize).
+//
+// Redeem and renew are deliberately held to the same live-only rule rather than
+// being widened on the intuition that a cooperative payout should still be
+// possible while a wallet winds down. Nothing in a signer approval certificate
+// binds the wallet's state - the signer set hash covers only wallet identity,
+// members hash, and threshold - so a certificate issued while the wallet was
+// live stays verifiable after closure, and widening any action here makes that
+// certificate replayable against a wallet the protocol already deauthorized.
+// Allowing another action/state pair therefore requires an explicit protocol
+// decision about why certificate reuse past that point is safe; add it here
+// with that justification and matching tests.
 func isCovenantSigningEligibleState(state WalletState) bool {
 	return state == StateLive
 }

@@ -322,3 +322,150 @@ func TestCovenantSignerEngine_SubmitRenewPaysCommittedOutput(t *testing.T) {
 		t.Fatal("renew output script does not match the committed next-covenant script")
 	}
 }
+
+// nonLiveCovenantSigningStates enumerates every wallet state other than
+// StateLive. Listing them explicitly (rather than deriving them) means a newly
+// added WalletState does not silently escape the matrix below: it stays absent
+// until someone decides, and records here, whether covenant signing may occur
+// in it.
+var nonLiveCovenantSigningStates = []WalletState{
+	StateUnknown,
+	StateMovingFunds,
+	StateClosing,
+	StateClosed,
+	StateTerminated,
+}
+
+// approvedRedeemActionRequest returns a REDEEM request that is valid in every
+// respect except, potentially, the wallet's on-chain state.
+func approvedRedeemActionRequest(
+	t *testing.T,
+	s covenantActionScaffold,
+) covenantsigner.RouteSubmitRequest {
+	t.Helper()
+
+	outputScript := payoutScript(t, 0xbb)
+	dest := &covenantsigner.RedeemDestinationReservation{
+		ReservationID:    "crdr_state_matrix",
+		Reserve:          s.reserve,
+		Epoch:            s.epoch,
+		Route:            covenantsigner.ReservationRouteRedeem,
+		Revealer:         s.revealer,
+		Vault:            s.vault,
+		Network:          "regtest",
+		Status:           covenantsigner.ReservationStatusReserved,
+		OutputScript:     "0x" + hex.EncodeToString(outputScript),
+		OutputScriptHash: testDepositScriptHash(t, outputScript),
+		OutputValueSats:  s.destinationValueSats,
+	}
+	dest.DestinationCommitmentHash = testRedeemCommitmentHash(t, dest)
+
+	s.request.Action = covenantsigner.CovenantActionRedeem
+	s.request.RedeemDestination = dest
+	s.request.DestinationCommitmentHash = dest.DestinationCommitmentHash
+
+	applyTestMigrationTransactionPlanCommitment(t, &s.request)
+	applyTestArtifactApprovals(t, s.node, s.walletPublicKey, &s.request, s.depositorPrivateKey, nil)
+
+	return s.request
+}
+
+// approvedRenewActionRequest returns a RENEW request that is valid in every
+// respect except, potentially, the wallet's on-chain state.
+func approvedRenewActionRequest(
+	t *testing.T,
+	s covenantActionScaffold,
+) covenantsigner.RouteSubmitRequest {
+	t.Helper()
+
+	nextScript := payoutScript(t, 0xcc)
+	dest := &covenantsigner.RenewDestinationReservation{
+		ReservationID:          "crnr_state_matrix",
+		Reserve:                s.reserve,
+		Epoch:                  s.epoch,
+		Route:                  covenantsigner.ReservationRouteRenew,
+		Revealer:               s.revealer,
+		Vault:                  s.vault,
+		Network:                "regtest",
+		Status:                 covenantsigner.ReservationStatusReserved,
+		NextCovenantScript:     "0x" + hex.EncodeToString(nextScript),
+		NextCovenantScriptHash: testDepositScriptHash(t, nextScript),
+		NextMaturityHeight:     987654,
+		OutputValueSats:        s.destinationValueSats,
+	}
+	dest.DestinationCommitmentHash = testRenewCommitmentHash(t, dest)
+
+	s.request.Action = covenantsigner.CovenantActionRenew
+	s.request.RenewDestination = dest
+	s.request.DestinationCommitmentHash = dest.DestinationCommitmentHash
+
+	applyTestMigrationTransactionPlanCommitment(t, &s.request)
+	applyTestArtifactApprovals(t, s.node, s.walletPublicKey, &s.request, s.depositorPrivateKey, nil)
+
+	return s.request
+}
+
+// TestCovenantSignerEngine_VerifySignerApprovalWalletStateMatrixForActions pins
+// the action x wallet-state authorization matrix for the cooperative actions.
+// REDEEM and RENEW are held to the same live-only rule as MIGRATION: a signer
+// approval certificate binds wallet identity, members hash, and threshold, but
+// nothing about wallet state, so a certificate issued while the wallet was live
+// would otherwise stay replayable against a wallet the protocol has since
+// deauthorized. Widening any cell here is a protocol decision, and this matrix
+// is what makes such a widening deliberate rather than incidental.
+func TestCovenantSignerEngine_VerifySignerApprovalWalletStateMatrixForActions(t *testing.T) {
+	actions := []struct {
+		name  string
+		build func(*testing.T, covenantActionScaffold) covenantsigner.RouteSubmitRequest
+	}{
+		{"REDEEM", approvedRedeemActionRequest},
+		{"RENEW", approvedRenewActionRequest},
+	}
+
+	for _, action := range actions {
+		t.Run(action.name, func(t *testing.T) {
+			s := newCovenantActionScaffold(t)
+			request := action.build(t, s)
+
+			localChain, ok := s.node.chain.(*localChain)
+			if !ok {
+				t.Fatal("expected local chain implementation")
+			}
+
+			walletPublicKeyHash := bitcoin.PublicKeyHash(s.walletPublicKey)
+			live, err := localChain.GetWallet(walletPublicKeyHash)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			cse := &covenantSignerEngine{node: s.node}
+
+			// Control: while the wallet is live the request is otherwise valid, so
+			// a rejection below is attributable to the wallet state alone.
+			if err := cse.VerifySignerApproval(request); err != nil {
+				t.Fatalf("expected a live wallet to be accepted, got: %v", err)
+			}
+
+			for _, state := range nonLiveCovenantSigningStates {
+				t.Run(state.String(), func(t *testing.T) {
+					mutated := *live
+					mutated.State = state
+					localChain.setWallet(walletPublicKeyHash, &mutated)
+					defer localChain.setWallet(walletPublicKeyHash, live)
+
+					err := cse.VerifySignerApproval(request)
+					if err == nil {
+						t.Fatalf(
+							"expected %s to be rejected for a wallet in state %v",
+							action.name,
+							state,
+						)
+					}
+					if !strings.Contains(err.Error(), "not eligible for covenant signing") {
+						t.Fatalf("unexpected error for state %v: %v", state, err)
+					}
+				})
+			}
+		})
+	}
+}
