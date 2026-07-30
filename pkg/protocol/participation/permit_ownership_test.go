@@ -260,13 +260,116 @@ func TestPermit_TranscriptCannotClaimAnUnoperatedSeat(t *testing.T) {
 	}
 }
 
-// TestPermit_TBTCDKGTranscriptIsNotHeldToItsPermitSeat is the exemption, tested
-// so it cannot be removed by someone who reads the binding above as universal.
+// TestPermit_TBTCDKGTranscriptIsHeldToItsPermitSeatThroughTheMapping asserts the
+// one ceremony whose record is in a different index space than its permit is
+// still bound to it, through the mapping its own transcript carries.
+//
 // A tBTC DKG permit is issued for a DKG member index while its transcript and
 // persisted membership are in the final signing group's index space, rebuilt
-// after inactive and disqualified members are removed — so the same node
-// legitimately runs seat 9 of the ceremony and persists seat 7 of the group.
-func TestPermit_TBTCDKGTranscriptIsNotHeldToItsPermitSeat(t *testing.T) {
+// after the members this node did not see operating are removed — so a node
+// legitimately runs seat 9 of the ceremony and lands in seat 8 of the group.
+// Exempting the ceremony from the binding left the one case that remaps
+// unchecked; comparing the raw numbers would refuse the correct record. The
+// mapping is what makes the comparison mean something, so both the record that
+// agrees with it and the record that does not are asserted here.
+func TestPermit_TBTCDKGTranscriptIsHeldToItsPermitSeatThroughTheMapping(
+	t *testing.T,
+) {
+	// Ten members were selected and member 2 was not seen operating, so the
+	// nine survivors are renumbered 1 through 9 and every seat above the removed
+	// one shifts down by one.
+	surviving := MemberIndexes{1, 3, 4, 5, 6, 7, 8, 9, 10}
+	finalSeats := MemberIndexes{1, 2, 3, 4, 5, 6, 7, 8, 9}
+
+	// DKG seat 9 is the eighth survivor, so it holds final seat 8.
+	tests := map[string]struct {
+		operatedDKGSeat group.MemberIndex
+		accepted        bool
+	}{
+		"the seat the mapping traces the record back to": {
+			operatedDKGSeat: 9,
+			accepted:        true,
+		},
+		// The number the raw comparison would have matched. Reading the two
+		// spaces as one accepts this and attributes final seat 8 to whoever
+		// holds DKG seat 8 — which after the removal is a different node.
+		"the same number in the other index space": {
+			operatedDKGSeat: 8,
+			accepted:        false,
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			const cutover = uint64(1_000)
+			gate, err := newGate(
+				context.Background(),
+				Schedule{CutoverBlock: cutover},
+				newGateBlockCounter(cutover),
+				newFakeMetrics(),
+				inertPollInterval,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(gate.Close)
+
+			permit, err := gate.Begin(
+				TBTCDKG,
+				cutover,
+				PermitIdentity{
+					WorkID:   strings.Repeat("d", 64),
+					PermitID: fmt.Sprint(test.operatedDKGSeat),
+					OperatedMembers: MemberIndexes{
+						test.operatedDKGSeat,
+					},
+				},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer permit.Close()
+
+			err = permit.RecordTerminalOutcome(
+				TerminalOutcomeCompleted,
+				TerminalEvidence{
+					Kind:            TerminalEvidencePersistedTBTCSinger,
+					Reference:       "wallet-storage-key",
+					MembershipIndex: 8,
+					Contribution: &TranscriptContribution{
+						IncorporatedMembers: finalSeats,
+						LocalMembers:        MemberIndexes{8},
+						PermitSpaceMembers:  surviving,
+					},
+				},
+			)
+			if test.accepted && err != nil {
+				t.Fatalf(
+					"a final seat the transcript traces back to this permit's "+
+						"own DKG seat was refused: [%v]",
+					err,
+				)
+			}
+			if !test.accepted {
+				if err == nil {
+					t.Fatal(
+						"a final seat produced by another node's DKG seat was " +
+							"accepted against this permit",
+					)
+				}
+				if !errors.Is(err, ErrInvalidTerminalOutcome) {
+					t.Fatalf("unexpected error: [%v]", err)
+				}
+			}
+		})
+	}
+}
+
+// TestPermit_TBTCDKGTranscriptRequiresItsPermitSpaceMapping asserts the mapping
+// is not optional for the ceremony that needs it. Without it there is nothing to
+// hold the transcript to the permit, and a reader is back to comparing seat
+// numbers from two different index spaces.
+func TestPermit_TBTCDKGTranscriptRequiresItsPermitSpaceMapping(t *testing.T) {
 	const cutover = uint64(1_000)
 	gate, err := newGate(
 		context.Background(),
@@ -284,9 +387,9 @@ func TestPermit_TBTCDKGTranscriptIsNotHeldToItsPermitSeat(t *testing.T) {
 		TBTCDKG,
 		cutover,
 		PermitIdentity{
-			WorkID:          strings.Repeat("d", 64),
-			PermitID:        "9",
-			OperatedMembers: MemberIndexes{9},
+			WorkID:          strings.Repeat("e", 64),
+			PermitID:        "3",
+			OperatedMembers: MemberIndexes{3},
 		},
 	)
 	if err != nil {
@@ -294,23 +397,23 @@ func TestPermit_TBTCDKGTranscriptIsNotHeldToItsPermitSeat(t *testing.T) {
 	}
 	defer permit.Close()
 
-	if err := permit.RecordTerminalOutcome(
+	err = permit.RecordTerminalOutcome(
 		TerminalOutcomeCompleted,
 		TerminalEvidence{
 			Kind:            TerminalEvidencePersistedTBTCSinger,
 			Reference:       "wallet-storage-key",
-			MembershipIndex: 7,
+			MembershipIndex: 3,
 			Contribution: &TranscriptContribution{
-				IncorporatedMembers: MemberIndexes{1, 2, 3, 4, 5, 6, 7},
-				LocalMembers:        MemberIndexes{7},
+				IncorporatedMembers: MemberIndexes{1, 2, 3},
+				LocalMembers:        MemberIndexes{3},
 			},
 		},
-	); err != nil {
-		t.Fatalf(
-			"a final signing group seat was refused against the DKG seat its "+
-				"permit was issued for: [%v]",
-			err,
-		)
+	)
+	if err == nil {
+		t.Fatal("a tBTC DKG transcript was recorded without its mapping")
+	}
+	if !errors.Is(err, ErrInvalidTerminalOutcome) {
+		t.Fatalf("unexpected error: [%v]", err)
 	}
 }
 

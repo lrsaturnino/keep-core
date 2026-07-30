@@ -50,6 +50,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -5482,6 +5483,22 @@ func validateNodeQuiescenceSnapshot(
 				},
 			)...,
 		)
+		// The issuance-time side of the seat ownership statement, checked
+		// against the shape its own ceremony can have. The audit reads it out of
+		// a stopped node's storage rather than watching it being issued, so
+		// nothing has held it to that shape yet.
+		if err := participation.ValidatePermitOperatedShape(
+			permit.Ceremony,
+			permit.PermitID,
+			permit.OperatedMembers,
+		); err != nil {
+			violations = append(violations, fmt.Sprintf(
+				"node-authored gate inventory entry [%d] claims operated "+
+					"memberships its ceremony cannot have: [%v]",
+				i,
+				err,
+			))
+		}
 
 		identity := inventoryIdentity(permit)
 		if firstIndex, duplicate := identities[identity]; duplicate {
@@ -5642,11 +5659,45 @@ func validateNodeTerminalOutcomes(
 		} else {
 			seen[identity] = i
 		}
-		if _, inventoried := inventory[identity]; !inventoried {
+		if inventoryIndex, inventoried := inventory[identity]; !inventoried {
 			violations = append(violations, fmt.Sprintf(
 				"node-authored terminal outcome [%d] has no matching permit "+
 					"in the at-quiescence gate inventory",
 				i,
+			))
+		} else if issued := snapshot.ActivePermits[inventoryIndex]; !slices.Equal(
+			outcome.Permit.OperatedMembers,
+			issued.OperatedMembers,
+		) {
+			// The two sides of the seat ownership statement: the seats the
+			// snapshot recorded this permit holding while it was live, and the
+			// seats the journal record for the same permit carries. Both are
+			// copies of one set fixed at issuance, so a disagreement is an edit
+			// to whichever of them a reader is about to build an ownership map
+			// from, and there is no rule for choosing between them that is not a
+			// guess.
+			violations = append(violations, fmt.Sprintf(
+				"node-authored terminal outcome [%d] claims operated "+
+					"memberships %v, but the at-quiescence gate inventory "+
+					"issued the same permit %v",
+				i,
+				outcome.Permit.OperatedMembers,
+				issued.OperatedMembers,
+			))
+		}
+		// The shape the ceremony can have, reapplied to the journal's own copy.
+		// An inventory entry it agrees with is not enough on its own: the same
+		// edit made to both sides would pass the comparison above.
+		if err := participation.ValidatePermitOperatedShape(
+			outcome.Permit.Ceremony,
+			outcome.Permit.PermitID,
+			outcome.Permit.OperatedMembers,
+		); err != nil {
+			violations = append(violations, fmt.Sprintf(
+				"node-authored terminal outcome [%d] claims operated "+
+					"memberships its ceremony cannot have: [%v]",
+				i,
+				err,
 			))
 		}
 		if outcome.RecordedAt.IsZero() {

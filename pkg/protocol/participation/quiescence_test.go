@@ -334,7 +334,28 @@ func testTranscriptContribution(
 	return &TranscriptContribution{
 		IncorporatedMembers: incorporated,
 		LocalMembers:        []group.MemberIndex{local},
+		PermitSpaceMembers:  testPermitSpaceMembers(ceremony, incorporated),
 	}
+}
+
+// testPermitSpaceMembers renders the mapping from a transcript's seats back to
+// the index space this work's permits were issued in, for the ceremonies that
+// require one, and nil for the ceremonies whose result already speaks in that
+// space.
+//
+// The mapping is the identity so that a fixture naming a persisted membership or
+// a permit's operated seat needs no translating to agree with itself. The tests
+// that mean to exercise a real remapping build their own; see
+// TestPermit_TBTCDKGTranscriptIsHeldToItsPermitSeatThroughTheMapping.
+func testPermitSpaceMembers(
+	ceremony Ceremony,
+	incorporated []group.MemberIndex,
+) MemberIndexes {
+	if _, mapped := permitSpaceMappingCeremonies[ceremony]; !mapped {
+		return nil
+	}
+
+	return slices.Clone(incorporated)
 }
 
 // isBeaconRelayCeremony reports whether a ceremony's permits are issued for an
@@ -1162,6 +1183,10 @@ func TestValidateTerminalOutcome_TranscriptContributionIsRequired(t *testing.T) 
 		evidence.Contribution = &TranscriptContribution{
 			IncorporatedMembers: []group.MemberIndex{1, 2},
 			LocalMembers:        []group.MemberIndex{1},
+			PermitSpaceMembers: testPermitSpaceMembers(
+				ceremony,
+				[]group.MemberIndex{1, 2},
+			),
 		}
 		err = ValidateTerminalOutcome(
 			ceremony,
@@ -1295,6 +1320,10 @@ func TestValidateTerminalOutcome_TranscriptContributionBindsPersistedMembership(
 			Contribution: &TranscriptContribution{
 				IncorporatedMembers: []group.MemberIndex{1, 4, 9},
 				LocalMembers:        []group.MemberIndex{local},
+				PermitSpaceMembers: testPermitSpaceMembers(
+					TBTCDKG,
+					[]group.MemberIndex{1, 4, 9},
+				),
 			},
 		}
 	}

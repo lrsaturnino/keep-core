@@ -22,7 +22,14 @@ import (
 const (
 	// QuiescenceSnapshotSchemaVersion is the schema of the node-authored gate
 	// snapshot persisted at the quiescence transition.
-	QuiescenceSnapshotSchemaVersion = uint32(1)
+	//
+	// Version 2 added the memberships each live permit's holder operates. The
+	// snapshot is the issuance-time side of that statement and the journal is
+	// the terminal side, so an audit that reconciles the two needs the field in
+	// both: a version 1 snapshot carries no operated seats at all, leaving the
+	// journal's own account of them the only account, which is exactly the
+	// unreconciled single-sided claim the field was added to remove.
+	QuiescenceSnapshotSchemaVersion = uint32(2)
 
 	// QuiescenceSnapshotStorageDirectory and
 	// QuiescenceSnapshotStorageFile identify the record inside the encrypted
@@ -56,7 +63,15 @@ const (
 	// as a seat the node never operated. The distinction matters most where the
 	// inference is least visible: a fleet-wide ownership map missing those seats
 	// attributes them to whoever else was on the network.
-	TerminalOutcomeJournalSchemaVersion = uint32(5)
+	//
+	// Version 6 added the mapping from a transcript's seats back to the index
+	// space the permits for the same work were issued in. A version 5 journal
+	// records a tBTC DKG transcript in the final signing group's space beside
+	// permits in the ceremony's, with nothing to line the two up, so a reader
+	// joining them either compares raw numbers from different spaces or gives
+	// up on the join — and the first of those silently attributes a remapped
+	// seat to whichever party happens to hold that number in the other space.
+	TerminalOutcomeJournalSchemaVersion = uint32(6)
 
 	// TerminalOutcomeJournalStorageFile identifies the terminal-outcome
 	// journal beside the immutable gate snapshot. Both records are encrypted
@@ -160,10 +175,7 @@ func validatePermitIdentity(identity PermitIdentity) error {
 		}
 	}
 
-	return validateMemberIndexSet(
-		"operated memberships",
-		identity.OperatedMembers,
-	)
+	return nil
 }
 
 // validatePermitIdentityForCeremony applies the identity shape that is
@@ -207,17 +219,49 @@ func validatePermitIdentityForCeremony(
 				group.MaxMemberIndex,
 			)
 		}
+	}
+
+	return ValidatePermitOperatedShape(
+		ceremony,
+		identity.PermitID,
+		identity.OperatedMembers,
+	)
+}
+
+// ValidatePermitOperatedShape checks that a permit's operated seats are the
+// shape its ceremony can have, given the permit they belong to.
+//
+// It is exported because the operated set is what a fleet-wide seat ownership
+// map is built from, and the offline audit reads that set out of a stopped
+// node's own records rather than watching it being issued. Nothing else in a
+// snapshot constrains it: a record whose operated seats were widened after the
+// fact still names a real ceremony, a real permit, and a real outcome, and would
+// enter an ownership map claiming seats no permit was ever issued to run.
+func ValidatePermitOperatedShape(
+	ceremony Ceremony,
+	permitID string,
+	operatedMembers MemberIndexes,
+) error {
+	if err := validateMemberIndexSet(
+		"operated memberships",
+		operatedMembers,
+	); err != nil {
+		return err
+	}
+
+	switch ceremony {
+	case TBTCDKG, BeaconDKG, BeaconRelaySigning:
 		// The permit already names the one seat it was issued for, so the
 		// operated set is not free to say anything else. Two node-authored
 		// statements about the same permit that disagree would leave a reader
 		// choosing between them, and either choice is an inference.
-		if len(identity.OperatedMembers) != 1 ||
-			uint64(identity.OperatedMembers[0]) != memberIndex {
+		if len(operatedMembers) != 1 ||
+			fmt.Sprint(operatedMembers[0]) != permitID {
 			return fmt.Errorf(
 				"ceremony [%s] runs one seat per permit, so its operated "+
 					"memberships must be exactly its permit ID [%s]",
 				ceremony,
-				identity.PermitID,
+				permitID,
 			)
 		}
 	case BeaconRelayForwarding, BeaconTimeoutReport:
@@ -226,7 +270,7 @@ func validatePermitIdentityForCeremony(
 		// filing. A seat claimed here would enter the fleet's ownership map as
 		// operated by this node without any membership behind it, which is the
 		// self-attestation the map exists to keep out.
-		if len(identity.OperatedMembers) != 0 {
+		if len(operatedMembers) != 0 {
 			return fmt.Errorf(
 				"ceremony [%s] operates no membership, so it must claim none",
 				ceremony,
@@ -396,6 +440,32 @@ type TranscriptContribution struct {
 	// to record the result would leave the permit unresolved over work that
 	// demonstrably concluded.
 	LocalMembers MemberIndexes `json:"local_members"`
+	// PermitSpaceMembers is the ceremony membership behind each entry of
+	// IncorporatedMembers, in the index space the permits for this work were
+	// issued in, positionally aligned with IncorporatedMembers and therefore
+	// exactly as long.
+	//
+	// It is present only for the ceremonies whose result is recorded in a
+	// different index space than their permits — see
+	// permitSpaceMappingCeremonies — and absent everywhere else, where the two
+	// spaces are the same and a mapping would be a second answer to a question
+	// that already has one.
+	//
+	// It exists because a transcript is useless to a reader that cannot say
+	// which node sat in the seats it names. tBTC DKG rebuilds its group after
+	// removing the members it did not see operating, so a node runs seat 9 of
+	// the ceremony and lands in seat 7 of the group, and the permits — issued
+	// before the result exists, hence in the ceremony's space — cannot be held
+	// against the transcript without this. Reading the two spaces as one is
+	// worse than having neither: with a middle member removed, every final seat
+	// shifts down and a reader comparing the raw numbers attributes seats to
+	// parties that never held them.
+	//
+	// The mapping is the accepted result's own: the ascending members this node
+	// authenticated through every round, which is what the final group was
+	// built from. It is checked against the author's own permit at record time,
+	// so a node cannot use it to move its own seat.
+	PermitSpaceMembers MemberIndexes `json:"permit_space_members,omitempty"`
 }
 
 // MemberIndexes is a set of ceremony member indexes in a record that leaves the
@@ -457,7 +527,8 @@ func (c *TranscriptContribution) Equal(other *TranscriptContribution) bool {
 	}
 
 	return slices.Equal(c.IncorporatedMembers, other.IncorporatedMembers) &&
-		slices.Equal(c.LocalMembers, other.LocalMembers)
+		slices.Equal(c.LocalMembers, other.LocalMembers) &&
+		slices.Equal(c.PermitSpaceMembers, other.PermitSpaceMembers)
 }
 
 // Equal reports whether two evidence records describe the same durable result.
@@ -1303,31 +1374,99 @@ func validateTranscriptContribution(
 		)
 	}
 
+	_, mapped := permitSpaceMappingCeremonies[ceremony]
+	if !mapped {
+		if len(contribution.PermitSpaceMembers) != 0 {
+			return fmt.Errorf(
+				"ceremony [%s] records its result in the index space its "+
+					"permits were issued in, so its transcript must not map "+
+					"between spaces",
+				ceremony,
+			)
+		}
+
+		return nil
+	}
+	if len(contribution.PermitSpaceMembers) == 0 {
+		return fmt.Errorf(
+			"ceremony [%s] records its result in a different index space than "+
+				"its permits, so its transcript requires the membership behind "+
+				"each incorporated seat",
+			ceremony,
+		)
+	}
+	if err := validateMemberIndexSet(
+		"permit-space memberships",
+		contribution.PermitSpaceMembers,
+	); err != nil {
+		return err
+	}
+	// Positional alignment is the whole encoding of the mapping, so a length
+	// disagreement leaves every seat past the shorter list unmapped and the
+	// ones before it unverifiable.
+	if len(contribution.PermitSpaceMembers) !=
+		len(contribution.IncorporatedMembers) {
+		return fmt.Errorf(
+			"the transcript names %d incorporated memberships but maps %d of "+
+				"them back to the permits' index space",
+			len(contribution.IncorporatedMembers),
+			len(contribution.PermitSpaceMembers),
+		)
+	}
+
 	return nil
 }
 
-// permitSeatSpaceCeremonies names the ceremonies whose terminal record speaks
-// in the same membership index space its permit was issued in, and whose seats
-// may therefore be held against the permit's operated set.
+// PermitSpaceMember translates one membership of a mapped transcript into the
+// index space this work's permits were issued in. It reports false when the
+// transcript does not name that membership, and it is the identity translation
+// for the ceremonies whose result already speaks in the permits' space.
 //
-// tBTC DKG is deliberately absent. Its permit is issued for a DKG member index
-// while its transcript and persisted membership are in the final signing
-// group's index space, which is rebuilt after inactive and disqualified members
-// are removed — so the same node legitimately operates seat 9 of the ceremony
-// and persists seat 7 of the group. Comparing across the two would refuse
-// correct records and, worse, would teach a reader that the numbers mean the
-// same thing.
-var permitSeatSpaceCeremonies = map[Ceremony]struct{}{
-	// The beacon group index is the DKG index: no membership is removed
-	// between the ceremony and the persisted signer.
-	BeaconDKG: {},
-	// Issued per local membership of an existing group, and the entry shares
-	// are combined in that same group's index space.
-	BeaconRelaySigning: {},
-	// A wallet action's permit covers this node's seats in the wallet's
-	// signing group, which is the space its done checks are counted in.
-	TBTCSigning:   {},
-	TBTCHeartbeat: {},
+// It exists so that every reader joining a transcript to a permit — the gate at
+// record time, the offline audit, the fleet ownership map a rehearsal builds —
+// performs the translation the same way rather than each re-deriving it from the
+// positional convention.
+func PermitSpaceMember(
+	ceremony Ceremony,
+	contribution *TranscriptContribution,
+	member group.MemberIndex,
+) (group.MemberIndex, bool) {
+	if _, mapped := permitSpaceMappingCeremonies[ceremony]; !mapped {
+		return member, true
+	}
+	if contribution == nil {
+		return 0, false
+	}
+
+	for position, incorporated := range contribution.IncorporatedMembers {
+		if incorporated != member {
+			continue
+		}
+		if position >= len(contribution.PermitSpaceMembers) {
+			return 0, false
+		}
+		return contribution.PermitSpaceMembers[position], true
+	}
+
+	return 0, false
+}
+
+// permitSpaceMappingCeremonies names the ceremonies whose terminal record
+// speaks in a different membership index space than the permits issued for the
+// same work, and whose transcript therefore has to carry the mapping between
+// the two.
+//
+// tBTC DKG is the only one. Its permit is issued for a DKG member index while
+// its transcript and persisted membership are in the final signing group's
+// index space, which is rebuilt after inactive and disqualified members are
+// removed — so the same node legitimately operates seat 9 of the ceremony and
+// persists seat 7 of the group. Every other ceremony records its result in the
+// space its permits name: the beacon removes no membership between DKG and the
+// persisted signer, beacon relay shares are combined in the existing group's
+// space, and a wallet action's permit covers this node's seats in the very
+// signing group its done checks are counted in.
+var permitSpaceMappingCeremonies = map[Ceremony]struct{}{
+	TBTCDKG: {},
 }
 
 // ValidatePermitOperatedOwnership checks that a terminal record claims no seat
@@ -1342,8 +1481,11 @@ var permitSeatSpaceCeremonies = map[Ceremony]struct{}{
 // are the seats it announced it was operating, and the two accounts could be
 // used against each other.
 //
-// Only the ceremonies whose record shares its permit's index space are checked;
-// see permitSeatSpaceCeremonies for why tBTC DKG cannot be.
+// Records whose index space differs from their permits' are compared through the
+// transcript's own mapping rather than exempted from comparison. Exempting them
+// left the load-bearing statement unchecked for the one ceremony that remaps,
+// and a reader translating with the mapping needs to know the author could not
+// have used it to move its own seat.
 func ValidatePermitOperatedOwnership(
 	ceremony Ceremony,
 	operatedMembers MemberIndexes,
@@ -1356,24 +1498,72 @@ func ValidatePermitOperatedOwnership(
 	); err != nil {
 		return err
 	}
-	if _, comparable := permitSeatSpaceCeremonies[ceremony]; !comparable {
-		return nil
-	}
 
-	if evidence.MembershipIndex != 0 &&
-		!slices.Contains(operatedMembers, evidence.MembershipIndex) {
-		return fmt.Errorf(
-			"membership index [%d] is not among the memberships [%v] this "+
-				"permit was issued to operate",
+	_, mapped := permitSpaceMappingCeremonies[ceremony]
+	if evidence.MembershipIndex != 0 {
+		// The persisted membership is in the record's own space, so for a
+		// remapping ceremony it is the transcript that says which ceremony seat
+		// produced it.
+		persisted, translated := PermitSpaceMember(
+			ceremony,
+			evidence.Contribution,
 			evidence.MembershipIndex,
-			operatedMembers,
 		)
+		if !translated {
+			return fmt.Errorf(
+				"membership index [%d] cannot be traced back to a membership "+
+					"this permit could have operated",
+				evidence.MembershipIndex,
+			)
+		}
+		if !slices.Contains(operatedMembers, persisted) {
+			if mapped {
+				return fmt.Errorf(
+					"membership index [%d] was produced by membership [%d], "+
+						"which is not among the memberships [%v] this permit "+
+						"was issued to operate",
+					evidence.MembershipIndex,
+					persisted,
+					operatedMembers,
+				)
+			}
+			return fmt.Errorf(
+				"membership index [%d] is not among the memberships [%v] this "+
+					"permit was issued to operate",
+				evidence.MembershipIndex,
+				operatedMembers,
+			)
+		}
 	}
 	if evidence.Contribution == nil {
 		return nil
 	}
 	for _, local := range evidence.Contribution.LocalMembers {
-		if !slices.Contains(operatedMembers, local) {
+		operated, translated := PermitSpaceMember(
+			ceremony,
+			evidence.Contribution,
+			local,
+		)
+		if !translated {
+			return fmt.Errorf(
+				"outcome [%s] claims membership [%d] in its transcript without "+
+					"saying which membership produced it",
+				outcome,
+				local,
+			)
+		}
+		if !slices.Contains(operatedMembers, operated) {
+			if mapped {
+				return fmt.Errorf(
+					"outcome [%s] claims membership [%d] in its transcript, "+
+						"produced by membership [%d], which is not among the "+
+						"memberships [%v] this permit was issued to operate",
+					outcome,
+					local,
+					operated,
+					operatedMembers,
+				)
+			}
 			return fmt.Errorf(
 				"outcome [%s] claims membership [%d] in its transcript, which "+
 					"is not among the memberships [%v] this permit was issued "+

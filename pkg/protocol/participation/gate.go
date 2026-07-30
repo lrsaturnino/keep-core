@@ -1474,6 +1474,9 @@ func (g *chainGate) terminalOutcomesLocked() []TerminalOutcomeRecord {
 			contribution.LocalMembers = slices.Clone(
 				contribution.LocalMembers,
 			)
+			contribution.PermitSpaceMembers = slices.Clone(
+				contribution.PermitSpaceMembers,
+			)
 			record.Evidence.Contribution = &contribution
 		}
 		records = append(records, record)

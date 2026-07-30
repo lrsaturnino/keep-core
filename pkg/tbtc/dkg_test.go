@@ -22,6 +22,7 @@ import (
 	"github.com/keep-network/keep-core/pkg/net/local"
 	"github.com/keep-network/keep-core/pkg/operator"
 	"github.com/keep-network/keep-core/pkg/protocol/group"
+	"github.com/keep-network/keep-core/pkg/protocol/participation"
 	"github.com/keep-network/keep-core/pkg/tecdsa"
 	"github.com/keep-network/keep-core/pkg/tecdsa/dkg"
 )
@@ -37,6 +38,197 @@ func TestTBTCDKGPermitIdentityIsCanonical(t *testing.T) {
 	}
 	if identity.PermitID != "17" {
 		t.Errorf("unexpected DKG permit ID [%s]", identity.PermitID)
+	}
+	if !slices.Equal(
+		identity.OperatedMembers,
+		participation.MemberIndexes{17},
+	) {
+		t.Errorf(
+			"unexpected operated memberships [%v]",
+			identity.OperatedMembers,
+		)
+	}
+}
+
+// TestDKGTranscriptContributionMapsBackToThePermitSpace asserts the transcript a
+// completed tBTC DKG records lines its final signing group seats up with the DKG
+// seats its permits were issued for.
+//
+// This is the one ceremony whose record and permits live in different index
+// spaces: the group is rebuilt from the members this node saw operating, so every
+// seat above a removed one shifts down. The mapping is what lets a reader join
+// the two, and it has to come from the same accepted result the final group was
+// built from — a mapping derived any other way would place seats by coincidence
+// wherever no member was removed and silently misplace them wherever one was.
+func TestDKGTranscriptContributionMapsBackToThePermitSpace(t *testing.T) {
+	groupParameters := &GroupParameters{
+		GroupSize:       5,
+		GroupQuorum:     3,
+		HonestThreshold: 3,
+	}
+
+	selectedOperators := []chain.Address{
+		"0xAA",
+		"0xBB",
+		"0xCC",
+		"0xDD",
+		"0xEE",
+	}
+
+	testData, err := tecdsatest.LoadPrivateKeyShareTestFixtures(1)
+	if err != nil {
+		t.Fatalf("failed to load test data: [%v]", err)
+	}
+
+	var tests = map[string]struct {
+		memberIndex               group.MemberIndex
+		inactiveMemberIndexes     []group.MemberIndex
+		disqualifiedMemberIndexes []group.MemberIndex
+
+		expectedIncorporated participation.MemberIndexes
+		expectedLocal        participation.MemberIndexes
+		expectedPermitSpace  participation.MemberIndexes
+	}{
+		// Nothing was removed, so the two spaces coincide. The mapping still
+		// has to be there: a reader cannot tell this case from a remapped one
+		// without it, and its absence is what would send the reader back to
+		// comparing raw numbers.
+		"the whole selected group operated": {
+			memberIndex:          4,
+			expectedIncorporated: participation.MemberIndexes{1, 2, 3, 4, 5},
+			expectedLocal:        participation.MemberIndexes{4},
+			expectedPermitSpace:  participation.MemberIndexes{1, 2, 3, 4, 5},
+		},
+		// The case a raw comparison gets wrong. DKG seat 4 lands in final seat
+		// 3, and final seat 3 belongs to DKG seat 4 rather than to whichever
+		// node ran DKG seat 3.
+		"a middle member was not seen operating": {
+			memberIndex:           4,
+			inactiveMemberIndexes: []group.MemberIndex{2},
+			expectedIncorporated:  participation.MemberIndexes{1, 2, 3, 4},
+			expectedLocal:         participation.MemberIndexes{3},
+			expectedPermitSpace:   participation.MemberIndexes{1, 3, 4, 5},
+		},
+		"a middle member was disqualified": {
+			memberIndex:               5,
+			disqualifiedMemberIndexes: []group.MemberIndex{3},
+			expectedIncorporated:      participation.MemberIndexes{1, 2, 3, 4},
+			expectedLocal:             participation.MemberIndexes{4},
+			expectedPermitSpace:       participation.MemberIndexes{1, 2, 4, 5},
+		},
+		"members were removed from both ends": {
+			memberIndex:               3,
+			inactiveMemberIndexes:     []group.MemberIndex{1},
+			disqualifiedMemberIndexes: []group.MemberIndex{5},
+			expectedIncorporated:      participation.MemberIndexes{1, 2, 3},
+			expectedLocal:             participation.MemberIndexes{2},
+			expectedPermitSpace:       participation.MemberIndexes{2, 3, 4},
+		},
+	}
+
+	for testName, test := range tests {
+		t.Run(testName, func(t *testing.T) {
+			persistenceHandle := &mockPersistenceHandle{}
+			localChain := Connect()
+			walletRegistry, err := newWalletRegistry(
+				persistenceHandle,
+				localChain.CalculateWalletID,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			dkgExecutor := &dkgExecutor{
+				groupParameters: groupParameters,
+				chain:           localChain,
+				walletRegistry:  walletRegistry,
+			}
+
+			dkgGroup := group.NewGroup(
+				groupParameters.DishonestThreshold(),
+				groupParameters.GroupSize,
+			)
+			for _, inactive := range test.inactiveMemberIndexes {
+				dkgGroup.MarkMemberAsInactive(inactive)
+			}
+			for _, disqualified := range test.disqualifiedMemberIndexes {
+				dkgGroup.MarkMemberAsDisqualified(disqualified)
+			}
+
+			result := &dkg.Result{
+				Group:           dkgGroup,
+				PrivateKeyShare: tecdsa.NewPrivateKeyShare(testData[0]),
+			}
+
+			signer, err := dkgExecutor.buildFinalSigner(
+				result,
+				test.memberIndex,
+				selectedOperators,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			contribution := dkgTranscriptContribution(signer, result)
+
+			if !slices.Equal(
+				contribution.IncorporatedMembers,
+				test.expectedIncorporated,
+			) {
+				t.Errorf(
+					"unexpected incorporated memberships\n"+
+						"expected: %v\n"+
+						"actual:   %v\n",
+					test.expectedIncorporated,
+					contribution.IncorporatedMembers,
+				)
+			}
+			if !slices.Equal(contribution.LocalMembers, test.expectedLocal) {
+				t.Errorf(
+					"unexpected local memberships\n"+
+						"expected: %v\n"+
+						"actual:   %v\n",
+					test.expectedLocal,
+					contribution.LocalMembers,
+				)
+			}
+			if !slices.Equal(
+				contribution.PermitSpaceMembers,
+				test.expectedPermitSpace,
+			) {
+				t.Errorf(
+					"unexpected permit-space memberships\n"+
+						"expected: %v\n"+
+						"actual:   %v\n",
+					test.expectedPermitSpace,
+					contribution.PermitSpaceMembers,
+				)
+			}
+
+			// The mapping is only worth carrying if it is the one the gate
+			// checks the record against, so the record this node would write is
+			// held to the permit this node was issued exactly as the gate holds
+			// it.
+			if err := participation.ValidatePermitOperatedOwnership(
+				participation.TBTCDKG,
+				participation.MemberIndexes{test.memberIndex},
+				participation.TerminalOutcomeCompleted,
+				participation.TerminalEvidence{
+					Kind: participation.TerminalEvidencePersistedTBTCSinger,
+					Reference: getWalletStorageKey(
+						signer.wallet.publicKey,
+					),
+					MembershipIndex: signer.signingGroupMemberIndex,
+					Contribution:    contribution,
+				},
+			); err != nil {
+				t.Errorf(
+					"the transcript this node wrote was refused against the "+
+						"DKG seat its own permit was issued for: [%v]",
+					err,
+				)
+			}
+		})
 	}
 }
 

@@ -756,7 +756,7 @@ func (de *dkgExecutor) completeDkgCeremony(
 				signer.wallet.publicKey,
 			),
 			MembershipIndex: signer.signingGroupMemberIndex,
-			Contribution:    dkgTranscriptContribution(signer),
+			Contribution:    dkgTranscriptContribution(signer, result),
 		},
 	)
 
@@ -779,9 +779,21 @@ func (de *dkgExecutor) completeDkgCeremony(
 // persisted membership this evidence names is a final index, and a transcript
 // that mixed the two would join a result produced in one ceremony to a signer
 // persisted from another.
+//
+// Because the permits for this ceremony are in the DKG's space, the transcript
+// also carries the seat each final membership was rebuilt from. That mapping is
+// the accepted result's own operating members, ascending, which is precisely the
+// list finalSigningGroup positions the final group by — so entry i of it is the
+// DKG seat that became final seat i+1.
 func dkgTranscriptContribution(
 	persistedSigner *signer,
+	result *dkg.Result,
 ) *participation.TranscriptContribution {
+	operatingMembers := result.Group.OperatingMemberIndexes()
+	sort.Slice(operatingMembers, func(i, j int) bool {
+		return operatingMembers[i] < operatingMembers[j]
+	})
+
 	finalGroupSize := len(persistedSigner.wallet.signingGroupOperators)
 
 	incorporated := make(participation.MemberIndexes, 0, finalGroupSize)
@@ -794,6 +806,7 @@ func dkgTranscriptContribution(
 		LocalMembers: participation.MemberIndexes{
 			persistedSigner.signingGroupMemberIndex,
 		},
+		PermitSpaceMembers: participation.MemberIndexes(operatingMembers),
 	}
 }
 
@@ -944,7 +957,7 @@ func (de *dkgExecutor) preserveInterruptedSigner(
 						signer.wallet.publicKey,
 					),
 					MembershipIndex: signer.signingGroupMemberIndex,
-					Contribution:    dkgTranscriptContribution(signer),
+					Contribution:    dkgTranscriptContribution(signer, result),
 				},
 			)
 		}

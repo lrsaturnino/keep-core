@@ -333,9 +333,14 @@ func testOperatedMembers(
 // none. The local membership is the one the record persists, so the two halves
 // of the fixture describe one ceremony and a test that means to break the
 // binding has to say so.
+// testTranscriptContribution renders the transcript a completed outcome must
+// carry. permitSeat is the seat in the permits' own index space that produced the
+// local membership; it is read only for the ceremonies whose record speaks in a
+// different space than their permits, and 0 stands for "the same seat".
 func testTranscriptContribution(
 	ceremony participation.Ceremony,
 	local group.MemberIndex,
+	permitSeat group.MemberIndex,
 ) *participation.TranscriptContribution {
 	if !participation.AuthorsTranscriptContribution(ceremony) {
 		return nil
@@ -356,7 +361,44 @@ func testTranscriptContribution(
 	return &participation.TranscriptContribution{
 		IncorporatedMembers: incorporated,
 		LocalMembers:        participation.MemberIndexes{local},
+		PermitSpaceMembers: testPermitSpaceMembers(
+			ceremony,
+			incorporated,
+			local,
+			permitSeat,
+		),
 	}
+}
+
+// testPermitSpaceMembers renders a mapping from a transcript's seats back to the
+// index space this work's permits were issued in, placing permitSeat under local
+// and running consecutively either side of it, and nil for the ceremonies whose
+// result already speaks in the permits' space.
+//
+// permitSeat must leave room for the seats below local, which every fixture here
+// satisfies. A mapping that does not is left malformed rather than quietly
+// adjusted: the gate's own set validation then refuses it, which is the loud
+// failure a fixture that cannot mean what it says deserves.
+func testPermitSpaceMembers(
+	ceremony participation.Ceremony,
+	incorporated participation.MemberIndexes,
+	local group.MemberIndex,
+	permitSeat group.MemberIndex,
+) participation.MemberIndexes {
+	if ceremony != participation.TBTCDKG {
+		return nil
+	}
+	if permitSeat == 0 {
+		permitSeat = local
+	}
+
+	position := slices.Index(incorporated, local)
+	mapping := make(participation.MemberIndexes, len(incorporated))
+	for i := range mapping {
+		mapping[i] = group.MemberIndex(int(permitSeat) + i - position)
+	}
+
+	return mapping
 }
 
 func testTerminalOutcomeRecord(
@@ -432,19 +474,17 @@ func testTerminalOutcomeRecord(
 		// The transcript's local seat is the seat the permit was issued for
 		// wherever the two share an index space. tBTC DKG is the exception:
 		// its permit names a DKG index while its transcript is in the final
-		// signing group's, so there the persisted membership is the local seat.
+		// signing group's, so there the persisted membership is the local seat
+		// and the permit's own seat is what the transcript maps it back to.
 		local := evidence.MembershipIndex
-		if snapshot.Ceremony != participation.TBTCDKG {
-			if seat := testPermitSeat(
-				snapshot.Ceremony,
-				snapshot.PermitID,
-			); seat != 0 {
-				local = seat
-			}
+		permitSeat := testPermitSeat(snapshot.Ceremony, snapshot.PermitID)
+		if snapshot.Ceremony != participation.TBTCDKG && permitSeat != 0 {
+			local = permitSeat
 		}
 		evidence.Contribution = testTranscriptContribution(
 			snapshot.Ceremony,
 			local,
+			permitSeat,
 		)
 	case participation.TerminalOutcomeQuarantined:
 		evidence = participation.TerminalEvidence{
@@ -3056,6 +3096,218 @@ func TestValidateNodeTerminalOutcomes_DKGCompletionIsMembershipExact(
 	}
 }
 
+// TestValidateNodeTerminalOutcomes_OperatedMembershipsAreReconciled proves the
+// offline audit holds a permit's operated seats to both records that carry them.
+//
+// The seats are fixed at issuance and copied into two places: the gate snapshot
+// captured while the permit was live, and the journal record written when it
+// closed. A reader building a fleet seat ownership map picks one of the two, and
+// nothing else in either record constrains the field — an entry whose seats were
+// widened, narrowed, or reassigned after the fact still names a real ceremony, a
+// real permit and a real outcome. So the audit reconciles the two copies against
+// each other, holds each to the shape its ceremony can have, and holds the
+// transcript to the copy it travelled with.
+func TestValidateNodeTerminalOutcomes_OperatedMembershipsAreReconciled(
+	t *testing.T,
+) {
+	capturedAt := time.Now().UTC().Add(-time.Minute)
+	workID := strings.Repeat("d", 64)
+
+	// Two DKG seats of one ceremony, both surviving into a two-member final
+	// group: DKG seat 2 holds final seat 1 and DKG seat 3 holds final seat 2.
+	newPermit := func(
+		permitID string,
+		operated participation.MemberIndexes,
+	) participation.PermitSnapshot {
+		return participation.PermitSnapshot{
+			Ceremony:            participation.TBTCDKG,
+			Mode:                participation.ModeSecurityV2.String(),
+			CanonicalStartBlock: 1_000,
+			WorkID:              workID,
+			PermitID:            permitID,
+			IdentityBound:       true,
+			OperatedMembers:     operated,
+		}
+	}
+	newRecord := func(
+		permit participation.PermitSnapshot,
+		membership group.MemberIndex,
+		permitSeat group.MemberIndex,
+	) participation.TerminalOutcomeRecord {
+		return participation.TerminalOutcomeRecord{
+			RecordedAt: time.Now().UTC(),
+			Permit:     permit,
+			Outcome:    participation.TerminalOutcomeCompleted,
+			Evidence: participation.TerminalEvidence{
+				Kind:            participation.TerminalEvidencePersistedTBTCSinger,
+				Reference:       "wallet-storage-key",
+				MembershipIndex: membership,
+				Contribution: testTranscriptContribution(
+					participation.TBTCDKG,
+					membership,
+					permitSeat,
+				),
+			},
+		}
+	}
+	newManifest := func(
+		inventory []participation.PermitSnapshot,
+		outcomes []participation.TerminalOutcomeRecord,
+	) *manifest {
+		return &manifest{
+			QuiescenceSnapshot: &participation.QuiescenceSnapshot{
+				SchemaVersion: participation.QuiescenceSnapshotSchemaVersion,
+				CapturedAt:    capturedAt,
+				ActivePermits: inventory,
+			},
+			ParticipationTerminalOutcomes: &participation.TerminalOutcomeJournal{
+				SchemaVersion:      participation.TerminalOutcomeJournalSchemaVersion,
+				SnapshotCapturedAt: capturedAt,
+				Outcomes:           outcomes,
+			},
+			TBTCActiveWallets: []tbtcWalletRecord{
+				{
+					WalletStorageKey: "wallet-storage-key",
+					WalletID:         "wallet-id",
+					MemberIndexes:    []uint8{1, 2},
+					SigningGroupSize: 2,
+				},
+			},
+		}
+	}
+
+	honestFirst := newPermit("2", participation.MemberIndexes{2})
+	honestSecond := newPermit("3", participation.MemberIndexes{3})
+	honestInventory := []participation.PermitSnapshot{honestFirst, honestSecond}
+
+	// The baseline both sides agree on, so a mutation below is the only reason
+	// any of these findings can appear.
+	baseline := validateNodeTerminalOutcomes(newManifest(
+		honestInventory,
+		[]participation.TerminalOutcomeRecord{
+			newRecord(honestFirst, group.MemberIndex(1), group.MemberIndex(2)),
+			newRecord(honestSecond, group.MemberIndex(2), group.MemberIndex(3)),
+		},
+	))
+	for _, violation := range baseline {
+		if strings.Contains(violation, "operated membership") ||
+			strings.Contains(violation, "outside its permit") {
+			t.Errorf(
+				"a journal agreeing with its own gate inventory was refused: [%s]",
+				violation,
+			)
+		}
+	}
+
+	tests := map[string]struct {
+		inventory       []participation.PermitSnapshot
+		outcomes        []participation.TerminalOutcomeRecord
+		expectedFinding string
+	}{
+		// A schema-1 snapshot carries no operated seats at all, so a journal
+		// that names them is the only account of them and there is nothing left
+		// to reconcile it against.
+		"the gate inventory carries no operated seats": {
+			inventory: []participation.PermitSnapshot{
+				newPermit("2", nil),
+				newPermit("3", nil),
+			},
+			outcomes: []participation.TerminalOutcomeRecord{
+				newRecord(honestFirst, group.MemberIndex(1), group.MemberIndex(2)),
+				newRecord(honestSecond, group.MemberIndex(2), group.MemberIndex(3)),
+			},
+			expectedFinding: "but the at-quiescence gate inventory issued the same permit",
+		},
+		"the journal widened one permit's operated seats": {
+			inventory: honestInventory,
+			outcomes: []participation.TerminalOutcomeRecord{
+				newRecord(
+					newPermit("2", participation.MemberIndexes{2, 3}),
+					group.MemberIndex(1),
+					group.MemberIndex(2),
+				),
+				newRecord(honestSecond, group.MemberIndex(2), group.MemberIndex(3)),
+			},
+			expectedFinding: "but the at-quiescence gate inventory issued the same permit",
+		},
+		// The same edit applied to both copies passes the reconciliation above,
+		// so the shape its ceremony can have has to be reapplied to each.
+		"both copies claim a second seat for a one-seat ceremony": {
+			inventory: []participation.PermitSnapshot{
+				newPermit("2", participation.MemberIndexes{2, 3}),
+				honestSecond,
+			},
+			outcomes: []participation.TerminalOutcomeRecord{
+				newRecord(
+					newPermit("2", participation.MemberIndexes{2, 3}),
+					group.MemberIndex(1),
+					group.MemberIndex(2),
+				),
+				newRecord(honestSecond, group.MemberIndex(2), group.MemberIndex(3)),
+			},
+			expectedFinding: "runs one seat per permit",
+		},
+		"both copies claim a seat that is not the permit's own": {
+			inventory: []participation.PermitSnapshot{
+				newPermit("2", participation.MemberIndexes{4}),
+				honestSecond,
+			},
+			outcomes: []participation.TerminalOutcomeRecord{
+				newRecord(
+					newPermit("2", participation.MemberIndexes{4}),
+					group.MemberIndex(1),
+					group.MemberIndex(4),
+				),
+				newRecord(honestSecond, group.MemberIndex(2), group.MemberIndex(3)),
+			},
+			expectedFinding: "runs one seat per permit",
+		},
+		"both copies carry a malformed operated set": {
+			inventory: []participation.PermitSnapshot{
+				newPermit("2", participation.MemberIndexes{2, 2}),
+				honestSecond,
+			},
+			outcomes: []participation.TerminalOutcomeRecord{
+				newRecord(
+					newPermit("2", participation.MemberIndexes{2, 2}),
+					group.MemberIndex(1),
+					group.MemberIndex(2),
+				),
+				newRecord(honestSecond, group.MemberIndex(2), group.MemberIndex(3)),
+			},
+			expectedFinding: "operated memberships",
+		},
+		// The persisted memberships swapped under one shared, honest mapping.
+		// This is the swap a reader of the raw seat numbers cannot see and the
+		// mapping makes local: final seat 2 was produced by DKG seat 3, which is
+		// not the seat this permit was issued to operate.
+		"the persisted memberships were swapped under one mapping": {
+			inventory: honestInventory,
+			outcomes: []participation.TerminalOutcomeRecord{
+				newRecord(honestFirst, group.MemberIndex(2), group.MemberIndex(3)),
+				newRecord(honestSecond, group.MemberIndex(1), group.MemberIndex(2)),
+			},
+			expectedFinding: "which is not among the memberships",
+		},
+	}
+
+	for testName, test := range tests {
+		t.Run(testName, func(t *testing.T) {
+			violations := validateNodeTerminalOutcomes(
+				newManifest(test.inventory, test.outcomes),
+			)
+			if !containsSubstring(violations, test.expectedFinding) {
+				t.Fatalf(
+					"expected an operated-membership violation containing "+
+						"[%s], got: %v",
+					test.expectedFinding,
+					violations,
+				)
+			}
+		})
+	}
+}
+
 // TestValidateNodeTerminalOutcomes_CompletedEvidenceKindIsPinnedPerCeremony
 // proves the offline audit refuses a settlement recorded in the wrong evidence
 // class. A wallet action's durable result is a Bitcoin transaction the audit
@@ -3123,6 +3375,7 @@ func TestValidateNodeTerminalOutcomes_CompletedEvidenceKindIsPinnedPerCeremony(
 			Reference: strings.Repeat("a", 64),
 			Contribution: testTranscriptContribution(
 				participation.TBTCSigning,
+				group.MemberIndex(1),
 				group.MemberIndex(1),
 			),
 		},
@@ -3312,6 +3565,7 @@ func TestValidateChainReconciliationEvidence_TBTCDKGPermitLineage(
 			WorkID:              seedHash,
 			PermitID:            "2",
 			IdentityBound:       true,
+			OperatedMembers:     participation.MemberIndexes{2},
 		},
 		{
 			Ceremony:            participation.TBTCDKG,
@@ -3320,6 +3574,7 @@ func TestValidateChainReconciliationEvidence_TBTCDKGPermitLineage(
 			WorkID:              seedHash,
 			PermitID:            "3",
 			IdentityBound:       true,
+			OperatedMembers:     participation.MemberIndexes{3},
 		},
 	}
 
@@ -3357,9 +3612,17 @@ func TestValidateChainReconciliationEvidence_TBTCDKGPermitLineage(
 							Kind:            participation.TerminalEvidencePersistedTBTCSinger,
 							Reference:       "wallet-storage-key",
 							MembershipIndex: firstMembership,
+							// Each record maps its own final seat back to the
+							// DKG seat its own permit was issued for, so the
+							// journal is internally consistent whichever way the
+							// two persisted memberships are assigned. The two
+							// mappings then disagree about how one final group
+							// was rebuilt, and only the accepted result on chain
+							// says which of them is the real one.
 							Contribution: testTranscriptContribution(
 								participation.TBTCDKG,
 								firstMembership,
+								group.MemberIndex(2),
 							),
 						},
 					},
@@ -3374,6 +3637,7 @@ func TestValidateChainReconciliationEvidence_TBTCDKGPermitLineage(
 							Contribution: testTranscriptContribution(
 								participation.TBTCDKG,
 								secondMembership,
+								group.MemberIndex(3),
 							),
 						},
 					},
