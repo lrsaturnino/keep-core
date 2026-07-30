@@ -44,6 +44,12 @@ GHSA aliases. Serving only `btcec` from this directory lets the main
 btcd module track a current, fully patched release while the btcec
 consumers keep compiling against byte-identical crypto sources.
 
+Note: the v0.22.3-to-v0.24.2 jump also raised btcd's shared script
+pool ceiling from 6.4 MB (12,500 * 512 B) to roughly 524 MB (125 * 4 MiB
+slabs) per concurrent decode. This is not a security issue - per-decode
+worst case is unchanged at 4 MiB - but RSS can grow under high
+concurrency, which is worth knowing for future capacity triage.
+
 ## Verifying against upstream
 
 ```sh
