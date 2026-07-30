@@ -856,8 +856,9 @@ func (h *unwritableRecordHandle) Save(
 type quarantineLogCapture struct {
 	testutils.MockLogger
 
-	mu     sync.Mutex
-	errors []string
+	mu       sync.Mutex
+	errors   []string
+	warnings []string
 }
 
 func (c *quarantineLogCapture) Errorf(format string, args ...interface{}) {
@@ -866,10 +867,25 @@ func (c *quarantineLogCapture) Errorf(format string, args ...interface{}) {
 	c.errors = append(c.errors, fmt.Sprintf(format, args...))
 }
 
+func (c *quarantineLogCapture) Warnf(format string, args ...interface{}) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.warnings = append(c.warnings, fmt.Sprintf(format, args...))
+}
+
 func (c *quarantineLogCapture) joined() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return strings.Join(c.errors, "\n")
+}
+
+// joinedWarnings is kept apart from joined because the two say different
+// things: an error line is a state an operator has to act on, a warning line is
+// the record of what happened to an output.
+func (c *quarantineLogCapture) joinedWarnings() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return strings.Join(c.warnings, "\n")
 }
 
 // savedNames lists the record names a namespace accepted, in write order.
@@ -946,7 +962,7 @@ func TestSignerQuarantine_Preserve_AttemptsBothRecordsAndReportsWhatLanded(
 					ReleaseEpoch: participation.CompiledEpoch.String(),
 					Ceremony:     string(participation.TBTCDKG),
 				},
-				nil,
+				quarantineObserver{},
 			)
 
 			expectedComplete := test.membershipPersisted &&
@@ -1304,13 +1320,20 @@ func TestSignerQuarantine_Preserve_KeepsTryingThroughAProlongedRefusal(
 	// attempt, so it is counted rather than allowed to stand in for a result.
 	notifications := 0
 
-	state, err := newTestSignerQuarantine(handle, refusals*2).preserve(
+	quarantine := newTestSignerQuarantine(handle, refusals*2)
+
+	operatorLog := &quarantineLogCapture{}
+	quarantine.logger = operatorLog
+
+	state, err := quarantine.preserve(
 		signer,
 		QuarantinedSignerMetadata{
 			ReleaseEpoch: participation.CompiledEpoch.String(),
 			Ceremony:     string(participation.TBTCDKG),
 		},
-		func(quarantineState, error) { notifications++ },
+		quarantineObserver{
+			stillIncomplete: func(quarantineState, error) { notifications++ },
+		},
 	)
 	if err != nil {
 		t.Fatalf(
@@ -1338,6 +1361,23 @@ func TestSignerQuarantine_Preserve_KeepsTryingThroughAProlongedRefusal(
 		[]string{"/metadata_1", "/membership_1"},
 	) {
 		t.Errorf("namespace holds %v, expected both halves", got)
+	}
+
+	// The node was told, and the operator record says, that this share reached
+	// no namespace. Leaving that as the last word would have an operator repair
+	// a loss the namespace had already stopped being.
+	if logged := operatorLog.joinedWarnings(); !strings.Contains(
+		logged,
+		"took the tbtc key material it had been refusing",
+	) || !strings.Contains(
+		logged,
+		fmt.Sprintf("[round=%d]", refusals+1),
+	) {
+		t.Errorf(
+			"the operator record must say which round the namespace took the "+
+				"material in, got [%s]",
+			logged,
+		)
 	}
 }
 
@@ -1381,7 +1421,9 @@ func TestSignerQuarantine_Preserve_GivesUpOnlyWhenTheProcessEnds(
 			ReleaseEpoch: participation.CompiledEpoch.String(),
 			Ceremony:     string(participation.TBTCDKG),
 		},
-		func(quarantineState, error) { notifications++ },
+		quarantineObserver{
+			stillIncomplete: func(quarantineState, error) { notifications++ },
+		},
 	)
 	if err == nil {
 		t.Fatal("expected a preservation error")
@@ -1419,6 +1461,147 @@ func TestSignerQuarantine_Preserve_GivesUpOnlyWhenTheProcessEnds(
 	}
 }
 
+// latchedMembershipHandle refuses both halves of a preserved output until the
+// given round, then takes the key material and goes on refusing the audit record
+// for good.
+//
+// It stands for the namespace state a count has to survive: the share is down on
+// disk while the record explaining it is still missing, and the preservation
+// holding the pair open has not returned and, on this namespace, never will.
+type latchedMembershipHandle struct {
+	mockPersistenceHandle
+
+	// membershipTakenAtRound is the round from which the key material is
+	// accepted. The membership is attempted once per round for as long as it
+	// has not landed, so its attempt count is the round number.
+	membershipTakenAtRound int
+
+	mu                 sync.Mutex
+	membershipAttempts int
+}
+
+func (h *latchedMembershipHandle) Save(
+	data []byte,
+	directory string,
+	name string,
+) error {
+	if !strings.HasPrefix(name, "/membership_") {
+		return fmt.Errorf("cannot write [%s]", name)
+	}
+
+	h.mu.Lock()
+	h.membershipAttempts++
+	round := h.membershipAttempts
+	h.mu.Unlock()
+
+	if round < h.membershipTakenAtRound {
+		return fmt.Errorf("cannot write [%s] yet", name)
+	}
+
+	return h.mockPersistenceHandle.Save(data, directory, name)
+}
+
+// TestDkgExecutor_PreserveInterruptedSigner_CountsTheShareTheNamespaceTakesMidRetry
+// proves the reported count rises at the moment the namespace takes the key
+// material, while the preservation that wrote it is still running and the audit
+// record beside it is still being refused.
+//
+// The node is told once, after the grace rounds, that it is holding an output the
+// namespace does not fully have, and quiescing on that notification is one-way.
+// What follows it is not: a namespace can take the share several rounds later and
+// go on refusing the record, and the preservation then keeps running for the rest
+// of the process. A count taken from that notification, or from what preserve
+// eventually returns, would report an empty quarantine for all of that time over
+// a namespace holding key material — the all-clear a rollback decision must never
+// be given.
+func TestDkgExecutor_PreserveInterruptedSigner_CountsTheShareTheNamespaceTakesMidRetry(
+	t *testing.T,
+) {
+	de, result, gsr, _, _ := setupPreserveScenario(t)
+
+	recorder := newDispatchGaugeRecorder()
+	de.metricsRecorder = recorder
+
+	// The share lands well after the grace rounds are spent, so the node has
+	// already been told the pair is incomplete by the time the namespace takes
+	// it, and the preservation outlives the write by several more rounds.
+	const membershipTakenAtRound = quarantineGraceAttempts + 3
+	const roundsBeforeShutdown = membershipTakenAtRound + 3
+
+	handle := &latchedMembershipHandle{
+		membershipTakenAtRound: membershipTakenAtRound,
+	}
+
+	quarantine := newSignerQuarantine(context.Background(), logger, handle)
+
+	// Sampled between rounds, which is inside the preservation: a count read
+	// after preserve has returned cannot tell a gauge that rose at the write
+	// from one that rose at the return, and the two are the whole question here.
+	countAfterRound := make([]int, 0, roundsBeforeShutdown)
+	round := 0
+	quarantine.wait = func(context.Context, time.Duration) bool {
+		round++
+		countAfterRound = append(countAfterRound, int(recorder.gauge(
+			clientinfo.MetricParticipationQuarantinedTBTCSigners,
+		)))
+		return round < roundsBeforeShutdown
+	}
+	de.signerQuarantine = quarantine
+
+	permit := newTestPermit(participation.TBTCDKG)
+
+	de.preserveInterruptedSigner(
+		logger.With(),
+		permit,
+		big.NewInt(1),
+		result,
+		group.MemberIndex(1),
+		gsr,
+		"tbtc_dkg_signer_activation",
+		fmt.Errorf("activation refused"),
+	)
+
+	testutils.AssertIntsEqual(
+		t,
+		"rounds the preservation spent",
+		roundsBeforeShutdown,
+		len(countAfterRound),
+	)
+
+	for spentRound, count := range countAfterRound {
+		// countAfterRound[i] is what the count said once round i+1 was over.
+		expected := 0
+		if spentRound+1 >= membershipTakenAtRound {
+			expected = 1
+		}
+
+		testutils.AssertIntsEqual(
+			t,
+			fmt.Sprintf("reported quarantined signers after round %d",
+				spentRound+1),
+			expected,
+			count,
+		)
+	}
+
+	// The record explaining the share never landed, so this is the state the
+	// count had to be right about rather than one preservation resolved.
+	if got := savedNames(&handle.mockPersistenceHandle); !reflect.DeepEqual(
+		got,
+		[]string{"/membership_1"},
+	) {
+		t.Errorf("namespace holds %v, expected only the key material", got)
+	}
+
+	if outcomes := permit.recordedTerminalOutcomes(); len(outcomes) != 0 {
+		t.Errorf(
+			"an output whose audit record never landed must not end the "+
+				"permit, got %v",
+			outcomes,
+		)
+	}
+}
+
 // TestSignerQuarantine_Preserve_WritesOnlyTheHalfTheNamespaceLacks proves a
 // round does not rewrite a half that already landed. The retry exists for the
 // missing record, and rewriting the preserved one would keep touching key
@@ -1448,7 +1631,7 @@ func TestSignerQuarantine_Preserve_WritesOnlyTheHalfTheNamespaceLacks(
 			ReleaseEpoch: participation.CompiledEpoch.String(),
 			Ceremony:     string(participation.TBTCDKG),
 		},
-		nil,
+		quarantineObserver{},
 	); err != nil {
 		t.Fatalf("expected the retried write to preserve the share, got [%v]", err)
 	}
@@ -1711,6 +1894,120 @@ func TestDkgExecutor_ReportInitialQuarantinedSigners_CountsAShareTheNamespaceToo
 			clientinfo.MetricParticipationQuarantinedTBTCSigners,
 		)),
 	)
+}
+
+// TestDkgExecutor_ReportInitialQuarantinedSigners_RecoversAHandoffTheProcessEndCutOff
+// proves what survives a handoff the process end interrupted: a namespace that
+// took the key material while it kept refusing the record explaining it, left
+// behind by a process that retried until it was taken away.
+//
+// The distinction being tested is between a preservation that finished and one
+// that only stopped. The writing process never saw the pair complete, recorded no
+// terminal outcome, and quiesced; the next process shares none of its state and
+// still has to find the share, count it, and be able to read it back. What it
+// cannot recover is the explanation — that half exists only in the process that
+// generated it — which is why the incomplete pair blocks the offline barrier
+// instead of being repaired here.
+func TestDkgExecutor_ReportInitialQuarantinedSigners_RecoversAHandoffTheProcessEndCutOff(
+	t *testing.T,
+) {
+	de, result, gsr, _, _ := setupPreserveScenario(t)
+
+	recorder := newDispatchGaugeRecorder()
+	de.metricsRecorder = recorder
+
+	// A namespace that takes key material and never takes the record beside it,
+	// under a process that goes away long after the grace rounds are spent.
+	handle := &unwritableRecordHandle{refusedNamePrefix: "/metadata_"}
+	de.signerQuarantine = newTestSignerQuarantine(
+		handle,
+		quarantineGraceAttempts*4,
+	)
+
+	permit := newTestPermit(participation.TBTCDKG)
+
+	de.preserveInterruptedSigner(
+		logger.With(),
+		permit,
+		big.NewInt(1),
+		result,
+		group.MemberIndex(1),
+		gsr,
+		"tbtc_dkg_signer_activation",
+		fmt.Errorf("activation refused"),
+	)
+
+	if got := savedNames(&handle.mockPersistenceHandle); !reflect.DeepEqual(
+		got,
+		[]string{"/membership_1"},
+	) {
+		t.Fatalf("namespace holds %v, expected only the key material", got)
+	}
+
+	// The handoff was cut off rather than completed, so the permit this process
+	// leaves behind is unresolved and the offline barrier still blocks on it.
+	if outcomes := permit.recordedTerminalOutcomes(); len(outcomes) != 0 {
+		t.Errorf(
+			"an interrupted handoff must not end the permit, got %v",
+			outcomes,
+		)
+	}
+
+	// The next process: a new executor over the namespace the interrupted one
+	// left, sharing none of its state — no floor, no standing count, no memory
+	// of what was written.
+	restarted, _, _, _, _ := setupPreserveScenario(t)
+	restartedRecorder := newDispatchGaugeRecorder()
+	restarted.metricsRecorder = restartedRecorder
+	restarted.signerQuarantine = newSignerQuarantine(
+		context.Background(),
+		logger,
+		handle,
+	)
+
+	if err := restarted.reportInitialQuarantinedSigners(); err != nil {
+		t.Fatal(err)
+	}
+
+	testutils.AssertIntsEqual(
+		t,
+		"preserved outputs the next process counts",
+		1,
+		int(restartedRecorder.gauge(
+			clientinfo.MetricParticipationQuarantinedTBTCSigners,
+		)),
+	)
+
+	// Counting the record is not the same as being able to use it. The material
+	// is recovery evidence, so the next process has to be able to read back the
+	// seat and wallet it belongs to, which is what the offline audit reconciles
+	// against the chain.
+	preserved := handle.saved[0]
+	content, err := preserved.Content()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	record, err := DecodeSignerAuditRecord(content)
+	if err != nil {
+		t.Fatalf("the preserved key material cannot be read back: [%v]", err)
+	}
+
+	testutils.AssertIntsEqual(
+		t,
+		"seat the preserved material was generated for",
+		1,
+		int(record.MemberIndex),
+	)
+	if expected := getWalletStorageKey(
+		result.PrivateKeyShare.PublicKey(),
+	); record.WalletStorageKey != expected {
+		t.Errorf(
+			"preserved material belongs to wallet [%s], expected [%s]",
+			record.WalletStorageKey,
+			expected,
+		)
+	}
 }
 
 // TestSignerQuarantine_PreservedOutputs_RestartSeesWhatEachWriteFailureLeft

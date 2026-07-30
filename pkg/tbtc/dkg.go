@@ -1144,29 +1144,34 @@ func (de *dkgExecutor) preserveInterruptedSigner(
 			FailedOperation:     operation,
 			LastObservedBlock:   snapshot.CurrentBlock,
 		},
-		// Preservation keeps running behind this. It fires once the namespace
-		// has refused a half for longer than a passing fault would last, so the
-		// node stops taking new work while it is still holding an output the
-		// namespace does not fully have.
-		func(state quarantineState, cause error) {
-			de.accountForPreservedKeyMaterial(dkgLogger, signer, state)
-			de.blockOnIncompleteQuarantine(
-				dkgLogger,
-				memberIndex,
-				state,
-				cause,
-			)
+		quarantineObserver{
+			// The published count follows the key material alone: a share the
+			// namespace holds is material a rollback has to account for even
+			// when the record explaining it did not land, and a share that
+			// never reached the namespace is not quarantined however much was
+			// written about it.
+			//
+			// It is taken here, at the moment the namespace accepts the share,
+			// rather than from what preserve returns. A preservation whose
+			// other half keeps being refused runs until the process ends, so
+			// the return is not a moment this count can wait for.
+			keyMaterialPreserved: func() {
+				de.accountForPreservedKeyMaterial(dkgLogger, signer)
+			},
+			// Preservation keeps running behind this. It fires once the
+			// namespace has refused a half for longer than a passing fault
+			// would last, so the node stops taking new work while it is still
+			// holding an output the namespace does not fully have.
+			stillIncomplete: func(state quarantineState, cause error) {
+				de.blockOnIncompleteQuarantine(
+					dkgLogger,
+					memberIndex,
+					state,
+					cause,
+				)
+			},
 		},
 	)
-
-	// The published count follows the key material alone: a share the namespace
-	// holds is material a rollback has to account for even when the record
-	// explaining it did not land, and a share that never reached the namespace
-	// is not quarantined however much was written about it. It is recorded
-	// before the count is published so the identity this process knows it
-	// persisted is already the count's floor by the time the namespace is
-	// recounted.
-	de.accountForPreservedKeyMaterial(dkgLogger, signer, quarantineState)
 
 	// The terminal outcome, unlike the count, needs the whole pair. The
 	// metadata is what names the mode, canonical anchor, ceremony, seat, and
@@ -1197,7 +1202,8 @@ func (de *dkgExecutor) preserveInterruptedSigner(
 }
 
 // accountForPreservedKeyMaterial adds key material this process durably wrote
-// to the count a rollback reads, as soon as the namespace is known to hold it.
+// to the count a rollback reads. It is called once the quarantine namespace is
+// known to hold the share, which is the only condition it may be called under.
 //
 // The audit metadata may still be missing. The count is of preserved shares,
 // and a share the namespace holds is one whether or not the record explaining
@@ -1206,12 +1212,7 @@ func (de *dkgExecutor) preserveInterruptedSigner(
 func (de *dkgExecutor) accountForPreservedKeyMaterial(
 	dkgLogger log.StandardLogger,
 	signer *signer,
-	state quarantineState,
 ) {
-	if !state.membershipPersisted {
-		return
-	}
-
 	de.noteQuarantinedOutput(quarantinedSigner{
 		walletStorageKey: getWalletStorageKey(signer.wallet.publicKey),
 		memberIndex:      signer.signingGroupMemberIndex,

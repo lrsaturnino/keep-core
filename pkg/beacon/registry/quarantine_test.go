@@ -190,7 +190,12 @@ func TestQuarantine_Preserve_KeepsTryingThroughAProlongedRefusal(t *testing.T) {
 	// attempt, so it is counted rather than allowed to stand in for a result.
 	notifications := 0
 
-	state, err := newTestQuarantine(handle, refusals*2).Preserve(
+	quarantine := newTestQuarantine(handle, refusals*2)
+
+	operatorLog := &warningCapture{}
+	quarantine.logger = operatorLog
+
+	state, err := quarantine.Preserve(
 		&Membership{Signer: signer1, ChannelName: channelName1},
 		QuarantinedSignerMetadata{
 			ReleaseEpoch: "security_v2_cutover",
@@ -226,6 +231,23 @@ func TestQuarantine_Preserve_KeepsTryingThroughAProlongedRefusal(t *testing.T) {
 		t.Errorf(
 			"namespace holds %v, expected both halves",
 			handle.savedNames,
+		)
+	}
+
+	// The node was told, and the operator record says, that this share reached
+	// no namespace. Leaving that as the last word would have an operator repair
+	// a loss the namespace had already stopped being.
+	if logged := operatorLog.joined(); !strings.Contains(
+		logged,
+		"took the beacon key material it had been refusing",
+	) || !strings.Contains(
+		logged,
+		fmt.Sprintf("[round=%d]", refusals+1),
+	) {
+		t.Errorf(
+			"the operator record must say which round the namespace took the "+
+				"material in, got [%s]",
+			logged,
 		)
 	}
 }
@@ -333,6 +355,111 @@ func TestQuarantine_Preserve_WritesOnlyTheHalfTheNamespaceLacks(t *testing.T) {
 	}
 }
 
+// TestQuarantine_Preserve_LeavesReadableMaterialWhenTheProcessEndCutsTheHandoff
+// proves what a beacon handoff the process end interrupted leaves behind: the
+// key material on disk and readable by whatever comes next, with no record
+// explaining it.
+//
+// The distinction being tested is between a preservation that finished and one
+// that only stopped. This one reports an incomplete pair, which is what makes
+// its caller leave the permit unresolved — but the share itself must still be
+// on disk and must still decode. A beacon share is the worse one to lose: its
+// group may already have an accepted result, and a member that cannot produce
+// its share permanently reduces that group's usable threshold.
+//
+// What no later process can recover is the explanation. The mode, canonical
+// anchor, ceremony, seat, and refused operation exist only in the process that
+// generated them, which is why the incomplete pair is a finding for an operator
+// rather than something a restart repairs.
+func TestQuarantine_Preserve_LeavesReadableMaterialWhenTheProcessEndCutsTheHandoff(
+	t *testing.T,
+) {
+	handle := &unwritableRecordHandle{refusedNamePrefix: "/metadata_"}
+
+	state, err := newTestQuarantine(
+		handle,
+		quarantineGraceAttempts*4,
+	).Preserve(
+		&Membership{Signer: signer1, ChannelName: channelName1},
+		QuarantinedSignerMetadata{
+			ReleaseEpoch: "security_v2_cutover",
+			Ceremony:     "beacon_dkg",
+		},
+		nil,
+	)
+	if err == nil {
+		t.Fatal("expected a preservation error")
+	}
+
+	testutils.AssertBoolsEqual(
+		t,
+		"membership persisted",
+		true,
+		state.MembershipPersisted,
+	)
+	testutils.AssertBoolsEqual(
+		t,
+		"metadata persisted",
+		false,
+		state.MetadataPersisted,
+	)
+
+	if !reflect.DeepEqual(handle.savedNames, []string{"/membership_1"}) {
+		t.Fatalf(
+			"namespace holds %v, expected only the key material",
+			handle.savedNames,
+		)
+	}
+
+	// Counting a record is not the same as being able to use it. The next
+	// process reads the preserved material the way the offline audit does, and
+	// has to find the group and seat it belongs to.
+	preserved := &Membership{}
+	if err := preserved.Unmarshal(
+		handle.savedContent["/membership_1"],
+	); err != nil {
+		t.Fatalf("the preserved key material cannot be read back: [%v]", err)
+	}
+
+	if got, expected := preserved.Signer.MemberID(),
+		signer1.MemberID(); got != expected {
+		t.Errorf(
+			"preserved material was generated for seat [%v], expected [%v]",
+			got,
+			expected,
+		)
+	}
+	if got, expected := preserved.Signer.GroupPublicKeyBytesCompressed(),
+		signer1.GroupPublicKeyBytesCompressed(); !reflect.DeepEqual(
+		got,
+		expected,
+	) {
+		t.Errorf(
+			"preserved material belongs to group [%x], expected [%x]",
+			got,
+			expected,
+		)
+	}
+}
+
+// warningCapture records the warning lines a preservation emits, so a test can
+// hold the operator's account of a preserved output to what the namespace
+// actually holds. That account is the only description of a quarantine an
+// operator reads at the time it matters.
+type warningCapture struct {
+	testutils.MockLogger
+
+	warnings []string
+}
+
+func (c *warningCapture) Warnf(format string, args ...interface{}) {
+	c.warnings = append(c.warnings, fmt.Sprintf(format, args...))
+}
+
+func (c *warningCapture) joined() string {
+	return strings.Join(c.warnings, "\n")
+}
+
 // unwritableRecordHandle is a protected namespace that refuses one record name
 // while writing its neighbours, as a disk namespace does when a single file
 // cannot be written.
@@ -341,6 +468,11 @@ type unwritableRecordHandle struct {
 	refusedNamePrefix string
 
 	savedNames []string
+
+	// savedContent keeps what each accepted record holds, so a test can read a
+	// preserved record back the way a later process would rather than only
+	// observe that a write happened.
+	savedContent map[string][]byte
 }
 
 func (h *unwritableRecordHandle) Save(
@@ -353,6 +485,11 @@ func (h *unwritableRecordHandle) Save(
 	}
 
 	h.savedNames = append(h.savedNames, name)
+
+	if h.savedContent == nil {
+		h.savedContent = make(map[string][]byte)
+	}
+	h.savedContent[name] = append([]byte(nil), data...)
 
 	return nil
 }

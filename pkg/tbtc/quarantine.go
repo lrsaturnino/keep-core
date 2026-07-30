@@ -145,6 +145,34 @@ type quarantineState struct {
 	metadataPersisted   bool
 }
 
+// quarantineObserver receives what a preservation learns while it is still
+// holding the output, for the things a caller must not wait for the return
+// value to know. Both callbacks run on the preserving goroutine.
+type quarantineObserver struct {
+	// keyMaterialPreserved is called the moment the namespace takes the key
+	// material, whether or not the audit record beside it has landed.
+	//
+	// The count of preserved shares follows the material alone, and the
+	// preservation still waiting on the other half can run for the rest of the
+	// process. A caller that learned this from the return value would leave a
+	// share the namespace already holds unreported for exactly as long as the
+	// metadata keeps being refused — the stale all-clear the count exists to
+	// prevent.
+	keyMaterialPreserved func()
+
+	// stillIncomplete is called once, after graceAttempts rounds have left a
+	// half unwritten, with what the namespace holds so far. It exists so the
+	// node can stop taking new work while it is still holding an output no
+	// namespace fully has — not to end the attempt, which continues behind it
+	// until the pair is durable or the process ends.
+	//
+	// It is one-shot on purpose: quiescence is one-way, so saying it twice
+	// changes nothing, and key material that lands in a later round is
+	// reported by keyMaterialPreserved rather than by a second notification
+	// here.
+	stillIncomplete func(quarantineState, error)
+}
+
 // preserve durably saves the signer membership and its audit metadata under
 // the quarantine namespace, mirroring the active storage layout so the same
 // decoding path can interpret both. It keeps ownership of the generated output
@@ -162,15 +190,13 @@ type quarantineState struct {
 // writes leaves the key material behind rather than only the note describing
 // it: an unexplained share is recoverable, a lost one is not.
 //
-// notifyIncomplete is called once, after graceAttempts rounds have left a half
-// unwritten, with what the namespace holds so far. It exists so the node can
-// stop taking new work while it is still holding an output no namespace fully
-// has — not to end the attempt, which continues behind it until the pair is
-// durable or the process ends.
+// The observer is told what the namespace takes while the preservation is still
+// running, because a caller that only reads the returned state learns nothing
+// until an attempt that may outlast the process is over.
 func (q *signerQuarantine) preserve(
 	signer *signer,
 	metadata QuarantinedSignerMetadata,
-	notifyIncomplete func(quarantineState, error),
+	observer quarantineObserver,
 ) (quarantineState, error) {
 	var state quarantineState
 
@@ -232,7 +258,7 @@ func (q *signerQuarantine) preserve(
 		memberSuffix,
 		signerBytes,
 		metadataBytes,
-		notifyIncomplete,
+		observer,
 	)
 	if lastErr == nil {
 		report(rounds, true)
@@ -266,7 +292,7 @@ func (q *signerQuarantine) persistPair(
 	memberSuffix string,
 	signerBytes []byte,
 	metadataBytes []byte,
-	notifyIncomplete func(quarantineState, error),
+	observer quarantineObserver,
 ) (int, error) {
 	graceAttempts := q.graceAttempts
 	if graceAttempts < 1 {
@@ -279,6 +305,13 @@ func (q *signerQuarantine) persistPair(
 	delay := q.retryDelay
 
 	notified := false
+
+	// announcedLostMaterial remembers that the operator record says this share
+	// reached no namespace. It is what makes a later write worth a line of its
+	// own: until one is written, the standing account of this output is an error
+	// saying the material is only in memory, over a namespace that now holds it.
+	announcedLostMaterial := false
+
 	var lastErr error
 
 	for round := 1; ; round++ {
@@ -295,7 +328,32 @@ func (q *signerQuarantine) persistPair(
 					err,
 				))
 			} else {
+				// Reported from inside the round rather than from the return,
+				// because the round the metadata lands in may never come: this
+				// is the only moment the material is known to be held that a
+				// caller is guaranteed to see.
 				state.membershipPersisted = true
+
+				if announcedLostMaterial {
+					announcedLostMaterial = false
+					// Named by the directory the record lives under rather
+					// than by the wallet hash the other quarantine lines
+					// carry: an operator reading this is going to the
+					// namespace to confirm the material is there.
+					q.logger.Warnf(
+						"the quarantine namespace took the tbtc key material "+
+							"it had been refusing [walletStorageKey=%s] "+
+							"[member=%s] [round=%d]; the share this node "+
+							"reported as only in memory is on disk",
+						directory,
+						memberSuffix,
+						round,
+					)
+				}
+
+				if observer.keyMaterialPreserved != nil {
+					observer.keyMaterialPreserved()
+				}
 			}
 		}
 
@@ -327,8 +385,9 @@ func (q *signerQuarantine) persistPair(
 		// the retry keeps running behind the notification.
 		if !notified && round >= graceAttempts {
 			notified = true
-			if notifyIncomplete != nil {
-				notifyIncomplete(*state, lastErr)
+			announcedLostMaterial = !state.membershipPersisted
+			if observer.stillIncomplete != nil {
+				observer.stillIncomplete(*state, lastErr)
 			}
 		}
 

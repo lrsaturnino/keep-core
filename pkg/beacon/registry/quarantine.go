@@ -275,6 +275,13 @@ func (q *Quarantine) persistPair(
 	delay := q.retryDelay
 
 	notified := false
+
+	// announcedLostMaterial remembers that the operator record says this share
+	// reached no namespace. It is what makes a later write worth a line of its
+	// own: until one is written, the standing account of this output is an error
+	// saying the material is only in memory, over a namespace that now holds it.
+	announcedLostMaterial := false
+
 	var lastErr error
 
 	for round := 1; ; round++ {
@@ -292,6 +299,19 @@ func (q *Quarantine) persistPair(
 				))
 			} else {
 				state.MembershipPersisted = true
+
+				if announcedLostMaterial {
+					announcedLostMaterial = false
+					q.logger.Warnf(
+						"the quarantine namespace took the beacon key "+
+							"material it had been refusing [group=0x%s] "+
+							"[member=%s] [round=%d]; the share this node "+
+							"reported as only in memory is on disk",
+						directory,
+						memberSuffix,
+						round,
+					)
+				}
 			}
 		}
 
@@ -323,6 +343,7 @@ func (q *Quarantine) persistPair(
 		// the retry keeps running behind the notification.
 		if !notified && round >= graceAttempts {
 			notified = true
+			announcedLostMaterial = !state.MembershipPersisted
 			if notifyIncomplete != nil {
 				notifyIncomplete(*state, lastErr)
 			}
