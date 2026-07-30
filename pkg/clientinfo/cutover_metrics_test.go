@@ -3,6 +3,11 @@ package clientinfo
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
 	"testing"
 
 	keepclientinfo "github.com/keep-network/keep-common/pkg/clientinfo"
@@ -129,6 +134,80 @@ var participationMetricFamily = []string{
 	MetricParticipationTBTCQuarantineIncompleteOutputs,
 	MetricParticipationBeaconQuarantineIncompleteOutputs,
 	MetricParticipationQuarantinedTBTCSigners,
+}
+
+// TestParticipationMetrics_DocumentationMatchesFamily keeps the canonical
+// metrics reference and the fixed participation family in lockstep in both
+// directions. A code metric with no heading leaves operators without its
+// semantics; a participation heading with no code metric promises a series no
+// node can publish.
+//
+// Per-ceremony refusals are generated from a closed roster and intentionally
+// share one documentation template, so that template joins the fixed family
+// for this comparison.
+func TestParticipationMetrics_DocumentationMatchesFamily(t *testing.T) {
+	documentPath := filepath.Join("..", "..", "docs", "performance-metrics.adoc")
+	document, err := os.ReadFile(documentPath)
+	if err != nil {
+		t.Fatalf("cannot read participation metrics reference: %v", err)
+	}
+
+	const sectionHeading = "=== Protocol Participation Gate Metrics"
+	sectionStart := strings.Index(string(document), sectionHeading)
+	if sectionStart < 0 {
+		t.Fatalf("metrics reference has no %q section", sectionHeading)
+	}
+
+	section := string(document)[sectionStart+len(sectionHeading):]
+	if nextSection := strings.Index(section, "\n=== "); nextSection >= 0 {
+		section = section[:nextSection]
+	}
+
+	headingPattern := regexp.MustCompile(
+		"(?m)^==== `performance_(participation_[^`]+)`[[:space:]]*$",
+	)
+	documented := make(map[string]int)
+	for _, match := range headingPattern.FindAllStringSubmatch(section, -1) {
+		documented[match[1]]++
+	}
+
+	expected := make(map[string]struct{}, len(participationMetricFamily)+1)
+	for _, metric := range participationMetricFamily {
+		expected[metric] = struct{}{}
+	}
+	expected["participation_refusals_<ceremony>_total"] = struct{}{}
+
+	var missing []string
+	for metric := range expected {
+		if documented[metric] == 0 {
+			missing = append(missing, "performance_"+metric)
+		}
+	}
+
+	var unexpected []string
+	var duplicate []string
+	for metric, count := range documented {
+		if _, ok := expected[metric]; !ok {
+			unexpected = append(unexpected, "performance_"+metric)
+		}
+		if count > 1 {
+			duplicate = append(duplicate, "performance_"+metric)
+		}
+	}
+
+	sort.Strings(missing)
+	sort.Strings(unexpected)
+	sort.Strings(duplicate)
+
+	if len(missing) > 0 {
+		t.Errorf("participation metrics missing from reference: %v", missing)
+	}
+	if len(unexpected) > 0 {
+		t.Errorf("reference documents unknown participation metrics: %v", unexpected)
+	}
+	if len(duplicate) > 0 {
+		t.Errorf("reference duplicates participation metric headings: %v", duplicate)
+	}
 }
 
 // TestParticipationMetrics_RegisteredWithTheExposingRegistry proves every

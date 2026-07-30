@@ -9752,12 +9752,12 @@ ROLLBACK_QUARANTINE_PRESERVATION_FAILURES=""
 ROLLBACK_REQUIRED_CLASSES="threshold_ceremony bitcoin_action"
 
 rollback_quarantine_preservation_verdict() {
-  local step="quarantine preservation failures remain zero through quiescence"
+  local step="quarantine preservation is complete through quiescence"
   local assertion="rollback quiescence loses no generated signer output to \
 an unwritable quarantine namespace"
   local service tbtc_failures beacon_failures tbtc_incomplete beacon_incomplete
   local nodes=0
-  local unread="" failed=""
+  local unread="" still_incomplete="" recovered=""
 
   while read -r service tbtc_failures beacon_failures tbtc_incomplete \
     beacon_incomplete; do
@@ -9784,11 +9784,22 @@ ${tbtc_incomplete},\
 \"${service}.participation_beacon_quarantine_incomplete_outputs\":\
 ${beacon_incomplete}"
 
-    if ((tbtc_failures > 0 || beacon_failures > 0 ||
-      tbtc_incomplete > 0 || beacon_incomplete > 0)); then
-      failed="${failed}${failed:+, }${service} (tBTC failures \
-${tbtc_failures}, beacon failures ${beacon_failures}, tBTC incomplete \
-${tbtc_incomplete}, beacon incomplete ${beacon_incomplete})"
+    if ((tbtc_incomplete > 0)); then
+      still_incomplete="${still_incomplete}${still_incomplete:+, }${service} \
+(tBTC incomplete ${tbtc_incomplete}, grace-exhaustion history \
+${tbtc_failures})"
+    elif ((tbtc_failures > 0)); then
+      recovered="${recovered}${recovered:+, }${service} (tBTC \
+grace-exhaustion episodes ${tbtc_failures}, live incomplete 0)"
+    fi
+
+    if ((beacon_incomplete > 0)); then
+      still_incomplete="${still_incomplete}${still_incomplete:+, }${service} \
+(beacon incomplete ${beacon_incomplete}, grace-exhaustion history \
+${beacon_failures})"
+    elif ((beacon_failures > 0)); then
+      recovered="${recovered}${recovered:+, }${service} (beacon \
+grace-exhaustion episodes ${beacon_failures}, live incomplete 0)"
     fi
   done <<<"${ROLLBACK_QUARANTINE_PRESERVATION_FAILURES}"
 
@@ -9802,14 +9813,21 @@ generated share was lost"
 incomplete-output gauges were unreadable on ${unread}; zero must be a \
 node-authored reading, not the value assigned to a node that stopped answering"
     record_assertion "${assertion}" false "${step}"
-  elif [[ -n "${failed}" ]]; then
-    record_step "${step}" fail "generated signer output did not reach a \
-complete protected quarantine on ${failed}; no offline audit can recover a \
-share the namespace retained nowhere"
+  elif [[ -n "${still_incomplete}" ]]; then
+    record_step "${step}" fail "an R1 node is still holding generated signer \
+output whose protected quarantine lacks key material or its audit record on \
+${still_incomplete}; rollback remains refused until every output becomes \
+fully durable and its live incomplete-output gauge clears"
     record_assertion "${assertion}" false "${step}"
+  elif [[ -n "${recovered}" ]]; then
+    record_step "${step}" pass "preservation exhausted its write-grace rounds \
+and later completed on ${recovered}; the cumulative counters retain those \
+recovered episodes, every live incomplete-output gauge is zero, and the \
+offline state audit remains required before rollback"
+    record_assertion "${assertion}" true "${step}"
   else
     record_step "${step}" pass "every R1 node reported zero tBTC and beacon \
-quarantine-preservation failures and zero live incomplete outputs through its \
+write-grace exhaustion episodes and zero live incomplete outputs through its \
 last readable drain sample"
     record_assertion "${assertion}" true "${step}"
   fi
@@ -11973,7 +11991,7 @@ ${beacon_incomplete_outputs[${pos}]}"
   ROLLBACK_DRAIN_RC="${drain_rc}"
   rollback_drain_verdict
 
-  begin_step "quarantine preservation failures remain zero through quiescence"
+  begin_step "quarantine preservation is complete through quiescence"
   rollback_quarantine_preservation_verdict
 
   begin_step "no prior binary starts during quiescence"
@@ -12842,7 +12860,7 @@ evidence_acceptance_findings() {
       rollback: {
         stages: [
           "quiesce every R1 node with work represented",
-          "quarantine preservation failures remain zero through quiescence",
+          "quarantine preservation is complete through quiescence",
           "no prior binary starts during quiescence",
           "a forced deadline quarantines rather than completing",
           "every release candidate is stopped or network-quarantined",
@@ -12863,7 +12881,7 @@ evidence_acceptance_findings() {
             name:
               "rollback quiescence loses no generated signer output to an unwritable quarantine namespace",
             stage:
-              "quarantine preservation failures remain zero through quiescence",
+              "quarantine preservation is complete through quiescence",
           },
           {
             name:
@@ -12968,7 +12986,7 @@ evidence_acceptance_findings() {
 
     if (record.gate === "rollback") {
       const preservationStageName =
-        "quarantine preservation failures remain zero through quiescence";
+        "quarantine preservation is complete through quiescence";
       const preservationStage = stageByName.get(preservationStageName) || {};
       const gauges =
         preservationStage.gauges &&
@@ -12980,34 +12998,78 @@ evidence_acceptance_findings() {
       // the validator self-test. Requiring every service in that same roster
       // prevents one healthy node from standing in for another node that
       // stopped answering before it published whether preservation failed.
-      for (const metric of [
-        "participation_tbtc_quarantine_preservation_failures_total",
-        "participation_beacon_quarantine_preservation_failures_total",
-        "participation_tbtc_quarantine_incomplete_outputs",
-        "participation_beacon_quarantine_incomplete_outputs",
-      ]) {
-        for (const service of expectedServices) {
-          const name = service + "." + metric;
-          if (!Object.prototype.hasOwnProperty.call(gauges, name)) {
-            add(
-              "unrehearsed",
-              "rollback step " + JSON.stringify(preservationStageName) +
-                " carries no fleet reading of " + JSON.stringify(name)
-            );
-            continue;
-          }
-          const value = gauges[name];
-          if (!Number.isFinite(value)) {
-            add(
-              "unrehearsed",
-              "rollback quarantine-preservation reading " +
-                JSON.stringify(name) + " is not numeric"
-            );
-          } else if (value !== 0) {
+      if (expectedServices.length === 0) {
+        add(
+          "unrehearsed",
+          "rollback acceptance received an empty expected R1 service roster; " +
+            "no fleet reading can authorize rollback"
+        );
+      }
+
+      const readMetric = (service, metric) => {
+        const name = service + "." + metric;
+        if (!Object.prototype.hasOwnProperty.call(gauges, name)) {
+          add(
+            "unrehearsed",
+            "rollback step " + JSON.stringify(preservationStageName) +
+              " carries no fleet reading of " + JSON.stringify(name)
+          );
+          return undefined;
+        }
+        const value = gauges[name];
+        if (!Number.isFinite(value)) {
+          add(
+            "unrehearsed",
+            "rollback quarantine-preservation reading " +
+              JSON.stringify(name) + " is not numeric"
+          );
+          return undefined;
+        }
+        return value;
+      };
+
+      const quarantineSignals = [
+        {
+          protocol: "tBTC",
+          counter:
+            "participation_tbtc_quarantine_preservation_failures_total",
+          incomplete:
+            "participation_tbtc_quarantine_incomplete_outputs",
+        },
+        {
+          protocol: "beacon",
+          counter:
+            "participation_beacon_quarantine_preservation_failures_total",
+          incomplete:
+            "participation_beacon_quarantine_incomplete_outputs",
+        },
+      ];
+      for (const service of expectedServices) {
+        for (const signal of quarantineSignals) {
+          const counterName = service + "." + signal.counter;
+          const incompleteName = service + "." + signal.incomplete;
+          const counter = readMetric(service, signal.counter);
+          const incomplete = readMetric(service, signal.incomplete);
+          if (incomplete !== undefined && incomplete !== 0) {
             add(
               "refuted",
-              "rollback quarantine-preservation reading " +
-                JSON.stringify(name) + " is " + value + ", not zero"
+              "rollback node " + JSON.stringify(service) +
+                " is still holding " + signal.protocol +
+                " output whose protected quarantine is incomplete: " +
+                JSON.stringify(incompleteName) + " is " + incomplete
+            );
+          } else if (
+            counter !== undefined &&
+            incomplete === 0 &&
+            counter !== 0
+          ) {
+            add(
+              "advisory",
+              "rollback node " + JSON.stringify(service) + " recorded " +
+                signal.protocol + " preservation whose write-grace " +
+                "exhausted and later completed: " +
+                JSON.stringify(counterName) + " is " + counter + " and " +
+                JSON.stringify(incompleteName) + " is zero"
             );
           }
         }
@@ -13063,7 +13125,8 @@ evidence_acceptance_findings() {
     }
 
     process.stdout.write(findings.join("\n"));
-  ' "${record}" "${REHEARSAL_R1_SERVICES[@]}"
+  ' "${record}" \
+    "${REHEARSAL_R1_SERVICES[@]+"${REHEARSAL_R1_SERVICES[@]}"}"
 }
 
 # Apply the acceptance contract to a caller-selected record set. The
@@ -13073,7 +13136,7 @@ assess_evidence_record_set() {
   (($# > 0)) ||
     blocked "no evidence records were supplied for acceptance"
 
-  local refutations=() unrehearsed=()
+  local refutations=() unrehearsed=() advisories=()
   local record outcomes kind what
   for record in "$@"; do
     outcomes="$(evidence_acceptance_findings "${record}")" ||
@@ -13084,6 +13147,7 @@ assess_evidence_record_set() {
       case "${kind}" in
       refuted) refutations+=("${record##*/}: ${what}") ;;
       unrehearsed) unrehearsed+=("${record##*/}: ${what}") ;;
+      advisory) advisories+=("${record##*/}: ${what}") ;;
       esac
     done <<<"${outcomes}"
   done
@@ -13099,6 +13163,11 @@ records were missing, duplicated, misbound, or never executed: \
 ${unrehearsed[*]}; an incomplete gate contract has not been rehearsed, \
 whatever the records that do exist show"
   fi
+
+  local advisory
+  for advisory in "${advisories[@]+"${advisories[@]}"}"; do
+    note "non-fatal recovered quarantine evidence: ${advisory}"
+  done
 
   note "every required step passed exactly once, every required assertion \
 holds against its designated passing step, and every required reviewed \

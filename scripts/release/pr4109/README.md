@@ -1972,10 +1972,15 @@ history. The accompanying
 `performance_participation_beacon_quarantine_incomplete_outputs` gauges are
 also pre-registered at zero, rise for the whole live retry after grace is
 exhausted, and clear only when the full output becomes durable. The rollback
-rehearsal samples all four signals while each candidate drains and refuses a
-nonzero or unreadable value; zero means the node reported neither a
-grace-exhausting preservation failure nor an output currently incomplete, not
-that a missing share was counted as an empty quarantine.
+rehearsal samples all four signals while each candidate drains. An unreadable
+signal or a nonzero live gauge refuses rollback because the node has not proved
+that the output became fully durable. A nonzero counter paired with a zero live
+gauge is retained as a distinct, non-fatal recovery finding: preservation
+exhausted its write-grace rounds and later completed. It does not bypass the
+offline state audit, which must still prove the durable namespace before the
+prior release starts. All four zero means the node reported neither a
+grace-exhausting episode nor an output currently incomplete; it does not turn a
+missing reading into an empty quarantine.
 
 Two things would close it, and both are decisions rather than oversights. A
 `keep-common` change making `Write` write-temp-sync-rename-sync-dir is the

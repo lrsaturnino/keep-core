@@ -769,9 +769,11 @@ const (
 	// The quarantine-preservation failure counters increment as soon as an
 	// output remains incomplete after the write-grace rounds, while the process
 	// is still alive and retrying. An attempt that returns incomplete before
-	// that observer can run is counted on return. They are protocol-specific
-	// fixed counters so the fleet and rollback evidence can identify which
-	// recovery path failed without introducing per-output labels.
+	// that observer can run is counted on return. They remain cumulative if a
+	// later retry completes; the paired live gauges below distinguish recovered
+	// history from an output still incomplete. They are protocol-specific fixed
+	// counters so fleet and rollback evidence can identify which recovery path
+	// exhausted its grace without introducing per-output labels.
 	MetricParticipationTBTCQuarantinePreservationFailuresTotal   = "participation_tbtc_quarantine_preservation_failures_total"
 	MetricParticipationBeaconQuarantinePreservationFailuresTotal = "participation_beacon_quarantine_preservation_failures_total"
 	MetricHeartbeatPenaltySuppressedTotal                        = "heartbeat_penalty_suppressed_total"

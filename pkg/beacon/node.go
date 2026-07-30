@@ -527,9 +527,12 @@ func (n *node) quarantineSigner(
 
 // markIncompleteQuarantine publishes a newly observed incomplete preservation.
 // The normal call is the live grace-exhaustion callback; the return-time call
-// covers failures that reached no callback. The counter records each distinct
-// incomplete episode and the gauge remains nonzero for as long as the output
-// lacks either key material or its audit record.
+// covers failures that reached no callback. The counter records the first
+// grace-exhaustion notification for an output while that output remains
+// unresolved; repeated notifications for the same group seat coalesce in the
+// live gauge. Resolution removes the seat, so a later incomplete episode for
+// it is counted again. The gauge remains nonzero for as long as the output lacks
+// either key material or its audit record.
 func (n *node) markIncompleteQuarantine(
 	output beaconQuarantinedSigner,
 ) {

@@ -197,7 +197,7 @@ SINGLE_RELEASE_ASSERTIONS='
   { "assertion": "a finished cutover rehearsal leaves no candidate able to act", "holds": true, "evidence_stage": "the cutover fleet leaves no release candidate running" }'
 ROLLBACK_STAGES='
   { "name": "quiesce every R1 node with work represented", "outcome": "pass" },
-  { "name": "quarantine preservation failures remain zero through quiescence", "outcome": "pass", "gauges": {
+  { "name": "quarantine preservation is complete through quiescence", "outcome": "pass", "gauges": {
       "r1-node-1.participation_tbtc_quarantine_preservation_failures_total": 0,
       "r1-node-1.participation_beacon_quarantine_preservation_failures_total": 0,
       "r1-node-1.participation_tbtc_quarantine_incomplete_outputs": 0,
@@ -218,7 +218,7 @@ ROLLBACK_STAGES='
   { "name": "the prior binary loads and signs with a wallet created after C", "outcome": "pass" }'
 ROLLBACK_ASSERTIONS='
   { "assertion": "every R1 node drains to a stop within the reviewed termination grace", "holds": true, "evidence_stage": "quiesce every R1 node with work represented" },
-  { "assertion": "rollback quiescence loses no generated signer output to an unwritable quarantine namespace", "holds": true, "evidence_stage": "quarantine preservation failures remain zero through quiescence" },
+  { "assertion": "rollback quiescence loses no generated signer output to an unwritable quarantine namespace", "holds": true, "evidence_stage": "quarantine preservation is complete through quiescence" },
   { "assertion": "no prior binary participates before every R1 node is down", "holds": true, "evidence_stage": "no prior binary starts during quiescence" },
   { "assertion": "all R1 is down or quarantined before any prior binary participates", "holds": true, "evidence_stage": "every release candidate is stopped or network-quarantined" },
   { "assertion": "the offline state audit passes before rollback", "holds": true, "evidence_stage": "offline state audit produces a rollback-safe manifest" },
@@ -1162,7 +1162,7 @@ node -e '
   const stage = record.stages.find(
     ({ name }) =>
       name ===
-      "quarantine preservation failures remain zero through quiescence"
+      "quarantine preservation is complete through quiescence"
   );
   delete stage.gauges[
     "r1-node-1.participation_beacon_quarantine_preservation_failures_total"
@@ -1173,10 +1173,27 @@ run_validator "${D}"
 check "rollback acceptance requires both preservation-failure readings" 3 \
   "carries no fleet reading of.*r1-node-1.*beacon_quarantine_preservation_failures_total"
 
-# A complete reading that is nonzero refutes rollback rather than leaving it
-# merely unrehearsed: the node reported that generated material did not reach a
-# complete auditable namespace.
-D="${WORK}/accept-rollback-preservation-failure"
+# The acceptance reader must never become vacuous if its expected fleet roster
+# is empty. The compose/source drift check normally prevents that state, but
+# the reader is a release gate in its own right and refuses it explicitly.
+D="${WORK}/accept-rollback-empty-expected-roster"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z" "${FIXTURE_SHA}" "${ROLLBACK_STAGES}" \
+  "${ROLLBACK_ASSERTIONS}" "rollback"
+SAVED_ACCEPTANCE_R1_SERVICES=("${REHEARSAL_R1_SERVICES[@]}")
+REHEARSAL_R1_SERVICES=()
+run_validator "${D}"
+REHEARSAL_R1_SERVICES=("${SAVED_ACCEPTANCE_R1_SERVICES[@]}")
+check "rollback acceptance refuses an empty expected R1 service roster" 3 \
+  "empty expected R1 service roster.*no fleet reading can authorize rollback"
+
+# A grace-exhaustion counter is historical. When the paired live gauge is zero,
+# the full output later became durable; retain that episode as an explicit
+# advisory without permanently refusing a rollback whose offline audit still
+# has to prove the namespace.
+D="${WORK}/accept-rollback-recovered-preservation-episode"
 mkdir -p "${D}"
 write_attestation "${D}"
 write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
@@ -1189,7 +1206,7 @@ node -e '
   const stage = record.stages.find(
     ({ name }) =>
       name ===
-      "quarantine preservation failures remain zero through quiescence"
+      "quarantine preservation is complete through quiescence"
   );
   stage.gauges[
     "r1-node-1.participation_tbtc_quarantine_preservation_failures_total"
@@ -1197,8 +1214,9 @@ node -e '
   fs.writeFileSync(path, JSON.stringify(record, null, 2));
 ' "${D}/record.json"
 run_validator "${D}"
-check "a reported quarantine-preservation failure refutes rollback" 1 \
-  "quarantine-preservation reading.*tbtc.*is 1, not zero"
+check "a recovered grace-exhaustion episode is retained but does not refuse rollback" \
+  0 "non-fatal recovered quarantine evidence.*tBTC.*write-grace exhausted.*later completed" \
+  "tbtc_quarantine_preservation_failures_total.*is 1.*incomplete_outputs.*is zero"
 
 # The live gauge is independently load-bearing. The counter records that an
 # output exhausted its grace rounds; the gauge proves a running node is not
@@ -1216,7 +1234,7 @@ node -e '
   const stage = record.stages.find(
     ({ name }) =>
       name ===
-      "quarantine preservation failures remain zero through quiescence"
+      "quarantine preservation is complete through quiescence"
   );
   delete stage.gauges[
     "r1-node-2.participation_beacon_quarantine_incomplete_outputs"
@@ -1240,8 +1258,11 @@ node -e '
   const stage = record.stages.find(
     ({ name }) =>
       name ===
-      "quarantine preservation failures remain zero through quiescence"
+      "quarantine preservation is complete through quiescence"
   );
+  stage.gauges[
+    "r1-node-2.participation_tbtc_quarantine_preservation_failures_total"
+  ] = 1;
   stage.gauges[
     "r1-node-2.participation_tbtc_quarantine_incomplete_outputs"
   ] = 1;
@@ -1249,7 +1270,50 @@ node -e '
 ' "${D}/record.json"
 run_validator "${D}"
 check "a live incomplete quarantine output refutes rollback" 1 \
-  "quarantine-preservation reading.*tbtc_quarantine_incomplete_outputs.*is 1"
+  "still holding tBTC output whose protected quarantine is incomplete.*tbtc_quarantine_incomplete_outputs.*is 1"
+
+# Drive the shell-side verdict as well as the archive reader. These are the two
+# states the metrics can distinguish: historical grace exhaustion whose output
+# later became fully durable, and an output the running node is still holding
+# while its protected namespace remains incomplete.
+quarantine_preservation_verdict_case() {
+  local readings="$1"
+  local saved_readings="${ROLLBACK_QUARANTINE_PRESERVATION_FAILURES}"
+  local saved_step_gauges="${STEP_GAUGES}"
+
+  REHEARSAL_STEPS=()
+  REHEARSAL_ASSERTIONS=()
+  REHEARSAL_BLOCKED_STEPS=()
+  REHEARSAL_FAILED_STEPS=()
+  REHEARSAL_REFUTED_ASSERTIONS=()
+  ROLLBACK_QUARANTINE_PRESERVATION_FAILURES="${readings}"
+
+  {
+    begin_step "quarantine preservation is complete through quiescence"
+    rollback_quarantine_preservation_verdict
+  } >/dev/null
+
+  CASE_OUT="${REHEARSAL_STEPS[0]} ${REHEARSAL_ASSERTIONS[0]}"
+  CASE_RC=0
+
+  ROLLBACK_QUARANTINE_PRESERVATION_FAILURES="${saved_readings}"
+  STEP_GAUGES="${saved_step_gauges}"
+  REHEARSAL_STEPS=()
+  REHEARSAL_ASSERTIONS=()
+  REHEARSAL_BLOCKED_STEPS=()
+  REHEARSAL_FAILED_STEPS=()
+  REHEARSAL_REFUTED_ASSERTIONS=()
+}
+
+quarantine_preservation_verdict_case "r1-node-1 1 0 0 0"
+check "the live verdict records a recovered episode as non-fatal" 0 \
+  '"outcome":"pass".*write-grace rounds and later completed' \
+  '"holds":true'
+
+quarantine_preservation_verdict_case "r1-node-1 1 0 1 0"
+check "the live verdict refuses an output that remains incomplete" 0 \
+  '"outcome":"fail".*still holding generated signer output' \
+  '"holds":false'
 
 # Repetition and invention cannot manufacture a complete gate. These records
 # keep the canonical item count deliberately plausible so the decision cannot
