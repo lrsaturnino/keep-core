@@ -1,7 +1,14 @@
 {
-  "schema_version": 1,
-  "generated_at": "2026-07-28T00:15:48Z",
+  "schema_version": 2,
+  "generated_at": "2026-07-30T16:31:04Z",
   "protocol_epoch": "security_v2_cutover",
+  "release_identity": {
+    "source_commit": "",
+    "chain_id": 1,
+    "cutover_block": 0,
+    "images": [],
+    "notes": "The chain id and the cutover block are held against what the client compiles in, so this document can never name a cutover height no node observes. Both remaining fields are unrecorded on purpose: a manifest is reviewed before the build it names exists, and the source commit and immutable image digests are outputs of that build. `keep-client release-manifest validate` accepts this document as internally valid; `validate --release-ready` refuses it and names what is missing, which today includes the zero cutover block — the compiled placeholder a reviewed release commit must replace with the block published in the operator notice. No release-acceptance decision may be taken against a manifest that does not pass `--release-ready`."
+  },
   "termination_grace": {
     "tbtc_completion_blocks": 1200,
     "beacon_completion_blocks": 136,

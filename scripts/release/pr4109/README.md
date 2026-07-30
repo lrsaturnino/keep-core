@@ -1484,6 +1484,43 @@ inside that headroom. The client never reads the manifest at runtime; its
 bounds are compiled in, and the manifest exists so the SIGKILL deadline is
 derived from those same bounds.
 
+Beside the grace, the manifest names what the release *is*. The grace binds
+the document to the compiled bounds of the binary validating it, which
+establishes the numbers are right for some build of this source; it does not
+establish which build the fleet runs, nor which chain and block the cutover it
+describes is for. Every statement made about the release afterwards — smoke
+gate evidence, the inventory's per-instance digest attestation, a rollback
+decision taken against a block height — is stated against those identities, so
+`release_identity` carries them: the mainnet `chain_id`, the `cutover_block`
+C, the `source_commit` finally built, and one digest-pinned image `reference`
+per platform.
+
+Two of those four are checked by every validate run. `chain_id` is re-derived
+from the same network definition the client verifies the remote endpoint
+against at connect time, and `cutover_block` must equal
+`participation.MainnetCutoverBlock` as compiled into the validating binary —
+so the reviewed document can never publish a height no node observes, and the
+release commit that sets C forces the manifest to be regenerated and
+re-reviewed. The other two are outputs of a build that does not exist when the
+manifest is first reviewed, so they are recorded by the release commit rather
+than derived, and each image reference must end with exactly the digest
+recorded beside it: a tag is a name the registry may repoint, so a tagged
+reference would run whatever it resolves to at pull time rather than the
+artifact the evidence describes.
+
+Validity and release-readiness are therefore separate verdicts.
+`release-manifest validate` asks whether the document contradicts the binary,
+which it must not at any point in development. `release-manifest validate
+--release-ready` additionally asks whether the identity is complete, and it is
+the check a release-acceptance decision is taken against. The checked-in
+manifest passes the first and deliberately fails the second; the failure names
+what is outstanding, which today includes the zero cutover block — the one
+blocker that lives in the client rather than in the document, clearable only
+by a reviewed release commit and not by any edit to this file. A `cmd` test
+holds that standing state in place from both directions: it fails if the
+manifest stops validating, and it fails if release-readiness starts passing
+while the identity is still empty.
+
 The chain is enforced at three layers, each fail-closed:
 
 - `keep-client release-manifest derive` prints the manifest derived from the
@@ -1491,7 +1528,10 @@ The chain is enforced at three layers, each fail-closed:
   --manifest <path>` re-derives every number and rejects the manifest on any
   mismatch, reporting every violation at once. Because the subcommand ships in
   the client binary, the exact-image rehearsal can validate the manifest with
-  the very artifact under test.
+  the very artifact under test. `derive` fills in only the identity the binary
+  can speak for — a binary cannot honestly name the tree it was built from or
+  the registry addresses it was packaged into — so its output carries an empty
+  source commit and image list, exactly what `--release-ready` then refuses.
 - `go test ./cmd/ -run TestReleaseManifest` pins the checked-in manifest to
   the compiled bounds and the deployment scaffold to the manifest, so a
   changed protocol constant, a stale manifest, and a drifted scaffold value

@@ -2,9 +2,11 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -17,6 +19,8 @@ import (
 const releaseManifestRepositoryPath = "../scripts/release/pr4109/release-manifest.json"
 
 const releaseManifestDeployDirectory = "../scripts/release/pr4109/deploy"
+
+const releaseManifestSchemaPath = "../scripts/release/pr4109/release-manifest.schema.json"
 
 const rehearsalEvidenceSchemaPath = "../scripts/release/pr4109/rehearsal-evidence.schema.json"
 
@@ -35,8 +39,35 @@ func validReleaseManifestForTests(t *testing.T) releaseManifest {
 		SchemaVersion:    releaseManifestSchemaVersion,
 		GeneratedAt:      "2026-07-27T23:11:28Z",
 		ProtocolEpoch:    participation.CompiledEpoch.String(),
+		ReleaseIdentity:  deriveReleaseIdentity(),
 		TerminationGrace: grace,
 	}
+}
+
+// releaseReadyIdentityForTests is a fully recorded release identity: the
+// compiled chain and cutover block plus the build outputs a release commit
+// supplies. The cutover block is taken from the compiled constant rather than
+// invented, so this helper states a complete identity for as long as that
+// constant is a placeholder and keeps stating one after it is set.
+func releaseReadyIdentityForTests() releaseIdentity {
+	identity := deriveReleaseIdentity()
+	identity.SourceCommit = "0123456789abcdef0123456789abcdef01234567"
+	identity.Images = []releaseImage{
+		{
+			Platform: "linux/amd64",
+			Reference: "gcr.io/keep-test/keep-client@sha256:" +
+				strings.Repeat("a", 64),
+			Digest: "sha256:" + strings.Repeat("a", 64),
+		},
+		{
+			Platform: "linux/arm64",
+			Reference: "gcr.io/keep-test/keep-client@sha256:" +
+				strings.Repeat("b", 64),
+			Digest: "sha256:" + strings.Repeat("b", 64),
+		},
+	}
+
+	return identity
 }
 
 // TestReleaseManifestDeriveMatchesCompiledBounds is the drift assertion for
@@ -274,6 +305,163 @@ func TestReleaseManifestDeploymentScaffoldMatchesManifest(t *testing.T) {
 	}
 }
 
+// TestReleaseManifestSchemaMatchesTheDecodedDocument is the drift check for
+// the published schema. The schema is a hand-written mirror of the types the
+// client decodes, and nothing but this test holds the two together.
+//
+// Drift here is quiet and one-directional. The strict Go loader rejects a field
+// the schema forgot, so a manifest is never accepted on a mismatch; what
+// happens instead is that external tooling validating against the schema passes
+// a document the release binary refuses, or — worse — reports a document
+// complete while a required section it never learned about is missing from it.
+func TestReleaseManifestSchemaMatchesTheDecodedDocument(t *testing.T) {
+	content, err := os.ReadFile(releaseManifestSchemaPath)
+	if err != nil {
+		t.Fatalf("cannot read the manifest schema: [%v]", err)
+	}
+
+	// Decoded as an object graph rather than into a shape of its own: the check
+	// walks the same nesting the manifest types have, and a schema that renamed
+	// or moved a section must fail rather than decode into zero values.
+	var schema map[string]any
+	if err := json.Unmarshal(content, &schema); err != nil {
+		t.Fatalf("cannot decode the manifest schema: [%v]", err)
+	}
+
+	if version := schemaObject(t, schema, "properties", "schema_version"); version != nil {
+		if got, want := version["const"], float64(releaseManifestSchemaVersion); got != want {
+			t.Errorf(
+				"the schema pins schema_version to [%v], the binary accepts "+
+					"only [%v]",
+				got,
+				want,
+			)
+		}
+	}
+
+	for _, section := range []struct {
+		name     string
+		path     []string
+		recorded any
+	}{
+		{"the manifest", nil, releaseManifest{}},
+		{
+			"release_identity",
+			[]string{"properties", "release_identity"},
+			releaseIdentity{},
+		},
+		{
+			"release_identity.images entries",
+			[]string{
+				"properties", "release_identity", "properties", "images",
+				"items",
+			},
+			releaseImage{},
+		},
+		{
+			"termination_grace",
+			[]string{"properties", "termination_grace"},
+			terminationGrace{},
+		},
+		{
+			"termination_grace.beacon_inputs",
+			[]string{
+				"properties", "termination_grace", "properties",
+				"beacon_inputs",
+			},
+			beaconCompletionInputs{},
+		},
+	} {
+		object := schemaObject(t, schema, section.path...)
+		if object == nil {
+			t.Errorf("the schema defines no [%s] section", section.name)
+			continue
+		}
+
+		// A schema that accepts unknown properties describes a laxer document
+		// than the loader does, which is the direction that lets a hand-edited
+		// manifest read as valid to everything except the binary.
+		if closed, _ := object["additionalProperties"].(bool); closed {
+			t.Errorf("[%s] must not accept additional properties", section.name)
+		}
+
+		declared := schemaObject(t, object, "properties")
+		requiredList, _ := object["required"].([]any)
+		required := make(map[string]struct{}, len(requiredList))
+		for _, entry := range requiredList {
+			name, _ := entry.(string)
+			required[name] = struct{}{}
+		}
+
+		for field, optional := range jsonFields(section.recorded) {
+			if _, present := declared[field]; !present {
+				t.Errorf("[%s] must define [%s]", section.name, field)
+			}
+			// Optional exactly where the encoder may omit it. A required field
+			// the schema left optional is a section a document may drop; an
+			// optional one the schema required is a document the binary
+			// produces and the schema rejects.
+			if _, present := required[field]; present == optional {
+				if optional {
+					t.Errorf(
+						"[%s] must not require [%s]: the client omits it when "+
+							"it is empty",
+						section.name,
+						field,
+					)
+				} else {
+					t.Errorf("[%s] must require [%s]", section.name, field)
+				}
+			}
+		}
+
+		for field := range declared {
+			if _, recorded := jsonFields(section.recorded)[field]; !recorded {
+				t.Errorf(
+					"[%s] defines [%s], which the client does not decode",
+					section.name,
+					field,
+				)
+			}
+		}
+	}
+}
+
+// schemaObject walks a decoded schema to the object at the given path,
+// reporting nil when the path does not lead to one.
+func schemaObject(t *testing.T, schema map[string]any, path ...string) map[string]any {
+	t.Helper()
+
+	object := schema
+	for _, step := range path {
+		next, ok := object[step].(map[string]any)
+		if !ok {
+			return nil
+		}
+		object = next
+	}
+
+	return object
+}
+
+// jsonFields lists the JSON member names a manifest type encodes, saying of
+// each whether the encoder may leave it out.
+func jsonFields(recorded any) map[string]bool {
+	fields := make(map[string]bool)
+
+	structType := reflect.TypeOf(recorded)
+	for index := range structType.NumField() {
+		tag := structType.Field(index).Tag.Get("json")
+		name, options, _ := strings.Cut(tag, ",")
+		if name == "" || name == "-" {
+			continue
+		}
+		fields[name] = strings.Contains(options, "omitempty")
+	}
+
+	return fields
+}
+
 // TestRehearsalEvidenceSchemaRequiresManifestBinding pins the evidence
 // schema's release-manifest binding: every accepted rehearsal record must
 // name the hash of the reviewed manifest and the grace it ran under.
@@ -339,8 +527,8 @@ func TestReleaseManifestValidateFailsClosed(t *testing.T) {
 		expectedMessage string
 	}{
 		"wrong schema version": {
-			func(m *releaseManifest) { m.SchemaVersion = 2 },
-			"schema_version must be [1]",
+			func(m *releaseManifest) { m.SchemaVersion = 1 },
+			"schema_version must be [2]",
 		},
 		"unparseable generation timestamp": {
 			func(m *releaseManifest) { m.GeneratedAt = "yesterday" },
@@ -529,6 +717,7 @@ func TestReleaseManifestValidateRejectsCoherentlyChangedAllowance(t *testing.T) 
 func TestReleaseManifestValidateReportsEveryViolation(t *testing.T) {
 	manifest := validReleaseManifestForTests(t)
 	manifest.SchemaVersion = 7
+	manifest.ReleaseIdentity.ChainID++
 	manifest.TerminationGrace.ReviewedMarginBlocks++
 	manifest.TerminationGrace.TerminationGracePeriodSeconds++
 
@@ -537,7 +726,8 @@ func TestReleaseManifestValidateReportsEveryViolation(t *testing.T) {
 		t.Fatal("expected the mutated manifest to be rejected")
 	}
 	for _, expectedMessage := range []string{
-		"schema_version must be [1]",
+		"schema_version must be [2]",
+		"release_identity.chain_id must be [1]",
 		"reviewed_margin_blocks must be [100]",
 		"termination_grace_period_seconds must be [20160]",
 	} {
@@ -548,6 +738,223 @@ func TestReleaseManifestValidateReportsEveryViolation(t *testing.T) {
 				err,
 			)
 		}
+	}
+}
+
+// TestReleaseManifestValidateBindsIdentityToTheCompiledClient proves the
+// recorded chain and cutover block cannot drift from what the binary compiles
+// in, and that a recorded source commit or image reference has to name one
+// immutable thing.
+//
+// The client reads no manifest at runtime: it resolves the mainnet schedule
+// from its compiled constant. A document naming a different block would send
+// operators to a cutover height no node observes, and a reference carrying a
+// tag would let deployment pull whatever the registry resolves it to rather
+// than the artifact the acceptance evidence describes.
+func TestReleaseManifestValidateBindsIdentityToTheCompiledClient(t *testing.T) {
+	tests := map[string]struct {
+		mutate          func(*releaseIdentity)
+		expectedMessage string
+	}{
+		"chain other than the one the compiled cutover block is for": {
+			func(i *releaseIdentity) { i.ChainID = 11155111 },
+			"release_identity.chain_id must be [1]",
+		},
+		"cutover block the client does not compile in": {
+			func(i *releaseIdentity) {
+				i.CutoverBlock = participation.MainnetCutoverBlock + 1
+			},
+			"release_identity.cutover_block must be [" + strconv.FormatUint(
+				participation.MainnetCutoverBlock,
+				10,
+			) + "]",
+		},
+		"abbreviated source commit": {
+			func(i *releaseIdentity) { i.SourceCommit = "0123456" },
+			"release_identity.source_commit must be a full 40-character",
+		},
+		"source commit that is not hexadecimal": {
+			func(i *releaseIdentity) {
+				i.SourceCommit = strings.Repeat("z", 40)
+			},
+			"release_identity.source_commit must be a full 40-character",
+		},
+		"image digest under another algorithm": {
+			func(i *releaseIdentity) {
+				i.Images[0].Digest = "sha512:" + strings.Repeat("a", 64)
+				i.Images[0].Reference = "gcr.io/keep-test/keep-client@" +
+					i.Images[0].Digest
+			},
+			"release_identity.images[0].digest must be a sha256 content digest",
+		},
+		"image reference carrying a tag instead of its digest": {
+			func(i *releaseIdentity) {
+				i.Images[0].Reference = "gcr.io/keep-test/keep-client:v2.1.0"
+			},
+			"release_identity.images[0].reference must be pinned to its digest",
+		},
+		"image reference pinned to a different digest": {
+			func(i *releaseIdentity) {
+				i.Images[0].Reference = "gcr.io/keep-test/keep-client@sha256:" +
+					strings.Repeat("c", 64)
+			},
+			"release_identity.images[0].reference must be pinned to its digest",
+		},
+		"image without a platform": {
+			func(i *releaseIdentity) { i.Images[0].Platform = "" },
+			"release_identity.images[0].platform must name the platform",
+		},
+		"two images for one platform": {
+			func(i *releaseIdentity) {
+				i.Images[1].Platform = i.Images[0].Platform
+			},
+			"release_identity.images[1] repeats platform [linux/amd64]",
+		},
+	}
+
+	for testName, test := range tests {
+		t.Run(testName, func(t *testing.T) {
+			manifest := validReleaseManifestForTests(t)
+			manifest.ReleaseIdentity = releaseReadyIdentityForTests()
+			test.mutate(&manifest.ReleaseIdentity)
+
+			err := validateReleaseManifest(manifest)
+			if err == nil {
+				t.Fatal("expected the mutated identity to be rejected")
+			}
+			if !strings.Contains(err.Error(), test.expectedMessage) {
+				t.Errorf(
+					"rejection must name the violation [%s], got:\n%v",
+					test.expectedMessage,
+					err,
+				)
+			}
+		})
+	}
+}
+
+// TestReleaseManifestValidateAcceptsAFullyRecordedIdentity proves a complete
+// identity passes, so the checks above reject what is wrong with a manifest
+// rather than the act of recording one.
+func TestReleaseManifestValidateAcceptsAFullyRecordedIdentity(t *testing.T) {
+	manifest := validReleaseManifestForTests(t)
+	manifest.ReleaseIdentity = releaseReadyIdentityForTests()
+
+	if err := validateReleaseManifest(manifest); err != nil {
+		t.Errorf("fully recorded manifest rejected: [%v]", err)
+	}
+	if violations := releaseReadyViolations(manifest); len(violations) > 0 &&
+		participation.MainnetCutoverBlock != 0 {
+		t.Errorf(
+			"fully recorded manifest is not release-ready: %v",
+			violations,
+		)
+	}
+}
+
+// TestReleaseManifestRepositoryFileIsNotReleaseReady is the standing statement
+// of what release acceptance is still waiting for, checked rather than
+// asserted in prose.
+//
+// The checked-in manifest is a valid document — every number in it matches the
+// compiled bounds — and it is deliberately not a release-ready one. It is
+// reviewed before the build it will name exists, and the cutover block it
+// records is the compiled zero placeholder. This test fails the moment that
+// stops being true in either direction: a manifest that stops validating, or
+// one that starts passing release-readiness while its identity is still empty.
+func TestReleaseManifestRepositoryFileIsNotReleaseReady(t *testing.T) {
+	manifest, err := loadReleaseManifest(releaseManifestRepositoryPath)
+	if err != nil {
+		t.Fatalf("cannot load the repository manifest: [%v]", err)
+	}
+
+	if err := validateReleaseManifest(manifest); err != nil {
+		t.Fatalf("the repository manifest must be a valid document: [%v]", err)
+	}
+
+	violations := releaseReadyViolations(manifest)
+	if len(violations) == 0 {
+		t.Fatal(
+			"the repository manifest passed release-readiness: either the " +
+				"release identity was recorded without this gate being " +
+				"revisited, or the readiness check stopped checking",
+		)
+	}
+
+	expected := []string{
+		"release_identity.source_commit is unrecorded",
+		"release_identity.images is empty",
+	}
+	// Named separately because it is the one blocker that lives in the client
+	// rather than in the document: no edit to the manifest can clear it, only a
+	// reviewed release commit setting C.
+	if participation.MainnetCutoverBlock == 0 {
+		expected = append(
+			expected,
+			"release_identity.cutover_block is the zero placeholder",
+		)
+	}
+
+	joined := errors.Join(violations...).Error()
+	for _, expectedMessage := range expected {
+		if !strings.Contains(joined, expectedMessage) {
+			t.Errorf(
+				"release-readiness must still report [%s], got:\n%s",
+				expectedMessage,
+				joined,
+			)
+		}
+	}
+}
+
+// TestReleaseManifestReleaseReadyIsSeparateFromValidity proves the two verdicts
+// stay apart: a document can be entirely valid and still not be something an
+// acceptance decision may be taken against.
+func TestReleaseManifestReleaseReadyIsSeparateFromValidity(t *testing.T) {
+	manifest := validReleaseManifestForTests(t)
+
+	if err := validateReleaseManifest(manifest); err != nil {
+		t.Fatalf("the derived manifest must be valid: [%v]", err)
+	}
+
+	violations := releaseReadyViolations(manifest)
+	if len(violations) == 0 {
+		t.Fatal(
+			"a derived manifest records no build outputs and must not pass " +
+				"release-readiness",
+		)
+	}
+
+	// Recording the build outputs clears every blocker the document owns. What
+	// remains, until a reviewed release commit sets C, is the compiled
+	// placeholder — which is the point: release-readiness cannot be reached by
+	// editing this file.
+	manifest.ReleaseIdentity = releaseReadyIdentityForTests()
+	remaining := releaseReadyViolations(manifest)
+
+	if participation.MainnetCutoverBlock == 0 {
+		if len(remaining) != 1 {
+			t.Fatalf(
+				"the compiled zero cutover block must be the only blocker "+
+					"left, got: %v",
+				remaining,
+			)
+		}
+		if !strings.Contains(
+			remaining[0].Error(),
+			"release_identity.cutover_block is the zero placeholder",
+		) {
+			t.Errorf("unexpected remaining blocker: [%v]", remaining[0])
+		}
+		return
+	}
+
+	if len(remaining) != 0 {
+		t.Errorf(
+			"a fully recorded identity over a set cutover block must be "+
+				"release-ready, got: %v",
+			remaining,
+		)
 	}
 }
 
