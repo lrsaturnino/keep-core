@@ -6,11 +6,15 @@ name: Cutover Rehearsal
 # static analyzers, and the ECDSA contracts build/test, self-tests the
 # source-binding and evidence-record validators, validates any produced
 # evidence records against the evidence schema, and archives each stage's
-# log for the dispatched SHA. The container rehearsal stages run only when
-# explicitly requested with the immutable image digests and the rehearsal
-# chain inputs, and each one names the exact input it is missing and reports
-# BLOCKED — a failed job — rather than running partially, because a rehearsal
-# that cannot execute must never look green.
+# log for the dispatched SHA. The container rehearsal derives one native-runner
+# job per published platform from the sealed release provenance. Each runner
+# needs an isolated pre-C chain, emits only the platform record it can honestly
+# observe, and uploads it for a final archive-wide validation over both gates
+# and every platform. These stages run only when explicitly requested with the
+# immutable image digests and rehearsal-chain inputs, and each one names the
+# exact input it is missing and reports BLOCKED — a failed job — rather than
+# running partially, because a rehearsal that cannot execute must never look
+# green.
 #
 # Provenance is fail-closed: every proof stage receives the dispatched SHA
 # in PR4109_EXPECTED_SOURCE_COMMIT and refuses to produce evidence unless
@@ -55,16 +59,40 @@ on:
         description: "Immutable digest of the wget-carrying probe image every evidence reading is scraped with (repo@sha256:...); a mutable tag would leave the reading instrument outside the record's provenance"
         required: false
       eth_ws_url:
-        description: "Rehearsal chain websocket endpoint"
+        description: "amd64 runner's isolated rehearsal-chain websocket endpoint"
         required: false
       eth_rpc_url:
-        description: "The same chain's JSON-RPC endpoint. Every transaction a work driver reports is confirmed against it — mined, successful, and no later than the anchor claimed for the work it started — because an unconfirmed report is the driver's own account of itself"
+        description: "The same isolated amd64 chain's JSON-RPC endpoint. Every transaction a work driver reports is confirmed against it — mined, successful, and no later than the anchor claimed for the work it started — because an unconfirmed report is the driver's own account of itself"
         required: false
       cutover_block:
-        description: "Rehearsed cutover block C on that chain"
+        description: "Rehearsed cutover block C on the isolated amd64 chain"
         required: false
       chain_id:
-        description: "Numeric chain id of that rehearsal chain"
+        description: "Numeric chain id of the amd64 rehearsal chain"
+        required: false
+      arm64_eth_ws_url:
+        description: "arm64 runner's isolated rehearsal-chain websocket endpoint; this chain must begin below its own C because every platform crosses C"
+        required: false
+      arm64_eth_rpc_url:
+        description: "JSON-RPC endpoint for the same isolated arm64 rehearsal chain"
+        required: false
+      arm64_cutover_block:
+        description: "Rehearsed cutover block C on the isolated arm64 chain"
+        required: false
+      arm64_chain_id:
+        description: "Numeric chain id of the isolated arm64 rehearsal chain"
+        required: false
+      arm64_v8_eth_ws_url:
+        description: "arm64/v8 runner's isolated rehearsal-chain websocket endpoint; required separately when provenance publishes both arm64 and arm64/v8"
+        required: false
+      arm64_v8_eth_rpc_url:
+        description: "JSON-RPC endpoint for the same isolated arm64/v8 rehearsal chain"
+        required: false
+      arm64_v8_cutover_block:
+        description: "Rehearsed cutover block C on the isolated arm64/v8 chain"
+        required: false
+      arm64_v8_chain_id:
+        description: "Numeric chain id of the isolated arm64/v8 rehearsal chain"
         required: false
       bitcoin_network:
         description: "Bitcoin network the rollback state audit reconciles against (e.g. testnet)"
@@ -353,6 +381,105 @@ jobs:
           path: rehearsal-evidence/
           if-no-files-found: error
 
+  rehearsal-platforms:
+    # One evidence record can speak only for the native image its runner
+    # executed. Derive the runner matrix from the detached, reviewed provenance
+    # rather than from a hand-maintained architecture list, and refuse a release
+    # publishing a platform this workflow has no native runner or isolated chain
+    # input for.
+    if: inputs.run_container_stages
+    needs: local-proofs
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Restore the release receipt
+        uses: actions/download-artifact@v4
+        with:
+          name: rehearsal-evidence-${{ github.sha }}
+          path: ${{ runner.temp }}/rehearsal-evidence
+
+      - name: Build the native-runner matrix from release provenance
+        id: matrix
+        env:
+          RECEIPT_DIR: ${{ runner.temp }}/rehearsal-evidence/attestation
+        run: |
+          provenance="$RECEIPT_DIR/release-provenance.json"
+          if [ ! -f "$provenance" ]; then
+            echo "BLOCKED: the release receipt carries no detached provenance;" >&2
+            echo "there is no reviewed platform set from which to build the" >&2
+            echo "native rehearsal matrix" >&2
+            exit 3
+          fi
+
+          node - "$provenance" "$GITHUB_OUTPUT" <<'NODE'
+          const fs = require("fs");
+          const [provenancePath, outputPath] = process.argv.slice(2);
+          const provenance = JSON.parse(
+            fs.readFileSync(provenancePath, "utf8")
+          );
+          const supported = {
+            amd64: {
+              runner: "ubuntu-latest",
+              artifact_key: "amd64",
+              eth_ws_input: "eth_ws_url",
+              eth_rpc_input: "eth_rpc_url",
+              cutover_input: "cutover_block",
+              chain_id_input: "chain_id",
+            },
+            arm64: {
+              runner: "ubuntu-24.04-arm",
+              artifact_key: "arm64",
+              eth_ws_input: "arm64_eth_ws_url",
+              eth_rpc_input: "arm64_eth_rpc_url",
+              cutover_input: "arm64_cutover_block",
+              chain_id_input: "arm64_chain_id",
+            },
+            "arm64/v8": {
+              runner: "ubuntu-24.04-arm",
+              artifact_key: "arm64-v8",
+              eth_ws_input: "arm64_v8_eth_ws_url",
+              eth_rpc_input: "arm64_v8_eth_rpc_url",
+              cutover_input: "arm64_v8_cutover_block",
+              chain_id_input: "arm64_v8_chain_id",
+            },
+          };
+
+          const include = [];
+          const seen = new Set();
+          for (const image of provenance.images || []) {
+            const platform = String(image.platform || "");
+            if (seen.has(platform)) {
+              console.error(
+                "BLOCKED: detached provenance publishes platform [" +
+                  platform + "] more than once"
+              );
+              process.exit(3);
+            }
+            seen.add(platform);
+            const config = supported[platform];
+            if (!config) {
+              console.error(
+                "BLOCKED: detached provenance publishes platform [" +
+                  platform + "], for which this workflow declares no native " +
+                  "runner and isolated chain inputs"
+              );
+              process.exit(3);
+            }
+            include.push({ platform, ...config });
+          }
+          if (include.length === 0) {
+            console.error(
+              "BLOCKED: detached provenance publishes no runtime platform"
+            );
+            process.exit(3);
+          }
+          fs.appendFileSync(
+            outputPath,
+            "matrix=" + JSON.stringify({ include }) + "\n"
+          );
+          NODE
+
   container-rehearsal:
     # The container stages need the immutable digests, a rehearsal chain, the
     # per-node keys/configs, and the chain-side programs no repository can
@@ -363,20 +490,26 @@ jobs:
     # reports BLOCKED (exit 3) naming the exact input, which is the truthful
     # status for a rehearsal that cannot execute.
     if: inputs.run_container_stages
-    needs: local-proofs
-    runs-on: ubuntu-latest
+    needs: [local-proofs, rehearsal-platforms]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.rehearsal-platforms.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
     env:
       PRIOR_IMAGE_DIGEST: ${{ inputs.prior_image_digest }}
       R1_IMAGE_DIGEST: ${{ inputs.r1_image_digest }}
       PROBE_IMAGE_DIGEST: ${{ inputs.probe_image_digest }}
-      ETH_WS_URL: ${{ inputs.eth_ws_url }}
-      ETH_RPC_URL: ${{ inputs.eth_rpc_url }}
-      CUTOVER_BLOCK: ${{ inputs.cutover_block }}
-      CHAIN_ID: ${{ inputs.chain_id }}
+      ETH_WS_URL: ${{ inputs[matrix.eth_ws_input] }}
+      ETH_RPC_URL: ${{ inputs[matrix.eth_rpc_input] }}
+      CUTOVER_BLOCK: ${{ inputs[matrix.cutover_input] }}
+      CHAIN_ID: ${{ inputs[matrix.chain_id_input] }}
       KEEP_ETHEREUM_PASSWORD: ${{ secrets.REHEARSAL_KEEP_ETHEREUM_PASSWORD }}
       PR4109_BITCOIN_NETWORK: ${{ inputs.bitcoin_network }}
       PR4109_PRIOR_VERSION: ${{ inputs.prior_version }}
       PR4109_PRIOR_REVISION: ${{ inputs.prior_revision }}
+      PR4109_EVIDENCE_RECORD_SUFFIX: ${{ matrix.artifact_key }}
+      REHEARSAL_PLATFORM: ${{ matrix.platform }}
+      REHEARSAL_PLATFORM_KEY: ${{ matrix.artifact_key }}
       # The container stages verify their own source binding before they emit
       # or judge a record, exactly like every other proof stage.
       PR4109_EXPECTED_SOURCE_COMMIT: ${{ github.sha }}
@@ -395,8 +528,10 @@ jobs:
       - name: Resolve the provisioning paths
         run: |
           {
-            echo "KEYSTORE_DIR=$RUNNER_TEMP/rehearsal-keystore"
+            echo "REHEARSAL_KEYSTORE_ROOT=$RUNNER_TEMP/rehearsal-keystore"
+            echo "KEYSTORE_DIR=$RUNNER_TEMP/rehearsal-keystore/$REHEARSAL_PLATFORM_KEY"
             echo "REHEARSAL_INPUTS_DIR=$RUNNER_TEMP/rehearsal-inputs"
+            echo "REHEARSAL_AUDIT_TRUST=$RUNNER_TEMP/rehearsal-audit-trust.json"
             echo "PR4109_WORK_DRIVER=$RUNNER_TEMP/rehearsal-inputs/work-driver"
             # An executable, not a bundle of records: every rollback evidence
             # record must name the aggregate checksum of the snapshot it speaks
@@ -423,10 +558,12 @@ jobs:
           } >> "$GITHUB_ENV"
 
       # The per-node keys and configurations come from one repository secret
-      # holding a base64-encoded tar.gz with a <service>/config.toml plus key
-      # material per rehearsal node — rehearsal-only throwaway keys, never
-      # production material. Without it the stage reports BLOCKED with the
-      # exact missing input instead of failing preflight opaquely.
+      # holding a base64-encoded tar.gz with one
+      # <platform-key>/<service>/config.toml plus key material per rehearsal
+      # node — rehearsal-only throwaway keys, never production material. The
+      # platform directory lets each isolated chain carry its own deployed
+      # contract addresses. Without it the stage reports BLOCKED with the exact
+      # missing input instead of failing preflight opaquely.
       - name: Provision the rehearsal keystore bundle
         env:
           REHEARSAL_KEYSTORE_BUNDLE_B64: ${{ secrets.REHEARSAL_KEYSTORE_BUNDLE_B64 }}
@@ -434,17 +571,98 @@ jobs:
           if [ -z "$REHEARSAL_KEYSTORE_BUNDLE_B64" ]; then
             echo "BLOCKED: the REHEARSAL_KEYSTORE_BUNDLE_B64 secret is not" >&2
             echo "provisioned; store a base64-encoded tar.gz holding one" >&2
-            echo "<service>/config.toml and rehearsal-only key material per" >&2
-            echo "node, then re-dispatch" >&2
+            echo "<platform-key>/<service>/config.toml and rehearsal-only" >&2
+            echo "key material per node, then re-dispatch" >&2
             exit 3
           fi
-          mkdir -p "$KEYSTORE_DIR"
+          mkdir -p "$REHEARSAL_KEYSTORE_ROOT"
           printf '%s' "$REHEARSAL_KEYSTORE_BUNDLE_B64" \
             | base64 -d \
-            | tar -xz -C "$KEYSTORE_DIR"
-          chmod -R go-rwx "$KEYSTORE_DIR"
+            | tar -xz -C "$REHEARSAL_KEYSTORE_ROOT"
+          chmod -R go-rwx "$REHEARSAL_KEYSTORE_ROOT"
+          if [ ! -d "$KEYSTORE_DIR" ]; then
+            echo "BLOCKED: the rehearsal keystore bundle has no" >&2
+            echo "$REHEARSAL_PLATFORM_KEY/ directory for published platform" >&2
+            echo "$REHEARSAL_PLATFORM; each platform needs configs naming its" >&2
+            echo "own isolated chain's deployed contract addresses" >&2
+            exit 3
+          fi
           echo "provisioned $(find "$KEYSTORE_DIR" -mindepth 1 -maxdepth 1 \
             -type d | wc -l | tr -d ' ') rehearsal node directories"
+
+      # The rollback audit's Ethereum trust roots must not come from the
+      # evidence generator they authenticate. Provision them independently,
+      # one set per isolated platform chain, from a separate secret document.
+      # The values are validated before being written to GITHUB_ENV so the
+      # document cannot inject another environment assignment.
+      - name: Provision the independent rollback trust bundle
+        env:
+          REHEARSAL_AUDIT_TRUST_B64: ${{ secrets.REHEARSAL_AUDIT_TRUST_B64 }}
+        run: |
+          if [ -z "$REHEARSAL_AUDIT_TRUST_B64" ]; then
+            echo "BLOCKED: the REHEARSAL_AUDIT_TRUST_B64 secret is not" >&2
+            echo "provisioned; store a base64-encoded JSON object keyed by" >&2
+            echo "platform key, independently from the evidence generator" >&2
+            exit 3
+          fi
+          printf '%s' "$REHEARSAL_AUDIT_TRUST_B64" \
+            | base64 -d >"$REHEARSAL_AUDIT_TRUST"
+
+          node - "$REHEARSAL_AUDIT_TRUST" "$REHEARSAL_PLATFORM_KEY" \
+            "$GITHUB_ENV" <<'NODE'
+          const fs = require("fs");
+          const [path, platform, outputPath] = process.argv.slice(2);
+          const document = JSON.parse(fs.readFileSync(path, "utf8"));
+          const trust = document[platform];
+          if (!trust || typeof trust !== "object" || Array.isArray(trust)) {
+            console.error(
+              "BLOCKED: the independent rollback trust bundle has no object " +
+                "for platform key [" + platform + "]"
+            );
+            process.exit(3);
+          }
+
+          const fields = [
+            [
+              "PR4109_WALLET_REGISTRY_ADDRESS",
+              "wallet_registry_address",
+              /^0x[0-9a-f]{40}$/,
+            ],
+            [
+              "PR4109_RANDOM_BEACON_ADDRESS",
+              "random_beacon_address",
+              /^0x[0-9a-f]{40}$/,
+            ],
+            [
+              "PR4109_FINALIZED_ETHEREUM_BLOCK_NUMBER",
+              "finalized_ethereum_block_number",
+              /^[1-9][0-9]*$/,
+            ],
+            [
+              "PR4109_FINALIZED_ETHEREUM_BLOCK_HASH",
+              "finalized_ethereum_block_hash",
+              /^0x[0-9a-f]{64}$/,
+            ],
+            [
+              "PR4109_CHAIN_EVIDENCE_PUBLIC_KEY",
+              "chain_evidence_public_key",
+              /^[0-9a-f]{64}$/,
+            ],
+          ];
+          const assignments = [];
+          for (const [environment, member, pattern] of fields) {
+            const value = String(trust[member] || "");
+            if (!pattern.test(value)) {
+              console.error(
+                "BLOCKED: rollback trust member [" + platform + "]." +
+                  member + " is absent or malformed"
+              );
+              process.exit(3);
+            }
+            assignments.push(environment + "=" + value);
+          }
+          fs.appendFileSync(outputPath, assignments.join("\n") + "\n");
+          NODE
 
       # The inputs that exist outside this repository entirely, and both of
       # them are programs rather than data. The fleet only reacts to chain
@@ -609,6 +827,30 @@ jobs:
           done
           rm -rf "$STORAGE_SNAPSHOT_DIR"
 
+      # The full per-platform archive contains identically named receipt and
+      # audit files, so it cannot be merged safely. Copy only the two top-level
+      # gate records into a dedicated artifact; their platform suffix makes
+      # every fan-in member unique.
+      - name: Stage this platform's records for aggregate validation
+        if: ${{ always() }}
+        run: |
+          aggregate="$RUNNER_TEMP/rehearsal-records"
+          mkdir -p "$aggregate"
+          count=0
+          for record in "$EVIDENCE_DIR"/*.json; do
+            [ -f "$record" ] || continue
+            case "$(basename "$record")" in
+              *-"$REHEARSAL_PLATFORM_KEY"-*.json) ;;
+              *)
+                echo "record $record carries no runner platform suffix" >&2
+                exit 1
+                ;;
+            esac
+            cp "$record" "$aggregate/"
+            count=$((count + 1))
+          done
+          echo "staged $count record(s) from $REHEARSAL_PLATFORM"
+
       # The rehearsal records and the audit manifests, whatever the verdict:
       # a refused gate's account of why it was refused is the evidence a
       # release decision most needs to read.
@@ -616,6 +858,66 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: container-rehearsal-evidence-${{ github.sha }}
+          name: container-rehearsal-evidence-${{ github.sha }}-${{ matrix.artifact_key }}
+          path: rehearsal-evidence/
+          if-no-files-found: error
+
+      - name: Upload this platform's aggregate records
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-rehearsal-records-${{ github.sha }}-${{ matrix.artifact_key }}
+          path: ${{ runner.temp }}/rehearsal-records/
+          if-no-files-found: warn
+
+  aggregate-rehearsal-evidence:
+    # Per-platform jobs can validate only the records they emitted. Restore the
+    # one receipt, fan in every native runner's uniquely named gate records, and
+    # ask archive completeness exactly once over the resulting set. Run even
+    # after a matrix failure: a missing artifact or record is itself a failed
+    # mandatory release gate, not a reason to skip the aggregate verdict.
+    if: ${{ always() && inputs.run_container_stages && !cancelled() }}
+    needs: [local-proofs, container-rehearsal]
+    runs-on: ubuntu-latest
+    env:
+      EVIDENCE_DIR: ${{ github.workspace }}/rehearsal-evidence
+      PR4109_EXPECTED_SOURCE_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Restore the release receipt
+        uses: actions/download-artifact@v4
+        with:
+          name: rehearsal-evidence-${{ github.sha }}
+          path: ${{ github.workspace }}/rehearsal-evidence
+
+      - name: Download every platform's gate records
+        uses: actions/download-artifact@v4
+        with:
+          pattern: container-rehearsal-records-${{ github.sha }}-*
+          path: ${{ runner.temp }}/rehearsal-records
+          merge-multiple: true
+
+      - name: Assemble the release evidence archive
+        run: |
+          mkdir -p "$EVIDENCE_DIR"
+          count=0
+          for record in "$RUNNER_TEMP"/rehearsal-records/*.json; do
+            [ -f "$record" ] || continue
+            cp "$record" "$EVIDENCE_DIR/"
+            count=$((count + 1))
+          done
+          echo "assembled $count top-level rehearsal record(s)"
+
+      - name: Validate complete gate and platform coverage
+        run: ./scripts/release/pr4109/rehearse.sh validate-evidence
+
+      - name: Upload aggregate rehearsal evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: aggregate-rehearsal-evidence-${{ github.sha }}
           path: rehearsal-evidence/
           if-no-files-found: error

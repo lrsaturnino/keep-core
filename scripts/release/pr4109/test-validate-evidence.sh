@@ -8,7 +8,9 @@
 # assertion-to-stage bindings, and reviewed instrument identities are all
 # correct — and rejects a wrong hash, a wrong grace, missing binding fields,
 # an incomplete or duplicated roster, a malformed timestamp, an empty record
-# set, and a bad record hiding behind a good one. It also drives the manifest
+# set, an archive missing either mandatory gate, duplicate gate/platform
+# records, and a bad record hiding behind a good one. It also drives the
+# manifest
 # attestation the stage requires before it measures anything: absent,
 # incomplete, taken over other manifest bytes, recording bounds the reviewed
 # manifest contradicts, taken at another commit than the run is bound to,
@@ -228,6 +230,24 @@ write_record() {
   local assertions="${7:-${ASSERTION_HOLDS}}"
   local gate="${8:-single_release}"
   local r1_images="${9:-${FIXTURE_R1_DIGEST_MAP}}"
+  local chain_inputs
+  if [[ "${gate}" == "rollback" ]]; then
+    chain_inputs="$(
+      printf '{
+        "work_driver_sha256": "%s",
+        "rollback_evidence_generator_sha256": "%s"
+      }' "${REVIEWED_WORK_DRIVER_DIGEST}" \
+        "${REVIEWED_ROLLBACK_GENERATOR_DIGEST}"
+    )"
+  else
+    chain_inputs="$(
+      printf '{
+        "work_driver_sha256": "%s",
+        "tsslib_review_sha256": "%s"
+      }' "${REVIEWED_WORK_DRIVER_DIGEST}" \
+        "${REVIEWED_TSSLIB_REVIEW_DIGEST}"
+    )"
+  fi
   cat >"${path}" <<EOF
 {
   "schema_version": 1,
@@ -248,14 +268,74 @@ write_record() {
     "sha256": "${sha}",
     "termination_grace_period_seconds": ${grace}
   },
-  "chain_inputs": {
-    "work_driver_sha256": "${REVIEWED_WORK_DRIVER_DIGEST}",
-    "tsslib_review_sha256": "${REVIEWED_TSSLIB_REVIEW_DIGEST}"
-  },
+  "chain_inputs": ${chain_inputs},
   "stages": [ ${stages} ],
   "assertions": [ ${assertions} ]
 }
 EOF
+}
+
+# Most cases below isolate one malformed field in one record. Archive
+# validation requires the Cartesian product of both mandatory gates and every
+# published platform, so give those focused cases valid counterparts rather
+# than making each repeat unrelated fixture setup. Archive-specific cases use
+# run_validator_as_is and exercise the exact record set they wrote.
+complete_fixture_archive() {
+  local dir="$1"
+  [[ -f "${dir}/attestation/release-provenance.json" ]] || return 0
+  compgen -G "${dir}/*.json" >/dev/null || return 0
+
+  local records=("${dir}"/*.json)
+  local missing
+  missing="$(node -e '
+    const fs = require("fs");
+    const [provenancePath, ...recordPaths] = process.argv.slice(1);
+    const provenance = JSON.parse(fs.readFileSync(provenancePath, "utf8"));
+    const existing = new Set();
+    for (const path of recordPaths) {
+      try {
+        const record = JSON.parse(fs.readFileSync(path, "utf8"));
+        for (const platform of Object.keys(
+          ((record.artifacts || {}).r1_image_digests || {})
+        )) {
+          existing.add(String(record.gate || "") + "\t" + platform);
+        }
+      } catch (_) {
+        // The validator owns malformed records. They provide no usable pair.
+      }
+    }
+    for (const image of provenance.images || []) {
+      for (const gate of ["single_release", "rollback"]) {
+        const key = gate + "\t" + image.platform;
+        if (!existing.has(key)) {
+          process.stdout.write(
+            gate + "\t" + image.platform + "\t" + image.reference + "\n"
+          );
+        }
+      }
+    }
+  ' "${dir}/attestation/release-provenance.json" "${records[@]}")"
+
+  local gate platform reference r1_images timestamp ordinal=0
+  while IFS="$(printf '\t')" read -r gate platform reference; do
+    [[ -n "${gate}" ]] || continue
+    ordinal=$((ordinal + 1))
+    printf -v timestamp '2026-07-28T12:00:%02dZ' "${ordinal}"
+    r1_images="$(node -e '
+      process.stdout.write(JSON.stringify({ [process.argv[1]]: process.argv[2] }));
+    ' "${platform}" "${reference}")"
+    if [[ "${gate}" == "rollback" ]]; then
+      write_record "${dir}/supplement-${ordinal}.json" "${MANIFEST_SHA}" \
+        "${MANIFEST_GRACE}" "${timestamp}" \
+        "${FIXTURE_SHA}" "${ROLLBACK_STAGES}" "${ROLLBACK_ASSERTIONS}" \
+        "${gate}" "${r1_images}"
+    else
+      write_record "${dir}/supplement-${ordinal}.json" "${MANIFEST_SHA}" \
+        "${MANIFEST_GRACE}" "${timestamp}" \
+        "${FIXTURE_SHA}" "${SINGLE_RELEASE_STAGES}" \
+        "${SINGLE_RELEASE_ASSERTIONS}" "${gate}" "${r1_images}"
+    fi
+  done <<<"${missing}"
 }
 
 # The attestation the stage demands before it measures any record against
@@ -322,6 +402,10 @@ run_validator() {
   local dir="$1"
   local expected="${2:-${FIXTURE_SHA}}"
   local repo="${3:-${WORK}/repo}"
+  local archive_mode="${4:-complete}"
+  if [[ "${archive_mode}" == "complete" ]]; then
+    complete_fixture_archive "${dir}"
+  fi
   set +e
   CASE_OUT="$(
     (
@@ -340,6 +424,12 @@ run_validator() {
   )"
   CASE_RC=$?
   set -e
+}
+
+# Preserve exactly the records a case wrote. This is reserved for tests whose
+# subject is archive completeness itself.
+run_validator_as_is() {
+  run_validator "$1" "${2:-${FIXTURE_SHA}}" "${3:-${WORK}/repo}" as-is
 }
 
 # Assert the captured rc and that the output matches every given pattern.
@@ -542,6 +632,25 @@ run_validator "${D}"
 check "a record naming no image at all is refused" 3 \
   "it names no image at all"
 
+# A record cannot claim the other native runner's execution. Even if both
+# references are published and therefore individually admissible, one run
+# observed only one of them.
+D="${WORK}/record-names-two-platforms"
+mkdir -p "${D}"
+write_attestation "${D}" "${MANIFEST_SHA}" "${TEST_DIR}/release-manifest.json" \
+  "${FIXTURE_SHA}" "yes" "${MANIFEST_SHA}" "${FIXTURE_SHA}" \
+  "${FIXTURE_R1_IMAGES_BOTH}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z" "${FIXTURE_SHA}" "${STAGE_PASSED}" \
+  "${ASSERTION_HOLDS}" "single_release" \
+  "$(printf '{"%s": "%s", "%s": "%s"}' \
+    "${FIXTURE_R1_PLATFORMS[0]}" "${FIXTURE_R1_REFERENCE}" \
+    "${FIXTURE_R1_PLATFORMS[1]}" "${FIXTURE_R1_REFERENCE}")"
+run_validator_as_is "${D}"
+check "one record cannot claim two platform runners' executions" 3 \
+  "it names 2 platforms" \
+  "one record can evidence only that image"
+
 # The same content pulled from another repository is a different supply chain
 # reaching the same bytes, for exactly as long as nobody repoints it. The
 # comparison is over references and not bare digests so that this fails.
@@ -592,11 +701,11 @@ write_attestation "${D}" "${MANIFEST_SHA}" "${TEST_DIR}/release-manifest.json" \
   "${FIXTURE_R1_IMAGES_BOTH}"
 write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
   "2026-07-28T00:00:00Z"
-run_validator "${D}"
+run_validator_as_is "${D}"
 check "a release platform no record rehearsed is refused" 3 \
-  "do not rehearse every image this release publishes" \
+  "does not contain exactly one record for every required gate and published platform" \
   "the single_release gate evidences \[${FIXTURE_R1_PLATFORMS[0]}\] and not \[${FIXTURE_R1_PLATFORMS[1]}\]" \
-  "each one honestly names only the platform its runner executed"
+  "the rollback gate evidences \[\\] and not \[${FIXTURE_R1_PLATFORMS[0]}, ${FIXTURE_R1_PLATFORMS[1]}\]"
 
 # The same release, rehearsed on both. Two records, each naming the one
 # platform its runner ran, and together they cover what the release ships.
@@ -612,7 +721,8 @@ write_record "${D}/second.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
   "${ASSERTION_HOLDS}" "single_release" "${FIXTURE_R1_SECOND_DIGEST_MAP}"
 run_validator "${D}"
 check "one record per published platform covers the release" 0 \
-  "every platform the release publishes is evidenced by every gate"
+  "single_release and rollback each evidence every platform" \
+  "exactly one admissible record for every required gate"
 
 # And the gap a whole-archive union would miss: every published platform
 # appears somewhere, so the union is complete, and the rollback gate still
@@ -628,11 +738,49 @@ write_record "${D}/cutover-second.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
   "2026-07-28T01:00:00Z" "${FIXTURE_SHA}" "${STAGE_PASSED}" \
   "${ASSERTION_HOLDS}" "single_release" "${FIXTURE_R1_SECOND_DIGEST_MAP}"
 write_record "${D}/rollback.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
-  "2026-07-28T02:00:00Z" "${FIXTURE_SHA}" "${STAGE_PASSED}" \
-  "${ASSERTION_HOLDS}" "rollback"
-run_validator "${D}"
+  "2026-07-28T02:00:00Z" "${FIXTURE_SHA}" "${ROLLBACK_STAGES}" \
+  "${ROLLBACK_ASSERTIONS}" "rollback"
+run_validator_as_is "${D}"
 check "a gate that skipped a platform the other gate covered is refused" 3 \
   "the rollback gate evidences \[${FIXTURE_R1_PLATFORMS[0]}\] and not \[${FIXTURE_R1_PLATFORMS[1]}\]"
+
+# A gate that is absent altogether used to disappear from the coverage map.
+# Both directions matter: neither gate may stand in for the other.
+D="${WORK}/coverage-no-rollback-gate"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/single-release.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+run_validator_as_is "${D}"
+check "an archive with no rollback gate is refused" 3 \
+  "the rollback gate evidences \[\\] and not \[${FIXTURE_R1_PLATFORMS[0]}\]"
+
+D="${WORK}/coverage-no-single-release-gate"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/rollback.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z" "${FIXTURE_SHA}" "${ROLLBACK_STAGES}" \
+  "${ROLLBACK_ASSERTIONS}" "rollback"
+run_validator_as_is "${D}"
+check "an archive with no single-release gate is refused" 3 \
+  "the single_release gate evidences \[\\] and not \[${FIXTURE_R1_PLATFORMS[0]}\]"
+
+# More records are not stronger evidence when two of them claim the same
+# mandatory slot. The archive must identify one authoritative run.
+D="${WORK}/coverage-duplicate-gate-platform"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/single-release-a.json" "${MANIFEST_SHA}" \
+  "${MANIFEST_GRACE}" "2026-07-28T00:00:00Z"
+write_record "${D}/single-release-b.json" "${MANIFEST_SHA}" \
+  "${MANIFEST_GRACE}" "2026-07-28T01:00:00Z"
+write_record "${D}/rollback.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T02:00:00Z" "${FIXTURE_SHA}" "${ROLLBACK_STAGES}" \
+  "${ROLLBACK_ASSERTIONS}" "rollback"
+run_validator_as_is "${D}"
+check "duplicate records for one gate and platform are refused" 3 \
+  "the single_release gate has 2 records for \[${FIXTURE_R1_PLATFORMS[0]}\]" \
+  "competing accounts of which run is authoritative"
 
 # The manifest is internally valid and every comparison in the stage agrees
 # with it — and it still names no release. Records measured against it
@@ -1012,6 +1160,13 @@ write_attestation "${D}"
 write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
   "2026-07-28T00:00:00Z" "${FIXTURE_SHA}" "${ROLLBACK_STAGES}" \
   "${ROLLBACK_ASSERTIONS}" rollback
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  delete record.chain_inputs.rollback_evidence_generator_sha256;
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
 run_validator "${D}"
 check "rollback requires the reviewed evidence generator as well as the driver" \
   3 "required reviewed release input.*rollback_evidence_generator_sha256"
@@ -1075,17 +1230,21 @@ run_validator "${D}"
 check "a failed step outranks a blocked one in the acceptance verdict" 1 \
   "the evidence refutes the gate it records"
 
-# The gate a release actually reads is the whole directory, so a passing
-# record must never cover for a failing one beside it.
+# A passing record for one platform cannot cover a failing record for another.
+# Each occupies its one authoritative archive slot, and acceptance still reads
+# every verdict after completeness holds.
 D="${WORK}/accept-one-failed-among-good"
 mkdir -p "${D}"
-write_attestation "${D}"
+write_attestation "${D}" "${MANIFEST_SHA}" "${TEST_DIR}/release-manifest.json" \
+  "${FIXTURE_SHA}" "yes" "${MANIFEST_SHA}" "${FIXTURE_SHA}" \
+  "${FIXTURE_R1_IMAGES_BOTH}"
 write_record "${D}/a-good.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
   "2026-07-28T00:00:00Z"
 write_record "${D}/b-failed.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
-  "2026-07-28T00:00:00Z" "${FIXTURE_SHA}" "${STAGE_FAILED}"
+  "2026-07-28T00:00:00Z" "${FIXTURE_SHA}" "${STAGE_FAILED}" \
+  "${ASSERTION_HOLDS}" "single_release" "${FIXTURE_R1_SECOND_DIGEST_MAP}"
 run_validator "${D}"
-check "a passing record does not cover for a failing one beside it" 1 \
+check "a passing platform record does not cover for a failing one" 1 \
   "the evidence refutes the gate it records" "b-failed.json"
 
 # ----------------------------------------------------------------------------
@@ -5087,6 +5246,7 @@ check "a homogeneous R1 transcript cannot stand for a mixed one" 3 \
 # every requirement stays uncovered whatever the list claims — including the
 # beacon families, whose prior share was the driver's word for as long as their
 # ceremonies published no population of their own.
+# shellcheck disable=SC2016
 run_verdict precutover_case eval '
   PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS//1,7/1}"'
 check "a driver-claimed prior party outside the transcript is refused" 3 \
@@ -5102,6 +5262,7 @@ tbtc_wallet_action transcript incorporated a share"
 # report the coverage gap that silence produces: read the other way, an unknown
 # map places none of the seats and every seat of a homogeneous transcript sits
 # outside it.
+# shellcheck disable=SC2016
 run_verdict precutover_case eval '
   PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS} \
 r1-node-2@tbtc_dkg@842@dkg842#9=completed=persisted_tbtc_signer=0xdkg842=7\
@@ -5112,6 +5273,7 @@ check "an ownership map that cannot be placed is named as unknown" 3 \
 # And the reverse mutation on the same fixture: a seat the fleet does not claim
 # is what makes the reading mixed, so moving that seat into a node's own
 # memberships leaves a transcript this fleet produced alone.
+# shellcheck disable=SC2016
 run_verdict precutover_case eval '
   PRECUTOVER_AUTHORED_ENDINGS="\
 ${PRECUTOVER_AUTHORED_ENDINGS//=1,7|1,7=1=-=1/=1,7|1,7=1,7=-=1,7}"
@@ -5128,6 +5290,7 @@ tbtc_wallet_action transcript incorporated a share"
 # invisible — and a step reading past it decides a compatibility claim while this
 # fleet may have left an inactivity claim on the chain that nobody can account
 # for.
+# shellcheck disable=SC2016
 run_verdict precutover_case eval '
   PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS/\
 0xbeat844=-=1,7=1=-=1/0xbeat844=-=1,7=1=tbtc_inactivity_claim=1}"'
@@ -5138,6 +5301,7 @@ resolve" "tbtc_inactivity_claim"
 # The same side effect with its canonical identity beside it, which is what the
 # rung is asking for rather than an absence of side effects: a holder that named
 # the claim it filed leaves nothing for a later reader to resolve.
+# shellcheck disable=SC2016
 run_verdict precutover_case eval '
   PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS/\
 0xbeat844=-=1,7=1=-=1/0xbeat844=-=1,7=1=tbtc_inactivity_claim:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:3=1}"'
@@ -5151,6 +5315,7 @@ check "a resolved side effect leaves the step to its own claim" 0 \
 # result — the DKG its accepted result's operating members, the relay the
 # authenticated shares it combined — so a homogeneous beacon run leaves no seat
 # the fleet does not claim, and the claim cannot add one.
+# shellcheck disable=SC2016
 run_verdict precutover_case eval '
   PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS/\
 0xentry841=-=1,7=1=-=1/0xentry841=-=1=1=-=1}"
@@ -5171,6 +5336,7 @@ check "a homogeneous beacon run is not covered by a claimed prior party" 3 \
 # contribution — which is all a completion could ever say — this fixture is a
 # homogeneous prior ceremony passing as interoperation, with the prior half of
 # the claim genuinely present and the R1 half supplied by an observer.
+# shellcheck disable=SC2016
 run_verdict precutover_case eval '
   PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS/\
 0xsign843=-=1,7=1=-=1/0xsign843=-=7=-=-=1}"'
@@ -5293,6 +5459,7 @@ check "an R1 contributor that recorded no ending still owns its seat" 3 \
 # what the prior binary holding it actually looks like. It is here so the control
 # above cannot pass by refusing every mixed reading: the two differ only in
 # whether some R1 permit claims seat 7.
+# shellcheck disable=SC2016
 run_verdict precutover_case eval '
   PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS} \
 r1-node-2@tbtc_signing@843@sign843#9=unresolved=-=-=-=-=-=-=9"'
@@ -5305,6 +5472,7 @@ check "a seat no permit in the fleet claims is still outside it" 0 \
 # is refused rather than decided. Without this the operated set would be
 # decorative: a holder could announce one seat and record a result produced with
 # another.
+# shellcheck disable=SC2016
 run_verdict precutover_case eval '
   PRECUTOVER_AUTHORED_ENDINGS="${PRECUTOVER_AUTHORED_ENDINGS/\
 0xsign843=-=1,7=1=-=1/0xsign843=-=1,7=1,7=-=1}"'
@@ -5857,6 +6025,7 @@ check "no driver holds no legacy permit across C" 3 \
 # A control that only rejects extra terminal records reads a partial population
 # as a whole one. These three mutations each leave a settlement and a moving
 # counter in place, and each hides a permit the step claims to speak for.
+# shellcheck disable=SC2034
 SURVIVE_TX_SECOND="0xff77777777777777777777777777777777777777777777777777777777777777"
 
 # Two permits held across C, one settled, the other simply unmentioned.
@@ -6061,6 +6230,7 @@ quiesce_sequencing_stubs() {
   # The reading taken before the stop is issued, which is the only one the
   # control still takes a field at a time: it needs a held permit there, or the
   # ladder stops at "nothing was in flight" before reaching the anchors.
+  # shellcheck disable=SC2329
   participation_field() {
     case "$2" in
     gate_state) printf 'quiescing' ;;
@@ -6079,6 +6249,7 @@ quiesce_sequencing_stubs() {
   QUIESCE_SEQ_REFUSED_BY_CEREMONY="${WORK}/quiesce-seq-refused-ceremony"
   rm -f "${QUIESCE_SEQ_REFUSED}" "${QUIESCE_SEQ_REFUSED_BY_CEREMONY}"
 
+  # shellcheck disable=SC2329
   metric_value() {
     case "$2" in
     participation_refusals_total)
@@ -6092,6 +6263,7 @@ quiesce_sequencing_stubs() {
     *) printf '0' ;;
     esac
   }
+  # shellcheck disable=SC2329
   ceremony_refusal_counters() {
     if [[ -f "${QUIESCE_SEQ_REFUSED_BY_CEREMONY}" ]]; then
       printf 'tbtc_signing=1'
@@ -6100,8 +6272,11 @@ quiesce_sequencing_stubs() {
       printf 'tbtc_signing=0'
     fi
   }
+  # shellcheck disable=SC2329
   manifest_termination_grace() { printf '4'; }
+  # shellcheck disable=SC2329
   compose() { return 0; }
+  # shellcheck disable=SC2329
   node_reachable() { return 1; }
 
   # The gate's own list of what it is holding, which the control reads beside
@@ -6109,6 +6284,7 @@ quiesce_sequencing_stubs() {
   # node; the other mode stands for a permit live beside it, which the seeded
   # control requires and a mutation can take away.
   QUIESCE_SEQ_COLIVE="r1-node-1@tbtc_signing@1200@colive900#other-1"
+  # shellcheck disable=SC2329
   node_mode_permits() {
     case "$2" in
     legacy)
@@ -6131,6 +6307,7 @@ quiesce_sequencing_stubs() {
   # population it goes on to drain rather than a second one beside it.
   QUIESCE_SEQ_SEEDED=0
 
+  # shellcheck disable=SC2329
   run_work_driver() {
     WORK_DRIVER_RC=0
     WORK_DRIVER_TX_COUNT=1

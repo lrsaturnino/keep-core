@@ -35,6 +35,11 @@
 #   KEEP_ETHEREUM_PASSWORD  operator key file password for the fleet
 #   STORAGE_SNAPSHOT_DIR    rollback only: one storage snapshot per R1 service
 #                        for the offline state audit
+#   PR4109_EVIDENCE_RECORD_SUFFIX
+#                        optional safe filename component identifying the
+#                        native runner (for example amd64 or arm64-v8). The
+#                        dispatched workflow sets it so records from separate
+#                        platform jobs remain unique when they are aggregated
 #
 # Rollback only — the audit inputs no storage snapshot can supply. Every one
 # is required before the offline state audit can authorize anything, and a
@@ -133,8 +138,11 @@
 # Every accepted rehearsal run must produce a record conforming to
 # rehearsal-evidence.schema.json and binding the checked-in release
 # manifest — its exact hash and its termination grace; the validate-evidence
-# stage enforces both, self-testing its own checker first. Those comparisons
-# only speak for the release while that manifest still matches the compiled
+# stage enforces both, self-testing its own checker first. It also requires
+# exactly one record for each single_release/rollback and published-platform
+# pair; per-run emission validates only its own record, because no native
+# runner can see another runner's workspace. Those comparisons only speak for
+# the release while that manifest still matches the compiled
 # bounds, so local-proofs attests it under EVIDENCE_DIR/attestation and
 # validate-evidence refuses to measure a record without that receipt. The
 # receipt belongs to one run at one commit: local-proofs destroys the
@@ -276,11 +284,14 @@ stages:
                       the attestation, every record, and this run's own
                       binding to name one commit, verifies its own source
                       binding like any proof stage, and self-tests its
-                      checker first. Then asks the separate question the
-                      binding checks cannot: a correctly bound record still
-                      says whether its gate held, so the stage exits FAIL on
-                      any recorded failed step or refused acceptance
-                      assertion and BLOCKED on any step that never executed
+                      checker first. Requires exactly one record for every
+                      single_release/rollback and published-platform pair,
+                      rejecting a wholly missing gate and duplicate accounts.
+                      Then asks the separate question the binding checks
+                      cannot: a correctly bound record still says whether its
+                      gate held, so the stage exits FAIL on any recorded
+                      failed step or refused acceptance assertion and BLOCKED
+                      on any step that never executed
 
 environment (every proof stage):
   PR4109_EXPECTED_SOURCE_COMMIT
@@ -304,6 +315,9 @@ environment (preflight, single-release, rollback):
   CHAIN_ID            that chain's numeric chain id
   KEYSTORE_DIR        per-node inputs, one <service>/ directory each holding
                       that node's config.toml and key material
+  PR4109_EVIDENCE_RECORD_SUFFIX
+                      optional safe filename component identifying this
+                      native runner; the workflow sets one per platform
   KEEP_ETHEREUM_PASSWORD
                       the key files' password
   PR4109_WORK_DRIVER  executable called with the phase name to originate
@@ -5434,9 +5448,25 @@ ${attested}, the rehearsed C, and the chain the record is written against"
 # admissible, so emission never certifies its own output.
 emit_evidence_record() {
   local manifest="${SCRIPT_DIR}/release-manifest.json"
+  local record_suffix="${PR4109_EVIDENCE_RECORD_SUFFIX:-}"
+  if [[ -n "${record_suffix}" ]] &&
+    [[ ! "${record_suffix}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    blocked "PR4109_EVIDENCE_RECORD_SUFFIX [${record_suffix}] is not a safe \
+record-name component; use only letters, digits, dots, underscores, and \
+hyphens, beginning with a letter or digit"
+  fi
+
+  local record_name="${REHEARSAL_GATE}"
+  if [[ -n "${record_suffix}" ]]; then
+    record_name="${record_name}-${record_suffix}"
+  fi
+
   local record
-  record="${EVIDENCE_DIR}/${REHEARSAL_GATE}-$(date -u +%Y%m%dT%H%M%SZ).json"
+  record="${EVIDENCE_DIR}/${record_name}-$(date -u +%Y%m%dT%H%M%SZ).json"
   mkdir -p "${EVIDENCE_DIR}"
+  [[ ! -e "${record}" ]] ||
+    blocked "evidence record ${record} already exists; refusing to overwrite \
+another account of this gate and platform"
 
   local source_sha
   source_sha="$(attested_source_identity)"
@@ -5542,7 +5572,7 @@ that never captured it has nothing to bind"
   # are the ones that say the record is admissible. Whether its contents
   # accept the gate is conclude_verdict's decision on the way out, and the
   # acceptance stage's when a reviewer reads the directory later.
-  validate_evidence_records
+  validate_evidence_record_set "${record}"
 }
 
 # The verdict a ledger implies, with no emission and no I/O of its own, so
@@ -12210,13 +12240,15 @@ collect_evidence_records() {
   shopt -u nullglob
 }
 
-# Is each record admissible — well formed, produced at the attested commit,
-# and measured against the reviewed manifest? This decides nothing about
-# whether the gates the records evidence were satisfied; that is a separate
-# question, asked by assess_evidence_acceptance. Keeping the two apart is
-# what lets a refused rehearsal still write and shape-check the record that
-# says why it was refused, without the shape check reading as acceptance.
-validate_evidence_records() {
+# Is each caller-selected record admissible — well formed, produced at the
+# attested commit, and measured against the reviewed manifest? This decides
+# nothing about whether the gates the records evidence were satisfied, or
+# whether the archive contains every required gate and platform. Those are
+# separate questions, asked by assess_evidence_acceptance and
+# require_evidenced_platform_coverage respectively. Keeping all three apart
+# lets one platform runner validate the record it actually produced without
+# pretending it can see the records other runners have not uploaded yet.
+validate_evidence_record_set() {
   local schema="${SCRIPT_DIR}/rehearsal-evidence.schema.json"
   local manifest="${SCRIPT_DIR}/release-manifest.json"
 
@@ -12237,11 +12269,8 @@ validate_evidence_records() {
   # verdict means anything.
   verify_source_binding
 
-  collect_evidence_records
-  if ((${#EVIDENCE_RECORDS[@]} == 0)); then
-    blocked "no evidence records found under ${EVIDENCE_DIR}; a rehearsal \
-run that produced no record cannot be accepted"
-  fi
+  (($# > 0)) ||
+    blocked "no evidence records were supplied for admissibility validation"
 
   command -v npx >/dev/null 2>&1 ||
     blocked "npx (Node.js) is required to validate evidence records"
@@ -12282,7 +12311,7 @@ run that produced no record cannot be accepted"
   # it answers is not one any single record can be asked.
   EVIDENCED_GATE_PLATFORMS=()
 
-  for record in "${EVIDENCE_RECORDS[@]}"; do
+  for record in "$@"; do
     note "validating ${record}"
     # ajv needs the formats plugin loaded explicitly or it rejects the
     # schema's own date-time format annotation before ever reading a
@@ -12331,8 +12360,15 @@ compiled bounds judging it must come from the same commit"
       const reviewed = JSON.parse(process.argv[2]);
       const ran = (record.artifacts || {}).r1_image_digests || {};
       const differences = [];
-      if (Object.keys(ran).length === 0) {
+      const platforms = Object.keys(ran);
+      if (platforms.length === 0) {
         differences.push("it names no image at all");
+      } else if (platforms.length > 1) {
+        differences.push(
+          "it names " + platforms.length + " platforms [" +
+            platforms.sort().join(", ") + "], but one runner executes one " +
+            "published image and one record can evidence only that image"
+        );
       }
       for (const platform of Object.keys(ran).sort()) {
         if (!(platform in reviewed)) {
@@ -12466,14 +12502,29 @@ repository never took"
     fi
   done
 
-  require_evidenced_platform_coverage
-
-  note "all evidence records conform to the schema, were produced at \
+  note "the supplied evidence records conform to the schema, were produced at \
 ${attested_source}, ran only images the release publishes, and bind the \
 reviewed release manifest's hash and termination grace"
 }
 
-# Was every published image actually rehearsed?
+# Validate the complete archive. Per-record admissibility deliberately cannot
+# answer whether another platform runner or the other mandatory gate produced
+# its record, so only this whole-directory entry point asks that question.
+validate_evidence_records() {
+  collect_evidence_records
+  if ((${#EVIDENCE_RECORDS[@]} == 0)); then
+    blocked "no evidence records found under ${EVIDENCE_DIR}; a rehearsal \
+run that produced no record cannot be accepted"
+  fi
+
+  validate_evidence_record_set "${EVIDENCE_RECORDS[@]}"
+  require_evidenced_platform_coverage
+
+  note "the evidence archive contains exactly one admissible record for every \
+required gate and published platform"
+}
+
+# Was every published image rehearsed by every mandatory gate, exactly once?
 #
 # Each record names the one platform its runner executed, which is the only
 # honest thing a record can say and is exactly why no record can answer this.
@@ -12484,12 +12535,14 @@ reviewed release manifest's hash and termination grace"
 # other with no evidence that it can be rolled back, however thoroughly the
 # cutover gate covered both.
 #
-# Gates are taken from the records rather than from a roster, because this is a
-# coverage question and not a completeness one — which gates a release must
-# produce at all is the acceptance contract's to require, and duplicating it
-# here would put two answers to one question in two places.
+# Both mandatory gates are named here because archive completeness is a
+# property of their gate/platform product. Inferring the gates from the
+# records makes a wholly absent rollback record disappear from the question.
+# Counting instead of taking a set matters too: two records for the same
+# gate/platform are two competing accounts of one mandatory run, not stronger
+# evidence for it.
 require_evidenced_platform_coverage() {
-  local pairs="" missing
+  local pairs="" archive_problem
   # bash 3.2 refuses to expand an empty array under `set -u`, and the per-record
   # check has already blocked every record that named no image, so an empty set
   # here means no record at all — which the caller refused before this ran.
@@ -12500,8 +12553,9 @@ require_evidenced_platform_coverage() {
     )"
   fi
 
-  missing="$(printf '%s' "${pairs}" | node -e '
+  archive_problem="$(printf '%s' "${pairs}" | node -e '
     const reviewed = Object.keys(JSON.parse(process.argv[1])).sort();
+    const requiredGates = ["single_release", "rollback"];
     let raw = "";
     process.stdin.on("data", (d) => (raw += d));
     process.stdin.on("end", () => {
@@ -12509,37 +12563,47 @@ require_evidenced_platform_coverage() {
       for (const line of raw.split("\n")) {
         if (!line) continue;
         const [gate, platform] = JSON.parse(line);
-        if (!covered.has(gate)) covered.set(gate, new Set());
-        covered.get(gate).add(platform);
+        if (!covered.has(gate)) covered.set(gate, new Map());
+        const counts = covered.get(gate);
+        counts.set(platform, (counts.get(platform) || 0) + 1);
       }
-      const gaps = [];
-      for (const gate of Array.from(covered.keys()).sort()) {
-        const ran = covered.get(gate);
+      const problems = [];
+      for (const gate of requiredGates) {
+        const ran = covered.get(gate) || new Map();
         const absent = reviewed.filter((platform) => !ran.has(platform));
         if (absent.length > 0) {
-          gaps.push(
+          problems.push(
             "the " + gate + " gate evidences [" +
-              Array.from(ran).sort().join(", ") + "] and not [" +
+              Array.from(ran.keys()).sort().join(", ") + "] and not [" +
               absent.join(", ") + "]"
           );
         }
+        for (const platform of Array.from(ran.keys()).sort()) {
+          const count = ran.get(platform);
+          if (count > 1) {
+            problems.push(
+              "the " + gate + " gate has " + count +
+                " records for [" + platform + "]"
+            );
+          }
+        }
       }
-      process.stdout.write(gaps.join("; "));
+      process.stdout.write(problems.join("; "));
     });
   ' "${ATTESTED_PROVENANCE_IMAGES}")" ||
-    blocked "cannot determine which of the release's platforms these records \
-evidence"
+    blocked "cannot determine whether the evidence archive contains every \
+required gate and platform exactly once"
 
-  if [[ -n "${missing}" ]]; then
-    blocked "these records do not rehearse every image this release \
-publishes: ${missing}; a published platform no gate ran is an artifact this \
-release would ship untested, and no single record can report that because \
-each one honestly names only the platform its runner executed — rehearse the \
-gate on the missing platform and validate the records together"
+  if [[ -n "${archive_problem}" ]]; then
+    blocked "the evidence archive does not contain exactly one record for \
+every required gate and published platform: ${archive_problem}; a missing \
+record leaves a mandatory release property unproved, while duplicate records \
+leave competing accounts of which run is authoritative — rehearse each gate \
+once on every platform and validate the records together"
   fi
 
-  note "every platform the release publishes is evidenced by every gate these \
-records cover"
+  note "single_release and rollback each evidence every platform the release \
+publishes exactly once"
 }
 
 # Render every acceptance-relevant finding in one record. The gate contracts

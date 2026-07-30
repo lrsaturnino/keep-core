@@ -191,14 +191,19 @@ stage validates every top-level JSON against the rehearsal record schema and
 an audit manifest is a different document.
 
 The two **container** rehearsals are mandatory release gates that cannot run
-from this repository alone: they need the immutable prior-production and R1
-runtime image digests, an equally immutable probe image digest, a rehearsal
-chain with deployed beacon/tBTC contracts and its chain id, per-node operator
-keys and configs each declaring a nonzero `clientInfo.port`, a work driver
-that originates protocol work on that chain, and (for rollback) a directory
-to capture each drained node's state into. `rehearse.sh preflight` validates
-those inputs and reports `BLOCKED` with the exact missing one. The rollback
-gate additionally needs the audit inputs no storage snapshot can supply — the
+from this repository alone. For every platform the detached release provenance
+publishes, they need a native runner, the immutable prior-production and R1
+runtime image digests, an equally immutable probe image digest, and an isolated
+rehearsal chain that begins below its own C with deployed beacon/tBTC contracts
+and its chain id. Each platform also needs per-node operator keys and configs
+under `<platform-key>/<service>/`, with the configs naming that chain's
+contracts and declaring a nonzero `clientInfo.port`; reusing one already-crossed
+chain for another platform is not a rehearsal of that platform's cutover. The
+shared inputs are a work driver that originates protocol work on those chains
+and (for rollback) a directory to capture each drained node's state into.
+`rehearse.sh preflight` validates those inputs and reports `BLOCKED` with the
+exact missing one. The rollback gate additionally needs the audit inputs no
+storage snapshot can supply — the
 rollback evidence generator that produces the chain and Bitcoin
 reconciliation, quiescence outcome, and prior-reader compatibility records for
 each captured snapshot, the independently provisioned WalletRegistry/finalized
@@ -246,9 +251,12 @@ property violated is recorded `fail` the same way, and an acceptance
 assertion is written `true` only where the run watched the property hold, so
 an unobserved one reads as refused rather than as satisfied.
 
-Every run therefore ends with an evidence record on disk — shape-checked by
-the acceptance stage's own validator — and the stage's exit is decided from
-the recorded outcomes. A failed step is the strongest verdict and exits
+Every run therefore ends with an evidence record on disk — checked for
+per-record admissibility by the acceptance stage's own validator — and the
+stage's exit is decided from the recorded outcomes. A platform runner does not
+ask the archive-wide completeness question while emitting: the other runners'
+records do not exist in its workspace yet. A failed step is the strongest
+verdict and exits
 `FAIL`: the rehearsal reached the property, watched it, and watched it break,
 which outranks anything the run could not reach. A step that never executed
 exits `BLOCKED`: the gate is unproved rather than disproved. A refused
@@ -962,9 +970,11 @@ digests, chain ID and C, the sha256 of the reviewed `release-manifest.json`
 the fleet's termination grace was taken from and the grace value itself,
 per-stage canonical/callback blocks, permit modes, gauge snapshots,
 transaction hashes, and non-secret state checksums. Screenshots alone are
-insufficient. `./rehearse.sh validate-evidence` checks every record under
-`EVIDENCE_DIR` against the schema (ajv pinned to exact versions) and
-requires the recorded manifest hash *and* the recorded termination grace to
+insufficient. The emitter validates its one record with
+`validate_evidence_record_set`; `./rehearse.sh validate-evidence` is the
+archive entry point and checks every record under `EVIDENCE_DIR` against the
+schema (ajv pinned to exact versions) before checking archive completeness. Both
+require the recorded manifest hash *and* the recorded termination grace to
 equal the checked-in manifest's — the hash alone would accept a record that
 names the right manifest while claiming the fleet ran under some other
 grace — so an admissible record links the termination-grace record to the
@@ -1106,13 +1116,14 @@ a bound run, the dispatched one, and already required to equal every record's
 `source_sha`. And the images are checked in two places, because they answer two
 different questions.
 
-Per record, every platform in `artifacts.r1_image_digests` must be one the
+Per record, the one platform in `artifacts.r1_image_digests` must be one the
 provenance publishes, at exactly the reference it publishes: an extra platform
 is a fleet running something the release never shipped, a substituted digest is
 a rehearsal of an artifact this release does not publish, and a record naming
 no image at all would agree with every release by having nothing to disagree
-about. The comparison is over references rather than bare digests, so the same
-content pulled from another repository is refused too.
+about. A record naming two published platforms is refused too: one runner did
+not execute both. The comparison is over references rather than bare digests,
+so the same content pulled from another repository is refused as well.
 
 What a record does *not* name is not asked of it. A multi-architecture digest
 names a manifest list whose children are the real runtime images, and a runner
@@ -1124,11 +1135,17 @@ ran, refusing rather than guessing when the index publishes none for that
 platform, more than one, or nothing readable at all.
 
 Covering the published set is therefore a property of the archive, checked once
-over every record and asked per gate: a release publishing two architectures is
-evidenced by rehearsing on each, and a rollback gate that ran on one of them
-leaves the other with no evidence it can be rolled back, however thoroughly the
-cutover gate covered both. Which gates a release must produce at all stays the
-acceptance contract's question; this one is only about coverage.
+over every record as the exact product of the mandatory gates
+`single_release`/`rollback` and the provenance's platforms. A release publishing
+two architectures is evidenced by rehearsing both gates on each. A wholly absent
+rollback gate no longer disappears from a map inferred from existing records,
+and two records for one gate/platform are refused as competing accounts rather
+than collapsed into a set. The workflow derives its native-runner matrix from
+the sealed provenance, gives every runner a platform suffix and an isolated
+chain input, uploads only its uniquely named top-level records for fan-in, and
+runs `validate-evidence` once in `aggregate-rehearsal-evidence` after all
+platform jobs. Full per-platform artifacts remain separate because their audit
+trees legitimately contain colliding filenames.
 
 A receipt belongs to one run at one commit, and three rules keep it that
 way. `local-proofs` destroys the receipt it inherits — interrupted staging
@@ -1478,13 +1495,14 @@ a bump there touches no line under `scripts/`.
 
 On a hosted runner the per-node keystore comes from the
 `REHEARSAL_KEYSTORE_BUNDLE_B64` repository secret: a base64-encoded tar.gz
-whose top level holds one `<service>/` directory per rehearsal node, each
-with its `config.toml` and rehearsal-only key material. Generate it from a
-prepared `KEYSTORE_DIR` with `tar -cz -C "$KEYSTORE_DIR" . | base64`. The
-bundle MUST contain throwaway rehearsal keys only — never production
-operator keys — and the dispatch reports `BLOCKED` when the secret is not
-provisioned. The companion `REHEARSAL_KEEP_ETHEREUM_PASSWORD` secret carries
-the key files' password.
+whose top level holds one platform key (`amd64`, `arm64`, or `arm64-v8`) per
+published image and one `<service>/` directory per rehearsal node beneath it,
+each with its platform chain's `config.toml` and rehearsal-only key material.
+Generate it from a prepared root with `tar -cz -C "$KEYSTORE_ROOT" . | base64`.
+The bundle MUST contain throwaway rehearsal keys only — never production
+operator keys — and the dispatch reports `BLOCKED` when the secret or the
+current platform's subtree is not provisioned. The companion
+`REHEARSAL_KEEP_ETHEREUM_PASSWORD` secret carries the key files' password.
 
 The rest of what a container rehearsal needs is chain-side, which is to say
 outside this repository, and arrives the same way. The dispatch inputs name
@@ -1494,8 +1512,9 @@ mutable probe tag would leave the reading instrument outside the record's
 provenance), the rehearsal chain's websocket endpoint and numeric chain id,
 its JSON-RPC endpoint — the one every transaction a driver reports is
 confirmed against, and which preflight refuses unless it answers with the
-rehearsed chain id — the rehearsed `C`, and the Bitcoin network, prior
-version, and prior revision the rollback state audit binds its verdict to. The
+rehearsed chain id — the rehearsed `C`, with a separate endpoint/C/id tuple for
+each published platform, and the Bitcoin network, prior version, and prior
+revision the rollback state audit binds its verdict to. The
 `REHEARSAL_CHAIN_INPUTS_BUNDLE_B64` secret carries two executables, not data:
 a base64-encoded tar.gz holding `work-driver` — called with the phase name,
 because the fleet only reacts to chain events and without something
@@ -1508,6 +1527,18 @@ this run has drained the fleet; a bundle unpacked before the fleet started
 could not know a checksum computed later. Both members are checked as they are
 unpacked, so a bundle missing one blocks before the fleet starts rather than
 halfway through a rehearsal.
+
+The authenticated Ethereum half of rollback has a separate trust path.
+`REHEARSAL_AUDIT_TRUST_B64` is base64 JSON keyed by the same platform keys as
+the keystore. Each value must contain `wallet_registry_address`,
+`random_beacon_address`, `finalized_ethereum_block_number`,
+`finalized_ethereum_block_hash`, and the lowercase-hex
+`chain_evidence_public_key`. The workflow validates their canonical shapes and
+exports them only for that platform's job. This document MUST be provisioned
+independently of `rollback-evidence-generator`: letting the program supply the
+contract addresses, finalized anchor, or public key that authenticate its own
+record would turn signature and canonical-chain verification into
+self-attestation.
 
 An executable bit is not provenance, though, and that secret is mutable. Both
 programs produce readings that become release evidence — the driver's account
