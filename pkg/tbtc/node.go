@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/big"
+	"slices"
 	"sync"
 	"time"
 
@@ -144,10 +145,14 @@ type node struct {
 	participationGate participation.Gate
 }
 
+// walletPermitIdentity binds a wallet permit to the wallet and canonical block
+// it runs for. operatedMembers is this node's own seats in that wallet's
+// signing group, read from the registry at issuance.
 func walletPermitIdentity(
 	workClass string,
 	walletPublicKey *ecdsa.PublicKey,
 	canonicalStartBlock uint64,
+	operatedMembers participation.MemberIndexes,
 ) participation.PermitIdentity {
 	walletPublicKeyHash := bitcoin.PublicKeyHash(walletPublicKey)
 	walletID := hex.EncodeToString(walletPublicKeyHash[:])
@@ -159,8 +164,41 @@ func walletPermitIdentity(
 			canonicalStartBlock,
 			walletID,
 		),
-		PermitID: walletID,
+		PermitID:        walletID,
+		OperatedMembers: operatedMembers,
 	}
+}
+
+// walletSigningGroupSeats reports this node's seats in the given wallet's
+// signing group, ascending and distinct, as the wallet registry holds them.
+//
+// It is read at permit issuance rather than derived later from whatever the
+// ceremony produced. A wallet action's permit is one permit covering every seat
+// this node operates in the wallet, so unlike a per-seat DKG or relay permit it
+// cannot carry the seat in its identity — and a reader assembling which seats
+// this node held on this wallet action has nowhere else to get them if the
+// action ends without a result.
+//
+// An empty result is a real answer and is recorded as one: a node whose signers
+// for the wallet were archived between the coordination window and the action
+// operates no seat in it, and saying so is more accurate than declining to
+// record the permit at all.
+func (n *node) walletSigningGroupSeats(
+	walletPublicKey *ecdsa.PublicKey,
+) participation.MemberIndexes {
+	signers := n.walletRegistry.getSigners(walletPublicKey)
+
+	seats := make(participation.MemberIndexes, 0, len(signers))
+	for _, signer := range signers {
+		if !slices.Contains(seats, signer.signingGroupMemberIndex) {
+			seats = append(seats, signer.signingGroupMemberIndex)
+		}
+	}
+	// The gate requires an ascending, duplicate-free set: one set has exactly
+	// one encoding, so two readings of the same permit compare equal.
+	slices.Sort(seats)
+
+	return seats
 }
 
 func newNode(
@@ -1297,6 +1335,7 @@ func executeCoordinationProcedure(
 			"wallet-coordination",
 			walletPublicKey,
 			window.coordinationBlock,
+			node.walletSigningGroupSeats(walletPublicKey),
 		),
 	)
 	if err != nil {
@@ -1665,6 +1704,7 @@ func (n *node) beginWalletActionPermit(
 				fmt.Sprintf("wallet-action-%d", proposedAction),
 				walletPublicKeys[0],
 				startBlock,
+				n.walletSigningGroupSeats(walletPublicKeys[0]),
 			),
 		)
 	}

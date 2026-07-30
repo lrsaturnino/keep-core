@@ -4175,6 +4175,47 @@ TERMINAL_OUTCOME_JS='
         return kind + "=" + reference + "=" + membership + "=" +
           contributionOf(record, kind, membership) + "=" + settlement;
       };
+      // The ceremonies that operate no seat of their own. A forwarder relays
+      // shares belonging to other members and computes nothing; a timeout
+      // monitor files a penalty. The gate refuses a seat claimed under either,
+      // so the reading here is the mirror of that refusal: a seat arriving on
+      // one of them is a record no gate wrote.
+      const SEATLESS_CEREMONIES = [
+        "beacon_relay_forwarding", "beacon_timeout_report",
+      ];
+      // The seats the holder of a permit says it operates, comma-joined, as
+      // published when the permit was issued.
+      //
+      // The one-seat-per-permit rule the gate applies to a DKG or relay signing
+      // membership is deliberately not mirrored here. The gate refuses such an
+      // identity at issuance, and the shell reader holds every transcript to the
+      // operated set of its own permit, so a third copy of the rule would buy
+      // nothing and would take a whole snapshot down the moment it drifted from
+      // the gate by one ceremony.
+      //
+      // This is the half of an ownership map that a transcript cannot supply. A
+      // transcript exists only where a ceremony produced a result, so an
+      // ownership map assembled from transcripts covers the nodes that finished
+      // and silently omits the ones that contributed and then crashed, timed
+      // out, or ended with nothing — and a seat omitted from the ownership map
+      // of a fleet is a seat attributed to whoever else was on the network.
+      // Reading it off the permit covers every holder whatever became of it.
+      const operatedOf = (record) => {
+        const permit = record.permit;
+        const ceremony = permit.ceremony;
+        const operated = memberSetOf(
+          permit.operated_members === undefined ?
+            [] : permit.operated_members,
+          "the memberships a permit holder operates",
+        );
+        if (SEATLESS_CEREMONIES.includes(ceremony) && operated.length > 0) {
+          console.error("a " + JSON.stringify(ceremony) +
+            " permit claims seats it operates none of: " +
+            JSON.stringify(record));
+          process.exit(1);
+        }
+        return operated.join(",") || NONE;
+      };
       const terminalOutcome = (service, record) => {
         if (record === null || typeof record !== "object" ||
           Array.isArray(record)) {
@@ -4193,7 +4234,8 @@ TERMINAL_OUTCOME_JS='
           process.exit(1);
         }
         return permitIdentity(service, record.permit, "a closed permit") +
-          "=" + record.outcome + "=" + evidenceOf(record);
+          "=" + record.outcome + "=" + evidenceOf(record) +
+          "=" + operatedOf(record);
       };
 '
 
@@ -5975,8 +6017,13 @@ present_tokens() {
 # "<service>@<gate ceremony>@<anchor>@<chain work>#<permit>", which carries no
 # "=" of its own. The node-authored side appends what its holder recorded:
 # "=<outcome>=<evidence kind>=<result>=<membership>=<incorporated>=<local>=
-# <settlement>", with "-" wherever the gate carries no value. The two membership
-# sets are comma-joined ascending.
+# <settlement>=<operated>", with "-" wherever the gate carries no value. The
+# three membership sets are comma-joined ascending.
+#
+# The last field is the permit's rather than the ending's: it is the seats the
+# holder said it was operating when the permit was issued, so it is there on
+# every record whatever the ending, including the ones that produced nothing to
+# write a transcript about.
 # ---------------------------------------------------------------------------
 
 # The permit identity a node-authored outcome token names, without its ending.
@@ -6071,6 +6118,29 @@ authored_local() {
 # result, "<kind>" or "<kind>:<canonical identity>", or "-" for the permits
 # that dispatched none.
 authored_settlement() {
+  local rest
+  rest="${1#*=}"
+  rest="${rest#*=}"
+  rest="${rest#*=}"
+  rest="${rest#*=}"
+  rest="${rest#*=}"
+  rest="${rest#*=}"
+  rest="${rest#*=}"
+  printf '%s' "${rest%%=*}"
+}
+
+# The memberships the permit's holder said it was operating when the permit was
+# issued, comma-joined ascending, or "-" for the permits that operate none.
+#
+# This is the field an ownership map is built from, and it is a different
+# statement from the transcript's local half above. The transcript exists only
+# where a ceremony reached a result, so a map assembled from transcripts covers
+# the holders that finished and omits the ones that contributed and then crashed,
+# timed out, or ended with nothing to record. Every one of those still operated
+# its seats, and a seat missing from the fleet's map is a seat attributed to
+# whichever other release was on the network — which is the whole mixed-release
+# claim, decided by an omission.
+authored_operated() {
   printf '%s' "${1##*=}"
 }
 
@@ -6196,6 +6266,16 @@ identity_work() {
   printf '%s' "${rest%%#*}"
 }
 
+# The gate ceremony a permit identity was issued for. It is read out of the
+# identity rather than out of the driver's vocabulary because the two spell
+# different things: the driver names the work it originated, and the gate names
+# the ceremony class whose rules the permit was issued under.
+identity_ceremony() {
+  local rest
+  rest="${1#*@}"
+  printf '%s' "${rest%%@*}"
+}
+
 # The whole node-authored record for one named permit, empty when none names
 # it. Like authored_ending it reads the last match, so where a duplicate slips
 # past the check above the later record is the one that stands.
@@ -6209,9 +6289,10 @@ authored_record() {
 }
 
 # Whether one node-authored token carries the whole ending shape: an identity,
-# the disposition, and the six evidence fields behind it — kind, result,
-# persisted membership, the memberships that produced the result, the ones the
-# holder operated, and the chain settlement.
+# the disposition, the six evidence fields behind it — kind, result, persisted
+# membership, the memberships that produced the result, the ones the holder named
+# in the transcript, and the chain settlement — and the seats the permit was
+# issued to operate.
 #
 # The count is exact rather than a floor. A token with fewer fields comes from a
 # release publishing a narrower account, and every reader below would take the
@@ -6223,7 +6304,7 @@ authored_record_complete() {
     rest="${rest#*=}"
     count=$((count + 1))
   done
-  ((count == 7))
+  ((count == 8))
 }
 
 # Of the named permits, the ones whose node-authored record stops short of the
@@ -6631,19 +6712,84 @@ uncredited_contributors() {
 # it, not whichever node published the transcript naming it. Nothing in it is the
 # driver's word: each holder names only memberships of its own, and no report can
 # add one.
+#
+# Every ending counts toward it, and that is what makes the map a map. The seats
+# are read from the permit rather than from the transcript, so they are there for
+# a holder that contributed and then crashed, timed out, exhausted its retries,
+# or closed without recording anything at all — and the "outside the map"
+# reading below is what the fleet actually did not operate rather than what the
+# subset of it that reached a result happened to write down. A map built from
+# completions alone gets exactly one case wrong, and it is the case that decides
+# the mixed-release claim: an R1 node whose seat went into another R1 node's
+# result while its own permit ended with nothing to record leaves that seat
+# outside the map, and the reading below then calls an all-R1 transcript mixed.
 authored_work_local_members() {
   local work="$1" authored="$2" token permit members out=""
   for token in ${authored}; do
     authored_record_complete "${token}" || continue
-    [[ "$(authored_outcome "${token}")" == "completed" ]] || continue
     permit="$(authored_permit "${token}")"
     [[ "$(identity_work "${permit}")" == "${work}" ]] || continue
-    members="$(authored_local "${token}")"
+    members="$(authored_operated "${token}")"
     # "-" is how the gate renders an absent set, and it must not survive into a
-    # membership map: read as a token it would make an incorporated "-" look
-    # like an operated seat.
+    # membership map: read as a token it would make an absent "-" look like an
+    # operated seat.
     [[ "${members}" == "-" ]] && continue
     out="${out}${out:+ }${members//,/ }"
+  done
+  printf '%s' "${out}"
+}
+
+# Of the records on one piece of chain work, the ones whose transcript claims a
+# seat their own permit was not issued to operate, rendered as
+# "<permit> (transcript <seats>, operated <seats>)".
+#
+# A holder makes two statements about one permit: the seats it announced it was
+# operating, before the ceremony ran, and the seats it says produced the result,
+# after. The ownership map above rests entirely on the first, so the second has to
+# be held to it — otherwise a holder could announce one seat, record a result
+# produced with another, and leave a reader with two node-authored answers and no
+# rule for choosing between them.
+#
+# The gate refuses such a record at the moment it is written, so anything found
+# here reached a gate scrape by some other route. Either way it is a reason to
+# refuse the reading rather than to pick a side.
+#
+# tBTC DKG is deliberately not compared. Its permit names a DKG member index
+# while its transcript is in the final signing group's index space, rebuilt after
+# inactive and disqualified members are removed, so the same node legitimately
+# runs seat 9 of the ceremony and persists seat 7 of the group.
+disowned_transcript_permits() {
+  local work="$1" authored="$2"
+  local token permit operated local_members member out=""
+  for token in ${authored}; do
+    authored_record_complete "${token}" || continue
+    permit="$(authored_permit "${token}")"
+    [[ "$(identity_work "${permit}")" == "${work}" ]] || continue
+    [[ "$(identity_ceremony "${permit}")" == "tbtc_dkg" ]] && continue
+    local_members="$(authored_local "${token}")"
+    [[ "${local_members}" == "-" ]] && continue
+    operated="$(authored_operated "${token}")"
+    for member in ${local_members//,/ }; do
+      contains_token "${operated//,/ }" "${member}" && continue
+      out="${out}${out:+, }${permit} (transcript ${local_members}, \
+operated ${operated})"
+      break
+    done
+  done
+  printf '%s' "${out}"
+}
+
+# The same across every piece of work a control covers, so a verdict can name the
+# record that contradicted itself rather than reporting only the coverage gap it
+# leaves behind. A step that blocked with "no transcript incorporated a share"
+# would send a reader looking for a homogeneous fleet when what actually happened
+# is that a holder published two irreconcilable accounts of one permit.
+disowned_authored_transcripts() {
+  local authored="$1" works="$2" work found out=""
+  for work in ${works}; do
+    found="$(disowned_transcript_permits "${work}" "${authored}")"
+    [[ -n "${found}" ]] || continue
+    out="${out}${out:+, }${found}"
   done
   printf '%s' "${out}"
 }
@@ -6671,9 +6817,22 @@ authored_work_local_members() {
 # record with a seat outside the map, a run it only watched leaves no record with
 # a seat inside it, and a driver naming a party the fleet never authenticated
 # cannot add either half.
+#
+# The map the seats are read against spans every ending rather than only the
+# completions, so a holder that contributed and then ended with nothing to record
+# still puts its seats in it. Without that the reading has a false positive in
+# exactly the direction it is used: an all-R1 ceremony one of whose contributors
+# never published an ending would present its seat as outside the fleet, and a
+# homogeneous run would satisfy a control whose whole claim is that two releases
+# combined into one output.
+#
+# A record whose transcript claims a seat its own permit never operated is not
+# read at all. The two statements would have to be reconciled before either could
+# be believed, and there is no rule for doing that which is not a guess.
 mixed_transcript_permits() {
   local work="$1" authored="$2"
   local owned token permit incorporated member fleet outside out=""
+  [[ -z "$(disowned_transcript_permits "${work}" "${authored}")" ]] || return 0
   owned="$(authored_work_local_members "${work}" "${authored}")"
   for token in ${authored}; do
     authored_record_complete "${token}" || continue
@@ -9342,6 +9501,7 @@ precutover_verdict() {
 
   local failed_results missing_ceremonies settlements
   local uninteroperated stray unended invented uncredited unrecognized
+  local disowned
   local named_permits unauthored duplicated unresolved misended authored
   local malformed misevidenced disagreeing unclaimed result_population
   local unresolved_settlements
@@ -9412,6 +9572,9 @@ precutover_verdict() {
     "${REHEARSAL_PRIOR_SERVICE}" "${REHEARSAL_R1_SERVICES[*]}")"
   uncredited="$(uncredited_contributors "${PRECUTOVER_CONTRIBUTORS}" \
     "${PRECUTOVER_AUTHORED_ENDINGS}" "$(identity_works "${named_permits}")")"
+  disowned="$(disowned_authored_transcripts \
+    "${PRECUTOVER_AUTHORED_ENDINGS}" \
+    "$(identity_works "${named_permits}")")"
   uninteroperated="$(ceremonies_without_mixed_transcript \
     "${PRECUTOVER_CONTRIBUTORS}" "${PRECUTOVER_AUTHORED_ENDINGS}" \
     "${required_ceremonies}" "${REHEARSAL_PRIOR_SERVICE}")"
@@ -9528,6 +9691,12 @@ parties to the transcripts it settled, and this rehearsal runs no such \
 service; a holder whose release is unknown is neither half of a mixed \
 prior/R1 claim, and counting it as either would let a stray container supply \
 the side it was never shown to be on"
+  elif [[ -n "${disowned}" ]]; then
+    block_step "${step}" "${disowned}; a holder said which seats it was \
+operating when its permit was issued and then published a result produced with \
+a seat it never claimed, and the two accounts of one permit cannot both be \
+true; the fleet ownership map every mixed reading is decided against is built \
+from the first of them, so a record contradicting it settles nothing either way"
   elif [[ -n "${uninteroperated}" ]]; then
     block_step "${step}" "the work driver settled ${settlements}, but no \
 ${uninteroperated} transcript incorporated a share from both \

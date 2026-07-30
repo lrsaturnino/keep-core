@@ -46,7 +46,17 @@ const (
 	// produced it, so every reading of it has to fall back on treating a
 	// completion as a contribution — which is exactly the inference this field
 	// exists to remove.
-	TerminalOutcomeJournalSchemaVersion = uint32(4)
+	//
+	// Version 5 added the memberships each permit's holder operates, recorded
+	// at issuance and carried by every permit whatever became of it. A version 4
+	// journal names operated seats only inside the transcripts of permits that
+	// completed, so a reader asking which seats this node held on one piece of
+	// work has to answer from the subset of them that reached a result — and a
+	// seat whose permit ended exhausted, quarantined, or unresolved then reads
+	// as a seat the node never operated. The distinction matters most where the
+	// inference is least visible: a fleet-wide ownership map missing those seats
+	// attributes them to whoever else was on the network.
+	TerminalOutcomeJournalSchemaVersion = uint32(5)
 
 	// TerminalOutcomeJournalStorageFile identifies the terminal-outcome
 	// journal beside the immutable gate snapshot. Both records are encrypted
@@ -61,6 +71,28 @@ const (
 type PermitIdentity struct {
 	WorkID   string `json:"work_id"`
 	PermitID string `json:"permit_id"`
+	// OperatedMembers are the ceremony memberships this node itself operates
+	// under this permit, ascending and distinct. It is empty for the permits
+	// that operate no seat at all — a forwarder relaying other members' shares,
+	// a timeout monitor filing a penalty.
+	//
+	// It is supplied at issuance, before any outcome exists, and that is the
+	// whole reason it lives here rather than only in a terminal record's
+	// transcript. A reader asking who operated a seat on one piece of work is
+	// building an ownership map, and an ownership map assembled from completions
+	// is incomplete by construction: a node that contributed and then crashed,
+	// timed out, or ended without a threshold result operated its seats just as
+	// much as one that finished, and records nothing about them. Reading the
+	// seats off the permit instead covers every node that was allowed to take
+	// part, whatever became of it — which is what makes "no node in this fleet
+	// operated that seat" a statement about the fleet rather than about the
+	// subset of it that happened to complete.
+	//
+	// A node can only ever name its own seats here. The gate refuses a
+	// transcript whose local memberships are not among the permit's operated
+	// ones, so the two node-authored accounts of the same permit cannot
+	// disagree, and no report from another party can add a seat to either.
+	OperatedMembers MemberIndexes `json:"operated_members,omitempty"`
 }
 
 const (
@@ -128,7 +160,10 @@ func validatePermitIdentity(identity PermitIdentity) error {
 		}
 	}
 
-	return nil
+	return validateMemberIndexSet(
+		"operated memberships",
+		identity.OperatedMembers,
+	)
 }
 
 // validatePermitIdentityForCeremony applies the identity shape that is
@@ -172,6 +207,31 @@ func validatePermitIdentityForCeremony(
 				group.MaxMemberIndex,
 			)
 		}
+		// The permit already names the one seat it was issued for, so the
+		// operated set is not free to say anything else. Two node-authored
+		// statements about the same permit that disagree would leave a reader
+		// choosing between them, and either choice is an inference.
+		if len(identity.OperatedMembers) != 1 ||
+			uint64(identity.OperatedMembers[0]) != memberIndex {
+			return fmt.Errorf(
+				"ceremony [%s] runs one seat per permit, so its operated "+
+					"memberships must be exactly its permit ID [%s]",
+				ceremony,
+				identity.PermitID,
+			)
+		}
+	case BeaconRelayForwarding, BeaconTimeoutReport:
+		// Neither operates a seat: a forwarder relays other members' shares
+		// and computes nothing, and a timeout report is one node's penalty
+		// filing. A seat claimed here would enter the fleet's ownership map as
+		// operated by this node without any membership behind it, which is the
+		// self-attestation the map exists to keep out.
+		if len(identity.OperatedMembers) != 0 {
+			return fmt.Errorf(
+				"ceremony [%s] operates no membership, so it must claim none",
+				ceremony,
+			)
+		}
 	}
 
 	return nil
@@ -190,6 +250,25 @@ type PermitSnapshot struct {
 	// unbound path exists only for test gates without a persistence recorder;
 	// production issuance and the rollback audit both refuse it.
 	IdentityBound bool `json:"identity_bound"`
+	// OperatedMembers are the memberships this node operates under the permit,
+	// as its owner named them at issuance. It travels with every reading of the
+	// permit — live, quiesced, and terminal, whatever the outcome — because a
+	// reader building a per-work seat ownership map needs the seats of the
+	// permits that came to nothing just as much as the ones that completed.
+	OperatedMembers MemberIndexes `json:"operated_members,omitempty"`
+}
+
+// Equal reports whether two permit snapshots describe the same permit. It
+// exists because the snapshot carries a slice, so == neither compiles nor
+// compares a snapshot with the same snapshot reloaded from the journal.
+func (p PermitSnapshot) Equal(other PermitSnapshot) bool {
+	return p.Ceremony == other.Ceremony &&
+		p.Mode == other.Mode &&
+		p.CanonicalStartBlock == other.CanonicalStartBlock &&
+		p.WorkID == other.WorkID &&
+		p.PermitID == other.PermitID &&
+		p.IdentityBound == other.IdentityBound &&
+		slices.Equal(p.OperatedMembers, other.OperatedMembers)
 }
 
 // QuiescenceSnapshot is the node-authored, immutable record captured under
@@ -871,7 +950,7 @@ type TerminalOutcomeRecord struct {
 // rebuilt or reloaded elsewhere. Callers must use this instead of ==.
 func (r TerminalOutcomeRecord) Equal(other TerminalOutcomeRecord) bool {
 	return r.RecordedAt.Equal(other.RecordedAt) &&
-		r.Permit == other.Permit &&
+		r.Permit.Equal(other.Permit) &&
 		r.Outcome == other.Outcome &&
 		r.Evidence.Equal(other.Evidence)
 }
@@ -1227,6 +1306,88 @@ func validateTranscriptContribution(
 	return nil
 }
 
+// permitSeatSpaceCeremonies names the ceremonies whose terminal record speaks
+// in the same membership index space its permit was issued in, and whose seats
+// may therefore be held against the permit's operated set.
+//
+// tBTC DKG is deliberately absent. Its permit is issued for a DKG member index
+// while its transcript and persisted membership are in the final signing
+// group's index space, which is rebuilt after inactive and disqualified members
+// are removed — so the same node legitimately operates seat 9 of the ceremony
+// and persists seat 7 of the group. Comparing across the two would refuse
+// correct records and, worse, would teach a reader that the numbers mean the
+// same thing.
+var permitSeatSpaceCeremonies = map[Ceremony]struct{}{
+	// The beacon group index is the DKG index: no membership is removed
+	// between the ceremony and the persisted signer.
+	BeaconDKG: {},
+	// Issued per local membership of an existing group, and the entry shares
+	// are combined in that same group's index space.
+	BeaconRelaySigning: {},
+	// A wallet action's permit covers this node's seats in the wallet's
+	// signing group, which is the space its done checks are counted in.
+	TBTCSigning:   {},
+	TBTCHeartbeat: {},
+}
+
+// ValidatePermitOperatedOwnership checks that a terminal record claims no seat
+// its own permit was not issued to operate.
+//
+// A permit's operated set and a completed record's local memberships are two
+// node-authored statements about one permit, made at different times: the first
+// before the ceremony ran, the second after it produced something. Holding the
+// second against the first is what keeps the earlier statement load-bearing —
+// without it a reader building a per-work ownership map from permits would have
+// no assurance that the seats a node later claims to have produced a result with
+// are the seats it announced it was operating, and the two accounts could be
+// used against each other.
+//
+// Only the ceremonies whose record shares its permit's index space are checked;
+// see permitSeatSpaceCeremonies for why tBTC DKG cannot be.
+func ValidatePermitOperatedOwnership(
+	ceremony Ceremony,
+	operatedMembers MemberIndexes,
+	outcome TerminalOutcome,
+	evidence TerminalEvidence,
+) error {
+	if err := validateMemberIndexSet(
+		"operated memberships",
+		operatedMembers,
+	); err != nil {
+		return err
+	}
+	if _, comparable := permitSeatSpaceCeremonies[ceremony]; !comparable {
+		return nil
+	}
+
+	if evidence.MembershipIndex != 0 &&
+		!slices.Contains(operatedMembers, evidence.MembershipIndex) {
+		return fmt.Errorf(
+			"membership index [%d] is not among the memberships [%v] this "+
+				"permit was issued to operate",
+			evidence.MembershipIndex,
+			operatedMembers,
+		)
+	}
+	if evidence.Contribution == nil {
+		return nil
+	}
+	for _, local := range evidence.Contribution.LocalMembers {
+		if !slices.Contains(operatedMembers, local) {
+			return fmt.Errorf(
+				"outcome [%s] claims membership [%d] in its transcript, which "+
+					"is not among the memberships [%v] this permit was issued "+
+					"to operate",
+				outcome,
+				local,
+				operatedMembers,
+			)
+		}
+	}
+
+	return nil
+}
+
 // validateMemberIndexSet checks that a member-index list is an ascending,
 // duplicate-free set of valid indexes. The ordering requirement is not
 // cosmetic: it makes one set have exactly one encoding, so two records of the
@@ -1472,7 +1633,7 @@ func (r *persistenceQuiescenceSnapshotRecorder) RecordTerminalOutcome(
 	}
 
 	for _, existing := range r.journal.Outcomes {
-		if existing.Permit == outcome.Permit {
+		if existing.Permit.Equal(outcome.Permit) {
 			if existing.Equal(outcome) {
 				return nil
 			}

@@ -56,16 +56,26 @@ func beaconDKGPermitIdentity(
 	return participation.PermitIdentity{
 		WorkID:   hex.EncodeToString(seedHash[:]),
 		PermitID: fmt.Sprint(memberIndex),
+		// The one seat this permit runs. The beacon group index is the DKG
+		// index, so this is also the seat the persisted signer will carry.
+		OperatedMembers: participation.MemberIndexes{memberIndex},
 	}
 }
 
+// beaconRelayPermitIdentity binds a relay permit to the request it answers.
+// operatedMembers is the seat the permit runs for a signing membership, and
+// empty for the relay permits that operate no seat — a forwarder relays other
+// members' shares and computes nothing, and a timeout monitor files a penalty
+// rather than a contribution.
 func beaconRelayPermitIdentity(
 	requestStartBlock uint64,
 	localPermitID string,
+	operatedMembers ...group.MemberIndex,
 ) participation.PermitIdentity {
 	return participation.PermitIdentity{
-		WorkID:   participation.BeaconRelayWorkID(requestStartBlock),
-		PermitID: localPermitID,
+		WorkID:          participation.BeaconRelayWorkID(requestStartBlock),
+		PermitID:        localPermitID,
+		OperatedMembers: participation.MemberIndexes(operatedMembers),
 	}
 }
 
@@ -1361,6 +1371,7 @@ func (n *node) generateRelayEntry(
 			beaconRelayPermitIdentity(
 				startBlockHeight,
 				fmt.Sprint(member.Signer.MemberID()),
+				member.Signer.MemberID(),
 			),
 		)
 		if err != nil {

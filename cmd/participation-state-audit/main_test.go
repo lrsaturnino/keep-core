@@ -233,6 +233,10 @@ func newTestStorageWithQuiescencePermits(
 				WorkID:              permit.WorkID,
 				PermitID:            permit.PermitID,
 				IdentityBound:       true,
+				OperatedMembers: testOperatedMembers(
+					participation.Ceremony(permit.Ceremony),
+					permit.PermitID,
+				),
 			},
 		)
 		switch permit.Mode {
@@ -262,6 +266,10 @@ func newTestStorageWithQuiescencePermits(
 				WorkID:              permit.WorkID,
 				PermitID:            permit.PermitID,
 				IdentityBound:       true,
+				OperatedMembers: testOperatedMembers(
+					participation.Ceremony(permit.Ceremony),
+					permit.PermitID,
+				),
 			},
 			fmt.Sprintf("test-result-%d", i),
 			groupPublicKeyHex(activeMembership),
@@ -272,6 +280,52 @@ func newTestStorageWithQuiescencePermits(
 	}
 
 	return storageDir
+}
+
+// testPermitSeat reports the seat a per-seat ceremony names in its own permit
+// identity, and zero for the permits that name none. A DKG member, a beacon
+// group member and a relay signing membership each run one seat under one
+// permit, so the identity is where their seat lives.
+func testPermitSeat(
+	ceremony participation.Ceremony,
+	permitID string,
+) group.MemberIndex {
+	switch ceremony {
+	case participation.TBTCDKG,
+		participation.BeaconDKG,
+		participation.BeaconRelaySigning:
+	default:
+		return 0
+	}
+
+	seat, err := strconv.ParseUint(permitID, 10, 8)
+	if err != nil || seat == 0 {
+		return 0
+	}
+
+	return group.MemberIndex(seat)
+}
+
+// testOperatedMembers renders the seats a fixture permit's holder operates, as
+// the production node names them at issuance. The per-seat ceremonies take
+// theirs from the permit identity; a wallet action takes the seat its transcript
+// is written for; and the permits that operate none — a forwarder, a timeout
+// monitor — name none.
+func testOperatedMembers(
+	ceremony participation.Ceremony,
+	permitID string,
+) participation.MemberIndexes {
+	switch ceremony {
+	case participation.BeaconRelayForwarding,
+		participation.BeaconTimeoutReport:
+		return nil
+	}
+
+	if seat := testPermitSeat(ceremony, permitID); seat != 0 {
+		return participation.MemberIndexes{seat}
+	}
+
+	return participation.MemberIndexes{group.MemberIndex(1)}
 }
 
 // testTranscriptContribution renders the transcript a completed outcome of the
@@ -375,9 +429,22 @@ func testTerminalOutcomeRecord(
 				Kind: participation.TerminalEvidenceForwarderClosed,
 			}
 		}
+		// The transcript's local seat is the seat the permit was issued for
+		// wherever the two share an index space. tBTC DKG is the exception:
+		// its permit names a DKG index while its transcript is in the final
+		// signing group's, so there the persisted membership is the local seat.
+		local := evidence.MembershipIndex
+		if snapshot.Ceremony != participation.TBTCDKG {
+			if seat := testPermitSeat(
+				snapshot.Ceremony,
+				snapshot.PermitID,
+			); seat != 0 {
+				local = seat
+			}
+		}
 		evidence.Contribution = testTranscriptContribution(
 			snapshot.Ceremony,
-			evidence.MembershipIndex,
+			local,
 		)
 	case participation.TerminalOutcomeQuarantined:
 		evidence = participation.TerminalEvidence{
@@ -497,6 +564,10 @@ func persistRealGateQuiescenceSnapshot(
 			participation.PermitIdentity{
 				WorkID:   expected.WorkID,
 				PermitID: expected.PermitID,
+				OperatedMembers: testOperatedMembers(
+					participation.Ceremony(expected.Ceremony),
+					expected.PermitID,
+				),
 			},
 		)
 		if err != nil {
@@ -524,6 +595,10 @@ func persistRealGateQuiescenceSnapshot(
 				WorkID:              permit.WorkID(),
 				PermitID:            permit.PermitID(),
 				IdentityBound:       true,
+				OperatedMembers: testOperatedMembers(
+					permit.Ceremony(),
+					permit.PermitID(),
+				),
 			},
 			fmt.Sprintf("real-gate-result-%d", i),
 			"",
@@ -1158,7 +1233,7 @@ func newValidEvidence(t *testing.T, auditManifest *manifest) evidenceInputs {
 			outcome := participation.TerminalOutcomeCompleted
 			if auditManifest.ParticipationTerminalOutcomes != nil {
 				for _, terminal := range auditManifest.ParticipationTerminalOutcomes.Outcomes {
-					if terminal.Permit == permit {
+					if terminal.Permit.Equal(permit) {
 						outcome = terminal.Outcome
 						break
 					}

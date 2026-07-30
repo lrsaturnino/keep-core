@@ -53,29 +53,112 @@ func TestGate_CeremonySpecificPermitIdentityValidation(t *testing.T) {
 		"uppercase DKG seed hash": {
 			ceremony: TBTCDKG,
 			identity: PermitIdentity{
-				WorkID:   strings.Repeat("A", 64),
-				PermitID: "1",
+				WorkID:          strings.Repeat("A", 64),
+				PermitID:        "1",
+				OperatedMembers: MemberIndexes{1},
 			},
 		},
 		"truncated DKG seed hash": {
 			ceremony: BeaconDKG,
 			identity: PermitIdentity{
-				WorkID:   strings.Repeat("a", 63),
-				PermitID: "1",
+				WorkID:          strings.Repeat("a", 63),
+				PermitID:        "1",
+				OperatedMembers: MemberIndexes{1},
 			},
 		},
 		"prefixed member index": {
 			ceremony: TBTCDKG,
 			identity: PermitIdentity{
-				WorkID:   strings.Repeat("a", 64),
-				PermitID: "01",
+				WorkID:          strings.Repeat("a", 64),
+				PermitID:        "01",
+				OperatedMembers: MemberIndexes{1},
 			},
 		},
 		"zero member index": {
 			ceremony: BeaconDKG,
 			identity: PermitIdentity{
+				WorkID:          strings.Repeat("a", 64),
+				PermitID:        "0",
+				OperatedMembers: MemberIndexes{1},
+			},
+		},
+		// The seats a per-seat ceremony announces cannot say anything other
+		// than what its permit ID already says.
+		"DKG permit operating no seat": {
+			ceremony: TBTCDKG,
+			identity: PermitIdentity{
 				WorkID:   strings.Repeat("a", 64),
-				PermitID: "0",
+				PermitID: "7",
+			},
+		},
+		"DKG permit operating a different seat": {
+			ceremony: BeaconDKG,
+			identity: PermitIdentity{
+				WorkID:          strings.Repeat("a", 64),
+				PermitID:        "7",
+				OperatedMembers: MemberIndexes{8},
+			},
+		},
+		"DKG permit operating more than its own seat": {
+			ceremony: TBTCDKG,
+			identity: PermitIdentity{
+				WorkID:          strings.Repeat("a", 64),
+				PermitID:        "7",
+				OperatedMembers: MemberIndexes{7, 8},
+			},
+		},
+		"relay signing permit operating a different seat": {
+			ceremony: BeaconRelaySigning,
+			identity: PermitIdentity{
+				WorkID:          BeaconRelayWorkID(1_000),
+				PermitID:        "3",
+				OperatedMembers: MemberIndexes{4},
+			},
+		},
+		// And the ceremonies that operate no seat may not claim one: a
+		// forwarder relays other members' shares and a timeout report is a
+		// penalty filing, so a seat here would enter the fleet's ownership map
+		// with no membership behind it.
+		"forwarder claiming a seat": {
+			ceremony: BeaconRelayForwarding,
+			identity: PermitIdentity{
+				WorkID:          BeaconRelayWorkID(1_000),
+				PermitID:        "forwarder",
+				OperatedMembers: MemberIndexes{1},
+			},
+		},
+		"timeout monitor claiming a seat": {
+			ceremony: BeaconTimeoutReport,
+			identity: PermitIdentity{
+				WorkID:          BeaconRelayWorkID(1_000),
+				PermitID:        "timeout-monitor",
+				OperatedMembers: MemberIndexes{1},
+			},
+		},
+		// The generic set rules hold for every ceremony: one set has exactly
+		// one encoding, so a reader cannot be shown the same seat twice.
+		"unordered operated seats": {
+			ceremony: TBTCSigning,
+			identity: PermitIdentity{
+				WorkID:          "wallet-action-unordered",
+				PermitID:        "wallet",
+				OperatedMembers: MemberIndexes{4, 2},
+			},
+		},
+		"repeated operated seat": {
+			ceremony: TBTCSigning,
+			identity: PermitIdentity{
+				WorkID:          "wallet-action-repeated",
+				PermitID:        "wallet",
+				OperatedMembers: MemberIndexes{2, 2},
+			},
+		},
+		"invalid operated seat": {
+			ceremony: TBTCSigning,
+			identity: PermitIdentity{
+				WorkID:          "wallet-action-zero-seat",
+				PermitID:        "wallet",
+				OperatedMembers: MemberIndexes{0},
 			},
 		},
 		"nonmember relay identity": {
@@ -106,8 +189,9 @@ func TestGate_CeremonySpecificPermitIdentityValidation(t *testing.T) {
 		TBTCDKG,
 		cutover,
 		PermitIdentity{
-			WorkID:   strings.Repeat("a", 64),
-			PermitID: "255",
+			WorkID:          strings.Repeat("a", 64),
+			PermitID:        "255",
+			OperatedMembers: MemberIndexes{255},
 		},
 	)
 	if err != nil {
@@ -139,8 +223,9 @@ func TestGate_NodeAuthoredTerminalOutcomes(t *testing.T) {
 		TBTCSigning,
 		cutover,
 		PermitIdentity{
-			WorkID:   "wallet-action-completed",
-			PermitID: "wallet-completed",
+			WorkID:          "wallet-action-completed",
+			PermitID:        "wallet-completed",
+			OperatedMembers: MemberIndexes{1},
 		},
 	)
 	if err != nil {
@@ -225,7 +310,11 @@ func TestGate_RetainsTerminalOutcomesOfClosedPermits(t *testing.T) {
 	completed, err := gate.Begin(
 		TBTCSigning,
 		cutover,
-		PermitIdentity{WorkID: "wallet-action", PermitID: "wallet"},
+		PermitIdentity{
+			WorkID:          "wallet-action",
+			PermitID:        "wallet",
+			OperatedMembers: MemberIndexes{1},
+		},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -332,8 +421,9 @@ func TestGate_TerminalOutcomeAccountIsBounded(t *testing.T) {
 			TBTCSigning,
 			cutover,
 			PermitIdentity{
-				WorkID:   fmt.Sprintf("wallet-action-%d", i),
-				PermitID: fmt.Sprintf("wallet-%d", i),
+				WorkID:          fmt.Sprintf("wallet-action-%d", i),
+				PermitID:        fmt.Sprintf("wallet-%d", i),
+				OperatedMembers: MemberIndexes{1},
 			},
 		)
 		if err != nil {
@@ -385,7 +475,11 @@ func TestGate_TerminalOutcomeAccountIsNotAliased(t *testing.T) {
 	permit, err := gate.Begin(
 		TBTCHeartbeat,
 		cutover,
-		PermitIdentity{WorkID: "heartbeat-work", PermitID: "heartbeat"},
+		PermitIdentity{
+			WorkID:          "heartbeat-work",
+			PermitID:        "heartbeat",
+			OperatedMembers: MemberIndexes{1},
+		},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -446,8 +540,9 @@ func TestGate_NodeAuthoredTerminalOutcomeRetriesPersistence(t *testing.T) {
 		TBTCSigning,
 		cutover,
 		PermitIdentity{
-			WorkID:   "wallet-action-retry",
-			PermitID: "wallet-retry",
+			WorkID:          "wallet-action-retry",
+			PermitID:        "wallet-retry",
+			OperatedMembers: MemberIndexes{1},
 		},
 	)
 	if err != nil {
@@ -513,7 +608,7 @@ func (r *recordingQuiescenceSnapshotRecorder) RecordTerminalOutcome(
 	}
 
 	for _, existing := range r.outcomes {
-		if existing.Permit == outcome.Permit {
+		if existing.Permit.Equal(outcome.Permit) {
 			if existing.Equal(outcome) {
 				return r.err
 			}
@@ -1554,8 +1649,9 @@ func TestGate_QuiescenceCapturesRealPermitInventoryAtomically(t *testing.T) {
 		BeaconRelaySigning,
 		cutover,
 		PermitIdentity{
-			WorkID:   "relay-request-security-v2",
-			PermitID: "2",
+			WorkID:          "relay-request-security-v2",
+			PermitID:        "2",
+			OperatedMembers: MemberIndexes{2},
 		},
 	)
 	if err != nil {
@@ -2505,8 +2601,9 @@ func TestGate_TerminalOutcomeRetryComparesSettlementByValue(t *testing.T) {
 		TBTCHeartbeat,
 		cutover,
 		PermitIdentity{
-			WorkID:   "heartbeat-retry",
-			PermitID: "heartbeat-retry",
+			WorkID:          "heartbeat-retry",
+			PermitID:        "heartbeat-retry",
+			OperatedMembers: MemberIndexes{1},
 		},
 	)
 	if err != nil {

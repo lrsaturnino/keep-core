@@ -5688,6 +5688,25 @@ func validateNodeTerminalOutcomes(
 					err,
 				))
 			}
+			// The same binding the live gate applies at record time, reapplied
+			// to the journal it wrote. A record that reached storage with a
+			// transcript seat outside its permit's operated set was either
+			// written by a gate this audit cannot vouch for or edited
+			// afterwards, and both are reasons to refuse it rather than to read
+			// its seats into an ownership map.
+			if err := participation.ValidatePermitOperatedOwnership(
+				outcome.Permit.Ceremony,
+				outcome.Permit.OperatedMembers,
+				outcome.Outcome,
+				outcome.Evidence,
+			); err != nil {
+				violations = append(violations, fmt.Sprintf(
+					"node-authored terminal outcome [%d] claims a membership "+
+						"outside its permit: [%v]",
+					i,
+					err,
+				))
+			}
 		}
 
 		switch outcome.Outcome {

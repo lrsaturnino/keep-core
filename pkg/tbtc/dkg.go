@@ -111,6 +111,12 @@ func tbtcDKGPermitIdentity(
 	return participation.PermitIdentity{
 		WorkID:   hex.EncodeToString(seedHash[:]),
 		PermitID: fmt.Sprint(memberIndex),
+		// The one DKG seat this permit runs. It is the ceremony's own index
+		// space, not the final signing group's: the final group is not known
+		// until the result is built, and the seats a reader needs in order to
+		// tell which node was operating this ceremony are the ones it was
+		// operating while it ran.
+		OperatedMembers: participation.MemberIndexes{memberIndex},
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -373,6 +374,12 @@ type permit struct {
 	workID              string
 	permitID            string
 	identityBound       bool
+	// operatedMembers is the issuance-time copy of the memberships this
+	// permit's holder operates. It is written once, before the permit is
+	// reachable by any other goroutine, and only ever read afterwards — every
+	// reader receives a copy, so no holder of a snapshot can reach back into
+	// the permit's own record.
+	operatedMembers MemberIndexes
 
 	ctx    context.Context
 	cancel context.CancelCauseFunc
@@ -1017,8 +1024,12 @@ func (g *chainGate) issue(
 		workID:              identity.WorkID,
 		permitID:            identity.PermitID,
 		identityBound:       identityBound,
-		ctx:                 ctx,
-		cancel:              cancel,
+		// Copied rather than aliased: the caller still holds the slice it
+		// passed, and a permit whose operated seats can be rewritten after
+		// issuance is not the immutable record every reading of it claims.
+		operatedMembers: slices.Clone(identity.OperatedMembers),
+		ctx:             ctx,
+		cancel:          cancel,
 	}
 
 	g.permits[p] = struct{}{}
@@ -1159,6 +1170,22 @@ func (p *permit) RecordTerminalOutcome(
 			ErrInvalidTerminalOutcome,
 		)
 	}
+	// The seats the holder announced it was operating are read here, not in the
+	// shared validator, because only the permit knows them. p.operatedMembers is
+	// written once at issuance and never again, so it needs no lock.
+	if err := ValidatePermitOperatedOwnership(
+		p.ceremony,
+		p.operatedMembers,
+		outcome,
+		evidence,
+	); err != nil {
+		return fmt.Errorf(
+			"terminal outcome for ceremony [%s] rejected: [%v]: %w",
+			p.ceremony,
+			err,
+			ErrInvalidTerminalOutcome,
+		)
+	}
 
 	g := p.gate
 	g.mu.Lock()
@@ -1233,6 +1260,10 @@ func (p *permit) snapshot() PermitSnapshot {
 		WorkID:              p.workID,
 		PermitID:            p.permitID,
 		IdentityBound:       p.identityBound,
+		// A snapshot outlives the call that took it — into a diagnostics
+		// scrape, a quiescence inventory, a journal record — so it carries its
+		// own copy rather than a window onto the permit's slice.
+		OperatedMembers: slices.Clone(p.operatedMembers),
 	}
 }
 
@@ -1430,6 +1461,21 @@ func (g *chainGate) terminalOutcomesLocked() []TerminalOutcomeRecord {
 			settlement := *record.Evidence.ChainSettlement
 			record.Evidence.ChainSettlement = &settlement
 		}
+		// And the memberships travel by slice, which a plain copy shares for
+		// the same reason.
+		record.Permit.OperatedMembers = slices.Clone(
+			record.Permit.OperatedMembers,
+		)
+		if record.Evidence.Contribution != nil {
+			contribution := *record.Evidence.Contribution
+			contribution.IncorporatedMembers = slices.Clone(
+				contribution.IncorporatedMembers,
+			)
+			contribution.LocalMembers = slices.Clone(
+				contribution.LocalMembers,
+			)
+			record.Evidence.Contribution = &contribution
+		}
 		records = append(records, record)
 	}
 
@@ -1469,6 +1515,15 @@ func cloneQuiescenceSnapshot(
 		[]PermitSnapshot(nil),
 		snapshot.ActivePermits...,
 	)
+	// Copying the list is not copying the permits: each one carries the
+	// memberships its holder operates by slice, and the inventory this returns
+	// is the immutable record of what the node was holding at the transition.
+	for i := range snapshot.ActivePermits {
+		snapshot.ActivePermits[i].OperatedMembers = slices.Clone(
+			snapshot.ActivePermits[i].OperatedMembers,
+		)
+	}
+
 	return snapshot
 }
 

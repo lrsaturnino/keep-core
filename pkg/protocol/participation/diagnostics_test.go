@@ -251,7 +251,11 @@ func TestRegisterDiagnosticSources_EmitsGateStateContract(t *testing.T) {
 	permit, err := gate.Begin(
 		TBTCSigning,
 		1100,
-		PermitIdentity{WorkID: strings.Repeat("a", 64), PermitID: "1"},
+		PermitIdentity{
+			WorkID:          strings.Repeat("a", 64),
+			PermitID:        "1",
+			OperatedMembers: MemberIndexes{4},
+		},
 	)
 	if err != nil {
 		t.Fatalf("failed to begin a ceremony: [%v]", err)
@@ -282,6 +286,11 @@ func TestRegisterDiagnosticSources_EmitsGateStateContract(t *testing.T) {
 				"work_id":               strings.Repeat("a", 64),
 				"permit_id":             "1",
 				"identity_bound":        true,
+				// The seats this permit's holder operates, published while the
+				// permit is still live. A reader assembling who operated which
+				// seat on this work reads them from here rather than waiting to
+				// see whether the ceremony produces a result.
+				"operated_members": []interface{}{float64(4)},
 			},
 		},
 		"recent_terminal_outcomes": []interface{}{},
@@ -354,7 +363,11 @@ func TestRegisterDiagnosticSources_NamesWhatBecameOfClosedPermits(t *testing.T) 
 	permit, err := gate.Begin(
 		TBTCSigning,
 		1100,
-		PermitIdentity{WorkID: strings.Repeat("a", 64), PermitID: "1"},
+		PermitIdentity{
+			WorkID:          strings.Repeat("a", 64),
+			PermitID:        "1",
+			OperatedMembers: MemberIndexes{4},
+		},
 	)
 	if err != nil {
 		t.Fatalf("failed to begin a ceremony: [%v]", err)
@@ -503,7 +516,11 @@ func TestRegisterDiagnosticSources_NamesEachHeldPermit(t *testing.T) {
 	securityV2, err := gate.Begin(
 		BeaconDKG,
 		1100,
-		PermitIdentity{WorkID: securityWorkID, PermitID: "2"},
+		PermitIdentity{
+			WorkID:          securityWorkID,
+			PermitID:        "2",
+			OperatedMembers: MemberIndexes{2},
+		},
 	)
 	if err != nil {
 		t.Fatalf("failed to begin the security-v2 ceremony: [%v]", err)
