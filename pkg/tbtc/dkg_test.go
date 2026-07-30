@@ -232,6 +232,151 @@ func TestDKGTranscriptContributionMapsBackToThePermitSpace(t *testing.T) {
 	}
 }
 
+// The result a member activates its own key material against has to be the
+// result it generated.
+//
+// Activation persists a share and enters it in the wallet cache under the final
+// group the local result describes. A subscription read as nothing but
+// "something settled" makes that a claim about chain state nobody looked at:
+// another ceremony settling, or this one settling on a group rebuilt from a
+// different membership, satisfies it just as well — and the node is then holding
+// an active signer for a wallet, or a seat, the chain does not agree with.
+func TestDKGResultSettledLocalCeremony(t *testing.T) {
+	testData, err := tecdsatest.LoadPrivateKeyShareTestFixtures(1)
+	if err != nil {
+		t.Fatalf("failed to load test data: [%v]", err)
+	}
+
+	groupParameters := &GroupParameters{
+		GroupSize:       5,
+		GroupQuorum:     3,
+		HonestThreshold: 3,
+	}
+
+	seed := big.NewInt(123456789)
+	memberIndex := group.MemberIndex(3)
+
+	localGroup := group.NewGroup(
+		groupParameters.DishonestThreshold(),
+		groupParameters.GroupSize,
+	)
+	localGroup.MarkMemberAsInactive(group.MemberIndex(2))
+	result := &dkg.Result{
+		Group:           localGroup,
+		PrivateKeyShare: tecdsa.NewPrivateKeyShare(testData[0]),
+	}
+	localGroupPublicKey, err := result.GroupPublicKeyBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A different key, built by moving one coordinate byte. The shares this
+	// package's fixtures carry all belong to one group, so a second fixture
+	// would produce the very key this case has to differ from.
+	otherGroupPublicKey := slices.Clone(localGroupPublicKey)
+	otherGroupPublicKey[len(otherGroupPublicKey)-1] ^= 0xff
+
+	settled := func(
+		seed *big.Int,
+		groupPublicKey []byte,
+		misbehaved []group.MemberIndex,
+	) *DKGResultSubmittedEvent {
+		return &DKGResultSubmittedEvent{
+			Seed: seed,
+			Result: &DKGChainResult{
+				SubmitterMemberIndex:     group.MemberIndex(1),
+				GroupPublicKey:           groupPublicKey,
+				MisbehavedMembersIndexes: misbehaved,
+			},
+			BlockNumber: 1_000,
+		}
+	}
+
+	var tests = map[string]struct {
+		submitted *DKGResultSubmittedEvent
+		expected  bool
+	}{
+		"this member's own result settled": {
+			submitted: settled(
+				seed,
+				localGroupPublicKey,
+				[]group.MemberIndex{2},
+			),
+			expected: true,
+		},
+		// The registry stores the coordinate pair without the uncompressed
+		// prefix the local marshaling carries, so the same key legitimately
+		// reaches this comparison in two encodings.
+		"the same key without its uncompressed prefix": {
+			submitted: settled(
+				seed,
+				localGroupPublicKey[1:],
+				[]group.MemberIndex{2},
+			),
+			expected: true,
+		},
+		"nothing settled": {
+			submitted: nil,
+			expected:  false,
+		},
+		"an event carrying no result": {
+			submitted: &DKGResultSubmittedEvent{Seed: seed},
+			expected:  false,
+		},
+		"another ceremony settled": {
+			submitted: settled(
+				big.NewInt(987654321),
+				localGroupPublicKey,
+				[]group.MemberIndex{2},
+			),
+			expected: false,
+		},
+		"a result for another group settled": {
+			submitted: settled(
+				seed,
+				otherGroupPublicKey,
+				[]group.MemberIndex{2},
+			),
+			expected: false,
+		},
+		// The same key, rebuilt from a different membership. The wallet would
+		// be the right one and this member's seat in it would not.
+		"a result removing different members settled": {
+			submitted: settled(
+				seed,
+				localGroupPublicKey,
+				[]group.MemberIndex{4},
+			),
+			expected: false,
+		},
+		"a result removing nobody settled": {
+			submitted: settled(seed, localGroupPublicKey, nil),
+			expected:  false,
+		},
+	}
+
+	for testName, test := range tests {
+		t.Run(testName, func(t *testing.T) {
+			actual := dkgResultSettledLocalCeremony(
+				&testutils.MockLogger{},
+				memberIndex,
+				seed,
+				result,
+				test.submitted,
+			)
+			if actual != test.expected {
+				t.Errorf(
+					"unexpected settlement verdict\n"+
+						"expected: %v\n"+
+						"actual:   %v\n",
+					test.expected,
+					actual,
+				)
+			}
+		})
+	}
+}
+
 func TestDkgExecutor_RegisterSigner(t *testing.T) {
 	testData, err := tecdsatest.LoadPrivateKeyShareTestFixtures(1)
 	if err != nil {

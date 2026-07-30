@@ -1,12 +1,14 @@
 package tbtc
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"math/big"
+	"slices"
 	"sort"
 	"sync/atomic"
 	"time"
@@ -403,20 +405,27 @@ func (de *dkgExecutor) generateSigningGroup(
 			)
 			defer cancelCtx()
 
-			// resultSubmitted records that a DKG result for this ceremony
-			// reached the chain — submitted by this member or any other —
-			// before the subscription canceled the publication context.
-			// Activating the generated signer is conditioned on it: a
-			// publication context that ends without a submitted result must
-			// not leave an active signer behind.
-			var resultSubmitted atomic.Bool
+			// resultSubmitted holds the DKG result this ceremony was seen to
+			// settle on chain — submitted by this member or any other — before
+			// the subscription canceled the publication context. Activating the
+			// generated signer is conditioned on it: a publication context that
+			// ends without a submitted result must not leave an active signer
+			// behind.
+			//
+			// The event itself is kept rather than the fact that one arrived.
+			// The key material about to be activated is this member's own, and
+			// a result that settled for some other ceremony, or for some other
+			// group, says nothing about it — so what settled has to be readable
+			// where the generated result is, which is only after key generation
+			// returns.
+			var resultSubmitted atomic.Pointer[DKGResultSubmittedEvent]
 
 			// TODO: This subscription has to be updated once we implement
 			//       re-submitting DKG result to the chain after a challenge.
 			//       See https://github.com/keep-network/keep-core/issues/3450
 			subscription := de.chain.OnDKGResultSubmitted(
 				func(event *DKGResultSubmittedEvent) {
-					resultSubmitted.Store(true)
+					resultSubmitted.Store(event)
 					defer cancelCtx()
 
 					dkgLogger.Infof(
@@ -586,7 +595,15 @@ func (de *dkgExecutor) generateSigningGroup(
 				result,
 				memberIndex,
 				groupSelectionResult,
-				resultSubmitted.Load,
+				func() bool {
+					return dkgResultSettledLocalCeremony(
+						dkgLogger,
+						memberIndex,
+						seed,
+						result,
+						resultSubmitted.Load(),
+					)
+				},
 				func(publishCtx context.Context) error {
 					return de.publishDkgResult(
 						publishCtx,
@@ -611,17 +628,121 @@ func (de *dkgExecutor) generateSigningGroup(
 	}
 }
 
+// dkgResultSettledLocalCeremony reports whether the DKG result observed to
+// settle on chain is the one this member generated.
+//
+// Activation persists key material and enters it into the wallet cache under
+// the final signing group the local result describes. Reading the subscription
+// as nothing but "something settled" makes that a claim about a chain state
+// nobody checked: an event for a different ceremony, or for a group rebuilt
+// from a different membership, satisfies it equally, and the node then holds an
+// active signer whose seat and whose wallet the chain does not agree with. That
+// disagreement is exactly what the offline audit exists to find, and finding it
+// afterwards is worse than not activating in the first place — so a mismatch
+// falls through to the interrupted-signer path, which preserves the share
+// without activating it and leaves the audit a record to reconcile.
+//
+// The three fields compared are the ones the wallet identity and the final
+// group are derived from: the ceremony this result answers, the key it produced,
+// and the members removed from the group that produced it.
+func dkgResultSettledLocalCeremony(
+	dkgLogger log.StandardLogger,
+	memberIndex group.MemberIndex,
+	seed *big.Int,
+	result *dkg.Result,
+	submitted *DKGResultSubmittedEvent,
+) bool {
+	if submitted == nil || submitted.Result == nil {
+		return false
+	}
+
+	if seed == nil || submitted.Seed == nil ||
+		seed.Cmp(submitted.Seed) != 0 {
+		dkgLogger.Warnf(
+			"[member:%v] observed a DKG result for seed [0x%x] while running "+
+				"the ceremony for seed [0x%x]; not activating the generated "+
+				"signer against another ceremony's result",
+			memberIndex,
+			submitted.Seed,
+			seed,
+		)
+		return false
+	}
+
+	localGroupPublicKey, err := result.GroupPublicKeyBytes()
+	if err != nil {
+		dkgLogger.Errorf(
+			"[member:%v] cannot read the generated group public key to "+
+				"compare it with the submitted DKG result: [%v]",
+			memberIndex,
+			err,
+		)
+		return false
+	}
+	if !sameChainGroupPublicKey(
+		localGroupPublicKey,
+		submitted.Result.GroupPublicKey,
+	) {
+		dkgLogger.Warnf(
+			"[member:%v] the DKG result submitted for this ceremony carries "+
+				"group public key [0x%x] while this member generated [0x%x]; "+
+				"not activating a signer for a wallet the chain does not have",
+			memberIndex,
+			submitted.Result.GroupPublicKey,
+			localGroupPublicKey,
+		)
+		return false
+	}
+
+	localMisbehaved := result.MisbehavedMembersIndexes()
+	if !slices.Equal(localMisbehaved, submitted.Result.MisbehavedMembersIndexes) {
+		dkgLogger.Warnf(
+			"[member:%v] the DKG result submitted for this ceremony removes "+
+				"members %v while this member removed %v; the two describe "+
+				"different final signing groups, so the generated signer is "+
+				"not activated",
+			memberIndex,
+			submitted.Result.MisbehavedMembersIndexes,
+			localMisbehaved,
+		)
+		return false
+	}
+
+	return true
+}
+
+// sameChainGroupPublicKey reports whether a locally marshaled group public key
+// and one carried by a submitted DKG result are the same key.
+//
+// The Chain interface does not pin the encoding of the submitted key, and its
+// implementations differ: the on-chain binding carries the 64-byte X||Y pair the
+// registry stores, while the in-process chain carries the 65-byte uncompressed
+// marshaling the local key produces. Both name one point, so the comparison is
+// made on the coordinates the two share rather than on whichever prefix each
+// happens to include.
+func sameChainGroupPublicKey(local []byte, submitted []byte) bool {
+	uncompressed := func(key []byte) []byte {
+		if len(key) == 65 && key[0] == 4 {
+			return key[1:]
+		}
+		return key
+	}
+
+	return bytes.Equal(uncompressed(local), uncompressed(submitted))
+}
+
 // completeDkgCeremony finalizes one member's DKG after key generation.
 // Publication precedes activation: the generated share stays out of the
 // active namespace and the wallet cache until the DKG result demonstrably
 // reached the chain and the activation fence passed. A clock failure, forced
-// quiescence, or a publication window that closes without a submitted result
-// therefore never leaves an active signer for an unpublished result; every
-// such outcome preserves the share through the interrupted-signer path
-// instead of dropping or activating it. publishResultFn performs the result
-// publication bound to the given context; resultSubmittedFn reports whether a
-// submitted DKG result was observed on chain for this ceremony. It returns
-// true only when the signer was activated.
+// quiescence, a publication window that closes without a submitted result, or
+// a submitted result that is not the one this member generated therefore never
+// leaves an active signer; every such outcome preserves the share through the
+// interrupted-signer path instead of dropping or activating it.
+// publishResultFn performs the result publication bound to the given context;
+// resultSubmittedFn reports whether the result observed to settle on chain for
+// this ceremony is this member's own. It returns true only when the signer was
+// activated.
 func (de *dkgExecutor) completeDkgCeremony(
 	ctx context.Context,
 	dkgLogger log.StandardLogger,
