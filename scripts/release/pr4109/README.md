@@ -1975,24 +1975,43 @@ exhausted, and clear only when the full output becomes durable. Both
 exact-image gates sample all four signals while their candidates still answer.
 All four are process-local and reset when a node restarts. The
 `single_release` gate therefore opens its account before the cross-C restart,
-splits the volatile node's restart into a watched stop and a later start, and
-samples the old process throughout that stop while it is still serving. The
-stop derives its timeout from the reviewed manifest — the same 20,160-second
-service-manager grace used by rollback and the Compose deployment — so this
-recovery control cannot silently reintroduce a shorter SIGKILL ceiling. After
-the stop and before the start, the gate archives the old process's four last
-readings under `<service>.pre_restart.*` and inspects that exact stopped
-container's exit status as
-`<service>.pre_restart.container_exit_code`. A missing preservation reading or
-exit status blocks the control; a nonzero live incomplete-output gauge or
-nonzero exit status fails it. A truncated stop is a refusal, not a pass, and
-the replacement process cannot retroactively supply either fact with its newly
-initialized zeros. Only after a zero exit status and complete preservation
-account does Compose start the same container. Once the new process answers,
-the gate re-seeds that node's live account, refreshes it through the chain-clock
-cancellation and both quiescence controls, and records the fleet verdict before
-its final fleet-stop stage. The rollback gate uses the same accumulator and
-refreshes it while every candidate drains.
+takes and archives an actual refusal reading under
+`<service>.pre_stop.*`, and decides it before sending any stop signal. An
+unreadable pre-stop account blocks the control; a nonzero live
+incomplete-output gauge fails it. In either case the stop is not issued and the
+old process remains live to finish preservation and to serve the later,
+independent controls.
+
+Only a readable pre-stop account whose two live incomplete-output gauges are
+zero authorizes the split, watched stop. The stop derives its timeout from the
+reviewed manifest — the same 20,160-second service-manager grace used by
+rollback and the Compose deployment — so this recovery control cannot silently
+reintroduce a shorter SIGKILL ceiling. While the endpoint answers, the gate
+samples the old process throughout that stop; once the endpoint disappears it
+stops scraping, waits for Compose, and retains the last node-authored values.
+After the stop and before any start, it archives that watched account under
+`<service>.pre_restart.*` and inspects that exact stopped container's exit
+status as `<service>.pre_restart.container_exit_code`. Thus `pre_stop` means
+the guard before a signal and `pre_restart` means the final account after the
+guard authorized a stop; a record from one phase cannot stand in for the
+other.
+
+A missing watched-stop reading or exit status blocks the control; a
+preservation gauge that rises during the drain or a nonzero exit status fails
+it. A truncated stop is a refusal, not a pass, and a new process cannot
+retroactively supply either fact with initialized zeros. On a clean account
+and zero exit status, Compose starts the same container as the restart under
+test. If a confirmed-stopped path instead refuses, the harness recovery-starts
+that same container only to keep the remaining clock and quiescence controls
+interpretable; the restart step remains refused and its old-process evidence
+remains in the record. If that recovery cannot restore the client-info
+endpoint, the rehearsal emits the partial record immediately and states that
+the later controls were not evaluated instead of manufacturing failures
+against a dead node. Once any new process answers, the gate re-seeds that
+node's live account, refreshes it through the chain-clock cancellation and both
+quiescence controls, and records the fleet verdict before its final fleet-stop
+stage. The rollback gate uses the same accumulator and refreshes it while every
+candidate drains.
 
 An unreadable signal, an account that does not cover every configured R1
 service exactly once, or a nonzero live gauge refuses either gate because the

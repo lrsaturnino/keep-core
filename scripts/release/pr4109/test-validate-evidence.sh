@@ -179,6 +179,10 @@ SINGLE_RELEASE_STAGES='
   { "name": "cross C without restart", "outcome": "pass" },
   { "name": "pre-cutover legacy work survives C and completes", "outcome": "pass" },
   { "name": "restart across C derives mode from the chain, not from process state", "outcome": "pass", "gauges": {
+      "r1-node-2.pre_stop.participation_tbtc_quarantine_preservation_failures_total": 0,
+      "r1-node-2.pre_stop.participation_beacon_quarantine_preservation_failures_total": 0,
+      "r1-node-2.pre_stop.participation_tbtc_quarantine_incomplete_outputs": 0,
+      "r1-node-2.pre_stop.participation_beacon_quarantine_incomplete_outputs": 0,
       "r1-node-2.pre_restart.participation_tbtc_quarantine_preservation_failures_total": 0,
       "r1-node-2.pre_restart.participation_beacon_quarantine_preservation_failures_total": 0,
       "r1-node-2.pre_restart.participation_tbtc_quarantine_incomplete_outputs": 0,
@@ -1162,11 +1166,73 @@ run_validator "${D}"
 check "a record naming a review the control does not pin is rejected" 3 \
   "review record hashing to \[c{64}\]"
 
-# The restart destroys the old process's counters. Its stage therefore has its
-# own last-readable account, taken before Compose is allowed to issue the
-# restart and namespaced apart from the replacement process's gauges. Deleting
-# one of those old-process readings must make an otherwise complete archive
-# unrehearsed.
+# The first account is a real pre-stop guard. If it reports a live incomplete
+# output, no watched-stop or exit-status evidence should exist: the producer
+# refused before signaling the process. A fabricated passing record with that
+# account is independently refuted by the archive reader.
+D="${WORK}/accept-restart-unreadable-pre-stop-guard"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  const stage = record.stages.find(
+    ({ name }) =>
+      name ===
+      "restart across C derives mode from the chain, not from process state"
+  );
+  delete stage.gauges[
+    "r1-node-2.pre_stop.participation_beacon_quarantine_incomplete_outputs"
+  ];
+  for (const name of Object.keys(stage.gauges)) {
+    if (name.startsWith("r1-node-2.pre_restart.")) {
+      delete stage.gauges[name];
+    }
+  }
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "an unreadable pre-stop account refuses without requiring a watched stop" \
+  3 "single_release step.*restart across C.*carries no pre-stop reading of.*pre_stop.*beacon_quarantine_incomplete_outputs"
+
+D="${WORK}/accept-restart-refused-at-pre-stop-guard"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  const stage = record.stages.find(
+    ({ name }) =>
+      name ===
+      "restart across C derives mode from the chain, not from process state"
+  );
+  stage.gauges[
+    "r1-node-2.pre_stop.participation_tbtc_quarantine_preservation_failures_total"
+  ] = 1;
+  stage.gauges[
+    "r1-node-2.pre_stop.participation_tbtc_quarantine_incomplete_outputs"
+  ] = 1;
+  for (const name of Object.keys(stage.gauges)) {
+    if (name.startsWith("r1-node-2.pre_restart.")) {
+      delete stage.gauges[name];
+    }
+  }
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "a live incomplete pre-stop account refuses before the watched stop" 1 \
+  "single_release restart node.*reported live incomplete tBTC quarantine output at the pre-stop guard; the stop was not authorized.*pre_stop.*incomplete_outputs.*is 1"
+
+# Once the guard passes, the restart destroys the old process's counters. Its
+# stage therefore has a separate last-readable watched-stop account, namespaced
+# apart from both the guard and replacement process. Deleting one of those
+# old-process readings must make an otherwise complete archive unrehearsed.
 D="${WORK}/accept-restart-missing-preservation-reading"
 mkdir -p "${D}"
 write_attestation "${D}"
@@ -1188,12 +1254,11 @@ node -e '
 ' "${D}/record.json"
 run_validator "${D}"
 check "single-release acceptance requires every pre-restart preservation reading" \
-  3 "single_release step.*restart across C.*carries no pre-restart reading of.*r1-node-2.*beacon_quarantine_incomplete_outputs"
+  3 "single_release step.*restart across C.*carries no watched-stop reading of.*r1-node-2.*beacon_quarantine_incomplete_outputs"
 
-# A numeric pre-restart reading is not sufficient when it says an output is
-# still incomplete. The harness refuses to restart in this state; the archive
-# consumer independently treats a fabricated passing step carrying the same
-# evidence as a refutation.
+# A numeric watched-stop reading is not sufficient when preservation became
+# incomplete after the guard passed. The old process is already stopped in
+# this case; the archive message must keep it distinct from the refusal above.
 D="${WORK}/accept-restart-incomplete-output"
 mkdir -p "${D}"
 write_attestation "${D}"
@@ -1218,7 +1283,7 @@ node -e '
 ' "${D}/record.json"
 run_validator "${D}"
 check "a live incomplete output immediately before restart refutes acceptance" \
-  1 "single_release restart node.*reported live incomplete tBTC quarantine output immediately before.*incomplete_outputs.*is 1"
+  1 "single_release restart node.*reported live incomplete tBTC quarantine output during the watched stop after the pre-stop guard passed.*pre_restart.*incomplete_outputs.*is 1"
 
 # Historical exhaustion is still evidence even though the replacement process
 # starts its counters from zero. Paired with a zero live gauge it is retained
@@ -1269,7 +1334,7 @@ node -e '
 ' "${D}/record.json"
 run_validator "${D}"
 check "single-release acceptance requires the old process exit status" 3 \
-  "single_release step.*restart across C.*carries no pre-restart container exit-status reading of.*r1-node-2.pre_restart.container_exit_code"
+  "single_release step.*restart across C.*carries no watched-stop container exit-status reading of.*r1-node-2.pre_restart.container_exit_code"
 
 # Exit 137 is the exact state a timed-out Docker stop leaves after SIGKILL. A
 # fabricated passing step carrying it must be refuted independently of the
@@ -1294,6 +1359,30 @@ node -e '
 run_validator "${D}"
 check "a killed old process refutes single-release acceptance" 1 \
   "single_release restart node.*did not stop naturally.*container_exit_code.*137.*truncated stop"
+
+# Non-integral and negative values are neither Docker exit statuses nor proof
+# of a clean stop. Exercise the reader's invalid-value branch separately from
+# missing and nonzero-but-valid statuses.
+D="${WORK}/accept-restart-invalid-container-exit-status"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  const stage = record.stages.find(
+    ({ name }) =>
+      name ===
+      "restart across C derives mode from the chain, not from process state"
+  );
+  stage.gauges["r1-node-2.pre_restart.container_exit_code"] = -1;
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "an invalid old-process exit status leaves the restart unrehearsed" 3 \
+  "single_release restart node.*carries an invalid old-process exit status.*container_exit_code.*is -1"
 
 # The single-release gate is itself where the clock-failure and quiescence
 # controls can strand generated output. Its preservation stage therefore
@@ -1531,9 +1620,9 @@ check "a live incomplete quarantine output refutes rollback" 1 \
 # Drive the producer-side accumulator directly with a stubbed metric reader.
 # This is the property the downstream verdict cannot localize: unreadable is
 # retained as unreadable until a node authors a number, later probe failure
-# keeps the last number rather than inventing zero, a later number overwrites,
-# and replacing one service leaves exactly one intact line for every other
-# service.
+# keeps the last number rather than inventing zero while separately reporting
+# that the current sample was unreadable, a later number overwrites, and
+# replacing one service leaves exactly one intact line for every other service.
 set +e
 CASE_OUT="$(
   (
@@ -1542,6 +1631,7 @@ CASE_OUT="$(
     # fixtures.
     # shellcheck disable=SC2030
     QUARANTINE_PRESERVATION_READINGS=""
+    QUARANTINE_PRESERVATION_SAMPLE_READABLE=0
     SAMPLER_ROUND="unread"
 
     # Invoked indirectly by sample_quarantine_preservation_signals.
@@ -1592,24 +1682,39 @@ CASE_OUT="$(
       printf '%s\n' "${label}"
     }
 
+    expect_sampler_freshness() {
+      local label="$1" expected="$2"
+      if [[ "${QUARANTINE_PRESERVATION_SAMPLE_READABLE}" != "${expected}" ]]; then
+        printf 'sampler freshness mismatch at %s: expected [%s], actual [%s]\n' \
+          "${label}" "${expected}" \
+          "${QUARANTINE_PRESERVATION_SAMPLE_READABLE}"
+        return 1
+      fi
+      printf '%s\n' "${label}"
+    }
+
     sample_quarantine_preservation_signals r1-node-1
     expect_sampler_readings "first unreadable sample is explicit" \
       "r1-node-1 unreadable unreadable unreadable unreadable"
+    expect_sampler_freshness "first unreadable sample is not fresh" 0
 
     SAMPLER_ROUND="first"
     sample_quarantine_preservation_signals r1-node-1
     expect_sampler_readings "numeric sample replaces unreadable fields" \
       "r1-node-1 1 2 3 4"
+    expect_sampler_freshness "numeric sample is fresh" 1
 
     SAMPLER_ROUND="unread"
     sample_quarantine_preservation_signals r1-node-1
     expect_sampler_readings "later unreadable sample retains numeric fields" \
       "r1-node-1 1 2 3 4"
+    expect_sampler_freshness "retained numeric history is not a fresh sample" 0
 
     SAMPLER_ROUND="second"
     sample_quarantine_preservation_signals r1-node-1
     expect_sampler_readings "later numeric sample overwrites numeric fields" \
       "r1-node-1 5 6 7 8"
+    expect_sampler_freshness "later numeric sample is fresh" 1
 
     SAMPLER_ROUND="other"
     sample_quarantine_preservation_signals r1-node-2
@@ -1620,6 +1725,12 @@ CASE_OUT="$(
     sample_quarantine_preservation_signals r1-node-1
     expect_sampler_readings "resampling one service replaces rather than appends" \
       $'r1-node-2 9 10 11 12\nr1-node-1 13 14 15 16'
+
+    SAMPLER_ROUND="unread"
+    sample_quarantine_preservation_signals r1-node-1 1
+    expect_sampler_readings "a replacement process inherits no old account" \
+      $'r1-node-2 9 10 11 12\nr1-node-1 unreadable unreadable unreadable unreadable'
+    expect_sampler_freshness "an unreadable replacement account is not fresh" 0
 
     QUARANTINE_PRESERVATION_READINGS="stale 1 1 1 1"
     SAMPLER_ROUND="initialize"
@@ -1632,11 +1743,16 @@ CASE_RC=$?
 set -e
 check "the preservation sampler retains only node-authored last readings" 0 \
   "first unreadable sample is explicit" \
+  "first unreadable sample is not fresh" \
   "numeric sample replaces unreadable fields" \
+  "numeric sample is fresh" \
   "later unreadable sample retains numeric fields" \
+  "retained numeric history is not a fresh sample" \
   "later numeric sample overwrites numeric fields" \
   "sampling a second service keeps one line each" \
   "resampling one service replaces rather than appends" \
+  "a replacement process inherits no old account" \
+  "an unreadable replacement account is not fresh" \
   "initializer resets stale state in roster order"
 
 # Drive the shell-side verdict as well as the archive reader. These are the two
@@ -2243,9 +2359,10 @@ complete_run() {
     elif [[ "${stage}" == \
       "restart across C derives mode from the chain, not from process state" ]]; then
       # The process about to disappear is the only author of these readings.
-      # Keep them distinct from the replacement process's same metric names.
+      # The pre-stop guard and the later watched-stop account are distinct;
+      # both remain distinct from the replacement process's same metric names.
       # shellcheck disable=SC2034
-      STEP_GAUGES='"r1-node-2.pre_restart.participation_tbtc_quarantine_preservation_failures_total":0,"r1-node-2.pre_restart.participation_beacon_quarantine_preservation_failures_total":0,"r1-node-2.pre_restart.participation_tbtc_quarantine_incomplete_outputs":0,"r1-node-2.pre_restart.participation_beacon_quarantine_incomplete_outputs":0,"r1-node-2.pre_restart.container_exit_code":0'
+      STEP_GAUGES='"r1-node-2.pre_stop.participation_tbtc_quarantine_preservation_failures_total":0,"r1-node-2.pre_stop.participation_beacon_quarantine_preservation_failures_total":0,"r1-node-2.pre_stop.participation_tbtc_quarantine_incomplete_outputs":0,"r1-node-2.pre_stop.participation_beacon_quarantine_incomplete_outputs":0,"r1-node-2.pre_restart.participation_tbtc_quarantine_preservation_failures_total":0,"r1-node-2.pre_restart.participation_beacon_quarantine_preservation_failures_total":0,"r1-node-2.pre_restart.participation_tbtc_quarantine_incomplete_outputs":0,"r1-node-2.pre_restart.participation_beacon_quarantine_incomplete_outputs":0,"r1-node-2.pre_restart.container_exit_code":0'
     elif [[ "${stage}" == \
       "quarantine preservation is complete through quiescence" ]]; then
       # shellcheck disable=SC2034
@@ -8089,6 +8206,30 @@ else
   FAILED=$((FAILED + 1))
 fi
 
+# The old process's exit status has the same producer/reader boundary as the
+# preservation signals even though it is not a Prometheus metric. Bind its
+# suffix too: a one-sided rename would turn a clean exact-image rehearsal into
+# an unread archive after the expensive run had already finished.
+READER_RESTART_CONTAINER_EXIT_CODE_SUFFIX="$(sed -n \
+  's/^[[:space:]]*const exitCodeSuffix = \"\([^\"]*\)\";[[:space:]]*$/\1/p' \
+  "${TEST_DIR}/rehearse.sh")"
+# This is the literal interpolation the producer source must carry.
+# shellcheck disable=SC2016
+RESTART_CONTAINER_EXIT_CODE_PRODUCER_KEY='${restarted}.pre_restart.${RESTART_CONTAINER_EXIT_CODE_SUFFIX}'
+if [[ -n "${RESTART_CONTAINER_EXIT_CODE_SUFFIX}" ]] &&
+  [[ "${RESTART_CONTAINER_EXIT_CODE_SUFFIX}" == \
+  "${READER_RESTART_CONTAINER_EXIT_CODE_SUFFIX}" ]] &&
+  declare -f stage_single_release |
+    grep -F "${RESTART_CONTAINER_EXIT_CODE_PRODUCER_KEY}" >/dev/null; then
+  printf 'ok   the restart exit-status producer and archive reader use the same suffix\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL the restart exit-status suffix drifted from the archive reader: producer [%s], reader [%s]\n' \
+    "${RESTART_CONTAINER_EXIT_CODE_SUFFIX:-missing}" \
+    "${READER_RESTART_CONTAINER_EXIT_CODE_SUFFIX:-missing}"
+  FAILED=$((FAILED + 1))
+fi
+
 # The per-ceremony refusal counters are what turn "the node refused something"
 # into "the node refused this", and a ceremony the shell list omits is a
 # refusal the rehearsal reads as unattributed — a quiescence that really did
@@ -8459,6 +8600,46 @@ else
     "manifest grace [${RESTART_REVIEWED_GRACE:-unset}]"
 fi
 
+# The pre-stop sample is a refusal guard only if its retained account is both
+# archived and decided before the destructive call becomes reachable.
+RESTART_PRE_STOP_ORDER="$(
+  printf '%s\n' "${SINGLE_RELEASE_SOURCE}" | awk '
+    /local restart_followups_safe=1/ {
+      guard = 1
+      next
+    }
+    guard &&
+      /sample_quarantine_preservation_signals "\$\{restarted\}"/ {
+      print "sample"
+      next
+    }
+    guard && /append_quarantine_preservation_gauges/ {
+      print "archive"
+      next
+    }
+    guard && /if \(\(pre_stop_readable == 0\)\)/ {
+      print "decide"
+      next
+    }
+    guard && /if \(\(restart_stop_authorized == 1\)\)/ {
+      print "authorize"
+      next
+    }
+    guard &&
+      /compose stop --timeout "\$\{restart_grace\}" "\$\{restarted\}" &/ {
+      print "stop"
+      exit
+    }
+  '
+)"
+if [[ "${RESTART_PRE_STOP_ORDER}" == \
+  $'sample\narchive\ndecide\nauthorize\nstop' ]]; then
+  pass_case "the cross-C restart decides its archived pre-stop guard before stop"
+else
+  fail_case "the cross-C restart decides its archived pre-stop guard before stop" \
+    "observed order [${RESTART_PRE_STOP_ORDER//$'\n'/, }]"
+fi
+
 # The order is the preservation property: sample while the old stop is live,
 # wait for it, inspect that exact stopped container, and only then start it.
 # Merely bracketing an atomic restart would lose a counter increment in the
@@ -8500,6 +8681,20 @@ if [[ "${RESTART_CONTROL_ORDER}" == \
 else
   fail_case "the cross-C restart watches and inspects the old stop before start" \
     "observed order [${RESTART_CONTROL_ORDER//$'\n'/, }]"
+fi
+
+# Once the old endpoint disappears, more scrapes cannot add a node-authored
+# value. The watched stop still waits for Compose, but stops hammering a dead
+# client-info endpoint.
+if printf '%s\n' "${SINGLE_RELEASE_SOURCE}" | awk '
+  /while kill -0 "\$\{restart_stop_pid\}"/ { watching = 1 }
+  watching && /node_reachable "\$\{restarted\}" \|\| break/ { found = 1 }
+  watching && /^[[:space:]]*done[[:space:]]*$/ { exit(found ? 0 : 1) }
+  END { if (!watching) exit 1 }
+'; then
+  pass_case "the watched cross-C stop stops scraping after endpoint loss"
+else
+  fail_case "the watched cross-C stop stops scraping after endpoint loss"
 fi
 
 # Every control the sequence turns on has to be present and resolved. A site
