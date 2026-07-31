@@ -1998,14 +1998,18 @@ the guard before a signal and `pre_restart` means the final account after the
 guard authorized a stop; a record from one phase cannot stand in for the
 other. Each watched value also carries
 `<service>.pre_restart.<metric>.read_in_final_watched_sample`. The harness
-replaces this four-field provenance mask on every sampling attempt that reads
-anything, or that runs while the endpoint is still reachable; it does not
-combine freshness from different attempts. An all-unreadable scrape after the
-endpoint disappears retains the last useful mask. Both incomplete-output
-fields must be marked `1` before restart, while a retained historical counter
-marked `0` remains an advisory. This lets a normal endpoint shutdown retain its
-last useful account without allowing one field's successful read to make a
-different, carried zero look fresh.
+fetches `/metrics` once per sampling attempt and parses all four values from
+that one response, so a process stopping between independent HTTP requests
+cannot manufacture an account whose fields never coexisted. A readable
+exposition that genuinely omits one field leaves exactly that field's mask bit
+clear. The harness replaces the four-field provenance mask only when the
+response carried at least one signal; it does not combine freshness from
+different attempts, and an all-unreadable fetch — whether `/diagnostics` still
+answers or the endpoint has disappeared — retains the last useful mask. Both
+incomplete-output fields must be marked `1` before restart, while a retained
+historical counter marked `0` remains an advisory. This lets a normal endpoint
+shutdown retain its last useful account without allowing one field's
+successful read to make a different, carried zero look fresh.
 
 A missing watched-stop reading or exit status blocks the control; a
 provenance marker, a carried incomplete-output field, a preservation gauge

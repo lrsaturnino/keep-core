@@ -1799,9 +1799,9 @@ check "a live incomplete quarantine output refutes rollback" 1 \
 # keeps the last number rather than inventing zero while separately reporting
 # that the current sample was unreadable, a later number overwrites, and
 # replacing one service leaves exactly one intact line for every other service.
+SAMPLER_CASE_LOG="${WORK}/sampler-case.log"
 set +e
-CASE_OUT="$(
-  (
+(
     set -e
     # This accumulator is deliberately isolated from the later live-verdict
     # fixtures.
@@ -1812,11 +1812,14 @@ CASE_OUT="$(
     # shellcheck disable=SC2030
     QUARANTINE_PRESERVATION_SAMPLE_READ_MASK=0
     SAMPLER_ROUND="unread"
+    SAMPLER_FETCH_LOG="${WORK}/sampler-fetches.log"
+    : >"${SAMPLER_FETCH_LOG}"
 
     # Invoked indirectly by sample_quarantine_preservation_signals.
     # shellcheck disable=SC2329
-    metric_value() {
-      local service="$1" metric="$2" base offset
+    probe_metrics() {
+      local service="$1" base metric offset
+      printf '%s\n' "${service}" >>"${SAMPLER_FETCH_LOG}"
       if [[ "${SAMPLER_ROUND}:${service}" == "first:r1-node-1" ]]; then
         base=0
       elif [[ "${SAMPLER_ROUND}:${service}" == "second:r1-node-1" ]]; then
@@ -1835,26 +1838,23 @@ CASE_OUT="$(
         return 1
       fi
 
-      if [[ "${metric}" == \
-        "participation_tbtc_quarantine_preservation_failures_total" ]]; then
-        offset=1
-      elif [[ "${metric}" == \
-        "participation_beacon_quarantine_preservation_failures_total" ]]; then
-        offset=2
-      elif [[ "${metric}" == \
-        "participation_tbtc_quarantine_incomplete_outputs" ]]; then
-        offset=3
-      elif [[ "${metric}" == \
-        "participation_beacon_quarantine_incomplete_outputs" ]]; then
-        offset=4
-      else
-        return 1
-      fi
-      if [[ "${SAMPLER_ROUND}:${metric}" == \
-        "partial:participation_tbtc_quarantine_incomplete_outputs" ]]; then
-        return 1
-      fi
-      printf '%d' "$((base + offset))"
+      for metric in "${QUARANTINE_PRESERVATION_METRICS[@]}"; do
+        case "${metric}" in
+        participation_tbtc_quarantine_preservation_failures_total) offset=1 ;;
+        participation_beacon_quarantine_preservation_failures_total) offset=2 ;;
+        participation_tbtc_quarantine_incomplete_outputs) offset=3 ;;
+        participation_beacon_quarantine_incomplete_outputs) offset=4 ;;
+        *) return 1 ;;
+        esac
+        # A readable body with one metric genuinely absent is a partial
+        # node-authored exposition, not a torn sequence of HTTP fetches.
+        if [[ "${SAMPLER_ROUND}:${metric}" == \
+          "partial:participation_tbtc_quarantine_incomplete_outputs" ]]; then
+          continue
+        fi
+        printf 'performance_%s %d 1720000000000\n' \
+          "${metric}" "$((base + offset))"
+      done
     }
 
     expect_sampler_readings() {
@@ -1967,10 +1967,10 @@ CASE_OUT="$(
 
     SAMPLER_ROUND="partial"
     sample_quarantine_preservation_signals r1-node-1
-    expect_sampler_readings "partial sample retains only its unread field" \
+    expect_sampler_readings "one-body sample retains its absent field" \
       "r1-node-1 41 42 7 44"
-    expect_sampler_freshness "partial sample is not globally fresh" 0
-    expect_sampler_read_mask "partial sample names its three read fields" 11
+    expect_sampler_freshness "one-body absent field is not globally fresh" 0
+    expect_sampler_read_mask "one-body mask names exactly present fields" 11
     STEP_GAUGES=""
     append_quarantine_preservation_gauges \
       r1-node-1 "${RESTART_WATCHED_STOP_NAMESPACE}" "" 11
@@ -2003,9 +2003,11 @@ CASE_OUT="$(
     initialize_quarantine_preservation_readings r1-node-1 r1-node-2
     expect_sampler_readings "initializer resets stale state in roster order" \
       $'r1-node-1 21 22 23 24\nr1-node-2 31 32 33 34'
-  ) 2>&1
-)"
+    [[ "$(/usr/bin/wc -l <"${SAMPLER_FETCH_LOG}" | tr -d ' ')" == "10" ]]
+    printf 'each sampler attempt fetched one metrics body\n'
+) >"${SAMPLER_CASE_LOG}" 2>&1
 CASE_RC=$?
+CASE_OUT="$(<"${SAMPLER_CASE_LOG}")"
 set -e
 check "the preservation sampler retains only node-authored last readings" 0 \
   "first unreadable sample is explicit" \
@@ -2023,15 +2025,16 @@ check "the preservation sampler retains only node-authored last readings" 0 \
   "invalid sampler freshness is rejected by the producer" \
   "later numeric sample overwrites numeric fields" \
   "later numeric sample names all four read fields" \
-  "partial sample retains only its unread field" \
-  "partial sample is not globally fresh" \
-  "partial sample names its three read fields" \
+  "one-body sample retains its absent field" \
+  "one-body absent field is not globally fresh" \
+  "one-body mask names exactly present fields" \
   "carried incomplete field is archived and refused by the producer" \
   "sampling a second service keeps one line each" \
   "resampling one service replaces rather than appends" \
   "a replacement process inherits no old account" \
   "an unreadable replacement account is not fresh" \
-  "initializer resets stale state in roster order"
+  "initializer resets stale state in roster order" \
+  "each sampler attempt fetched one metrics body"
 
 # Drive the stopped-subject recovery helper through all three outcomes. The
 # success case deliberately makes one replacement-process metric unreadable:
@@ -2056,16 +2059,13 @@ restart_recovery_case() {
   }
 
   # shellcheck disable=SC2329
-  metric_value() {
+  probe_metrics() {
     [[ "$1" == "r1-node-1" && "${RECOVERY_CASE}" == "success" ]] ||
       return 1
-    case "$2" in
-    participation_tbtc_quarantine_preservation_failures_total) printf '5' ;;
-    participation_beacon_quarantine_preservation_failures_total) printf '6' ;;
-    participation_tbtc_quarantine_incomplete_outputs) printf '7' ;;
-    participation_beacon_quarantine_incomplete_outputs) return 1 ;;
-    *) return 1 ;;
-    esac
+    printf '%s\n' \
+      'performance_participation_tbtc_quarantine_preservation_failures_total 5 1720000000000' \
+      'performance_participation_beacon_quarantine_preservation_failures_total 6 1720000000000' \
+      'performance_participation_tbtc_quarantine_incomplete_outputs 7 1720000000000'
   }
 
   QUARANTINE_PRESERVATION_READINGS=$'r1-node-1 90 91 92 93\nr1-node-2 1 2 3 4'
@@ -8567,6 +8567,75 @@ else
   FAILED=$((FAILED + 1))
 fi
 
+# The accumulator line and archive helper carry exactly four numeric fields.
+# Pin the producer list to that representation so adding a fifth signal cannot
+# pass the generic mask validation and then disappear from values[0..3].
+if ((${#QUARANTINE_PRESERVATION_METRICS[@]} == 4)); then
+  printf 'ok   the preservation signal list matches the four-field account\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL the preservation signal list has [%d] entries but the account has four fields\n' \
+    "${#QUARANTINE_PRESERVATION_METRICS[@]}"
+  FAILED=$((FAILED + 1))
+fi
+
+# The producer decides which fields require final-attempt provenance by metric
+# suffix; the reader decides from each quarantineSignals entry's `incomplete`
+# property. Bind those classifications, not only the union of all signal
+# names, so both sides cannot agree on a new name while disagreeing on whether
+# carrying it from history is fatal.
+SHELL_QUARANTINE_INCOMPLETE_METRICS="$(
+  printf '%s\n' "${QUARANTINE_PRESERVATION_METRICS[@]}" |
+    awk '/_quarantine_incomplete_outputs$/ { print }' | sort
+)"
+READER_QUARANTINE_INCOMPLETE_METRICS="$(
+  sed -n '/const quarantineSignals = \[/,/^ *\];/p' \
+    "${TEST_DIR}/rehearse.sh" |
+    awk '
+      /^[[:space:]]*incomplete:[[:space:]]*$/ {
+        if (getline > 0 && match($0, /"[^"]+"/)) {
+          print substr($0, RSTART + 1, RLENGTH - 2)
+        }
+      }
+    ' | sort -u
+)"
+if [[ -n "${SHELL_QUARANTINE_INCOMPLETE_METRICS}" ]] &&
+  [[ "${SHELL_QUARANTINE_INCOMPLETE_METRICS}" == \
+  "${READER_QUARANTINE_INCOMPLETE_METRICS}" ]]; then
+  printf 'ok   the preservation producer and reader classify the same live fields\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL the preservation live-field classification drifted: %s\n' \
+    "$(diff \
+      <(printf '%s\n' "${SHELL_QUARANTINE_INCOMPLETE_METRICS}") \
+      <(printf '%s\n' "${READER_QUARANTINE_INCOMPLETE_METRICS}") |
+      tr '\n' ' ')"
+  FAILED=$((FAILED + 1))
+fi
+
+# A preservation sample is one scrape, then four parses of that immutable
+# response. Calling metric_value here would perform one HTTP fetch per field
+# and recreate a torn shutdown account.
+PRESERVATION_SAMPLER_SOURCE="$(
+  declare -f sample_quarantine_preservation_signals
+)"
+PRESERVATION_SAMPLER_FETCHES="$(
+  printf '%s\n' "${PRESERVATION_SAMPLER_SOURCE}" |
+    grep -Fc "probe_metrics \"\${service}\"" || true
+)"
+if [[ "${PRESERVATION_SAMPLER_FETCHES}" == "1" ]] &&
+  printf '%s\n' "${PRESERVATION_SAMPLER_SOURCE}" |
+    grep -Fq "metric_value_from_exposition \"\${metric}\"" &&
+  ! printf '%s\n' "${PRESERVATION_SAMPLER_SOURCE}" |
+    grep -Fq "metric_value \"\${service}\""; then
+  printf 'ok   one preservation attempt parses one metrics response\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL a preservation attempt does not use exactly one metrics response (fetches [%s])\n' \
+    "${PRESERVATION_SAMPLER_FETCHES:-unreadable}"
+  FAILED=$((FAILED + 1))
+fi
+
 # The pre-stop and watched-stop namespace literals cross the shell/JavaScript
 # boundary just like the metric names. Pin both reader literals to producer
 # constants and require the destructive call sites to use those constants, so
@@ -9137,7 +9206,7 @@ fi
 # client-info endpoint.
 if printf '%s\n' "${SINGLE_RELEASE_SOURCE}" | awk '
   /while kill -0 "\$\{restart_stop_pid\}"/ { watching = 1 }
-  watching && /if node_reachable "\$\{restarted\}"; then/ {
+  watching && /if ! node_reachable "\$\{restarted\}"; then/ {
     checked = 1
   }
   watching && checked && /^[[:space:]]*break;?[[:space:]]*$/ {
@@ -9151,6 +9220,52 @@ if printf '%s\n' "${SINGLE_RELEASE_SOURCE}" | awk '
   pass_case "the watched cross-C stop stops scraping after endpoint loss"
 else
   fail_case "the watched cross-C stop stops scraping after endpoint loss"
+fi
+
+# A failed /metrics fetch has no node-authored field and therefore cannot
+# replace a useful mask merely because /diagnostics is still reachable. The
+# same positive-mask guard applies before the reachability branch and to the
+# post-stop upgrade.
+RESTART_WATCHED_MASK_ORDER="$(
+  printf '%s\n' "${SINGLE_RELEASE_SOURCE}" | awk '
+    /while kill -0 "\$\{restart_stop_pid\}"/ {
+      watching = 1
+      next
+    }
+    watching &&
+      /sample_quarantine_preservation_signals "\$\{restarted\}"/ {
+      print "sample"
+      next
+    }
+    watching &&
+      /if \(\(QUARANTINE_PRESERVATION_SAMPLE_READ_MASK > 0\)\); then/ {
+      print "positive-mask"
+      next
+    }
+    watching &&
+      /restart_watched_sample_read_mask=/ {
+      print "replace"
+      next
+    }
+    watching && /if ! node_reachable "\$\{restarted\}"; then/ {
+      print "reachability"
+      next
+    }
+    watching && /^[[:space:]]*break;?[[:space:]]*$/ {
+      print "break"
+      next
+    }
+    watching && /^[[:space:]]*done;?[[:space:]]*$/ {
+      exit
+    }
+  '
+)"
+if [[ "${RESTART_WATCHED_MASK_ORDER}" == \
+  $'sample\npositive-mask\nreplace\nreachability\nbreak' ]]; then
+  pass_case "the watched stop ignores an information-free metrics attempt"
+else
+  fail_case "the watched stop ignores an information-free metrics attempt" \
+    "observed order [${RESTART_WATCHED_MASK_ORDER//$'\n'/, }]"
 fi
 
 # The final useful sampling attempt replaces the prior attempt's mask; it is

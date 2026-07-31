@@ -3868,16 +3868,24 @@ manifest_protocol_epoch() {
   ' "${SCRIPT_DIR}/release-manifest.json"
 }
 
+# One value from an already-fetched Prometheus text exposition. Keeping the
+# parser separate from the HTTP probe lets safety-sensitive multi-field
+# accounts parse one node-authored response rather than assemble an apparent
+# instant from several requests made while the process is stopping.
+metric_value_from_exposition() {
+  local metric="${METRIC_APPLICATION_PREFIX}_$1"
+  awk -v metric="${metric}" '
+    $1 == metric || index($1, metric "{") == 1 { print $2; found = 1; exit }
+    END { if (!found) exit 1 }
+  '
+}
+
 # One counter from a node's Prometheus text exposition. The parser reads the
 # exposition's own shape: the metric name, optional labels, the value, and the
 # trailing timestamp the client-info registry appends.
 metric_value() {
-  local service="$1" metric="${METRIC_APPLICATION_PREFIX}_$2"
-  probe_metrics "${service}" |
-    awk -v metric="${metric}" '
-      $1 == metric || index($1, metric "{") == 1 { print $2; found = 1; exit }
-      END { if (!found) exit 1 }
-    '
+  local service="$1"
+  probe_metrics "${service}" | metric_value_from_exposition "$2"
 }
 
 # The four process-local signals that decide whether generated signer output
@@ -9814,7 +9822,7 @@ sample_quarantine_preservation_signals() {
   local service="$1" reset_existing="${2:-0}"
   local listed_service listed_tbtc_failures listed_beacon_failures
   local listed_tbtc_incomplete listed_beacon_incomplete
-  local retained="" reading metric index=0
+  local retained="" metrics_body="" reading metric index=0
   local values=("unreadable" "unreadable" "unreadable" "unreadable")
   local sample_readable=1 sample_read_mask=0
 
@@ -9835,16 +9843,29 @@ ${listed_tbtc_failures} ${listed_beacon_failures} \
 ${listed_tbtc_incomplete} ${listed_beacon_incomplete}"
   done <<<"${QUARANTINE_PRESERVATION_READINGS}"
 
-  for metric in "${QUARANTINE_PRESERVATION_METRICS[@]}"; do
-    reading="$(metric_value "${service}" "${metric}" 2>/dev/null || printf '')"
-    if [[ "${reading}" =~ ^[0-9]+$ ]]; then
-      values[index]="${reading}"
-      sample_read_mask=$((sample_read_mask | (1 << index)))
-    else
-      sample_readable=0
-    fi
-    index=$((index + 1))
-  done
+  # One sampler attempt is exactly one /metrics response. Four independent
+  # HTTP requests can straddle process shutdown and manufacture a partial
+  # account whose fields never coexisted. A readable exposition may still
+  # genuinely omit a metric; that field keeps its retained value and its mask
+  # bit stays clear, making the node-authored absence explicit to acceptance.
+  if metrics_body="$(probe_metrics "${service}" 2>/dev/null)"; then
+    for metric in "${QUARANTINE_PRESERVATION_METRICS[@]}"; do
+      reading="$(
+        printf '%s\n' "${metrics_body}" |
+          metric_value_from_exposition "${metric}" 2>/dev/null ||
+          printf ''
+      )"
+      if [[ "${reading}" =~ ^[0-9]+$ ]]; then
+        values[index]="${reading}"
+        sample_read_mask=$((sample_read_mask | (1 << index)))
+      else
+        sample_readable=0
+      fi
+      index=$((index + 1))
+    done
+  else
+    sample_readable=0
+  fi
 
   QUARANTINE_PRESERVATION_READINGS="\
 ${retained}${retained:+$'\n'}${service} ${values[0]} ${values[1]} \
@@ -11828,21 +11849,19 @@ complete preservation remains live for the later independent controls"
       local restart_watched_sample_read_mask=0
       while kill -0 "${restart_stop_pid}" 2>/dev/null; do
         sample_quarantine_preservation_signals "${restarted}"
-        if node_reachable "${restarted}"; then
-          # A reachable endpoint had the opportunity to publish all four
-          # fields. Retain this exact attempt, including any missing field,
-          # rather than OR-ing freshness from an earlier sample.
+        # Retain this exact response whenever it carried at least one signal,
+        # including a node-authored missing field, rather than OR-ing
+        # freshness from an earlier response. A failed /metrics fetch carries
+        # no information and cannot erase an earlier complete account merely
+        # because the separate diagnostics endpoint still answers.
+        if ((QUARANTINE_PRESERVATION_SAMPLE_READ_MASK > 0)); then
           restart_watched_sample_read_mask="\
 ${QUARANTINE_PRESERVATION_SAMPLE_READ_MASK}"
-        else
-          # The endpoint may disappear between the four metric reads and the
-          # reachability probe. Preserve any fields authored in that final
-          # partial attempt; an all-unreadable post-exit scrape must not erase
-          # the last attempt made while the process could still answer.
-          if ((QUARANTINE_PRESERVATION_SAMPLE_READ_MASK > 0)); then
-            restart_watched_sample_read_mask="\
-${QUARANTINE_PRESERVATION_SAMPLE_READ_MASK}"
-          fi
+        fi
+        if ! node_reachable "${restarted}"; then
+          # Diagnostics disappearance ends the watched window. An
+          # all-unreadable post-exit metrics fetch has already been ignored,
+          # so the last response that actually carried a signal stands.
           break
         fi
         sleep 2
