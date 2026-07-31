@@ -10,7 +10,7 @@ import { signOperatorInactivityClaim } from "./utils/inactivity"
 
 import type { ContractTransaction } from "ethers"
 import type { SignerWithAddress } from "@nomiclabs/hardhat-ethers/signers"
-import type { FakeContract } from "@defi-wonderland/smock"
+import type { Mock } from "./helpers/mock"
 import type { DkgResult } from "./utils/dkg"
 import type { Operator, OperatorID } from "./utils/operators"
 import type {
@@ -53,8 +53,8 @@ describe("WalletRegistry - Rewards", () => {
   let staking: TokenStaking
   let walletRegistryGovernance: WalletRegistryGovernance
   let sortitionPool: SortitionPool
-  let randomBeacon: FakeContract<IRandomBeacon>
-  let walletOwner: FakeContract<IWalletOwner>
+  let randomBeacon: Mock<IRandomBeacon>
+  let walletOwner: Mock<IWalletOwner>
 
   let deployer: SignerWithAddress
   let governance: SignerWithAddress

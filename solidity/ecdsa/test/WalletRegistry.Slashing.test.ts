@@ -13,7 +13,7 @@ import type {
   T,
   IRandomBeacon,
 } from "../typechain"
-import type { FakeContract } from "@defi-wonderland/smock"
+import type { Mock } from "./helpers/mock"
 import type { SignerWithAddress } from "@nomiclabs/hardhat-ethers/signers"
 import type { Operator, OperatorID } from "./utils/operators"
 
@@ -51,8 +51,8 @@ describe.skip("TokenStaking Integration (DEPRECATED TIP-092)", () => {
 
 describe("WalletRegistry - Slashing", () => {
   let walletRegistry: WalletRegistry
-  let randomBeacon: FakeContract<IRandomBeacon>
-  let walletOwner: FakeContract<IWalletOwner>
+  let randomBeacon: Mock<IRandomBeacon>
+  let walletOwner: Mock<IWalletOwner>
   let thirdParty: SignerWithAddress
   let staking: TokenStaking
   let tToken: T
