@@ -1973,19 +1973,32 @@ history. The accompanying
 also pre-registered at zero, rise for the whole live retry after grace is
 exhausted, and clear only when the full output becomes durable. Both
 exact-image gates sample all four signals while their candidates still answer.
-The `single_release` gate seeds the account before the chain-clock failure,
-refreshes the affected node through that cancellation and both quiescence
-controls, and records the verdict before its final fleet-stop stage. The
-rollback gate refreshes the same account while every candidate drains. An
-unreadable signal or a nonzero live gauge refuses either gate because the node
-has not proved that the output became fully durable. A nonzero counter paired
-with a zero live gauge is retained as a distinct, non-fatal recovery finding:
-preservation exhausted its write-grace rounds and later completed. The finding
-is printed even when an unrelated requirement refuses the same archive. It
-does not bypass the offline state audit, which must still prove the durable
-namespace before the prior release starts. All four zero means the node
-reported neither a grace-exhausting episode nor an output currently
-incomplete; it does not turn a missing reading into an empty quarantine.
+All four are process-local and reset when a node restarts. The
+`single_release` gate therefore opens its account before the cross-C restart,
+samples the volatile node again immediately before issuing it, and archives
+that old process's four readings on the restart step under
+`<service>.pre_restart.*`. A missing pre-restart reading blocks the control and
+a nonzero live incomplete-output gauge refuses the restart; the replacement
+process cannot retroactively supply either fact with its newly initialized
+zeros. The Compose restart itself has an explicit 600-second shutdown timeout
+instead of inheriting the service's multi-hour rollback grace. Once the new
+process answers, the gate re-seeds that node's live account, refreshes it
+through the chain-clock cancellation and both quiescence controls, and records
+the fleet verdict before its final fleet-stop stage. The rollback gate uses the
+same accumulator and refreshes it while every candidate drains.
+
+An unreadable signal, an account that does not cover every configured R1
+service exactly once, or a nonzero live gauge refuses either gate because the
+node has not proved that the output became fully durable. A nonzero counter
+paired with a zero live gauge is retained as a distinct, non-fatal recovery
+finding: preservation exhausted its write-grace rounds and later completed.
+For the restart reading this finding remains in the archive after the new
+process resets its counters. The finding is printed even when an unrelated
+requirement refuses the same archive. It does not bypass the offline state
+audit, which must still prove the durable namespace before the prior release
+starts. All four zero means the node reported neither a grace-exhausting
+episode nor an output currently incomplete; it does not turn a missing reading
+into an empty quarantine.
 
 `performance_participation_quarantined_tbtc_signers` is deliberately not a
 live preservation verdict. A nonzero value means the protected namespace

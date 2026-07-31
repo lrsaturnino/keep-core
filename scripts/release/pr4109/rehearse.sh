@@ -3875,6 +3875,20 @@ metric_value() {
     '
 }
 
+# The four process-local signals that decide whether generated signer output
+# made it fully into protected quarantine. This is the shell producer's one
+# ordered definition: the general step snapshot, last-readable accumulator,
+# evidence-gauge emitter, and rollback drain all consume this same list. The
+# archive reader carries the corresponding JavaScript list below; the scaffold
+# self-test binds the two so adding or renaming a signal cannot silently make
+# one gate read a different preservation contract.
+QUARANTINE_PRESERVATION_METRICS=(
+  participation_tbtc_quarantine_preservation_failures_total
+  participation_beacon_quarantine_preservation_failures_total
+  participation_tbtc_quarantine_incomplete_outputs
+  participation_beacon_quarantine_incomplete_outputs
+)
+
 # The participation metrics an evidence step snapshots, by their internal names.
 #
 # Every one of them is registered at zero with the rest of the fixed metric
@@ -3906,10 +3920,7 @@ PARTICIPATION_METRICS=(
   participation_clock_aborts_total
   participation_quiesce_total
   participation_quiesce_forced_aborts_total
-  participation_tbtc_quarantine_preservation_failures_total
-  participation_beacon_quarantine_preservation_failures_total
-  participation_tbtc_quarantine_incomplete_outputs
-  participation_beacon_quarantine_incomplete_outputs
+  "${QUARANTINE_PRESERVATION_METRICS[@]}"
   participation_quarantined_tbtc_signers
 )
 
@@ -9770,18 +9781,17 @@ sample_quarantine_preservation_signals() {
   local service="$1"
   local listed_service listed_tbtc_failures listed_beacon_failures
   local listed_tbtc_incomplete listed_beacon_incomplete
-  local tbtc_failures="unreadable" beacon_failures="unreadable"
-  local tbtc_incomplete="unreadable" beacon_incomplete="unreadable"
-  local retained="" reading
+  local retained="" reading metric index=0
+  local values=("unreadable" "unreadable" "unreadable" "unreadable")
 
   while read -r listed_service listed_tbtc_failures listed_beacon_failures \
     listed_tbtc_incomplete listed_beacon_incomplete; do
     [[ -n "${listed_service}" ]] || continue
     if [[ "${listed_service}" == "${service}" ]]; then
-      tbtc_failures="${listed_tbtc_failures}"
-      beacon_failures="${listed_beacon_failures}"
-      tbtc_incomplete="${listed_tbtc_incomplete}"
-      beacon_incomplete="${listed_beacon_incomplete}"
+      values[0]="${listed_tbtc_failures}"
+      values[1]="${listed_beacon_failures}"
+      values[2]="${listed_tbtc_incomplete}"
+      values[3]="${listed_beacon_incomplete}"
       continue
     fi
     retained="${retained}${retained:+$'\n'}${listed_service} \
@@ -9789,29 +9799,17 @@ ${listed_tbtc_failures} ${listed_beacon_failures} \
 ${listed_tbtc_incomplete} ${listed_beacon_incomplete}"
   done <<<"${QUARANTINE_PRESERVATION_READINGS}"
 
-  reading="$(metric_value "${service}" \
-    participation_tbtc_quarantine_preservation_failures_total \
-    2>/dev/null || printf '')"
-  [[ "${reading}" =~ ^[0-9]+$ ]] && tbtc_failures="${reading}"
-
-  reading="$(metric_value "${service}" \
-    participation_beacon_quarantine_preservation_failures_total \
-    2>/dev/null || printf '')"
-  [[ "${reading}" =~ ^[0-9]+$ ]] && beacon_failures="${reading}"
-
-  reading="$(metric_value "${service}" \
-    participation_tbtc_quarantine_incomplete_outputs \
-    2>/dev/null || printf '')"
-  [[ "${reading}" =~ ^[0-9]+$ ]] && tbtc_incomplete="${reading}"
-
-  reading="$(metric_value "${service}" \
-    participation_beacon_quarantine_incomplete_outputs \
-    2>/dev/null || printf '')"
-  [[ "${reading}" =~ ^[0-9]+$ ]] && beacon_incomplete="${reading}"
+  for metric in "${QUARANTINE_PRESERVATION_METRICS[@]}"; do
+    reading="$(metric_value "${service}" "${metric}" 2>/dev/null || printf '')"
+    if [[ "${reading}" =~ ^[0-9]+$ ]]; then
+      values[index]="${reading}"
+    fi
+    index=$((index + 1))
+  done
 
   QUARANTINE_PRESERVATION_READINGS="\
-${retained}${retained:+$'\n'}${service} ${tbtc_failures} ${beacon_failures} \
-${tbtc_incomplete} ${beacon_incomplete}"
+${retained}${retained:+$'\n'}${service} ${values[0]} ${values[1]} \
+${values[2]} ${values[3]}"
 }
 
 initialize_quarantine_preservation_readings() {
@@ -9822,17 +9820,97 @@ initialize_quarantine_preservation_readings() {
   done
 }
 
+# Return one service's retained account exactly as the accumulator stores it.
+# An absent service is different from an unreadable service: the latter has a
+# line containing `unreadable`, while the former proves the expected fleet was
+# never sampled at all.
+quarantine_preservation_reading_for() {
+  local wanted="$1"
+  local service tbtc_failures beacon_failures tbtc_incomplete beacon_incomplete
+
+  while read -r service tbtc_failures beacon_failures tbtc_incomplete \
+    beacon_incomplete; do
+    [[ -n "${service}" ]] || continue
+    if [[ "${service}" == "${wanted}" ]]; then
+      printf '%s %s %s %s %s' \
+        "${service}" "${tbtc_failures}" "${beacon_failures}" \
+        "${tbtc_incomplete}" "${beacon_incomplete}"
+      return 0
+    fi
+  done <<<"${QUARANTINE_PRESERVATION_READINGS}"
+
+  return 1
+}
+
+# Attach one retained account to the current evidence step. A namespace keeps
+# a reading from a process that is about to disappear distinct from the same
+# metric name published by the replacement process. Only numeric fields are
+# emitted; the archive reader treats an absent key as an unread instrument and
+# therefore cannot mistake `unreadable` for a node-authored zero.
+append_quarantine_preservation_gauges() {
+  local service="$1" namespace="${2:-}" account
+  local listed_service tbtc_failures beacon_failures
+  local tbtc_incomplete beacon_incomplete metric value index=0
+  local key_prefix="${service}."
+
+  [[ -n "${namespace}" ]] && key_prefix="${service}.${namespace}."
+  account="$(quarantine_preservation_reading_for "${service}")" || return 1
+  read -r listed_service tbtc_failures beacon_failures tbtc_incomplete \
+    beacon_incomplete <<<"${account}"
+  local values=(
+    "${tbtc_failures}"
+    "${beacon_failures}"
+    "${tbtc_incomplete}"
+    "${beacon_incomplete}"
+  )
+
+  local complete=1
+  for metric in "${QUARANTINE_PRESERVATION_METRICS[@]}"; do
+    value="${values[${index}]}"
+    if [[ "${value}" =~ ^[0-9]+$ ]]; then
+      STEP_GAUGES="${STEP_GAUGES}${STEP_GAUGES:+,}\
+\"${key_prefix}${metric}\":${value}"
+    else
+      complete=0
+    fi
+    index=$((index + 1))
+  done
+
+  ((complete == 1))
+}
+
 quarantine_preservation_verdict() {
   local assertion="$1"
   local step="quarantine preservation is complete through quiescence"
   local service tbtc_failures beacon_failures tbtc_incomplete beacon_incomplete
   local nodes=0
   local unread="" still_incomplete="" recovered=""
+  local unexpected_services="" duplicate_services="" missing_services=""
+  local expected seen
+  local seen_services=()
 
   while read -r service tbtc_failures beacon_failures tbtc_incomplete \
     beacon_incomplete; do
     [[ -n "${service}" ]] || continue
     nodes=$((nodes + 1))
+
+    local already_seen=0 expected_service=0
+    for seen in "${seen_services[@]+"${seen_services[@]}"}"; do
+      [[ "${seen}" == "${service}" ]] && already_seen=1
+    done
+    if ((already_seen == 1)); then
+      duplicate_services="${duplicate_services}\
+${duplicate_services:+, }${service}"
+    else
+      seen_services+=("${service}")
+    fi
+    for expected in "${REHEARSAL_R1_SERVICES[@]+"${REHEARSAL_R1_SERVICES[@]}"}"; do
+      [[ "${expected}" == "${service}" ]] && expected_service=1
+    done
+    if ((expected_service == 0)); then
+      unexpected_services="${unexpected_services}\
+${unexpected_services:+, }${service}"
+    fi
 
     if [[ ! "${tbtc_failures}" =~ ^[0-9]+$ ]] ||
       [[ ! "${beacon_failures}" =~ ^[0-9]+$ ]] ||
@@ -9844,15 +9922,7 @@ ${tbtc_incomplete}, beacon incomplete ${beacon_incomplete})"
       continue
     fi
 
-    STEP_GAUGES="${STEP_GAUGES}${STEP_GAUGES:+,}\
-\"${service}.participation_tbtc_quarantine_preservation_failures_total\":\
-${tbtc_failures},\
-\"${service}.participation_beacon_quarantine_preservation_failures_total\":\
-${beacon_failures},\
-\"${service}.participation_tbtc_quarantine_incomplete_outputs\":\
-${tbtc_incomplete},\
-\"${service}.participation_beacon_quarantine_incomplete_outputs\":\
-${beacon_incomplete}"
+    append_quarantine_preservation_gauges "${service}"
 
     if ((tbtc_incomplete > 0)); then
       still_incomplete="${still_incomplete}${still_incomplete:+, }${service} \
@@ -9873,10 +9943,31 @@ grace-exhaustion episodes ${beacon_failures}, live incomplete 0)"
     fi
   done <<<"${QUARANTINE_PRESERVATION_READINGS}"
 
-  if ((nodes == 0)); then
+  for expected in "${REHEARSAL_R1_SERVICES[@]+"${REHEARSAL_R1_SERVICES[@]}"}"; do
+    local found=0
+    for seen in "${seen_services[@]+"${seen_services[@]}"}"; do
+      [[ "${seen}" == "${expected}" ]] && found=1
+    done
+    if ((found == 0)); then
+      missing_services="${missing_services}${missing_services:+, }${expected}"
+    fi
+  done
+
+  if ((${#REHEARSAL_R1_SERVICES[@]} == 0)); then
+    block_step "${step}" "the expected R1 service roster is empty; no fleet \
+reading can authorize quarantine preservation"
+    record_assertion "${assertion}" false "${step}"
+  elif ((nodes == 0)); then
     block_step "${step}" "no R1 node's quarantine-preservation counters were \
 captured before the fleet stopped; an absent reading cannot say that no \
 generated share was lost"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ -n "${missing_services}${unexpected_services}${duplicate_services}" ]]; then
+    block_step "${step}" "the quarantine-preservation readings do not cover \
+the authoritative R1 service roster exactly (missing \
+[${missing_services:-none}], unexpected [${unexpected_services:-none}], \
+duplicate [${duplicate_services:-none}]); one healthy \
+node cannot stand in for a fleet member that was never sampled"
     record_assertion "${assertion}" false "${step}"
   elif [[ -n "${unread}" ]]; then
     block_step "${step}" "the quarantine-preservation counters or live \
@@ -11328,6 +11419,11 @@ kept its identity and its mode across the crossing and was allowed to finish"
 # one place and checked rather than repeated at four call sites.
 SINGLE_RELEASE_LEGACY_NODE=""
 SINGLE_RELEASE_VOLATILE_NODE=""
+# The restart is a recovery control, not a second full rollback drain. Bound
+# its stop phase explicitly so a node blocked on an unwritable quarantine
+# namespace produces a named failed control instead of inheriting Compose's
+# multi-hour service grace before the reachability deadline even begins.
+SINGLE_RELEASE_RESTART_TIMEOUT_SECONDS=600
 
 assign_single_release_nodes() {
   SINGLE_RELEASE_LEGACY_NODE="${REHEARSAL_R1_SERVICES[0]:-}"
@@ -11469,39 +11565,109 @@ open_security_v2 within an hour of it"
   resolve_surviving_legacy_work
   surviving_legacy_verdict
 
+  # Open the last-readable preservation window before the first control that
+  # destroys a process. All four signals are process-local: once the volatile
+  # node restarts, no reading from the new process can say what the old one was
+  # holding. Seed the whole fleet now, retain a separately named pre-restart
+  # reading in step 4, and then re-seed the replacement process once it answers.
+  initialize_quarantine_preservation_readings \
+    "${REHEARSAL_R1_SERVICES[@]}"
+  QUARANTINE_PRESERVATION_SAMPLING=1
+
   # Step 4. Mode must come from the canonical anchor and the current chain, so
   # a node that lost its process state entirely must land on the same answer.
   begin_step "restart across C derives mode from the chain, not from process state"
   local restarted="${SINGLE_RELEASE_VOLATILE_NODE}"
-  compose restart "${restarted}"
-  local deadline=$((SECONDS + 600))
-  until node_reachable "${restarted}"; do
-    if ((SECONDS >= deadline)); then
-      break
-    fi
-    sleep 5
-  done
-  local restarted_state
-  restarted_state="$(participation_field "${restarted}" gate_state 2>/dev/null || true)"
-  observe_canonical_block "${restarted}"
-  observe_gate_gauges "${restarted}"
-  if [[ "${restarted_state}" == "open_security_v2" ]]; then
-    record_step \
-      "restart across C derives mode from the chain, not from process state" \
-      pass "${restarted} returned to open_security_v2 after a full restart \
-with no watcher history and no wall-clock input"
-    record_assertion \
-      "a restarted node derives its mode from the canonical anchor and the \
-current chain" true \
-      "restart across C derives mode from the chain, not from process state"
+  local deadline
+  sample_quarantine_preservation_signals "${restarted}"
+
+  local pre_restart_account=""
+  local pre_restart_tbtc_failures="unreadable"
+  local pre_restart_beacon_failures="unreadable"
+  local pre_restart_tbtc_incomplete="unreadable"
+  local pre_restart_beacon_incomplete="unreadable"
+  local pre_restart_readable=1
+  if pre_restart_account="$(
+    quarantine_preservation_reading_for "${restarted}"
+  )"; then
+    read -r _ pre_restart_tbtc_failures \
+      pre_restart_beacon_failures pre_restart_tbtc_incomplete \
+      pre_restart_beacon_incomplete <<<"${pre_restart_account}"
   else
-    record_step \
-      "restart across C derives mode from the chain, not from process state" \
-      fail "${restarted} reported [${restarted_state:-unreadable}] after restart"
-    record_assertion \
-      "a restarted node derives its mode from the canonical anchor and the \
-current chain" false \
-      "restart across C derives mode from the chain, not from process state"
+    pre_restart_readable=0
+  fi
+  if ! append_quarantine_preservation_gauges \
+    "${restarted}" "pre_restart"; then
+    pre_restart_readable=0
+  fi
+
+  local restart_step="restart across C derives mode from the chain, not from process state"
+  local restart_assertion="a restarted node derives its mode from the canonical anchor and the current chain"
+  if ((pre_restart_readable == 0)); then
+    block_step "${restart_step}" "${restarted} did not publish all four numeric \
+quarantine-preservation signals immediately before restart; the old process is \
+the last source that can say whether it is holding generated output, so the \
+restart was refused rather than replacing an unreadable account with zeros"
+    record_assertion "${restart_assertion}" false "${restart_step}"
+  elif ((pre_restart_tbtc_incomplete > 0 || pre_restart_beacon_incomplete > 0)); then
+    record_step "${restart_step}" fail "${restarted} reported live incomplete \
+quarantine output immediately before restart (tBTC \
+${pre_restart_tbtc_incomplete}, beacon ${pre_restart_beacon_incomplete}); the \
+restart was refused because replacing this process would destroy the only live \
+reading of whether that generated output became fully durable"
+    record_assertion "${restart_assertion}" false "${restart_step}"
+  else
+    local restart_rc=0
+    compose restart --timeout "${SINGLE_RELEASE_RESTART_TIMEOUT_SECONDS}" \
+      "${restarted}" || restart_rc=$?
+
+    deadline=$((SECONDS + SINGLE_RELEASE_RESTART_TIMEOUT_SECONDS))
+    if ((restart_rc == 0)); then
+      until node_reachable "${restarted}"; do
+        if ((SECONDS >= deadline)); then
+          break
+        fi
+        sleep 5
+      done
+    fi
+
+    local restarted_state="" restarted_reachable=0
+    if ((restart_rc == 0)) && node_reachable "${restarted}"; then
+      restarted_reachable=1
+      # This is a new process-local account. Re-seed it rather than letting the
+      # old process's retained values stand for a process that did not publish
+      # them; the separately namespaced pre-restart gauges preserve the only
+      # admissible reading of the old process.
+      sample_quarantine_preservation_signals "${restarted}"
+      restarted_state="$(
+        participation_field "${restarted}" gate_state 2>/dev/null || true
+      )"
+      observe_canonical_block "${restarted}"
+      observe_gate_gauges "${restarted}"
+    fi
+
+    if ((restart_rc != 0)); then
+      record_step "${restart_step}" fail "the explicitly bounded restart of \
+${restarted} exited [${restart_rc}] with a \
+${SINGLE_RELEASE_RESTART_TIMEOUT_SECONDS}-second shutdown timeout"
+      record_assertion "${restart_assertion}" false "${restart_step}"
+    elif ((restarted_reachable == 0)); then
+      record_step "${restart_step}" fail "${restarted} did not become reachable \
+within ${SINGLE_RELEASE_RESTART_TIMEOUT_SECONDS} seconds after its bounded \
+restart"
+      record_assertion "${restart_assertion}" false "${restart_step}"
+    elif [[ "${restarted_state}" == "open_security_v2" ]]; then
+      record_step "${restart_step}" pass "${restarted} returned to \
+open_security_v2 after a full restart with no watcher history and no wall-clock \
+input; its old process reported zero live incomplete outputs immediately before \
+the explicitly bounded restart (prior tBTC/beacon write-grace exhaustion \
+counters ${pre_restart_tbtc_failures}/${pre_restart_beacon_failures})"
+      record_assertion "${restart_assertion}" true "${restart_step}"
+    else
+      record_step "${restart_step}" fail "${restarted} reported \
+[${restarted_state:-unreadable}] after restart"
+      record_assertion "${restart_assertion}" false "${restart_step}"
+    fi
   fi
 
   # Step 5. The prior binary is still reachable and still speaking the legacy
@@ -11645,16 +11811,15 @@ network"
 
   homogeneous_control_verdict
 
-  # Everything after the homogeneous control can preserve generated signer
-  # output into quarantine: the clock-failure control cancels every held
-  # permit on its node, and each quiescence control may reach its forced
-  # deadline. Seed a last-readable account while both endpoints answer, then
-  # refresh the affected node throughout each destructive window. The verdict
-  # is emitted only after both quiescence controls, but before the fleet-stop
-  # barrier makes any remaining endpoint unreadable.
-  initialize_quarantine_preservation_readings \
-    "${REHEARSAL_R1_SERVICES[@]}"
-  QUARANTINE_PRESERVATION_SAMPLING=1
+  # Refresh the window opened before the restart while both current processes
+  # answer. The clock-failure control cancels every held permit on its node,
+  # and each quiescence control may reach its forced deadline, so their affected
+  # nodes continue to be sampled throughout those destructive windows. The
+  # verdict is emitted only after both quiescence controls, but before the
+  # fleet-stop barrier makes any remaining endpoint unreadable.
+  for service in "${REHEARSAL_R1_SERVICES[@]}"; do
+    sample_quarantine_preservation_signals "${service}"
+  done
 
   # Step 7. Severing a node from the chain endpoint is a real clock failure:
   # the gate's synchronous read fails, and the release's contract is that it
@@ -11886,10 +12051,10 @@ nowhere to capture them to"
   # node held to what became of them, and the reconciliation below is about
   # each permit rather than about the size of the population.
   local held_at_stop=() forced_before=() forced_after=() final_active=()
-  local tbtc_preservation_failures=() beacon_preservation_failures=()
-  local tbtc_incomplete_outputs=() beacon_incomplete_outputs=()
   local authored_endings=()
   local svc reading
+  initialize_quarantine_preservation_readings \
+    "${REHEARSAL_R1_SERVICES[@]}"
   for svc in "${REHEARSAL_R1_SERVICES[@]}"; do
     # "unread" rather than empty, because a node that answered with nothing yet
     # closed also has an empty list; the reconciliation has to tell a node it
@@ -11910,30 +12075,6 @@ nowhere to capture them to"
     [[ "${reading}" =~ ^[0-9]+$ ]] || reading="unreadable"
     forced_before+=("${reading}")
     forced_after+=("${reading}")
-
-    reading="$(metric_value "${svc}" \
-      participation_tbtc_quarantine_preservation_failures_total \
-      2>/dev/null || printf 'unreadable')"
-    [[ "${reading}" =~ ^[0-9]+$ ]] || reading="unreadable"
-    tbtc_preservation_failures+=("${reading}")
-
-    reading="$(metric_value "${svc}" \
-      participation_beacon_quarantine_preservation_failures_total \
-      2>/dev/null || printf 'unreadable')"
-    [[ "${reading}" =~ ^[0-9]+$ ]] || reading="unreadable"
-    beacon_preservation_failures+=("${reading}")
-
-    reading="$(metric_value "${svc}" \
-      participation_tbtc_quarantine_incomplete_outputs \
-      2>/dev/null || printf 'unreadable')"
-    [[ "${reading}" =~ ^[0-9]+$ ]] || reading="unreadable"
-    tbtc_incomplete_outputs+=("${reading}")
-
-    reading="$(metric_value "${svc}" \
-      participation_beacon_quarantine_incomplete_outputs \
-      2>/dev/null || printf 'unreadable')"
-    [[ "${reading}" =~ ^[0-9]+$ ]] || reading="unreadable"
-    beacon_incomplete_outputs+=("${reading}")
   done
 
   # The grace comes out of the reviewed manifest, which the Go drift test
@@ -11987,8 +12128,7 @@ nowhere to capture them to"
     # closes its last permit and exits: asked separately it answers the count
     # and not the endings, and the reconciliation would then read a drained
     # node beside the ending list from before that permit closed.
-    local idx=0 snapshot_now active_now forced_now tbtc_failure_now
-    local beacon_failure_now tbtc_incomplete_now beacon_incomplete_now
+    local idx=0 snapshot_now active_now forced_now
     for svc in "${REHEARSAL_R1_SERVICES[@]}"; do
       if snapshot_now="$(service_gate_snapshot "${svc}" \
         active_security_v2_ceremonies 2>/dev/null)"; then
@@ -12007,34 +12147,7 @@ nowhere to capture them to"
       if [[ "${forced_now}" =~ ^[0-9]+$ ]]; then
         forced_after[idx]="${forced_now}"
       fi
-
-      tbtc_failure_now="$(metric_value "${svc}" \
-        participation_tbtc_quarantine_preservation_failures_total \
-        2>/dev/null || printf '')"
-      if [[ "${tbtc_failure_now}" =~ ^[0-9]+$ ]]; then
-        tbtc_preservation_failures[idx]="${tbtc_failure_now}"
-      fi
-
-      beacon_failure_now="$(metric_value "${svc}" \
-        participation_beacon_quarantine_preservation_failures_total \
-        2>/dev/null || printf '')"
-      if [[ "${beacon_failure_now}" =~ ^[0-9]+$ ]]; then
-        beacon_preservation_failures[idx]="${beacon_failure_now}"
-      fi
-
-      tbtc_incomplete_now="$(metric_value "${svc}" \
-        participation_tbtc_quarantine_incomplete_outputs \
-        2>/dev/null || printf '')"
-      if [[ "${tbtc_incomplete_now}" =~ ^[0-9]+$ ]]; then
-        tbtc_incomplete_outputs[idx]="${tbtc_incomplete_now}"
-      fi
-
-      beacon_incomplete_now="$(metric_value "${svc}" \
-        participation_beacon_quarantine_incomplete_outputs \
-        2>/dev/null || printf '')"
-      if [[ "${beacon_incomplete_now}" =~ ^[0-9]+$ ]]; then
-        beacon_incomplete_outputs[idx]="${beacon_incomplete_now}"
-      fi
+      sample_quarantine_preservation_signals "${svc}"
       idx=$((idx + 1))
     done
     sleep 2
@@ -12048,8 +12161,12 @@ nowhere to capture them to"
 
   # One last sample once the drain is over, so the watched window ends where
   # the barrier's precondition is finally established rather than a probe
-  # earlier.
+  # earlier. Endpoints that already stopped keep their last numeric node-
+  # authored values rather than becoming invented zeros.
   sample_prior_absence
+  for svc in "${REHEARSAL_R1_SERVICES[@]}"; do
+    sample_quarantine_preservation_signals "${svc}"
+  done
 
   # The accounting the reconciliation step reads, assembled once the drain is
   # over. The forced-abort figure is the delta across the drain rather than the
@@ -12057,7 +12174,6 @@ nowhere to capture them to"
   # not permits this drain force-canceled.
   ROLLBACK_NODE_ACCOUNTS=""
   ROLLBACK_NODE_ENDINGS=""
-  QUARANTINE_PRESERVATION_READINGS=""
   local pos=0 forced_delta
   for svc in "${REHEARSAL_R1_SERVICES[@]}"; do
     if [[ "${forced_before[${pos}]}" =~ ^[0-9]+$ ]] &&
@@ -12074,13 +12190,6 @@ ${forced_delta} ${final_active[${pos}]}"
     # endings carry spaces, and the accounting is read field by field.
     ROLLBACK_NODE_ENDINGS="${ROLLBACK_NODE_ENDINGS}\
 ${ROLLBACK_NODE_ENDINGS:+$'\n'}${svc} ${authored_endings[${pos}]}"
-    QUARANTINE_PRESERVATION_READINGS="\
-${QUARANTINE_PRESERVATION_READINGS}\
-${QUARANTINE_PRESERVATION_READINGS:+$'\n'}${svc} \
-${tbtc_preservation_failures[${pos}]} \
-${beacon_preservation_failures[${pos}]} \
-${tbtc_incomplete_outputs[${pos}]} \
-${beacon_incomplete_outputs[${pos}]}"
     pos=$((pos + 1))
   done
 
@@ -13090,51 +13199,10 @@ evidence_acceptance_findings() {
     }
 
     if (record.gate === "single_release" || record.gate === "rollback") {
-      const preservationStageName =
-        "quarantine preservation is complete through quiescence";
-      const preservationStage = stageByName.get(preservationStageName) || {};
-      const gauges =
-        preservationStage.gauges &&
-        typeof preservationStage.gauges === "object" &&
-        !Array.isArray(preservationStage.gauges)
-          ? preservationStage.gauges
-          : {};
-      // The shell roster drives the fleet and is held to the compose file by
-      // the validator self-test. Requiring every service in that same roster
-      // prevents one healthy node from standing in for another node that
-      // stopped answering before it published whether preservation failed.
-      if (expectedServices.length === 0) {
-        add(
-          "unrehearsed",
-          record.gate +
-            " acceptance received an empty expected R1 service roster; " +
-            "no fleet reading can authorize the gate"
-        );
-      }
-
-      const readMetric = (service, metric) => {
-        const name = service + "." + metric;
-        if (!Object.prototype.hasOwnProperty.call(gauges, name)) {
-          add(
-            "unrehearsed",
-            record.gate + " step " +
-              JSON.stringify(preservationStageName) +
-              " carries no fleet reading of " + JSON.stringify(name)
-          );
-          return undefined;
-        }
-        const value = gauges[name];
-        if (!Number.isFinite(value)) {
-          add(
-            "unrehearsed",
-            record.gate + " quarantine-preservation reading " +
-              JSON.stringify(name) + " is not numeric"
-          );
-          return undefined;
-        }
-        return value;
-      };
-
+      // This is the JavaScript consumer-side mirror of the shell producer-side
+      // QUARANTINE_PRESERVATION_METRICS list. The scaffold self-test compares
+      // the two exact sets so the archive cannot silently decide on fewer
+      // signals than the running rehearsal sampled and emitted.
       const quarantineSignals = [
         {
           protocol: "tBTC",
@@ -13151,6 +13219,118 @@ evidence_acceptance_findings() {
             "participation_beacon_quarantine_incomplete_outputs",
         },
       ];
+      const stageGauges = (stage) =>
+        stage.gauges &&
+        typeof stage.gauges === "object" &&
+        !Array.isArray(stage.gauges)
+          ? stage.gauges
+          : {};
+      const readGauge = (stageName, gauges, name, readingKind) => {
+        if (!Object.prototype.hasOwnProperty.call(gauges, name)) {
+          add(
+            "unrehearsed",
+            record.gate + " step " + JSON.stringify(stageName) +
+              " carries no " + readingKind + " reading of " +
+              JSON.stringify(name)
+          );
+          return undefined;
+        }
+        const value = gauges[name];
+        if (!Number.isFinite(value)) {
+          add(
+            "unrehearsed",
+            record.gate + " quarantine-preservation reading " +
+              JSON.stringify(name) + " is not numeric"
+          );
+          return undefined;
+        }
+        return value;
+      };
+
+      if (record.gate === "single_release") {
+        const restartStageName =
+          "restart across C derives mode from the chain, not from process state";
+        const restartStage = stageByName.get(restartStageName) || {};
+        const restartGauges = stageGauges(restartStage);
+        // assign_single_release_nodes gives the destructive controls the
+        // second R1 service. The source/compose roster test holds this array to
+        // that allocation, so the archive asks the process that actually
+        // disappeared rather than accepting a clean reading from its peer.
+        const restartService = expectedServices[1];
+        if (!restartService) {
+          add(
+            "unrehearsed",
+            "single_release restart has no volatile R1 service in the " +
+              "expected fleet roster"
+          );
+        } else {
+          for (const signal of quarantineSignals) {
+            const prefix = restartService + ".pre_restart.";
+            const counterName = prefix + signal.counter;
+            const incompleteName = prefix + signal.incomplete;
+            const counter = readGauge(
+              restartStageName,
+              restartGauges,
+              counterName,
+              "pre-restart"
+            );
+            const incomplete = readGauge(
+              restartStageName,
+              restartGauges,
+              incompleteName,
+              "pre-restart"
+            );
+            if (incomplete !== undefined && incomplete !== 0) {
+              add(
+                "refuted",
+                "single_release restart node " +
+                  JSON.stringify(restartService) + " reported live incomplete " +
+                  signal.protocol + " quarantine output immediately before " +
+                  "its process-local account disappeared: " +
+                  JSON.stringify(incompleteName) + " is " + incomplete
+              );
+            } else if (
+              counter !== undefined &&
+              incomplete === 0 &&
+              counter !== 0
+            ) {
+              add(
+                "advisory",
+                "single_release restart node " +
+                  JSON.stringify(restartService) + " recorded " +
+                  signal.protocol + " preservation whose write-grace " +
+                  "exhausted and later completed before restart reset its " +
+                  "process-local counters: " + JSON.stringify(counterName) +
+                  " is " + counter + " and " +
+                  JSON.stringify(incompleteName) + " is zero"
+              );
+            }
+          }
+        }
+      }
+
+      const preservationStageName =
+        "quarantine preservation is complete through quiescence";
+      const preservationStage = stageByName.get(preservationStageName) || {};
+      const gauges = stageGauges(preservationStage);
+      // The shell roster drives the fleet and is held to the compose file by
+      // the validator self-test. Requiring every service in that same roster
+      // prevents one healthy node from standing in for another node that
+      // stopped answering before it published whether preservation failed.
+      if (expectedServices.length === 0) {
+        add(
+          "unrehearsed",
+          record.gate +
+            " acceptance received an empty expected R1 service roster; " +
+            "no fleet reading can authorize the gate"
+        );
+      }
+
+      const readMetric = (service, metric) => {
+        const name = service + "." + metric;
+        return readGauge(preservationStageName, gauges, name, "fleet");
+      };
+
       for (const service of expectedServices) {
         for (const signal of quarantineSignals) {
           const counterName = service + "." + signal.counter;

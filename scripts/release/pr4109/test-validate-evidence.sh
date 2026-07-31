@@ -178,7 +178,12 @@ SINGLE_RELEASE_STAGES='
   { "name": "representative pre-cutover work including the longest wallet action", "outcome": "pass" },
   { "name": "cross C without restart", "outcome": "pass" },
   { "name": "pre-cutover legacy work survives C and completes", "outcome": "pass" },
-  { "name": "restart across C derives mode from the chain, not from process state", "outcome": "pass" },
+  { "name": "restart across C derives mode from the chain, not from process state", "outcome": "pass", "gauges": {
+      "r1-node-2.pre_restart.participation_tbtc_quarantine_preservation_failures_total": 0,
+      "r1-node-2.pre_restart.participation_beacon_quarantine_preservation_failures_total": 0,
+      "r1-node-2.pre_restart.participation_tbtc_quarantine_incomplete_outputs": 0,
+      "r1-node-2.pre_restart.participation_beacon_quarantine_incomplete_outputs": 0
+    } },
   { "name": "post-cutover straggler fails closed and enters the roster", "outcome": "pass" },
   { "name": "90/10 DKG consequence is visible with the straggler eligible", "outcome": "pass" },
   { "name": "quarantine the straggler", "outcome": "pass" },
@@ -1156,6 +1161,90 @@ run_validator "${D}"
 check "a record naming a review the control does not pin is rejected" 3 \
   "review record hashing to \[c{64}\]"
 
+# The restart destroys the old process's counters. Its stage therefore has its
+# own last-readable account, taken before Compose is allowed to issue the
+# restart and namespaced apart from the replacement process's gauges. Deleting
+# one of those old-process readings must make an otherwise complete archive
+# unrehearsed.
+D="${WORK}/accept-restart-missing-preservation-reading"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  const stage = record.stages.find(
+    ({ name }) =>
+      name ===
+      "restart across C derives mode from the chain, not from process state"
+  );
+  delete stage.gauges[
+    "r1-node-2.pre_restart.participation_beacon_quarantine_incomplete_outputs"
+  ];
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "single-release acceptance requires every pre-restart preservation reading" \
+  3 "single_release step.*restart across C.*carries no pre-restart reading of.*r1-node-2.*beacon_quarantine_incomplete_outputs"
+
+# A numeric pre-restart reading is not sufficient when it says an output is
+# still incomplete. The harness refuses to restart in this state; the archive
+# consumer independently treats a fabricated passing step carrying the same
+# evidence as a refutation.
+D="${WORK}/accept-restart-incomplete-output"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  const stage = record.stages.find(
+    ({ name }) =>
+      name ===
+      "restart across C derives mode from the chain, not from process state"
+  );
+  stage.gauges[
+    "r1-node-2.pre_restart.participation_tbtc_quarantine_preservation_failures_total"
+  ] = 1;
+  stage.gauges[
+    "r1-node-2.pre_restart.participation_tbtc_quarantine_incomplete_outputs"
+  ] = 1;
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "a live incomplete output immediately before restart refutes acceptance" \
+  1 "single_release restart node.*reported live incomplete tBTC quarantine output immediately before.*incomplete_outputs.*is 1"
+
+# Historical exhaustion is still evidence even though the replacement process
+# starts its counters from zero. Paired with a zero live gauge it is retained
+# as a non-fatal recovery finding, just like the final fleet account.
+D="${WORK}/accept-restart-recovered-preservation-episode"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  const stage = record.stages.find(
+    ({ name }) =>
+      name ===
+      "restart across C derives mode from the chain, not from process state"
+  );
+  stage.gauges[
+    "r1-node-2.pre_restart.participation_tbtc_quarantine_preservation_failures_total"
+  ] = 1;
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "a recovered pre-restart episode remains visible after counters reset" 0 \
+  "non-fatal recovered quarantine evidence.*single_release restart node.*tBTC.*before restart reset its process-local counters"
+
 # The single-release gate is itself where the clock-failure and quiescence
 # controls can strand generated output. Its preservation stage therefore
 # carries the same four node-authored signals as rollback, before the final
@@ -1389,12 +1478,125 @@ run_validator "${D}"
 check "a live incomplete quarantine output refutes rollback" 1 \
   "still holding tBTC output whose protected quarantine is incomplete.*tbtc_quarantine_incomplete_outputs.*is 1"
 
+# Drive the producer-side accumulator directly with a stubbed metric reader.
+# This is the property the downstream verdict cannot localize: unreadable is
+# retained as unreadable until a node authors a number, later probe failure
+# keeps the last number rather than inventing zero, a later number overwrites,
+# and replacing one service leaves exactly one intact line for every other
+# service.
+set +e
+CASE_OUT="$(
+  (
+    set -e
+    # This accumulator is deliberately isolated from the later live-verdict
+    # fixtures.
+    # shellcheck disable=SC2030
+    QUARANTINE_PRESERVATION_READINGS=""
+    SAMPLER_ROUND="unread"
+
+    # Invoked indirectly by sample_quarantine_preservation_signals.
+    # shellcheck disable=SC2329
+    metric_value() {
+      local service="$1" metric="$2" base offset
+      if [[ "${SAMPLER_ROUND}:${service}" == "first:r1-node-1" ]]; then
+        base=0
+      elif [[ "${SAMPLER_ROUND}:${service}" == "second:r1-node-1" ]]; then
+        base=4
+      elif [[ "${SAMPLER_ROUND}:${service}" == "other:r1-node-2" ]]; then
+        base=8
+      elif [[ "${SAMPLER_ROUND}:${service}" == "third:r1-node-1" ]]; then
+        base=12
+      elif [[ "${SAMPLER_ROUND}:${service}" == "initialize:r1-node-1" ]]; then
+        base=20
+      elif [[ "${SAMPLER_ROUND}:${service}" == "initialize:r1-node-2" ]]; then
+        base=30
+      else
+        return 1
+      fi
+
+      if [[ "${metric}" == \
+        "participation_tbtc_quarantine_preservation_failures_total" ]]; then
+        offset=1
+      elif [[ "${metric}" == \
+        "participation_beacon_quarantine_preservation_failures_total" ]]; then
+        offset=2
+      elif [[ "${metric}" == \
+        "participation_tbtc_quarantine_incomplete_outputs" ]]; then
+        offset=3
+      elif [[ "${metric}" == \
+        "participation_beacon_quarantine_incomplete_outputs" ]]; then
+        offset=4
+      else
+        return 1
+      fi
+      printf '%d' "$((base + offset))"
+    }
+
+    expect_sampler_readings() {
+      local label="$1" expected="$2"
+      if [[ "${QUARANTINE_PRESERVATION_READINGS}" != "${expected}" ]]; then
+        printf 'sampler mismatch at %s\nexpected [%s]\nactual   [%s]\n' \
+          "${label}" "${expected}" "${QUARANTINE_PRESERVATION_READINGS}"
+        return 1
+      fi
+      printf '%s\n' "${label}"
+    }
+
+    sample_quarantine_preservation_signals r1-node-1
+    expect_sampler_readings "first unreadable sample is explicit" \
+      "r1-node-1 unreadable unreadable unreadable unreadable"
+
+    SAMPLER_ROUND="first"
+    sample_quarantine_preservation_signals r1-node-1
+    expect_sampler_readings "numeric sample replaces unreadable fields" \
+      "r1-node-1 1 2 3 4"
+
+    SAMPLER_ROUND="unread"
+    sample_quarantine_preservation_signals r1-node-1
+    expect_sampler_readings "later unreadable sample retains numeric fields" \
+      "r1-node-1 1 2 3 4"
+
+    SAMPLER_ROUND="second"
+    sample_quarantine_preservation_signals r1-node-1
+    expect_sampler_readings "later numeric sample overwrites numeric fields" \
+      "r1-node-1 5 6 7 8"
+
+    SAMPLER_ROUND="other"
+    sample_quarantine_preservation_signals r1-node-2
+    expect_sampler_readings "sampling a second service keeps one line each" \
+      $'r1-node-1 5 6 7 8\nr1-node-2 9 10 11 12'
+
+    SAMPLER_ROUND="third"
+    sample_quarantine_preservation_signals r1-node-1
+    expect_sampler_readings "resampling one service replaces rather than appends" \
+      $'r1-node-2 9 10 11 12\nr1-node-1 13 14 15 16'
+
+    QUARANTINE_PRESERVATION_READINGS="stale 1 1 1 1"
+    SAMPLER_ROUND="initialize"
+    initialize_quarantine_preservation_readings r1-node-1 r1-node-2
+    expect_sampler_readings "initializer resets stale state in roster order" \
+      $'r1-node-1 21 22 23 24\nr1-node-2 31 32 33 34'
+  ) 2>&1
+)"
+CASE_RC=$?
+set -e
+check "the preservation sampler retains only node-authored last readings" 0 \
+  "first unreadable sample is explicit" \
+  "numeric sample replaces unreadable fields" \
+  "later unreadable sample retains numeric fields" \
+  "later numeric sample overwrites numeric fields" \
+  "sampling a second service keeps one line each" \
+  "resampling one service replaces rather than appends" \
+  "initializer resets stale state in roster order"
+
 # Drive the shell-side verdict as well as the archive reader. These are the two
 # states the metrics can distinguish: historical grace exhaustion whose output
 # later became fully durable, and an output the running node is still holding
 # while its protected namespace remains incomplete.
 quarantine_preservation_verdict_case() {
   local readings="$1"
+  # The sampler fixture above ran in a subshell and cannot change this value.
+  # shellcheck disable=SC2031
   local saved_readings="${QUARANTINE_PRESERVATION_READINGS}"
   local saved_step_gauges="${STEP_GAUGES}"
 
@@ -1424,14 +1626,21 @@ quarantine namespace"
   REHEARSAL_REFUTED_ASSERTIONS=()
 }
 
-quarantine_preservation_verdict_case "r1-node-1 1 0 0 0"
+quarantine_preservation_verdict_case \
+  $'r1-node-1 1 0 0 0\nr1-node-2 0 0 0 0'
 check "the live verdict records a recovered episode as non-fatal" 0 \
   '"outcome":"pass".*write-grace rounds and later completed' \
   '"holds":true'
 
-quarantine_preservation_verdict_case "r1-node-1 1 0 1 0"
+quarantine_preservation_verdict_case \
+  $'r1-node-1 1 0 1 0\nr1-node-2 0 0 0 0'
 check "the live verdict refuses an output that remains incomplete" 0 \
   '"outcome":"fail".*still holding generated signer output' \
+  '"holds":false'
+
+quarantine_preservation_verdict_case "r1-node-1 0 0 0 0"
+check "the live verdict refuses an incomplete R1 service roster" 0 \
+  '"outcome":"blocked".*do not cover.*missing \[r1-node-2\]' \
   '"holds":false'
 
 # Repetition and invention cannot manufacture a complete gate. These records
@@ -1981,6 +2190,12 @@ complete_run() {
       STEP_PERMIT_MODES='"security_v2"'
       # shellcheck disable=SC2034
       STEP_GAUGES='"r1-node-1.participation_gate_state":2'
+    elif [[ "${stage}" == \
+      "restart across C derives mode from the chain, not from process state" ]]; then
+      # The process about to disappear is the only author of these readings.
+      # Keep them distinct from the replacement process's same metric names.
+      # shellcheck disable=SC2034
+      STEP_GAUGES='"r1-node-2.pre_restart.participation_tbtc_quarantine_preservation_failures_total":0,"r1-node-2.pre_restart.participation_beacon_quarantine_preservation_failures_total":0,"r1-node-2.pre_restart.participation_tbtc_quarantine_incomplete_outputs":0,"r1-node-2.pre_restart.participation_beacon_quarantine_incomplete_outputs":0'
     elif [[ "${stage}" == \
       "quarantine preservation is complete through quiescence" ]]; then
       # shellcheck disable=SC2034
@@ -7798,6 +8013,32 @@ else
   FAILED=$((FAILED + 1))
 fi
 
+# The shell producer now has one preservation-metric list consumed by both
+# gates. The archive reader necessarily mirrors it in JavaScript, so bind those
+# two exact sets here: a renamed signal must fail this scaffold test instead of
+# leaving one side to accept evidence the other side never sampled.
+SHELL_QUARANTINE_PRESERVATION_METRICS="$(
+  printf '%s\n' "${QUARANTINE_PRESERVATION_METRICS[@]}" | sort
+)"
+READER_QUARANTINE_PRESERVATION_METRICS="$(sed -n \
+  '/const quarantineSignals = \[/,/^ *\];/p' "${TEST_DIR}/rehearse.sh" |
+  grep -oE \
+    '"participation_(tbtc|beacon)_quarantine_(preservation_failures_total|incomplete_outputs)"' |
+  tr -d '"' | sort -u || true)"
+if [[ -n "${SHELL_QUARANTINE_PRESERVATION_METRICS}" ]] &&
+  [[ "${SHELL_QUARANTINE_PRESERVATION_METRICS}" == \
+  "${READER_QUARANTINE_PRESERVATION_METRICS}" ]]; then
+  printf 'ok   the preservation producer and archive reader use the same signals\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL the preservation signal list drifted from the archive reader: %s\n' \
+    "$(diff \
+      <(printf '%s\n' "${SHELL_QUARANTINE_PRESERVATION_METRICS}") \
+      <(printf '%s\n' "${READER_QUARANTINE_PRESERVATION_METRICS}") |
+      tr '\n' ' ')"
+  FAILED=$((FAILED + 1))
+fi
+
 # The per-ceremony refusal counters are what turn "the node refused something"
 # into "the node refused this", and a ceremony the shell list omits is a
 # refusal the rehearsal reads as unattributed — a quiescence that really did
@@ -8110,6 +8351,23 @@ REHEARSAL_R1_SERVICES=("${SAVED_R1_SERVICES[@]}")
 assign_single_release_nodes
 
 CONTROL_ORDER="$(single_release_control_order)"
+
+# A restart with no explicit timeout inherits the service's full rollback
+# grace, currently measured in hours, and the reachability deadline does not
+# begin until that wait returns. Hold the destructive control to its named,
+# positive bound so an unwritable quarantine namespace cannot stall the
+# rehearsal invisibly.
+# The literal function source is the subject of the single-quoted grep.
+# shellcheck disable=SC2016
+if [[ "${SINGLE_RELEASE_RESTART_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ ]] &&
+  declare -f stage_single_release |
+  grep -Fq \
+    'compose restart --timeout "${SINGLE_RELEASE_RESTART_TIMEOUT_SECONDS}"'; then
+  pass_case "the cross-C restart has an explicit positive shutdown timeout"
+else
+  fail_case "the cross-C restart has an explicit positive shutdown timeout" \
+    "timeout [${SINGLE_RELEASE_RESTART_TIMEOUT_SECONDS:-unset}]"
+fi
 
 # Every control the sequence turns on has to be present and resolved. A site
 # that went back to naming a service directly drops out of the extraction
