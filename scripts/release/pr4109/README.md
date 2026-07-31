@@ -1975,12 +1975,14 @@ exhausted, and clear only when the full output becomes durable. Both
 exact-image gates sample all four signals while their candidates still answer.
 All four are process-local and reset when a node restarts. The
 `single_release` gate therefore opens its account before the cross-C restart,
-takes and archives an actual refusal reading under
-`<service>.pre_stop.*`, and decides it before sending any stop signal. An
-unreadable pre-stop account blocks the control; a nonzero live
-incomplete-output gauge fails it. In either case the stop is not issued and the
-old process remains live to finish preservation and to serve the later,
-independent controls.
+takes and archives the retained numeric account under
+`<service>.pre_stop.*` together with
+`<service>.pre_stop.sample_readable`, and decides it before sending any stop
+signal. A zero freshness bit states that the numeric fields are retained
+history rather than a successful current scrape and blocks the control; a
+fresh account with a nonzero live incomplete-output gauge fails it. In either
+case the stop is not issued and the old process remains live to finish
+preservation and to serve the later, independent controls.
 
 Only a readable pre-stop account whose two live incomplete-output gauges are
 zero authorizes the split, watched stop. The stop derives its timeout from the
@@ -2007,11 +2009,14 @@ interpretable; the restart step remains refused and its old-process evidence
 remains in the record. If that recovery cannot restore the client-info
 endpoint, the rehearsal emits the partial record immediately and states that
 the later controls were not evaluated instead of manufacturing failures
-against a dead node. Once any new process answers, the gate re-seeds that
-node's live account, refreshes it through the chain-clock cancellation and both
-quiescence controls, and records the fleet verdict before its final fleet-stop
-stage. The rollback gate uses the same accumulator and refreshes it while every
-candidate drains.
+against a dead node. That early partial-record exit occurs before the final
+fleet-stop stage; it leaves any still-running rehearsal containers in place,
+and the operator must tear down the `pr4109-single_release` Compose project
+manually after preserving the record and any needed container evidence. Once
+any new process answers, the gate re-seeds that node's live account, refreshes
+it through the chain-clock cancellation and both quiescence controls, and
+records the fleet verdict before its final fleet-stop stage. The rollback gate
+uses the same accumulator and refreshes it while every candidate drains.
 
 An unreadable signal, an account that does not cover every configured R1
 service exactly once, or a nonzero live gauge refuses either gate because the

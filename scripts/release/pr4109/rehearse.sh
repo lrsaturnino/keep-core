@@ -3894,9 +3894,11 @@ QUARANTINE_PRESERVATION_METRICS=(
   participation_beacon_quarantine_incomplete_outputs
 )
 
-# The stopped process's own exit status is evidence, not a Compose command
-# result. Keep its archive suffix named once on the producer side; the scaffold
-# self-test binds it to the JavaScript acceptance reader below.
+# The pre-stop sampler's freshness and the stopped process's own exit status
+# are evidence, not Prometheus metrics or Compose command results. Keep their
+# archive suffixes named once on the producer side; the scaffold self-test
+# binds them to the JavaScript acceptance reader below.
+RESTART_PRE_STOP_SAMPLE_READABLE_SUFFIX="sample_readable"
 RESTART_CONTAINER_EXIT_CODE_SUFFIX="container_exit_code"
 
 # The participation metrics an evidence step snapshots, by their internal names.
@@ -9871,11 +9873,14 @@ quarantine_preservation_reading_for() {
 
 # Attach one retained account to the current evidence step. A namespace keeps
 # a reading from a process that is about to disappear distinct from the same
-# metric name published by the replacement process. Only numeric fields are
-# emitted; the archive reader treats an absent key as an unread instrument and
-# therefore cannot mistake `unreadable` for a node-authored zero.
+# metric name published by the replacement process. Only numeric signal fields
+# are emitted; the archive reader treats an absent key as an unread instrument
+# and therefore cannot mistake `unreadable` for a node-authored zero. When the
+# caller supplies sample_readable, archive that bit beside the retained values
+# so a failed current scrape cannot pass off older numeric history as a fresh
+# pre-stop reading.
 append_quarantine_preservation_gauges() {
-  local service="$1" namespace="${2:-}" account
+  local service="$1" namespace="${2:-}" sample_readable="${3:-}" account
   local listed_service tbtc_failures beacon_failures
   local tbtc_incomplete beacon_incomplete metric value index=0
   local key_prefix="${service}."
@@ -9902,6 +9907,15 @@ append_quarantine_preservation_gauges() {
     fi
     index=$((index + 1))
   done
+
+  if [[ -n "${sample_readable}" ]]; then
+    if [[ "${sample_readable}" =~ ^[01]$ ]]; then
+      STEP_GAUGES="${STEP_GAUGES}${STEP_GAUGES:+,}\
+\"${key_prefix}${RESTART_PRE_STOP_SAMPLE_READABLE_SUFFIX}\":${sample_readable}"
+    else
+      complete=0
+    fi
+  fi
 
   ((complete == 1))
 }
@@ -9952,7 +9966,11 @@ controls were not evaluated against an unavailable node."
   fi
 
   # This is a new process-local account. The old account already lives under
-  # the restart step's pre_restart namespace and must not stand in for it.
+  # the restart step's pre_restart namespace and must not stand in for it. This
+  # reset is safe only because every caller is already on an irrevocable
+  # fail/blocked restart path; a future caller MUST establish that refusal
+  # before invoking this helper, so replacement-process zeros can never turn
+  # the restart step into a pass.
   sample_quarantine_preservation_signals "${service}" 1
   RESTART_RECOVERY_SAFE=1
   RESTART_RECOVERY_NOTE=" The same container was recovery-started only so the \
@@ -11675,7 +11693,10 @@ open_security_v2 within an hour of it"
   local restart_grace=""
   local restarted_container=""
   local restart_followups_safe=1
+  local restart_step_outcome=""
+  local restart_stop_authorized=0
   if ! restart_grace="$(manifest_termination_grace)"; then
+    restart_step_outcome="blocked"
     block_step "${restart_step}" "the reviewed release manifest did not provide \
 a positive termination grace, so ${restarted} was not stopped under an \
 auditable bound; the node remains running and the later independent controls \
@@ -11684,6 +11705,7 @@ may still be evaluated"
   elif ! restarted_container="$(
     compose ps --all --quiet "${restarted}" 2>/dev/null
   )" || [[ -z "${restarted_container}" ]]; then
+    restart_step_outcome="blocked"
     block_step "${restart_step}" "${restarted} has no inspectable container; \
 the control cannot prove which old process it stopped or how that process \
 exited, so it issued no stop and left the node available to the later \
@@ -11699,27 +11721,24 @@ independent controls"
     local pre_stop_beacon_failures="unreadable"
     local pre_stop_tbtc_incomplete="unreadable"
     local pre_stop_beacon_incomplete="unreadable"
-    local pre_stop_readable="${QUARANTINE_PRESERVATION_SAMPLE_READABLE}"
-    local restart_stop_authorized=0
-    if ((pre_stop_readable == 1)); then
-      if pre_stop_account="$(
-        quarantine_preservation_reading_for "${restarted}"
-      )"; then
-        read -r _ pre_stop_tbtc_failures pre_stop_beacon_failures \
-          pre_stop_tbtc_incomplete pre_stop_beacon_incomplete \
-          <<<"${pre_stop_account}"
-      else
-        pre_stop_readable=0
-      fi
+    local pre_stop_sample_readable="${QUARANTINE_PRESERVATION_SAMPLE_READABLE}"
+    local pre_stop_readable="${pre_stop_sample_readable}"
+    if pre_stop_account="$(
+      quarantine_preservation_reading_for "${restarted}"
+    )"; then
+      read -r _ pre_stop_tbtc_failures pre_stop_beacon_failures \
+        pre_stop_tbtc_incomplete pre_stop_beacon_incomplete \
+        <<<"${pre_stop_account}"
+    else
+      pre_stop_readable=0
     fi
-    if ((pre_stop_readable == 1)); then
-      if ! append_quarantine_preservation_gauges \
-        "${restarted}" "pre_stop"; then
-        pre_stop_readable=0
-      fi
+    if ! append_quarantine_preservation_gauges \
+      "${restarted}" "pre_stop" "${pre_stop_sample_readable}"; then
+      pre_stop_readable=0
     fi
 
     if ((pre_stop_readable == 0)); then
+      restart_step_outcome="blocked"
       block_step "${restart_step}" "${restarted} did not publish all four \
 numeric quarantine-preservation signals at the pre-stop guard (tBTC failures \
 ${pre_stop_tbtc_failures}, beacon failures ${pre_stop_beacon_failures}, tBTC \
@@ -11730,6 +11749,7 @@ against it"
       record_assertion "${restart_assertion}" false "${restart_step}"
     elif ((pre_stop_tbtc_incomplete > 0 || \
       pre_stop_beacon_incomplete > 0)); then
+      restart_step_outcome="fail"
       record_step "${restart_step}" fail "${restarted} reported live incomplete \
 quarantine output at the pre-stop guard (tBTC \
 ${pre_stop_tbtc_incomplete}, beacon ${pre_stop_beacon_incomplete}; \
@@ -11742,209 +11762,240 @@ complete preservation remains live for the later independent controls"
     fi
 
     if ((restart_stop_authorized == 1)); then
-    # `compose restart` blocks across the entire stop and erases the only
-    # process that can report a preservation failure during its drain. Split
-    # the operation: watch the old process while Compose stops it under the
-    # manifest's reviewed service-manager grace, inspect that exact stopped
-    # container, and only then allow the replacement process to start.
-    compose stop --timeout "${restart_grace}" "${restarted}" &
-    local restart_stop_pid=$!
-    local restart_watched_sample_readable=0
-    while kill -0 "${restart_stop_pid}" 2>/dev/null; do
+      # `compose restart` blocks across the entire stop and erases the only
+      # process that can report a preservation failure during its drain. Split
+      # the operation: watch the old process while Compose stops it under the
+      # manifest's reviewed service-manager grace, inspect that exact stopped
+      # container, and only then allow the replacement process to start.
+      compose stop --timeout "${restart_grace}" "${restarted}" &
+      local restart_stop_pid=$!
+      local restart_watched_sample_readable=0
+      while kill -0 "${restart_stop_pid}" 2>/dev/null; do
+        sample_quarantine_preservation_signals "${restarted}"
+        if ((QUARANTINE_PRESERVATION_SAMPLE_READABLE == 1)); then
+          restart_watched_sample_readable=1
+        fi
+        node_reachable "${restarted}" || break
+        sleep 2
+      done
+
+      local restart_stop_rc=0
+      if wait "${restart_stop_pid}"; then
+        restart_stop_rc=0
+      else
+        restart_stop_rc=$?
+      fi
+      # End the watched window at the stop itself. If the endpoint has already
+      # disappeared the sampler retains its last numeric, node-authored values;
+      # it never substitutes replacement-process zeros.
       sample_quarantine_preservation_signals "${restarted}"
       if ((QUARANTINE_PRESERVATION_SAMPLE_READABLE == 1)); then
         restart_watched_sample_readable=1
       fi
-      node_reachable "${restarted}" || break
-      sleep 2
-    done
 
-    local restart_stop_rc=0
-    if wait "${restart_stop_pid}"; then
-      restart_stop_rc=0
-    else
-      restart_stop_rc=$?
-    fi
-    # End the watched window at the stop itself. If the endpoint has already
-    # disappeared the sampler retains its last numeric, node-authored values;
-    # it never substitutes replacement-process zeros.
-    sample_quarantine_preservation_signals "${restarted}"
-    if ((QUARANTINE_PRESERVATION_SAMPLE_READABLE == 1)); then
-      restart_watched_sample_readable=1
-    fi
-
-    local pre_restart_account=""
-    local pre_restart_tbtc_failures="unreadable"
-    local pre_restart_beacon_failures="unreadable"
-    local pre_restart_tbtc_incomplete="unreadable"
-    local pre_restart_beacon_incomplete="unreadable"
-    local pre_restart_readable="${restart_watched_sample_readable}"
-    if ((pre_restart_readable == 1)); then
-      if pre_restart_account="$(
-        quarantine_preservation_reading_for "${restarted}"
-      )"; then
-        read -r _ pre_restart_tbtc_failures \
-          pre_restart_beacon_failures pre_restart_tbtc_incomplete \
-          pre_restart_beacon_incomplete <<<"${pre_restart_account}"
-      else
-        pre_restart_readable=0
+      local pre_restart_account=""
+      local pre_restart_tbtc_failures="unreadable"
+      local pre_restart_beacon_failures="unreadable"
+      local pre_restart_tbtc_incomplete="unreadable"
+      local pre_restart_beacon_incomplete="unreadable"
+      local pre_restart_readable="${restart_watched_sample_readable}"
+      if ((pre_restart_readable == 1)); then
+        if pre_restart_account="$(
+          quarantine_preservation_reading_for "${restarted}"
+        )"; then
+          read -r _ pre_restart_tbtc_failures \
+            pre_restart_beacon_failures pre_restart_tbtc_incomplete \
+            pre_restart_beacon_incomplete <<<"${pre_restart_account}"
+        else
+          pre_restart_readable=0
+        fi
       fi
-    fi
-    if ((pre_restart_readable == 1)); then
-      if ! append_quarantine_preservation_gauges \
-        "${restarted}" "pre_restart"; then
-        pre_restart_readable=0
+      if ((pre_restart_readable == 1)); then
+        if ! append_quarantine_preservation_gauges \
+          "${restarted}" "pre_restart"; then
+          pre_restart_readable=0
+        fi
       fi
-    fi
 
-    # Compose can report a successful stop after Docker exhausted the timeout
-    # and killed the process. Read the old container itself before `start`
-    # resets its state, and archive the code beside that process's last
-    # preservation readings. Only exit zero is a natural, auditable stop.
-    local restart_container_exit_code=""
-    local restart_container_running=""
-    restart_container_exit_code="$(
-      docker inspect --format '{{.State.ExitCode}}' \
-        "${restarted_container}" 2>/dev/null || true
-    )"
-    restart_container_running="$(
-      docker inspect --format '{{.State.Running}}' \
-        "${restarted_container}" 2>/dev/null || true
-    )"
-    if [[ "${restart_container_exit_code}" =~ ^[0-9]+$ ]]; then
-      STEP_GAUGES="${STEP_GAUGES}${STEP_GAUGES:+,}\
+      # Compose can report a successful stop after Docker exhausted the timeout
+      # and killed the process. Read the old container itself before `start`
+      # resets its state, and archive the code beside that process's last
+      # preservation readings. Only exit zero is a natural, auditable stop.
+      local restart_container_exit_code=""
+      local restart_container_running=""
+      restart_container_exit_code="$(
+        docker inspect --format '{{.State.ExitCode}}' \
+          "${restarted_container}" 2>/dev/null || true
+      )"
+      restart_container_running="$(
+        docker inspect --format '{{.State.Running}}' \
+          "${restarted_container}" 2>/dev/null || true
+      )"
+      if [[ "${restart_container_exit_code}" =~ ^[0-9]+$ ]]; then
+        STEP_GAUGES="${STEP_GAUGES}${STEP_GAUGES:+,}\
 \"${restarted}.pre_restart.${RESTART_CONTAINER_EXIT_CODE_SUFFIX}\":\
 ${restart_container_exit_code}"
-    fi
+      fi
 
-    local restart_start_rc=0
-    local restarted_state="" restarted_reachable=0
-    if ((restart_stop_rc != 0)); then
-      if [[ "${restart_container_running}" == "false" ]]; then
-        recover_stopped_restart_subject "${restarted}" || true
-        restart_followups_safe="${RESTART_RECOVERY_SAFE}"
-      else
-        RESTART_RECOVERY_NOTE=" The container was not confirmed stopped \
+      local restart_start_rc=0
+      local restarted_state="" restarted_reachable=0
+      if ((restart_stop_rc != 0)); then
+        if [[ "${restart_container_running}" == "false" ]]; then
+          recover_stopped_restart_subject "${restarted}" || true
+          restart_followups_safe="${RESTART_RECOVERY_SAFE}"
+        else
+          RESTART_RECOVERY_NOTE=" The container was not confirmed stopped \
 (running [${restart_container_running:-unreadable}]); no recovery start was \
 attempted."
-      fi
-      record_step "${restart_step}" fail "the watched stop of ${restarted} \
+        fi
+        restart_step_outcome="fail"
+        record_step "${restart_step}" fail "the watched stop of ${restarted} \
 exited [${restart_stop_rc}] under the reviewed ${restart_grace}-second \
 termination grace.${RESTART_RECOVERY_NOTE}"
-      record_assertion "${restart_assertion}" false "${restart_step}"
-    elif [[ "${restart_container_running}" != "false" ]]; then
-      block_step "${restart_step}" "the old ${restarted} container did not \
+        record_assertion "${restart_assertion}" false "${restart_step}"
+      elif [[ "${restart_container_running}" != "false" ]]; then
+        restart_step_outcome="blocked"
+        block_step "${restart_step}" "the old ${restarted} container did not \
 report a stopped state after Compose returned (running \
 [${restart_container_running:-unreadable}]); starting a replacement would \
 overlap an unaccounted-for candidate process, so no recovery start was \
 attempted"
-      record_assertion "${restart_assertion}" false "${restart_step}"
-    elif [[ ! "${restart_container_exit_code}" =~ ^[0-9]+$ ]]; then
-      recover_stopped_restart_subject "${restarted}" || true
-      restart_followups_safe="${RESTART_RECOVERY_SAFE}"
-      block_step "${restart_step}" "the old ${restarted} container published \
+        record_assertion "${restart_assertion}" false "${restart_step}"
+      elif [[ ! "${restart_container_exit_code}" =~ ^[0-9]+$ ]]; then
+        recover_stopped_restart_subject "${restarted}" || true
+        restart_followups_safe="${RESTART_RECOVERY_SAFE}"
+        restart_step_outcome="blocked"
+        block_step "${restart_step}" "the old ${restarted} container published \
 no numeric exit status after its watched stop; a truncated stop is a refusal, \
 not evidence of a clean process restart.${RESTART_RECOVERY_NOTE}"
-      record_assertion "${restart_assertion}" false "${restart_step}"
-    elif ((restart_container_exit_code != 0)); then
-      recover_stopped_restart_subject "${restarted}" || true
-      restart_followups_safe="${RESTART_RECOVERY_SAFE}"
-      record_step "${restart_step}" fail "the old ${restarted} process exited \
+        record_assertion "${restart_assertion}" false "${restart_step}"
+      elif ((restart_container_exit_code != 0)); then
+        recover_stopped_restart_subject "${restarted}" || true
+        restart_followups_safe="${RESTART_RECOVERY_SAFE}"
+        restart_step_outcome="fail"
+        record_step "${restart_step}" fail "the old ${restarted} process exited \
 [${restart_container_exit_code}] under the reviewed ${restart_grace}-second \
 termination grace; the replacement was refused because a killed or otherwise \
 unclean stop cannot prove preservation completed naturally (last watched tBTC \
 and beacon incomplete-output readings ${pre_restart_tbtc_incomplete}/\
 ${pre_restart_beacon_incomplete}).\
 ${RESTART_RECOVERY_NOTE}"
-      record_assertion "${restart_assertion}" false "${restart_step}"
-    elif ((pre_restart_readable == 0)); then
-      recover_stopped_restart_subject "${restarted}" || true
-      restart_followups_safe="${RESTART_RECOVERY_SAFE}"
-      block_step "${restart_step}" "${restarted} did not publish all four \
+        record_assertion "${restart_assertion}" false "${restart_step}"
+      elif ((pre_restart_readable == 0)); then
+        recover_stopped_restart_subject "${restarted}" || true
+        restart_followups_safe="${RESTART_RECOVERY_SAFE}"
+        restart_step_outcome="blocked"
+        block_step "${restart_step}" "${restarted} did not publish all four \
 numeric quarantine-preservation signals during its watched stop; the old \
 process was the last source that could say whether it was holding generated \
 output, so the restart control was refused rather than substituting zeros.\
 ${RESTART_RECOVERY_NOTE}"
-      record_assertion "${restart_assertion}" false "${restart_step}"
-    elif ((pre_restart_tbtc_incomplete > 0 || pre_restart_beacon_incomplete > 0)); then
-      recover_stopped_restart_subject "${restarted}" || true
-      restart_followups_safe="${RESTART_RECOVERY_SAFE}"
-      record_step "${restart_step}" fail "${restarted} reported live \
+        record_assertion "${restart_assertion}" false "${restart_step}"
+      elif ((pre_restart_tbtc_incomplete > 0 || pre_restart_beacon_incomplete > 0)); then
+        recover_stopped_restart_subject "${restarted}" || true
+        restart_followups_safe="${RESTART_RECOVERY_SAFE}"
+        restart_step_outcome="fail"
+        record_step "${restart_step}" fail "${restarted} reported live \
 incomplete quarantine output during its watched stop (tBTC \
 ${pre_restart_tbtc_incomplete}, beacon ${pre_restart_beacon_incomplete}); the \
 restart control was refused because the generated output was not yet fully \
 durable when the old process disappeared.${RESTART_RECOVERY_NOTE}"
-      record_assertion "${restart_assertion}" false "${restart_step}"
-    else
-      compose start "${restarted}" || restart_start_rc=$?
+        record_assertion "${restart_assertion}" false "${restart_step}"
+      else
+        compose start "${restarted}" || restart_start_rc=$?
 
-      local deadline
-      deadline=$((SECONDS + NODE_REACHABILITY_TIMEOUT_SECONDS))
-      if ((restart_start_rc == 0)); then
-        until node_reachable "${restarted}"; do
-          if ((SECONDS >= deadline)); then
-            break
-          fi
-          sleep 5
-        done
-      fi
+        local deadline
+        deadline=$((SECONDS + NODE_REACHABILITY_TIMEOUT_SECONDS))
+        if ((restart_start_rc == 0)); then
+          until node_reachable "${restarted}"; do
+            if ((SECONDS >= deadline)); then
+              break
+            fi
+            sleep 5
+          done
+        fi
 
-      if ((restart_start_rc == 0)) && node_reachable "${restarted}"; then
-        restarted_reachable=1
-        # This is a new process-local account. Re-seed it rather than letting
-        # the old process's retained values stand for a process that did not
-        # publish them; the separately namespaced pre-restart gauges preserve
-        # the old process's watched drain account.
-        sample_quarantine_preservation_signals "${restarted}" 1
-        restarted_state="$(
-          participation_field "${restarted}" gate_state 2>/dev/null || true
-        )"
-        observe_canonical_block "${restarted}"
-        observe_gate_gauges "${restarted}"
-      fi
+        if ((restart_start_rc == 0)) && node_reachable "${restarted}"; then
+          restarted_reachable=1
+          # This is a new process-local account. Re-seed it rather than letting
+          # the old process's retained values stand for a process that did not
+          # publish them; the separately namespaced pre-restart gauges preserve
+          # the old process's watched drain account.
+          sample_quarantine_preservation_signals "${restarted}" 1
+          restarted_state="$(
+            participation_field "${restarted}" gate_state 2>/dev/null || true
+          )"
+          observe_canonical_block "${restarted}"
+          observe_gate_gauges "${restarted}"
+        fi
 
-      if ((restart_start_rc != 0)); then
-        restart_followups_safe=0
-        record_step "${restart_step}" fail "the cleanly stopped ${restarted} \
+        if ((restart_start_rc != 0)); then
+          restart_followups_safe=0
+          restart_step_outcome="fail"
+          record_step "${restart_step}" fail "the cleanly stopped ${restarted} \
 container could not be started again (Compose exited \
 [${restart_start_rc}]); the remaining single-release controls were not \
 evaluated against an unavailable node"
-        record_assertion "${restart_assertion}" false "${restart_step}"
-      elif ((restarted_reachable == 0)); then
-        restart_followups_safe=0
-        record_step "${restart_step}" fail "${restarted} did not become \
+          record_assertion "${restart_assertion}" false "${restart_step}"
+        elif ((restarted_reachable == 0)); then
+          restart_followups_safe=0
+          restart_step_outcome="fail"
+          record_step "${restart_step}" fail "${restarted} did not become \
 reachable within ${NODE_REACHABILITY_TIMEOUT_SECONDS} seconds after its clean \
 watched stop and start; the remaining single-release controls were not \
 evaluated against an unavailable node"
-        record_assertion "${restart_assertion}" false "${restart_step}"
-      elif [[ "${restarted_state}" == "open_security_v2" ]]; then
-        record_step "${restart_step}" pass "${restarted} returned to \
+          record_assertion "${restart_assertion}" false "${restart_step}"
+        elif [[ "${restarted_state}" == "open_security_v2" ]]; then
+          restart_step_outcome="pass"
+          record_step "${restart_step}" pass "${restarted} returned to \
 open_security_v2 after a full restart with no watcher history and no wall-clock \
 input; its old process exited zero under the reviewed ${restart_grace}-second \
 termination grace and reported zero live incomplete outputs throughout the \
 watched stop (prior tBTC/beacon write-grace exhaustion counters \
 ${pre_restart_tbtc_failures}/${pre_restart_beacon_failures})"
-        record_assertion "${restart_assertion}" true "${restart_step}"
-      else
-        record_step "${restart_step}" fail "${restarted} reported \
+          record_assertion "${restart_assertion}" true "${restart_step}"
+        else
+          restart_step_outcome="fail"
+          record_step "${restart_step}" fail "${restarted} reported \
 [${restarted_state:-unreadable}] after restart"
-        record_assertion "${restart_assertion}" false "${restart_step}"
+          record_assertion "${restart_assertion}" false "${restart_step}"
+        fi
       fi
-    fi
     fi
   fi
 
-  # A refusal is allowed to coexist with later independent evidence only while
-  # the node those controls target is actually available. If a confirmed stop
-  # could not be recovery-started, emit the honest partial record now instead
-  # of manufacturing clock/quiescence failures against a dead endpoint.
-  if ((restart_followups_safe == 1)) &&
-    ! node_reachable "${restarted}"; then
-    restart_followups_safe=0
+  # A stop-authorized non-passing path is allowed to coexist with later
+  # independent evidence only while the node those controls target is actually
+  # available. Give that post-step check the same bounded readiness window as a
+  # normal start. The passing path already proved bounded reachability, and the
+  # four pre-stop refusal paths issued no stop, so neither is probed here.
+  if ((restart_stop_authorized == 1)) &&
+    [[ "${restart_step_outcome}" != "pass" ]] &&
+    ((restart_followups_safe == 1)); then
+    local restart_followup_probe_deadline
+    restart_followup_probe_deadline=$((SECONDS +
+      NODE_REACHABILITY_TIMEOUT_SECONDS))
+    until node_reachable "${restarted}"; do
+      if ((SECONDS >= restart_followup_probe_deadline)); then
+        break
+      fi
+      sleep 5
+    done
+    if ! node_reachable "${restarted}"; then
+      restart_followups_safe=0
+    fi
   fi
   if ((restart_followups_safe == 0)); then
+    local restart_unavailable_context
+    if ((restart_stop_authorized == 1)); then
+      restart_unavailable_context="after the control issued its watched stop \
+and recorded outcome [${restart_step_outcome:-unrecorded}]"
+    else
+      restart_unavailable_context="while the control recorded outcome \
+[${restart_step_outcome:-unrecorded}] without authorizing a stop"
+    fi
     note "the remaining single-release controls were not evaluated because \
-${restarted} was unavailable after the refused restart control"
+${restarted} was unavailable ${restart_unavailable_context}"
     conclude_rehearsal
   fi
 
@@ -13546,7 +13597,8 @@ evidence_acceptance_findings() {
             namespace,
             readingKind,
             incompleteDescription,
-            recoveryDescription
+            recoveryDescription,
+            evaluateValues = true
           ) => {
             const prefix = restartService + "." + namespace + ".";
             let readable = true;
@@ -13571,15 +13623,18 @@ evidence_acceptance_findings() {
               }
               if (incomplete !== undefined && incomplete !== 0) {
                 incompleteOutput = true;
-                add(
-                  "refuted",
-                  "single_release restart node " +
-                    JSON.stringify(restartService) +
-                    " reported live incomplete " + signal.protocol +
-                    " quarantine output " + incompleteDescription + ": " +
-                    JSON.stringify(incompleteName) + " is " + incomplete
-                );
+                if (evaluateValues) {
+                  add(
+                    "refuted",
+                    "single_release restart node " +
+                      JSON.stringify(restartService) +
+                      " reported live incomplete " + signal.protocol +
+                      " quarantine output " + incompleteDescription + ": " +
+                      JSON.stringify(incompleteName) + " is " + incomplete
+                  );
+                }
               } else if (
+                evaluateValues &&
                 counter !== undefined &&
                 incomplete === 0 &&
                 counter !== 0
@@ -13601,11 +13656,46 @@ evidence_acceptance_findings() {
           // This account was read before any stop signal. An unreadable or
           // live-incomplete account does not authorize the watched stop, so in
           // that case post-stop readings are neither required nor expected.
+          const preStopSampleReadableSuffix = "sample_readable";
+          const preStopSampleReadableName =
+            restartService + ".pre_stop." + preStopSampleReadableSuffix;
+          const preStopSampleReadable = readGauge(
+            restartStageName,
+            restartGauges,
+            preStopSampleReadableName,
+            "pre-stop freshness"
+          );
+          let preStopFresh = preStopSampleReadable === 1;
+          if (
+            preStopSampleReadable !== undefined &&
+            (!Number.isInteger(preStopSampleReadable) ||
+              (preStopSampleReadable !== 0 && preStopSampleReadable !== 1))
+          ) {
+            add(
+              "unrehearsed",
+              "single_release restart node " +
+                JSON.stringify(restartService) +
+                " carries an invalid pre-stop sample freshness: " +
+                JSON.stringify(preStopSampleReadableName) + " is " +
+                preStopSampleReadable
+            );
+            preStopFresh = false;
+          } else if (preStopSampleReadable === 0) {
+            add(
+              "unrehearsed",
+              "single_release restart node " +
+                JSON.stringify(restartService) +
+                " did not provide a fresh pre-stop preservation sample: " +
+                JSON.stringify(preStopSampleReadableName) +
+                " is zero; the archived signal values are retained history"
+            );
+          }
           const preStop = readPreservationAccount(
             "pre_stop",
             "pre-stop",
             "at the pre-stop guard; the stop was not authorized",
-            "before the pre-stop guard"
+            "before the pre-stop guard",
+            preStopFresh
           );
           const exitCodeSuffix = "container_exit_code";
           const exitCodeName =
@@ -13621,7 +13711,11 @@ evidence_acceptance_findings() {
             Object.prototype.hasOwnProperty.call(restartGauges, name)
           );
 
-          if (!preStop.readable || preStop.incompleteOutput) {
+          if (
+            !preStopFresh ||
+            !preStop.readable ||
+            preStop.incompleteOutput
+          ) {
             if (carriesWatchedEvidence) {
               add(
                 "refuted",

@@ -183,6 +183,7 @@ SINGLE_RELEASE_STAGES='
       "r1-node-2.pre_stop.participation_beacon_quarantine_preservation_failures_total": 0,
       "r1-node-2.pre_stop.participation_tbtc_quarantine_incomplete_outputs": 0,
       "r1-node-2.pre_stop.participation_beacon_quarantine_incomplete_outputs": 0,
+      "r1-node-2.pre_stop.sample_readable": 1,
       "r1-node-2.pre_restart.participation_tbtc_quarantine_preservation_failures_total": 0,
       "r1-node-2.pre_restart.participation_beacon_quarantine_preservation_failures_total": 0,
       "r1-node-2.pre_restart.participation_tbtc_quarantine_incomplete_outputs": 0,
@@ -1166,10 +1167,13 @@ run_validator "${D}"
 check "a record naming a review the control does not pin is rejected" 3 \
   "review record hashing to \[c{64}\]"
 
-# The first account is a real pre-stop guard. If it reports a live incomplete
-# output, no watched-stop or exit-status evidence should exist: the producer
-# refused before signaling the process. A fabricated passing record with that
-# account is independently refuted by the archive reader.
+# The first account is a real pre-stop guard. A failed fresh scrape archives
+# the retained numeric values it actually saw plus an explicit freshness zero;
+# it must be refused as stale evidence, not rendered as a wholly absent
+# reading. If a fresh account reports a live incomplete output, no watched-stop
+# or exit-status evidence should exist: the producer refused before signaling
+# the process. A fabricated passing record with that account is independently
+# refuted by the archive reader.
 D="${WORK}/accept-restart-unreadable-pre-stop-guard"
 mkdir -p "${D}"
 write_attestation "${D}"
@@ -1184,9 +1188,16 @@ node -e '
       name ===
       "restart across C derives mode from the chain, not from process state"
   );
-  delete stage.gauges[
-    "r1-node-2.pre_stop.participation_beacon_quarantine_incomplete_outputs"
-  ];
+  stage.gauges[
+    "r1-node-2.pre_stop.participation_tbtc_quarantine_preservation_failures_total"
+  ] = 3;
+  stage.gauges[
+    "r1-node-2.pre_stop.participation_beacon_quarantine_preservation_failures_total"
+  ] = 4;
+  stage.gauges[
+    "r1-node-2.pre_stop.participation_tbtc_quarantine_incomplete_outputs"
+  ] = 5;
+  stage.gauges["r1-node-2.pre_stop.sample_readable"] = 0;
   for (const name of Object.keys(stage.gauges)) {
     if (name.startsWith("r1-node-2.pre_restart.")) {
       delete stage.gauges[name];
@@ -1196,7 +1207,63 @@ node -e '
 ' "${D}/record.json"
 run_validator "${D}"
 check "an unreadable pre-stop account refuses without requiring a watched stop" \
-  3 "single_release step.*restart across C.*carries no pre-stop reading of.*pre_stop.*beacon_quarantine_incomplete_outputs"
+  3 "single_release restart node.*did not provide a fresh pre-stop preservation sample.*pre_stop.sample_readable.*is zero.*retained history"
+
+# Only the two producer values are meaningful. A fabricated value must not
+# authorize the stop or degrade into a generic truthy freshness reading.
+D="${WORK}/accept-restart-invalid-pre-stop-freshness"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  const stage = record.stages.find(
+    ({ name }) =>
+      name ===
+      "restart across C derives mode from the chain, not from process state"
+  );
+  stage.gauges["r1-node-2.pre_stop.sample_readable"] = 2;
+  for (const name of Object.keys(stage.gauges)) {
+    if (name.startsWith("r1-node-2.pre_restart.")) {
+      delete stage.gauges[name];
+    }
+  }
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "an invalid pre-stop freshness value leaves the restart unrehearsed" \
+  3 "single_release restart node.*carries an invalid pre-stop sample freshness.*pre_stop.sample_readable.*is 2"
+
+# The inverse is an impossible producer account: watched-stop readings say the
+# old process was signaled, but no pre-stop guard says that signal was ever
+# authorized. Exercise the reader's independent consistency refusal directly.
+D="${WORK}/accept-restart-watched-without-pre-stop-guard"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  const stage = record.stages.find(
+    ({ name }) =>
+      name ===
+      "restart across C derives mode from the chain, not from process state"
+  );
+  for (const name of Object.keys(stage.gauges)) {
+    if (name.startsWith("r1-node-2.pre_stop.")) {
+      delete stage.gauges[name];
+    }
+  }
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "watched-stop evidence without an authorizing pre-stop guard is refuted" \
+  1 "single_release restart node.*carries watched-stop evidence even though its pre-stop preservation guard did not authorize issuing the stop"
 
 D="${WORK}/accept-restart-refused-at-pre-stop-guard"
 mkdir -p "${D}"
@@ -1631,6 +1698,7 @@ CASE_OUT="$(
     # fixtures.
     # shellcheck disable=SC2030
     QUARANTINE_PRESERVATION_READINGS=""
+    # shellcheck disable=SC2030
     QUARANTINE_PRESERVATION_SAMPLE_READABLE=0
     SAMPLER_ROUND="unread"
 
@@ -1710,6 +1778,28 @@ CASE_OUT="$(
       "r1-node-1 1 2 3 4"
     expect_sampler_freshness "retained numeric history is not a fresh sample" 0
 
+    # shellcheck disable=SC2030
+    STEP_GAUGES=""
+    append_quarantine_preservation_gauges r1-node-1 pre_stop 0
+    [[ "${STEP_GAUGES}" == \
+      *'"r1-node-1.pre_stop.participation_tbtc_quarantine_preservation_failures_total":1'* ]]
+    [[ "${STEP_GAUGES}" == \
+      *'"r1-node-1.pre_stop.participation_beacon_quarantine_preservation_failures_total":2'* ]]
+    [[ "${STEP_GAUGES}" == \
+      *'"r1-node-1.pre_stop.participation_tbtc_quarantine_incomplete_outputs":3'* ]]
+    [[ "${STEP_GAUGES}" == \
+      *'"r1-node-1.pre_stop.participation_beacon_quarantine_incomplete_outputs":4'* ]]
+    [[ "${STEP_GAUGES}" == *'"r1-node-1.pre_stop.sample_readable":0'* ]]
+    printf 'stale numeric history is archived with freshness zero\n'
+
+    STEP_GAUGES=""
+    if append_quarantine_preservation_gauges r1-node-1 pre_stop 2; then
+      printf 'invalid sampler freshness unexpectedly archived\n'
+      exit 1
+    fi
+    [[ "${STEP_GAUGES}" != *".sample_readable"* ]]
+    printf 'invalid sampler freshness is rejected by the producer\n'
+
     SAMPLER_ROUND="second"
     sample_quarantine_preservation_signals r1-node-1
     expect_sampler_readings "later numeric sample overwrites numeric fields" \
@@ -1748,12 +1838,96 @@ check "the preservation sampler retains only node-authored last readings" 0 \
   "numeric sample is fresh" \
   "later unreadable sample retains numeric fields" \
   "retained numeric history is not a fresh sample" \
+  "stale numeric history is archived with freshness zero" \
+  "invalid sampler freshness is rejected by the producer" \
   "later numeric sample overwrites numeric fields" \
   "sampling a second service keeps one line each" \
   "resampling one service replaces rather than appends" \
   "a replacement process inherits no old account" \
   "an unreadable replacement account is not fresh" \
   "initializer resets stale state in roster order"
+
+# Drive the stopped-subject recovery helper through all three outcomes. The
+# success case deliberately makes one replacement-process metric unreadable:
+# reset_existing=1 must discard that field from the old process instead of
+# retaining its numeric history, while the other service's line stays intact.
+restart_recovery_case() {
+  set -e
+  RECOVERY_CASE=""
+
+  # shellcheck disable=SC2329
+  compose() {
+    [[ "$1" == "start" && "$2" == "r1-node-1" ]] ||
+      return 99
+    [[ "${RECOVERY_CASE}" != "start_failure" ]] || return 17
+    return 0
+  }
+
+  # shellcheck disable=SC2329
+  node_reachable() {
+    [[ "$1" == "r1-node-1" ]] || return 1
+    [[ "${RECOVERY_CASE}" == "success" ]]
+  }
+
+  # shellcheck disable=SC2329
+  metric_value() {
+    [[ "$1" == "r1-node-1" && "${RECOVERY_CASE}" == "success" ]] ||
+      return 1
+    case "$2" in
+    participation_tbtc_quarantine_preservation_failures_total) printf '5' ;;
+    participation_beacon_quarantine_preservation_failures_total) printf '6' ;;
+    participation_tbtc_quarantine_incomplete_outputs) printf '7' ;;
+    participation_beacon_quarantine_incomplete_outputs) return 1 ;;
+    *) return 1 ;;
+    esac
+  }
+
+  QUARANTINE_PRESERVATION_READINGS=$'r1-node-1 90 91 92 93\nr1-node-2 1 2 3 4'
+  RECOVERY_CASE="start_failure"
+  if recover_stopped_restart_subject r1-node-1; then
+    printf 'start-failure recovery unexpectedly succeeded\n'
+    exit 1
+  fi
+  [[ "${RESTART_RECOVERY_SAFE}" == "0" ]]
+  [[ "${RESTART_RECOVERY_NOTE}" == *"could not be recovery-started"* ]]
+  [[ "${RESTART_RECOVERY_NOTE}" == *"Compose exited [17]"* ]]
+  printf 'recovery start failure is unsafe and explained\n'
+
+  RECOVERY_CASE="timeout"
+  NODE_REACHABILITY_TIMEOUT_SECONDS=0
+  if recover_stopped_restart_subject r1-node-1; then
+    printf 'unreachable recovery unexpectedly succeeded\n'
+    exit 1
+  fi
+  [[ "${RESTART_RECOVERY_SAFE}" == "0" ]]
+  [[ "${RESTART_RECOVERY_NOTE}" == *"did not become reachable within 0 seconds"* ]]
+  printf 'recovery reachability timeout is unsafe and explained\n'
+
+  QUARANTINE_PRESERVATION_READINGS=$'r1-node-1 90 91 92 93\nr1-node-2 1 2 3 4'
+  RECOVERY_CASE="success"
+  # Read by the sourced recovery helper.
+  # shellcheck disable=SC2034
+  NODE_REACHABILITY_TIMEOUT_SECONDS=600
+  recover_stopped_restart_subject r1-node-1
+  [[ "${RESTART_RECOVERY_SAFE}" == "1" ]]
+  [[ "${RESTART_RECOVERY_NOTE}" == *"recovery-started only so the remaining"* ]]
+  [[ "${QUARANTINE_PRESERVATION_READINGS}" == \
+    $'r1-node-2 1 2 3 4\nr1-node-1 5 6 7 unreadable' ]]
+  # The sampler fixture above changed this name in another subshell; this
+  # assertion reads the recovery helper's call in the current test process.
+  # shellcheck disable=SC2031
+  [[ "${QUARANTINE_PRESERVATION_SAMPLE_READABLE}" == "0" ]]
+  printf 'successful recovery resets only the replacement process account\n'
+}
+
+set +e
+CASE_OUT="$(restart_recovery_case 2>&1)"
+CASE_RC=$?
+set -e
+check "stopped restart-subject recovery is explicit and process-local" 0 \
+  "recovery start failure is unsafe and explained" \
+  "recovery reachability timeout is unsafe and explained" \
+  "successful recovery resets only the replacement process account"
 
 # Drive the shell-side verdict as well as the archive reader. These are the two
 # states the metrics can distinguish: historical grace exhaustion whose output
@@ -1764,6 +1938,7 @@ quarantine_preservation_verdict_case() {
   # The sampler fixture above ran in a subshell and cannot change this value.
   # shellcheck disable=SC2031
   local saved_readings="${QUARANTINE_PRESERVATION_READINGS}"
+  # shellcheck disable=SC2031
   local saved_step_gauges="${STEP_GAUGES}"
 
   REHEARSAL_STEPS=()
@@ -2362,7 +2537,7 @@ complete_run() {
       # The pre-stop guard and the later watched-stop account are distinct;
       # both remain distinct from the replacement process's same metric names.
       # shellcheck disable=SC2034
-      STEP_GAUGES='"r1-node-2.pre_stop.participation_tbtc_quarantine_preservation_failures_total":0,"r1-node-2.pre_stop.participation_beacon_quarantine_preservation_failures_total":0,"r1-node-2.pre_stop.participation_tbtc_quarantine_incomplete_outputs":0,"r1-node-2.pre_stop.participation_beacon_quarantine_incomplete_outputs":0,"r1-node-2.pre_restart.participation_tbtc_quarantine_preservation_failures_total":0,"r1-node-2.pre_restart.participation_beacon_quarantine_preservation_failures_total":0,"r1-node-2.pre_restart.participation_tbtc_quarantine_incomplete_outputs":0,"r1-node-2.pre_restart.participation_beacon_quarantine_incomplete_outputs":0,"r1-node-2.pre_restart.container_exit_code":0'
+      STEP_GAUGES='"r1-node-2.pre_stop.participation_tbtc_quarantine_preservation_failures_total":0,"r1-node-2.pre_stop.participation_beacon_quarantine_preservation_failures_total":0,"r1-node-2.pre_stop.participation_tbtc_quarantine_incomplete_outputs":0,"r1-node-2.pre_stop.participation_beacon_quarantine_incomplete_outputs":0,"r1-node-2.pre_stop.sample_readable":1,"r1-node-2.pre_restart.participation_tbtc_quarantine_preservation_failures_total":0,"r1-node-2.pre_restart.participation_beacon_quarantine_preservation_failures_total":0,"r1-node-2.pre_restart.participation_tbtc_quarantine_incomplete_outputs":0,"r1-node-2.pre_restart.participation_beacon_quarantine_incomplete_outputs":0,"r1-node-2.pre_restart.container_exit_code":0'
     elif [[ "${stage}" == \
       "quarantine preservation is complete through quiescence" ]]; then
       # shellcheck disable=SC2034
@@ -8206,6 +8381,29 @@ else
   FAILED=$((FAILED + 1))
 fi
 
+# The freshness bit is produced by the shell archive helper and consumed by
+# the JavaScript restart reader. Bind its suffix across that boundary so a
+# one-sided rename cannot silently turn retained history into missing evidence.
+READER_RESTART_PRE_STOP_SAMPLE_READABLE_SUFFIX="$(sed -n \
+  's/^[[:space:]]*const preStopSampleReadableSuffix = \"\([^\"]*\)\";[[:space:]]*$/\1/p' \
+  "${TEST_DIR}/rehearse.sh")"
+# This is the literal interpolation the producer helper must carry.
+# shellcheck disable=SC2016
+RESTART_PRE_STOP_SAMPLE_READABLE_PRODUCER_KEY='${key_prefix}${RESTART_PRE_STOP_SAMPLE_READABLE_SUFFIX}'
+if [[ -n "${RESTART_PRE_STOP_SAMPLE_READABLE_SUFFIX}" ]] &&
+  [[ "${RESTART_PRE_STOP_SAMPLE_READABLE_SUFFIX}" == \
+  "${READER_RESTART_PRE_STOP_SAMPLE_READABLE_SUFFIX}" ]] &&
+  declare -f append_quarantine_preservation_gauges |
+    grep -F "${RESTART_PRE_STOP_SAMPLE_READABLE_PRODUCER_KEY}" >/dev/null; then
+  printf 'ok   the pre-stop freshness producer and archive reader use the same suffix\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL the pre-stop freshness suffix drifted from the archive reader: producer [%s], reader [%s]\n' \
+    "${RESTART_PRE_STOP_SAMPLE_READABLE_SUFFIX:-missing}" \
+    "${READER_RESTART_PRE_STOP_SAMPLE_READABLE_SUFFIX:-missing}"
+  FAILED=$((FAILED + 1))
+fi
+
 # The old process's exit status has the same producer/reader boundary as the
 # preservation signals even though it is not a Prometheus metric. Bind its
 # suffix too: a one-sided rename would turn a clean exact-image rehearsal into
@@ -8695,6 +8893,73 @@ if printf '%s\n' "${SINGLE_RELEASE_SOURCE}" | awk '
   pass_case "the watched cross-C stop stops scraping after endpoint loss"
 else
   fail_case "the watched cross-C stop stops scraping after endpoint loss"
+fi
+
+# The availability check that decides whether later independent controls may
+# run has authority to terminate the rehearsal. It therefore needs the same
+# bounded retry as a normal process start, and it must be unreachable both when
+# no stop was authorized and when the restart step already passed.
+RESTART_FOLLOWUP_PROBE_GUARD="$(
+  printf '%s\n' "${SINGLE_RELEASE_SOURCE}" |
+    grep -F 'if ((restart_stop_authorized == 1)) &&' || true
+)"
+RESTART_FOLLOWUP_PROBE_ORDER="$(
+  printf '%s\n' "${SINGLE_RELEASE_SOURCE}" | awk '
+    /restart_followup_probe_deadline=.*SECONDS/ {
+      probe = 1
+      print "deadline"
+      next
+    }
+    probe && /until node_reachable "\$\{restarted\}"/ {
+      print "poll"
+      next
+    }
+    probe && /SECONDS >= restart_followup_probe_deadline/ {
+      print "bound"
+      next
+    }
+    probe && /sleep 5/ {
+      print "wait"
+      next
+    }
+    probe && /if ! node_reachable "\$\{restarted\}"/ {
+      print "verify"
+      next
+    }
+    probe && /restart_followups_safe=0/ {
+      print "refuse"
+      exit
+    }
+  '
+)"
+# These are literal source fragments, not expansions in this test shell.
+# shellcheck disable=SC2016
+if [[ "${RESTART_FOLLOWUP_PROBE_GUARD}" == \
+  *'[[ "${restart_step_outcome}" != "pass" ]]'* ]] &&
+  [[ "${RESTART_FOLLOWUP_PROBE_GUARD}" == \
+  *'((restart_followups_safe == 1))'* ]] &&
+  [[ "${RESTART_FOLLOWUP_PROBE_ORDER}" == \
+  $'deadline\npoll\nbound\nwait\nverify\nrefuse' ]]; then
+  pass_case "the post-restart availability decision is bounded and skips safe paths"
+else
+  fail_case "the post-restart availability decision is bounded and skips safe paths" \
+    "guard [${RESTART_FOLLOWUP_PROBE_GUARD:-missing}], observed order \
+[${RESTART_FOLLOWUP_PROBE_ORDER//$'\n'/, }]"
+fi
+
+# If that bounded check still cannot recover a node, its partial-record note
+# names what the control actually did and the outcome it recorded. It must not
+# claim every path was a refused restart: a clean start can fail, and a pre-stop
+# guard can refuse without issuing any stop.
+if printf '%s\n' "${SINGLE_RELEASE_SOURCE}" |
+  grep -Fq 'after the control issued its watched stop' &&
+  printf '%s\n' "${SINGLE_RELEASE_SOURCE}" |
+  grep -Fq 'without authorizing a stop' &&
+  ! printf '%s\n' "${SINGLE_RELEASE_SOURCE}" |
+  grep -Fq 'unavailable after the refused restart control'; then
+  pass_case "the partial-record note reflects stop authority and recorded outcome"
+else
+  fail_case "the partial-record note reflects stop authority and recorded outcome"
 fi
 
 # Every control the sequence turns on has to be present and resolved. A site
