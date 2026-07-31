@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
@@ -136,6 +137,91 @@ var participationMetricFamily = []string{
 	MetricParticipationQuarantinedTBTCSigners,
 }
 
+const participationMetricsSectionHeading = "=== Protocol Participation Gate Metrics"
+
+var participationMetricHeadingPattern = regexp.MustCompile(
+	"(?m)^==== `performance_(participation_[^`]+)`[[:space:]]*$",
+)
+
+type participationMetricsDocumentationDiff struct {
+	missing    []string
+	unexpected []string
+	duplicate  []string
+}
+
+// compareParticipationMetricsDocumentation compares an in-memory metrics
+// reference with the fixed participation family. Missing metrics are scoped to
+// the canonical participation section, while unknown and duplicated
+// participation headings are detected across the whole document. This reports
+// a known metric moved under another section as missing and an invented metric
+// anywhere in the reference as unexpected.
+func compareParticipationMetricsDocumentation(
+	document string,
+) (participationMetricsDocumentationDiff, error) {
+	sectionStart := strings.Index(document, participationMetricsSectionHeading)
+	if sectionStart < 0 {
+		return participationMetricsDocumentationDiff{}, fmt.Errorf(
+			"metrics reference has no %q section",
+			participationMetricsSectionHeading,
+		)
+	}
+
+	section := document[sectionStart+len(participationMetricsSectionHeading):]
+	if nextSection := strings.Index(section, "\n=== "); nextSection >= 0 {
+		section = section[:nextSection]
+	}
+
+	documentedInSection := make(map[string]int)
+	for _, match := range participationMetricHeadingPattern.FindAllStringSubmatch(
+		section,
+		-1,
+	) {
+		documentedInSection[match[1]]++
+	}
+
+	documentedEverywhere := make(map[string]int)
+	for _, match := range participationMetricHeadingPattern.FindAllStringSubmatch(
+		document,
+		-1,
+	) {
+		documentedEverywhere[match[1]]++
+	}
+
+	expected := make(map[string]struct{}, len(participationMetricFamily)+1)
+	for _, metric := range participationMetricFamily {
+		expected[metric] = struct{}{}
+	}
+	expected["participation_refusals_<ceremony>_total"] = struct{}{}
+
+	result := participationMetricsDocumentationDiff{}
+	for metric := range expected {
+		if documentedInSection[metric] == 0 {
+			result.missing = append(result.missing, "performance_"+metric)
+		}
+	}
+
+	for metric, count := range documentedEverywhere {
+		if _, ok := expected[metric]; !ok {
+			result.unexpected = append(
+				result.unexpected,
+				"performance_"+metric,
+			)
+		}
+		if count > 1 {
+			result.duplicate = append(
+				result.duplicate,
+				"performance_"+metric,
+			)
+		}
+	}
+
+	sort.Strings(result.missing)
+	sort.Strings(result.unexpected)
+	sort.Strings(result.duplicate)
+
+	return result, nil
+}
+
 // TestParticipationMetrics_DocumentationMatchesFamily keeps the canonical
 // metrics reference and the fixed participation family in lockstep in both
 // directions. A code metric with no heading leaves operators without its
@@ -152,61 +238,119 @@ func TestParticipationMetrics_DocumentationMatchesFamily(t *testing.T) {
 		t.Fatalf("cannot read participation metrics reference: %v", err)
 	}
 
-	const sectionHeading = "=== Protocol Participation Gate Metrics"
-	sectionStart := strings.Index(string(document), sectionHeading)
-	if sectionStart < 0 {
-		t.Fatalf("metrics reference has no %q section", sectionHeading)
+	diff, err := compareParticipationMetricsDocumentation(string(document))
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	section := string(document)[sectionStart+len(sectionHeading):]
-	if nextSection := strings.Index(section, "\n=== "); nextSection >= 0 {
-		section = section[:nextSection]
+	if len(diff.missing) > 0 {
+		t.Errorf(
+			"participation metrics missing from reference: %v",
+			diff.missing,
+		)
 	}
+	if len(diff.unexpected) > 0 {
+		t.Errorf(
+			"reference documents unknown participation metrics: %v",
+			diff.unexpected,
+		)
+	}
+	if len(diff.duplicate) > 0 {
+		t.Errorf(
+			"reference duplicates participation metric headings: %v",
+			diff.duplicate,
+		)
+	}
+}
 
-	headingPattern := regexp.MustCompile(
-		"(?m)^==== `performance_(participation_[^`]+)`[[:space:]]*$",
+// TestParticipationMetrics_DocumentationComparisonDetectsDrift proves each
+// direction of the documentation comparison is load-bearing. The missing case
+// moves a real heading below the next level-three section, exercising the
+// section truncation rather than simply deleting text. The unexpected case
+// places an invented participation heading in that later section, proving
+// headings outside the canonical section are not invisible to drift checks.
+func TestParticipationMetrics_DocumentationComparisonDetectsDrift(
+	t *testing.T,
+) {
+	canonical := append([]string(nil), participationMetricFamily...)
+	canonical = append(
+		canonical,
+		"participation_refusals_<ceremony>_total",
 	)
-	documented := make(map[string]int)
-	for _, match := range headingPattern.FindAllStringSubmatch(section, -1) {
-		documented[match[1]]++
-	}
+	sort.Strings(canonical)
 
-	expected := make(map[string]struct{}, len(participationMetricFamily)+1)
-	for _, metric := range participationMetricFamily {
-		expected[metric] = struct{}{}
-	}
-	expected["participation_refusals_<ceremony>_total"] = struct{}{}
-
-	var missing []string
-	for metric := range expected {
-		if documented[metric] == 0 {
-			missing = append(missing, "performance_"+metric)
+	render := func(sectionMetrics, laterMetrics []string) string {
+		var result strings.Builder
+		result.WriteString("= Metrics\n\n")
+		result.WriteString(participationMetricsSectionHeading)
+		result.WriteString("\n")
+		for _, metric := range sectionMetrics {
+			fmt.Fprintf(
+				&result,
+				"\n==== `performance_%s`\n*Type*: Gauge\n",
+				metric,
+			)
 		}
-	}
-
-	var unexpected []string
-	var duplicate []string
-	for metric, count := range documented {
-		if _, ok := expected[metric]; !ok {
-			unexpected = append(unexpected, "performance_"+metric)
+		result.WriteString("\n=== Another Metrics Section\n")
+		for _, metric := range laterMetrics {
+			fmt.Fprintf(
+				&result,
+				"\n==== `performance_%s`\n*Type*: Gauge\n",
+				metric,
+			)
 		}
-		if count > 1 {
-			duplicate = append(duplicate, "performance_"+metric)
-		}
+		return result.String()
 	}
 
-	sort.Strings(missing)
-	sort.Strings(unexpected)
-	sort.Strings(duplicate)
+	movedMetric := canonical[0]
+	duplicatedMetric := canonical[1]
+	cases := map[string]struct {
+		document string
+		expected participationMetricsDocumentationDiff
+	}{
+		"known heading moved beyond the section": {
+			document: render(canonical[1:], []string{movedMetric}),
+			expected: participationMetricsDocumentationDiff{
+				missing: []string{"performance_" + movedMetric},
+			},
+		},
+		"unknown heading in another section": {
+			document: render(
+				canonical,
+				[]string{"participation_invented_total"},
+			),
+			expected: participationMetricsDocumentationDiff{
+				unexpected: []string{
+					"performance_participation_invented_total",
+				},
+			},
+		},
+		"duplicated heading": {
+			document: render(
+				append(canonical, duplicatedMetric),
+				nil,
+			),
+			expected: participationMetricsDocumentationDiff{
+				duplicate: []string{"performance_" + duplicatedMetric},
+			},
+		},
+	}
 
-	if len(missing) > 0 {
-		t.Errorf("participation metrics missing from reference: %v", missing)
-	}
-	if len(unexpected) > 0 {
-		t.Errorf("reference documents unknown participation metrics: %v", unexpected)
-	}
-	if len(duplicate) > 0 {
-		t.Errorf("reference duplicates participation metric headings: %v", duplicate)
+	for name, test := range cases {
+		t.Run(name, func(t *testing.T) {
+			actual, err := compareParticipationMetricsDocumentation(
+				test.document,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(test.expected, actual) {
+				t.Errorf(
+					"unexpected documentation diff\nexpected: %#v\nactual:   %#v",
+					test.expected,
+					actual,
+				)
+			}
+		})
 	}
 }
 

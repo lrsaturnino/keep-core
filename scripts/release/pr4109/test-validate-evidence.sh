@@ -186,6 +186,16 @@ SINGLE_RELEASE_STAGES='
   { "name": "clock failure quarantines work rather than guessing a mode", "outcome": "pass" },
   { "name": "quiescence with an in-flight security-v2 permit", "outcome": "pass" },
   { "name": "quiescence with an in-flight legacy permit", "outcome": "pass" },
+  { "name": "quarantine preservation is complete through quiescence", "outcome": "pass", "gauges": {
+      "r1-node-1.participation_tbtc_quarantine_preservation_failures_total": 0,
+      "r1-node-1.participation_beacon_quarantine_preservation_failures_total": 0,
+      "r1-node-1.participation_tbtc_quarantine_incomplete_outputs": 0,
+      "r1-node-1.participation_beacon_quarantine_incomplete_outputs": 0,
+      "r1-node-2.participation_tbtc_quarantine_preservation_failures_total": 0,
+      "r1-node-2.participation_beacon_quarantine_preservation_failures_total": 0,
+      "r1-node-2.participation_tbtc_quarantine_incomplete_outputs": 0,
+      "r1-node-2.participation_beacon_quarantine_incomplete_outputs": 0
+    } },
   { "name": "the cutover fleet leaves no release candidate running", "outcome": "pass" }'
 SINGLE_RELEASE_ASSERTIONS='
   { "assertion": "the gate crosses C in-process, without a restart or a global toggle", "holds": true, "evidence_stage": "cross C without restart" },
@@ -194,6 +204,7 @@ SINGLE_RELEASE_ASSERTIONS='
   { "assertion": "post-C ceremonies run security-v2 with no legacy sightings", "holds": true, "evidence_stage": "homogeneous security-v2 controls with no legacy sightings" },
   { "assertion": "a failed chain-clock read refuses new work instead of assuming a side of C", "holds": true, "evidence_stage": "clock failure quarantines work rather than guessing a mode" },
   { "assertion": "graceful quiescence starts no new work and lets held permits finish", "holds": true, "evidence_stage": "quiescence with an in-flight security-v2 permit" },
+  { "assertion": "single-release quiescence loses no generated signer output to an unwritable quarantine namespace", "holds": true, "evidence_stage": "quarantine preservation is complete through quiescence" },
   { "assertion": "a finished cutover rehearsal leaves no candidate able to act", "holds": true, "evidence_stage": "the cutover fleet leaves no release candidate running" }'
 ROLLBACK_STAGES='
   { "name": "quiesce every R1 node with work represented", "outcome": "pass" },
@@ -1145,6 +1156,112 @@ run_validator "${D}"
 check "a record naming a review the control does not pin is rejected" 3 \
   "review record hashing to \[c{64}\]"
 
+# The single-release gate is itself where the clock-failure and quiescence
+# controls can strand generated output. Its preservation stage therefore
+# carries the same four node-authored signals as rollback, before the final
+# fleet-stop stage makes those endpoints unreadable.
+D="${WORK}/accept-single-release-missing-preservation-reading"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  const stage = record.stages.find(
+    ({ name }) =>
+      name ===
+      "quarantine preservation is complete through quiescence"
+  );
+  delete stage.gauges[
+    "r1-node-1.participation_beacon_quarantine_preservation_failures_total"
+  ];
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "single-release acceptance requires every preservation reading" 3 \
+  "single_release step.*carries no fleet reading of.*r1-node-1.*beacon_quarantine_preservation_failures_total"
+
+D="${WORK}/accept-single-release-incomplete-output"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  const stage = record.stages.find(
+    ({ name }) =>
+      name ===
+      "quarantine preservation is complete through quiescence"
+  );
+  stage.gauges[
+    "r1-node-2.participation_tbtc_quarantine_preservation_failures_total"
+  ] = 1;
+  stage.gauges[
+    "r1-node-2.participation_tbtc_quarantine_incomplete_outputs"
+  ] = 1;
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "a live incomplete quarantine output refutes single-release acceptance" \
+  1 "single_release node.*still holding tBTC output.*incomplete_outputs.*is 1"
+
+D="${WORK}/accept-single-release-recovered-preservation-episode"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  const stage = record.stages.find(
+    ({ name }) =>
+      name ===
+      "quarantine preservation is complete through quiescence"
+  );
+  stage.gauges[
+    "r1-node-1.participation_tbtc_quarantine_preservation_failures_total"
+  ] = 1;
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "a recovered episode remains advisory in single-release acceptance" 0 \
+  "non-fatal recovered quarantine evidence.*single_release node.*tBTC.*later completed"
+
+# An advisory is diagnostic evidence about the same run and must survive an
+# unrelated refusal. Print it before fail/blocked exits so an operator does not
+# lose the recovered preservation episode while debugging the refutation.
+D="${WORK}/accept-recovered-preservation-beside-refutation"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  record.stages.find(
+    ({ name }) => name === "cross C without restart"
+  ).outcome = "fail";
+  const stage = record.stages.find(
+    ({ name }) =>
+      name ===
+      "quarantine preservation is complete through quiescence"
+  );
+  stage.gauges[
+    "r1-node-1.participation_tbtc_quarantine_preservation_failures_total"
+  ] = 1;
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "a recovery advisory survives an unrelated gate refutation" 1 \
+  "non-fatal recovered quarantine evidence.*single_release node.*later completed" \
+  "evidence refutes the gate it records.*cross C without restart"
+
 # The rollback assertion is not accepted on its prose alone. Its designated
 # stage must carry both pre-registered protocol counters and both live
 # incomplete-output gauges as node-authored numeric readings; an absent series
@@ -1187,7 +1304,7 @@ REHEARSAL_R1_SERVICES=()
 run_validator "${D}"
 REHEARSAL_R1_SERVICES=("${SAVED_ACCEPTANCE_R1_SERVICES[@]}")
 check "rollback acceptance refuses an empty expected R1 service roster" 3 \
-  "empty expected R1 service roster.*no fleet reading can authorize rollback"
+  "empty expected R1 service roster.*no fleet reading can authorize the gate"
 
 # A grace-exhaustion counter is historical. When the paired live gauge is zero,
 # the full output later became durable; retain that episode as an explicit
@@ -1278,7 +1395,7 @@ check "a live incomplete quarantine output refutes rollback" 1 \
 # while its protected namespace remains incomplete.
 quarantine_preservation_verdict_case() {
   local readings="$1"
-  local saved_readings="${ROLLBACK_QUARANTINE_PRESERVATION_FAILURES}"
+  local saved_readings="${QUARANTINE_PRESERVATION_READINGS}"
   local saved_step_gauges="${STEP_GAUGES}"
 
   REHEARSAL_STEPS=()
@@ -1286,17 +1403,19 @@ quarantine_preservation_verdict_case() {
   REHEARSAL_BLOCKED_STEPS=()
   REHEARSAL_FAILED_STEPS=()
   REHEARSAL_REFUTED_ASSERTIONS=()
-  ROLLBACK_QUARANTINE_PRESERVATION_FAILURES="${readings}"
+  QUARANTINE_PRESERVATION_READINGS="${readings}"
 
   {
     begin_step "quarantine preservation is complete through quiescence"
-    rollback_quarantine_preservation_verdict
+    quarantine_preservation_verdict \
+      "rollback quiescence loses no generated signer output to an unwritable \
+quarantine namespace"
   } >/dev/null
 
   CASE_OUT="${REHEARSAL_STEPS[0]} ${REHEARSAL_ASSERTIONS[0]}"
   CASE_RC=0
 
-  ROLLBACK_QUARANTINE_PRESERVATION_FAILURES="${saved_readings}"
+  QUARANTINE_PRESERVATION_READINGS="${saved_readings}"
   STEP_GAUGES="${saved_step_gauges}"
   REHEARSAL_STEPS=()
   REHEARSAL_ASSERTIONS=()
@@ -1327,7 +1446,7 @@ node -e '
   const fs = require("fs");
   const path = process.argv[1];
   const record = JSON.parse(fs.readFileSync(path, "utf8"));
-  record.stages[12] = { ...record.stages[2] };
+  record.stages[13] = { ...record.stages[2] };
   fs.writeFileSync(path, JSON.stringify(record, null, 2));
 ' "${D}/record.json"
 run_validator "${D}"
@@ -1344,7 +1463,7 @@ node -e '
   const fs = require("fs");
   const path = process.argv[1];
   const record = JSON.parse(fs.readFileSync(path, "utf8"));
-  record.assertions[6] = {
+  record.assertions[7] = {
     assertion: "an invented release property",
     holds: true,
     evidence_stage: "the cutover fleet leaves no release candidate running",
@@ -1848,6 +1967,7 @@ complete_run() {
     "clock failure quarantines work rather than guessing a mode"
     "quiescence with an in-flight security-v2 permit"
     "quiescence with an in-flight legacy permit"
+    "quarantine preservation is complete through quiescence"
     "the cutover fleet leaves no release candidate running"
   )
   local stage
@@ -1861,6 +1981,10 @@ complete_run() {
       STEP_PERMIT_MODES='"security_v2"'
       # shellcheck disable=SC2034
       STEP_GAUGES='"r1-node-1.participation_gate_state":2'
+    elif [[ "${stage}" == \
+      "quarantine preservation is complete through quiescence" ]]; then
+      # shellcheck disable=SC2034
+      STEP_GAUGES='"r1-node-1.participation_tbtc_quarantine_preservation_failures_total":0,"r1-node-1.participation_beacon_quarantine_preservation_failures_total":0,"r1-node-1.participation_tbtc_quarantine_incomplete_outputs":0,"r1-node-1.participation_beacon_quarantine_incomplete_outputs":0,"r1-node-2.participation_tbtc_quarantine_preservation_failures_total":0,"r1-node-2.participation_beacon_quarantine_preservation_failures_total":0,"r1-node-2.participation_tbtc_quarantine_incomplete_outputs":0,"r1-node-2.participation_beacon_quarantine_incomplete_outputs":0'
     fi
     record_step "${stage}" pass "self-test observed the mandatory property"
   done
@@ -1884,6 +2008,9 @@ complete_run() {
   record_assertion \
     "graceful quiescence starts no new work and lets held permits finish" \
     true "quiescence with an in-flight security-v2 permit"
+  record_assertion \
+    "single-release quiescence loses no generated signer output to an unwritable quarantine namespace" \
+    true "quarantine preservation is complete through quiescence"
   record_assertion \
     "a finished cutover rehearsal leaves no candidate able to act" true \
     "the cutover fleet leaves no release candidate running"

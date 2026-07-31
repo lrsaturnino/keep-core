@@ -9339,6 +9339,9 @@ on the rehearsal chain that is still running at shutdown"
   # it holds. A number restated here would go on stopping nodes under the
   # old ceiling the first time the reviewed bounds moved.
   QUIESCE_GRACE="$(manifest_termination_grace)"
+  if ((QUARANTINE_PRESERVATION_SAMPLING == 1)); then
+    sample_quarantine_preservation_signals "${node}"
+  fi
   compose stop --timeout "${QUIESCE_GRACE}" "${node}" &
   local stop_pid=$!
 
@@ -9421,6 +9424,9 @@ on the rehearsal chain that is still running at shutdown"
     if [[ "${refusals_now}" =~ ^[0-9]+$ ]]; then
       QUIESCE_REFUSALS_AFTER="${refusals_now}"
       QUIESCE_CEREMONY_REFUSALS_AFTER="$(ceremony_refusal_counters "${node}")"
+    fi
+    if ((QUARANTINE_PRESERVATION_SAMPLING == 1)); then
+      sample_quarantine_preservation_signals "${node}"
     fi
     # The node going unreachable is the drain finishing, not a failure.
     node_reachable "${node}" || break
@@ -9741,7 +9747,6 @@ ROLLBACK_ORIGINATED=""
 ROLLBACK_INFLIGHT=""
 ROLLBACK_DRAIN_RC=""
 ROLLBACK_GRACE=""
-ROLLBACK_QUARANTINE_PRESERVATION_FAILURES=""
 # The kinds of work a rollback has to be authorized over, both in flight at
 # once. A rollback decision is taken over a fleet that was holding whatever it
 # was holding, and the two classes fail differently under an interrupted
@@ -9751,10 +9756,75 @@ ROLLBACK_QUARANTINE_PRESERVATION_FAILURES=""
 # says nothing about the other, and a permit total cannot tell them apart.
 ROLLBACK_REQUIRED_CLASSES="threshold_ceremony bitcoin_action"
 
-rollback_quarantine_preservation_verdict() {
+# The last readable quarantine-preservation account from every R1 service.
+#
+# Both exact-image gates can manufacture a quarantine: rollback does so while
+# draining the whole fleet, and single_release does so when it severs a node's
+# chain clock or forces either quiescence control. The nodes stop answering at
+# the end of those controls, so each gate retains the newest numeric reading
+# while the endpoint is still live and records the shared verdict afterwards.
+QUARANTINE_PRESERVATION_READINGS=""
+QUARANTINE_PRESERVATION_SAMPLING=0
+
+sample_quarantine_preservation_signals() {
+  local service="$1"
+  local listed_service listed_tbtc_failures listed_beacon_failures
+  local listed_tbtc_incomplete listed_beacon_incomplete
+  local tbtc_failures="unreadable" beacon_failures="unreadable"
+  local tbtc_incomplete="unreadable" beacon_incomplete="unreadable"
+  local retained="" reading
+
+  while read -r listed_service listed_tbtc_failures listed_beacon_failures \
+    listed_tbtc_incomplete listed_beacon_incomplete; do
+    [[ -n "${listed_service}" ]] || continue
+    if [[ "${listed_service}" == "${service}" ]]; then
+      tbtc_failures="${listed_tbtc_failures}"
+      beacon_failures="${listed_beacon_failures}"
+      tbtc_incomplete="${listed_tbtc_incomplete}"
+      beacon_incomplete="${listed_beacon_incomplete}"
+      continue
+    fi
+    retained="${retained}${retained:+$'\n'}${listed_service} \
+${listed_tbtc_failures} ${listed_beacon_failures} \
+${listed_tbtc_incomplete} ${listed_beacon_incomplete}"
+  done <<<"${QUARANTINE_PRESERVATION_READINGS}"
+
+  reading="$(metric_value "${service}" \
+    participation_tbtc_quarantine_preservation_failures_total \
+    2>/dev/null || printf '')"
+  [[ "${reading}" =~ ^[0-9]+$ ]] && tbtc_failures="${reading}"
+
+  reading="$(metric_value "${service}" \
+    participation_beacon_quarantine_preservation_failures_total \
+    2>/dev/null || printf '')"
+  [[ "${reading}" =~ ^[0-9]+$ ]] && beacon_failures="${reading}"
+
+  reading="$(metric_value "${service}" \
+    participation_tbtc_quarantine_incomplete_outputs \
+    2>/dev/null || printf '')"
+  [[ "${reading}" =~ ^[0-9]+$ ]] && tbtc_incomplete="${reading}"
+
+  reading="$(metric_value "${service}" \
+    participation_beacon_quarantine_incomplete_outputs \
+    2>/dev/null || printf '')"
+  [[ "${reading}" =~ ^[0-9]+$ ]] && beacon_incomplete="${reading}"
+
+  QUARANTINE_PRESERVATION_READINGS="\
+${retained}${retained:+$'\n'}${service} ${tbtc_failures} ${beacon_failures} \
+${tbtc_incomplete} ${beacon_incomplete}"
+}
+
+initialize_quarantine_preservation_readings() {
+  QUARANTINE_PRESERVATION_READINGS=""
+  local service
+  for service in "$@"; do
+    sample_quarantine_preservation_signals "${service}"
+  done
+}
+
+quarantine_preservation_verdict() {
+  local assertion="$1"
   local step="quarantine preservation is complete through quiescence"
-  local assertion="rollback quiescence loses no generated signer output to \
-an unwritable quarantine namespace"
   local service tbtc_failures beacon_failures tbtc_incomplete beacon_incomplete
   local nodes=0
   local unread="" still_incomplete="" recovered=""
@@ -9801,11 +9871,11 @@ ${beacon_failures})"
       recovered="${recovered}${recovered:+, }${service} (beacon \
 grace-exhaustion episodes ${beacon_failures}, live incomplete 0)"
     fi
-  done <<<"${ROLLBACK_QUARANTINE_PRESERVATION_FAILURES}"
+  done <<<"${QUARANTINE_PRESERVATION_READINGS}"
 
   if ((nodes == 0)); then
     block_step "${step}" "no R1 node's quarantine-preservation counters were \
-captured while the fleet drained; an absent reading cannot say that no \
+captured before the fleet stopped; an absent reading cannot say that no \
 generated share was lost"
     record_assertion "${assertion}" false "${step}"
   elif [[ -n "${unread}" ]]; then
@@ -9816,19 +9886,19 @@ node-authored reading, not the value assigned to a node that stopped answering"
   elif [[ -n "${still_incomplete}" ]]; then
     record_step "${step}" fail "an R1 node is still holding generated signer \
 output whose protected quarantine lacks key material or its audit record on \
-${still_incomplete}; rollback remains refused until every output becomes \
+${still_incomplete}; the gate remains refused until every output becomes \
 fully durable and its live incomplete-output gauge clears"
     record_assertion "${assertion}" false "${step}"
   elif [[ -n "${recovered}" ]]; then
     record_step "${step}" pass "preservation exhausted its write-grace rounds \
 and later completed on ${recovered}; the cumulative counters retain those \
 recovered episodes, every live incomplete-output gauge is zero, and the \
-offline state audit remains required before rollback"
+offline state audit remains required before any prior release starts"
     record_assertion "${assertion}" true "${step}"
   else
     record_step "${step}" pass "every R1 node reported zero tBTC and beacon \
-write-grace exhaustion episodes and zero live incomplete outputs through its \
-last readable drain sample"
+write-grace exhaustion episodes and zero live incomplete outputs in its last \
+readable cutover/quiescence sample"
     record_assertion "${assertion}" true "${step}"
   fi
 }
@@ -11575,6 +11645,17 @@ network"
 
   homogeneous_control_verdict
 
+  # Everything after the homogeneous control can preserve generated signer
+  # output into quarantine: the clock-failure control cancels every held
+  # permit on its node, and each quiescence control may reach its forced
+  # deadline. Seed a last-readable account while both endpoints answer, then
+  # refresh the affected node throughout each destructive window. The verdict
+  # is emitted only after both quiescence controls, but before the fleet-stop
+  # barrier makes any remaining endpoint unreadable.
+  initialize_quarantine_preservation_readings \
+    "${REHEARSAL_R1_SERVICES[@]}"
+  QUARANTINE_PRESERVATION_SAMPLING=1
+
   # Step 7. Severing a node from the chain endpoint is a real clock failure:
   # the gate's synchronous read fails, and the release's contract is that it
   # refuses new work and cancels what it holds rather than guessing a side of
@@ -11607,6 +11688,7 @@ network"
     sleep 5
   done
   observe_gate_gauges "${clock_node}"
+  sample_quarantine_preservation_signals "${clock_node}"
 
   # The refusal half of the contract, attempted rather than inferred. Until
   # something asks this gate to start work while it cannot read the chain, an
@@ -11669,6 +11751,7 @@ network"
     sleep 5
   done
   observe_gate_gauges "${clock_node}"
+  sample_quarantine_preservation_signals "${clock_node}"
 
   clock_failure_verdict
 
@@ -11710,6 +11793,19 @@ that reason and its drain says nothing about quiescence"
     "quiescence with an in-flight legacy permit" \
     "" legacy active_legacy_ceremonies \
     participation_mode_legacy_total quiesce-legacy "${QUIESCE_SEEDED_WORK}"
+
+  # Take one final pass over nodes that remain live because a control blocked
+  # before issuing its stop. For nodes that already drained, the sampler keeps
+  # their last numeric values rather than replacing them with an invented zero.
+  for service in "${REHEARSAL_R1_SERVICES[@]}"; do
+    sample_quarantine_preservation_signals "${service}"
+  done
+  QUARANTINE_PRESERVATION_SAMPLING=0
+
+  begin_step "quarantine preservation is complete through quiescence"
+  quarantine_preservation_verdict \
+    "single-release quiescence loses no generated signer output to an \
+unwritable quarantine namespace"
 
   # This gate ends where the next one begins. A rollback rehearsal's whole
   # subject is that no prior binary participates while a release candidate can
@@ -11961,7 +12057,7 @@ nowhere to capture them to"
   # not permits this drain force-canceled.
   ROLLBACK_NODE_ACCOUNTS=""
   ROLLBACK_NODE_ENDINGS=""
-  ROLLBACK_QUARANTINE_PRESERVATION_FAILURES=""
+  QUARANTINE_PRESERVATION_READINGS=""
   local pos=0 forced_delta
   for svc in "${REHEARSAL_R1_SERVICES[@]}"; do
     if [[ "${forced_before[${pos}]}" =~ ^[0-9]+$ ]] &&
@@ -11978,9 +12074,9 @@ ${forced_delta} ${final_active[${pos}]}"
     # endings carry spaces, and the accounting is read field by field.
     ROLLBACK_NODE_ENDINGS="${ROLLBACK_NODE_ENDINGS}\
 ${ROLLBACK_NODE_ENDINGS:+$'\n'}${svc} ${authored_endings[${pos}]}"
-    ROLLBACK_QUARANTINE_PRESERVATION_FAILURES="\
-${ROLLBACK_QUARANTINE_PRESERVATION_FAILURES}\
-${ROLLBACK_QUARANTINE_PRESERVATION_FAILURES:+$'\n'}${svc} \
+    QUARANTINE_PRESERVATION_READINGS="\
+${QUARANTINE_PRESERVATION_READINGS}\
+${QUARANTINE_PRESERVATION_READINGS:+$'\n'}${svc} \
 ${tbtc_preservation_failures[${pos}]} \
 ${beacon_preservation_failures[${pos}]} \
 ${tbtc_incomplete_outputs[${pos}]} \
@@ -11992,7 +12088,9 @@ ${beacon_incomplete_outputs[${pos}]}"
   rollback_drain_verdict
 
   begin_step "quarantine preservation is complete through quiescence"
-  rollback_quarantine_preservation_verdict
+  quarantine_preservation_verdict \
+    "rollback quiescence loses no generated signer output to an unwritable \
+quarantine namespace"
 
   begin_step "no prior binary starts during quiescence"
   prior_absence_verdict "no prior binary starts during quiescence" \
@@ -12781,7 +12879,7 @@ publishes exactly once"
 #
 # This is deliberately stricter than JSON shape validation. JSON Schema can
 # type an array entry, but a typed entry named "preflight" is not a substitute
-# for the thirteen steps of the single-release gate, and a true assertion
+# for the fourteen steps of the single-release gate, and a true assertion
 # linked to some other passing step proves neither property.
 evidence_acceptance_findings() {
   local record="$1"
@@ -12805,6 +12903,7 @@ evidence_acceptance_findings() {
           "clock failure quarantines work rather than guessing a mode",
           "quiescence with an in-flight security-v2 permit",
           "quiescence with an in-flight legacy permit",
+          "quarantine preservation is complete through quiescence",
           "the cutover fleet leaves no release candidate running",
         ],
         assertions: [
@@ -12842,6 +12941,12 @@ evidence_acceptance_findings() {
               "graceful quiescence starts no new work and lets held permits finish",
             stage:
               "quiescence with an in-flight security-v2 permit",
+          },
+          {
+            name:
+              "single-release quiescence loses no generated signer output to an unwritable quarantine namespace",
+            stage:
+              "quarantine preservation is complete through quiescence",
           },
           {
             name:
@@ -12984,7 +13089,7 @@ evidence_acceptance_findings() {
       }
     }
 
-    if (record.gate === "rollback") {
+    if (record.gate === "single_release" || record.gate === "rollback") {
       const preservationStageName =
         "quarantine preservation is complete through quiescence";
       const preservationStage = stageByName.get(preservationStageName) || {};
@@ -13001,8 +13106,9 @@ evidence_acceptance_findings() {
       if (expectedServices.length === 0) {
         add(
           "unrehearsed",
-          "rollback acceptance received an empty expected R1 service roster; " +
-            "no fleet reading can authorize rollback"
+          record.gate +
+            " acceptance received an empty expected R1 service roster; " +
+            "no fleet reading can authorize the gate"
         );
       }
 
@@ -13011,7 +13117,8 @@ evidence_acceptance_findings() {
         if (!Object.prototype.hasOwnProperty.call(gauges, name)) {
           add(
             "unrehearsed",
-            "rollback step " + JSON.stringify(preservationStageName) +
+            record.gate + " step " +
+              JSON.stringify(preservationStageName) +
               " carries no fleet reading of " + JSON.stringify(name)
           );
           return undefined;
@@ -13020,7 +13127,7 @@ evidence_acceptance_findings() {
         if (!Number.isFinite(value)) {
           add(
             "unrehearsed",
-            "rollback quarantine-preservation reading " +
+            record.gate + " quarantine-preservation reading " +
               JSON.stringify(name) + " is not numeric"
           );
           return undefined;
@@ -13053,7 +13160,7 @@ evidence_acceptance_findings() {
           if (incomplete !== undefined && incomplete !== 0) {
             add(
               "refuted",
-              "rollback node " + JSON.stringify(service) +
+              record.gate + " node " + JSON.stringify(service) +
                 " is still holding " + signal.protocol +
                 " output whose protected quarantine is incomplete: " +
                 JSON.stringify(incompleteName) + " is " + incomplete
@@ -13065,7 +13172,8 @@ evidence_acceptance_findings() {
           ) {
             add(
               "advisory",
-              "rollback node " + JSON.stringify(service) + " recorded " +
+              record.gate + " node " + JSON.stringify(service) +
+                " recorded " +
                 signal.protocol + " preservation whose write-grace " +
                 "exhausted and later completed: " +
                 JSON.stringify(counterName) + " is " + counter + " and " +
@@ -13152,6 +13260,11 @@ assess_evidence_record_set() {
     done <<<"${outcomes}"
   done
 
+  local advisory
+  for advisory in "${advisories[@]+"${advisories[@]}"}"; do
+    note "non-fatal recovered quarantine evidence: ${advisory}"
+  done
+
   if ((${#refutations[@]} > 0)); then
     fail "the evidence refutes the gate it records — ${#refutations[@]} \
 failed step(s) or refused assertion(s): ${refutations[*]}; these records are \
@@ -13163,11 +13276,6 @@ records were missing, duplicated, misbound, or never executed: \
 ${unrehearsed[*]}; an incomplete gate contract has not been rehearsed, \
 whatever the records that do exist show"
   fi
-
-  local advisory
-  for advisory in "${advisories[@]+"${advisories[@]}"}"; do
-    note "non-fatal recovered quarantine evidence: ${advisory}"
-  done
 
   note "every required step passed exactly once, every required assertion \
 holds against its designated passing step, and every required reviewed \

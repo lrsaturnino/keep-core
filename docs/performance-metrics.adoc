@@ -451,12 +451,12 @@ of them carries an operator, session, wallet, or peer label.
 
 ==== `performance_participation_tbtc_quarantine_incomplete_outputs`
 *Type*: Gauge
-*Description*: tBTC signer outputs the running process is still holding after write-grace exhaustion while the protected namespace lacks either key material or the audit record explaining it. The gauge clears only when the complete output becomes durable. A nonzero or unreadable value refuses rollback acceptance
+*Description*: tBTC signer outputs the running process is still holding after write-grace exhaustion while the protected namespace lacks either key material or the audit record explaining it. The gauge clears only when the complete output becomes durable. A nonzero or unreadable value refuses both single-release cutover and rollback acceptance
 *Labels*: None
 
 ==== `performance_participation_beacon_quarantine_incomplete_outputs`
 *Type*: Gauge
-*Description*: Beacon signer outputs the running process is still holding after write-grace exhaustion while the protected namespace lacks either key material or the audit record explaining it. The gauge clears only when the complete output becomes durable. A nonzero or unreadable value refuses rollback acceptance
+*Description*: Beacon signer outputs the running process is still holding after write-grace exhaustion while the protected namespace lacks either key material or the audit record explaining it. The gauge clears only when the complete output becomes durable. A nonzero or unreadable value refuses both single-release cutover and rollback acceptance
 *Labels*: None
 
 ==== `performance_participation_quarantined_tbtc_signers`

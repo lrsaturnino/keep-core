@@ -987,19 +987,19 @@ says. A record is precisely where a rehearsal reports that a mandatory step
 failed or an acceptance assertion does not hold, so a schema-valid,
 correctly bound record can be exactly the evidence that a gate must be
 refused. `validate-evidence` therefore asks the second question separately
-against the exact gate contract. The single-release record must carry its 13
-named stages and seven named assertions; rollback must carry its ten stages
-and six assertions. Every entry occurs exactly once and in execution order,
+against the exact gate contract. The single-release record must carry its 14
+named stages and eight named assertions; rollback must carry its 11 stages
+and seven assertions. Every entry occurs exactly once and in execution order,
 unknown entries are rejected, and every assertion must cite its designated
 passing stage rather than any convenient passing step. Single-release must
-also name the reviewed work-driver digest; rollback must name both that digest
-and the reviewed rollback-evidence-generator digest. Any recorded failed step
-or refused assertion, in any record in the directory, exits `FAIL`; anything
-missing, duplicated, misbound, blocked, or produced without its required
-reviewed instrument exits `BLOCKED`. Only the complete exact contracts are
-evidence of satisfied gates. A passing record beside a failing one accepts
-nothing. The in-process emitter applies this same contract to the record it
-just wrote before a rehearsal is allowed to print success.
+also name the reviewed work-driver and tss-lib-review digests; rollback must
+name the work-driver and reviewed rollback-evidence-generator digests. Any
+recorded failed step or refused assertion, in any record in the directory,
+exits `FAIL`; anything missing, duplicated, misbound, blocked, or produced
+without its required reviewed instrument exits `BLOCKED`. Only the complete
+exact contracts are evidence of satisfied gates. A passing record beside a
+failing one accepts nothing. The in-process emitter applies this same contract
+to the record it just wrote before a rehearsal is allowed to print success.
 
 Those comparisons only mean something while the checked-in manifest is
 still the compiled bounds' own manifest, so the stage refuses to measure
@@ -1971,16 +1971,32 @@ history. The accompanying
 `performance_participation_tbtc_quarantine_incomplete_outputs` and
 `performance_participation_beacon_quarantine_incomplete_outputs` gauges are
 also pre-registered at zero, rise for the whole live retry after grace is
-exhausted, and clear only when the full output becomes durable. The rollback
-rehearsal samples all four signals while each candidate drains. An unreadable
-signal or a nonzero live gauge refuses rollback because the node has not proved
-that the output became fully durable. A nonzero counter paired with a zero live
-gauge is retained as a distinct, non-fatal recovery finding: preservation
-exhausted its write-grace rounds and later completed. It does not bypass the
-offline state audit, which must still prove the durable namespace before the
-prior release starts. All four zero means the node reported neither a
-grace-exhausting episode nor an output currently incomplete; it does not turn a
-missing reading into an empty quarantine.
+exhausted, and clear only when the full output becomes durable. Both
+exact-image gates sample all four signals while their candidates still answer.
+The `single_release` gate seeds the account before the chain-clock failure,
+refreshes the affected node through that cancellation and both quiescence
+controls, and records the verdict before its final fleet-stop stage. The
+rollback gate refreshes the same account while every candidate drains. An
+unreadable signal or a nonzero live gauge refuses either gate because the node
+has not proved that the output became fully durable. A nonzero counter paired
+with a zero live gauge is retained as a distinct, non-fatal recovery finding:
+preservation exhausted its write-grace rounds and later completed. The finding
+is printed even when an unrelated requirement refuses the same archive. It
+does not bypass the offline state audit, which must still prove the durable
+namespace before the prior release starts. All four zero means the node
+reported neither a grace-exhausting episode nor an output currently
+incomplete; it does not turn a missing reading into an empty quarantine.
+
+`performance_participation_quarantined_tbtc_signers` is deliberately not a
+live preservation verdict. A nonzero value means the protected namespace
+retained signer material that is not active — state a rollback must reconcile,
+not a preservation failure — while zero can mean either no quarantined signer
+or an output the namespace failed to retain at all. The offline state audit is
+its authoritative consumer: it enumerates the protected namespace, binds each
+record to chain settlement and permit evidence, and refuses rollback on any
+unreadable or unreconciled output. The exact-image stages still snapshot the
+gauge for diagnosis, but neither treats its value as a substitute for the
+four preservation signals or for the offline audit.
 
 Two things would close it, and both are decisions rather than oversights. A
 `keep-common` change making `Write` write-temp-sync-rename-sync-dir is the
