@@ -1975,17 +1975,24 @@ exhausted, and clear only when the full output becomes durable. Both
 exact-image gates sample all four signals while their candidates still answer.
 All four are process-local and reset when a node restarts. The
 `single_release` gate therefore opens its account before the cross-C restart,
-samples the volatile node again immediately before issuing it, and archives
-that old process's four readings on the restart step under
-`<service>.pre_restart.*`. A missing pre-restart reading blocks the control and
-a nonzero live incomplete-output gauge refuses the restart; the replacement
-process cannot retroactively supply either fact with its newly initialized
-zeros. The Compose restart itself has an explicit 600-second shutdown timeout
-instead of inheriting the service's multi-hour rollback grace. Once the new
-process answers, the gate re-seeds that node's live account, refreshes it
-through the chain-clock cancellation and both quiescence controls, and records
-the fleet verdict before its final fleet-stop stage. The rollback gate uses the
-same accumulator and refreshes it while every candidate drains.
+splits the volatile node's restart into a watched stop and a later start, and
+samples the old process throughout that stop while it is still serving. The
+stop derives its timeout from the reviewed manifest — the same 20,160-second
+service-manager grace used by rollback and the Compose deployment — so this
+recovery control cannot silently reintroduce a shorter SIGKILL ceiling. After
+the stop and before the start, the gate archives the old process's four last
+readings under `<service>.pre_restart.*` and inspects that exact stopped
+container's exit status as
+`<service>.pre_restart.container_exit_code`. A missing preservation reading or
+exit status blocks the control; a nonzero live incomplete-output gauge or
+nonzero exit status fails it. A truncated stop is a refusal, not a pass, and
+the replacement process cannot retroactively supply either fact with its newly
+initialized zeros. Only after a zero exit status and complete preservation
+account does Compose start the same container. Once the new process answers,
+the gate re-seeds that node's live account, refreshes it through the chain-clock
+cancellation and both quiescence controls, and records the fleet verdict before
+its final fleet-stop stage. The rollback gate uses the same accumulator and
+refreshes it while every candidate drains.
 
 An unreadable signal, an account that does not cover every configured R1
 service exactly once, or a nonzero live gauge refuses either gate because the

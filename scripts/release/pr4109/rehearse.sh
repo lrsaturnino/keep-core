@@ -3177,6 +3177,11 @@ solidity-proofs"
 REHEARSAL_PRIOR_SERVICE="prior-node"
 REHEARSAL_R1_SERVICES=("r1-node-1" "r1-node-2")
 
+# This bounds only the client-info readiness probe after Compose starts a
+# process. It is not a service-manager termination grace: every R1 stop derives
+# that independently reviewed bound from release-manifest.json.
+NODE_REACHABILITY_TIMEOUT_SECONDS=600
+
 # One compose project per rehearsal so `docker compose` resolves the fleet,
 # its volumes, and its two networks by name from any working directory, and
 # so a rollback rehearsal never adopts a cutover rehearsal's containers.
@@ -5790,7 +5795,7 @@ fleet_up() {
   compose up --detach "$@"
 
   local service deadline
-  deadline=$((SECONDS + 600))
+  deadline=$((SECONDS + NODE_REACHABILITY_TIMEOUT_SECONDS))
   for service in "$@"; do
     note "waiting for ${service} to serve its client-info port"
     until node_reachable "${service}"; do
@@ -9350,7 +9355,7 @@ on the rehearsal chain that is still running at shutdown"
   # it holds. A number restated here would go on stopping nodes under the
   # old ceiling the first time the reviewed bounds moved.
   QUIESCE_GRACE="$(manifest_termination_grace)"
-  if ((QUARANTINE_PRESERVATION_SAMPLING == 1)); then
+  if ((SINGLE_RELEASE_QUARANTINE_PRESERVATION_SAMPLING == 1)); then
     sample_quarantine_preservation_signals "${node}"
   fi
   compose stop --timeout "${QUIESCE_GRACE}" "${node}" &
@@ -9436,7 +9441,7 @@ on the rehearsal chain that is still running at shutdown"
       QUIESCE_REFUSALS_AFTER="${refusals_now}"
       QUIESCE_CEREMONY_REFUSALS_AFTER="$(ceremony_refusal_counters "${node}")"
     fi
-    if ((QUARANTINE_PRESERVATION_SAMPLING == 1)); then
+    if ((SINGLE_RELEASE_QUARANTINE_PRESERVATION_SAMPLING == 1)); then
       sample_quarantine_preservation_signals "${node}"
     fi
     # The node going unreachable is the drain finishing, not a failure.
@@ -9775,7 +9780,10 @@ ROLLBACK_REQUIRED_CLASSES="threshold_ceremony bitcoin_action"
 # the end of those controls, so each gate retains the newest numeric reading
 # while the endpoint is still live and records the shared verdict afterwards.
 QUARANTINE_PRESERVATION_READINGS=""
-QUARANTINE_PRESERVATION_SAMPLING=0
+# run_quiescence_control is shared, but only the single-release stage uses it
+# inside the gate's process-local preservation window. Rollback samples the
+# same signals directly in its fleet-drain loop.
+SINGLE_RELEASE_QUARANTINE_PRESERVATION_SAMPLING=0
 
 sample_quarantine_preservation_signals() {
   local service="$1"
@@ -9886,6 +9894,7 @@ quarantine_preservation_verdict() {
   local nodes=0
   local unread="" still_incomplete="" recovered=""
   local unexpected_services="" duplicate_services="" missing_services=""
+  local gauge_errors=""
   local expected seen
   local seen_services=()
 
@@ -9922,8 +9931,6 @@ ${tbtc_incomplete}, beacon incomplete ${beacon_incomplete})"
       continue
     fi
 
-    append_quarantine_preservation_gauges "${service}"
-
     if ((tbtc_incomplete > 0)); then
       still_incomplete="${still_incomplete}${still_incomplete:+, }${service} \
 (tBTC incomplete ${tbtc_incomplete}, grace-exhaustion history \
@@ -9953,6 +9960,20 @@ grace-exhaustion episodes ${beacon_failures}, live incomplete 0)"
     fi
   done
 
+  # Emit only after the accumulator has proved it covers the authoritative
+  # roster exactly once. Walking the roster, rather than the untrusted reading
+  # lines, prevents a duplicated line from producing duplicate JSON keys.
+  # Guard the designed-to-fail emitter so a future mismatch blocks this stage
+  # instead of aborting the entire set -e rehearsal.
+  if [[ -z "${missing_services}${unexpected_services}${duplicate_services}${unread}" ]] &&
+    ((${#REHEARSAL_R1_SERVICES[@]} > 0)); then
+    for expected in "${REHEARSAL_R1_SERVICES[@]}"; do
+      if ! append_quarantine_preservation_gauges "${expected}"; then
+        gauge_errors="${gauge_errors}${gauge_errors:+, }${expected}"
+      fi
+    done
+  fi
+
   if ((${#REHEARSAL_R1_SERVICES[@]} == 0)); then
     block_step "${step}" "the expected R1 service roster is empty; no fleet \
 reading can authorize quarantine preservation"
@@ -9969,9 +9990,10 @@ the authoritative R1 service roster exactly (missing \
 duplicate [${duplicate_services:-none}]); one healthy \
 node cannot stand in for a fleet member that was never sampled"
     record_assertion "${assertion}" false "${step}"
-  elif [[ -n "${unread}" ]]; then
+  elif [[ -n "${unread}${gauge_errors}" ]]; then
     block_step "${step}" "the quarantine-preservation counters or live \
-incomplete-output gauges were unreadable on ${unread}; zero must be a \
+incomplete-output gauges were unreadable on \
+${unread:-${gauge_errors} (evidence gauge emission failed)}; zero must be a \
 node-authored reading, not the value assigned to a node that stopped answering"
     record_assertion "${assertion}" false "${step}"
   elif [[ -n "${still_incomplete}" ]]; then
@@ -11419,11 +11441,6 @@ kept its identity and its mode across the crossing and was allowed to finish"
 # one place and checked rather than repeated at four call sites.
 SINGLE_RELEASE_LEGACY_NODE=""
 SINGLE_RELEASE_VOLATILE_NODE=""
-# The restart is a recovery control, not a second full rollback drain. Bound
-# its stop phase explicitly so a node blocked on an unwritable quarantine
-# namespace produces a named failed control instead of inheriting Compose's
-# multi-hour service grace before the reachability deadline even begins.
-SINGLE_RELEASE_RESTART_TIMEOUT_SECONDS=600
 
 assign_single_release_nodes() {
   SINGLE_RELEASE_LEGACY_NODE="${REHEARSAL_R1_SERVICES[0]:-}"
@@ -11572,101 +11589,181 @@ open_security_v2 within an hour of it"
   # reading in step 4, and then re-seed the replacement process once it answers.
   initialize_quarantine_preservation_readings \
     "${REHEARSAL_R1_SERVICES[@]}"
-  QUARANTINE_PRESERVATION_SAMPLING=1
+  SINGLE_RELEASE_QUARANTINE_PRESERVATION_SAMPLING=1
 
   # Step 4. Mode must come from the canonical anchor and the current chain, so
   # a node that lost its process state entirely must land on the same answer.
   begin_step "restart across C derives mode from the chain, not from process state"
   local restarted="${SINGLE_RELEASE_VOLATILE_NODE}"
-  local deadline
-  sample_quarantine_preservation_signals "${restarted}"
-
-  local pre_restart_account=""
-  local pre_restart_tbtc_failures="unreadable"
-  local pre_restart_beacon_failures="unreadable"
-  local pre_restart_tbtc_incomplete="unreadable"
-  local pre_restart_beacon_incomplete="unreadable"
-  local pre_restart_readable=1
-  if pre_restart_account="$(
-    quarantine_preservation_reading_for "${restarted}"
-  )"; then
-    read -r _ pre_restart_tbtc_failures \
-      pre_restart_beacon_failures pre_restart_tbtc_incomplete \
-      pre_restart_beacon_incomplete <<<"${pre_restart_account}"
-  else
-    pre_restart_readable=0
-  fi
-  if ! append_quarantine_preservation_gauges \
-    "${restarted}" "pre_restart"; then
-    pre_restart_readable=0
-  fi
-
   local restart_step="restart across C derives mode from the chain, not from process state"
   local restart_assertion="a restarted node derives its mode from the canonical anchor and the current chain"
-  if ((pre_restart_readable == 0)); then
-    block_step "${restart_step}" "${restarted} did not publish all four numeric \
-quarantine-preservation signals immediately before restart; the old process is \
-the last source that can say whether it is holding generated output, so the \
-restart was refused rather than replacing an unreadable account with zeros"
+  local restart_grace=""
+  local restarted_container=""
+  if ! restart_grace="$(manifest_termination_grace)"; then
+    block_step "${restart_step}" "the reviewed release manifest did not provide \
+a positive termination grace, so ${restarted} was not stopped under an \
+auditable bound"
     record_assertion "${restart_assertion}" false "${restart_step}"
-  elif ((pre_restart_tbtc_incomplete > 0 || pre_restart_beacon_incomplete > 0)); then
-    record_step "${restart_step}" fail "${restarted} reported live incomplete \
-quarantine output immediately before restart (tBTC \
-${pre_restart_tbtc_incomplete}, beacon ${pre_restart_beacon_incomplete}); the \
-restart was refused because replacing this process would destroy the only live \
-reading of whether that generated output became fully durable"
+  elif ! restarted_container="$(
+    compose ps --all --quiet "${restarted}" 2>/dev/null
+  )" || [[ -z "${restarted_container}" ]]; then
+    block_step "${restart_step}" "${restarted} has no inspectable container; \
+the control cannot prove which old process it stopped or how that process \
+exited"
     record_assertion "${restart_assertion}" false "${restart_step}"
   else
-    local restart_rc=0
-    compose restart --timeout "${SINGLE_RELEASE_RESTART_TIMEOUT_SECONDS}" \
-      "${restarted}" || restart_rc=$?
-
-    deadline=$((SECONDS + SINGLE_RELEASE_RESTART_TIMEOUT_SECONDS))
-    if ((restart_rc == 0)); then
-      until node_reachable "${restarted}"; do
-        if ((SECONDS >= deadline)); then
-          break
-        fi
-        sleep 5
-      done
-    fi
-
-    local restarted_state="" restarted_reachable=0
-    if ((restart_rc == 0)) && node_reachable "${restarted}"; then
-      restarted_reachable=1
-      # This is a new process-local account. Re-seed it rather than letting the
-      # old process's retained values stand for a process that did not publish
-      # them; the separately namespaced pre-restart gauges preserve the only
-      # admissible reading of the old process.
+    # `compose restart` blocks across the entire stop and erases the only
+    # process that can report a preservation failure during its drain. Split
+    # the operation: watch the old process while Compose stops it under the
+    # manifest's reviewed service-manager grace, inspect that exact stopped
+    # container, and only then allow the replacement process to start.
+    sample_quarantine_preservation_signals "${restarted}"
+    compose stop --timeout "${restart_grace}" "${restarted}" &
+    local restart_stop_pid=$!
+    while kill -0 "${restart_stop_pid}" 2>/dev/null; do
       sample_quarantine_preservation_signals "${restarted}"
-      restarted_state="$(
-        participation_field "${restarted}" gate_state 2>/dev/null || true
-      )"
-      observe_canonical_block "${restarted}"
-      observe_gate_gauges "${restarted}"
+      sleep 2
+    done
+
+    local restart_stop_rc=0
+    if wait "${restart_stop_pid}"; then
+      restart_stop_rc=0
+    else
+      restart_stop_rc=$?
+    fi
+    # End the watched window at the stop itself. If the endpoint has already
+    # disappeared the sampler retains its last numeric, node-authored values;
+    # it never substitutes replacement-process zeros.
+    sample_quarantine_preservation_signals "${restarted}"
+
+    local pre_restart_account=""
+    local pre_restart_tbtc_failures="unreadable"
+    local pre_restart_beacon_failures="unreadable"
+    local pre_restart_tbtc_incomplete="unreadable"
+    local pre_restart_beacon_incomplete="unreadable"
+    local pre_restart_readable=1
+    if pre_restart_account="$(
+      quarantine_preservation_reading_for "${restarted}"
+    )"; then
+      read -r _ pre_restart_tbtc_failures \
+        pre_restart_beacon_failures pre_restart_tbtc_incomplete \
+        pre_restart_beacon_incomplete <<<"${pre_restart_account}"
+    else
+      pre_restart_readable=0
+    fi
+    if ! append_quarantine_preservation_gauges \
+      "${restarted}" "pre_restart"; then
+      pre_restart_readable=0
     fi
 
-    if ((restart_rc != 0)); then
-      record_step "${restart_step}" fail "the explicitly bounded restart of \
-${restarted} exited [${restart_rc}] with a \
-${SINGLE_RELEASE_RESTART_TIMEOUT_SECONDS}-second shutdown timeout"
+    # Compose can report a successful stop after Docker exhausted the timeout
+    # and killed the process. Read the old container itself before `start`
+    # resets its state, and archive the code beside that process's last
+    # preservation readings. Only exit zero is a natural, auditable stop.
+    local restart_container_exit_code=""
+    local restart_container_running=""
+    restart_container_exit_code="$(
+      docker inspect --format '{{.State.ExitCode}}' \
+        "${restarted_container}" 2>/dev/null || true
+    )"
+    restart_container_running="$(
+      docker inspect --format '{{.State.Running}}' \
+        "${restarted_container}" 2>/dev/null || true
+    )"
+    if [[ "${restart_container_exit_code}" =~ ^[0-9]+$ ]]; then
+      STEP_GAUGES="${STEP_GAUGES}${STEP_GAUGES:+,}\
+\"${restarted}.pre_restart.container_exit_code\":\
+${restart_container_exit_code}"
+    fi
+
+    local restart_start_rc=0
+    local restarted_state="" restarted_reachable=0
+    if ((restart_stop_rc != 0)); then
+      record_step "${restart_step}" fail "the watched stop of ${restarted} \
+exited [${restart_stop_rc}] under the reviewed ${restart_grace}-second \
+termination grace"
       record_assertion "${restart_assertion}" false "${restart_step}"
-    elif ((restarted_reachable == 0)); then
-      record_step "${restart_step}" fail "${restarted} did not become reachable \
-within ${SINGLE_RELEASE_RESTART_TIMEOUT_SECONDS} seconds after its bounded \
-restart"
+    elif [[ "${restart_container_running}" != "false" ]]; then
+      block_step "${restart_step}" "the old ${restarted} container did not \
+report a stopped state after Compose returned (running \
+[${restart_container_running:-unreadable}]); starting a replacement would \
+overlap an unaccounted-for candidate process"
       record_assertion "${restart_assertion}" false "${restart_step}"
-    elif [[ "${restarted_state}" == "open_security_v2" ]]; then
-      record_step "${restart_step}" pass "${restarted} returned to \
-open_security_v2 after a full restart with no watcher history and no wall-clock \
-input; its old process reported zero live incomplete outputs immediately before \
-the explicitly bounded restart (prior tBTC/beacon write-grace exhaustion \
-counters ${pre_restart_tbtc_failures}/${pre_restart_beacon_failures})"
-      record_assertion "${restart_assertion}" true "${restart_step}"
+    elif [[ ! "${restart_container_exit_code}" =~ ^[0-9]+$ ]]; then
+      block_step "${restart_step}" "the old ${restarted} container published \
+no numeric exit status after its watched stop; a truncated stop is a refusal, \
+not evidence of a clean process restart"
+      record_assertion "${restart_assertion}" false "${restart_step}"
+    elif ((restart_container_exit_code != 0)); then
+      record_step "${restart_step}" fail "the old ${restarted} process exited \
+[${restart_container_exit_code}] under the reviewed ${restart_grace}-second \
+termination grace; the replacement was refused because a killed or otherwise \
+unclean stop cannot prove preservation completed naturally"
+      record_assertion "${restart_assertion}" false "${restart_step}"
+    elif ((pre_restart_readable == 0)); then
+      block_step "${restart_step}" "${restarted} did not publish all four \
+numeric quarantine-preservation signals during its watched stop; the old \
+process was the last source that could say whether it was holding generated \
+output, so the replacement start was refused rather than substituting zeros"
+      record_assertion "${restart_assertion}" false "${restart_step}"
+    elif ((pre_restart_tbtc_incomplete > 0 || pre_restart_beacon_incomplete > 0)); then
+      record_step "${restart_step}" fail "${restarted} reported live \
+incomplete quarantine output during its watched stop (tBTC \
+${pre_restart_tbtc_incomplete}, beacon ${pre_restart_beacon_incomplete}); the \
+replacement was refused because the generated output was not yet fully \
+durable when the old process disappeared"
+      record_assertion "${restart_assertion}" false "${restart_step}"
     else
-      record_step "${restart_step}" fail "${restarted} reported \
+      compose start "${restarted}" || restart_start_rc=$?
+
+      local deadline
+      deadline=$((SECONDS + NODE_REACHABILITY_TIMEOUT_SECONDS))
+      if ((restart_start_rc == 0)); then
+        until node_reachable "${restarted}"; do
+          if ((SECONDS >= deadline)); then
+            break
+          fi
+          sleep 5
+        done
+      fi
+
+      if ((restart_start_rc == 0)) && node_reachable "${restarted}"; then
+        restarted_reachable=1
+        # This is a new process-local account. Re-seed it rather than letting
+        # the old process's retained values stand for a process that did not
+        # publish them; the separately namespaced pre-restart gauges preserve
+        # the old process's watched drain account.
+        sample_quarantine_preservation_signals "${restarted}"
+        restarted_state="$(
+          participation_field "${restarted}" gate_state 2>/dev/null || true
+        )"
+        observe_canonical_block "${restarted}"
+        observe_gate_gauges "${restarted}"
+      fi
+
+      if ((restart_start_rc != 0)); then
+        record_step "${restart_step}" fail "the cleanly stopped ${restarted} \
+container could not be started again (Compose exited \
+[${restart_start_rc}])"
+        record_assertion "${restart_assertion}" false "${restart_step}"
+      elif ((restarted_reachable == 0)); then
+        record_step "${restart_step}" fail "${restarted} did not become \
+reachable within ${NODE_REACHABILITY_TIMEOUT_SECONDS} seconds after its clean \
+watched stop and start"
+        record_assertion "${restart_assertion}" false "${restart_step}"
+      elif [[ "${restarted_state}" == "open_security_v2" ]]; then
+        record_step "${restart_step}" pass "${restarted} returned to \
+open_security_v2 after a full restart with no watcher history and no wall-clock \
+input; its old process exited zero under the reviewed ${restart_grace}-second \
+termination grace and reported zero live incomplete outputs throughout the \
+watched stop (prior tBTC/beacon write-grace exhaustion counters \
+${pre_restart_tbtc_failures}/${pre_restart_beacon_failures})"
+        record_assertion "${restart_assertion}" true "${restart_step}"
+      else
+        record_step "${restart_step}" fail "${restarted} reported \
 [${restarted_state:-unreadable}] after restart"
-      record_assertion "${restart_assertion}" false "${restart_step}"
+        record_assertion "${restart_assertion}" false "${restart_step}"
+      fi
     fi
   fi
 
@@ -11965,7 +12062,7 @@ that reason and its drain says nothing about quiescence"
   for service in "${REHEARSAL_R1_SERVICES[@]}"; do
     sample_quarantine_preservation_signals "${service}"
   done
-  QUARANTINE_PRESERVATION_SAMPLING=0
+  SINGLE_RELEASE_QUARANTINE_PRESERVATION_SAMPLING=0
 
   begin_step "quarantine preservation is complete through quiescence"
   quarantine_preservation_verdict \
@@ -13264,6 +13361,36 @@ evidence_acceptance_findings() {
               "expected fleet roster"
           );
         } else {
+          const exitCodeName =
+            restartService + ".pre_restart.container_exit_code";
+          const exitCode = readGauge(
+            restartStageName,
+            restartGauges,
+            exitCodeName,
+            "pre-restart container exit-status"
+          );
+          if (
+            exitCode !== undefined &&
+            (!Number.isInteger(exitCode) || exitCode < 0)
+          ) {
+            add(
+              "unrehearsed",
+              "single_release restart node " +
+                JSON.stringify(restartService) +
+                " carries an invalid old-process exit status: " +
+                JSON.stringify(exitCodeName) + " is " + exitCode
+            );
+          } else if (exitCode !== undefined && exitCode !== 0) {
+            add(
+              "refuted",
+              "single_release restart node " +
+                JSON.stringify(restartService) +
+                " did not stop naturally: old process exit status " +
+                JSON.stringify(exitCodeName) + " is " + exitCode +
+                "; a killed or otherwise truncated stop cannot authorize " +
+                "starting the replacement process"
+            );
+          }
           for (const signal of quarantineSignals) {
             const prefix = restartService + ".pre_restart.";
             const counterName = prefix + signal.counter;

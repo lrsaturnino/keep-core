@@ -182,7 +182,8 @@ SINGLE_RELEASE_STAGES='
       "r1-node-2.pre_restart.participation_tbtc_quarantine_preservation_failures_total": 0,
       "r1-node-2.pre_restart.participation_beacon_quarantine_preservation_failures_total": 0,
       "r1-node-2.pre_restart.participation_tbtc_quarantine_incomplete_outputs": 0,
-      "r1-node-2.pre_restart.participation_beacon_quarantine_incomplete_outputs": 0
+      "r1-node-2.pre_restart.participation_beacon_quarantine_incomplete_outputs": 0,
+      "r1-node-2.pre_restart.container_exit_code": 0
     } },
   { "name": "post-cutover straggler fails closed and enters the roster", "outcome": "pass" },
   { "name": "90/10 DKG consequence is visible with the straggler eligible", "outcome": "pass" },
@@ -1245,6 +1246,55 @@ run_validator "${D}"
 check "a recovered pre-restart episode remains visible after counters reset" 0 \
   "non-fatal recovered quarantine evidence.*single_release restart node.*tBTC.*before restart reset its process-local counters"
 
+# Compose returning from a stop does not say the old process exited naturally:
+# Docker may have exhausted the timeout and killed it. The producer therefore
+# records the stopped container's own exit code before `compose start`, and an
+# archive without that reading cannot authorize the replacement process.
+D="${WORK}/accept-restart-missing-container-exit-status"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  const stage = record.stages.find(
+    ({ name }) =>
+      name ===
+      "restart across C derives mode from the chain, not from process state"
+  );
+  delete stage.gauges["r1-node-2.pre_restart.container_exit_code"];
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "single-release acceptance requires the old process exit status" 3 \
+  "single_release step.*restart across C.*carries no pre-restart container exit-status reading of.*r1-node-2.pre_restart.container_exit_code"
+
+# Exit 137 is the exact state a timed-out Docker stop leaves after SIGKILL. A
+# fabricated passing step carrying it must be refuted independently of the
+# producer-side branch that refuses to start the replacement.
+D="${WORK}/accept-restart-killed-container"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  const stage = record.stages.find(
+    ({ name }) =>
+      name ===
+      "restart across C derives mode from the chain, not from process state"
+  );
+  stage.gauges["r1-node-2.pre_restart.container_exit_code"] = 137;
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "a killed old process refutes single-release acceptance" 1 \
+  "single_release restart node.*did not stop naturally.*container_exit_code.*137.*truncated stop"
+
 # The single-release gate is itself where the clock-failure and quiescence
 # controls can strand generated output. Its preservation stage therefore
 # carries the same four node-authored signals as rollback, before the final
@@ -2195,7 +2245,7 @@ complete_run() {
       # The process about to disappear is the only author of these readings.
       # Keep them distinct from the replacement process's same metric names.
       # shellcheck disable=SC2034
-      STEP_GAUGES='"r1-node-2.pre_restart.participation_tbtc_quarantine_preservation_failures_total":0,"r1-node-2.pre_restart.participation_beacon_quarantine_preservation_failures_total":0,"r1-node-2.pre_restart.participation_tbtc_quarantine_incomplete_outputs":0,"r1-node-2.pre_restart.participation_beacon_quarantine_incomplete_outputs":0'
+      STEP_GAUGES='"r1-node-2.pre_restart.participation_tbtc_quarantine_preservation_failures_total":0,"r1-node-2.pre_restart.participation_beacon_quarantine_preservation_failures_total":0,"r1-node-2.pre_restart.participation_tbtc_quarantine_incomplete_outputs":0,"r1-node-2.pre_restart.participation_beacon_quarantine_incomplete_outputs":0,"r1-node-2.pre_restart.container_exit_code":0'
     elif [[ "${stage}" == \
       "quarantine preservation is complete through quiescence" ]]; then
       # shellcheck disable=SC2034
@@ -8352,21 +8402,104 @@ assign_single_release_nodes
 
 CONTROL_ORDER="$(single_release_control_order)"
 
-# A restart with no explicit timeout inherits the service's full rollback
-# grace, currently measured in hours, and the reachability deadline does not
-# begin until that wait returns. Hold the destructive control to its named,
-# positive bound so an unwritable quarantine namespace cannot stall the
-# rehearsal invisibly.
+# The archive reader selects the volatile service by index from the evidence
+# roster. Bind that index to assign_single_release_nodes with three distinct
+# nodes so the test proves the index itself, not merely that both default roles
+# happen to exist.
+RESTART_READER_INDEX="$(
+  sed -n \
+    's/^[[:space:]]*const restartService = expectedServices\[\([0-9][0-9]*\)\];[[:space:]]*$/\1/p' \
+    "${TEST_DIR}/rehearse.sh"
+)"
+REHEARSAL_R1_SERVICES=("r1-node-a" "r1-node-b" "r1-node-c")
+if [[ "${RESTART_READER_INDEX}" =~ ^[0-9]+$ ]] &&
+  assign_single_release_nodes &&
+  [[ "${SINGLE_RELEASE_VOLATILE_NODE}" == \
+  "${REHEARSAL_R1_SERVICES[${RESTART_READER_INDEX}]:-}" ]]; then
+  pass_case "the archive restart reader selects the assigned volatile node"
+else
+  fail_case "the archive restart reader selects the assigned volatile node" \
+    "reader index [${RESTART_READER_INDEX:-missing}], volatile \
+[${SINGLE_RELEASE_VOLATILE_NODE:-missing}], roster \
+[${REHEARSAL_R1_SERVICES[*]}]"
+fi
+REHEARSAL_R1_SERVICES=("${SAVED_R1_SERVICES[@]}")
+assign_single_release_nodes
+
+# A recovery restart uses the same reviewed termination grace as every other
+# R1 stop. A separate 600-second ceiling would SIGKILL a process that is still
+# inside its manifest-authorized drain and erase the preservation counters the
+# control is supposed to judge.
+SINGLE_RELEASE_SOURCE="$(declare -f stage_single_release)"
+# shellcheck disable=SC2016
+if printf '%s\n' "${SINGLE_RELEASE_SOURCE}" |
+  grep -Fq 'restart_grace="$(manifest_termination_grace)"' &&
+  printf '%s\n' "${SINGLE_RELEASE_SOURCE}" |
+  grep -Fq 'compose stop --timeout "${restart_grace}" "${restarted}" &' &&
+  ! printf '%s\n' "${SINGLE_RELEASE_SOURCE}" |
+  grep -Eq '^[[:space:]]*compose restart([[:space:]]|$)'; then
+  pass_case "the cross-C stop derives its timeout from the reviewed manifest"
+else
+  fail_case "the cross-C stop derives its timeout from the reviewed manifest"
+fi
+
+# Preserve the original positive-bound assertion while strengthening where its
+# value comes from: the timeout is still explicit at the Compose boundary, but
+# the positive number is now the reviewed manifest value rather than a local
+# 600-second restatement.
+RESTART_REVIEWED_GRACE="$(manifest_termination_grace)"
 # The literal function source is the subject of the single-quoted grep.
 # shellcheck disable=SC2016
-if [[ "${SINGLE_RELEASE_RESTART_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ ]] &&
-  declare -f stage_single_release |
-  grep -Fq \
-    'compose restart --timeout "${SINGLE_RELEASE_RESTART_TIMEOUT_SECONDS}"'; then
+if [[ "${RESTART_REVIEWED_GRACE}" =~ ^[1-9][0-9]*$ ]] &&
+  printf '%s\n' "${SINGLE_RELEASE_SOURCE}" |
+  grep -Fq 'compose stop --timeout "${restart_grace}" "${restarted}" &'; then
   pass_case "the cross-C restart has an explicit positive shutdown timeout"
 else
   fail_case "the cross-C restart has an explicit positive shutdown timeout" \
-    "timeout [${SINGLE_RELEASE_RESTART_TIMEOUT_SECONDS:-unset}]"
+    "manifest grace [${RESTART_REVIEWED_GRACE:-unset}]"
+fi
+
+# The order is the preservation property: sample while the old stop is live,
+# wait for it, inspect that exact stopped container, and only then start it.
+# Merely bracketing an atomic restart would lose a counter increment in the
+# stop window with the process that authored it.
+RESTART_CONTROL_ORDER="$(
+  printf '%s\n' "${SINGLE_RELEASE_SOURCE}" | awk '
+    /compose stop --timeout "\$\{restart_grace\}" "\$\{restarted\}" &/ {
+      watching = 1
+      print "stop"
+      next
+    }
+    watching && /while kill -0 "\$\{restart_stop_pid\}"/ {
+      print "poll"
+      next
+    }
+    watching && !sampled &&
+      /sample_quarantine_preservation_signals "\$\{restarted\}"/ {
+      sampled = 1
+      print "sample"
+      next
+    }
+    watching && /wait "\$\{restart_stop_pid\}"/ {
+      print "wait"
+      next
+    }
+    watching && /State.ExitCode/ {
+      print "inspect-exit"
+      next
+    }
+    watching && /compose start "\$\{restarted\}"/ {
+      print "start"
+      exit
+    }
+  '
+)"
+if [[ "${RESTART_CONTROL_ORDER}" == \
+  $'stop\npoll\nsample\nwait\ninspect-exit\nstart' ]]; then
+  pass_case "the cross-C restart watches and inspects the old stop before start"
+else
+  fail_case "the cross-C restart watches and inspects the old stop before start" \
+    "observed order [${RESTART_CONTROL_ORDER//$'\n'/, }]"
 fi
 
 # Every control the sequence turns on has to be present and resolved. A site
