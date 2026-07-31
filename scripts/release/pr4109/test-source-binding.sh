@@ -113,11 +113,11 @@ DEFAULT_SOLIDITY_JOB="  ${SOLIDITY_PROOFS_JOB}:
       - uses: actions/checkout@v4
       - uses: ${SETUP_NODE_ACTION}@v4
         with:
-          node-version: \"18.15.0\""
+          node-version: \"22.23.1\""
 DEFAULT_CONTRACTS_STEPS="      - uses: actions/checkout@v3
       - uses: ${SETUP_NODE_ACTION}@v3
         with:
-          node-version: \"18.15.0\"
+          node-version: \"22.23.1\"
       - uses: ./.github/actions/install-yarn-deps
         with:
           working-directory: ./solidity/ecdsa"
@@ -2307,7 +2307,7 @@ make_toolchain_repo "${T}" "${DEFAULT_CONTRACTS_STEPS}"
 run_toolchain_pin "${T}"
 check "contracts toolchain: the named job's pin is the one both sides are \
 held to" 0 \
-  "both pin Node 18\.15\.0"
+  "both pin Node 22\.23\.1"
 
 # The jobs on either side of the named one pin other releases, so a resolution
 # reading the workflow rather than the job would resolve one of those.
@@ -2338,19 +2338,19 @@ run_toolchain_pin "${T}"
 check "contracts toolchain: a dispatch provisioning another release fails \
 closed" 1 \
   "provisions Node 20\.11\.0 while" \
-  "pins 18\.15\.0" \
+  "pins 22\.23\.1" \
   "evidence produced on another toolchain is not its evidence"
 
 # The direction the constant made invisible: CI moves, the scaffold does not.
 T="${WORK}/toolchain-ci-bumped"
 make_toolchain_repo "${T}" "      - uses: ${SETUP_NODE_ACTION}@v3
         with:
-          node-version: \"22.11.0\""
+          node-version: \"23.0.0\""
 run_toolchain_pin "${T}"
 check "contracts toolchain: a bump in CI the scaffold has not followed fails \
 closed" 1 \
-  "provisions Node 18\.15\.0 while" \
-  "pins 22\.11\.0"
+  "provisions Node 22\.23\.1 while" \
+  "pins 23\.0\.0"
 
 T="${WORK}/toolchain-no-pin"
 make_toolchain_repo "${T}" "      - uses: ${SETUP_NODE_ACTION}@v3
