@@ -146,20 +146,35 @@ cmd-help: build
 	@echo '$$ $(app_name) start --help' > docs/resources/client-start-help
 	./$(app_name) start --help >> docs/resources/client-start-help
 
-# verify-cutover is the repository-owned completion gate for changes to the
-# coordinated cutover. Keeping the Go checks and rehearsal-scaffold analysis
-# behind one entry point prevents a green Go-only run from masking a broken
-# workflow, evidence validator, or shell harness.
+# verify-cutover is the repository-owned automation-loop completion subset for
+# changes to the coordinated cutover. It deliberately does not stand in for
+# the separately evidenced local-proofs, static-analysis, or solidity-proofs
+# release stages. verify-cutover-release-local composes all repository-local
+# stages; neither target replaces the exact-image cutover and rollback gates.
 EVIDENCE_DIR ?= $(CURDIR)/rehearsal-evidence
 
-verify-cutover:
+verify-cutover-go:
 	go build ./...
 	go vet ./...
 	go test -timeout 15m ./...
 	go test -race -timeout 5m ./pkg/protocol/...
+
+verify-cutover: verify-cutover-go
 	@mkdir -p "$(EVIDENCE_DIR)"
 	EVIDENCE_DIR="$(EVIDENCE_DIR)" \
 		./scripts/release/pr4109/rehearse.sh shell-analysis
-	@echo 'PASS: build+vet+unit-suite+participation-race+scaffold-shell-analysis green'
+	@echo 'PASS: cutover automation subset: build+vet+unit-suite+participation-race+scaffold-shell-analysis green'
 
-.PHONY: all development sepolia download_artifacts generate gen_proto build cmd-help release build_multi verify-cutover
+verify-cutover-release-local: verify-cutover-go
+	@mkdir -p "$(EVIDENCE_DIR)"
+	EVIDENCE_DIR="$(EVIDENCE_DIR)" \
+		./scripts/release/pr4109/rehearse.sh local-proofs
+	EVIDENCE_DIR="$(EVIDENCE_DIR)" \
+		./scripts/release/pr4109/rehearse.sh static-analysis
+	EVIDENCE_DIR="$(EVIDENCE_DIR)" \
+		./scripts/release/pr4109/rehearse.sh solidity-proofs
+	EVIDENCE_DIR="$(EVIDENCE_DIR)" \
+		./scripts/release/pr4109/rehearse.sh shell-analysis
+	@echo 'PASS: repository-local cutover release stages green; exact-image rehearsals not run'
+
+.PHONY: all development sepolia download_artifacts generate gen_proto build cmd-help release build_multi verify-cutover-go verify-cutover verify-cutover-release-local

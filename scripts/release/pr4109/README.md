@@ -54,8 +54,8 @@ fail-closed binding instead: the stage refuses to run at all unless the
 tree under test is exactly that commit, so a log carrying a verified stamp
 is proof the stamped bytes were the tested bytes.
 
-For a local or automation-loop completion check, use the repository-owned
-aggregate gate from the repository root:
+For a fast local or automation-loop completion check, use the repository-owned
+subset gate from the repository root:
 
 ```
 make verify-cutover
@@ -65,8 +65,23 @@ It runs `go build ./...`, `go vet ./...`, the full unit suite, the protocol
 packages under the race detector, and `shell-analysis` as one fail-fast
 command. A Go-only completion command is not sufficient for changes that can
 reach this scaffold, because it does not exercise the workflow and evidence
-validators. Set `EVIDENCE_DIR` to place the analysis log somewhere other than
-the ignored repository-root `rehearsal-evidence/` directory.
+validators. This is an automation-completion subset, not release approval: it
+does not run the separately evidenced `local-proofs`, `static-analysis`, or
+`solidity-proofs` stages and does not exercise either exact-image rehearsal.
+
+To run every repository-local release stage through one entry point while
+preserving each stage's separate evidence log, use:
+
+```
+make verify-cutover-release-local
+```
+
+That target adds `local-proofs`, `static-analysis`, and `solidity-proofs` to
+the build, vet, full unit suite, protocol race suite, and `shell-analysis`.
+It still cannot authorize a release: the native-platform exact-image cutover
+and homogeneous rollback rehearsals remain mandatory external gates. Set
+`EVIDENCE_DIR` for either target to place logs somewhere other than the ignored
+repository-root `rehearsal-evidence/` directory.
 
 The offline state classification the rollback barrier requires runs with
 `go run ./cmd/participation-state-audit --storage-snapshot <copy>`: it
