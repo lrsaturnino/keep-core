@@ -85,10 +85,12 @@ func TestSignalLifecycleController_FirstSignalPreventsNewPermits(t *testing.T) {
 	defer cancelRunCtx()
 
 	signals := make(chan os.Signal, 2)
+	evidenceWindow := participation.NewCutoverEvidenceWindowSignal()
 	shutdownChan := startSignalLifecycleController(
 		runCtx,
 		cancelRunCtx,
 		gate,
+		evidenceWindow,
 		signals,
 		time.Hour,
 		time.Hour,
@@ -115,6 +117,13 @@ func TestSignalLifecycleController_FirstSignalPreventsNewPermits(t *testing.T) {
 			t.Fatal("the gate never started refusing new permits")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+
+	if !evidenceWindow.Active() {
+		t.Fatal("the termination signal did not open the rollback evidence window")
+	}
+	if evidenceWindow.SetActive(false) {
+		t.Fatal("the rollback evidence window was not held active during quiescence")
 	}
 
 	// The drain must wait for the in-flight permit: no shutdown report and no
@@ -295,6 +304,7 @@ func TestSignalLifecycleController_TeardownFitsExitHeadroom(t *testing.T) {
 		runCtx,
 		cancelRunCtx,
 		gate,
+		participation.NewCutoverEvidenceWindowSignal(),
 		signals,
 		backstop,
 		allowance,
@@ -381,6 +391,7 @@ func TestSignalLifecycleController_JoinsForcedCancellationCleanup(t *testing.T) 
 		runCtx,
 		cancelRunCtx,
 		gate,
+		participation.NewCutoverEvidenceWindowSignal(),
 		signals,
 		time.Hour,
 		time.Hour,
@@ -478,6 +489,7 @@ func TestSignalLifecycleController_CancellationAllowanceBoundsTheWait(
 		runCtx,
 		cancelRunCtx,
 		gate,
+		participation.NewCutoverEvidenceWindowSignal(),
 		signals,
 		time.Hour,
 		allowance,

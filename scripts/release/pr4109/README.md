@@ -1633,6 +1633,22 @@ since that means the inputs never validated and the record would be about
 nothing. Both fleets are torn down and both records are archived whatever
 happened.
 
+## Node-local roster evidence window
+
+Go/no-go tooling opens the node-local roster evidence window by delivering
+`SIGUSR1` to every R1 process and closes it with `SIGUSR2` after the evidence
+archive has captured the required interval. For a host process that is
+`kill -USR1 <pid>` and `kill -USR2 <pid>`; for a container use the runtime's
+equivalent named-signal operation. While the window is open, each node emits
+the deterministic roster snapshot INFO line every five minutes even when the
+roster is empty. Outside the window, the same cadence emits only while the
+post-cutover legacy-peer roster is nonempty.
+
+These signals control logging only. They cannot select a protocol mode, issue
+a permit, classify a peer, or authorize a commit. A termination signal holds
+the window open before quiescence begins, and `SIGUSR2` cannot close that held
+rollback window while the process drains.
+
 ## Release manifest: service-manager termination grace
 
 A terminating node drains instead of dying: the first SIGTERM quiesces the

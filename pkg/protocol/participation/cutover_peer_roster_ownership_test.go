@@ -115,3 +115,124 @@ func TestProductionCutoverRosterUsesGateSchedule(t *testing.T) {
 		)
 	}
 }
+
+// TestProductionCutoverRosterUsesOperationalEvidenceWindow holds production
+// construction to one logging-only signal shared by the roster, the operator
+// SIGUSR controller, and rollback quiescence. Independently constructed
+// signals would make one of those controls appear wired while it changed an
+// object the periodic roster logger never reads.
+func TestProductionCutoverRosterUsesOperationalEvidenceWindow(t *testing.T) {
+	repoRoot, err := filepath.Abs(filepath.Join("..", "..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(repoRoot, "cmd", "start.go")
+	fileSet := token.NewFileSet()
+	file, err := parser.ParseFile(fileSet, path, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	constructions := 0
+	var (
+		constructedSignal string
+		rosterSignal      string
+		operatorSignal    string
+		quiescenceSignal  string
+	)
+
+	ast.Inspect(file, func(node ast.Node) bool {
+		switch typedNode := node.(type) {
+		case *ast.AssignStmt:
+			if len(typedNode.Lhs) != 1 || len(typedNode.Rhs) != 1 {
+				return true
+			}
+
+			call, ok := typedNode.Rhs[0].(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			selector, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok ||
+				selector.Sel.Name != "NewCutoverEvidenceWindowSignal" {
+				return true
+			}
+
+			constructions++
+			if signal, ok := typedNode.Lhs[0].(*ast.Ident); ok {
+				constructedSignal = signal.Name
+			}
+		case *ast.CallExpr:
+			switch functionName(typedNode.Fun) {
+			case "NewCutoverPeerRoster":
+				for _, argument := range typedNode.Args {
+					optionCall, ok := argument.(*ast.CallExpr)
+					if !ok ||
+						functionName(optionCall.Fun) !=
+							"WithCutoverEvidenceWindowSignal" ||
+						len(optionCall.Args) != 1 {
+						continue
+					}
+					rosterSignal = expressionIdentifier(optionCall.Args[0])
+				}
+			case "startEvidenceWindowSignalController":
+				if len(typedNode.Args) >= 2 {
+					operatorSignal = expressionIdentifier(typedNode.Args[1])
+				}
+			case "startSignalLifecycleController":
+				if len(typedNode.Args) >= 4 {
+					quiescenceSignal = expressionIdentifier(typedNode.Args[3])
+				}
+			}
+		}
+
+		return true
+	})
+
+	if constructions != 1 {
+		t.Errorf(
+			"expected one production evidence-window signal construction, "+
+				"found [%d]",
+			constructions,
+		)
+	}
+	for owner, signal := range map[string]string{
+		"roster":                rosterSignal,
+		"operator controller":   operatorSignal,
+		"quiescence controller": quiescenceSignal,
+	} {
+		if signal == "" {
+			t.Errorf("%s does not receive an evidence-window signal", owner)
+			continue
+		}
+		if signal != constructedSignal {
+			t.Errorf(
+				"%s uses evidence-window signal [%s], want the production "+
+					"signal [%s]",
+				owner,
+				signal,
+				constructedSignal,
+			)
+		}
+	}
+}
+
+func functionName(expression ast.Expr) string {
+	switch typedExpression := expression.(type) {
+	case *ast.Ident:
+		return typedExpression.Name
+	case *ast.SelectorExpr:
+		return typedExpression.Sel.Name
+	default:
+		return ""
+	}
+}
+
+func expressionIdentifier(expression ast.Expr) string {
+	identifier, ok := expression.(*ast.Ident)
+	if !ok {
+		return ""
+	}
+	return identifier.Name
+}

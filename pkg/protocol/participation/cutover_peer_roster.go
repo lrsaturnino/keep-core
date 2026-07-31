@@ -47,7 +47,7 @@ const (
 	// rosterSweepInterval is how often the background loop reads the chain clock
 	// to evict stale entries and refresh metrics.
 	rosterSweepInterval = 30 * time.Second
-	// rosterSnapshotLogInterval is how often a nonempty roster snapshot is
+	// rosterSnapshotLogInterval is how often a required roster snapshot is
 	// logged at INFO.
 	rosterSnapshotLogInterval = 5 * time.Minute
 )
@@ -94,8 +94,66 @@ type CutoverRosterMetricsRecorder interface {
 	SetGauge(name string, value float64)
 }
 
+// CutoverEvidenceWindowSignal is an operator-controlled, process-local signal
+// indicating that periodic cutover roster logs are being captured as
+// go/no-go or rollback evidence. It controls only whether an empty roster is
+// logged: it is never consulted by Gate, ObserveLegacy, or any protocol-mode
+// decision.
+//
+// The zero value is an inactive, usable signal.
+type CutoverEvidenceWindowSignal struct {
+	mutex      sync.RWMutex
+	active     bool
+	heldActive bool
+}
+
+// NewCutoverEvidenceWindowSignal creates an inactive evidence-window signal.
+func NewCutoverEvidenceWindowSignal() *CutoverEvidenceWindowSignal {
+	return &CutoverEvidenceWindowSignal{}
+}
+
+// Active reports whether periodic roster logs must include an empty snapshot.
+func (s *CutoverEvidenceWindowSignal) Active() bool {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+
+	return s.active
+}
+
+// SetActive opens or closes the evidence window and reports whether its state
+// changed. A signal held active for rollback cannot be closed.
+func (s *CutoverEvidenceWindowSignal) SetActive(active bool) bool {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	if !active && s.heldActive {
+		return false
+	}
+	if s.active == active {
+		return false
+	}
+
+	s.active = active
+	return true
+}
+
+// HoldActive opens the evidence window irreversibly for this process and
+// reports whether its visible state changed. The shutdown controller uses this
+// before quiescence so a later operator close signal cannot suppress rollback
+// evidence while the process is draining.
+func (s *CutoverEvidenceWindowSignal) HoldActive() bool {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	changed := !s.active
+	s.active = true
+	s.heldActive = true
+	return changed
+}
+
 type cutoverPeerRosterOptions struct {
-	cutoverBlock uint64
+	cutoverBlock   uint64
+	evidenceWindow *CutoverEvidenceWindowSignal
 }
 
 // CutoverPeerRosterOption configures immutable cutover context used by the
@@ -113,6 +171,22 @@ func WithCutoverSchedule(schedule Schedule) CutoverPeerRosterOption {
 		}
 
 		options.cutoverBlock = schedule.CutoverBlock
+		return nil
+	}
+}
+
+// WithCutoverEvidenceWindowSignal supplies the process-local evidence-window
+// signal observed by the roster's periodic logger. The signal has no effect on
+// roster contents, cutover classification, or protocol authorization.
+func WithCutoverEvidenceWindowSignal(
+	signal *CutoverEvidenceWindowSignal,
+) CutoverPeerRosterOption {
+	return func(options *cutoverPeerRosterOptions) error {
+		if signal == nil {
+			return fmt.Errorf("cutover evidence-window signal is required")
+		}
+
+		options.evidenceWindow = signal
 		return nil
 	}
 }
@@ -144,6 +218,7 @@ type CutoverPeerRoster struct {
 	blockCounter    chain.BlockCounter
 	retentionBlocks uint64
 	cutoverBlock    uint64
+	evidenceWindow  *CutoverEvidenceWindowSignal
 	metrics         CutoverRosterMetricsRecorder
 	clock           func() time.Time
 
@@ -193,7 +268,9 @@ func newCutoverPeerRoster(
 	clock func() time.Time,
 	optionFunctions ...CutoverPeerRosterOption,
 ) (*CutoverPeerRoster, error) {
-	options := &cutoverPeerRosterOptions{}
+	options := &cutoverPeerRosterOptions{
+		evidenceWindow: NewCutoverEvidenceWindowSignal(),
+	}
 	for _, option := range optionFunctions {
 		if option == nil {
 			return nil, fmt.Errorf("nil cutover peer roster option")
@@ -233,6 +310,7 @@ func newCutoverPeerRoster(
 		blockCounter:    blockCounter,
 		retentionBlocks: retentionBlocks,
 		cutoverBlock:    options.cutoverBlock,
+		evidenceWindow:  options.evidenceWindow,
 		metrics:         metrics,
 		clock:           clock,
 		logLimiter:      rate.NewLimiter(rate.Every(30*time.Second), 5),
@@ -292,7 +370,7 @@ func (r *CutoverPeerRoster) run() {
 			now := r.clock()
 			if now.Sub(lastSnapshotLog) >= rosterSnapshotLogInterval {
 				lastSnapshotLog = now
-				r.logSnapshotIfNonEmpty()
+				r.logSnapshotIfRequired()
 			}
 		}
 	}
@@ -558,15 +636,22 @@ func (r *CutoverPeerRoster) oldestFirstSeenBlockLocked() (uint64, bool) {
 	return oldest, found
 }
 
-func (r *CutoverPeerRoster) logSnapshotIfNonEmpty() {
+// logSnapshotIfRequired emits the periodic roster evidence line when a
+// post-cutover legacy peer is retained or when operators have explicitly
+// opened an evidence window. The latter includes an empty roster because
+// "zero observed peers" is itself required go/no-go and rollback evidence.
+func (r *CutoverPeerRoster) logSnapshotIfRequired() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if len(r.peers) == 0 {
+	if len(r.peers) == 0 && !r.evidenceWindow.Active() {
 		return
 	}
 
-	oldestFirstSeen, _ := r.oldestFirstSeenBlockLocked()
+	oldestFirstSeen, hasPeers := r.oldestFirstSeenBlockLocked()
+	if !hasPeers {
+		oldestFirstSeen = 0
+	}
 	rosterLogger.Infof(
 		"protocol cutover peer roster snapshot [currentBlock=%d] "+
 			"[clockAvailable=%t] [legacyPeers=%d] [oldestFirstSeenBlock=%d] "+

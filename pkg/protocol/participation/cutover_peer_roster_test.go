@@ -251,6 +251,21 @@ func TestCutoverPeerRoster_ConstructionRejectsUnprojectableCutoverSchedule(
 	}
 }
 
+func TestCutoverPeerRoster_ConstructionRejectsNilEvidenceWindowSignal(
+	t *testing.T,
+) {
+	_, err := NewCutoverPeerRoster(
+		context.Background(),
+		newFakeBlockCounter(0),
+		1000,
+		newFakeMetrics(),
+		WithCutoverEvidenceWindowSignal(nil),
+	)
+	if err == nil {
+		t.Fatal("expected an error for a nil evidence-window signal")
+	}
+}
+
 func TestCutoverPeerRoster_ConstructionInitializesMetricsAtZero(t *testing.T) {
 	_, _, metrics := newTestRoster(t, 100, 1000)
 
@@ -724,5 +739,220 @@ func TestCutoverPeerRoster_ConcurrentCloseSafe(t *testing.T) {
 	case <-thirdDone:
 	case <-time.After(5 * time.Second):
 		t.Fatal("a Close after shutdown blocked; Close is not idempotent")
+	}
+}
+
+func TestCutoverPeerRoster_EmptySnapshotDuringEvidenceWindow(t *testing.T) {
+	const currentBlock = uint64(1005)
+
+	expected := fmt.Sprintf(
+		"protocol cutover peer roster snapshot [currentBlock=%d] "+
+			"[clockAvailable=true] [legacyPeers=0] "+
+			"[oldestFirstSeenBlock=0] [rosterRevision=0]",
+		currentBlock,
+	)
+
+	entries := captureRosterLogs(t, func() {
+		evidenceWindow := NewCutoverEvidenceWindowSignal()
+		roster, err := newCutoverPeerRoster(
+			context.Background(),
+			newFakeBlockCounter(currentBlock),
+			1000,
+			newFakeMetrics(),
+			fixedClock(),
+			WithCutoverEvidenceWindowSignal(evidenceWindow),
+		)
+		if err != nil {
+			t.Fatalf("failed to construct roster: [%v]", err)
+		}
+
+		evidenceWindow.SetActive(true)
+		roster.logSnapshotIfRequired()
+		roster.Close()
+	})
+
+	assertRosterLogCount(t, entries, expected, 1)
+}
+
+func TestCutoverPeerRoster_NonemptySnapshotOutsideEvidenceWindowAfterCutover(
+	t *testing.T,
+) {
+	const (
+		cutoverBlock = uint64(1000)
+		currentBlock = cutoverBlock + 5
+	)
+
+	expected := fmt.Sprintf(
+		"protocol cutover peer roster snapshot [currentBlock=%d] "+
+			"[clockAvailable=true] [legacyPeers=1] "+
+			"[oldestFirstSeenBlock=%d] [rosterRevision=1]",
+		currentBlock,
+		currentBlock,
+	)
+
+	entries := captureRosterLogs(t, func() {
+		evidenceWindow := NewCutoverEvidenceWindowSignal()
+		roster, err := newCutoverPeerRoster(
+			context.Background(),
+			newFakeBlockCounter(currentBlock),
+			1000,
+			newFakeMetrics(),
+			fixedClock(),
+			WithCutoverSchedule(Schedule{CutoverBlock: cutoverBlock}),
+			WithCutoverEvidenceWindowSignal(evidenceWindow),
+		)
+		if err != nil {
+			t.Fatalf("failed to construct roster: [%v]", err)
+		}
+
+		observeStraggler(roster, "tbtc-dkg", 3, validAddress(1))
+		roster.logSnapshotIfRequired()
+		roster.Close()
+	})
+
+	assertRosterLogCount(t, entries, expected, 1)
+}
+
+func TestCutoverPeerRoster_ClockUnavailableSnapshotDuringEvidenceWindow(
+	t *testing.T,
+) {
+	const lastCurrentBlock = uint64(900)
+
+	expected := fmt.Sprintf(
+		"protocol cutover peer roster snapshot [currentBlock=%d] "+
+			"[clockAvailable=false] [legacyPeers=0] "+
+			"[oldestFirstSeenBlock=0] [rosterRevision=0]",
+		lastCurrentBlock,
+	)
+
+	entries := captureRosterLogs(t, func() {
+		blockCounter := newFakeBlockCounter(lastCurrentBlock)
+		evidenceWindow := NewCutoverEvidenceWindowSignal()
+		roster, err := newCutoverPeerRoster(
+			context.Background(),
+			blockCounter,
+			1000,
+			newFakeMetrics(),
+			fixedClock(),
+			WithCutoverEvidenceWindowSignal(evidenceWindow),
+		)
+		if err != nil {
+			t.Fatalf("failed to construct roster: [%v]", err)
+		}
+
+		blockCounter.set(0, fmt.Errorf("clock unavailable"))
+		roster.pollAndSweep()
+		evidenceWindow.SetActive(true)
+		roster.logSnapshotIfRequired()
+		roster.Close()
+	})
+
+	assertRosterLogCount(t, entries, expected, 1)
+}
+
+func TestCutoverPeerRoster_EvidenceWindowOnOff(t *testing.T) {
+	const currentBlock = uint64(1005)
+
+	expected := fmt.Sprintf(
+		"protocol cutover peer roster snapshot [currentBlock=%d] "+
+			"[clockAvailable=true] [legacyPeers=0] "+
+			"[oldestFirstSeenBlock=0] [rosterRevision=0]",
+		currentBlock,
+	)
+
+	entries := captureRosterLogs(t, func() {
+		evidenceWindow := NewCutoverEvidenceWindowSignal()
+		roster, err := newCutoverPeerRoster(
+			context.Background(),
+			newFakeBlockCounter(currentBlock),
+			1000,
+			newFakeMetrics(),
+			fixedClock(),
+			WithCutoverEvidenceWindowSignal(evidenceWindow),
+		)
+		if err != nil {
+			t.Fatalf("failed to construct roster: [%v]", err)
+		}
+
+		roster.logSnapshotIfRequired()
+		if !evidenceWindow.SetActive(true) {
+			t.Error("expected opening the evidence window to change its state")
+		}
+		roster.logSnapshotIfRequired()
+		if !evidenceWindow.SetActive(false) {
+			t.Error("expected closing the evidence window to change its state")
+		}
+		roster.logSnapshotIfRequired()
+		roster.Close()
+	})
+
+	assertRosterLogCount(t, entries, expected, 1)
+}
+
+func TestCutoverEvidenceWindowSignal_HoldActive(t *testing.T) {
+	evidenceWindow := NewCutoverEvidenceWindowSignal()
+
+	if evidenceWindow.Active() {
+		t.Fatal("a new evidence window must be inactive")
+	}
+	if !evidenceWindow.HoldActive() {
+		t.Error("holding an inactive evidence window should change its state")
+	}
+	if !evidenceWindow.Active() {
+		t.Fatal("a held evidence window must be active")
+	}
+	if evidenceWindow.SetActive(false) {
+		t.Error("a held evidence window must reject a close")
+	}
+	if !evidenceWindow.Active() {
+		t.Fatal("a rejected close must leave the evidence window active")
+	}
+}
+
+func TestCutoverEvidenceWindowSignal_ConcurrentAccess(t *testing.T) {
+	evidenceWindow := NewCutoverEvidenceWindowSignal()
+
+	var workers sync.WaitGroup
+	for worker := 0; worker < 32; worker++ {
+		workers.Add(1)
+		go func(worker int) {
+			defer workers.Done()
+
+			for iteration := 0; iteration < 100; iteration++ {
+				evidenceWindow.SetActive((worker+iteration)%2 == 0)
+				_ = evidenceWindow.Active()
+			}
+		}(worker)
+	}
+	workers.Wait()
+
+	evidenceWindow.HoldActive()
+	if !evidenceWindow.Active() {
+		t.Fatal("the evidence window must remain active after a concurrent hold")
+	}
+}
+
+func assertRosterLogCount(
+	t *testing.T,
+	entries []capturedRosterLogEntry,
+	expected string,
+	expectedCount int,
+) {
+	t.Helper()
+
+	actualCount := 0
+	for _, entry := range entries {
+		if entry.Message == expected {
+			actualCount++
+		}
+	}
+	if actualCount != expectedCount {
+		t.Errorf(
+			"expected roster log [%s] %d time(s), got %d in: %+v",
+			expected,
+			expectedCount,
+			actualCount,
+			entries,
+		)
 	}
 }

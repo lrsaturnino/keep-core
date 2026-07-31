@@ -77,6 +77,19 @@ func start(cmd *cobra.Command) error {
 	runCtx, cancelRunCtx := context.WithCancel(ctx)
 	defer cancelRunCtx()
 
+	// The roster evidence window is operational observability only. SIGUSR1
+	// opens it for go/no-go capture and SIGUSR2 closes it; the shutdown
+	// controller holds it open before rollback quiescence. Neither signal is
+	// visible to the participation gate or any protocol-mode decision.
+	cutoverEvidenceWindow := participation.NewCutoverEvidenceWindowSignal()
+	evidenceWindowSignalChan := make(chan os.Signal, 2)
+	signal.Notify(
+		evidenceWindowSignalChan,
+		syscall.SIGUSR1,
+		syscall.SIGUSR2,
+	)
+	defer signal.Stop(evidenceWindowSignalChan)
+
 	// Signal capture is installed before anything else so that no window of
 	// the startup sequence is left to the default signal action: a signal
 	// arriving before the participation gate exists is held in the buffered
@@ -206,11 +219,18 @@ func start(cmd *cobra.Command) error {
 		rosterRetentionBlocks,
 		rosterMetrics,
 		participation.WithCutoverSchedule(participationSchedule),
+		participation.WithCutoverEvidenceWindowSignal(cutoverEvidenceWindow),
 	)
 	if err != nil {
 		return fmt.Errorf("cannot create cutover peer roster: [%v]", err)
 	}
 	defer cutoverRoster.Close()
+
+	startEvidenceWindowSignalController(
+		runCtx,
+		cutoverEvidenceWindow,
+		evidenceWindowSignalChan,
+	)
 
 	if clientInfoRegistry != nil {
 		// The chain identity handed to the diagnostics contract is the
@@ -253,6 +273,7 @@ func start(cmd *cobra.Command) error {
 		runCtx,
 		cancelRunCtx,
 		participationGate,
+		cutoverEvidenceWindow,
 		signalChan,
 		quiesceBackstop,
 		forcedCancellationAllowance(),
@@ -428,6 +449,7 @@ func startSignalLifecycleController(
 	runCtx context.Context,
 	cancelRunCtx context.CancelFunc,
 	gate participation.Gate,
+	evidenceWindow *participation.CutoverEvidenceWindowSignal,
 	signals <-chan os.Signal,
 	backstop time.Duration,
 	cancellationAllowance time.Duration,
@@ -437,6 +459,16 @@ func startSignalLifecycleController(
 	go func() {
 		select {
 		case receivedSignal := <-signals:
+			// Rollback evidence must include empty roster snapshots throughout
+			// the drain. Hold the logging-only signal open before the gate
+			// enters quiescence so a later SIGUSR2 cannot suppress that evidence.
+			evidenceWindow.HoldActive()
+			logger.Infof(
+				"protocol cutover evidence window held active "+
+					"[source=quiescence] [signal=%v]",
+				receivedSignal,
+			)
+
 			quiesceCause := fmt.Errorf("received signal [%v]", receivedSignal)
 			quiesceDone := gate.Quiesce(quiesceCause)
 
@@ -498,6 +530,60 @@ func startSignalLifecycleController(
 	}()
 
 	return shutdown
+}
+
+// startEvidenceWindowSignalController applies the operator's logging-only
+// evidence-window controls. SIGUSR1 opens the window and SIGUSR2 closes it.
+// The signal changes only the roster's decision to log an empty periodic
+// snapshot; protocol authorization and mode selection remain exclusively
+// owned by the participation gate.
+func startEvidenceWindowSignalController(
+	ctx context.Context,
+	evidenceWindow *participation.CutoverEvidenceWindowSignal,
+	signals <-chan os.Signal,
+) <-chan struct{} {
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case receivedSignal, ok := <-signals:
+				if !ok {
+					return
+				}
+
+				var (
+					active  bool
+					changed bool
+				)
+				switch receivedSignal {
+				case syscall.SIGUSR1:
+					active = true
+					changed = evidenceWindow.SetActive(true)
+				case syscall.SIGUSR2:
+					active = false
+					changed = evidenceWindow.SetActive(false)
+				default:
+					continue
+				}
+
+				if changed {
+					logger.Infof(
+						"protocol cutover evidence window changed "+
+							"[active=%t] [signal=%v]",
+						active,
+						receivedSignal,
+					)
+				}
+			}
+		}
+	}()
+
+	return done
 }
 
 // quiesceUpperBlockIntervalSeconds is the conservative upper bound on the
