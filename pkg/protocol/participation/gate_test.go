@@ -1373,6 +1373,45 @@ func TestGate_SecurityV2CommitFences(t *testing.T) {
 	}
 }
 
+func TestGate_UnknownCommitClassFailsClosed(t *testing.T) {
+	gate, blockCounter, metrics := newTestGate(
+		t, Schedule{CutoverBlock: 1000}, 999, inertPollInterval,
+	)
+
+	permit, err := gate.Begin(TBTCHeartbeat, 999)
+	if err != nil {
+		t.Fatalf("unexpected error: [%v]", err)
+	}
+	defer permit.Close()
+
+	// An unknown class must not become an implicit completion or penalty.
+	// Exercise it after C, where treating it as neither would bypass the
+	// legacy penalty fence.
+	blockCounter.set(1000, nil)
+	err = permit.CheckCommit("unknown", CommitClass(0))
+	if !errors.Is(err, ErrInvalidCommitClass) {
+		t.Errorf("expected an invalid commit class refusal, got: [%v]", err)
+	}
+	if !IsGateRefusal(err) {
+		t.Errorf("expected the invalid commit class to be a gate refusal: [%v]", err)
+	}
+	if got := metrics.counter(
+		clientinfo.MetricParticipationCommitRefusalsTotal,
+	); got != 1 {
+		t.Errorf("expected commit refusals counter [1], got [%f]", got)
+	}
+	if got := metrics.counter(
+		clientinfo.MetricParticipationLegacyCompletionsAfterCutoverTotal,
+	); got != 0 {
+		t.Errorf("expected legacy completions counter [0], got [%f]", got)
+	}
+	if got := metrics.counter(
+		clientinfo.MetricHeartbeatPenaltySuppressedTotal,
+	); got != 0 {
+		t.Errorf("expected heartbeat suppressions counter [0], got [%f]", got)
+	}
+}
+
 func TestGate_ResumeOnlyForBeaconRelaySigning(t *testing.T) {
 	gate, _, _ := newTestGate(
 		t, Schedule{CutoverBlock: 1000}, 1500, inertPollInterval,

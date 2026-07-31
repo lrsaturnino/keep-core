@@ -109,6 +109,10 @@ var (
 	ErrCommitBeforeCutover = errors.New(
 		"security-v2 commit refused below the cutover block",
 	)
+	// ErrInvalidCommitClass means a caller supplied a commit class other than
+	// CompletionCommit or PenaltyCommit. Unknown classes fail closed so an
+	// unset or newly added value cannot bypass completion or penalty fencing.
+	ErrInvalidCommitClass = errors.New("invalid participation commit class")
 	// ErrPermitClosed means the permit was already closed by its owner.
 	ErrPermitClosed = errors.New("participation permit is closed")
 	// ErrInvalidPermitIdentity means a caller supplied an empty, malformed,
@@ -149,6 +153,7 @@ func IsGateRefusal(err error) bool {
 		ErrResumeUnsupported,
 		ErrPenaltySuppressed,
 		ErrCommitBeforeCutover,
+		ErrInvalidCommitClass,
 		ErrPermitClosed,
 		ErrInvalidPermitIdentity,
 	} {
@@ -1148,6 +1153,16 @@ func (p *permit) CheckCommit(operation string, class CommitClass) error {
 			class,
 			height,
 			ErrQuiesceDeadline,
+		)
+	}
+
+	if class != CompletionCommit && class != PenaltyCommit {
+		return g.refuseCommitLocked(
+			p,
+			operation,
+			class,
+			height,
+			ErrInvalidCommitClass,
 		)
 	}
 
