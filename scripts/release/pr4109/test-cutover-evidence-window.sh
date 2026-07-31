@@ -157,7 +157,9 @@ expect_success() {
 
   if ((CASE_RC == 0)) &&
     node -e '
+      const crypto = require("crypto");
       const fs = require("fs");
+      const path = require("path");
       const result = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
       if (!result.complete || result.services.length !== 2) process.exit(1);
       if (!result.services.every((service) =>
@@ -166,7 +168,12 @@ expect_success() {
         service.periodic_empty_snapshots_seen &&
         service.empty_snapshot_lines >= 2 &&
         service.close_delivered &&
-        service.close_seen
+        service.close_seen &&
+        crypto.createHash("sha256")
+          .update(fs.readFileSync(
+            path.join(path.dirname(process.argv[1]), service.service + ".log")
+          ))
+          .digest("hex") === service.relevant_log_sha256
       )) process.exit(1);
     ' "${archive}/result.json"; then
     pass_case "${name}"

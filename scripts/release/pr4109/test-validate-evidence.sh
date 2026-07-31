@@ -174,7 +174,7 @@ FIXTURE_R1_SECOND_DIGEST_MAP="$(
 # canonical entry, to prove an arbitrary passing subset cannot stand in for
 # the gate.
 SINGLE_RELEASE_STAGES='
-  { "name": "every R1 node authors periodic empty roster evidence", "outcome": "pass", "state_checksums": { "cutover_evidence_window_summary_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } },
+  { "name": "every R1 node authors periodic empty roster evidence", "outcome": "pass" },
   { "name": "mixed prior/R1 pre-cutover compatibility controls", "outcome": "pass" },
   { "name": "representative pre-cutover work including the longest wallet action", "outcome": "pass" },
   { "name": "cross C without restart", "outcome": "pass" },
@@ -278,6 +278,72 @@ ASSERTION_REFUSED='{
   "evidence_stage": "cross C without restart"
 }'
 
+CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID=""
+CUTOVER_WINDOW_FIXTURE_SUMMARY_SHA256=""
+
+# Build the same per-service archive shape as the real capture helper. Fixture
+# records are accepted only through these actual bytes: the summary digest is
+# computed from result.json, and result.json hashes the two logs that carry the
+# activation, cadence, emptiness, clock-health, advancing-block, and close
+# facts the acceptance reader independently checks.
+write_complete_cutover_window_archive() {
+  local evidence_dir="$1" record_id="$2"
+  local archive_id="cutover-roster-window-fixture-${record_id}"
+  local archive="${evidence_dir}/${archive_id}"
+  local services=(
+    "${REHEARSAL_R1_SERVICES[@]+"${REHEARSAL_R1_SERVICES[@]}"}"
+  )
+  local service
+
+  mkdir -p "${archive}"
+  for service in "${services[@]+"${services[@]}"}"; do
+    printf '%s\n' \
+      "2026-07-31T00:00:00.000000000Z protocol cutover evidence window changed [active=true] [signal=user defined signal 1]" \
+      "2026-07-31T00:00:30.000000000Z protocol cutover peer roster snapshot [currentBlock=100] [clockAvailable=true] [legacyPeers=0] [oldestFirstSeenBlock=0] [rosterRevision=0]" \
+      "2026-07-31T00:05:30.000000000Z protocol cutover peer roster snapshot [currentBlock=125] [clockAvailable=true] [legacyPeers=0] [oldestFirstSeenBlock=0] [rosterRevision=0]" \
+      "2026-07-31T00:05:31.000000000Z protocol cutover evidence window changed [active=false] [signal=user defined signal 2]" \
+      >"${archive}/${service}.log"
+  done
+
+  node -e '
+    const crypto = require("crypto");
+    const fs = require("fs");
+    const path = require("path");
+    const [archivePath, ...services] = process.argv.slice(1);
+    const entries = services.map((service) => {
+      const log = fs.readFileSync(path.join(archivePath, service + ".log"));
+      return {
+        service,
+        signal_delivered: true,
+        activation_seen: true,
+        periodic_empty_snapshots_seen: true,
+        close_delivered: true,
+        close_seen: true,
+        empty_snapshot_lines: 2,
+        relevant_log_sha256:
+          crypto.createHash("sha256").update(log).digest("hex"),
+      };
+    });
+    fs.writeFileSync(
+      path.join(archivePath, "result.json"),
+      JSON.stringify({
+        schema_version: 1,
+        opened_at: "2026-07-31T00:00:00.000Z",
+        archived_before_close_at: "2026-07-31T00:05:30Z",
+        closed_at: "2026-07-31T00:05:31Z",
+        complete: services.length > 0,
+        failures: [],
+        services: entries,
+      }, null, 2) + "\n"
+    );
+  ' "${archive}" "${services[@]+"${services[@]}"}"
+
+  CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID="${archive_id}"
+  CUTOVER_WINDOW_FIXTURE_SUMMARY_SHA256="$(
+    hash_stdin <"${archive}/result.json"
+  )"
+}
+
 write_record() {
   local path="$1" sha="$2" grace="$3" generated_at="$4"
   local source_sha="${5:-${FIXTURE_SHA}}"
@@ -285,7 +351,46 @@ write_record() {
   local assertions="${7:-${ASSERTION_HOLDS}}"
   local gate="${8:-single_release}"
   local r1_images="${9:-${FIXTURE_R1_DIGEST_MAP}}"
-  local chain_inputs
+  local chain_inputs stages_json
+  stages_json="[ ${stages} ]"
+  if [[ "${gate}" == "single_release" ]]; then
+    local record_id="${path##*/}"
+    record_id="${record_id%.json}"
+    write_complete_cutover_window_archive "$(dirname "${path}")" "${record_id}"
+    stages_json="$(node -e '
+      const [rawStages, archiveID, summaryDigest] = process.argv.slice(1);
+      const stages = JSON.parse("[" + rawStages + "]");
+      const stage = stages.find((entry) =>
+        entry &&
+        entry.name ===
+          "every R1 node authors periodic empty roster evidence"
+      );
+      if (stage) {
+        const checksums =
+          stage.state_checksums &&
+          typeof stage.state_checksums === "object" &&
+          !Array.isArray(stage.state_checksums)
+            ? stage.state_checksums
+            : {};
+        const refs =
+          stage.evidence_refs &&
+          typeof stage.evidence_refs === "object" &&
+          !Array.isArray(stage.evidence_refs)
+            ? stage.evidence_refs
+            : {};
+        stage.state_checksums = {
+          ...checksums,
+          cutover_evidence_window_summary_sha256: summaryDigest,
+        };
+        stage.evidence_refs = {
+          ...refs,
+          cutover_evidence_window_archive: archiveID,
+        };
+      }
+      process.stdout.write(JSON.stringify(stages));
+    ' "${stages}" "${CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID}" \
+      "${CUTOVER_WINDOW_FIXTURE_SUMMARY_SHA256}")"
+  fi
   if [[ "${gate}" == "rollback" ]]; then
     chain_inputs="$(
       printf '{
@@ -324,7 +429,7 @@ write_record() {
     "termination_grace_period_seconds": ${grace}
   },
   "chain_inputs": ${chain_inputs},
-  "stages": [ ${stages} ],
+  "stages": ${stages_json},
   "assertions": [ ${assertions} ]
 }
 EOF
@@ -2339,6 +2444,198 @@ run_validator "${D}"
 check "the fleet evidence window must bind its archived summary" 3 \
   "fleet evidence-window step carries no archived summary SHA-256"
 
+D="${WORK}/accept-unreferenced-evidence-window"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  delete record.stages[0].evidence_refs;
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "the fleet evidence window must identify its supporting archive" 3 \
+  "fleet evidence-window step carries no safe relative archive identifier"
+
+D="${WORK}/accept-missing-evidence-window-archive"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+ARCHIVE="${D}/${CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID}"
+mv "${ARCHIVE}" "${ARCHIVE}.absent"
+run_validator "${D}"
+check "a missing fleet evidence-window archive is refused" 3 \
+  "fleet evidence-window archive.*is absent or does not resolve safely"
+
+D="${WORK}/accept-missing-evidence-window-result"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+ARCHIVE="${D}/${CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID}"
+mv "${ARCHIVE}/result.json" "${ARCHIVE}/result.json.absent"
+run_validator "${D}"
+check "a fleet evidence-window archive without result.json is refused" 3 \
+  "has no safe archived result.json"
+
+D="${WORK}/accept-mutated-evidence-window-result"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+ARCHIVE="${D}/${CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID}"
+printf '\n' >>"${ARCHIVE}/result.json"
+run_validator "${D}"
+check "a mutated fleet evidence-window result.json is refused" 3 \
+  "summary SHA-256 does not match the archived result.json"
+
+D="${WORK}/accept-missing-evidence-window-log"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+ARCHIVE="${D}/${CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID}"
+mv "${ARCHIVE}/r1-node-2.log" "${ARCHIVE}/r1-node-2.log.absent"
+run_validator "${D}"
+check "a missing fleet evidence-window service log is refused" 3 \
+  "archived log set.*does not match.*service log set" \
+  "has no safe archived log for service.*r1-node-2"
+
+D="${WORK}/accept-altered-evidence-window-log"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+ARCHIVE="${D}/${CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID}"
+printf '%s\n' \
+  "2026-07-31T00:06:00.000000000Z altered after capture" \
+  >>"${ARCHIVE}/r1-node-1.log"
+run_validator "${D}"
+check "an altered fleet evidence-window service log is refused" 3 \
+  "archived log for service.*r1-node-1.*does not match its relevant_log_sha256"
+
+D="${WORK}/accept-evidence-window-service-mismatch"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+ARCHIVE="${D}/${CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID}"
+node -e '
+  const crypto = require("crypto");
+  const fs = require("fs");
+  const [recordPath, resultPath] = process.argv.slice(1);
+  const result = JSON.parse(fs.readFileSync(resultPath, "utf8"));
+  result.services = result.services.filter(
+    (service) => service.service !== "r1-node-2"
+  );
+  fs.writeFileSync(resultPath, JSON.stringify(result, null, 2) + "\n");
+  const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+  record.stages[0].state_checksums
+    .cutover_evidence_window_summary_sha256 = crypto
+      .createHash("sha256")
+      .update(fs.readFileSync(resultPath))
+      .digest("hex");
+  fs.writeFileSync(recordPath, JSON.stringify(record, null, 2));
+' "${D}/record.json" "${ARCHIVE}/result.json"
+run_validator "${D}"
+check "a fleet evidence-window archive for a smaller service set is refused" \
+  3 "service set.*r1-node-1.*does not match.*r1-node-1, r1-node-2"
+
+D="${WORK}/accept-incomplete-evidence-window"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+ARCHIVE="${D}/${CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID}"
+node -e '
+  const crypto = require("crypto");
+  const fs = require("fs");
+  const [recordPath, resultPath] = process.argv.slice(1);
+  const result = JSON.parse(fs.readFileSync(resultPath, "utf8"));
+  result.complete = false;
+  fs.writeFileSync(resultPath, JSON.stringify(result, null, 2) + "\n");
+  const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+  record.stages[0].state_checksums
+    .cutover_evidence_window_summary_sha256 = crypto
+      .createHash("sha256")
+      .update(fs.readFileSync(resultPath))
+      .digest("hex");
+  fs.writeFileSync(recordPath, JSON.stringify(record, null, 2));
+' "${D}/record.json" "${ARCHIVE}/result.json"
+run_validator "${D}"
+check "an evidence-window archive that reports incomplete refutes the gate" \
+  1 "fleet evidence-window archive reports complete=false"
+
+D="${WORK}/accept-false-evidence-window-cadence"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+ARCHIVE="${D}/${CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID}"
+node -e '
+  const crypto = require("crypto");
+  const fs = require("fs");
+  const [recordPath, resultPath, logPath] = process.argv.slice(1);
+  const log = fs.readFileSync(logPath, "utf8").replace(
+    "2026-07-31T00:05:30.000000000Z",
+    "2026-07-31T00:02:30.000000000Z"
+  );
+  fs.writeFileSync(logPath, log);
+  const result = JSON.parse(fs.readFileSync(resultPath, "utf8"));
+  result.services.find((service) => service.service === "r1-node-1")
+    .relevant_log_sha256 = crypto
+      .createHash("sha256")
+      .update(fs.readFileSync(logPath))
+      .digest("hex");
+  fs.writeFileSync(resultPath, JSON.stringify(result, null, 2) + "\n");
+  const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+  record.stages[0].state_checksums
+    .cutover_evidence_window_summary_sha256 = crypto
+      .createHash("sha256")
+      .update(fs.readFileSync(resultPath))
+      .digest("hex");
+  fs.writeFileSync(recordPath, JSON.stringify(record, null, 2));
+' "${D}/record.json" "${ARCHIVE}/result.json" \
+  "${ARCHIVE}/r1-node-1.log"
+run_validator "${D}"
+check "self-consistent hashes cannot hide a false evidence-window cadence" \
+  3 "r1-node-1.*has no two clock-healthy empty snapshots 270-360 seconds"
+
+D="${WORK}/accept-copied-evidence-window-digest"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+PRIMARY_ARCHIVE_ID="${CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID}"
+write_complete_cutover_window_archive "${D}" "borrowed-capture"
+BORROWED_ARCHIVE="${D}/${CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID}"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const result = JSON.parse(fs.readFileSync(path, "utf8"));
+  result.opened_at = "2026-07-30T00:00:00.000Z";
+  fs.writeFileSync(path, JSON.stringify(result, null, 2) + "\n");
+' "${BORROWED_ARCHIVE}/result.json"
+BORROWED_DIGEST="$(hash_stdin <"${BORROWED_ARCHIVE}/result.json")"
+node -e '
+  const fs = require("fs");
+  const [recordPath, primaryArchiveID, borrowedDigest] =
+    process.argv.slice(1);
+  const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+  record.stages[0].evidence_refs.cutover_evidence_window_archive =
+    primaryArchiveID;
+  record.stages[0].state_checksums
+    .cutover_evidence_window_summary_sha256 = borrowedDigest;
+  fs.writeFileSync(recordPath, JSON.stringify(record, null, 2));
+' "${D}/record.json" "${PRIMARY_ARCHIVE_ID}" "${BORROWED_DIGEST}"
+run_validator "${D}"
+check "a summary digest copied from another capture is refused" 3 \
+  "summary SHA-256 does not match the archived result.json"
+
 D="${WORK}/accept-unknown-assertion"
 mkdir -p "${D}"
 write_attestation "${D}"
@@ -2861,10 +3158,18 @@ complete_run() {
     begin_step "${stage}"
     if [[ "${stage}" == \
       "every R1 node authors periodic empty roster evidence" ]]; then
-      # The real helper hashes the archived per-service result into this slot.
+      # Exercise the emitter with a real supporting archive, not a digest-shaped
+      # fixture value. The acceptance reader resolves this relative identifier
+      # beneath the run evidence directory and rechecks every archived byte.
+      # shellcheck disable=SC2031
+      write_complete_cutover_window_archive \
+        "${EVIDENCE_DIR}" "emitted-single-release"
       # shellcheck disable=SC2034
       STEP_STATE_CHECKSUMS="\"cutover_evidence_window_summary_sha256\":\
-\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""
+\"${CUTOVER_WINDOW_FIXTURE_SUMMARY_SHA256}\""
+      # shellcheck disable=SC2034
+      STEP_EVIDENCE_REFS="\"cutover_evidence_window_archive\":\
+\"${CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID}\""
     elif [[ "${stage}" == "cross C without restart" ]]; then
       # The observation slots the real probes fill; record_step drains them.
       # shellcheck disable=SC2034

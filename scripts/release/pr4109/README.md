@@ -1646,6 +1646,18 @@ log, one-off snapshot, unavailable/stalled clock, nonempty-only capture, or
 missing close fails the mandatory rehearsal step. The capture helper refuses
 to overwrite an existing archive.
 
+The corresponding rehearsal step records both the archive's safe relative
+identifier beneath `EVIDENCE_DIR` and the SHA-256 of its `result.json`.
+`validate-evidence` does not trust those strings by shape: it rejects path
+traversal and symlinks, recomputes the summary digest, requires
+`complete=true` with an empty failure list and the exact authoritative R1
+service set, verifies every archived service log against
+`relevant_log_sha256`, and independently rechecks the activation/close lines
+and two clock-healthy empty snapshots 270–360 seconds apart with advancing
+blocks. The archive must therefore be preserved beside the top-level record;
+deleting it, editing either summary or log bytes, or borrowing a digest from
+another capture makes acceptance fail closed.
+
 For a host process the equivalent manual controls are `kill -USR1 <pid>` and
 `kill -USR2 <pid>`; for a container use the runtime's named-signal operation.
 While the window is open, each node emits the deterministic roster snapshot

@@ -106,6 +106,11 @@
             "type": "object",
             "additionalProperties": { "type": "string" }
           },
+          "evidence_refs": {
+            "description": "Safe relative identifiers for supporting artifacts stored beneath the rehearsal evidence directory.",
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+          },
           "notes": { "type": "string" }
         }
       }

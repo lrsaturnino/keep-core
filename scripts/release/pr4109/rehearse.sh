@@ -5107,6 +5107,7 @@ STEP_PERMIT_MODES=""
 STEP_GAUGES=""
 STEP_TX_HASHES=""
 STEP_STATE_CHECKSUMS=""
+STEP_EVIDENCE_REFS=""
 
 begin_step() {
   note "step: $1"
@@ -5115,6 +5116,7 @@ begin_step() {
   STEP_GAUGES=""
   STEP_TX_HASHES=""
   STEP_STATE_CHECKSUMS=""
+  STEP_EVIDENCE_REFS=""
 }
 
 # JSON-quote an arbitrary shell string. Node does the quoting because a step's
@@ -5141,6 +5143,8 @@ record_step() {
     fields="${fields},\"transaction_hashes\":[${STEP_TX_HASHES}]"
   [[ -n "${STEP_STATE_CHECKSUMS}" ]] &&
     fields="${fields},\"state_checksums\":{${STEP_STATE_CHECKSUMS}}"
+  [[ -n "${STEP_EVIDENCE_REFS}" ]] &&
+    fields="${fields},\"evidence_refs\":{${STEP_EVIDENCE_REFS}}"
   REHEARSAL_STEPS+=("{${fields}}")
 
   case "${outcome}" in
@@ -5508,9 +5512,10 @@ ${attested}, the rehearsed C, and the chain the record is written against"
 capture_cutover_roster_evidence_window() {
   local step="every R1 node authors periodic empty roster evidence"
   local assertion="every R1 node authors periodic empty roster evidence during the go/no-go window"
-  local archive
+  local archive archive_id
   archive="${EVIDENCE_DIR}/cutover-roster-window-${REHEARSAL_GATE}-\
 $(date -u +%Y%m%dT%H%M%SZ)-$$"
+  archive_id="${archive##*/}"
   local service container
   local bindings=()
 
@@ -5535,6 +5540,9 @@ the evidence window must be delivered to and acknowledged by every R1 service"
     STEP_STATE_CHECKSUMS="\"cutover_evidence_window_summary_sha256\":\"$(
       hash_stdin <"${archive}/result.json"
     )\""
+    STEP_EVIDENCE_REFS="\"cutover_evidence_window_archive\":$(
+      json_string "${archive_id}"
+    )"
   fi
 
   if ((capture_rc == 0)); then
@@ -13508,6 +13516,426 @@ once on every platform and validate the records together"
 publishes exactly once"
 }
 
+# Inspect the supporting roster-window archive named by one single-release
+# record. The record carries only a relative archive identifier and a digest;
+# this reader resolves the identifier beneath EVIDENCE_DIR, rejects symlinks
+# and traversal, and then re-derives the capture verdict from the archived
+# bytes. A digest-shaped string is not evidence unless the archive it names is
+# still present, complete, and authored by the exact R1 fleet.
+cutover_evidence_window_findings() {
+  local record="$1"
+  # The JavaScript regex replacement below contains literal $1/$2 capture
+  # references; they are intentionally not shell expansions.
+  # shellcheck disable=SC2016
+  node -e '
+    const crypto = require("crypto");
+    const fs = require("fs");
+    const path = require("path");
+    const [
+      recordPath, evidenceRootInput, ...expectedServices
+    ] = process.argv.slice(1);
+    const findings = [];
+    const add = (kind, what) => findings.push(kind + "\t" + what);
+    const isObject = (value) =>
+      value !== null &&
+      typeof value === "object" &&
+      !Array.isArray(value);
+    const safeIdentifier = (value) =>
+      typeof value === "string" &&
+      /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value);
+    const sameArray = (left, right) =>
+      left.length === right.length &&
+      left.every((value, index) => value === right[index]);
+    const sha256 = (value) =>
+      crypto.createHash("sha256").update(value).digest("hex");
+
+    const inspect = () => {
+      let record;
+      try {
+        record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+      } catch (error) {
+        add(
+          "unrehearsed",
+          "single_release record cannot be read while resolving its fleet " +
+            "evidence-window archive"
+        );
+        return;
+      }
+      if (record.gate !== "single_release") return;
+
+      const evidenceWindow = (Array.isArray(record.stages)
+        ? record.stages
+        : []
+      ).find((stage) =>
+        isObject(stage) &&
+        stage.name ===
+          "every R1 node authors periodic empty roster evidence"
+      );
+      if (!evidenceWindow) return;
+
+      const checksums = isObject(evidenceWindow.state_checksums)
+        ? evidenceWindow.state_checksums
+        : {};
+      const refs = isObject(evidenceWindow.evidence_refs)
+        ? evidenceWindow.evidence_refs
+        : {};
+      const summaryDigest =
+        checksums.cutover_evidence_window_summary_sha256;
+      const archiveID = refs.cutover_evidence_window_archive;
+
+      const summaryDigestValid =
+        typeof summaryDigest === "string" &&
+        /^[0-9a-f]{64}$/.test(summaryDigest);
+      if (!summaryDigestValid) {
+        add(
+          "unrehearsed",
+          "single_release fleet evidence-window step carries no archived " +
+            "summary SHA-256"
+        );
+      }
+      if (!safeIdentifier(archiveID)) {
+        add(
+          "unrehearsed",
+          "single_release fleet evidence-window step carries no safe " +
+            "relative archive identifier"
+        );
+        return;
+      }
+
+      const expectedCounts = new Map();
+      for (const service of expectedServices) {
+        expectedCounts.set(service, (expectedCounts.get(service) || 0) + 1);
+      }
+      if (
+        expectedServices.length === 0 ||
+        expectedServices.some((service) => !safeIdentifier(service)) ||
+        Array.from(expectedCounts.values()).some((count) => count !== 1)
+      ) {
+        add(
+          "unrehearsed",
+          "single_release fleet evidence-window reader received no exact " +
+            "authoritative R1 service set"
+        );
+        return;
+      }
+      const expectedSorted = [...expectedServices].sort();
+
+      let evidenceRoot;
+      let archivePath;
+      try {
+        evidenceRoot = fs.realpathSync(evidenceRootInput);
+        const rootStat = fs.lstatSync(evidenceRoot);
+        if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+          throw new Error("evidence root is not a directory");
+        }
+
+        const lexicalArchive = path.resolve(evidenceRoot, archiveID);
+        if (path.dirname(lexicalArchive) !== evidenceRoot) {
+          throw new Error("archive is not a direct evidence child");
+        }
+        const archiveStat = fs.lstatSync(lexicalArchive);
+        if (!archiveStat.isDirectory() || archiveStat.isSymbolicLink()) {
+          throw new Error("archive is not a real directory");
+        }
+        archivePath = fs.realpathSync(lexicalArchive);
+        if (path.dirname(archivePath) !== evidenceRoot) {
+          throw new Error("archive resolves outside evidence root");
+        }
+      } catch (error) {
+        add(
+          "unrehearsed",
+          "single_release fleet evidence-window archive " +
+            JSON.stringify(archiveID) +
+            " is absent or does not resolve safely beneath EVIDENCE_DIR"
+        );
+        return;
+      }
+
+      const readRegularArchiveFile = (name, description) => {
+        const candidate = path.join(archivePath, name);
+        try {
+          const stat = fs.lstatSync(candidate);
+          if (!stat.isFile() || stat.isSymbolicLink()) {
+            throw new Error("not a regular file");
+          }
+          const resolved = fs.realpathSync(candidate);
+          if (path.dirname(resolved) !== archivePath) {
+            throw new Error("file resolves outside archive");
+          }
+          return fs.readFileSync(resolved);
+        } catch (error) {
+          add(
+            "unrehearsed",
+            "single_release fleet evidence-window archive " +
+              JSON.stringify(archiveID) + " has no safe archived " +
+              description
+          );
+          return undefined;
+        }
+      };
+
+      const resultBytes = readRegularArchiveFile(
+        "result.json",
+        "result.json"
+      );
+      if (resultBytes === undefined) return;
+
+      const actualSummaryDigest = sha256(resultBytes);
+      if (
+        summaryDigestValid &&
+        actualSummaryDigest !== summaryDigest
+      ) {
+        add(
+          "unrehearsed",
+          "single_release fleet evidence-window summary SHA-256 does not " +
+            "match the archived result.json named by the record"
+        );
+      }
+
+      let result;
+      try {
+        result = JSON.parse(resultBytes.toString("utf8"));
+      } catch (error) {
+        add(
+          "unrehearsed",
+          "single_release fleet evidence-window result.json is malformed"
+        );
+        return;
+      }
+      if (!isObject(result) || result.schema_version !== 1) {
+        add(
+          "unrehearsed",
+          "single_release fleet evidence-window result.json has no " +
+            "supported schema_version"
+        );
+        return;
+      }
+      if (result.complete !== true) {
+        add(
+          "refuted",
+          "single_release fleet evidence-window archive reports " +
+            "complete=false"
+        );
+      }
+      if (!Array.isArray(result.failures)) {
+        add(
+          "unrehearsed",
+          "single_release fleet evidence-window result.json has no failure " +
+            "account"
+        );
+      } else if (result.failures.length !== 0) {
+        add(
+          "refuted",
+          "single_release fleet evidence-window archive records capture " +
+            "failures"
+        );
+      }
+      if (!Array.isArray(result.services)) {
+        add(
+          "unrehearsed",
+          "single_release fleet evidence-window result.json has no service " +
+            "account"
+        );
+        return;
+      }
+
+      const serviceEntries = new Map();
+      const resultServiceNames = [];
+      let serviceShapeValid = true;
+      for (const entry of result.services) {
+        if (!isObject(entry) || !safeIdentifier(entry.service)) {
+          serviceShapeValid = false;
+          continue;
+        }
+        resultServiceNames.push(entry.service);
+        if (serviceEntries.has(entry.service)) {
+          serviceShapeValid = false;
+        } else {
+          serviceEntries.set(entry.service, entry);
+        }
+      }
+      const resultSorted = [...resultServiceNames].sort();
+      if (
+        !serviceShapeValid ||
+        !sameArray(resultSorted, expectedSorted)
+      ) {
+        add(
+          "unrehearsed",
+          "single_release fleet evidence-window service set [" +
+            resultSorted.join(", ") +
+            "] does not match the authoritative R1 service set [" +
+            expectedSorted.join(", ") + "]"
+        );
+      }
+
+      try {
+        const archivedLogs = fs.readdirSync(archivePath)
+          .filter((name) => name.endsWith(".log"))
+          .sort();
+        const expectedLogs = expectedSorted
+          .map((service) => service + ".log")
+          .sort();
+        if (!sameArray(archivedLogs, expectedLogs)) {
+          add(
+            "unrehearsed",
+            "single_release fleet evidence-window archived log set [" +
+              archivedLogs.join(", ") +
+              "] does not match the authoritative R1 service log set [" +
+              expectedLogs.join(", ") + "]"
+          );
+        }
+      } catch (error) {
+        add(
+          "unrehearsed",
+          "single_release fleet evidence-window archive cannot enumerate " +
+            "its per-service logs"
+        );
+      }
+
+      const requiredFlags = [
+        "signal_delivered",
+        "activation_seen",
+        "periodic_empty_snapshots_seen",
+        "close_delivered",
+        "close_seen",
+      ];
+      for (const service of expectedSorted) {
+        const entry = serviceEntries.get(service);
+        if (!entry) continue;
+
+        for (const flag of requiredFlags) {
+          if (entry[flag] !== true) {
+            add(
+              "refuted",
+              "single_release fleet evidence-window service " +
+                JSON.stringify(service) + " does not record " +
+                JSON.stringify(flag) + " as true"
+            );
+          }
+        }
+
+        const logBytes = readRegularArchiveFile(
+          service + ".log",
+          "log for service " + JSON.stringify(service)
+        );
+        if (logBytes === undefined) continue;
+
+        const recordedLogDigest = entry.relevant_log_sha256;
+        if (
+          typeof recordedLogDigest !== "string" ||
+          !/^[0-9a-f]{64}$/.test(recordedLogDigest)
+        ) {
+          add(
+            "unrehearsed",
+            "single_release fleet evidence-window service " +
+              JSON.stringify(service) +
+              " carries no relevant-log SHA-256"
+          );
+        } else if (sha256(logBytes) !== recordedLogDigest) {
+          add(
+            "unrehearsed",
+            "single_release fleet evidence-window archived log for service " +
+              JSON.stringify(service) +
+              " does not match its relevant_log_sha256"
+          );
+        }
+
+        const lines = logBytes.toString("utf8").split(/\r?\n/);
+        const activationSeen = lines.some((line) =>
+          line.includes("protocol cutover evidence window changed") &&
+          line.includes("[active=true]")
+        );
+        const closeSeen = lines.some((line) =>
+          line.includes("protocol cutover evidence window changed") &&
+          line.includes("[active=false]")
+        );
+        if (!activationSeen) {
+          add(
+            "unrehearsed",
+            "single_release fleet evidence-window archived log for service " +
+              JSON.stringify(service) + " has no activation line"
+          );
+        }
+        if (!closeSeen) {
+          add(
+            "unrehearsed",
+            "single_release fleet evidence-window archived log for service " +
+              JSON.stringify(service) + " has no close line"
+          );
+        }
+
+        const emptySnapshotLines = lines.filter((line) =>
+          line.includes("protocol cutover peer roster snapshot") &&
+          line.includes("[legacyPeers=0]")
+        ).length;
+        if (
+          !Number.isSafeInteger(entry.empty_snapshot_lines) ||
+          entry.empty_snapshot_lines !== emptySnapshotLines
+        ) {
+          add(
+            "unrehearsed",
+            "single_release fleet evidence-window service " +
+              JSON.stringify(service) +
+              " empty_snapshot_lines does not match its archived log"
+          );
+        }
+
+        const eligibleSnapshots = lines
+          .filter((line) =>
+            line.includes("protocol cutover peer roster snapshot") &&
+            line.includes("[clockAvailable=true]") &&
+            line.includes("[legacyPeers=0]")
+          )
+          .map((line) => {
+            const timestampToken =
+              (line.match(/^(\S+)\s/) || [])[1] || "";
+            const blockText =
+              (line.match(/\[currentBlock=(\d+)\]/) || [])[1] || "";
+            const normalizedTimestamp = timestampToken.replace(
+              /(\.\d{3})\d+(Z|[+-]\d{2}:\d{2})$/,
+              "$1$2"
+            );
+            return {
+              timestamp: Date.parse(normalizedTimestamp),
+              currentBlock: Number(blockText),
+            };
+          })
+          .filter((snapshot) =>
+            Number.isFinite(snapshot.timestamp) &&
+            Number.isSafeInteger(snapshot.currentBlock)
+          );
+        let cadenceSeen = false;
+        for (let index = 1; index < eligibleSnapshots.length; index++) {
+          const previous = eligibleSnapshots[index - 1];
+          const current = eligibleSnapshots[index];
+          const elapsed = current.timestamp - previous.timestamp;
+          if (
+            elapsed >= 270000 &&
+            elapsed <= 360000 &&
+            current.currentBlock > previous.currentBlock
+          ) {
+            cadenceSeen = true;
+            break;
+          }
+        }
+        if (!cadenceSeen) {
+          add(
+            "unrehearsed",
+            "single_release fleet evidence-window archived log for service " +
+              JSON.stringify(service) +
+              " has no two clock-healthy empty snapshots 270-360 seconds " +
+              "apart with advancing blocks"
+          );
+        }
+      }
+    };
+
+    inspect();
+    process.stdout.write(findings.join("\n"));
+  ' "${record}" "${EVIDENCE_DIR}" \
+    "${REHEARSAL_R1_SERVICES[@]+"${REHEARSAL_R1_SERVICES[@]}"}"
+}
+
 # Render every acceptance-relevant finding in one record. The gate contracts
 # here are the authoritative rosters for evidence acceptance: each mandatory
 # stage and assertion must occur exactly once and in execution order, every
@@ -13729,30 +14157,6 @@ evidence_acceptance_findings() {
         add("refuted", "step " + JSON.stringify(name));
       } else if (stage.outcome === "blocked") {
         add("unrehearsed", "step " + JSON.stringify(name));
-      }
-    }
-
-    if (record.gate === "single_release") {
-      const evidenceWindow =
-        stageByName.get("every R1 node authors periodic empty roster evidence") ||
-        {};
-      const checksums =
-        evidenceWindow.state_checksums &&
-        typeof evidenceWindow.state_checksums === "object" &&
-        !Array.isArray(evidenceWindow.state_checksums)
-          ? evidenceWindow.state_checksums
-          : {};
-      const summary =
-        checksums.cutover_evidence_window_summary_sha256;
-      if (
-        typeof summary !== "string" ||
-        !/^[0-9a-f]{64}$/.test(summary)
-      ) {
-        add(
-          "unrehearsed",
-          "single_release fleet evidence-window step carries no archived " +
-            "summary SHA-256"
-        );
       }
     }
 
@@ -14267,10 +14671,16 @@ assess_evidence_record_set() {
     blocked "no evidence records were supplied for acceptance"
 
   local refutations=() unrehearsed=() advisories=()
-  local record outcomes kind what
+  local record outcomes archive_outcomes kind what
   for record in "$@"; do
     outcomes="$(evidence_acceptance_findings "${record}")" ||
       fail "cannot assess the gate contract recorded in ${record}"
+    archive_outcomes="$(cutover_evidence_window_findings "${record}")" ||
+      fail "cannot inspect the fleet evidence-window archive recorded in \
+${record}"
+    if [[ -n "${archive_outcomes}" ]]; then
+      outcomes="${outcomes}${outcomes:+$'\n'}${archive_outcomes}"
+    fi
 
     [[ -n "${outcomes}" ]] || continue
     while IFS="$(printf '\t')" read -r kind what; do
@@ -14300,8 +14710,9 @@ whatever the records that do exist show"
   fi
 
   note "every required step passed exactly once, every required assertion \
-holds against its designated passing step, and every required reviewed \
-release input is present"
+holds against its designated passing step, every required reviewed release \
+input is present, and every named supporting archive matches its recorded \
+digest and independently re-derived facts"
 }
 
 # Do the records show the gates held?
