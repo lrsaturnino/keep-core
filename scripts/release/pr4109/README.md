@@ -1996,27 +1996,39 @@ After the stop and before any start, it archives that watched account under
 status as `<service>.pre_restart.container_exit_code`. Thus `pre_stop` means
 the guard before a signal and `pre_restart` means the final account after the
 guard authorized a stop; a record from one phase cannot stand in for the
-other.
+other. Each watched value also carries
+`<service>.pre_restart.<metric>.read_in_final_watched_sample`. The harness
+replaces this four-field provenance mask on every sampling attempt that reads
+anything, or that runs while the endpoint is still reachable; it does not
+combine freshness from different attempts. An all-unreadable scrape after the
+endpoint disappears retains the last useful mask. Both incomplete-output
+fields must be marked `1` before restart, while a retained historical counter
+marked `0` remains an advisory. This lets a normal endpoint shutdown retain its
+last useful account without allowing one field's successful read to make a
+different, carried zero look fresh.
 
 A missing watched-stop reading or exit status blocks the control; a
-preservation gauge that rises during the drain or a nonzero exit status fails
-it. A truncated stop is a refusal, not a pass, and a new process cannot
-retroactively supply either fact with initialized zeros. On a clean account
-and zero exit status, Compose starts the same container as the restart under
-test. If a confirmed-stopped path instead refuses, the harness recovery-starts
-that same container only to keep the remaining clock and quiescence controls
+provenance marker, a carried incomplete-output field, a preservation gauge
+that rises during the drain, or a nonzero exit status refuses the control. A
+truncated stop is a refusal, not a pass, and a new process cannot retroactively
+supply either fact with initialized zeros. On a clean account and zero exit
+status, Compose starts the same container as the restart under test. If a
+confirmed-stopped path instead refuses, the harness recovery-starts that same
+container only to keep the remaining clock and quiescence controls
 interpretable; the restart step remains refused and its old-process evidence
 remains in the record. If that recovery cannot restore the client-info
 endpoint, the rehearsal emits the partial record immediately and states that
 the later controls were not evaluated instead of manufacturing failures
-against a dead node. That early partial-record exit occurs before the final
-fleet-stop stage; it leaves any still-running rehearsal containers in place,
-and the operator must tear down the `pr4109-single_release` Compose project
-manually after preserving the record and any needed container evidence. Once
-any new process answers, the gate re-seeds that node's live account, refreshes
-it through the chain-clock cancellation and both quiescence controls, and
-records the fleet verdict before its final fleet-stop stage. The rollback gate
-uses the same accumulator and refreshes it while every candidate drains.
+against a dead node. Pre-stop refusals never take that partial-record exit
+because they issue no stop and leave the original process live. That early
+partial-record exit occurs before the final fleet-stop stage; it leaves any
+still-running rehearsal containers in place, and the operator must tear down
+the `pr4109-single_release` Compose project manually after preserving the
+record and any needed container evidence. Once any new process answers, the
+gate re-seeds that node's live account, refreshes it through the chain-clock
+cancellation and both quiescence controls, and records the fleet verdict
+before its final fleet-stop stage. The rollback gate uses the same accumulator
+and refreshes it while every candidate drains.
 
 An unreadable signal, an account that does not cover every configured R1
 service exactly once, or a nonzero live gauge refuses either gate because the

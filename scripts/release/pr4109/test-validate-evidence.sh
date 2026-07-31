@@ -188,6 +188,10 @@ SINGLE_RELEASE_STAGES='
       "r1-node-2.pre_restart.participation_beacon_quarantine_preservation_failures_total": 0,
       "r1-node-2.pre_restart.participation_tbtc_quarantine_incomplete_outputs": 0,
       "r1-node-2.pre_restart.participation_beacon_quarantine_incomplete_outputs": 0,
+      "r1-node-2.pre_restart.participation_tbtc_quarantine_preservation_failures_total.read_in_final_watched_sample": 1,
+      "r1-node-2.pre_restart.participation_beacon_quarantine_preservation_failures_total.read_in_final_watched_sample": 1,
+      "r1-node-2.pre_restart.participation_tbtc_quarantine_incomplete_outputs.read_in_final_watched_sample": 1,
+      "r1-node-2.pre_restart.participation_beacon_quarantine_incomplete_outputs.read_in_final_watched_sample": 1,
       "r1-node-2.pre_restart.container_exit_code": 0
     } },
   { "name": "post-cutover straggler fails closed and enters the roster", "outcome": "pass" },
@@ -1207,7 +1211,9 @@ node -e '
 ' "${D}/record.json"
 run_validator "${D}"
 check "an unreadable pre-stop account refuses without requiring a watched stop" \
-  3 "single_release restart node.*did not provide a fresh pre-stop preservation sample.*pre_stop.sample_readable.*is zero.*retained history"
+  3 \
+  "single_release restart node.*did not provide a fresh pre-stop preservation sample.*pre_stop.sample_readable.*is zero.*retained history" \
+  "single_release restart node.*retained a nonzero tBTC incomplete-output observation in its stale pre-stop account.*pre_stop.*tbtc_quarantine_incomplete_outputs.*is 5.*freshness failure"
 
 # Only the two producer values are meaningful. A fabricated value must not
 # authorize the stop or degrade into a generic truthy freshness reading.
@@ -1322,6 +1328,109 @@ node -e '
 run_validator "${D}"
 check "single-release acceptance requires every pre-restart preservation reading" \
   3 "single_release step.*restart across C.*carries no watched-stop reading of.*r1-node-2.*beacon_quarantine_incomplete_outputs"
+
+# Every watched-stop value carries its own provenance bit. Missing or malformed
+# provenance cannot turn a retained number into a final watched sample, and an
+# incomplete-output field explicitly carried from an earlier sample blocks the
+# restart even when its retained numeric value is zero.
+D="${WORK}/accept-restart-missing-watched-field-provenance"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  const stage = record.stages.find(
+    ({ name }) =>
+      name ===
+      "restart across C derives mode from the chain, not from process state"
+  );
+  delete stage.gauges[
+    "r1-node-2.pre_restart.participation_tbtc_quarantine_incomplete_outputs.read_in_final_watched_sample"
+  ];
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "a watched-stop field with no provenance leaves restart unrehearsed" 3 \
+  "carries no watched-stop field provenance reading of.*tbtc_quarantine_incomplete_outputs.read_in_final_watched_sample"
+
+D="${WORK}/accept-restart-invalid-watched-field-provenance"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  const stage = record.stages.find(
+    ({ name }) =>
+      name ===
+      "restart across C derives mode from the chain, not from process state"
+  );
+  stage.gauges[
+    "r1-node-2.pre_restart.participation_beacon_quarantine_incomplete_outputs.read_in_final_watched_sample"
+  ] = 2;
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "invalid watched-stop field provenance leaves restart unrehearsed" 3 \
+  "invalid watched-stop field provenance.*beacon_quarantine_incomplete_outputs.read_in_final_watched_sample.*is 2"
+
+D="${WORK}/accept-restart-carried-incomplete-field"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  const stage = record.stages.find(
+    ({ name }) =>
+      name ===
+      "restart across C derives mode from the chain, not from process state"
+  );
+  stage.gauges[
+    "r1-node-2.pre_restart.participation_tbtc_quarantine_incomplete_outputs.read_in_final_watched_sample"
+  ] = 0;
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "a carried incomplete-output field cannot authorize restart" 3 \
+  "did not re-read the tBTC incomplete-output field in the final watched-stop sample.*tbtc_quarantine_incomplete_outputs.read_in_final_watched_sample.*is zero.*archived value.*carried from an earlier sample"
+
+# Historical counters are useful but do not carry the same live-safety
+# authority as incomplete-output gauges. A counter omitted from the final
+# partial sample stays visible as an advisory while both live fields remain
+# freshly read and authoritative.
+D="${WORK}/accept-restart-carried-preservation-counter"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  const stage = record.stages.find(
+    ({ name }) =>
+      name ===
+      "restart across C derives mode from the chain, not from process state"
+  );
+  stage.gauges[
+    "r1-node-2.pre_restart.participation_tbtc_quarantine_preservation_failures_total"
+  ] = 1;
+  stage.gauges[
+    "r1-node-2.pre_restart.participation_tbtc_quarantine_preservation_failures_total.read_in_final_watched_sample"
+  ] = 0;
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "a carried watched-stop counter remains a non-fatal advisory" 0 \
+  "retained the tBTC preservation counter from an earlier sample in its final watched-stop account.*tbtc_quarantine_preservation_failures_total.read_in_final_watched_sample.*is zero"
 
 # A numeric watched-stop reading is not sufficient when preservation became
 # incomplete after the guard passed. The old process is already stopped in
@@ -1700,6 +1809,8 @@ CASE_OUT="$(
     QUARANTINE_PRESERVATION_READINGS=""
     # shellcheck disable=SC2030
     QUARANTINE_PRESERVATION_SAMPLE_READABLE=0
+    # shellcheck disable=SC2030
+    QUARANTINE_PRESERVATION_SAMPLE_READ_MASK=0
     SAMPLER_ROUND="unread"
 
     # Invoked indirectly by sample_quarantine_preservation_signals.
@@ -1714,6 +1825,8 @@ CASE_OUT="$(
         base=8
       elif [[ "${SAMPLER_ROUND}:${service}" == "third:r1-node-1" ]]; then
         base=12
+      elif [[ "${SAMPLER_ROUND}:${service}" == "partial:r1-node-1" ]]; then
+        base=40
       elif [[ "${SAMPLER_ROUND}:${service}" == "initialize:r1-node-1" ]]; then
         base=20
       elif [[ "${SAMPLER_ROUND}:${service}" == "initialize:r1-node-2" ]]; then
@@ -1735,6 +1848,10 @@ CASE_OUT="$(
         "participation_beacon_quarantine_incomplete_outputs" ]]; then
         offset=4
       else
+        return 1
+      fi
+      if [[ "${SAMPLER_ROUND}:${metric}" == \
+        "partial:participation_tbtc_quarantine_incomplete_outputs" ]]; then
         return 1
       fi
       printf '%d' "$((base + offset))"
@@ -1761,22 +1878,36 @@ CASE_OUT="$(
       printf '%s\n' "${label}"
     }
 
+    expect_sampler_read_mask() {
+      local label="$1" expected="$2"
+      if [[ "${QUARANTINE_PRESERVATION_SAMPLE_READ_MASK}" != "${expected}" ]]; then
+        printf 'sampler read-mask mismatch at %s: expected [%s], actual [%s]\n' \
+          "${label}" "${expected}" \
+          "${QUARANTINE_PRESERVATION_SAMPLE_READ_MASK}"
+        return 1
+      fi
+      printf '%s\n' "${label}"
+    }
+
     sample_quarantine_preservation_signals r1-node-1
     expect_sampler_readings "first unreadable sample is explicit" \
       "r1-node-1 unreadable unreadable unreadable unreadable"
     expect_sampler_freshness "first unreadable sample is not fresh" 0
+    expect_sampler_read_mask "first unreadable sample names no read fields" 0
 
     SAMPLER_ROUND="first"
     sample_quarantine_preservation_signals r1-node-1
     expect_sampler_readings "numeric sample replaces unreadable fields" \
       "r1-node-1 1 2 3 4"
     expect_sampler_freshness "numeric sample is fresh" 1
+    expect_sampler_read_mask "numeric sample names all four read fields" 15
 
     SAMPLER_ROUND="unread"
     sample_quarantine_preservation_signals r1-node-1
     expect_sampler_readings "later unreadable sample retains numeric fields" \
       "r1-node-1 1 2 3 4"
     expect_sampler_freshness "retained numeric history is not a fresh sample" 0
+    expect_sampler_read_mask "unreadable sample names no newly read fields" 0
 
     # shellcheck disable=SC2030
     STEP_GAUGES=""
@@ -1793,6 +1924,33 @@ CASE_OUT="$(
     printf 'stale numeric history is archived with freshness zero\n'
 
     STEP_GAUGES=""
+    append_quarantine_preservation_gauges \
+      r1-node-1 "${RESTART_WATCHED_STOP_NAMESPACE}" "" 15
+    [[ "${STEP_GAUGES}" == \
+      *'"r1-node-1.pre_restart.participation_tbtc_quarantine_preservation_failures_total.read_in_final_watched_sample":1'* ]]
+    [[ "${STEP_GAUGES}" == \
+      *'"r1-node-1.pre_restart.participation_beacon_quarantine_preservation_failures_total.read_in_final_watched_sample":1'* ]]
+    [[ "${STEP_GAUGES}" == \
+      *'"r1-node-1.pre_restart.participation_tbtc_quarantine_incomplete_outputs.read_in_final_watched_sample":1'* ]]
+    [[ "${STEP_GAUGES}" == \
+      *'"r1-node-1.pre_restart.participation_beacon_quarantine_incomplete_outputs.read_in_final_watched_sample":1'* ]]
+    quarantine_preservation_incomplete_fields_read 15
+    printf 'fully re-read watched account archives four field provenance bits\n'
+
+    STEP_GAUGES=""
+    if append_quarantine_preservation_gauges \
+      r1-node-1 "${RESTART_WATCHED_STOP_NAMESPACE}" "" 16; then
+      printf 'invalid watched sample mask unexpectedly archived\n'
+      exit 1
+    fi
+    [[ "${STEP_GAUGES}" != *".read_in_final_watched_sample"* ]]
+    if quarantine_preservation_incomplete_fields_read 16; then
+      printf 'invalid watched sample mask unexpectedly authorized\n'
+      exit 1
+    fi
+    printf 'invalid watched sample mask is rejected by the producer\n'
+
+    STEP_GAUGES=""
     if append_quarantine_preservation_gauges r1-node-1 pre_stop 2; then
       printf 'invalid sampler freshness unexpectedly archived\n'
       exit 1
@@ -1805,11 +1963,29 @@ CASE_OUT="$(
     expect_sampler_readings "later numeric sample overwrites numeric fields" \
       "r1-node-1 5 6 7 8"
     expect_sampler_freshness "later numeric sample is fresh" 1
+    expect_sampler_read_mask "later numeric sample names all four read fields" 15
+
+    SAMPLER_ROUND="partial"
+    sample_quarantine_preservation_signals r1-node-1
+    expect_sampler_readings "partial sample retains only its unread field" \
+      "r1-node-1 41 42 7 44"
+    expect_sampler_freshness "partial sample is not globally fresh" 0
+    expect_sampler_read_mask "partial sample names its three read fields" 11
+    STEP_GAUGES=""
+    append_quarantine_preservation_gauges \
+      r1-node-1 "${RESTART_WATCHED_STOP_NAMESPACE}" "" 11
+    [[ "${STEP_GAUGES}" == \
+      *'"r1-node-1.pre_restart.participation_tbtc_quarantine_incomplete_outputs.read_in_final_watched_sample":0'* ]]
+    if quarantine_preservation_incomplete_fields_read 11; then
+      printf 'carried incomplete field unexpectedly authorized watched account\n'
+      exit 1
+    fi
+    printf 'carried incomplete field is archived and refused by the producer\n'
 
     SAMPLER_ROUND="other"
     sample_quarantine_preservation_signals r1-node-2
     expect_sampler_readings "sampling a second service keeps one line each" \
-      $'r1-node-1 5 6 7 8\nr1-node-2 9 10 11 12'
+      $'r1-node-1 41 42 7 44\nr1-node-2 9 10 11 12'
 
     SAMPLER_ROUND="third"
     sample_quarantine_preservation_signals r1-node-1
@@ -1834,13 +2010,23 @@ set -e
 check "the preservation sampler retains only node-authored last readings" 0 \
   "first unreadable sample is explicit" \
   "first unreadable sample is not fresh" \
+  "first unreadable sample names no read fields" \
   "numeric sample replaces unreadable fields" \
   "numeric sample is fresh" \
+  "numeric sample names all four read fields" \
   "later unreadable sample retains numeric fields" \
   "retained numeric history is not a fresh sample" \
+  "unreadable sample names no newly read fields" \
   "stale numeric history is archived with freshness zero" \
+  "fully re-read watched account archives four field provenance bits" \
+  "invalid watched sample mask is rejected by the producer" \
   "invalid sampler freshness is rejected by the producer" \
   "later numeric sample overwrites numeric fields" \
+  "later numeric sample names all four read fields" \
+  "partial sample retains only its unread field" \
+  "partial sample is not globally fresh" \
+  "partial sample names its three read fields" \
+  "carried incomplete field is archived and refused by the producer" \
   "sampling a second service keeps one line each" \
   "resampling one service replaces rather than appends" \
   "a replacement process inherits no old account" \
@@ -2537,7 +2723,7 @@ complete_run() {
       # The pre-stop guard and the later watched-stop account are distinct;
       # both remain distinct from the replacement process's same metric names.
       # shellcheck disable=SC2034
-      STEP_GAUGES='"r1-node-2.pre_stop.participation_tbtc_quarantine_preservation_failures_total":0,"r1-node-2.pre_stop.participation_beacon_quarantine_preservation_failures_total":0,"r1-node-2.pre_stop.participation_tbtc_quarantine_incomplete_outputs":0,"r1-node-2.pre_stop.participation_beacon_quarantine_incomplete_outputs":0,"r1-node-2.pre_stop.sample_readable":1,"r1-node-2.pre_restart.participation_tbtc_quarantine_preservation_failures_total":0,"r1-node-2.pre_restart.participation_beacon_quarantine_preservation_failures_total":0,"r1-node-2.pre_restart.participation_tbtc_quarantine_incomplete_outputs":0,"r1-node-2.pre_restart.participation_beacon_quarantine_incomplete_outputs":0,"r1-node-2.pre_restart.container_exit_code":0'
+      STEP_GAUGES='"r1-node-2.pre_stop.participation_tbtc_quarantine_preservation_failures_total":0,"r1-node-2.pre_stop.participation_beacon_quarantine_preservation_failures_total":0,"r1-node-2.pre_stop.participation_tbtc_quarantine_incomplete_outputs":0,"r1-node-2.pre_stop.participation_beacon_quarantine_incomplete_outputs":0,"r1-node-2.pre_stop.sample_readable":1,"r1-node-2.pre_restart.participation_tbtc_quarantine_preservation_failures_total":0,"r1-node-2.pre_restart.participation_beacon_quarantine_preservation_failures_total":0,"r1-node-2.pre_restart.participation_tbtc_quarantine_incomplete_outputs":0,"r1-node-2.pre_restart.participation_beacon_quarantine_incomplete_outputs":0,"r1-node-2.pre_restart.participation_tbtc_quarantine_preservation_failures_total.read_in_final_watched_sample":1,"r1-node-2.pre_restart.participation_beacon_quarantine_preservation_failures_total.read_in_final_watched_sample":1,"r1-node-2.pre_restart.participation_tbtc_quarantine_incomplete_outputs.read_in_final_watched_sample":1,"r1-node-2.pre_restart.participation_beacon_quarantine_incomplete_outputs.read_in_final_watched_sample":1,"r1-node-2.pre_restart.container_exit_code":0'
     elif [[ "${stage}" == \
       "quarantine preservation is complete through quiescence" ]]; then
       # shellcheck disable=SC2034
@@ -8381,6 +8567,42 @@ else
   FAILED=$((FAILED + 1))
 fi
 
+# The pre-stop and watched-stop namespace literals cross the shell/JavaScript
+# boundary just like the metric names. Pin both reader literals to producer
+# constants and require the destructive call sites to use those constants, so
+# neither side can silently rename one phase after an expensive rehearsal.
+READER_RESTART_PRE_STOP_NAMESPACE="$(sed -n \
+  's/^[[:space:]]*const preStopNamespace = \"\([^\"]*\)\";[[:space:]]*$/\1/p' \
+  "${TEST_DIR}/rehearse.sh")"
+READER_RESTART_WATCHED_STOP_NAMESPACE="$(sed -n \
+  's/^[[:space:]]*const watchedStopNamespace = \"\([^\"]*\)\";[[:space:]]*$/\1/p' \
+  "${TEST_DIR}/rehearse.sh")"
+# These are literal source fragments, not expansions in this test shell.
+# shellcheck disable=SC2016
+RESTART_PRE_STOP_NAMESPACE_PRODUCER_CALL='"${restarted}" "${RESTART_PRE_STOP_NAMESPACE}"'
+# shellcheck disable=SC2016
+RESTART_WATCHED_STOP_NAMESPACE_PRODUCER_CALL='"${restarted}" "${RESTART_WATCHED_STOP_NAMESPACE}"'
+if [[ -n "${RESTART_PRE_STOP_NAMESPACE}" ]] &&
+  [[ "${RESTART_PRE_STOP_NAMESPACE}" == \
+  "${READER_RESTART_PRE_STOP_NAMESPACE}" ]] &&
+  [[ -n "${RESTART_WATCHED_STOP_NAMESPACE}" ]] &&
+  [[ "${RESTART_WATCHED_STOP_NAMESPACE}" == \
+  "${READER_RESTART_WATCHED_STOP_NAMESPACE}" ]] &&
+  declare -f stage_single_release |
+    grep -F "${RESTART_PRE_STOP_NAMESPACE_PRODUCER_CALL}" >/dev/null &&
+  declare -f stage_single_release |
+    grep -F "${RESTART_WATCHED_STOP_NAMESPACE_PRODUCER_CALL}" >/dev/null; then
+  printf 'ok   the restart evidence producer and reader use the same namespaces\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL the restart evidence namespaces drifted: producer [%s/%s], reader [%s/%s]\n' \
+    "${RESTART_PRE_STOP_NAMESPACE:-missing}" \
+    "${RESTART_WATCHED_STOP_NAMESPACE:-missing}" \
+    "${READER_RESTART_PRE_STOP_NAMESPACE:-missing}" \
+    "${READER_RESTART_WATCHED_STOP_NAMESPACE:-missing}"
+  FAILED=$((FAILED + 1))
+fi
+
 # The freshness bit is produced by the shell archive helper and consumed by
 # the JavaScript restart reader. Bind its suffix across that boundary so a
 # one-sided rename cannot silently turn retained history into missing evidence.
@@ -8404,6 +8626,31 @@ else
   FAILED=$((FAILED + 1))
 fi
 
+# Every watched-stop field carries a producer-written provenance suffix which
+# the reader uses to distinguish the final partial sample from retained
+# history. Bind the suffix and the helper interpolation across that boundary.
+READER_RESTART_WATCHED_FIELD_READABLE_SUFFIX="$(sed -n \
+  '/^[[:space:]]*const watchedFieldReadableSuffix =$/{
+    n
+    s/^[[:space:]]*\"\([^\"]*\)\";[[:space:]]*$/\1/p
+  }' "${TEST_DIR}/rehearse.sh")"
+# This is the literal interpolation the producer helper must carry.
+# shellcheck disable=SC2016
+RESTART_WATCHED_FIELD_READABLE_PRODUCER_KEY='${key_prefix}${metric}.${RESTART_WATCHED_FIELD_READABLE_SUFFIX}'
+if [[ -n "${RESTART_WATCHED_FIELD_READABLE_SUFFIX}" ]] &&
+  [[ "${RESTART_WATCHED_FIELD_READABLE_SUFFIX}" == \
+  "${READER_RESTART_WATCHED_FIELD_READABLE_SUFFIX}" ]] &&
+  declare -f append_quarantine_preservation_gauges |
+    grep -F "${RESTART_WATCHED_FIELD_READABLE_PRODUCER_KEY}" >/dev/null; then
+  printf 'ok   the watched-stop field provenance producer and reader use the same suffix\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL the watched-stop field provenance suffix drifted: producer [%s], reader [%s]\n' \
+    "${RESTART_WATCHED_FIELD_READABLE_SUFFIX:-missing}" \
+    "${READER_RESTART_WATCHED_FIELD_READABLE_SUFFIX:-missing}"
+  FAILED=$((FAILED + 1))
+fi
+
 # The old process's exit status has the same producer/reader boundary as the
 # preservation signals even though it is not a Prometheus metric. Bind its
 # suffix too: a one-sided rename would turn a clean exact-image rehearsal into
@@ -8413,12 +8660,16 @@ READER_RESTART_CONTAINER_EXIT_CODE_SUFFIX="$(sed -n \
   "${TEST_DIR}/rehearse.sh")"
 # This is the literal interpolation the producer source must carry.
 # shellcheck disable=SC2016
-RESTART_CONTAINER_EXIT_CODE_PRODUCER_KEY='${restarted}.pre_restart.${RESTART_CONTAINER_EXIT_CODE_SUFFIX}'
+RESTART_CONTAINER_EXIT_CODE_PRODUCER_KEY='${restarted}.${RESTART_WATCHED_STOP_NAMESPACE}.'
+# shellcheck disable=SC2016
+RESTART_CONTAINER_EXIT_CODE_PRODUCER_SUFFIX='${RESTART_CONTAINER_EXIT_CODE_SUFFIX}'
 if [[ -n "${RESTART_CONTAINER_EXIT_CODE_SUFFIX}" ]] &&
   [[ "${RESTART_CONTAINER_EXIT_CODE_SUFFIX}" == \
   "${READER_RESTART_CONTAINER_EXIT_CODE_SUFFIX}" ]] &&
   declare -f stage_single_release |
-    grep -F "${RESTART_CONTAINER_EXIT_CODE_PRODUCER_KEY}" >/dev/null; then
+    grep -F "${RESTART_CONTAINER_EXIT_CODE_PRODUCER_KEY}" >/dev/null &&
+  declare -f stage_single_release |
+    grep -F "${RESTART_CONTAINER_EXIT_CODE_PRODUCER_SUFFIX}" >/dev/null; then
   printf 'ok   the restart exit-status producer and archive reader use the same suffix\n'
   PASS=$((PASS + 1))
 else
@@ -8886,13 +9137,39 @@ fi
 # client-info endpoint.
 if printf '%s\n' "${SINGLE_RELEASE_SOURCE}" | awk '
   /while kill -0 "\$\{restart_stop_pid\}"/ { watching = 1 }
-  watching && /node_reachable "\$\{restarted\}" \|\| break/ { found = 1 }
-  watching && /^[[:space:]]*done[[:space:]]*$/ { exit(found ? 0 : 1) }
+  watching && /if node_reachable "\$\{restarted\}"; then/ {
+    checked = 1
+  }
+  watching && checked && /^[[:space:]]*break;?[[:space:]]*$/ {
+    stopped = 1
+  }
+  watching && /^[[:space:]]*done;?[[:space:]]*$/ {
+    exit(checked && stopped ? 0 : 1)
+  }
   END { if (!watching) exit 1 }
 '; then
   pass_case "the watched cross-C stop stops scraping after endpoint loss"
 else
   fail_case "the watched cross-C stop stops scraping after endpoint loss"
+fi
+
+# The final useful sampling attempt replaces the prior attempt's mask; it is
+# never OR-accumulated across the window. Both incomplete-output bits are then
+# required before the old process can authorize a replacement start.
+# These are literal function-source fragments.
+# shellcheck disable=SC2016
+if [[ "${SINGLE_RELEASE_SOURCE}" == \
+  *'local restart_watched_sample_read_mask=0;'* ]] &&
+  [[ "${SINGLE_RELEASE_SOURCE}" == \
+  *'restart_watched_sample_read_mask="${QUARANTINE_PRESERVATION_SAMPLE_READ_MASK}";'* ]] &&
+  [[ "${SINGLE_RELEASE_SOURCE}" == \
+  *'append_quarantine_preservation_gauges "${restarted}" "${RESTART_WATCHED_STOP_NAMESPACE}" "" "${restart_watched_sample_read_mask}"'* ]] &&
+  [[ "${SINGLE_RELEASE_SOURCE}" == \
+  *'quarantine_preservation_incomplete_fields_read "${restart_watched_sample_read_mask}"'* ]] &&
+  [[ "${SINGLE_RELEASE_SOURCE}" != *'restart_watched_sample_read_mask=$((restart_watched_sample_read_mask |'* ]]; then
+  pass_case "the watched stop retains one final field mask and requires live gauges"
+else
+  fail_case "the watched stop retains one final field mask and requires live gauges"
 fi
 
 # The availability check that decides whether later independent controls may
@@ -8947,19 +9224,37 @@ else
 [${RESTART_FOLLOWUP_PROBE_ORDER//$'\n'/, }]"
 fi
 
-# If that bounded check still cannot recover a node, its partial-record note
-# names what the control actually did and the outcome it recorded. It must not
-# claim every path was a refused restart: a clean start can fail, and a pre-stop
-# guard can refuse without issuing any stop.
-if printf '%s\n' "${SINGLE_RELEASE_SOURCE}" |
-  grep -Fq 'after the control issued its watched stop' &&
+# If that bounded check still cannot recover a node, only a control that
+# actually issued the watched stop may emit the partial record. Pre-stop
+# refusals leave the old process live and continue into the independent
+# controls, so a no-stop note branch would be dead scaffolding.
+RESTART_PARTIAL_RECORD_ORDER="$(
+  printf '%s\n' "${SINGLE_RELEASE_SOURCE}" | awk '
+    /if \(\(restart_stop_authorized == 1 && restart_followups_safe == 0\)\); then/ {
+      guarded = 1
+      print "guard"
+      next
+    }
+    guarded && /note "the remaining single-release controls/ {
+      print "note"
+      next
+    }
+    guarded && /conclude_rehearsal/ {
+      print "conclude"
+      next
+    }
+    guarded && /^[[:space:]]*fi;[[:space:]]*$/ { exit }
+  '
+)"
+if [[ "${RESTART_PARTIAL_RECORD_ORDER}" == $'guard\nnote\nconclude' ]] &&
   printf '%s\n' "${SINGLE_RELEASE_SOURCE}" |
-  grep -Fq 'without authorizing a stop' &&
+  grep -Fq 'after the control issued its watched stop' &&
   ! printf '%s\n' "${SINGLE_RELEASE_SOURCE}" |
-  grep -Fq 'unavailable after the refused restart control'; then
-  pass_case "the partial-record note reflects stop authority and recorded outcome"
+  grep -Fq 'without authorizing a stop'; then
+  pass_case "only an authorized watched stop can emit the partial-record note"
 else
-  fail_case "the partial-record note reflects stop authority and recorded outcome"
+  fail_case "only an authorized watched stop can emit the partial-record note" \
+    "observed order [${RESTART_PARTIAL_RECORD_ORDER//$'\n'/, }]"
 fi
 
 # Every control the sequence turns on has to be present and resolved. A site

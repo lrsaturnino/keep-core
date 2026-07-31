@@ -3894,11 +3894,15 @@ QUARANTINE_PRESERVATION_METRICS=(
   participation_beacon_quarantine_incomplete_outputs
 )
 
-# The pre-stop sampler's freshness and the stopped process's own exit status
-# are evidence, not Prometheus metrics or Compose command results. Keep their
-# archive suffixes named once on the producer side; the scaffold self-test
-# binds them to the JavaScript acceptance reader below.
+# The restart evidence namespaces, pre-stop sampler freshness, watched-stop
+# field provenance, and stopped process exit status are evidence, not
+# Prometheus metrics or Compose command results. Keep their archive names once
+# on the producer side; the scaffold self-test binds them to the JavaScript
+# acceptance reader below.
+RESTART_PRE_STOP_NAMESPACE="pre_stop"
+RESTART_WATCHED_STOP_NAMESPACE="pre_restart"
 RESTART_PRE_STOP_SAMPLE_READABLE_SUFFIX="sample_readable"
+RESTART_WATCHED_FIELD_READABLE_SUFFIX="read_in_final_watched_sample"
 RESTART_CONTAINER_EXIT_CODE_SUFFIX="container_exit_code"
 
 # The participation metrics an evidence step snapshots, by their internal names.
@@ -9792,6 +9796,12 @@ QUARANTINE_PRESERVATION_READINGS=""
 # probe failure, so a destructive pre-stop guard must consult this bit rather
 # than mistaking retained history for a fresh reading.
 QUARANTINE_PRESERVATION_SAMPLE_READABLE=0
+# One bit per QUARANTINE_PRESERVATION_METRICS entry, set only when the most
+# recent sampler call read that field. The watched-stop account retains the
+# last attempt that read at least one field (or ran while the endpoint was
+# still reachable), so a partially stale incomplete-output value cannot borrow
+# freshness from another field or from an earlier all-readable sample.
+QUARANTINE_PRESERVATION_SAMPLE_READ_MASK=0
 # run_quiescence_control is shared, but only the single-release stage uses it
 # inside the gate's process-local preservation window. Rollback samples the
 # same signals directly in its fleet-drain loop.
@@ -9806,7 +9816,7 @@ sample_quarantine_preservation_signals() {
   local listed_tbtc_incomplete listed_beacon_incomplete
   local retained="" reading metric index=0
   local values=("unreadable" "unreadable" "unreadable" "unreadable")
-  local sample_readable=1
+  local sample_readable=1 sample_read_mask=0
 
   while read -r listed_service listed_tbtc_failures listed_beacon_failures \
     listed_tbtc_incomplete listed_beacon_incomplete; do
@@ -9829,6 +9839,7 @@ ${listed_tbtc_incomplete} ${listed_beacon_incomplete}"
     reading="$(metric_value "${service}" "${metric}" 2>/dev/null || printf '')"
     if [[ "${reading}" =~ ^[0-9]+$ ]]; then
       values[index]="${reading}"
+      sample_read_mask=$((sample_read_mask | (1 << index)))
     else
       sample_readable=0
     fi
@@ -9839,6 +9850,7 @@ ${listed_tbtc_incomplete} ${listed_beacon_incomplete}"
 ${retained}${retained:+$'\n'}${service} ${values[0]} ${values[1]} \
 ${values[2]} ${values[3]}"
   QUARANTINE_PRESERVATION_SAMPLE_READABLE="${sample_readable}"
+  QUARANTINE_PRESERVATION_SAMPLE_READ_MASK="${sample_read_mask}"
 }
 
 initialize_quarantine_preservation_readings() {
@@ -9878,14 +9890,27 @@ quarantine_preservation_reading_for() {
 # and therefore cannot mistake `unreadable` for a node-authored zero. When the
 # caller supplies sample_readable, archive that bit beside the retained values
 # so a failed current scrape cannot pass off older numeric history as a fresh
-# pre-stop reading.
+# pre-stop reading. When it supplies sample_read_mask, archive one provenance
+# bit beside every field so the watched-stop reader can distinguish values
+# actually re-read during the stop from values carried over by the accumulator.
 append_quarantine_preservation_gauges() {
-  local service="$1" namespace="${2:-}" sample_readable="${3:-}" account
+  local service="$1" namespace="${2:-}" sample_readable="${3:-}"
+  local sample_read_mask="${4:-}" account
   local listed_service tbtc_failures beacon_failures
-  local tbtc_incomplete beacon_incomplete metric value index=0
+  local tbtc_incomplete beacon_incomplete metric value field_readable index=0
   local key_prefix="${service}."
+  local complete=1 sample_read_mask_valid=0
+  local max_read_mask=$(((1 << ${#QUARANTINE_PRESERVATION_METRICS[@]}) - 1))
 
   [[ -n "${namespace}" ]] && key_prefix="${service}.${namespace}."
+  if [[ -n "${sample_read_mask}" ]]; then
+    if [[ "${sample_read_mask}" =~ ^[0-9]+$ ]] &&
+      ((sample_read_mask <= max_read_mask)); then
+      sample_read_mask_valid=1
+    else
+      complete=0
+    fi
+  fi
   account="$(quarantine_preservation_reading_for "${service}")" || return 1
   read -r listed_service tbtc_failures beacon_failures tbtc_incomplete \
     beacon_incomplete <<<"${account}"
@@ -9896,7 +9921,6 @@ append_quarantine_preservation_gauges() {
     "${beacon_incomplete}"
   )
 
-  local complete=1
   for metric in "${QUARANTINE_PRESERVATION_METRICS[@]}"; do
     value="${values[${index}]}"
     if [[ "${value}" =~ ^[0-9]+$ ]]; then
@@ -9904,6 +9928,12 @@ append_quarantine_preservation_gauges() {
 \"${key_prefix}${metric}\":${value}"
     else
       complete=0
+    fi
+    if ((sample_read_mask_valid == 1)); then
+      field_readable=$(((sample_read_mask >> index) & 1))
+      STEP_GAUGES="${STEP_GAUGES}${STEP_GAUGES:+,}\
+\"${key_prefix}${metric}.${RESTART_WATCHED_FIELD_READABLE_SUFFIX}\":\
+${field_readable}"
     fi
     index=$((index + 1))
   done
@@ -9918,6 +9948,31 @@ append_quarantine_preservation_gauges() {
   fi
 
   ((complete == 1))
+}
+
+# The two live incomplete-output gauges are the safety statement in a watched
+# stop account. Historical write-grace counters may be carried forward as
+# advisories, but neither incomplete-output zero may be carried into the final
+# useful watched sample from an earlier attempt.
+quarantine_preservation_incomplete_fields_read() {
+  local sample_read_mask="$1" metric index=0
+  local max_read_mask=$(((1 << ${#QUARANTINE_PRESERVATION_METRICS[@]}) - 1))
+
+  [[ "${sample_read_mask}" =~ ^[0-9]+$ ]] ||
+    return 1
+  ((sample_read_mask <= max_read_mask)) ||
+    return 1
+
+  for metric in "${QUARANTINE_PRESERVATION_METRICS[@]}"; do
+    if [[ "${metric}" == *_quarantine_incomplete_outputs ]]; then
+      if ((((sample_read_mask >> index) & 1) == 0)); then
+        return 1
+      fi
+    fi
+    index=$((index + 1))
+  done
+
+  return 0
 }
 
 # A watched stop can itself refute the restart control: the process may exit
@@ -11733,7 +11788,8 @@ independent controls"
       pre_stop_readable=0
     fi
     if ! append_quarantine_preservation_gauges \
-      "${restarted}" "pre_stop" "${pre_stop_sample_readable}"; then
+      "${restarted}" "${RESTART_PRE_STOP_NAMESPACE}" \
+      "${pre_stop_sample_readable}"; then
       pre_stop_readable=0
     fi
 
@@ -11769,13 +11825,26 @@ complete preservation remains live for the later independent controls"
       # container, and only then allow the replacement process to start.
       compose stop --timeout "${restart_grace}" "${restarted}" &
       local restart_stop_pid=$!
-      local restart_watched_sample_readable=0
+      local restart_watched_sample_read_mask=0
       while kill -0 "${restart_stop_pid}" 2>/dev/null; do
         sample_quarantine_preservation_signals "${restarted}"
-        if ((QUARANTINE_PRESERVATION_SAMPLE_READABLE == 1)); then
-          restart_watched_sample_readable=1
+        if node_reachable "${restarted}"; then
+          # A reachable endpoint had the opportunity to publish all four
+          # fields. Retain this exact attempt, including any missing field,
+          # rather than OR-ing freshness from an earlier sample.
+          restart_watched_sample_read_mask="\
+${QUARANTINE_PRESERVATION_SAMPLE_READ_MASK}"
+        else
+          # The endpoint may disappear between the four metric reads and the
+          # reachability probe. Preserve any fields authored in that final
+          # partial attempt; an all-unreadable post-exit scrape must not erase
+          # the last attempt made while the process could still answer.
+          if ((QUARANTINE_PRESERVATION_SAMPLE_READ_MASK > 0)); then
+            restart_watched_sample_read_mask="\
+${QUARANTINE_PRESERVATION_SAMPLE_READ_MASK}"
+          fi
+          break
         fi
-        node_reachable "${restarted}" || break
         sleep 2
       done
 
@@ -11789,8 +11858,9 @@ complete preservation remains live for the later independent controls"
       # disappeared the sampler retains its last numeric, node-authored values;
       # it never substitutes replacement-process zeros.
       sample_quarantine_preservation_signals "${restarted}"
-      if ((QUARANTINE_PRESERVATION_SAMPLE_READABLE == 1)); then
-        restart_watched_sample_readable=1
+      if ((QUARANTINE_PRESERVATION_SAMPLE_READ_MASK > 0)); then
+        restart_watched_sample_read_mask="\
+${QUARANTINE_PRESERVATION_SAMPLE_READ_MASK}"
       fi
 
       local pre_restart_account=""
@@ -11798,23 +11868,24 @@ complete preservation remains live for the later independent controls"
       local pre_restart_beacon_failures="unreadable"
       local pre_restart_tbtc_incomplete="unreadable"
       local pre_restart_beacon_incomplete="unreadable"
-      local pre_restart_readable="${restart_watched_sample_readable}"
-      if ((pre_restart_readable == 1)); then
-        if pre_restart_account="$(
-          quarantine_preservation_reading_for "${restarted}"
-        )"; then
-          read -r _ pre_restart_tbtc_failures \
-            pre_restart_beacon_failures pre_restart_tbtc_incomplete \
-            pre_restart_beacon_incomplete <<<"${pre_restart_account}"
-        else
-          pre_restart_readable=0
-        fi
+      local pre_restart_readable=1
+      if pre_restart_account="$(
+        quarantine_preservation_reading_for "${restarted}"
+      )"; then
+        read -r _ pre_restart_tbtc_failures \
+          pre_restart_beacon_failures pre_restart_tbtc_incomplete \
+          pre_restart_beacon_incomplete <<<"${pre_restart_account}"
+      else
+        pre_restart_readable=0
       fi
-      if ((pre_restart_readable == 1)); then
-        if ! append_quarantine_preservation_gauges \
-          "${restarted}" "pre_restart"; then
-          pre_restart_readable=0
-        fi
+      if ! append_quarantine_preservation_gauges \
+        "${restarted}" "${RESTART_WATCHED_STOP_NAMESPACE}" "" \
+        "${restart_watched_sample_read_mask}"; then
+        pre_restart_readable=0
+      fi
+      if ! quarantine_preservation_incomplete_fields_read \
+        "${restart_watched_sample_read_mask}"; then
+        pre_restart_readable=0
       fi
 
       # Compose can report a successful stop after Docker exhausted the timeout
@@ -11833,7 +11904,8 @@ complete preservation remains live for the later independent controls"
       )"
       if [[ "${restart_container_exit_code}" =~ ^[0-9]+$ ]]; then
         STEP_GAUGES="${STEP_GAUGES}${STEP_GAUGES:+,}\
-\"${restarted}.pre_restart.${RESTART_CONTAINER_EXIT_CODE_SUFFIX}\":\
+\"${restarted}.${RESTART_WATCHED_STOP_NAMESPACE}.\
+${RESTART_CONTAINER_EXIT_CODE_SUFFIX}\":\
 ${restart_container_exit_code}"
       fi
 
@@ -11885,10 +11957,13 @@ ${RESTART_RECOVERY_NOTE}"
         recover_stopped_restart_subject "${restarted}" || true
         restart_followups_safe="${RESTART_RECOVERY_SAFE}"
         restart_step_outcome="blocked"
-        block_step "${restart_step}" "${restarted} did not publish all four \
-numeric quarantine-preservation signals during its watched stop; the old \
-process was the last source that could say whether it was holding generated \
-output, so the restart control was refused rather than substituting zeros.\
+        block_step "${restart_step}" "${restarted} did not provide a complete \
+watched-stop quarantine-preservation account: all four retained values must be \
+numeric and both incomplete-output fields must have been re-read in the final \
+sample that obtained any watched-stop field (read mask \
+${restart_watched_sample_read_mask}); the old process was the last source that \
+could say whether it was holding generated output, so the restart control was \
+refused rather than treating carried values as fresh.\
 ${RESTART_RECOVERY_NOTE}"
         record_assertion "${restart_assertion}" false "${restart_step}"
       elif ((pre_restart_tbtc_incomplete > 0 || pre_restart_beacon_incomplete > 0)); then
@@ -11985,17 +12060,10 @@ ${pre_restart_tbtc_failures}/${pre_restart_beacon_failures})"
       restart_followups_safe=0
     fi
   fi
-  if ((restart_followups_safe == 0)); then
-    local restart_unavailable_context
-    if ((restart_stop_authorized == 1)); then
-      restart_unavailable_context="after the control issued its watched stop \
-and recorded outcome [${restart_step_outcome:-unrecorded}]"
-    else
-      restart_unavailable_context="while the control recorded outcome \
-[${restart_step_outcome:-unrecorded}] without authorizing a stop"
-    fi
+  if ((restart_stop_authorized == 1 && restart_followups_safe == 0)); then
     note "the remaining single-release controls were not evaluated because \
-${restarted} was unavailable ${restart_unavailable_context}"
+${restarted} was unavailable after the control issued its watched stop and \
+recorded outcome [${restart_step_outcome:-unrecorded}]"
     conclude_rehearsal
   fi
 
@@ -13632,6 +13700,17 @@ evidence_acceptance_findings() {
                       " quarantine output " + incompleteDescription + ": " +
                       JSON.stringify(incompleteName) + " is " + incomplete
                   );
+                } else {
+                  add(
+                    "advisory",
+                    "single_release restart node " +
+                      JSON.stringify(restartService) + " retained a nonzero " +
+                      signal.protocol + " incomplete-output observation in " +
+                      "its stale " + readingKind + " account: " +
+                      JSON.stringify(incompleteName) + " is " + incomplete +
+                      "; the freshness failure prevented that account from " +
+                      "authorizing a stop, but does not erase what it retained"
+                  );
                 }
               } else if (
                 evaluateValues &&
@@ -13656,9 +13735,12 @@ evidence_acceptance_findings() {
           // This account was read before any stop signal. An unreadable or
           // live-incomplete account does not authorize the watched stop, so in
           // that case post-stop readings are neither required nor expected.
+          const preStopNamespace = "pre_stop";
+          const watchedStopNamespace = "pre_restart";
           const preStopSampleReadableSuffix = "sample_readable";
           const preStopSampleReadableName =
-            restartService + ".pre_stop." + preStopSampleReadableSuffix;
+            restartService + "." + preStopNamespace + "." +
+            preStopSampleReadableSuffix;
           const preStopSampleReadable = readGauge(
             restartStageName,
             restartGauges,
@@ -13691,7 +13773,7 @@ evidence_acceptance_findings() {
             );
           }
           const preStop = readPreservationAccount(
-            "pre_stop",
+            preStopNamespace,
             "pre-stop",
             "at the pre-stop guard; the stop was not authorized",
             "before the pre-stop guard",
@@ -13699,12 +13781,21 @@ evidence_acceptance_findings() {
           );
           const exitCodeSuffix = "container_exit_code";
           const exitCodeName =
-            restartService + ".pre_restart." + exitCodeSuffix;
+            restartService + "." + watchedStopNamespace + "." +
+            exitCodeSuffix;
+          const watchedFieldReadableSuffix =
+            "read_in_final_watched_sample";
           const watchedNames = [exitCodeName];
           for (const signal of quarantineSignals) {
             watchedNames.push(
-              restartService + ".pre_restart." + signal.counter,
-              restartService + ".pre_restart." + signal.incomplete
+              restartService + "." + watchedStopNamespace + "." +
+                signal.counter,
+              restartService + "." + watchedStopNamespace + "." +
+                signal.incomplete,
+              restartService + "." + watchedStopNamespace + "." +
+                signal.counter + "." + watchedFieldReadableSuffix,
+              restartService + "." + watchedStopNamespace + "." +
+                signal.incomplete + "." + watchedFieldReadableSuffix
             );
           }
           const carriesWatchedEvidence = watchedNames.some((name) =>
@@ -13755,11 +13846,69 @@ evidence_acceptance_findings() {
               );
             }
             readPreservationAccount(
-              "pre_restart",
+              watchedStopNamespace,
               "watched-stop",
               "during the watched stop after the pre-stop guard passed",
               "before restart reset its process-local counters"
             );
+            for (const signal of quarantineSignals) {
+              const watchedPrefix =
+                restartService + "." + watchedStopNamespace + ".";
+              for (const field of [
+                { name: signal.counter, kind: "counter" },
+                { name: signal.incomplete, kind: "incomplete-output" },
+              ]) {
+                const fieldName = watchedPrefix + field.name;
+                const readableName =
+                  fieldName + "." + watchedFieldReadableSuffix;
+                const fieldReadable = readGauge(
+                  restartStageName,
+                  restartGauges,
+                  readableName,
+                  "watched-stop field provenance"
+                );
+                if (
+                  fieldReadable !== undefined &&
+                  (!Number.isInteger(fieldReadable) ||
+                    (fieldReadable !== 0 && fieldReadable !== 1))
+                ) {
+                  add(
+                    "unrehearsed",
+                    "single_release restart node " +
+                      JSON.stringify(restartService) +
+                      " carries an invalid watched-stop field provenance: " +
+                      JSON.stringify(readableName) + " is " + fieldReadable
+                  );
+                } else if (
+                  fieldReadable === 0 &&
+                  field.kind === "incomplete-output"
+                ) {
+                  add(
+                    "unrehearsed",
+                    "single_release restart node " +
+                      JSON.stringify(restartService) + " did not re-read the " +
+                      signal.protocol + " incomplete-output field in the " +
+                      "final watched-stop sample: " +
+                      JSON.stringify(readableName) +
+                      " is zero; archived value " +
+                      JSON.stringify(fieldName) + " was carried from an " +
+                      "earlier sample"
+                  );
+                } else if (
+                  fieldReadable === 0 &&
+                  field.kind === "counter"
+                ) {
+                  add(
+                    "advisory",
+                    "single_release restart node " +
+                      JSON.stringify(restartService) + " retained the " +
+                      signal.protocol + " preservation counter from an " +
+                      "earlier sample in its final watched-stop account: " +
+                      JSON.stringify(readableName) + " is zero"
+                  );
+                }
+              }
+            }
           }
         }
       }
