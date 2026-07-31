@@ -712,8 +712,8 @@ func validateReleaseProvenance(
 
 	if len(provenance.Images) == 0 {
 		violations = append(violations, fmt.Errorf(
-			"images is empty: provenance must record the immutable image " +
-				"digests the fleet runs and the acceptance evidence is " +
+			"images is empty: provenance must record the immutable image "+
+				"digests the fleet runs and the acceptance evidence is "+
 				"collected against",
 		))
 	}
