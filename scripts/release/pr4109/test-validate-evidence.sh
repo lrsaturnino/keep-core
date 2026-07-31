@@ -279,7 +279,34 @@ ASSERTION_REFUSED='{
 }'
 
 CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID=""
+CUTOVER_WINDOW_FIXTURE_CAPTURE_ID=""
 CUTOVER_WINDOW_FIXTURE_SUMMARY_SHA256=""
+
+fixture_identity() {
+  printf '%s' "$1" | hash_stdin | cut -c1-32
+}
+
+fixture_r1_fleet() {
+  local record_id="$1"
+  node -e '
+    const crypto = require("crypto");
+    const id = process.argv[1];
+    const container = (service) => crypto.createHash("sha256")
+      .update("container:" + id + ":" + service).digest("hex");
+    process.stdout.write(JSON.stringify([
+      {
+        service: "r1-node-1",
+        container_id: container("r1-node-1"),
+        operator_address: "0x" + "1".repeat(40),
+      },
+      {
+        service: "r1-node-2",
+        container_id: container("r1-node-2"),
+        operator_address: "0x" + "2".repeat(40),
+      },
+    ]));
+  ' "${record_id}"
+}
 
 # Build the same per-service archive shape as the real capture helper. Fixture
 # records are accepted only through these actual bytes: the summary digest is
@@ -287,29 +314,80 @@ CUTOVER_WINDOW_FIXTURE_SUMMARY_SHA256=""
 # activation, cadence, emptiness, clock-health, advancing-block, and close
 # facts the acceptance reader independently checks.
 write_complete_cutover_window_archive() {
-  local evidence_dir="$1" record_id="$2"
-  local archive_id="cutover-roster-window-fixture-${record_id}"
+  local evidence_dir="$1" record_id="$2" run_id="$3" source_sha="$4"
+  local r1_images="$5" revision="$6" chain_id="$7" cutover_block="$8"
+  local r1_fleet="$9"
+  local capture_id
+  capture_id="$(fixture_identity "capture:${record_id}")"
+  local archive_id="cutover-roster-window-${capture_id}"
   local archive="${evidence_dir}/${archive_id}"
   local services=(
     "${REHEARSAL_R1_SERVICES[@]+"${REHEARSAL_R1_SERVICES[@]}"}"
   )
   local service
+  local capture_context
+  capture_context="$(node -e '
+    const [
+      runID, captureID, archiveID, sourceSha, imagesJSON, revision,
+      chainID, cutoverBlock, fleetJSON,
+    ] = process.argv.slice(1);
+    process.stdout.write(JSON.stringify({
+      schema_version: 1,
+      run_id: runID,
+      capture_id: captureID,
+      archive_id: archiveID,
+      gate: "single_release",
+      source_sha: sourceSha,
+      r1_image_digests: JSON.parse(imagesJSON),
+      revision,
+      protocol_epoch: "security_v2_cutover",
+      chain_id: chainID,
+      cutover_block: Number(cutoverBlock),
+      r1_fleet: JSON.parse(fleetJSON),
+    }));
+  ' "${run_id}" "${capture_id}" "${archive_id}" "${source_sha}" \
+    "${r1_images}" "${revision}" "${chain_id}" "${cutover_block}" \
+    "${r1_fleet}")"
 
   mkdir -p "${archive}"
   for service in "${services[@]+"${services[@]}"}"; do
     printf '%s\n' \
-      "2026-07-31T00:00:00.000000000Z protocol cutover evidence window changed [active=true] [signal=user defined signal 1]" \
-      "2026-07-31T00:00:30.000000000Z protocol cutover peer roster snapshot [currentBlock=100] [clockAvailable=true] [legacyPeers=0] [oldestFirstSeenBlock=0] [rosterRevision=0]" \
-      "2026-07-31T00:05:30.000000000Z protocol cutover peer roster snapshot [currentBlock=125] [clockAvailable=true] [legacyPeers=0] [oldestFirstSeenBlock=0] [rosterRevision=0]" \
-      "2026-07-31T00:05:31.000000000Z protocol cutover evidence window changed [active=false] [signal=user defined signal 2]" \
+      "2026-07-27T00:00:00.100000000Z protocol cutover evidence window changed [active=true] [signal=user defined signal 1]" \
+      "2026-07-27T00:00:30.000000000Z protocol cutover peer roster snapshot [currentBlock=100] [clockAvailable=true] [legacyPeers=0] [oldestFirstSeenBlock=0] [rosterRevision=0]" \
+      "2026-07-27T00:05:30.000000000Z protocol cutover peer roster snapshot [currentBlock=125] [clockAvailable=true] [legacyPeers=0] [oldestFirstSeenBlock=0] [rosterRevision=0]" \
+      "2026-07-27T00:05:31.000000000Z protocol cutover evidence window changed [active=false] [signal=user defined signal 2]" \
       >"${archive}/${service}.log"
   done
+
+  node -e '
+    const fs = require("fs");
+    const [archivePath, captureContextJSON, ...services] =
+      process.argv.slice(1);
+    fs.writeFileSync(
+      archivePath + "/window-open.json",
+      JSON.stringify({
+        schema_version: 2,
+        capture_context: JSON.parse(captureContextJSON),
+        opened_at: "2026-07-27T00:00:00.000Z",
+        archived_at: "2026-07-27T00:05:30.500Z",
+        services: services.map((service) => ({
+          service,
+          signal_delivered: true,
+          activation_seen: true,
+          periodic_empty_snapshots_seen: true,
+        })),
+        complete: services.length > 0,
+      }, null, 2) + "\n"
+    );
+  ' "${archive}" "${capture_context}" \
+    "${services[@]+"${services[@]}"}"
 
   node -e '
     const crypto = require("crypto");
     const fs = require("fs");
     const path = require("path");
-    const [archivePath, ...services] = process.argv.slice(1);
+    const [archivePath, captureContextJSON, ...services] =
+      process.argv.slice(1);
     const entries = services.map((service) => {
       const log = fs.readFileSync(path.join(archivePath, service + ".log"));
       return {
@@ -327,21 +405,65 @@ write_complete_cutover_window_archive() {
     fs.writeFileSync(
       path.join(archivePath, "result.json"),
       JSON.stringify({
-        schema_version: 1,
-        opened_at: "2026-07-31T00:00:00.000Z",
-        archived_before_close_at: "2026-07-31T00:05:30Z",
-        closed_at: "2026-07-31T00:05:31Z",
+        schema_version: 2,
+        capture_context: JSON.parse(captureContextJSON),
+        opened_at: "2026-07-27T00:00:00.000Z",
+        archived_before_close_at: "2026-07-27T00:05:30.500Z",
+        closed_at: "2026-07-27T00:05:31.500Z",
+        window_open_sha256: crypto.createHash("sha256").update(
+          fs.readFileSync(path.join(archivePath, "window-open.json"))
+        ).digest("hex"),
         complete: services.length > 0,
         failures: [],
         services: entries,
       }, null, 2) + "\n"
     );
-  ' "${archive}" "${services[@]+"${services[@]}"}"
+  ' "${archive}" "${capture_context}" \
+    "${services[@]+"${services[@]}"}"
 
   CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID="${archive_id}"
+  CUTOVER_WINDOW_FIXTURE_CAPTURE_ID="${capture_id}"
   CUTOVER_WINDOW_FIXTURE_SUMMARY_SHA256="$(
     hash_stdin <"${archive}/result.json"
   )"
+}
+
+# Rebind every digest after an adversarial fixture changes semantically
+# meaningful bytes. Tests using this helper remain internally hash-consistent,
+# so a refusal comes from context or chronology rather than stale checksums.
+refresh_cutover_archive_bindings() {
+  local record="$1" archive="$2"
+  node -e '
+    const crypto = require("crypto");
+    const fs = require("fs");
+    const path = require("path");
+    const [recordPath, archivePath] = process.argv.slice(1);
+    const hash = (bytes) =>
+      crypto.createHash("sha256").update(bytes).digest("hex");
+    const resultPath = path.join(archivePath, "result.json");
+    const result = JSON.parse(fs.readFileSync(resultPath, "utf8"));
+    result.window_open_sha256 = hash(
+      fs.readFileSync(path.join(archivePath, "window-open.json"))
+    );
+    for (const service of result.services || []) {
+      const logPath = path.join(archivePath, service.service + ".log");
+      if (!fs.existsSync(logPath)) continue;
+      const log = fs.readFileSync(logPath);
+      service.relevant_log_sha256 = hash(log);
+      service.empty_snapshot_lines = log.toString("utf8").split(/\r?\n/)
+        .filter((line) =>
+          line.includes("protocol cutover peer roster snapshot") &&
+          line.includes("[legacyPeers=0]")
+        ).length;
+    }
+    fs.writeFileSync(resultPath, JSON.stringify(result, null, 2) + "\n");
+    const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+    const stage = record.stages.find((entry) => entry.name ===
+      "every R1 node authors periodic empty roster evidence");
+    stage.state_checksums.cutover_evidence_window_summary_sha256 =
+      hash(fs.readFileSync(resultPath));
+    fs.writeFileSync(recordPath, JSON.stringify(record, null, 2) + "\n");
+  ' "${record}" "${archive}"
 }
 
 write_record() {
@@ -351,14 +473,19 @@ write_record() {
   local assertions="${7:-${ASSERTION_HOLDS}}"
   local gate="${8:-single_release}"
   local r1_images="${9:-${FIXTURE_R1_DIGEST_MAP}}"
-  local chain_inputs stages_json
+  local chain_inputs stages_json record_id run_id r1_fleet
+  record_id="${path##*/}"
+  record_id="${record_id%.json}"
+  run_id="$(fixture_identity "run:${record_id}")"
+  r1_fleet="$(fixture_r1_fleet "${record_id}")"
   stages_json="[ ${stages} ]"
   if [[ "${gate}" == "single_release" ]]; then
-    local record_id="${path##*/}"
-    record_id="${record_id%.json}"
-    write_complete_cutover_window_archive "$(dirname "${path}")" "${record_id}"
+    write_complete_cutover_window_archive "$(dirname "${path}")" \
+      "${record_id}" "${run_id}" "${source_sha}" "${r1_images}" \
+      "${source_sha}" "11155111" "1000000" "${r1_fleet}"
     stages_json="$(node -e '
-      const [rawStages, archiveID, summaryDigest] = process.argv.slice(1);
+      const [rawStages, archiveID, captureID, summaryDigest] =
+        process.argv.slice(1);
       const stages = JSON.parse("[" + rawStages + "]");
       const stage = stages.find((entry) =>
         entry &&
@@ -385,10 +512,12 @@ write_record() {
         stage.evidence_refs = {
           ...refs,
           cutover_evidence_window_archive: archiveID,
+          cutover_evidence_window_capture_id: captureID,
         };
       }
       process.stdout.write(JSON.stringify(stages));
     ' "${stages}" "${CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID}" \
+      "${CUTOVER_WINDOW_FIXTURE_CAPTURE_ID}" \
       "${CUTOVER_WINDOW_FIXTURE_SUMMARY_SHA256}")"
   fi
   if [[ "${gate}" == "rollback" ]]; then
@@ -411,6 +540,7 @@ write_record() {
   cat >"${path}" <<EOF
 {
   "schema_version": 1,
+  "run_id": "${run_id}",
   "gate": "${gate}",
   "generated_at": "${generated_at}",
   "source_sha": "${source_sha}",
@@ -420,9 +550,10 @@ write_record() {
       "linux/amd64": "ghcr.io/keep-network/keep-client@sha256:2222222222222222222222222222222222222222222222222222222222222222"
     },
     "version": "v0.0.0-selftest",
-    "revision": "aaaaaaa",
+    "revision": "${source_sha}",
     "protocol_epoch": "security_v2_cutover"
   },
+  "r1_fleet": ${r1_fleet},
   "chain": { "chain_id": "11155111", "cutover_block": 1000000 },
   "release_manifest": {
     "sha256": "${sha}",
@@ -2502,7 +2633,7 @@ ARCHIVE="${D}/${CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID}"
 mv "${ARCHIVE}/r1-node-2.log" "${ARCHIVE}/r1-node-2.log.absent"
 run_validator "${D}"
 check "a missing fleet evidence-window service log is refused" 3 \
-  "archived log set.*does not match.*service log set" \
+  "archive file set.*does not match.*evidence file set" \
   "has no safe archived log for service.*r1-node-2"
 
 D="${WORK}/accept-altered-evidence-window-log"
@@ -2581,8 +2712,8 @@ node -e '
   const fs = require("fs");
   const [recordPath, resultPath, logPath] = process.argv.slice(1);
   const log = fs.readFileSync(logPath, "utf8").replace(
-    "2026-07-31T00:05:30.000000000Z",
-    "2026-07-31T00:02:30.000000000Z"
+    "2026-07-27T00:05:30.000000000Z",
+    "2026-07-27T00:02:30.000000000Z"
   );
   fs.writeFileSync(logPath, log);
   const result = JSON.parse(fs.readFileSync(resultPath, "utf8"));
@@ -2611,15 +2742,12 @@ write_attestation "${D}"
 write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
   "2026-07-28T00:00:00Z"
 PRIMARY_ARCHIVE_ID="${CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID}"
-write_complete_cutover_window_archive "${D}" "borrowed-capture"
+BORROWED_RUN_ID="$(fixture_identity 'run:borrowed-capture')"
+BORROWED_FLEET="$(fixture_r1_fleet 'borrowed-capture')"
+write_complete_cutover_window_archive "${D}" "borrowed-capture" \
+  "${BORROWED_RUN_ID}" "${FIXTURE_SHA}" "${FIXTURE_R1_DIGEST_MAP}" \
+  "${FIXTURE_SHA}" "11155111" "1000000" "${BORROWED_FLEET}"
 BORROWED_ARCHIVE="${D}/${CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID}"
-node -e '
-  const fs = require("fs");
-  const path = process.argv[1];
-  const result = JSON.parse(fs.readFileSync(path, "utf8"));
-  result.opened_at = "2026-07-30T00:00:00.000Z";
-  fs.writeFileSync(path, JSON.stringify(result, null, 2) + "\n");
-' "${BORROWED_ARCHIVE}/result.json"
 BORROWED_DIGEST="$(hash_stdin <"${BORROWED_ARCHIVE}/result.json")"
 node -e '
   const fs = require("fs");
@@ -2635,6 +2763,254 @@ node -e '
 run_validator "${D}"
 check "a summary digest copied from another capture is refused" 3 \
   "summary SHA-256 does not match the archived result.json"
+
+# Replacing both the reference and digest used to lend another run wholesale:
+# every byte was valid, so the record had no fact left with which to reject it.
+D="${WORK}/accept-borrowed-complete-evidence-window"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+BORROWED_RUN_ID="$(fixture_identity 'run:whole-borrowed-capture')"
+BORROWED_FLEET="$(fixture_r1_fleet 'whole-borrowed-capture')"
+write_complete_cutover_window_archive "${D}" "whole-borrowed-capture" \
+  "${BORROWED_RUN_ID}" "${FIXTURE_SHA}" "${FIXTURE_R1_DIGEST_MAP}" \
+  "${FIXTURE_SHA}" "11155111" "1000000" "${BORROWED_FLEET}"
+BORROWED_ARCHIVE_ID="${CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID}"
+BORROWED_CAPTURE_ID="${CUTOVER_WINDOW_FIXTURE_CAPTURE_ID}"
+BORROWED_DIGEST="${CUTOVER_WINDOW_FIXTURE_SUMMARY_SHA256}"
+node -e '
+  const fs = require("fs");
+  const [recordPath, archiveID, captureID, digest] = process.argv.slice(1);
+  const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+  const stage = record.stages[0];
+  stage.evidence_refs.cutover_evidence_window_archive = archiveID;
+  stage.evidence_refs.cutover_evidence_window_capture_id = captureID;
+  stage.state_checksums.cutover_evidence_window_summary_sha256 = digest;
+  fs.writeFileSync(recordPath, JSON.stringify(record, null, 2) + "\n");
+' "${D}/record.json" "${BORROWED_ARCHIVE_ID}" \
+  "${BORROWED_CAPTURE_ID}" "${BORROWED_DIGEST}"
+run_validator "${D}"
+check "another valid capture cannot lend both its reference and digest" 3 \
+  'capture context "run_id" does not match its rehearsal record' \
+  'capture context "r1_fleet" does not match its rehearsal record'
+
+# The immutable release/chain context is compared field by field. This copy is
+# internally complete and hash-consistent but belongs to another build, image,
+# chain, and C.
+D="${WORK}/accept-foreign-context-evidence-window"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+FOREIGN_RUN_ID="$(fixture_identity 'run:foreign-context-capture')"
+FOREIGN_FLEET="$(fixture_r1_fleet 'foreign-context-capture')"
+FOREIGN_IMAGES='{"amd64":"ghcr.io/keep-network/keep-client@sha256:3333333333333333333333333333333333333333333333333333333333333333"}'
+FOREIGN_SOURCE="$(printf 'c%.0s' {1..40})"
+write_complete_cutover_window_archive "${D}" "foreign-context-capture" \
+  "${FOREIGN_RUN_ID}" "${FOREIGN_SOURCE}" "${FOREIGN_IMAGES}" \
+  "${FOREIGN_SOURCE}" "1" "999999" "${FOREIGN_FLEET}"
+FOREIGN_ARCHIVE_ID="${CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID}"
+FOREIGN_CAPTURE_ID="${CUTOVER_WINDOW_FIXTURE_CAPTURE_ID}"
+FOREIGN_DIGEST="${CUTOVER_WINDOW_FIXTURE_SUMMARY_SHA256}"
+node -e '
+  const fs = require("fs");
+  const [recordPath, archiveID, captureID, digest] = process.argv.slice(1);
+  const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+  const stage = record.stages[0];
+  stage.evidence_refs.cutover_evidence_window_archive = archiveID;
+  stage.evidence_refs.cutover_evidence_window_capture_id = captureID;
+  stage.state_checksums.cutover_evidence_window_summary_sha256 = digest;
+  fs.writeFileSync(recordPath, JSON.stringify(record, null, 2) + "\n");
+' "${D}/record.json" "${FOREIGN_ARCHIVE_ID}" "${FOREIGN_CAPTURE_ID}" \
+  "${FOREIGN_DIGEST}"
+run_validator "${D}"
+check "a capture from another source image chain and C is refused" 3 \
+  'capture context "source_sha" does not match its rehearsal record' \
+  'capture context "r1_image_digests" does not match its rehearsal record' \
+  'capture context "chain_id" does not match its rehearsal record' \
+  'capture context "cutover_block" does not match its rehearsal record'
+
+# One capture cannot serve the two native runners. The arm64 record below
+# names the complete amd64 archive and all of its hashes; both per-record
+# context binding and archive-set ownership must reject it.
+D="${WORK}/accept-reused-evidence-window-across-platforms"
+mkdir -p "${D}"
+write_attestation "${D}" "${MANIFEST_SHA}" \
+  "${TEST_DIR}/release-manifest.json" "${FIXTURE_SHA}" yes \
+  "${MANIFEST_SHA}" "${FIXTURE_SHA}" "${FIXTURE_R1_IMAGES_BOTH}"
+write_record "${D}/single-amd64.json" "${MANIFEST_SHA}" \
+  "${MANIFEST_GRACE}" "2026-07-28T00:00:00Z" "${FIXTURE_SHA}" \
+  "${SINGLE_RELEASE_STAGES}" "${SINGLE_RELEASE_ASSERTIONS}" \
+  single_release "${FIXTURE_R1_DIGEST_MAP}"
+AMD64_ARCHIVE_ID="${CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID}"
+AMD64_CAPTURE_ID="${CUTOVER_WINDOW_FIXTURE_CAPTURE_ID}"
+AMD64_SUMMARY="${CUTOVER_WINDOW_FIXTURE_SUMMARY_SHA256}"
+write_record "${D}/single-arm64.json" "${MANIFEST_SHA}" \
+  "${MANIFEST_GRACE}" "2026-07-28T00:00:01Z" "${FIXTURE_SHA}" \
+  "${SINGLE_RELEASE_STAGES}" "${SINGLE_RELEASE_ASSERTIONS}" \
+  single_release "${FIXTURE_R1_SECOND_DIGEST_MAP}"
+write_record "${D}/rollback-amd64.json" "${MANIFEST_SHA}" \
+  "${MANIFEST_GRACE}" "2026-07-28T00:00:02Z" "${FIXTURE_SHA}" \
+  "${ROLLBACK_STAGES}" "${ROLLBACK_ASSERTIONS}" rollback \
+  "${FIXTURE_R1_DIGEST_MAP}"
+write_record "${D}/rollback-arm64.json" "${MANIFEST_SHA}" \
+  "${MANIFEST_GRACE}" "2026-07-28T00:00:03Z" "${FIXTURE_SHA}" \
+  "${ROLLBACK_STAGES}" "${ROLLBACK_ASSERTIONS}" rollback \
+  "${FIXTURE_R1_SECOND_DIGEST_MAP}"
+node -e '
+  const fs = require("fs");
+  const [recordPath, archiveID, captureID, digest] = process.argv.slice(1);
+  const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+  const stage = record.stages[0];
+  stage.evidence_refs.cutover_evidence_window_archive = archiveID;
+  stage.evidence_refs.cutover_evidence_window_capture_id = captureID;
+  stage.state_checksums.cutover_evidence_window_summary_sha256 = digest;
+  fs.writeFileSync(recordPath, JSON.stringify(record, null, 2) + "\n");
+' "${D}/single-arm64.json" "${AMD64_ARCHIVE_ID}" "${AMD64_CAPTURE_ID}" \
+  "${AMD64_SUMMARY}"
+run_validator_as_is "${D}"
+check "one valid capture cannot be reused across platform records" 3 \
+  'reuse fleet evidence-window capture identity' \
+  'capture context "r1_image_digests" does not match its rehearsal record'
+
+# A byte-for-byte directory copy retains valid hashes, but its captured archive
+# identity names the original direct child and cannot authorize a new path.
+D="${WORK}/accept-copied-evidence-window-directory"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+ARCHIVE="${D}/${CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID}"
+COPIED_ARCHIVE_ID="cutover-roster-window-copy-${CUTOVER_WINDOW_FIXTURE_CAPTURE_ID}"
+cp -R "${ARCHIVE}" "${D}/${COPIED_ARCHIVE_ID}"
+node -e '
+  const fs = require("fs");
+  const record = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  record.stages[0].evidence_refs.cutover_evidence_window_archive =
+    process.argv[2];
+  fs.writeFileSync(process.argv[1], JSON.stringify(record, null, 2) + "\n");
+' "${D}/record.json" "${COPIED_ARCHIVE_ID}"
+run_validator "${D}"
+check "a valid archive copied under a new directory identity is refused" 3 \
+  'archive identifier is not derived from its capture identity' \
+  'capture context "archive_id" does not match its rehearsal record'
+
+D="${WORK}/accept-missing-evidence-window-checkpoint"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+ARCHIVE="${D}/${CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID}"
+mv "${ARCHIVE}/window-open.json" "${ARCHIVE}/window-open.json.absent"
+run_validator "${D}"
+check "an archive without its pre-close checkpoint is refused" 3 \
+  'has no safe archived window-open.json'
+
+D="${WORK}/accept-mutated-evidence-window-checkpoint"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+ARCHIVE="${D}/${CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID}"
+printf '\n' >>"${ARCHIVE}/window-open.json"
+run_validator "${D}"
+check "a mutated pre-close checkpoint is refused" 3 \
+  'pre-close checkpoint does not match result.window_open_sha256'
+
+# Metadata order is checked independently of all hashes.
+D="${WORK}/accept-reversed-evidence-window-metadata"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+ARCHIVE="${D}/${CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID}"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const result = JSON.parse(fs.readFileSync(path, "utf8"));
+  result.closed_at = "2026-07-27T00:05:30.250Z";
+  fs.writeFileSync(path, JSON.stringify(result, null, 2) + "\n");
+' "${ARCHIVE}/result.json"
+refresh_cutover_archive_bindings "${D}/record.json" "${ARCHIVE}"
+run_validator "${D}"
+check "reversed archive and close metadata is refused" 3 \
+  'timeline is not opened_at <= archived_before_close_at <= closed_at'
+
+D="${WORK}/accept-evidence-window-after-record"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const record = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  record.generated_at = "2026-07-27T00:05:31.000Z";
+  fs.writeFileSync(process.argv[1], JSON.stringify(record, null, 2) + "\n");
+' "${D}/record.json"
+run_validator "${D}"
+check "a capture closing after its record was generated is refused" 3 \
+  'closed_at <= record.generated_at'
+
+# Reorder complete, hash-consistent log bytes. Presence-only checks accept all
+# four lines; chronology must reject snapshots placed before activation.
+D="${WORK}/accept-reversed-evidence-window-log-order"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+ARCHIVE="${D}/${CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID}"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const lines = fs.readFileSync(path, "utf8").trim().split(/\r?\n/);
+  fs.writeFileSync(path, [lines[1], lines[2], lines[0], lines[3]].join("\n") + "\n");
+' "${ARCHIVE}/r1-node-1.log"
+refresh_cutover_archive_bindings "${D}/record.json" "${ARCHIVE}"
+run_validator "${D}"
+check "snapshots ordered before activation are refused" 3 \
+  'r1-node-1.*is not in timestamp order' \
+  'r1-node-1.*has no two clock-healthy empty snapshots'
+
+D="${WORK}/accept-close-before-evidence-window-archive"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+ARCHIVE="${D}/${CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID}"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const log = fs.readFileSync(path, "utf8").replace(
+    "2026-07-27T00:05:31.000000000Z",
+    "2026-07-27T00:05:30.250000000Z"
+  );
+  fs.writeFileSync(path, log);
+' "${ARCHIVE}/r1-node-1.log"
+refresh_cutover_archive_bindings "${D}/record.json" "${ARCHIVE}"
+run_validator "${D}"
+check "a close authored before the archive checkpoint is refused" 3 \
+  'does not occur after the archive checkpoint'
+
+D="${WORK}/accept-activation-before-evidence-window-run"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+ARCHIVE="${D}/${CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID}"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const log = fs.readFileSync(path, "utf8").replace(
+    "2026-07-27T00:00:00.100000000Z",
+    "2026-07-26T23:59:59.900000000Z"
+  );
+  fs.writeFileSync(path, log);
+' "${ARCHIVE}/r1-node-1.log"
+refresh_cutover_archive_bindings "${D}/record.json" "${ARCHIVE}"
+run_validator "${D}"
+check "an activation timestamp outside the capture run is refused" 3 \
+  'activation.*r1-node-1.*falls outside its open-to-archive interval'
 
 D="${WORK}/accept-unknown-assertion"
 mkdir -p "${D}"
@@ -3126,6 +3502,16 @@ run_rehearsal() {
       # release identity off the running fleet before they touch it, and the
       # record is built from what was captured there.
       capture_r1_release_identity
+      initialize_rehearsal_run_identity
+      # The real fleet capture resolves Docker container identities. These
+      # emitter cases have no daemon; install the same schema-complete process
+      # identity and executed-image reading at that boundary.
+      # shellcheck disable=SC2030,SC2031,SC2034
+      REHEARSAL_R1_FLEET="$(fixture_r1_fleet "emitted-${gate}")"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      REHEARSAL_R1_EXECUTED_IMAGES="$(
+        executed_image_digest "${R1_IMAGE_DIGEST}"
+      )"
       "$@"
       conclude_rehearsal
     ) 2>&1
@@ -3163,13 +3549,18 @@ complete_run() {
       # beneath the run evidence directory and rechecks every archived byte.
       # shellcheck disable=SC2031
       write_complete_cutover_window_archive \
-        "${EVIDENCE_DIR}" "emitted-single-release"
+        "${EVIDENCE_DIR}" "emitted-single-release" \
+        "${REHEARSAL_RUN_ID}" "${FIXTURE_SHA}" \
+        "${REHEARSAL_R1_EXECUTED_IMAGES}" "${FIXTURE_SHA}" \
+        "${CHAIN_ID}" "${CUTOVER_BLOCK}" "${REHEARSAL_R1_FLEET}"
       # shellcheck disable=SC2034
       STEP_STATE_CHECKSUMS="\"cutover_evidence_window_summary_sha256\":\
 \"${CUTOVER_WINDOW_FIXTURE_SUMMARY_SHA256}\""
       # shellcheck disable=SC2034
       STEP_EVIDENCE_REFS="\"cutover_evidence_window_archive\":\
-\"${CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID}\""
+\"${CUTOVER_WINDOW_FIXTURE_ARCHIVE_ID}\",\
+\"cutover_evidence_window_capture_id\":\
+\"${CUTOVER_WINDOW_FIXTURE_CAPTURE_ID}\""
     elif [[ "${stage}" == "cross C without restart" ]]; then
       # The observation slots the real probes fill; record_step drains them.
       # shellcheck disable=SC2034
@@ -9463,6 +9854,8 @@ run_emitter() {
       # shellcheck disable=SC2030,SC2031,SC2034
       CHAIN_ID="11155111"
       # shellcheck disable=SC2030,SC2031,SC2034
+      CUTOVER_BLOCK="9000000"
+      # shellcheck disable=SC2030,SC2031,SC2034
       REHEARSAL_GATE="single_release"
       # shellcheck disable=SC2030,SC2031,SC2034
       WORK_DRIVER_DIGEST="${REVIEWED_WORK_DRIVER_DIGEST}"
@@ -9477,6 +9870,13 @@ run_emitter() {
               {}, doc.client_info, doc.protocol_participation)));
           });
         ')"
+      initialize_rehearsal_run_identity
+      # shellcheck disable=SC2030,SC2031,SC2034
+      REHEARSAL_R1_FLEET="$(fixture_r1_fleet emitter-guard)"
+      # shellcheck disable=SC2030,SC2031,SC2034
+      REHEARSAL_R1_EXECUTED_IMAGES="$(
+        executed_image_digest "${R1_IMAGE_DIGEST}"
+      )"
       complete_run
       emit_evidence_record
     ) 2>&1

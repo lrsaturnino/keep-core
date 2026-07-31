@@ -23,7 +23,7 @@ readonly MIN_CADENCE_SECONDS=270
 readonly MAX_CADENCE_SECONDS=360
 
 usage() {
-  printf 'usage: %s <archive-directory> <service=container> [...]\n' \
+  printf 'usage: %s <archive-directory> <capture-context-json> <service=container> [...]\n' \
     "$(basename "$0")" >&2
 }
 
@@ -32,7 +32,7 @@ fail() {
   exit 1
 }
 
-if (($# < 2)); then
+if (($# < 3)); then
   usage
   exit 2
 fi
@@ -43,6 +43,8 @@ command -v node >/dev/null 2>&1 ||
   fail "Node.js is required to validate timestamped roster evidence"
 
 ARCHIVE_DIR="$1"
+shift
+CAPTURE_CONTEXT="$1"
 shift
 
 if [[ -e "${ARCHIVE_DIR}" ]]; then
@@ -89,6 +91,143 @@ for binding in "$@"; do
   CLOSE_DELIVERED+=(0)
   CLOSE_SEEN+=(0)
 done
+
+# The caller builds this context independently from the running fleet and
+# later writes the same values into the rehearsal record. Validate it before
+# delivering a signal: a malformed or differently bound capture must not open
+# a logging window whose bytes could later be mistaken for release evidence.
+CAPTURE_CONTEXT="$({
+  node - "${CAPTURE_CONTEXT}" "${ARCHIVE_DIR##*/}" "$@" <<'NODE'
+const [rawContext, archiveID, ...bindings] = process.argv.slice(2);
+const fail = (message) => {
+  console.error(message);
+  process.exit(1);
+};
+const isObject = (value) =>
+  value !== null && typeof value === "object" && !Array.isArray(value);
+const exactKeys = (value, expected) => {
+  if (!isObject(value)) return false;
+  const actual = Object.keys(value).sort();
+  return actual.length === expected.length &&
+    actual.every((key, index) => key === [...expected].sort()[index]);
+};
+
+let context;
+try {
+  context = JSON.parse(rawContext);
+} catch (_) {
+  fail("capture context is not valid JSON");
+}
+
+const contextKeys = [
+  "schema_version",
+  "run_id",
+  "capture_id",
+  "archive_id",
+  "gate",
+  "source_sha",
+  "r1_image_digests",
+  "revision",
+  "protocol_epoch",
+  "chain_id",
+  "cutover_block",
+  "r1_fleet",
+];
+if (!exactKeys(context, contextKeys) || context.schema_version !== 1) {
+  fail("capture context has no supported exact shape");
+}
+if (!/^[0-9a-f]{32}$/.test(context.run_id || "")) {
+  fail("capture context has no valid run_id");
+}
+if (!/^[0-9a-f]{32}$/.test(context.capture_id || "")) {
+  fail("capture context has no valid capture_id");
+}
+const expectedArchiveID =
+  "cutover-roster-window-" + context.capture_id;
+if (
+  context.archive_id !== archiveID ||
+  context.archive_id !== expectedArchiveID
+) {
+  fail("capture context archive_id does not identify the archive directory");
+}
+if (context.gate !== "single_release") {
+  fail("capture context gate is not single_release");
+}
+if (!/^[0-9a-f]{40}$/.test(context.source_sha || "")) {
+  fail("capture context has no exact source revision");
+}
+if (context.revision !== context.source_sha) {
+  fail("capture context runtime revision differs from its source revision");
+}
+if (context.protocol_epoch !== "security_v2_cutover") {
+  fail("capture context has no security_v2_cutover epoch");
+}
+if (!/^[0-9]+$/.test(context.chain_id || "")) {
+  fail("capture context has no numeric chain_id");
+}
+if (!Number.isSafeInteger(context.cutover_block) || context.cutover_block < 1) {
+  fail("capture context has no positive safe cutover_block");
+}
+if (!isObject(context.r1_image_digests)) {
+  fail("capture context has no executed R1 image map");
+}
+const imagePlatforms = Object.keys(context.r1_image_digests);
+if (
+  imagePlatforms.length !== 1 ||
+  !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(imagePlatforms[0]) ||
+  !/@sha256:[0-9a-f]{64}$/.test(
+    String(context.r1_image_digests[imagePlatforms[0]] || "")
+  )
+) {
+  fail("capture context does not name exactly one immutable executed R1 image");
+}
+
+const bindingMap = new Map();
+for (const binding of bindings) {
+  const separator = binding.indexOf("=");
+  if (separator < 1) fail("capture context received a malformed fleet binding");
+  const service = binding.slice(0, separator);
+  const containerID = binding.slice(separator + 1);
+  if (bindingMap.has(service)) {
+    fail("capture context received a duplicate fleet service");
+  }
+  bindingMap.set(service, containerID);
+}
+if (!Array.isArray(context.r1_fleet) || context.r1_fleet.length < 1) {
+  fail("capture context has no authoritative R1 fleet");
+}
+const fleetServices = new Set();
+for (const instance of context.r1_fleet) {
+  if (!exactKeys(instance, ["service", "container_id", "operator_address"])) {
+    fail("capture context carries a malformed R1 fleet entry");
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(instance.service || "")) {
+    fail("capture context carries an unsafe R1 service identity");
+  }
+  if (!/^[0-9a-f]{64}$/.test(instance.container_id || "")) {
+    fail("capture context carries no immutable R1 container identity");
+  }
+  if (!/^0x[0-9a-f]{40}$/.test(instance.operator_address || "")) {
+    fail("capture context carries no normalized R1 operator identity");
+  }
+  if (fleetServices.has(instance.service)) {
+    fail("capture context carries a duplicate R1 service identity");
+  }
+  fleetServices.add(instance.service);
+  if (bindingMap.get(instance.service) !== instance.container_id) {
+    fail("capture context R1 fleet differs from the signaled container set");
+  }
+}
+if (
+  fleetServices.size !== bindingMap.size ||
+  Array.from(bindingMap.keys()).some((service) => !fleetServices.has(service))
+) {
+  fail("capture context R1 fleet differs from the signaled service set");
+}
+
+process.stdout.write(JSON.stringify(context));
+NODE
+} 2>&1)" || fail "invalid capture context: ${CAPTURE_CONTEXT}"
 
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cutover-evidence-window.XXXXXX")" ||
   fail "cannot create a temporary evidence directory"
@@ -274,11 +413,13 @@ for index in "${!SERVICES[@]}"; do
     "${CADENCE_SEEN[${index}]}" >>"${STATUS_FILE}"
 done
 
-ARCHIVED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-node - "${STATUS_FILE}" "${OPENED_AT}" "${ARCHIVED_AT}" <<'NODE' \
+ARCHIVED_AT="$(node -e 'process.stdout.write(new Date().toISOString())')"
+node - "${STATUS_FILE}" "${OPENED_AT}" "${ARCHIVED_AT}" \
+  "${CAPTURE_CONTEXT}" <<'NODE' \
   >"${ARCHIVE_DIR}/window-open.json"
 const fs = require("fs");
-const [statusPath, openedAt, archivedAt] = process.argv.slice(2);
+const [statusPath, openedAt, archivedAt, captureContextJSON] =
+  process.argv.slice(2);
 const services = fs.readFileSync(statusPath, "utf8").trim().split(/\r?\n/)
   .filter(Boolean)
   .map((line) => {
@@ -292,7 +433,8 @@ const services = fs.readFileSync(statusPath, "utf8").trim().split(/\r?\n/)
     };
   });
 process.stdout.write(JSON.stringify({
-  schema_version: 1,
+  schema_version: 2,
+  capture_context: JSON.parse(captureContextJSON),
   opened_at: openedAt,
   archived_at: archivedAt,
   services,
@@ -354,15 +496,17 @@ for index in "${!SERVICES[@]}"; do
     "${CLOSE_SEEN[${index}]}" >>"${STATUS_FILE}"
 done
 
-CLOSED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+CLOSED_AT="$(node -e 'process.stdout.write(new Date().toISOString())')"
 node - "${STATUS_FILE}" "${FAILURE_FILE}" "${ARCHIVE_DIR}" \
-  "${OPENED_AT}" "${ARCHIVED_AT}" "${CLOSED_AT}" <<'NODE' \
+  "${OPENED_AT}" "${ARCHIVED_AT}" "${CLOSED_AT}" \
+  "${CAPTURE_CONTEXT}" <<'NODE' \
   >"${ARCHIVE_DIR}/result.json"
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const [
   statusPath, failurePath, archivePath, openedAt, archivedAt, closedAt,
+  captureContextJSON,
 ] = process.argv.slice(2);
 const failures = fs.readFileSync(failurePath, "utf8").split(/\r?\n/)
   .filter(Boolean);
@@ -389,11 +533,15 @@ const services = fs.readFileSync(statusPath, "utf8").trim().split(/\r?\n/)
       relevant_log_sha256: crypto.createHash("sha256").update(log).digest("hex"),
     };
   });
+const windowOpen = fs.readFileSync(path.join(archivePath, "window-open.json"));
 process.stdout.write(JSON.stringify({
-  schema_version: 1,
+  schema_version: 2,
+  capture_context: JSON.parse(captureContextJSON),
   opened_at: openedAt,
   archived_before_close_at: archivedAt,
   closed_at: closedAt,
+  window_open_sha256:
+    crypto.createHash("sha256").update(windowOpen).digest("hex"),
   complete: failures.length === 0,
   failures,
   services,

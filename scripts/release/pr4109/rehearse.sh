@@ -5081,6 +5081,9 @@ await_gate_state() {
 # ---------------------------------------------------------------------------
 
 REHEARSAL_GATE=""
+REHEARSAL_RUN_ID=""
+REHEARSAL_R1_FLEET=""
+REHEARSAL_R1_EXECUTED_IMAGES=""
 REHEARSAL_STEPS=()
 REHEARSAL_ASSERTIONS=()
 REHEARSAL_BLOCKED_STEPS=()
@@ -5108,6 +5111,19 @@ STEP_GAUGES=""
 STEP_TX_HASHES=""
 STEP_STATE_CHECKSUMS=""
 STEP_EVIDENCE_REFS=""
+
+# One unpredictable identity is created before a rehearsal observes the fleet.
+# It is copied into the top-level record and every supporting capture, making
+# a valid archive from another run detectably foreign even when the two runs
+# used the same services, chain, and release artifact.
+initialize_rehearsal_run_identity() {
+  REHEARSAL_RUN_ID="$(node -e '
+    const crypto = require("crypto");
+    process.stdout.write(crypto.randomBytes(16).toString("hex"));
+  ')" || blocked "cannot generate the rehearsal run identity"
+  [[ "${REHEARSAL_RUN_ID}" =~ ^[0-9a-f]{32}$ ]] ||
+    blocked "the generated rehearsal run identity is malformed"
+}
 
 begin_step() {
   note "step: $1"
@@ -5502,6 +5518,82 @@ fleet is not one release under test and one record cannot speak for both"
 ${attested}, the rehearsed C, and the chain the record is written against"
 }
 
+# Capture the concrete R1 processes behind the authoritative service roster.
+# Service names alone repeat on every runner; full container IDs distinguish
+# one process population from another, and normalized operator addresses bind
+# each process to the chain identity it acts for. The image map is resolved at
+# the same point and reused by both the supporting archive and final record.
+capture_r1_fleet_identity() {
+  [[ "${REHEARSAL_RUN_ID}" =~ ^[0-9a-f]{32}$ ]] ||
+    blocked "no rehearsal run identity exists before fleet capture"
+
+  REHEARSAL_R1_EXECUTED_IMAGES="$(
+    executed_image_digest "${R1_IMAGE_DIGEST}"
+  )" || blocked "cannot resolve the executed R1 image before fleet capture"
+
+  local entries=()
+  local service container container_id operator entry
+  for service in "${REHEARSAL_R1_SERVICES[@]}"; do
+    container="$(compose ps --quiet "${service}" 2>/dev/null)" ||
+      blocked "cannot resolve the running container for ${service} while \
+capturing the authoritative R1 fleet"
+    [[ -n "${container}" ]] ||
+      blocked "${service} has no running container while capturing the \
+authoritative R1 fleet"
+    container_id="$(docker inspect --format '{{.Id}}' "${container}" \
+      2>/dev/null)" ||
+      blocked "cannot read the immutable container identity for ${service}"
+    [[ "${container_id}" =~ ^[0-9a-f]{64}$ ]] ||
+      blocked "${service} reports malformed container identity \
+[${container_id:-absent}]"
+
+    operator="$(node_operator_address "${service}" 2>/dev/null)" ||
+      blocked "cannot read the chain operator identity for ${service}"
+    operator="$(node -e '
+      const value = String(process.argv[1] || "").toLowerCase();
+      if (!/^0x[0-9a-f]{40}$/.test(value)) process.exit(1);
+      process.stdout.write(value);
+    ' "${operator}")" ||
+      blocked "${service} reports a malformed chain operator identity"
+
+    entry="$(node -e '
+      process.stdout.write(JSON.stringify({
+        service: process.argv[1],
+        container_id: process.argv[2],
+        operator_address: process.argv[3],
+      }));
+    ' "${service}" "${container_id}" "${operator}")" ||
+      blocked "cannot encode the authoritative R1 identity for ${service}"
+    entries+=("${entry}")
+  done
+
+  REHEARSAL_R1_FLEET="$(
+    IFS=,
+    printf '[%s]' "${entries[*]}"
+  )"
+  node -e '
+    const fleet = JSON.parse(process.argv[1]);
+    const services = fleet.map((instance) => instance.service);
+    if (
+      fleet.length === 0 ||
+      new Set(services).size !== services.length
+    ) process.exit(1);
+  ' "${REHEARSAL_R1_FLEET}" ||
+    blocked "the authoritative R1 fleet is empty or contains duplicate services"
+
+  note "captured ${#entries[@]} authoritative R1 process identities for run \
+${REHEARSAL_RUN_ID}"
+}
+
+r1_fleet_container_id() {
+  node -e '
+    const fleet = JSON.parse(process.argv[1]);
+    const instance = fleet.find((entry) => entry.service === process.argv[2]);
+    if (!instance) process.exit(1);
+    process.stdout.write(instance.container_id);
+  ' "${REHEARSAL_R1_FLEET}" "$1"
+}
+
 # Open the logging-only roster evidence window on every authoritative R1
 # service, retain it until each process has authored two clock-healthy empty
 # snapshots with advancing blocks at the five-minute production cadence,
@@ -5512,11 +5604,42 @@ ${attested}, the rehearsed C, and the chain the record is written against"
 capture_cutover_roster_evidence_window() {
   local step="every R1 node authors periodic empty roster evidence"
   local assertion="every R1 node authors periodic empty roster evidence during the go/no-go window"
-  local archive archive_id
-  archive="${EVIDENCE_DIR}/cutover-roster-window-${REHEARSAL_GATE}-\
-$(date -u +%Y%m%dT%H%M%SZ)-$$"
-  archive_id="${archive##*/}"
-  local service container
+  local capture_id archive_id archive capture_context source_sha revision
+  capture_id="$(node -e '
+    const crypto = require("crypto");
+    process.stdout.write(crypto.randomBytes(16).toString("hex"));
+  ')" || blocked "cannot generate the fleet evidence-window capture identity"
+  [[ "${capture_id}" =~ ^[0-9a-f]{32}$ ]] ||
+    blocked "the generated fleet evidence-window capture identity is malformed"
+  archive_id="cutover-roster-window-${capture_id}"
+  archive="${EVIDENCE_DIR}/${archive_id}"
+  source_sha="$(attested_source_identity)"
+  revision="$(json_field "${REHEARSAL_R1_IDENTITY}" revision)"
+  capture_context="$(node -e '
+    const [
+      runID, captureID, archiveID, sourceSha, imagesJSON, revision,
+      epoch, chainID, cutoverBlock, fleetJSON,
+    ] = process.argv.slice(1);
+    process.stdout.write(JSON.stringify({
+      schema_version: 1,
+      run_id: runID,
+      capture_id: captureID,
+      archive_id: archiveID,
+      gate: "single_release",
+      source_sha: sourceSha,
+      r1_image_digests: JSON.parse(imagesJSON),
+      revision,
+      protocol_epoch: epoch,
+      chain_id: chainID,
+      cutover_block: Number(cutoverBlock),
+      r1_fleet: JSON.parse(fleetJSON),
+    }));
+  ' "${REHEARSAL_RUN_ID}" "${capture_id}" "${archive_id}" "${source_sha}" \
+    "${REHEARSAL_R1_EXECUTED_IMAGES}" "${revision}" \
+    "${REHEARSAL_R1_EPOCH}" "${CHAIN_ID}" \
+    "${REHEARSAL_R1_CUTOVER_BLOCK}" "${REHEARSAL_R1_FLEET}")" ||
+    blocked "cannot build the fleet evidence-window capture context"
+  local service container container_id expected_container_id
   local bindings=()
 
   begin_step "${step}"
@@ -5529,12 +5652,26 @@ the evidence window must be delivered to and acknowledged by every R1 service"
       record_assertion "${assertion}" false "${step}"
       return
     fi
-    bindings+=("${service}=${container}")
+    if ! container_id="$(docker inspect --format '{{.Id}}' "${container}" \
+      2>/dev/null)" ||
+      ! expected_container_id="$(r1_fleet_container_id "${service}")"; then
+      block_step "${step}" "${service} has no readable immutable container \
+identity at evidence-window open"
+      record_assertion "${assertion}" false "${step}"
+      return
+    fi
+    if [[ "${container_id}" != "${expected_container_id}" ]]; then
+      block_step "${step}" "${service} changed from captured container \
+[${expected_container_id}] to [${container_id}] before evidence-window open"
+      record_assertion "${assertion}" false "${step}"
+      return
+    fi
+    bindings+=("${service}=${container_id}")
   done
 
   local capture_rc=0
   "${SCRIPT_DIR}/capture-cutover-evidence-window.sh" \
-    "${archive}" "${bindings[@]}" || capture_rc=$?
+    "${archive}" "${capture_context}" "${bindings[@]}" || capture_rc=$?
 
   if [[ -f "${archive}/result.json" ]]; then
     STEP_STATE_CHECKSUMS="\"cutover_evidence_window_summary_sha256\":\"$(
@@ -5542,6 +5679,8 @@ the evidence window must be delivered to and acknowledged by every R1 service"
     )\""
     STEP_EVIDENCE_REFS="\"cutover_evidence_window_archive\":$(
       json_string "${archive_id}"
+    ),\"cutover_evidence_window_capture_id\":$(
+      json_string "${capture_id}"
     )"
   fi
 
@@ -5598,7 +5737,15 @@ clean commit; a record built from bytes no commit accounts for is not evidence"
 record binds the rehearsal to what the running nodes reported, and a gate \
 that never captured it has nothing to bind"
   fi
-  r1_digests="$(executed_image_digest "${R1_IMAGE_DIGEST}")"
+  [[ "${REHEARSAL_RUN_ID}" =~ ^[0-9a-f]{32}$ ]] ||
+    blocked "no valid run identity was created before this rehearsal began"
+  [[ -n "${REHEARSAL_R1_FLEET}" ]] ||
+    blocked "no authoritative R1 process identity was captured while the \
+fleet was running"
+  [[ -n "${REHEARSAL_R1_EXECUTED_IMAGES}" ]] ||
+    blocked "no executed R1 image/platform identity was captured while the \
+fleet was running"
+  r1_digests="${REHEARSAL_R1_EXECUTED_IMAGES}"
   prior_digests="$(executed_image_digest "${PRIOR_IMAGE_DIGEST}")"
 
   local steps assertions
@@ -5625,13 +5772,14 @@ that never captured it has nothing to bind"
   node -e '
     const fs = require("fs");
     const [
-      manifestPath, gate, sourceSha, identityJSON, r1JSON, priorJSON,
-      chainID, stepsJSON, assertionsJSON, generatedAt,
+      manifestPath, runID, gate, sourceSha, identityJSON, r1JSON, priorJSON,
+      fleetJSON, chainID, stepsJSON, assertionsJSON, generatedAt,
     ] = process.argv.slice(1);
     const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
     const identity = JSON.parse(identityJSON);
     const record = {
       schema_version: 1,
+      run_id: runID,
       gate,
       generated_at: generatedAt,
       source_sha: sourceSha,
@@ -5646,6 +5794,7 @@ that never captured it has nothing to bind"
         // fleet armed; the capture already refused the run on a disagreement.
         protocol_epoch: identity.protocol_epoch,
       },
+      r1_fleet: JSON.parse(fleetJSON),
       chain: { chain_id: chainID, cutover_block: identity.cutover_block },
       release_manifest: {
         sha256: process.env.PR4109_MANIFEST_SHA256,
@@ -5671,9 +5820,10 @@ that never captured it has nothing to bind"
       assertions: JSON.parse("[" + assertionsJSON + "]"),
     };
     process.stdout.write(JSON.stringify(record, null, 2) + "\n");
-  ' "${manifest}" "${REHEARSAL_GATE}" "${source_sha}" "${identity}" \
-    "${r1_digests}" "${prior_digests}" "${CHAIN_ID}" \
-    "${steps}" "${assertions}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  ' "${manifest}" "${REHEARSAL_RUN_ID}" "${REHEARSAL_GATE}" \
+    "${source_sha}" "${identity}" "${r1_digests}" "${prior_digests}" \
+    "${REHEARSAL_R1_FLEET}" "${CHAIN_ID}" "${steps}" "${assertions}" \
+    "$(node -e 'process.stdout.write(new Date().toISOString())')" \
     >"${record}" ||
     fail "cannot build the rehearsal evidence record"
   EMITTED_EVIDENCE_RECORD="${record}"
@@ -11739,6 +11889,7 @@ assign_single_release_nodes() {
 stage_single_release() {
   REHEARSAL_GATE="single_release"
   stage_preflight
+  initialize_rehearsal_run_identity
 
   if ! assign_single_release_nodes; then
     begin_step "the fleet can carry the single-release controls"
@@ -11752,6 +11903,7 @@ absorb those controls, so it cannot be run as configured"
   verify_running_images "${R1_IMAGE_DIGEST}" "${REHEARSAL_R1_SERVICES[@]}"
   verify_running_images "${PRIOR_IMAGE_DIGEST}" "${REHEARSAL_PRIOR_SERVICE}"
   capture_r1_release_identity
+  capture_r1_fleet_identity
   capture_cutover_roster_evidence_window
 
   # Step 1 and step 2 both run R1 nodes on legacy-anchored ceremonies beside
@@ -12530,6 +12682,7 @@ stage_rollback() {
   REHEARSAL_GATE="rollback"
   require_env STORAGE_SNAPSHOT_DIR
   stage_preflight
+  initialize_rehearsal_run_identity
   # Where this run writes each drained node's captured state, not where it
   # reads someone else's: the audit below is only about the state this fleet
   # left behind, so the snapshots are taken from the stopped containers rather
@@ -12547,6 +12700,7 @@ nowhere to capture them to"
   verify_running_images "${R1_IMAGE_DIGEST}" "${REHEARSAL_R1_SERVICES[@]}"
   # While there is still a fleet to ask. Every step below stops these nodes.
   capture_r1_release_identity
+  capture_r1_fleet_identity
 
   # Step 1 and 2. Quiesce every R1 node, and prove no prior binary comes up
   # while they drain — the barrier the whole gate exists to establish.
@@ -13231,7 +13385,7 @@ validate_evidence_record_set() {
       --spec=draft2020 -c ajv-formats -s "${schema}" -d "${record}" ||
       blocked "evidence record ${record} does not conform to ${schema}"
 
-    local recorded_source recorded_sha recorded_grace
+    local recorded_source recorded_revision recorded_sha recorded_grace
     # The record, the bounds it is judged by, and — on a bound run — the
     # dispatch itself must all name one commit. Without this a record built
     # from any other bytes validates as soon as it copies the right manifest
@@ -13246,6 +13400,17 @@ validate_evidence_record_set() {
 [${recorded_source:-absent}], but the release-manifest attestation it is \
 measured against was taken at [${attested_source}]; a record and the \
 compiled bounds judging it must come from the same commit"
+    fi
+    recorded_revision="$(node -e '
+      const fs = require("fs");
+      const record = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      process.stdout.write(String((record.artifacts || {}).revision || ""));
+    ' "${record}")"
+    if [[ "${recorded_revision}" != "${recorded_source}" ]]; then
+      blocked "evidence record ${record} says its R1 runtime revision is \
+[${recorded_revision:-absent}], but its exact source commit is \
+[${recorded_source}]; an artifact identity abbreviated from or unrelated to \
+the source cannot bind supporting evidence to one build"
     fi
 
     # The images the record says the fleet ran, against the ones the release
@@ -13517,29 +13682,20 @@ publishes exactly once"
 }
 
 # Inspect the supporting roster-window archive named by one single-release
-# record. The record carries only a relative archive identifier and a digest;
-# this reader resolves the identifier beneath EVIDENCE_DIR, rejects symlinks
-# and traversal, and then re-derives the capture verdict from the archived
-# bytes. A digest-shaped string is not evidence unless the archive it names is
-# still present, complete, and authored by the exact R1 fleet.
+# record. The reader binds the bytes to that record and run, verifies the
+# pre-close checkpoint, and reconstructs the event chronology from each log.
 cutover_evidence_window_findings() {
   local record="$1"
-  # The JavaScript regex replacement below contains literal $1/$2 capture
-  # references; they are intentionally not shell expansions.
-  # shellcheck disable=SC2016
   node -e '
     const crypto = require("crypto");
     const fs = require("fs");
     const path = require("path");
-    const [
-      recordPath, evidenceRootInput, ...expectedServices
-    ] = process.argv.slice(1);
+    const [recordPath, evidenceRootInput, ...expectedServices] =
+      process.argv.slice(1);
     const findings = [];
     const add = (kind, what) => findings.push(kind + "\t" + what);
     const isObject = (value) =>
-      value !== null &&
-      typeof value === "object" &&
-      !Array.isArray(value);
+      value !== null && typeof value === "object" && !Array.isArray(value);
     const safeIdentifier = (value) =>
       typeof value === "string" &&
       /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value);
@@ -13548,58 +13704,101 @@ cutover_evidence_window_findings() {
       left.every((value, index) => value === right[index]);
     const sha256 = (value) =>
       crypto.createHash("sha256").update(value).digest("hex");
+    const canonical = (value) => {
+      if (Array.isArray(value)) return value.map(canonical);
+      if (!isObject(value)) return value;
+      return Object.fromEntries(
+        Object.keys(value).sort().map((key) => [key, canonical(value[key])])
+      );
+    };
+    const sameValue = (left, right) =>
+      JSON.stringify(canonical(left)) === JSON.stringify(canonical(right));
+
+    // Producer and Docker timestamps are UTC RFC3339/RFC3339Nano. Parsing an
+    // intentionally narrow form avoids Date.parse accepting normalized invalid
+    // dates or implementation-specific strings as release chronology.
+    const parseTimestamp = (value) => {
+      if (typeof value !== "string") return undefined;
+      const match = value.match(
+        /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?Z$/
+      );
+      if (!match) return undefined;
+      const year = Number(match[1]);
+      const month = Number(match[2]);
+      const day = Number(match[3]);
+      const hour = Number(match[4]);
+      const minute = Number(match[5]);
+      const second = Number(match[6]);
+      const fraction = match[7] || "";
+      if (
+        year < 1970 || month < 1 || month > 12 || day < 1 ||
+        day > new Date(Date.UTC(year, month, 0)).getUTCDate() ||
+        hour > 23 || minute > 59 || second > 59
+      ) return undefined;
+      const milliseconds = Date.UTC(year, month - 1, day, hour, minute, second);
+      const date = new Date(milliseconds);
+      if (
+        date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 ||
+        date.getUTCDate() !== day || date.getUTCHours() !== hour ||
+        date.getUTCMinutes() !== minute || date.getUTCSeconds() !== second
+      ) return undefined;
+      return {
+        seconds: Math.floor(milliseconds / 1000),
+        nanos: Number((fraction + "000000000").slice(0, 9)),
+      };
+    };
+    const compareTime = (left, right) =>
+      left.seconds === right.seconds
+        ? left.nanos - right.nanos
+        : left.seconds - right.seconds;
+    const elapsedMilliseconds = (left, right) =>
+      (right.seconds - left.seconds) * 1000 +
+      (right.nanos - left.nanos) / 1000000;
 
     const inspect = () => {
       let record;
       try {
         record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
-      } catch (error) {
-        add(
-          "unrehearsed",
-          "single_release record cannot be read while resolving its fleet " +
-            "evidence-window archive"
-        );
+      } catch (_) {
+        add("unrehearsed", "single_release record cannot be read while " +
+          "resolving its fleet evidence-window archive");
         return;
       }
       if (record.gate !== "single_release") return;
 
-      const evidenceWindow = (Array.isArray(record.stages)
-        ? record.stages
-        : []
-      ).find((stage) =>
-        isObject(stage) &&
-        stage.name ===
-          "every R1 node authors periodic empty roster evidence"
-      );
+      const evidenceWindow = (Array.isArray(record.stages) ? record.stages : [])
+        .find((stage) => isObject(stage) && stage.name ===
+          "every R1 node authors periodic empty roster evidence");
       if (!evidenceWindow) return;
-
       const checksums = isObject(evidenceWindow.state_checksums)
-        ? evidenceWindow.state_checksums
-        : {};
+        ? evidenceWindow.state_checksums : {};
       const refs = isObject(evidenceWindow.evidence_refs)
-        ? evidenceWindow.evidence_refs
-        : {};
+        ? evidenceWindow.evidence_refs : {};
       const summaryDigest =
         checksums.cutover_evidence_window_summary_sha256;
       const archiveID = refs.cutover_evidence_window_archive;
-
-      const summaryDigestValid =
-        typeof summaryDigest === "string" &&
+      const captureID = refs.cutover_evidence_window_capture_id;
+      const summaryDigestValid = typeof summaryDigest === "string" &&
         /^[0-9a-f]{64}$/.test(summaryDigest);
       if (!summaryDigestValid) {
-        add(
-          "unrehearsed",
-          "single_release fleet evidence-window step carries no archived " +
-            "summary SHA-256"
-        );
+        add("unrehearsed", "single_release fleet evidence-window step " +
+          "carries no archived summary SHA-256");
       }
       if (!safeIdentifier(archiveID)) {
-        add(
-          "unrehearsed",
-          "single_release fleet evidence-window step carries no safe " +
-            "relative archive identifier"
-        );
+        add("unrehearsed", "single_release fleet evidence-window step " +
+          "carries no safe relative archive identifier");
         return;
+      }
+      if (typeof captureID !== "string" || !/^[0-9a-f]{32}$/.test(captureID)) {
+        add("unrehearsed", "single_release fleet evidence-window step " +
+          "carries no valid capture identity");
+      }
+      if (
+        typeof captureID === "string" &&
+        archiveID !== "cutover-roster-window-" + captureID
+      ) {
+        add("unrehearsed", "single_release fleet evidence-window archive " +
+          "identifier is not derived from its capture identity");
       }
 
       const expectedCounts = new Map();
@@ -13611,11 +13810,8 @@ cutover_evidence_window_findings() {
         expectedServices.some((service) => !safeIdentifier(service)) ||
         Array.from(expectedCounts.values()).some((count) => count !== 1)
       ) {
-        add(
-          "unrehearsed",
-          "single_release fleet evidence-window reader received no exact " +
-            "authoritative R1 service set"
-        );
+        add("unrehearsed", "single_release fleet evidence-window reader " +
+          "received no exact authoritative R1 service set");
         return;
       }
       const expectedSorted = [...expectedServices].sort();
@@ -13628,7 +13824,6 @@ cutover_evidence_window_findings() {
         if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
           throw new Error("evidence root is not a directory");
         }
-
         const lexicalArchive = path.resolve(evidenceRoot, archiveID);
         if (path.dirname(lexicalArchive) !== evidenceRoot) {
           throw new Error("archive is not a direct evidence child");
@@ -13641,13 +13836,10 @@ cutover_evidence_window_findings() {
         if (path.dirname(archivePath) !== evidenceRoot) {
           throw new Error("archive resolves outside evidence root");
         }
-      } catch (error) {
-        add(
-          "unrehearsed",
-          "single_release fleet evidence-window archive " +
-            JSON.stringify(archiveID) +
-            " is absent or does not resolve safely beneath EVIDENCE_DIR"
-        );
+      } catch (_) {
+        add("unrehearsed", "single_release fleet evidence-window archive " +
+          JSON.stringify(archiveID) + " is absent or does not resolve " +
+          "safely beneath EVIDENCE_DIR");
         return;
       }
 
@@ -13663,269 +13855,377 @@ cutover_evidence_window_findings() {
             throw new Error("file resolves outside archive");
           }
           return fs.readFileSync(resolved);
-        } catch (error) {
-          add(
-            "unrehearsed",
-            "single_release fleet evidence-window archive " +
-              JSON.stringify(archiveID) + " has no safe archived " +
-              description
-          );
+        } catch (_) {
+          add("unrehearsed", "single_release fleet evidence-window archive " +
+            JSON.stringify(archiveID) + " has no safe archived " + description);
           return undefined;
         }
       };
 
-      const resultBytes = readRegularArchiveFile(
-        "result.json",
-        "result.json"
+      const resultBytes = readRegularArchiveFile("result.json", "result.json");
+      const checkpointBytes = readRegularArchiveFile(
+        "window-open.json", "window-open.json"
       );
-      if (resultBytes === undefined) return;
-
-      const actualSummaryDigest = sha256(resultBytes);
-      if (
-        summaryDigestValid &&
-        actualSummaryDigest !== summaryDigest
-      ) {
-        add(
-          "unrehearsed",
-          "single_release fleet evidence-window summary SHA-256 does not " +
-            "match the archived result.json named by the record"
-        );
+      if (resultBytes === undefined || checkpointBytes === undefined) return;
+      if (summaryDigestValid && sha256(resultBytes) !== summaryDigest) {
+        add("unrehearsed", "single_release fleet evidence-window summary " +
+          "SHA-256 does not match the archived result.json named by the record");
       }
 
       let result;
+      let checkpoint;
       try {
         result = JSON.parse(resultBytes.toString("utf8"));
-      } catch (error) {
-        add(
-          "unrehearsed",
-          "single_release fleet evidence-window result.json is malformed"
-        );
+      } catch (_) {
+        add("unrehearsed", "single_release fleet evidence-window result.json " +
+          "is malformed");
         return;
       }
-      if (!isObject(result) || result.schema_version !== 1) {
-        add(
-          "unrehearsed",
-          "single_release fleet evidence-window result.json has no " +
-            "supported schema_version"
-        );
+      try {
+        checkpoint = JSON.parse(checkpointBytes.toString("utf8"));
+      } catch (_) {
+        add("unrehearsed", "single_release fleet evidence-window " +
+          "window-open.json is malformed");
         return;
       }
-      if (result.complete !== true) {
-        add(
-          "refuted",
-          "single_release fleet evidence-window archive reports " +
-            "complete=false"
-        );
-      }
-      if (!Array.isArray(result.failures)) {
-        add(
-          "unrehearsed",
-          "single_release fleet evidence-window result.json has no failure " +
-            "account"
-        );
-      } else if (result.failures.length !== 0) {
-        add(
-          "refuted",
-          "single_release fleet evidence-window archive records capture " +
-            "failures"
-        );
-      }
-      if (!Array.isArray(result.services)) {
-        add(
-          "unrehearsed",
-          "single_release fleet evidence-window result.json has no service " +
-            "account"
-        );
+      if (!isObject(result) || result.schema_version !== 2) {
+        add("unrehearsed", "single_release fleet evidence-window result.json " +
+          "has no supported schema_version");
         return;
+      }
+      if (!isObject(checkpoint) || checkpoint.schema_version !== 2) {
+        add("unrehearsed", "single_release fleet evidence-window " +
+          "window-open.json has no supported schema_version");
+        return;
+      }
+      if (
+        typeof result.window_open_sha256 !== "string" ||
+        !/^[0-9a-f]{64}$/.test(result.window_open_sha256) ||
+        sha256(checkpointBytes) !== result.window_open_sha256
+      ) {
+        add("unrehearsed", "single_release fleet evidence-window pre-close " +
+          "checkpoint does not match result.window_open_sha256");
       }
 
-      const serviceEntries = new Map();
-      const resultServiceNames = [];
-      let serviceShapeValid = true;
-      for (const entry of result.services) {
-        if (!isObject(entry) || !safeIdentifier(entry.service)) {
-          serviceShapeValid = false;
+      const artifacts = isObject(record.artifacts) ? record.artifacts : {};
+      const chain = isObject(record.chain) ? record.chain : {};
+      const expectedContext = {
+        schema_version: 1,
+        run_id: record.run_id,
+        capture_id: captureID,
+        archive_id: archiveID,
+        gate: record.gate,
+        source_sha: record.source_sha,
+        r1_image_digests: artifacts.r1_image_digests,
+        revision: artifacts.revision,
+        protocol_epoch: artifacts.protocol_epoch,
+        chain_id: chain.chain_id,
+        cutover_block: chain.cutover_block,
+        r1_fleet: record.r1_fleet,
+      };
+      const contextFields = Object.keys(expectedContext);
+      for (const [name, context] of [
+        ["result.json", result.capture_context],
+        ["window-open.json", checkpoint.capture_context],
+      ]) {
+        if (!isObject(context)) {
+          add("unrehearsed", "single_release fleet evidence-window " + name +
+            " carries no capture context");
           continue;
         }
-        resultServiceNames.push(entry.service);
-        if (serviceEntries.has(entry.service)) {
-          serviceShapeValid = false;
-        } else {
-          serviceEntries.set(entry.service, entry);
-        }
-      }
-      const resultSorted = [...resultServiceNames].sort();
-      if (
-        !serviceShapeValid ||
-        !sameArray(resultSorted, expectedSorted)
-      ) {
-        add(
-          "unrehearsed",
-          "single_release fleet evidence-window service set [" +
-            resultSorted.join(", ") +
-            "] does not match the authoritative R1 service set [" +
-            expectedSorted.join(", ") + "]"
-        );
-      }
-
-      try {
-        const archivedLogs = fs.readdirSync(archivePath)
-          .filter((name) => name.endsWith(".log"))
-          .sort();
-        const expectedLogs = expectedSorted
-          .map((service) => service + ".log")
-          .sort();
-        if (!sameArray(archivedLogs, expectedLogs)) {
-          add(
-            "unrehearsed",
-            "single_release fleet evidence-window archived log set [" +
-              archivedLogs.join(", ") +
-              "] does not match the authoritative R1 service log set [" +
-              expectedLogs.join(", ") + "]"
-          );
-        }
-      } catch (error) {
-        add(
-          "unrehearsed",
-          "single_release fleet evidence-window archive cannot enumerate " +
-            "its per-service logs"
-        );
-      }
-
-      const requiredFlags = [
-        "signal_delivered",
-        "activation_seen",
-        "periodic_empty_snapshots_seen",
-        "close_delivered",
-        "close_seen",
-      ];
-      for (const service of expectedSorted) {
-        const entry = serviceEntries.get(service);
-        if (!entry) continue;
-
-        for (const flag of requiredFlags) {
-          if (entry[flag] !== true) {
-            add(
-              "refuted",
-              "single_release fleet evidence-window service " +
-                JSON.stringify(service) + " does not record " +
-                JSON.stringify(flag) + " as true"
-            );
+        for (const field of contextFields) {
+          if (!sameValue(context[field], expectedContext[field])) {
+            add("unrehearsed", "single_release fleet evidence-window " + name +
+              " capture context " + JSON.stringify(field) +
+              " does not match its rehearsal record");
           }
         }
+        const extras = Object.keys(context)
+          .filter((field) => !contextFields.includes(field));
+        if (extras.length > 0) {
+          add("unrehearsed", "single_release fleet evidence-window " + name +
+            " capture context carries unexpected fields [" +
+            extras.sort().join(", ") + "]");
+        }
+      }
+      if (!sameValue(result.capture_context, checkpoint.capture_context)) {
+        add("unrehearsed", "single_release fleet evidence-window capture " +
+          "context changed between open checkpoint and close result");
+      }
+
+      const timelineValues = {
+        "result.opened_at": result.opened_at,
+        "result.archived_before_close_at": result.archived_before_close_at,
+        "result.closed_at": result.closed_at,
+        "record.generated_at": record.generated_at,
+        "checkpoint.opened_at": checkpoint.opened_at,
+        "checkpoint.archived_at": checkpoint.archived_at,
+      };
+      const timeline = {};
+      for (const [name, value] of Object.entries(timelineValues)) {
+        timeline[name] = parseTimestamp(value);
+        if (!timeline[name]) {
+          add("unrehearsed", "single_release fleet evidence-window timestamp " +
+            JSON.stringify(name) + " is not supported valid UTC RFC3339");
+        }
+      }
+      if (
+        checkpoint.opened_at !== result.opened_at ||
+        checkpoint.archived_at !== result.archived_before_close_at
+      ) {
+        add("unrehearsed", "single_release fleet evidence-window pre-close " +
+          "checkpoint timestamps do not match the close result");
+      }
+      const opened = timeline["result.opened_at"];
+      const archived = timeline["result.archived_before_close_at"];
+      const closed = timeline["result.closed_at"];
+      const generated = timeline["record.generated_at"];
+      if (
+        opened && archived && closed && generated &&
+        (
+          compareTime(opened, archived) > 0 ||
+          compareTime(archived, closed) > 0 ||
+          compareTime(closed, generated) > 0
+        )
+      ) {
+        add("unrehearsed", "single_release fleet evidence-window timeline is " +
+          "not opened_at <= archived_before_close_at <= closed_at <= " +
+          "record.generated_at");
+      }
+
+      if (result.complete !== true) {
+        add("refuted", "single_release fleet evidence-window archive reports " +
+          "complete=false");
+      }
+      if (!Array.isArray(result.failures)) {
+        add("unrehearsed", "single_release fleet evidence-window result.json " +
+          "has no failure account");
+      } else if (result.failures.length !== 0) {
+        add("refuted", "single_release fleet evidence-window archive records " +
+          "capture failures");
+      }
+      if (checkpoint.complete !== true) {
+        add("refuted", "single_release fleet evidence-window pre-close " +
+          "checkpoint reports complete=false");
+      }
+      if (!Array.isArray(result.services) || !Array.isArray(checkpoint.services)) {
+        add("unrehearsed", "single_release fleet evidence-window archive has " +
+          "no complete result/checkpoint service account");
+        return;
+      }
+
+      const indexServices = (entries) => {
+        const map = new Map();
+        const names = [];
+        let valid = true;
+        for (const entry of entries) {
+          if (!isObject(entry) || !safeIdentifier(entry.service)) {
+            valid = false;
+            continue;
+          }
+          names.push(entry.service);
+          if (map.has(entry.service)) valid = false;
+          else map.set(entry.service, entry);
+        }
+        return { map, names: names.sort(), valid };
+      };
+      const resultIndex = indexServices(result.services);
+      const checkpointIndex = indexServices(checkpoint.services);
+      for (const [name, index] of [
+        ["result", resultIndex], ["pre-close checkpoint", checkpointIndex],
+      ]) {
+        if (!index.valid || !sameArray(index.names, expectedSorted)) {
+          add("unrehearsed", "single_release fleet evidence-window " + name +
+            " service set [" + index.names.join(", ") +
+            "] does not match the authoritative R1 service set [" +
+            expectedSorted.join(", ") + "]");
+        }
+      }
+
+      const expectedFiles = ["result.json", "window-open.json", ...expectedSorted
+        .map((service) => service + ".log")].sort();
+      try {
+        const actualFiles = fs.readdirSync(archivePath).sort();
+        if (!sameArray(actualFiles, expectedFiles)) {
+          add("unrehearsed", "single_release fleet evidence-window archive " +
+            "file set [" + actualFiles.join(", ") +
+            "] does not match its exact evidence file set [" +
+            expectedFiles.join(", ") + "]");
+        }
+      } catch (_) {
+        add("unrehearsed", "single_release fleet evidence-window archive " +
+          "cannot enumerate its evidence files");
+      }
+
+      const resultFlags = [
+        "signal_delivered", "activation_seen",
+        "periodic_empty_snapshots_seen", "close_delivered", "close_seen",
+      ];
+      const checkpointFlags = [
+        "signal_delivered", "activation_seen", "periodic_empty_snapshots_seen",
+      ];
+      for (const service of expectedSorted) {
+        const entry = resultIndex.map.get(service);
+        const checkpointEntry = checkpointIndex.map.get(service);
+        if (entry) {
+          for (const flag of resultFlags) {
+            if (entry[flag] !== true) {
+              add("refuted", "single_release fleet evidence-window service " +
+                JSON.stringify(service) + " does not record " +
+                JSON.stringify(flag) + " as true");
+            }
+          }
+        }
+        if (checkpointEntry) {
+          for (const flag of checkpointFlags) {
+            if (checkpointEntry[flag] !== true) {
+              add("refuted", "single_release fleet evidence-window pre-close " +
+                "service " + JSON.stringify(service) + " does not record " +
+                JSON.stringify(flag) + " as true");
+            }
+          }
+        }
+        if (!entry) continue;
 
         const logBytes = readRegularArchiveFile(
-          service + ".log",
-          "log for service " + JSON.stringify(service)
+          service + ".log", "log for service " + JSON.stringify(service)
         );
         if (logBytes === undefined) continue;
-
         const recordedLogDigest = entry.relevant_log_sha256;
         if (
           typeof recordedLogDigest !== "string" ||
           !/^[0-9a-f]{64}$/.test(recordedLogDigest)
         ) {
-          add(
-            "unrehearsed",
-            "single_release fleet evidence-window service " +
-              JSON.stringify(service) +
-              " carries no relevant-log SHA-256"
-          );
+          add("unrehearsed", "single_release fleet evidence-window service " +
+            JSON.stringify(service) + " carries no relevant-log SHA-256");
         } else if (sha256(logBytes) !== recordedLogDigest) {
-          add(
-            "unrehearsed",
-            "single_release fleet evidence-window archived log for service " +
-              JSON.stringify(service) +
-              " does not match its relevant_log_sha256"
-          );
+          add("unrehearsed", "single_release fleet evidence-window archived " +
+            "log for service " + JSON.stringify(service) +
+            " does not match its relevant_log_sha256");
         }
 
-        const lines = logBytes.toString("utf8").split(/\r?\n/);
-        const activationSeen = lines.some((line) =>
-          line.includes("protocol cutover evidence window changed") &&
-          line.includes("[active=true]")
-        );
-        const closeSeen = lines.some((line) =>
-          line.includes("protocol cutover evidence window changed") &&
-          line.includes("[active=false]")
-        );
-        if (!activationSeen) {
-          add(
-            "unrehearsed",
-            "single_release fleet evidence-window archived log for service " +
-              JSON.stringify(service) + " has no activation line"
-          );
+        const rawLines = logBytes.toString("utf8").split(/\r?\n/)
+          .filter((line) => line.length > 0);
+        const lines = rawLines.map((line, index) => {
+          const timestampToken = (line.match(/^(\S+)\s/) || [])[1] || "";
+          return { line, index, time: parseTimestamp(timestampToken) };
+        });
+        if (lines.some((line) => !line.time)) {
+          add("unrehearsed", "single_release fleet evidence-window archived " +
+            "log for service " + JSON.stringify(service) +
+            " carries a line without supported valid UTC RFC3339Nano time");
         }
-        if (!closeSeen) {
-          add(
-            "unrehearsed",
-            "single_release fleet evidence-window archived log for service " +
-              JSON.stringify(service) + " has no close line"
-          );
+        for (let index = 1; index < lines.length; index++) {
+          if (
+            lines[index - 1].time && lines[index].time &&
+            compareTime(lines[index - 1].time, lines[index].time) > 0
+          ) {
+            add("unrehearsed", "single_release fleet evidence-window archived " +
+              "log for service " + JSON.stringify(service) +
+              " is not in timestamp order");
+            break;
+          }
+        }
+        const activations = lines.filter((entry) =>
+          entry.line.includes("protocol cutover evidence window changed") &&
+          entry.line.includes("[active=true]"));
+        const closes = lines.filter((entry) =>
+          entry.line.includes("protocol cutover evidence window changed") &&
+          entry.line.includes("[active=false]"));
+        if (activations.length === 0) {
+          add("unrehearsed", "single_release fleet evidence-window archived " +
+            "log for service " + JSON.stringify(service) +
+            " has no activation line");
+        } else if (activations.length !== 1) {
+          add("unrehearsed", "single_release fleet evidence-window archived " +
+            "log for service " + JSON.stringify(service) +
+            " has more than one activation line");
+        }
+        if (closes.length === 0) {
+          add("unrehearsed", "single_release fleet evidence-window archived " +
+            "log for service " + JSON.stringify(service) + " has no close line");
+        } else if (closes.length !== 1) {
+          add("unrehearsed", "single_release fleet evidence-window archived " +
+            "log for service " + JSON.stringify(service) +
+            " has more than one close line");
+        }
+        const activation = activations.length === 1 ? activations[0] : undefined;
+        const close = closes.length === 1 ? closes[0] : undefined;
+        if (
+          activation && activation.time && opened && archived &&
+          (
+            compareTime(activation.time, opened) < 0 ||
+            compareTime(activation.time, archived) > 0
+          )
+        ) {
+          add("unrehearsed", "single_release fleet evidence-window activation " +
+            "for service " + JSON.stringify(service) +
+            " falls outside its open-to-archive interval");
+        }
+        if (
+          close && close.time && archived && closed &&
+          (
+            compareTime(close.time, archived) < 0 ||
+            compareTime(close.time, closed) > 0
+          )
+        ) {
+          add("unrehearsed", "single_release fleet evidence-window close for " +
+            "service " + JSON.stringify(service) +
+            " does not occur after the archive checkpoint and by closed_at");
+        }
+        if (activation && close && activation.index >= close.index) {
+          add("unrehearsed", "single_release fleet evidence-window close for " +
+            "service " + JSON.stringify(service) +
+            " is not ordered after activation");
         }
 
-        const emptySnapshotLines = lines.filter((line) =>
-          line.includes("protocol cutover peer roster snapshot") &&
-          line.includes("[legacyPeers=0]")
-        ).length;
+        const emptySnapshotLines = lines.filter((entry) =>
+          entry.line.includes("protocol cutover peer roster snapshot") &&
+          entry.line.includes("[legacyPeers=0]")).length;
         if (
           !Number.isSafeInteger(entry.empty_snapshot_lines) ||
           entry.empty_snapshot_lines !== emptySnapshotLines
         ) {
-          add(
-            "unrehearsed",
-            "single_release fleet evidence-window service " +
-              JSON.stringify(service) +
-              " empty_snapshot_lines does not match its archived log"
-          );
+          add("unrehearsed", "single_release fleet evidence-window service " +
+            JSON.stringify(service) +
+            " empty_snapshot_lines does not match its archived log");
         }
-
-        const eligibleSnapshots = lines
-          .filter((line) =>
-            line.includes("protocol cutover peer roster snapshot") &&
-            line.includes("[clockAvailable=true]") &&
-            line.includes("[legacyPeers=0]")
-          )
-          .map((line) => {
-            const timestampToken =
-              (line.match(/^(\S+)\s/) || [])[1] || "";
-            const blockText =
-              (line.match(/\[currentBlock=(\d+)\]/) || [])[1] || "";
-            const normalizedTimestamp = timestampToken.replace(
-              /(\.\d{3})\d+(Z|[+-]\d{2}:\d{2})$/,
-              "$1$2"
-            );
-            return {
-              timestamp: Date.parse(normalizedTimestamp),
-              currentBlock: Number(blockText),
-            };
-          })
-          .filter((snapshot) =>
-            Number.isFinite(snapshot.timestamp) &&
-            Number.isSafeInteger(snapshot.currentBlock)
-          );
+        const eligibleSnapshots = lines.filter((entry) =>
+          entry.line.includes("protocol cutover peer roster snapshot") &&
+          entry.line.includes("[clockAvailable=true]") &&
+          entry.line.includes("[legacyPeers=0]"))
+          .map((entry) => ({
+            ...entry,
+            currentBlock: Number(
+              (entry.line.match(/\[currentBlock=(\d+)\]/) || [])[1] || ""
+            ),
+          }))
+          .filter((entry) => entry.time && Number.isSafeInteger(entry.currentBlock));
         let cadenceSeen = false;
         for (let index = 1; index < eligibleSnapshots.length; index++) {
           const previous = eligibleSnapshots[index - 1];
           const current = eligibleSnapshots[index];
-          const elapsed = current.timestamp - previous.timestamp;
+          const elapsed = elapsedMilliseconds(previous.time, current.time);
           if (
-            elapsed >= 270000 &&
-            elapsed <= 360000 &&
-            current.currentBlock > previous.currentBlock
+            elapsed >= 270000 && elapsed <= 360000 &&
+            current.currentBlock > previous.currentBlock &&
+            activation && close && activation.time && close.time && archived &&
+            activation.index < previous.index && previous.index < current.index &&
+            current.index < close.index &&
+            compareTime(activation.time, previous.time) <= 0 &&
+            compareTime(previous.time, current.time) <= 0 &&
+            compareTime(current.time, archived) <= 0 &&
+            compareTime(archived, close.time) <= 0
           ) {
             cadenceSeen = true;
             break;
           }
         }
         if (!cadenceSeen) {
-          add(
-            "unrehearsed",
-            "single_release fleet evidence-window archived log for service " +
-              JSON.stringify(service) +
-              " has no two clock-healthy empty snapshots 270-360 seconds " +
-              "apart with advancing blocks"
-          );
+          add("unrehearsed", "single_release fleet evidence-window archived " +
+            "log for service " + JSON.stringify(service) +
+            " has no two clock-healthy empty snapshots 270-360 seconds apart " +
+            "with advancing blocks between activation and the pre-close archive");
         }
       }
     };
@@ -13934,6 +14234,68 @@ cutover_evidence_window_findings() {
     process.stdout.write(findings.join("\n"));
   ' "${record}" "${EVIDENCE_DIR}" \
     "${REHEARSAL_R1_SERVICES[@]+"${REHEARSAL_R1_SERVICES[@]}"}"
+}
+
+# Identities are also an archive-set property. A per-record comparison can
+# prove that a capture matches one record, but only the set can prove that two
+# platform records did not claim the same run or capture independently.
+cutover_evidence_window_set_findings() {
+  node -e '
+    const fs = require("fs");
+    const records = process.argv.slice(1).map((recordPath) => ({
+      recordPath,
+      record: JSON.parse(fs.readFileSync(recordPath, "utf8")),
+    }));
+    const findings = [];
+    const add = (what) => findings.push("unrehearsed\t" + what);
+    const ownersBy = (label, values) => {
+      const owners = new Map();
+      for (const { recordPath, value } of values) {
+        if (typeof value !== "string" || value.length === 0) continue;
+        if (!owners.has(value)) owners.set(value, []);
+        owners.get(value).push(recordPath.split("/").pop());
+      }
+      for (const [value, paths] of owners) {
+        if (paths.length > 1) {
+          add("evidence records [" + paths.sort().join(", ") + "] reuse " +
+            label + " " + JSON.stringify(value));
+        }
+      }
+    };
+
+    ownersBy("rehearsal run identity", records.map(({ recordPath, record }) => ({
+      recordPath,
+      value: record.run_id,
+    })));
+    const captures = [];
+    const archives = [];
+    const summaries = [];
+    for (const { recordPath, record } of records) {
+      if (record.gate !== "single_release") continue;
+      const stage = (Array.isArray(record.stages) ? record.stages : []).find(
+        (entry) => entry && entry.name ===
+          "every R1 node authors periodic empty roster evidence"
+      ) || {};
+      const refs = stage.evidence_refs || {};
+      const checksums = stage.state_checksums || {};
+      captures.push({
+        recordPath,
+        value: refs.cutover_evidence_window_capture_id,
+      });
+      archives.push({
+        recordPath,
+        value: refs.cutover_evidence_window_archive,
+      });
+      summaries.push({
+        recordPath,
+        value: checksums.cutover_evidence_window_summary_sha256,
+      });
+    }
+    ownersBy("fleet evidence-window capture identity", captures);
+    ownersBy("fleet evidence-window archive identity", archives);
+    ownersBy("fleet evidence-window summary bytes", summaries);
+    process.stdout.write(findings.join("\n"));
+  ' "$@"
 }
 
 # Render every acceptance-relevant finding in one record. The gate contracts
@@ -14107,6 +14469,32 @@ evidence_acceptance_findings() {
     const assertions = Array.isArray(record.assertions)
       ? record.assertions
       : [];
+
+    const fleet = Array.isArray(record.r1_fleet) ? record.r1_fleet : [];
+    const fleetServices = fleet
+      .map((instance) => String((instance || {}).service || ""))
+      .sort();
+    const authoritativeServices = [...expectedServices].sort();
+    if (
+      fleetServices.length !== authoritativeServices.length ||
+      fleetServices.some(
+        (service, index) => service !== authoritativeServices[index]
+      )
+    ) {
+      add("unrehearsed", "recorded R1 fleet service set [" +
+        fleetServices.join(", ") +
+        "] does not match the authoritative R1 service set [" +
+        authoritativeServices.join(", ") + "]");
+    }
+    if (new Set(fleetServices).size !== fleetServices.length) {
+      add("unrehearsed", "recorded R1 fleet contains duplicate services");
+    }
+    const containerIDs = fleet.map(
+      (instance) => String((instance || {}).container_id || "")
+    );
+    if (new Set(containerIDs).size !== containerIDs.length) {
+      add("unrehearsed", "recorded R1 fleet reuses one container identity");
+    }
 
     const checkRoster = (kind, entries, required, key) => {
       const actual = entries.map((entry) => String((entry || {})[key] || ""));
@@ -14671,7 +15059,19 @@ assess_evidence_record_set() {
     blocked "no evidence records were supplied for acceptance"
 
   local refutations=() unrehearsed=() advisories=()
-  local record outcomes archive_outcomes kind what
+  local record outcomes archive_outcomes set_outcomes kind what
+  set_outcomes="$(cutover_evidence_window_set_findings "$@")" ||
+    fail "cannot inspect rehearsal/capture identity ownership across the \
+evidence record set"
+  if [[ -n "${set_outcomes}" ]]; then
+    while IFS="$(printf '\t')" read -r kind what; do
+      case "${kind}" in
+      refuted) refutations+=("archive set: ${what}") ;;
+      unrehearsed) unrehearsed+=("archive set: ${what}") ;;
+      advisory) advisories+=("archive set: ${what}") ;;
+      esac
+    done <<<"${set_outcomes}"
+  fi
   for record in "$@"; do
     outcomes="$(evidence_acceptance_findings "${record}")" ||
       fail "cannot assess the gate contract recorded in ${record}"
@@ -14711,8 +15111,9 @@ whatever the records that do exist show"
 
   note "every required step passed exactly once, every required assertion \
 holds against its designated passing step, every required reviewed release \
-input is present, and every named supporting archive matches its recorded \
-digest and independently re-derived facts"
+input is present, every run and capture identity has one owner, and every \
+named supporting archive matches its record, digest, checkpoint, and \
+independently re-derived chronology"
 }
 
 # Do the records show the gates held?

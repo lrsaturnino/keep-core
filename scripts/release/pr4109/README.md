@@ -966,11 +966,12 @@ the external `ETH_WS_URL` endpoint.
 
 Every accepted rehearsal run must produce an evidence record conforming to
 `rehearsal-evidence.schema.json`: exact source SHA, per-architecture image
-digests, chain ID and C, the sha256 of the reviewed `release-manifest.json`
-the fleet's termination grace was taken from and the grace value itself,
-per-stage canonical/callback blocks, permit modes, gauge snapshots,
-transaction hashes, and non-secret state checksums. Screenshots alone are
-insufficient. The emitter validates its one record with
+digests, unique run identity, exact service/container/operator fleet, chain ID
+and C, the sha256 of the reviewed `release-manifest.json` the fleet's
+termination grace was taken from and the grace value itself, per-stage
+canonical/callback blocks, permit modes, gauge snapshots, transaction hashes,
+supporting-artifact identities, and non-secret state checksums. Screenshots
+alone are insufficient. The emitter validates its one record with
 `validate_evidence_record_set`; `./rehearse.sh validate-evidence` is the
 archive entry point and checks every record under `EVIDENCE_DIR` against the
 schema (ajv pinned to exact versions) before checking archive completeness. Both
@@ -987,8 +988,8 @@ says. A record is precisely where a rehearsal reports that a mandatory step
 failed or an acceptance assertion does not hold, so a schema-valid,
 correctly bound record can be exactly the evidence that a gate must be
 refused. `validate-evidence` therefore asks the second question separately
-against the exact gate contract. The single-release record must carry its 14
-named stages and eight named assertions; rollback must carry its 11 stages
+against the exact gate contract. The single-release record must carry its 15
+named stages and nine named assertions; rollback must carry its 11 stages
 and seven assertions. Every entry occurs exactly once and in execution order,
 unknown entries are rejected, and every assertion must cite its designated
 passing stage rather than any convenient passing step. Single-release must
@@ -1646,17 +1647,30 @@ log, one-off snapshot, unavailable/stalled clock, nonempty-only capture, or
 missing close fails the mandatory rehearsal step. The capture helper refuses
 to overwrite an existing archive.
 
-The corresponding rehearsal step records both the archive's safe relative
-identifier beneath `EVIDENCE_DIR` and the SHA-256 of its `result.json`.
+Before the window opens, the rehearsal creates unique run and capture
+identities and binds the capture to the record's exact source revision,
+executed image/platform, protocol epoch, chain ID, C, and authoritative
+service/container/operator fleet. The archive directory name is derived from
+the capture identity. The final record repeats the run/fleet context and the
+step records the capture/archive identities plus the SHA-256 of `result.json`.
+Archive-set acceptance rejects one run, capture, archive, or summary claimed by
+more than one record, so a capture from another run or native platform cannot
+be lent wholesale.
+
 `validate-evidence` does not trust those strings by shape: it rejects path
-traversal and symlinks, recomputes the summary digest, requires
+traversal and symlinks, recomputes the summary digest, and verifies the hashed
+`window-open.json` checkpoint that was written before `SIGUSR2`. It requires
 `complete=true` with an empty failure list and the exact authoritative R1
 service set, verifies every archived service log against
-`relevant_log_sha256`, and independently rechecks the activation/close lines
-and two clock-healthy empty snapshots 270–360 seconds apart with advancing
-blocks. The archive must therefore be preserved beside the top-level record;
-deleting it, editing either summary or log bytes, or borrowing a digest from
-another capture makes acceptance fail closed.
+`relevant_log_sha256`, and independently rechecks one activation, two
+clock-healthy empty snapshots 270–360 seconds apart with advancing blocks, and
+one close in that order. Supported UTC timestamps must prove
+`opened <= archived-before-close <= closed <= record-generated`; activation
+and both accepted snapshots precede the archive checkpoint, while close
+follows it. The archive must therefore be preserved beside the top-level
+record; deleting it, copying it under another identity, editing summary,
+checkpoint, or log bytes, or borrowing both reference and digest from another
+capture makes acceptance fail closed.
 
 For a host process the equivalent manual controls are `kill -USR1 <pid>` and
 `kill -USR2 <pid>`; for a container use the runtime's named-signal operation.

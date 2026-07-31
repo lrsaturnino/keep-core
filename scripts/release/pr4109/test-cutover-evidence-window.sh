@@ -4,7 +4,8 @@
 # exercises the successful two-service capture and the fail-closed cases for
 # an ignored signal, failed delivery, a missing second periodic snapshot,
 # periodic nonempty snapshots, and snapshots authored while the chain clock is
-# unavailable.
+# unavailable. It also proves a mismatched run/fleet context is rejected before
+# any process receives the opening signal.
 
 set -euo pipefail
 
@@ -28,6 +29,7 @@ set -u
 scenario="${FAKE_DOCKER_SCENARIO:?}"
 state="${FAKE_DOCKER_STATE:?}"
 archive="${FAKE_EXPECTED_ARCHIVE:?}"
+container_two="${FAKE_CONTAINER_TWO:?}"
 mkdir -p "${state}"
 
 command_name="${1:-}"
@@ -47,11 +49,11 @@ kill)
   case "${signal}" in
   SIGUSR1)
     if [[ "${scenario}" == "delivery_failure" &&
-      "${container}" == "container-two" ]]; then
+      "${container}" == "${container_two}" ]]; then
       exit 22
     fi
     if [[ "${scenario}" == "unsignaled" &&
-      "${container}" == "container-two" ]]; then
+      "${container}" == "${container_two}" ]]; then
       exit 0
     fi
     : >"${state}/${container}.open"
@@ -80,27 +82,26 @@ logs)
   printf '%s\n' \
     "2026-07-31T00:00:00.000000000Z protocol cutover evidence window changed [active=true] [signal=user defined signal 1]"
 
-  case "${scenario}:${container}" in
-  missing_periodic:container-two)
-    printf '%s\n' \
-      "2026-07-31T00:00:30.000000000Z protocol cutover peer roster snapshot [currentBlock=100] [clockAvailable=true] [legacyPeers=0] [oldestFirstSeenBlock=0] [rosterRevision=0]"
-    ;;
-  missing_empty:container-two)
-    printf '%s\n' \
-      "2026-07-31T00:00:30.000000000Z protocol cutover peer roster snapshot [currentBlock=100] [clockAvailable=true] [legacyPeers=1] [oldestFirstSeenBlock=99] [rosterRevision=1]" \
-      "2026-07-31T00:05:30.000000000Z protocol cutover peer roster snapshot [currentBlock=125] [clockAvailable=true] [legacyPeers=1] [oldestFirstSeenBlock=99] [rosterRevision=1]"
-    ;;
-  clock_unavailable:container-two)
-    printf '%s\n' \
-      "2026-07-31T00:00:30.000000000Z protocol cutover peer roster snapshot [currentBlock=100] [clockAvailable=false] [legacyPeers=0] [oldestFirstSeenBlock=0] [rosterRevision=0]" \
-      "2026-07-31T00:05:30.000000000Z protocol cutover peer roster snapshot [currentBlock=100] [clockAvailable=false] [legacyPeers=0] [oldestFirstSeenBlock=0] [rosterRevision=0]"
-    ;;
-  *)
+  if [[ "${container}" != "${container_two}" ]]; then
     printf '%s\n' \
       "2026-07-31T00:00:30.000000000Z protocol cutover peer roster snapshot [currentBlock=100] [clockAvailable=true] [legacyPeers=0] [oldestFirstSeenBlock=0] [rosterRevision=0]" \
       "2026-07-31T00:05:30.000000000Z protocol cutover peer roster snapshot [currentBlock=125] [clockAvailable=true] [legacyPeers=0] [oldestFirstSeenBlock=0] [rosterRevision=0]"
-    ;;
-  esac
+  elif [[ "${scenario}" == "missing_periodic" ]]; then
+    printf '%s\n' \
+      "2026-07-31T00:00:30.000000000Z protocol cutover peer roster snapshot [currentBlock=100] [clockAvailable=true] [legacyPeers=0] [oldestFirstSeenBlock=0] [rosterRevision=0]"
+  elif [[ "${scenario}" == "missing_empty" ]]; then
+    printf '%s\n' \
+      "2026-07-31T00:00:30.000000000Z protocol cutover peer roster snapshot [currentBlock=100] [clockAvailable=true] [legacyPeers=1] [oldestFirstSeenBlock=99] [rosterRevision=1]" \
+      "2026-07-31T00:05:30.000000000Z protocol cutover peer roster snapshot [currentBlock=125] [clockAvailable=true] [legacyPeers=1] [oldestFirstSeenBlock=99] [rosterRevision=1]"
+  elif [[ "${scenario}" == "clock_unavailable" ]]; then
+    printf '%s\n' \
+      "2026-07-31T00:00:30.000000000Z protocol cutover peer roster snapshot [currentBlock=100] [clockAvailable=false] [legacyPeers=0] [oldestFirstSeenBlock=0] [rosterRevision=0]" \
+      "2026-07-31T00:05:30.000000000Z protocol cutover peer roster snapshot [currentBlock=100] [clockAvailable=false] [legacyPeers=0] [oldestFirstSeenBlock=0] [rosterRevision=0]"
+  else
+    printf '%s\n' \
+      "2026-07-31T00:00:30.000000000Z protocol cutover peer roster snapshot [currentBlock=100] [clockAvailable=true] [legacyPeers=0] [oldestFirstSeenBlock=0] [rosterRevision=0]" \
+      "2026-07-31T00:05:30.000000000Z protocol cutover peer roster snapshot [currentBlock=125] [clockAvailable=true] [legacyPeers=0] [oldestFirstSeenBlock=0] [rosterRevision=0]"
+  fi
 
   if [[ -f "${state}/${container}.closed" ]]; then
     printf '%s\n' \
@@ -119,12 +120,68 @@ PASS=0
 FAILED=0
 CASE_RC=0
 CASE_OUTPUT=""
+CASE_ARCHIVE=""
+
+CONTAINER_ONE="$(printf '1%.0s' {1..64})"
+CONTAINER_TWO="$(printf '2%.0s' {1..64})"
 
 run_case() {
   local scenario="$1"
-  local archive="${WORK}/archive-${scenario}"
+  local capture_id
+  capture_id="$(printf '%s' "${scenario}" | shasum -a 256 | awk '{print substr($1, 1, 32)}')"
+  local archive="${WORK}/cutover-roster-window-${capture_id}"
   local state="${WORK}/state-${scenario}"
+  local context
+  context="$(node - "${scenario}" "${capture_id}" "${archive##*/}" \
+    "${CONTAINER_ONE}" "${CONTAINER_TWO}" <<'NODE'
+const crypto = require("crypto");
+const [scenario, captureID, archiveID, containerOne, containerTwo] =
+  process.argv.slice(2);
+process.stdout.write(JSON.stringify({
+  schema_version: 1,
+  run_id: crypto.createHash("sha256")
+    .update("run:" + scenario).digest("hex").slice(0, 32),
+  capture_id: captureID,
+  archive_id: archiveID,
+  gate: "single_release",
+  source_sha: "a".repeat(40),
+  r1_image_digests: {
+    amd64: "ghcr.io/keep-network/keep-client@sha256:" + "b".repeat(64),
+  },
+  revision: "a".repeat(40),
+  protocol_epoch: "security_v2_cutover",
+  chain_id: "11155111",
+  cutover_block: 1000000,
+  r1_fleet: [
+    {
+      service: "r1-node-1",
+      container_id: containerOne,
+      operator_address: "0x" + "1".repeat(40),
+    },
+    {
+      service: "r1-node-2",
+      container_id: containerTwo,
+      operator_address: "0x" + "2".repeat(40),
+    },
+  ],
+}));
+NODE
+  )"
+  if [[ "${scenario}" == "context_fleet_mismatch" ]]; then
+    context="$(node -e '
+      const context = JSON.parse(process.argv[1]);
+      context.r1_fleet[1].container_id = "3".repeat(64);
+      process.stdout.write(JSON.stringify(context));
+    ' "${context}")"
+  elif [[ "${scenario}" == "context_archive_mismatch" ]]; then
+    context="$(node -e '
+      const context = JSON.parse(process.argv[1]);
+      context.archive_id = "cutover-roster-window-" + "4".repeat(32);
+      process.stdout.write(JSON.stringify(context));
+    ' "${context}")"
+  fi
   mkdir -p "${state}"
+  CASE_ARCHIVE="${archive}"
 
   set +e
   CASE_OUTPUT="$(
@@ -132,8 +189,9 @@ run_case() {
       FAKE_DOCKER_SCENARIO="${scenario}" \
       FAKE_DOCKER_STATE="${state}" \
       FAKE_EXPECTED_ARCHIVE="${archive}" \
-      "${CAPTURE}" "${archive}" \
-      r1-node-1=container-one r1-node-2=container-two 2>&1
+      FAKE_CONTAINER_TWO="${CONTAINER_TWO}" \
+      "${CAPTURE}" "${archive}" "${context}" \
+      "r1-node-1=${CONTAINER_ONE}" "r1-node-2=${CONTAINER_TWO}" 2>&1
   )"
   CASE_RC=$?
   set -e
@@ -152,8 +210,8 @@ fail_case() {
 
 expect_success() {
   local name="$1" scenario="$2"
-  local archive="${WORK}/archive-${scenario}"
   run_case "${scenario}"
+  local archive="${CASE_ARCHIVE}"
 
   if ((CASE_RC == 0)) &&
     node -e '
@@ -161,7 +219,21 @@ expect_success() {
       const fs = require("fs");
       const path = require("path");
       const result = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-      if (!result.complete || result.services.length !== 2) process.exit(1);
+      const checkpoint = fs.readFileSync(
+        path.join(path.dirname(process.argv[1]), "window-open.json")
+      );
+      if (
+        result.schema_version !== 2 ||
+        result.capture_context.schema_version !== 1 ||
+        !result.complete ||
+        result.services.length !== 2 ||
+        crypto.createHash("sha256").update(checkpoint).digest("hex") !==
+          result.window_open_sha256 ||
+        Date.parse(result.opened_at) >
+          Date.parse(result.archived_before_close_at) ||
+        Date.parse(result.archived_before_close_at) >
+          Date.parse(result.closed_at)
+      ) process.exit(1);
       if (!result.services.every((service) =>
         service.signal_delivered &&
         service.activation_seen &&
@@ -184,8 +256,8 @@ expect_success() {
 
 expect_failure() {
   local name="$1" scenario="$2" pattern="$3"
-  local archive="${WORK}/archive-${scenario}"
   run_case "${scenario}"
+  local archive="${CASE_ARCHIVE}"
 
   if ((CASE_RC == 1)) &&
     grep -Eq "${pattern}" <<<"${CASE_OUTPUT}" &&
@@ -194,6 +266,21 @@ expect_failure() {
       const result = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
       if (result.complete || result.failures.length === 0) process.exit(1);
     ' "${archive}/result.json"; then
+    pass_case "${name}"
+  else
+    fail_case "${name}" "exit ${CASE_RC}: ${CASE_OUTPUT}"
+  fi
+}
+
+expect_context_failure() {
+  local name="$1" scenario="$2" pattern="$3"
+  run_case "${scenario}"
+  local state="${WORK}/state-${scenario}"
+
+  if ((CASE_RC == 1)) &&
+    grep -Eq "${pattern}" <<<"${CASE_OUTPUT}" &&
+    [[ ! -e "${CASE_ARCHIVE}" ]] &&
+    ! compgen -G "${state}/*.open" >/dev/null; then
     pass_case "${name}"
   else
     fail_case "${name}" "exit ${CASE_RC}: ${CASE_OUTPUT}"
@@ -223,6 +310,14 @@ expect_failure \
   "clock-unavailable snapshots cannot stand in for fresh readiness evidence" \
   clock_unavailable \
   "r1-node-2 did not author two clock-healthy empty roster snapshots"
+expect_context_failure \
+  "a foreign container identity is refused before the evidence window opens" \
+  context_fleet_mismatch \
+  "R1 fleet differs from the signaled container set"
+expect_context_failure \
+  "an archive path not derived from the capture identity is refused before open" \
+  context_archive_mismatch \
+  "archive_id does not identify the archive directory"
 
 printf '%d passed, %d failed\n' "${PASS}" "${FAILED}"
 if ((FAILED != 0)); then
