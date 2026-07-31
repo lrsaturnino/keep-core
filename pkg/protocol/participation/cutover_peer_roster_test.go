@@ -31,6 +31,15 @@ func captureRosterLogs(
 	t *testing.T,
 	fn func(),
 ) []capturedRosterLogEntry {
+	return captureRosterLogsWithObserver(t, func(<-chan capturedRosterLogEntry) {
+		fn()
+	})
+}
+
+func captureRosterLogsWithObserver(
+	t *testing.T,
+	fn func(<-chan capturedRosterLogEntry),
+) []capturedRosterLogEntry {
 	t.Helper()
 
 	const subsystem = "keep-participation"
@@ -42,6 +51,7 @@ func captureRosterLogs(
 
 	var mutex sync.Mutex
 	var entries []capturedRosterLogEntry
+	observed := make(chan capturedRosterLogEntry, 128)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -59,10 +69,12 @@ func captureRosterLogs(
 			mutex.Lock()
 			entries = append(entries, entry)
 			mutex.Unlock()
+
+			observed <- entry
 		}
 	}()
 
-	fn()
+	fn(observed)
 
 	if err := pipe.Close(); err != nil {
 		t.Logf("could not close log pipe reader: %v", err)
@@ -95,6 +107,7 @@ func (f *fakeBlockCounter) set(block uint64, err error) {
 func (f *fakeBlockCounter) CurrentBlock() (uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
 	return f.block, f.err
 }
 
@@ -113,6 +126,147 @@ func (f *fakeBlockCounter) WatchBlocks(ctx context.Context) <-chan uint64 {
 		close(ch)
 	}()
 	return ch
+}
+
+type mutableRosterClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func newMutableRosterClock(now time.Time) *mutableRosterClock {
+	return &mutableRosterClock{now: now}
+}
+
+func (c *mutableRosterClock) set(now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.now = now
+}
+
+func (c *mutableRosterClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.now
+}
+
+type manualRosterTicker struct {
+	ticks     chan time.Time
+	processed chan struct{}
+	stopOnce  sync.Once
+	stopped   chan struct{}
+}
+
+func newManualRosterTicker() *manualRosterTicker {
+	return &manualRosterTicker{
+		ticks:     make(chan time.Time, 1),
+		processed: make(chan struct{}, 1),
+		stopped:   make(chan struct{}),
+	}
+}
+
+func (t *manualRosterTicker) Ticks() <-chan time.Time {
+	return t.ticks
+}
+
+func (t *manualRosterTicker) MarkProcessed() {
+	t.processed <- struct{}{}
+}
+
+func (t *manualRosterTicker) Stop() {
+	t.stopOnce.Do(func() {
+		close(t.stopped)
+	})
+}
+
+func (t *manualRosterTicker) tick(at time.Time) {
+	t.ticks <- at
+}
+
+func newRunLoopTestRoster(
+	t *testing.T,
+	initialBlock uint64,
+	retention uint64,
+	clock *mutableRosterClock,
+	ticker *manualRosterTicker,
+	options ...CutoverPeerRosterOption,
+) (*CutoverPeerRoster, *fakeBlockCounter) {
+	t.Helper()
+
+	blockCounter := newFakeBlockCounter(initialBlock)
+	tickerOption := withCutoverPeerRosterTickerFactory(
+		func(interval time.Duration) cutoverPeerRosterTicker {
+			if interval != rosterSweepInterval {
+				t.Fatalf(
+					"unexpected roster sweep interval [%s], expected [%s]",
+					interval,
+					rosterSweepInterval,
+				)
+			}
+
+			return ticker
+		},
+	)
+	options = append(options, tickerOption)
+
+	roster, err := newCutoverPeerRoster(
+		context.Background(),
+		blockCounter,
+		retention,
+		newFakeMetrics(),
+		clock.Now,
+		options...,
+	)
+	if err != nil {
+		t.Fatalf("failed to construct roster: [%v]", err)
+	}
+	t.Cleanup(roster.Close)
+
+	return roster, blockCounter
+}
+
+func driveRosterRunLoopTick(
+	t *testing.T,
+	clock *mutableRosterClock,
+	ticker *manualRosterTicker,
+	at time.Time,
+) {
+	t.Helper()
+
+	clock.set(at)
+	ticker.tick(at)
+
+	timeout := time.NewTimer(5 * time.Second)
+	defer timeout.Stop()
+
+	select {
+	case <-ticker.processed:
+	case <-timeout.C:
+		t.Fatal("roster run loop did not process the injected cadence tick")
+	}
+}
+
+func waitForRosterLog(
+	t *testing.T,
+	observed <-chan capturedRosterLogEntry,
+	expected string,
+) {
+	t.Helper()
+
+	timeout := time.NewTimer(5 * time.Second)
+	defer timeout.Stop()
+
+	for {
+		select {
+		case entry := <-observed:
+			if entry.Message == expected {
+				return
+			}
+		case <-timeout.C:
+			t.Fatalf("roster run loop did not emit log [%s]", expected)
+		}
+	}
 }
 
 // fakeMetrics is a recording CutoverRosterMetricsRecorder.
@@ -742,7 +896,9 @@ func TestCutoverPeerRoster_ConcurrentCloseSafe(t *testing.T) {
 	}
 }
 
-func TestCutoverPeerRoster_EmptySnapshotDuringEvidenceWindow(t *testing.T) {
+func TestCutoverPeerRoster_RunLogsEmptySnapshotDuringEvidenceWindowAtCadence(
+	t *testing.T,
+) {
 	const currentBlock = uint64(1005)
 
 	expected := fmt.Sprintf(
@@ -752,29 +908,48 @@ func TestCutoverPeerRoster_EmptySnapshotDuringEvidenceWindow(t *testing.T) {
 		currentBlock,
 	)
 
-	entries := captureRosterLogs(t, func() {
+	entries := captureRosterLogsWithObserver(t, func(
+		observed <-chan capturedRosterLogEntry,
+	) {
 		evidenceWindow := NewCutoverEvidenceWindowSignal()
-		roster, err := newCutoverPeerRoster(
-			context.Background(),
-			newFakeBlockCounter(currentBlock),
+		evidenceWindow.SetActive(true)
+		clock := newMutableRosterClock(fixedTestTime)
+		ticker := newManualRosterTicker()
+		roster, _ := newRunLoopTestRoster(
+			t,
+			currentBlock,
 			1000,
-			newFakeMetrics(),
-			fixedClock(),
+			clock,
+			ticker,
 			WithCutoverEvidenceWindowSignal(evidenceWindow),
 		)
-		if err != nil {
-			t.Fatalf("failed to construct roster: [%v]", err)
-		}
 
-		evidenceWindow.SetActive(true)
-		roster.logSnapshotIfRequired()
+		driveRosterRunLoopTick(
+			t,
+			clock,
+			ticker,
+			fixedTestTime.Add(rosterSnapshotLogInterval-time.Second),
+		)
+		driveRosterRunLoopTick(
+			t,
+			clock,
+			ticker,
+			fixedTestTime.Add(rosterSnapshotLogInterval),
+		)
+		waitForRosterLog(t, observed, expected)
 		roster.Close()
+
+		select {
+		case <-ticker.stopped:
+		default:
+			t.Error("roster run loop did not stop its cadence source")
+		}
 	})
 
 	assertRosterLogCount(t, entries, expected, 1)
 }
 
-func TestCutoverPeerRoster_NonemptySnapshotOutsideEvidenceWindowAfterCutover(
+func TestCutoverPeerRoster_RunLogsNonemptySnapshotAfterCutover(
 	t *testing.T,
 ) {
 	const (
@@ -790,30 +965,37 @@ func TestCutoverPeerRoster_NonemptySnapshotOutsideEvidenceWindowAfterCutover(
 		currentBlock,
 	)
 
-	entries := captureRosterLogs(t, func() {
+	entries := captureRosterLogsWithObserver(t, func(
+		observed <-chan capturedRosterLogEntry,
+	) {
 		evidenceWindow := NewCutoverEvidenceWindowSignal()
-		roster, err := newCutoverPeerRoster(
-			context.Background(),
-			newFakeBlockCounter(currentBlock),
+		clock := newMutableRosterClock(fixedTestTime)
+		ticker := newManualRosterTicker()
+		roster, _ := newRunLoopTestRoster(
+			t,
+			currentBlock,
 			1000,
-			newFakeMetrics(),
-			fixedClock(),
+			clock,
+			ticker,
 			WithCutoverSchedule(Schedule{CutoverBlock: cutoverBlock}),
 			WithCutoverEvidenceWindowSignal(evidenceWindow),
 		)
-		if err != nil {
-			t.Fatalf("failed to construct roster: [%v]", err)
-		}
 
 		observeStraggler(roster, "tbtc-dkg", 3, validAddress(1))
-		roster.logSnapshotIfRequired()
+		driveRosterRunLoopTick(
+			t,
+			clock,
+			ticker,
+			fixedTestTime.Add(rosterSnapshotLogInterval),
+		)
+		waitForRosterLog(t, observed, expected)
 		roster.Close()
 	})
 
 	assertRosterLogCount(t, entries, expected, 1)
 }
 
-func TestCutoverPeerRoster_ClockUnavailableSnapshotDuringEvidenceWindow(
+func TestCutoverPeerRoster_RunLogsClockUnavailableSnapshotDuringEvidenceWindow(
 	t *testing.T,
 ) {
 	const lastCurrentBlock = uint64(900)
@@ -825,32 +1007,37 @@ func TestCutoverPeerRoster_ClockUnavailableSnapshotDuringEvidenceWindow(
 		lastCurrentBlock,
 	)
 
-	entries := captureRosterLogs(t, func() {
-		blockCounter := newFakeBlockCounter(lastCurrentBlock)
+	entries := captureRosterLogsWithObserver(t, func(
+		observed <-chan capturedRosterLogEntry,
+	) {
 		evidenceWindow := NewCutoverEvidenceWindowSignal()
-		roster, err := newCutoverPeerRoster(
-			context.Background(),
-			blockCounter,
+		evidenceWindow.SetActive(true)
+		clock := newMutableRosterClock(fixedTestTime)
+		ticker := newManualRosterTicker()
+		roster, blockCounter := newRunLoopTestRoster(
+			t,
+			lastCurrentBlock,
 			1000,
-			newFakeMetrics(),
-			fixedClock(),
+			clock,
+			ticker,
 			WithCutoverEvidenceWindowSignal(evidenceWindow),
 		)
-		if err != nil {
-			t.Fatalf("failed to construct roster: [%v]", err)
-		}
 
 		blockCounter.set(0, fmt.Errorf("clock unavailable"))
-		roster.pollAndSweep()
-		evidenceWindow.SetActive(true)
-		roster.logSnapshotIfRequired()
+		driveRosterRunLoopTick(
+			t,
+			clock,
+			ticker,
+			fixedTestTime.Add(rosterSnapshotLogInterval),
+		)
+		waitForRosterLog(t, observed, expected)
 		roster.Close()
 	})
 
 	assertRosterLogCount(t, entries, expected, 1)
 }
 
-func TestCutoverPeerRoster_EvidenceWindowOnOff(t *testing.T) {
+func TestCutoverPeerRoster_RunHonorsEvidenceWindowOnOffAtCadence(t *testing.T) {
 	const currentBlock = uint64(1005)
 
 	expected := fmt.Sprintf(
@@ -860,29 +1047,46 @@ func TestCutoverPeerRoster_EvidenceWindowOnOff(t *testing.T) {
 		currentBlock,
 	)
 
-	entries := captureRosterLogs(t, func() {
+	entries := captureRosterLogsWithObserver(t, func(
+		observed <-chan capturedRosterLogEntry,
+	) {
 		evidenceWindow := NewCutoverEvidenceWindowSignal()
-		roster, err := newCutoverPeerRoster(
-			context.Background(),
-			newFakeBlockCounter(currentBlock),
+		clock := newMutableRosterClock(fixedTestTime)
+		ticker := newManualRosterTicker()
+		roster, _ := newRunLoopTestRoster(
+			t,
+			currentBlock,
 			1000,
-			newFakeMetrics(),
-			fixedClock(),
+			clock,
+			ticker,
 			WithCutoverEvidenceWindowSignal(evidenceWindow),
 		)
-		if err != nil {
-			t.Fatalf("failed to construct roster: [%v]", err)
-		}
 
-		roster.logSnapshotIfRequired()
+		driveRosterRunLoopTick(
+			t,
+			clock,
+			ticker,
+			fixedTestTime.Add(rosterSnapshotLogInterval),
+		)
 		if !evidenceWindow.SetActive(true) {
 			t.Error("expected opening the evidence window to change its state")
 		}
-		roster.logSnapshotIfRequired()
+		driveRosterRunLoopTick(
+			t,
+			clock,
+			ticker,
+			fixedTestTime.Add(2*rosterSnapshotLogInterval),
+		)
+		waitForRosterLog(t, observed, expected)
 		if !evidenceWindow.SetActive(false) {
 			t.Error("expected closing the evidence window to change its state")
 		}
-		roster.logSnapshotIfRequired()
+		driveRosterRunLoopTick(
+			t,
+			clock,
+			ticker,
+			fixedTestTime.Add(3*rosterSnapshotLogInterval),
+		)
 		roster.Close()
 	})
 

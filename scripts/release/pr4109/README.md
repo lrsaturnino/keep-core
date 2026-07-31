@@ -1635,14 +1635,23 @@ happened.
 
 ## Node-local roster evidence window
 
-Go/no-go tooling opens the node-local roster evidence window by delivering
-`SIGUSR1` to every R1 process and closes it with `SIGUSR2` after the evidence
-archive has captured the required interval. For a host process that is
-`kill -USR1 <pid>` and `kill -USR2 <pid>`; for a container use the runtime's
-equivalent named-signal operation. While the window is open, each node emits
-the deterministic roster snapshot INFO line every five minutes even when the
-roster is empty. Outside the window, the same cadence emits only while the
-post-cutover legacy-peer roster is nonempty.
+The single-release rehearsal opens the node-local roster evidence window on
+every authoritative R1 service with `SIGUSR1`. It requires every process to
+author its activation line and two clock-healthy empty roster snapshots with
+advancing blocks, separated by the production five-minute cadence. The
+timestamped relevant lines and a per-service summary are written beneath the
+rehearsal evidence directory before `SIGUSR2` is delivered; every process must
+then author its close line. An unsignaled service, failed delivery, unreadable
+log, one-off snapshot, unavailable/stalled clock, nonempty-only capture, or
+missing close fails the mandatory rehearsal step. The capture helper refuses
+to overwrite an existing archive.
+
+For a host process the equivalent manual controls are `kill -USR1 <pid>` and
+`kill -USR2 <pid>`; for a container use the runtime's named-signal operation.
+While the window is open, each node emits the deterministic roster snapshot
+INFO line every five minutes even when the roster is empty. Outside the
+window, the same cadence emits only while the post-cutover legacy-peer roster
+is nonempty.
 
 These signals control logging only. They cannot select a protocol mode, issue
 a permit, classify a peer, or authorize a commit. A termination signal holds

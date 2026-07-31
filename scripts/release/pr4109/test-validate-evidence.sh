@@ -174,6 +174,7 @@ FIXTURE_R1_SECOND_DIGEST_MAP="$(
 # canonical entry, to prove an arbitrary passing subset cannot stand in for
 # the gate.
 SINGLE_RELEASE_STAGES='
+  { "name": "every R1 node authors periodic empty roster evidence", "outcome": "pass", "state_checksums": { "cutover_evidence_window_summary_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } },
   { "name": "mixed prior/R1 pre-cutover compatibility controls", "outcome": "pass" },
   { "name": "representative pre-cutover work including the longest wallet action", "outcome": "pass" },
   { "name": "cross C without restart", "outcome": "pass" },
@@ -221,6 +222,7 @@ SINGLE_RELEASE_STAGES='
     } },
   { "name": "the cutover fleet leaves no release candidate running", "outcome": "pass" }'
 SINGLE_RELEASE_ASSERTIONS='
+  { "assertion": "every R1 node authors periodic empty roster evidence during the go/no-go window", "holds": true, "evidence_stage": "every R1 node authors periodic empty roster evidence" },
   { "assertion": "the gate crosses C in-process, without a restart or a global toggle", "holds": true, "evidence_stage": "cross C without restart" },
   { "assertion": "a restarted node derives its mode from the canonical anchor and the current chain", "holds": true, "evidence_stage": "restart across C derives mode from the chain, not from process state" },
   { "assertion": "old post-C behavior fails closed and becomes operator-identified blocking evidence", "holds": true, "evidence_stage": "post-cutover straggler fails closed and enters the roster" },
@@ -2290,13 +2292,52 @@ node -e '
   const fs = require("fs");
   const path = process.argv[1];
   const record = JSON.parse(fs.readFileSync(path, "utf8"));
-  record.stages[13] = { ...record.stages[2] };
+  record.stages[14] = { ...record.stages[3] };
   fs.writeFileSync(path, JSON.stringify(record, null, 2));
 ' "${D}/record.json"
 run_validator "${D}"
 check "a duplicated passing stage cannot replace another mandatory step" 3 \
   "step.*cross C without restart.*appears 2 times" \
   "required step.*cutover fleet leaves no release candidate running.*absent"
+
+D="${WORK}/accept-missing-evidence-window"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  record.stages = record.stages.filter((stage) =>
+    stage.name !== "every R1 node authors periodic empty roster evidence"
+  );
+  record.assertions = record.assertions.filter((assertion) =>
+    assertion.assertion !==
+      "every R1 node authors periodic empty roster evidence during the go/no-go window"
+  );
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "an archived record cannot omit the fleet evidence window" 3 \
+  "required step.*periodic empty roster evidence.*absent" \
+  "required assertion.*periodic empty roster evidence.*absent"
+
+D="${WORK}/accept-unbound-evidence-window"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  delete record.stages[0].state_checksums;
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "the fleet evidence window must bind its archived summary" 3 \
+  "fleet evidence-window step carries no archived summary SHA-256"
 
 D="${WORK}/accept-unknown-assertion"
 mkdir -p "${D}"
@@ -2307,7 +2348,7 @@ node -e '
   const fs = require("fs");
   const path = process.argv[1];
   const record = JSON.parse(fs.readFileSync(path, "utf8"));
-  record.assertions[7] = {
+  record.assertions[8] = {
     assertion: "an invented release property",
     holds: true,
     evidence_stage: "the cutover fleet leaves no release candidate running",
@@ -2330,7 +2371,7 @@ node -e '
   const fs = require("fs");
   const path = process.argv[1];
   const record = JSON.parse(fs.readFileSync(path, "utf8"));
-  record.assertions[0].evidence_stage =
+  record.assertions[1].evidence_stage =
     "homogeneous security-v2 controls with no legacy sightings";
   fs.writeFileSync(path, JSON.stringify(record, null, 2));
 ' "${D}/record.json"
@@ -2799,6 +2840,7 @@ run_rehearsal() {
 # A rehearsal whose every mandatory step executed.
 complete_run() {
   local stages=(
+    "every R1 node authors periodic empty roster evidence"
     "mixed prior/R1 pre-cutover compatibility controls"
     "representative pre-cutover work including the longest wallet action"
     "cross C without restart"
@@ -2817,7 +2859,13 @@ complete_run() {
   local stage
   for stage in "${stages[@]}"; do
     begin_step "${stage}"
-    if [[ "${stage}" == "cross C without restart" ]]; then
+    if [[ "${stage}" == \
+      "every R1 node authors periodic empty roster evidence" ]]; then
+      # The real helper hashes the archived per-service result into this slot.
+      # shellcheck disable=SC2034
+      STEP_STATE_CHECKSUMS="\"cutover_evidence_window_summary_sha256\":\
+\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""
+    elif [[ "${stage}" == "cross C without restart" ]]; then
       # The observation slots the real probes fill; record_step drains them.
       # shellcheck disable=SC2034
       STEP_CANONICAL_BLOCKS="8999999,9000001"
@@ -2856,6 +2904,9 @@ complete_run() {
     record_step "${stage}" pass "self-test observed the mandatory property"
   done
 
+  record_assertion \
+    "every R1 node authors periodic empty roster evidence during the go/no-go window" \
+    true "every R1 node authors periodic empty roster evidence"
   record_assertion \
     "the gate crosses C in-process, without a restart or a global toggle" \
     true "cross C without restart"

@@ -154,11 +154,62 @@ func (s *CutoverEvidenceWindowSignal) HoldActive() bool {
 type cutoverPeerRosterOptions struct {
 	cutoverBlock   uint64
 	evidenceWindow *CutoverEvidenceWindowSignal
+	tickerFactory  cutoverPeerRosterTickerFactory
 }
 
 // CutoverPeerRosterOption configures immutable cutover context used by the
 // node-local roster's observability contract.
 type CutoverPeerRosterOption func(*cutoverPeerRosterOptions) error
+
+// cutoverPeerRosterTicker is the narrow cadence source consumed by the roster
+// loop. Keeping the ticker behind this seam lets the production run path be
+// exercised deterministically without shortening the five-minute evidence
+// contract or adding sleeps to tests.
+type cutoverPeerRosterTicker interface {
+	Ticks() <-chan time.Time
+	MarkProcessed()
+	Stop()
+}
+
+type cutoverPeerRosterTickerFactory func(time.Duration) cutoverPeerRosterTicker
+
+type wallClockCutoverPeerRosterTicker struct {
+	ticker *time.Ticker
+}
+
+func newWallClockCutoverPeerRosterTicker(
+	interval time.Duration,
+) cutoverPeerRosterTicker {
+	return &wallClockCutoverPeerRosterTicker{
+		ticker: time.NewTicker(interval),
+	}
+}
+
+func (t *wallClockCutoverPeerRosterTicker) Ticks() <-chan time.Time {
+	return t.ticker.C
+}
+
+func (t *wallClockCutoverPeerRosterTicker) MarkProcessed() {}
+
+func (t *wallClockCutoverPeerRosterTicker) Stop() {
+	t.ticker.Stop()
+}
+
+// withCutoverPeerRosterTickerFactory replaces the wall-clock cadence source.
+// It is intentionally package-private: production always uses real time while
+// same-package tests drive the exact run-loop boundary deterministically.
+func withCutoverPeerRosterTickerFactory(
+	factory cutoverPeerRosterTickerFactory,
+) CutoverPeerRosterOption {
+	return func(options *cutoverPeerRosterOptions) error {
+		if factory == nil {
+			return fmt.Errorf("cutover peer roster ticker factory is required")
+		}
+
+		options.tickerFactory = factory
+		return nil
+	}
+}
 
 // WithCutoverSchedule gives the roster the exact resolved schedule supplied to
 // the process participation gate. The roster does not use the schedule to
@@ -214,6 +265,7 @@ type CutoverPeerRoster struct {
 	cancel    context.CancelFunc
 	closeOnce sync.Once
 	loopDone  chan struct{}
+	ticker    cutoverPeerRosterTicker
 
 	blockCounter    chain.BlockCounter
 	retentionBlocks uint64
@@ -270,6 +322,7 @@ func newCutoverPeerRoster(
 ) (*CutoverPeerRoster, error) {
 	options := &cutoverPeerRosterOptions{
 		evidenceWindow: NewCutoverEvidenceWindowSignal(),
+		tickerFactory:  newWallClockCutoverPeerRosterTicker,
 	}
 	for _, option := range optionFunctions {
 		if option == nil {
@@ -301,12 +354,18 @@ func newCutoverPeerRoster(
 		return nil, fmt.Errorf("metrics recorder is required")
 	}
 
+	ticker := options.tickerFactory(rosterSweepInterval)
+	if ticker == nil {
+		return nil, fmt.Errorf("cutover peer roster ticker is required")
+	}
+
 	loopCtx, cancel := context.WithCancel(ctx)
 
 	roster := &CutoverPeerRoster{
 		ctx:             loopCtx,
 		cancel:          cancel,
 		loopDone:        make(chan struct{}),
+		ticker:          ticker,
 		blockCounter:    blockCounter,
 		retentionBlocks: retentionBlocks,
 		cutoverBlock:    options.cutoverBlock,
@@ -354,9 +413,7 @@ func (r *CutoverPeerRoster) initMetrics() {
 
 func (r *CutoverPeerRoster) run() {
 	defer close(r.loopDone)
-
-	ticker := time.NewTicker(rosterSweepInterval)
-	defer ticker.Stop()
+	defer r.ticker.Stop()
 
 	lastSnapshotLog := r.processStartedAt
 
@@ -364,7 +421,7 @@ func (r *CutoverPeerRoster) run() {
 		select {
 		case <-r.ctx.Done():
 			return
-		case <-ticker.C:
+		case <-r.ticker.Ticks():
 			r.pollAndSweep()
 
 			now := r.clock()
@@ -372,6 +429,7 @@ func (r *CutoverPeerRoster) run() {
 				lastSnapshotLog = now
 				r.logSnapshotIfRequired()
 			}
+			r.ticker.MarkProcessed()
 		}
 	}
 }

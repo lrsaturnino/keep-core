@@ -210,10 +210,11 @@ stages:
                       transcripts, the ten-misbehaved-seat real result, the
                       production-scale 90/10 split, heartbeat bands, and
                       roster wiring — under the race detector, plus the
-                      integration-tag compile proof; self-tests the
-                      source-binding and evidence-record validators first
-                      (the latter needs node/npx), reports every skipped
-                      case explicitly, holds the verifier's build-context
+                      integration-tag compile proof; self-tests source binding,
+                      evidence acceptance, native-runner dispatch, and the
+                      fleet evidence-window capture first (node/npx required),
+                      reports every skipped case explicitly, holds the
+                      verifier's build-context
                       classification to the commit's own .dockerignore,
                       discards any inherited EVIDENCE_DIR/attestation before
                       proving anything, and
@@ -240,9 +241,9 @@ stages:
                       path filters held to the same resolution — and both
                       validator self-tests: the gate the scaffold's CI job
                       runs on every change to these files and to the build
-                      inputs they mirror, so the checkers that admit
-                      rehearsal evidence are never proved only by a manual
-                      dispatch
+                      inputs they mirror, so the checkers and fleet-window
+                      capture that admit rehearsal evidence are never proved
+                      only by a manual dispatch
   solidity-proofs     build and test the changed ECDSA contracts surface
                       exactly as the contracts workflow's build-and-test job
                       does: the exact Node release that job pins — read out
@@ -2920,6 +2921,11 @@ run_local_proof_suite() {
   # reaching the expensive platform jobs merely because no container
   # rehearsal happened to exercise that input shape.
   "${SCRIPT_DIR}/test-rehearsal-matrix.sh"
+  # The go/no-go roster path is process-signaled and log-authored rather than
+  # exposed through the diagnostics API. Its capture helper is driven against
+  # a fake two-node Docker boundary so an ignored signal, failed delivery, or
+  # missing empty/cadenced evidence can never look like an empty ready fleet.
+  "${SCRIPT_DIR}/test-cutover-evidence-window.sh"
   # The readiness verdict this stage is about to write is the one thing in the
   # receipt the validator suite cannot prove: that suite hand-authors the
   # verdict file, so it holds the refusal without ever running the producer.
@@ -3117,6 +3123,8 @@ validator self-tests"
     "${SCRIPT_DIR}/test-validate-evidence.sh"
     note "native-runner matrix validator self-test"
     "${SCRIPT_DIR}/test-rehearsal-matrix.sh"
+    note "cutover evidence-window capture self-test"
+    "${SCRIPT_DIR}/test-cutover-evidence-window.sh"
   ) 2>&1 | tee "${log}"
 
   note "shell and workflow analysis recorded in ${log}"
@@ -5488,6 +5496,59 @@ fleet is not one release under test and one record cannot speak for both"
   REHEARSAL_R1_CUTOVER_BLOCK="$(json_field "${agreed}" cutover_block)"
   note "every R1 node reports ${agreed}, matching the attested source \
 ${attested}, the rehearsed C, and the chain the record is written against"
+}
+
+# Open the logging-only roster evidence window on every authoritative R1
+# service, retain it until each process has authored two clock-healthy empty
+# snapshots with advancing blocks at the five-minute production cadence,
+# archive those exact timestamped lines, and close it only after the archive
+# exists. The helper treats the supplied service list as an exact denominator:
+# an ignored signal or unreadable node is a failure, never an implicit empty
+# roster.
+capture_cutover_roster_evidence_window() {
+  local step="every R1 node authors periodic empty roster evidence"
+  local assertion="every R1 node authors periodic empty roster evidence during the go/no-go window"
+  local archive
+  archive="${EVIDENCE_DIR}/cutover-roster-window-${REHEARSAL_GATE}-\
+$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  local service container
+  local bindings=()
+
+  begin_step "${step}"
+
+  for service in "${REHEARSAL_R1_SERVICES[@]}"; do
+    if ! container="$(compose ps --quiet "${service}" 2>/dev/null)" ||
+      [[ -z "${container}" ]]; then
+      block_step "${step}" "${service} has no inspectable running container; \
+the evidence window must be delivered to and acknowledged by every R1 service"
+      record_assertion "${assertion}" false "${step}"
+      return
+    fi
+    bindings+=("${service}=${container}")
+  done
+
+  local capture_rc=0
+  "${SCRIPT_DIR}/capture-cutover-evidence-window.sh" \
+    "${archive}" "${bindings[@]}" || capture_rc=$?
+
+  if [[ -f "${archive}/result.json" ]]; then
+    STEP_STATE_CHECKSUMS="\"cutover_evidence_window_summary_sha256\":\"$(
+      hash_stdin <"${archive}/result.json"
+    )\""
+  fi
+
+  if ((capture_rc == 0)); then
+    record_step "${step}" pass "every R1 process acknowledged SIGUSR1, authored \
+two clock-healthy empty roster snapshots with advancing blocks at the \
+five-minute cadence, archived them, and acknowledged SIGUSR2 only after \
+archival"
+    record_assertion "${assertion}" true "${step}"
+  else
+    record_step "${step}" fail "the fleet evidence-window capture exited \
+[${capture_rc}]; its archived result identifies the unsignaled, unreadable, \
+uncadenced, nonempty-only, or unclosed service"
+    record_assertion "${assertion}" false "${step}"
+  fi
 }
 
 # Build the record and hand it to the acceptance stage's own validator. The
@@ -11683,6 +11744,7 @@ absorb those controls, so it cannot be run as configured"
   verify_running_images "${R1_IMAGE_DIGEST}" "${REHEARSAL_R1_SERVICES[@]}"
   verify_running_images "${PRIOR_IMAGE_DIGEST}" "${REHEARSAL_PRIOR_SERVICE}"
   capture_r1_release_identity
+  capture_cutover_roster_evidence_window
 
   # Step 1 and step 2 both run R1 nodes on legacy-anchored ceremonies beside
   # the prior binary. Whether the dependency's dual-mode transcripts have an
@@ -13454,7 +13516,7 @@ publishes exactly once"
 #
 # This is deliberately stricter than JSON shape validation. JSON Schema can
 # type an array entry, but a typed entry named "preflight" is not a substitute
-# for the fourteen steps of the single-release gate, and a true assertion
+# for the fifteen steps of the single-release gate, and a true assertion
 # linked to some other passing step proves neither property.
 evidence_acceptance_findings() {
   local record="$1"
@@ -13466,6 +13528,7 @@ evidence_acceptance_findings() {
     const contracts = {
       single_release: {
         stages: [
+          "every R1 node authors periodic empty roster evidence",
           "mixed prior/R1 pre-cutover compatibility controls",
           "representative pre-cutover work including the longest wallet action",
           "cross C without restart",
@@ -13482,6 +13545,11 @@ evidence_acceptance_findings() {
           "the cutover fleet leaves no release candidate running",
         ],
         assertions: [
+          {
+            name:
+              "every R1 node authors periodic empty roster evidence during the go/no-go window",
+            stage: "every R1 node authors periodic empty roster evidence",
+          },
           {
             name:
               "the gate crosses C in-process, without a restart or a global toggle",
@@ -13661,6 +13729,30 @@ evidence_acceptance_findings() {
         add("refuted", "step " + JSON.stringify(name));
       } else if (stage.outcome === "blocked") {
         add("unrehearsed", "step " + JSON.stringify(name));
+      }
+    }
+
+    if (record.gate === "single_release") {
+      const evidenceWindow =
+        stageByName.get("every R1 node authors periodic empty roster evidence") ||
+        {};
+      const checksums =
+        evidenceWindow.state_checksums &&
+        typeof evidenceWindow.state_checksums === "object" &&
+        !Array.isArray(evidenceWindow.state_checksums)
+          ? evidenceWindow.state_checksums
+          : {};
+      const summary =
+        checksums.cutover_evidence_window_summary_sha256;
+      if (
+        typeof summary !== "string" ||
+        !/^[0-9a-f]{64}$/.test(summary)
+      ) {
+        add(
+          "unrehearsed",
+          "single_release fleet evidence-window step carries no archived " +
+            "summary SHA-256"
+        );
       }
     }
 
