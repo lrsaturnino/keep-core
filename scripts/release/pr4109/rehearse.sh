@@ -9798,6 +9798,10 @@ ROLLBACK_REQUIRED_CLASSES="threshold_ceremony bitcoin_action"
 # chain clock or forces either quiescence control. The nodes stop answering at
 # the end of those controls, so each gate retains the newest numeric reading
 # while the endpoint is still live and records the shared verdict afterwards.
+# Every service line also retains the field mask from that service's final
+# useful attempt. Keeping the mask beside the values is what prevents a later
+# service sample — or an information-free post-exit scrape — from supplying
+# provenance for a different node's carried incomplete-output zero.
 QUARANTINE_PRESERVATION_READINGS=""
 # Whether the most recent sampler call read all four signals in that call.
 # The accumulator deliberately retains older numeric values across a transient
@@ -9821,26 +9825,32 @@ SINGLE_RELEASE_QUARANTINE_PRESERVATION_SAMPLING=0
 sample_quarantine_preservation_signals() {
   local service="$1" reset_existing="${2:-0}"
   local listed_service listed_tbtc_failures listed_beacon_failures
-  local listed_tbtc_incomplete listed_beacon_incomplete
+  local listed_tbtc_incomplete listed_beacon_incomplete listed_sample_read_mask
   local retained="" metrics_body="" reading metric index=0
   local values=("unreadable" "unreadable" "unreadable" "unreadable")
   local sample_readable=1 sample_read_mask=0
+  local retained_sample_read_mask=0
 
   while read -r listed_service listed_tbtc_failures listed_beacon_failures \
-    listed_tbtc_incomplete listed_beacon_incomplete; do
+    listed_tbtc_incomplete listed_beacon_incomplete \
+    listed_sample_read_mask; do
     [[ -n "${listed_service}" ]] || continue
+    [[ -n "${listed_sample_read_mask}" ]] ||
+      listed_sample_read_mask="unreadable"
     if [[ "${listed_service}" == "${service}" ]]; then
       if ((reset_existing == 0)); then
         values[0]="${listed_tbtc_failures}"
         values[1]="${listed_beacon_failures}"
         values[2]="${listed_tbtc_incomplete}"
         values[3]="${listed_beacon_incomplete}"
+        retained_sample_read_mask="${listed_sample_read_mask}"
       fi
       continue
     fi
     retained="${retained}${retained:+$'\n'}${listed_service} \
 ${listed_tbtc_failures} ${listed_beacon_failures} \
-${listed_tbtc_incomplete} ${listed_beacon_incomplete}"
+${listed_tbtc_incomplete} ${listed_beacon_incomplete} \
+${listed_sample_read_mask}"
   done <<<"${QUARANTINE_PRESERVATION_READINGS}"
 
   # One sampler attempt is exactly one /metrics response. Four independent
@@ -9867,9 +9877,16 @@ ${listed_tbtc_incomplete} ${listed_beacon_incomplete}"
     sample_readable=0
   fi
 
+  # Replace a service's provenance only with an attempt that read at least one
+  # field. Once the endpoint has disappeared, an information-free scrape has
+  # no node-authored fact with which to erase the final useful attempt.
+  if ((sample_read_mask > 0)); then
+    retained_sample_read_mask="${sample_read_mask}"
+  fi
+
   QUARANTINE_PRESERVATION_READINGS="\
 ${retained}${retained:+$'\n'}${service} ${values[0]} ${values[1]} \
-${values[2]} ${values[3]}"
+${values[2]} ${values[3]} ${retained_sample_read_mask}"
   QUARANTINE_PRESERVATION_SAMPLE_READABLE="${sample_readable}"
   QUARANTINE_PRESERVATION_SAMPLE_READ_MASK="${sample_read_mask}"
 }
@@ -9889,14 +9906,15 @@ initialize_quarantine_preservation_readings() {
 quarantine_preservation_reading_for() {
   local wanted="$1"
   local service tbtc_failures beacon_failures tbtc_incomplete beacon_incomplete
+  local sample_read_mask
 
   while read -r service tbtc_failures beacon_failures tbtc_incomplete \
-    beacon_incomplete; do
+    beacon_incomplete sample_read_mask; do
     [[ -n "${service}" ]] || continue
     if [[ "${service}" == "${wanted}" ]]; then
-      printf '%s %s %s %s %s' \
+      printf '%s %s %s %s %s %s' \
         "${service}" "${tbtc_failures}" "${beacon_failures}" \
-        "${tbtc_incomplete}" "${beacon_incomplete}"
+        "${tbtc_incomplete}" "${beacon_incomplete}" "${sample_read_mask}"
       return 0
     fi
   done <<<"${QUARANTINE_PRESERVATION_READINGS}"
@@ -9918,7 +9936,8 @@ append_quarantine_preservation_gauges() {
   local service="$1" namespace="${2:-}" sample_readable="${3:-}"
   local sample_read_mask="${4:-}" account
   local listed_service tbtc_failures beacon_failures
-  local tbtc_incomplete beacon_incomplete metric value field_readable index=0
+  local tbtc_incomplete beacon_incomplete retained_sample_read_mask
+  local metric value field_readable index=0
   local key_prefix="${service}."
   local complete=1 sample_read_mask_valid=0
   local max_read_mask=$(((1 << ${#QUARANTINE_PRESERVATION_METRICS[@]}) - 1))
@@ -9934,7 +9953,7 @@ append_quarantine_preservation_gauges() {
   fi
   account="$(quarantine_preservation_reading_for "${service}")" || return 1
   read -r listed_service tbtc_failures beacon_failures tbtc_incomplete \
-    beacon_incomplete <<<"${account}"
+    beacon_incomplete retained_sample_read_mask <<<"${account}"
   local values=(
     "${tbtc_failures}"
     "${beacon_failures}"
@@ -10059,15 +10078,17 @@ quarantine_preservation_verdict() {
   local assertion="$1"
   local step="quarantine preservation is complete through quiescence"
   local service tbtc_failures beacon_failures tbtc_incomplete beacon_incomplete
+  local sample_read_mask
   local nodes=0
   local unread="" still_incomplete="" recovered=""
+  local unread_provenance="" carried_incomplete=""
   local unexpected_services="" duplicate_services="" missing_services=""
   local gauge_errors=""
   local expected seen
   local seen_services=()
 
   while read -r service tbtc_failures beacon_failures tbtc_incomplete \
-    beacon_incomplete; do
+    beacon_incomplete sample_read_mask; do
     [[ -n "${service}" ]] || continue
     nodes=$((nodes + 1))
 
@@ -10097,6 +10118,17 @@ ${unexpected_services:+, }${service}"
 failures ${tbtc_failures}, beacon failures ${beacon_failures}, tBTC incomplete \
 ${tbtc_incomplete}, beacon incomplete ${beacon_incomplete})"
       continue
+    fi
+
+    if [[ ! "${sample_read_mask}" =~ ^[0-9]+$ ]]; then
+      unread_provenance="${unread_provenance}\
+${unread_provenance:+, }${service} (final useful sample mask \
+${sample_read_mask:-absent})"
+    elif ! quarantine_preservation_incomplete_fields_read \
+      "${sample_read_mask}"; then
+      carried_incomplete="${carried_incomplete}\
+${carried_incomplete:+, }${service} (final useful sample mask \
+${sample_read_mask})"
     fi
 
     if ((tbtc_incomplete > 0)); then
@@ -10136,7 +10168,16 @@ grace-exhaustion episodes ${beacon_failures}, live incomplete 0)"
   if [[ -z "${missing_services}${unexpected_services}${duplicate_services}${unread}" ]] &&
     ((${#REHEARSAL_R1_SERVICES[@]} > 0)); then
     for expected in "${REHEARSAL_R1_SERVICES[@]}"; do
-      if ! append_quarantine_preservation_gauges "${expected}"; then
+      local expected_account expected_sample_read_mask
+      expected_account="$(
+        quarantine_preservation_reading_for "${expected}"
+      )" || {
+        gauge_errors="${gauge_errors}${gauge_errors:+, }${expected}"
+        continue
+      }
+      read -r _ _ _ _ _ expected_sample_read_mask <<<"${expected_account}"
+      if ! append_quarantine_preservation_gauges \
+        "${expected}" "" "" "${expected_sample_read_mask}"; then
         gauge_errors="${gauge_errors}${gauge_errors:+, }${expected}"
       fi
     done
@@ -10158,11 +10199,18 @@ the authoritative R1 service roster exactly (missing \
 duplicate [${duplicate_services:-none}]); one healthy \
 node cannot stand in for a fleet member that was never sampled"
     record_assertion "${assertion}" false "${step}"
-  elif [[ -n "${unread}${gauge_errors}" ]]; then
+  elif [[ -n "${unread}${unread_provenance}${gauge_errors}" ]]; then
     block_step "${step}" "the quarantine-preservation counters or live \
-incomplete-output gauges were unreadable on \
-${unread:-${gauge_errors} (evidence gauge emission failed)}; zero must be a \
-node-authored reading, not the value assigned to a node that stopped answering"
+incomplete-output gauges, or their final useful sample provenance, were \
+unreadable on ${unread:-${unread_provenance:-${gauge_errors} (evidence gauge \
+emission failed)}}; zero must be a node-authored reading, not the value \
+assigned to a node that stopped answering"
+    record_assertion "${assertion}" false "${step}"
+  elif [[ -n "${carried_incomplete}" ]]; then
+    block_step "${step}" "the final useful quarantine-preservation sample did \
+not re-read both live incomplete-output fields on ${carried_incomplete}; a \
+zero carried from an earlier attempt cannot prove preservation completed \
+through quiescence"
     record_assertion "${assertion}" false "${step}"
   elif [[ -n "${still_incomplete}" ]]; then
     record_step "${step}" fail "an R1 node is still holding generated signer \
@@ -11804,6 +11852,7 @@ independent controls"
     )"; then
       read -r _ pre_stop_tbtc_failures pre_stop_beacon_failures \
         pre_stop_tbtc_incomplete pre_stop_beacon_incomplete \
+        _ \
         <<<"${pre_stop_account}"
     else
       pre_stop_readable=0
@@ -11893,7 +11942,8 @@ ${QUARANTINE_PRESERVATION_SAMPLE_READ_MASK}"
       )"; then
         read -r _ pre_restart_tbtc_failures \
           pre_restart_beacon_failures pre_restart_tbtc_incomplete \
-          pre_restart_beacon_incomplete <<<"${pre_restart_account}"
+          pre_restart_beacon_incomplete _ \
+          <<<"${pre_restart_account}"
       else
         pre_restart_readable=0
       fi
@@ -13662,6 +13712,12 @@ evidence_acceptance_findings() {
         }
         return value;
       };
+      // Fleet and rollback verdicts use the same per-field provenance suffix
+      // as the watched-stop restart account. The shell emitter archives one
+      // bit from the final useful attempt for each service; a process-global
+      // "last sample" value cannot stand in for another service.
+      const fleetFieldReadableSuffix =
+        "read_in_final_watched_sample";
 
       if (record.gate === "single_release") {
         const restartStageName =
@@ -13960,7 +14016,76 @@ evidence_acceptance_findings() {
           const incompleteName = service + "." + signal.incomplete;
           const counter = readMetric(service, signal.counter);
           const incomplete = readMetric(service, signal.incomplete);
-          if (incomplete !== undefined && incomplete !== 0) {
+          const counterReadableName =
+            counterName + "." + fleetFieldReadableSuffix;
+          const incompleteReadableName =
+            incompleteName + "." + fleetFieldReadableSuffix;
+          const counterReadable = readGauge(
+            preservationStageName,
+            gauges,
+            counterReadableName,
+            "fleet field provenance"
+          );
+          const incompleteReadable = readGauge(
+            preservationStageName,
+            gauges,
+            incompleteReadableName,
+            "fleet field provenance"
+          );
+          let counterProvenanceValid = counterReadable !== undefined;
+          let incompleteFresh = incompleteReadable === 1;
+          if (
+            counterReadable !== undefined &&
+            (!Number.isInteger(counterReadable) ||
+              (counterReadable !== 0 && counterReadable !== 1))
+          ) {
+            counterProvenanceValid = false;
+            add(
+              "unrehearsed",
+              record.gate + " node " + JSON.stringify(service) +
+                " carries invalid " + signal.protocol +
+                " preservation-counter provenance: " +
+                JSON.stringify(counterReadableName) + " is " +
+                counterReadable
+            );
+          } else if (counterReadable === 0) {
+            add(
+              "advisory",
+              record.gate + " node " + JSON.stringify(service) +
+                " retained the " + signal.protocol +
+                " preservation counter from an earlier sample in its final " +
+                "fleet account: " + JSON.stringify(counterReadableName) +
+                " is zero"
+            );
+          }
+          if (
+            incompleteReadable !== undefined &&
+            (!Number.isInteger(incompleteReadable) ||
+              (incompleteReadable !== 0 && incompleteReadable !== 1))
+          ) {
+            incompleteFresh = false;
+            add(
+              "unrehearsed",
+              record.gate + " node " + JSON.stringify(service) +
+                " carries invalid " + signal.protocol +
+                " incomplete-output provenance: " +
+                JSON.stringify(incompleteReadableName) + " is " +
+                incompleteReadable
+            );
+          } else if (incompleteReadable === 0) {
+            incompleteFresh = false;
+            add(
+              "unrehearsed",
+              record.gate + " node " + JSON.stringify(service) +
+                " did not re-read the " + signal.protocol +
+                " incomplete-output field in its final useful fleet sample: " +
+                JSON.stringify(incompleteReadableName) +
+                " is zero; archived value " +
+                JSON.stringify(incompleteName) +
+                " was carried from an earlier sample"
+            );
+          }
+          if (incompleteFresh && incomplete !== undefined && incomplete !== 0) {
             add(
               "refuted",
               record.gate + " node " + JSON.stringify(service) +
@@ -13969,7 +14094,9 @@ evidence_acceptance_findings() {
                 JSON.stringify(incompleteName) + " is " + incomplete
             );
           } else if (
+            counterProvenanceValid &&
             counter !== undefined &&
+            incompleteFresh &&
             incomplete === 0 &&
             counter !== 0
           ) {

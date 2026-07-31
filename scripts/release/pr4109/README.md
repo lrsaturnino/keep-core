@@ -2032,13 +2032,25 @@ record and any needed container evidence. Once any new process answers, the
 gate re-seeds that node's live account, refreshes it through the chain-clock
 cancellation and both quiescence controls, and records the fleet verdict
 before its final fleet-stop stage. The rollback gate uses the same accumulator
-and refreshes it while every candidate drains.
+and refreshes it while every candidate drains. The accumulator retains each
+service's final useful four-field mask beside that service's values; a sample
+from another service and an information-free post-exit scrape cannot replace
+it. The fleet verdict archives those bits as
+`<service>.<metric>.read_in_final_watched_sample` for every authoritative R1
+service in both gates. Both incomplete-output bits must be `1` for that
+service. Historical counter bits may be `0` and remain advisory, but a carried
+incomplete-output zero leaves the gate unrehearsed. Per-service masks can
+differ and are classified independently; the process-global result of the
+sampler's most recent call never supplies provenance for the rest of the
+fleet.
 
 An unreadable signal, an account that does not cover every configured R1
-service exactly once, or a nonzero live gauge refuses either gate because the
+service exactly once, unreadable final-attempt provenance, a carried live
+field, or a nonzero freshly read live gauge refuses either gate because the
 node has not proved that the output became fully durable. A nonzero counter
-paired with a zero live gauge is retained as a distinct, non-fatal recovery
-finding: preservation exhausted its write-grace rounds and later completed.
+paired with a freshly read zero live gauge is retained as a distinct,
+non-fatal recovery finding: preservation exhausted its write-grace rounds and
+later completed.
 For the restart reading this finding remains in the archive after the new
 process resets its counters. The finding is printed even when an unrelated
 requirement refuses the same archive. It does not bypass the offline state

@@ -206,10 +206,18 @@ SINGLE_RELEASE_STAGES='
       "r1-node-1.participation_beacon_quarantine_preservation_failures_total": 0,
       "r1-node-1.participation_tbtc_quarantine_incomplete_outputs": 0,
       "r1-node-1.participation_beacon_quarantine_incomplete_outputs": 0,
+      "r1-node-1.participation_tbtc_quarantine_preservation_failures_total.read_in_final_watched_sample": 1,
+      "r1-node-1.participation_beacon_quarantine_preservation_failures_total.read_in_final_watched_sample": 1,
+      "r1-node-1.participation_tbtc_quarantine_incomplete_outputs.read_in_final_watched_sample": 1,
+      "r1-node-1.participation_beacon_quarantine_incomplete_outputs.read_in_final_watched_sample": 1,
       "r1-node-2.participation_tbtc_quarantine_preservation_failures_total": 0,
       "r1-node-2.participation_beacon_quarantine_preservation_failures_total": 0,
       "r1-node-2.participation_tbtc_quarantine_incomplete_outputs": 0,
-      "r1-node-2.participation_beacon_quarantine_incomplete_outputs": 0
+      "r1-node-2.participation_beacon_quarantine_incomplete_outputs": 0,
+      "r1-node-2.participation_tbtc_quarantine_preservation_failures_total.read_in_final_watched_sample": 1,
+      "r1-node-2.participation_beacon_quarantine_preservation_failures_total.read_in_final_watched_sample": 1,
+      "r1-node-2.participation_tbtc_quarantine_incomplete_outputs.read_in_final_watched_sample": 1,
+      "r1-node-2.participation_beacon_quarantine_incomplete_outputs.read_in_final_watched_sample": 1
     } },
   { "name": "the cutover fleet leaves no release candidate running", "outcome": "pass" }'
 SINGLE_RELEASE_ASSERTIONS='
@@ -228,10 +236,18 @@ ROLLBACK_STAGES='
       "r1-node-1.participation_beacon_quarantine_preservation_failures_total": 0,
       "r1-node-1.participation_tbtc_quarantine_incomplete_outputs": 0,
       "r1-node-1.participation_beacon_quarantine_incomplete_outputs": 0,
+      "r1-node-1.participation_tbtc_quarantine_preservation_failures_total.read_in_final_watched_sample": 1,
+      "r1-node-1.participation_beacon_quarantine_preservation_failures_total.read_in_final_watched_sample": 1,
+      "r1-node-1.participation_tbtc_quarantine_incomplete_outputs.read_in_final_watched_sample": 1,
+      "r1-node-1.participation_beacon_quarantine_incomplete_outputs.read_in_final_watched_sample": 1,
       "r1-node-2.participation_tbtc_quarantine_preservation_failures_total": 0,
       "r1-node-2.participation_beacon_quarantine_preservation_failures_total": 0,
       "r1-node-2.participation_tbtc_quarantine_incomplete_outputs": 0,
-      "r1-node-2.participation_beacon_quarantine_incomplete_outputs": 0
+      "r1-node-2.participation_beacon_quarantine_incomplete_outputs": 0,
+      "r1-node-2.participation_tbtc_quarantine_preservation_failures_total.read_in_final_watched_sample": 1,
+      "r1-node-2.participation_beacon_quarantine_preservation_failures_total.read_in_final_watched_sample": 1,
+      "r1-node-2.participation_tbtc_quarantine_incomplete_outputs.read_in_final_watched_sample": 1,
+      "r1-node-2.participation_beacon_quarantine_incomplete_outputs.read_in_final_watched_sample": 1
     } },
   { "name": "no prior binary starts during quiescence", "outcome": "pass" },
   { "name": "a forced deadline quarantines rather than completing", "outcome": "pass" },
@@ -1587,6 +1603,63 @@ run_validator "${D}"
 check "single-release acceptance requires every preservation reading" 3 \
   "single_release step.*carries no fleet reading of.*r1-node-1.*beacon_quarantine_preservation_failures_total"
 
+# A retained numeric zero is not proof that the stopped process still reported
+# no incomplete output in its final useful sample. The fleet verdict carries
+# one provenance bit beside every field and the archive reader refuses a live
+# field that was carried from an earlier attempt.
+D="${WORK}/accept-single-release-carried-incomplete-output"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  const stage = record.stages.find(
+    ({ name }) =>
+      name ===
+      "quarantine preservation is complete through quiescence"
+  );
+  stage.gauges[
+    "r1-node-1.participation_tbtc_quarantine_incomplete_outputs.read_in_final_watched_sample"
+  ] = 0;
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "single-release refuses a carried incomplete-output zero" 3 \
+  "single_release node.*r1-node-1.*did not re-read the tBTC incomplete-output field in its final useful fleet sample.*read_in_final_watched_sample.*is zero.*carried from an earlier sample"
+
+# Provenance belongs to each service, not to the sampler's process-global last
+# call. A stale historical counter on node 1 remains advisory while a carried
+# live field on node 2 independently leaves the gate unrehearsed.
+D="${WORK}/accept-single-release-independent-final-masks"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  const stage = record.stages.find(
+    ({ name }) =>
+      name ===
+      "quarantine preservation is complete through quiescence"
+  );
+  stage.gauges[
+    "r1-node-1.participation_tbtc_quarantine_preservation_failures_total.read_in_final_watched_sample"
+  ] = 0;
+  stage.gauges[
+    "r1-node-2.participation_beacon_quarantine_incomplete_outputs.read_in_final_watched_sample"
+  ] = 0;
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "fleet provenance masks classify services independently" 3 \
+  "non-fatal recovered quarantine evidence.*r1-node-1.*retained the tBTC preservation counter from an earlier sample" \
+  "single_release node.*r1-node-2.*did not re-read the beacon incomplete-output field in its final useful fleet sample"
+
 D="${WORK}/accept-single-release-incomplete-output"
 mkdir -p "${D}"
 write_attestation "${D}"
@@ -1693,6 +1766,30 @@ node -e '
 run_validator "${D}"
 check "rollback acceptance requires both preservation-failure readings" 3 \
   "carries no fleet reading of.*r1-node-1.*beacon_quarantine_preservation_failures_total"
+
+D="${WORK}/accept-rollback-carried-incomplete-output"
+mkdir -p "${D}"
+write_attestation "${D}"
+write_record "${D}/record.json" "${MANIFEST_SHA}" "${MANIFEST_GRACE}" \
+  "2026-07-28T00:00:00Z" "${FIXTURE_SHA}" "${ROLLBACK_STAGES}" \
+  "${ROLLBACK_ASSERTIONS}" "rollback"
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  const record = JSON.parse(fs.readFileSync(path, "utf8"));
+  const stage = record.stages.find(
+    ({ name }) =>
+      name ===
+      "quarantine preservation is complete through quiescence"
+  );
+  stage.gauges[
+    "r1-node-2.participation_beacon_quarantine_incomplete_outputs.read_in_final_watched_sample"
+  ] = 0;
+  fs.writeFileSync(path, JSON.stringify(record, null, 2));
+' "${D}/record.json"
+run_validator "${D}"
+check "rollback refuses a carried incomplete-output zero" 3 \
+  "rollback node.*r1-node-2.*did not re-read the beacon incomplete-output field in its final useful fleet sample.*read_in_final_watched_sample.*is zero.*carried from an earlier sample"
 
 # The acceptance reader must never become vacuous if its expected fleet roster
 # is empty. The compose/source drift check normally prevents that state, but
@@ -1891,21 +1988,21 @@ set +e
 
     sample_quarantine_preservation_signals r1-node-1
     expect_sampler_readings "first unreadable sample is explicit" \
-      "r1-node-1 unreadable unreadable unreadable unreadable"
+      "r1-node-1 unreadable unreadable unreadable unreadable 0"
     expect_sampler_freshness "first unreadable sample is not fresh" 0
     expect_sampler_read_mask "first unreadable sample names no read fields" 0
 
     SAMPLER_ROUND="first"
     sample_quarantine_preservation_signals r1-node-1
     expect_sampler_readings "numeric sample replaces unreadable fields" \
-      "r1-node-1 1 2 3 4"
+      "r1-node-1 1 2 3 4 15"
     expect_sampler_freshness "numeric sample is fresh" 1
     expect_sampler_read_mask "numeric sample names all four read fields" 15
 
     SAMPLER_ROUND="unread"
     sample_quarantine_preservation_signals r1-node-1
     expect_sampler_readings "later unreadable sample retains numeric fields" \
-      "r1-node-1 1 2 3 4"
+      "r1-node-1 1 2 3 4 15"
     expect_sampler_freshness "retained numeric history is not a fresh sample" 0
     expect_sampler_read_mask "unreadable sample names no newly read fields" 0
 
@@ -1961,14 +2058,14 @@ set +e
     SAMPLER_ROUND="second"
     sample_quarantine_preservation_signals r1-node-1
     expect_sampler_readings "later numeric sample overwrites numeric fields" \
-      "r1-node-1 5 6 7 8"
+      "r1-node-1 5 6 7 8 15"
     expect_sampler_freshness "later numeric sample is fresh" 1
     expect_sampler_read_mask "later numeric sample names all four read fields" 15
 
     SAMPLER_ROUND="partial"
     sample_quarantine_preservation_signals r1-node-1
     expect_sampler_readings "one-body sample retains its absent field" \
-      "r1-node-1 41 42 7 44"
+      "r1-node-1 41 42 7 44 11"
     expect_sampler_freshness "one-body absent field is not globally fresh" 0
     expect_sampler_read_mask "one-body mask names exactly present fields" 11
     STEP_GAUGES=""
@@ -1985,24 +2082,24 @@ set +e
     SAMPLER_ROUND="other"
     sample_quarantine_preservation_signals r1-node-2
     expect_sampler_readings "sampling a second service keeps one line each" \
-      $'r1-node-1 41 42 7 44\nr1-node-2 9 10 11 12'
+      $'r1-node-1 41 42 7 44 11\nr1-node-2 9 10 11 12 15'
 
     SAMPLER_ROUND="third"
     sample_quarantine_preservation_signals r1-node-1
     expect_sampler_readings "resampling one service replaces rather than appends" \
-      $'r1-node-2 9 10 11 12\nr1-node-1 13 14 15 16'
+      $'r1-node-2 9 10 11 12 15\nr1-node-1 13 14 15 16 15'
 
     SAMPLER_ROUND="unread"
     sample_quarantine_preservation_signals r1-node-1 1
     expect_sampler_readings "a replacement process inherits no old account" \
-      $'r1-node-2 9 10 11 12\nr1-node-1 unreadable unreadable unreadable unreadable'
+      $'r1-node-2 9 10 11 12 15\nr1-node-1 unreadable unreadable unreadable unreadable 0'
     expect_sampler_freshness "an unreadable replacement account is not fresh" 0
 
-    QUARANTINE_PRESERVATION_READINGS="stale 1 1 1 1"
+    QUARANTINE_PRESERVATION_READINGS="stale 1 1 1 1 15"
     SAMPLER_ROUND="initialize"
     initialize_quarantine_preservation_readings r1-node-1 r1-node-2
     expect_sampler_readings "initializer resets stale state in roster order" \
-      $'r1-node-1 21 22 23 24\nr1-node-2 31 32 33 34'
+      $'r1-node-1 21 22 23 24 15\nr1-node-2 31 32 33 34 15'
     [[ "$(/usr/bin/wc -l <"${SAMPLER_FETCH_LOG}" | tr -d ' ')" == "10" ]]
     printf 'each sampler attempt fetched one metrics body\n'
 ) >"${SAMPLER_CASE_LOG}" 2>&1
@@ -2068,7 +2165,7 @@ restart_recovery_case() {
       'performance_participation_tbtc_quarantine_incomplete_outputs 7 1720000000000'
   }
 
-  QUARANTINE_PRESERVATION_READINGS=$'r1-node-1 90 91 92 93\nr1-node-2 1 2 3 4'
+  QUARANTINE_PRESERVATION_READINGS=$'r1-node-1 90 91 92 93 15\nr1-node-2 1 2 3 4 15'
   RECOVERY_CASE="start_failure"
   if recover_stopped_restart_subject r1-node-1; then
     printf 'start-failure recovery unexpectedly succeeded\n'
@@ -2089,7 +2186,7 @@ restart_recovery_case() {
   [[ "${RESTART_RECOVERY_NOTE}" == *"did not become reachable within 0 seconds"* ]]
   printf 'recovery reachability timeout is unsafe and explained\n'
 
-  QUARANTINE_PRESERVATION_READINGS=$'r1-node-1 90 91 92 93\nr1-node-2 1 2 3 4'
+  QUARANTINE_PRESERVATION_READINGS=$'r1-node-1 90 91 92 93 15\nr1-node-2 1 2 3 4 15'
   RECOVERY_CASE="success"
   # Read by the sourced recovery helper.
   # shellcheck disable=SC2034
@@ -2098,7 +2195,7 @@ restart_recovery_case() {
   [[ "${RESTART_RECOVERY_SAFE}" == "1" ]]
   [[ "${RESTART_RECOVERY_NOTE}" == *"recovery-started only so the remaining"* ]]
   [[ "${QUARANTINE_PRESERVATION_READINGS}" == \
-    $'r1-node-2 1 2 3 4\nr1-node-1 5 6 7 unreadable' ]]
+    $'r1-node-2 1 2 3 4 15\nr1-node-1 5 6 7 unreadable 7' ]]
   # The sampler fixture above changed this name in another subshell; this
   # assertion reads the recovery helper's call in the current test process.
   # shellcheck disable=SC2031
@@ -2154,18 +2251,29 @@ quarantine namespace"
 }
 
 quarantine_preservation_verdict_case \
-  $'r1-node-1 1 0 0 0\nr1-node-2 0 0 0 0'
+  $'r1-node-1 1 0 0 0 15\nr1-node-2 0 0 0 0 15'
 check "the live verdict records a recovered episode as non-fatal" 0 \
   '"outcome":"pass".*write-grace rounds and later completed' \
+  'r1-node-1.participation_tbtc_quarantine_incomplete_outputs.read_in_final_watched_sample.:1' \
+  'r1-node-2.participation_beacon_quarantine_incomplete_outputs.read_in_final_watched_sample.:1' \
   '"holds":true'
 
 quarantine_preservation_verdict_case \
-  $'r1-node-1 1 0 1 0\nr1-node-2 0 0 0 0'
+  $'r1-node-1 1 0 1 0 15\nr1-node-2 0 0 0 0 15'
 check "the live verdict refuses an output that remains incomplete" 0 \
   '"outcome":"fail".*still holding generated signer output' \
   '"holds":false'
 
-quarantine_preservation_verdict_case "r1-node-1 0 0 0 0"
+quarantine_preservation_verdict_case \
+  $'r1-node-1 0 0 0 0 12\nr1-node-2 0 0 0 0 11'
+check "the live verdict classifies each service final mask independently" 0 \
+  '"outcome":"blocked".*r1-node-2.*final useful sample mask 11' \
+  'r1-node-1.participation_tbtc_quarantine_preservation_failures_total.read_in_final_watched_sample.:0' \
+  'r1-node-1.participation_tbtc_quarantine_incomplete_outputs.read_in_final_watched_sample.:1' \
+  'r1-node-2.participation_tbtc_quarantine_incomplete_outputs.read_in_final_watched_sample.:0' \
+  '"holds":false'
+
+quarantine_preservation_verdict_case "r1-node-1 0 0 0 0 15"
 check "the live verdict refuses an incomplete R1 service roster" 0 \
   '"outcome":"blocked".*do not cover.*missing \[r1-node-2\]' \
   '"holds":false'
@@ -2727,7 +2835,23 @@ complete_run() {
     elif [[ "${stage}" == \
       "quarantine preservation is complete through quiescence" ]]; then
       # shellcheck disable=SC2034
-      STEP_GAUGES='"r1-node-1.participation_tbtc_quarantine_preservation_failures_total":0,"r1-node-1.participation_beacon_quarantine_preservation_failures_total":0,"r1-node-1.participation_tbtc_quarantine_incomplete_outputs":0,"r1-node-1.participation_beacon_quarantine_incomplete_outputs":0,"r1-node-2.participation_tbtc_quarantine_preservation_failures_total":0,"r1-node-2.participation_beacon_quarantine_preservation_failures_total":0,"r1-node-2.participation_tbtc_quarantine_incomplete_outputs":0,"r1-node-2.participation_beacon_quarantine_incomplete_outputs":0'
+      STEP_GAUGES='
+"r1-node-1.participation_tbtc_quarantine_preservation_failures_total":0,
+"r1-node-1.participation_beacon_quarantine_preservation_failures_total":0,
+"r1-node-1.participation_tbtc_quarantine_incomplete_outputs":0,
+"r1-node-1.participation_beacon_quarantine_incomplete_outputs":0,
+"r1-node-1.participation_tbtc_quarantine_preservation_failures_total.read_in_final_watched_sample":1,
+"r1-node-1.participation_beacon_quarantine_preservation_failures_total.read_in_final_watched_sample":1,
+"r1-node-1.participation_tbtc_quarantine_incomplete_outputs.read_in_final_watched_sample":1,
+"r1-node-1.participation_beacon_quarantine_incomplete_outputs.read_in_final_watched_sample":1,
+"r1-node-2.participation_tbtc_quarantine_preservation_failures_total":0,
+"r1-node-2.participation_beacon_quarantine_preservation_failures_total":0,
+"r1-node-2.participation_tbtc_quarantine_incomplete_outputs":0,
+"r1-node-2.participation_beacon_quarantine_incomplete_outputs":0,
+"r1-node-2.participation_tbtc_quarantine_preservation_failures_total.read_in_final_watched_sample":1,
+"r1-node-2.participation_beacon_quarantine_preservation_failures_total.read_in_final_watched_sample":1,
+"r1-node-2.participation_tbtc_quarantine_incomplete_outputs.read_in_final_watched_sample":1,
+"r1-node-2.participation_beacon_quarantine_incomplete_outputs.read_in_final_watched_sample":1'
     fi
     record_step "${stage}" pass "self-test observed the mandatory property"
   done
@@ -8567,9 +8691,10 @@ else
   FAILED=$((FAILED + 1))
 fi
 
-# The accumulator line and archive helper carry exactly four numeric fields.
-# Pin the producer list to that representation so adding a fifth signal cannot
-# pass the generic mask validation and then disappear from values[0..3].
+# The accumulator line and archive helper carry exactly four numeric signal
+# fields plus their per-service final-useful-attempt mask. Pin the producer list
+# to the four values so adding a fifth signal cannot pass generic mask
+# validation and then disappear from values[0..3].
 if ((${#QUARANTINE_PRESERVATION_METRICS[@]} == 4)); then
   printf 'ok   the preservation signal list matches the four-field account\n'
   PASS=$((PASS + 1))
@@ -8633,6 +8758,33 @@ if [[ "${PRESERVATION_SAMPLER_FETCHES}" == "1" ]] &&
 else
   printf 'FAIL a preservation attempt does not use exactly one metrics response (fetches [%s])\n' \
     "${PRESERVATION_SAMPLER_FETCHES:-unreadable}"
+  FAILED=$((FAILED + 1))
+fi
+
+# Every fleet preservation field uses the same provenance suffix and the shell
+# verdict must pass each service's retained mask into the emitter's fourth
+# argument with the empty fleet namespace. This binds the producer/reader
+# boundary separately from the restart path: either call site can otherwise
+# drift while the other continues to pass.
+READER_FLEET_FIELD_READABLE_SUFFIX="$(sed -n \
+  '/^[[:space:]]*const fleetFieldReadableSuffix =$/{
+    n
+    s/^[[:space:]]*\"\([^\"]*\)\";[[:space:]]*$/\1/p
+  }' "${TEST_DIR}/rehearse.sh")"
+# This is the literal producer call, not an expansion in this test shell.
+# shellcheck disable=SC2016
+FLEET_PROVENANCE_PRODUCER_CALL='"${expected}" "" "" "${expected_sample_read_mask}"'
+if [[ -n "${RESTART_WATCHED_FIELD_READABLE_SUFFIX}" ]] &&
+  [[ "${RESTART_WATCHED_FIELD_READABLE_SUFFIX}" == \
+  "${READER_FLEET_FIELD_READABLE_SUFFIX}" ]] &&
+  declare -f quarantine_preservation_verdict |
+    grep -F "${FLEET_PROVENANCE_PRODUCER_CALL}" >/dev/null; then
+  printf 'ok   the fleet-verdict producer and reader use per-service provenance\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL the fleet-verdict provenance drifted: producer suffix [%s], reader suffix [%s]\n' \
+    "${RESTART_WATCHED_FIELD_READABLE_SUFFIX:-missing}" \
+    "${READER_FLEET_FIELD_READABLE_SUFFIX:-missing}"
   FAILED=$((FAILED + 1))
 fi
 
