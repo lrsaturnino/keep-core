@@ -502,6 +502,7 @@ func (n *node) getSigningExecutor(
 		blockCounter.CurrentBlock,
 		n.waitForBlockHeight,
 		signingAttemptsLimit,
+		n.participationGate,
 	)
 
 	// Wire metrics recorder if available

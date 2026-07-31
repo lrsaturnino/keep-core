@@ -23,6 +23,18 @@ type announcerMismatchLogger interface {
 	Infof(format string, args ...interface{})
 }
 
+type participationGateStateReader interface {
+	State() participation.Snapshot
+}
+
+func currentParticipationGateState(gate participationGateStateReader) string {
+	if gate == nil {
+		return "unknown"
+	}
+
+	return gate.State().State.String()
+}
+
 // handleAnnouncerSessionMismatch centralizes the node-local response to a
 // membership-valid, protocol-matched announcement whose session ID differs from
 // the local one. It is invoked once per mismatching sender per Announce call
@@ -45,6 +57,7 @@ func handleAnnouncerSessionMismatch(
 	metrics announcerMismatchMetrics,
 	roster *participation.CutoverPeerRoster,
 	currentMode participation.ProtocolMode,
+	gateState string,
 	operatorAddresses chain.Addresses,
 	protocolID string,
 	sender group.MemberIndex,
@@ -78,12 +91,13 @@ func handleAnnouncerSessionMismatch(
 		logger.Infof(
 			"protocol announcement rejected: session ID mismatch "+
 				"[protocol=%s] [member=%d] [expectedFormat=%s] "+
-				"[observedFormat=%s] [permitMode=%s]",
+				"[observedFormat=%s] [permitMode=%s] [gateState=%s]",
 			protocolID,
 			sender,
 			expectedFormat,
 			observedFormat,
 			currentMode,
+			gateState,
 		)
 	}
 }

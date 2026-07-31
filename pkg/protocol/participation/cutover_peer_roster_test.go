@@ -1,12 +1,15 @@
 package participation
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"sync"
 	"testing"
 	"time"
+
+	log2 "github.com/ipfs/go-log/v2"
 
 	"github.com/keep-network/keep-core/pkg/chain"
 	"github.com/keep-network/keep-core/pkg/protocol/announcer"
@@ -17,6 +20,58 @@ var fixedTestTime = time.Date(2026, 7, 24, 0, 0, 0, 0, time.UTC)
 
 func fixedClock() func() time.Time {
 	return func() time.Time { return fixedTestTime }
+}
+
+type capturedRosterLogEntry struct {
+	Logger  string `json:"logger"`
+	Message string `json:"msg"`
+}
+
+func captureRosterLogs(
+	t *testing.T,
+	fn func(),
+) []capturedRosterLogEntry {
+	t.Helper()
+
+	const subsystem = "keep-participation"
+	if err := log2.SetLogLevel(subsystem, "debug"); err != nil {
+		t.Fatal(err)
+	}
+
+	pipe := log2.NewPipeReader()
+
+	var mutex sync.Mutex
+	var entries []capturedRosterLogEntry
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+
+		scanner := bufio.NewScanner(pipe)
+		for scanner.Scan() {
+			var entry capturedRosterLogEntry
+			if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+				continue
+			}
+			if entry.Logger != subsystem {
+				continue
+			}
+
+			mutex.Lock()
+			entries = append(entries, entry)
+			mutex.Unlock()
+		}
+	}()
+
+	fn()
+
+	if err := pipe.Close(); err != nil {
+		t.Logf("could not close log pipe reader: %v", err)
+	}
+	<-done
+
+	mutex.Lock()
+	defer mutex.Unlock()
+	return append([]capturedRosterLogEntry(nil), entries...)
 }
 
 // fakeBlockCounter is a controllable chain.BlockCounter for tests.
@@ -179,6 +234,23 @@ func TestCutoverPeerRoster_ConstructionRejectsOverflowRetention(t *testing.T) {
 	}
 }
 
+func TestCutoverPeerRoster_ConstructionRejectsUnprojectableCutoverSchedule(
+	t *testing.T,
+) {
+	_, err := NewCutoverPeerRoster(
+		context.Background(),
+		newFakeBlockCounter(0),
+		1000,
+		newFakeMetrics(),
+		WithCutoverSchedule(Schedule{
+			CutoverBlock: maxSafeMetricInteger + 1,
+		}),
+	)
+	if err == nil {
+		t.Fatal("expected an error for a precision-unsafe cutover schedule")
+	}
+}
+
 func TestCutoverPeerRoster_ConstructionInitializesMetricsAtZero(t *testing.T) {
 	_, _, metrics := newTestRoster(t, 100, 1000)
 
@@ -226,6 +298,52 @@ func TestCutoverPeerRoster_ConstructionClockFailureIsTolerated(t *testing.T) {
 	if snapshot.ClockAvailable {
 		t.Error("expected clock to be marked unavailable after a construction clock error")
 	}
+}
+
+func TestCutoverPeerRoster_EntryLogIncludesResolvedCutoverBlock(t *testing.T) {
+	const (
+		cutoverBlock = uint64(1000)
+		currentBlock = uint64(1005)
+	)
+
+	expected := fmt.Sprintf(
+		"protocol legacy peer entered cutover roster "+
+			"[operator=%s] [protocol=%s] [member=%d] "+
+			"[firstSeenBlock=%d] [cutoverBlock=%d]",
+		validAddress(1),
+		"tbtc-dkg",
+		3,
+		currentBlock,
+		cutoverBlock,
+	)
+
+	entries := captureRosterLogs(t, func() {
+		roster, err := NewCutoverPeerRoster(
+			context.Background(),
+			newFakeBlockCounter(currentBlock),
+			1000,
+			newFakeMetrics(),
+			WithCutoverSchedule(Schedule{CutoverBlock: cutoverBlock}),
+		)
+		if err != nil {
+			t.Fatalf("failed to construct roster: [%v]", err)
+		}
+
+		observeStraggler(roster, "tbtc-dkg", 3, validAddress(1))
+		roster.Close()
+	})
+
+	for _, entry := range entries {
+		if entry.Message == expected {
+			return
+		}
+	}
+
+	t.Errorf(
+		"expected roster entry log [%s], got: %+v",
+		expected,
+		entries,
+	)
 }
 
 func TestCutoverPeerRoster_ObserveLegacyRecordsStraggler(t *testing.T) {

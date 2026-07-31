@@ -89,6 +89,51 @@ func (l *captureLogger) all() []string {
 	return out
 }
 
+type fixedParticipationGateState struct {
+	state participation.State
+}
+
+func (f fixedParticipationGateState) State() participation.Snapshot {
+	return participation.Snapshot{State: f.state}
+}
+
+func TestCurrentParticipationGateState(t *testing.T) {
+	tests := map[string]struct {
+		gate participationGateStateReader
+		want string
+	}{
+		"missing gate": {
+			want: "unknown",
+		},
+		"open security v2": {
+			gate: fixedParticipationGateState{
+				state: participation.StateOpenSecurityV2,
+			},
+			want: "open_security_v2",
+		},
+		"quiescing": {
+			gate: fixedParticipationGateState{
+				state: participation.StateQuiescing,
+			},
+			want: "quiescing",
+		},
+		"clock unavailable": {
+			gate: fixedParticipationGateState{
+				state: participation.StateClockUnavailable,
+			},
+			want: "clock_unavailable",
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			if got := currentParticipationGateState(test.gate); got != test.want {
+				t.Errorf("expected gate state [%s], got [%s]", test.want, got)
+			}
+		})
+	}
+}
+
 // operatorAddrs is a set of three valid, distinct operator addresses.
 var operatorAddrs = chain.Addresses{
 	chain.Address("0x1111111111111111111111111111111111111111"),
@@ -131,6 +176,7 @@ func TestHandleAnnouncerSessionMismatch_LegacyStragglerRecorded(t *testing.T) {
 		metrics,
 		roster,
 		participation.ModeSecurityV2,
+		participation.StateOpenSecurityV2.String(),
 		operatorAddrs,
 		"tbtc-dkg",
 		group.MemberIndex(2),
@@ -161,11 +207,12 @@ func TestHandleAnnouncerSessionMismatch_LegacyStragglerRecorded(t *testing.T) {
 		t.Fatalf("expected 1 log line, got %d: %v", len(lines), lines)
 	}
 	line := lines[0]
-	if !strings.Contains(line, "session ID mismatch") ||
-		!strings.Contains(line, "legacy") ||
-		!strings.Contains(line, "hardened_dkg") ||
-		!strings.Contains(line, "security_v2") {
-		t.Errorf("log line missing expected safe fields: %q", line)
+	expectedLog := "protocol announcement rejected: session ID mismatch " +
+		"[protocol=tbtc-dkg] [member=2] [expectedFormat=hardened_dkg] " +
+		"[observedFormat=legacy] [permitMode=security_v2] " +
+		"[gateState=open_security_v2]"
+	if line != expectedLog {
+		t.Errorf("unexpected mismatch log:\n got: %q\nwant: %q", line, expectedLog)
 	}
 	// The observer only ever receives classified formats, never raw IDs; the
 	// operator address is the only identifier and no session-ID hex appears.
@@ -190,6 +237,7 @@ func TestHandleAnnouncerSessionMismatch_HardenedVsHardened(t *testing.T) {
 		metrics,
 		roster,
 		participation.ModeSecurityV2,
+		participation.StateOpenSecurityV2.String(),
 		operatorAddrs,
 		"tbtc-signing",
 		group.MemberIndex(1),
@@ -222,6 +270,7 @@ func TestHandleAnnouncerSessionMismatch_OutOfRangeSender(t *testing.T) {
 		metrics,
 		roster,
 		participation.ModeSecurityV2,
+		participation.StateOpenSecurityV2.String(),
 		operatorAddrs,
 		"tbtc-dkg",
 		group.MemberIndex(99),
@@ -252,6 +301,7 @@ func TestHandleAnnouncerSessionMismatch_PortZeroNilMetrics(t *testing.T) {
 		nil, // no metrics sink (client-info disabled)
 		roster,
 		participation.ModeSecurityV2,
+		participation.StateOpenSecurityV2.String(),
 		operatorAddrs,
 		"tbtc-dkg",
 		group.MemberIndex(3),

@@ -511,6 +511,7 @@ func (de *dkgExecutor) generateSigningGroup(
 					de.metricsRecorder,
 					de.cutoverPeerRoster,
 					currentMode,
+					currentParticipationGateState(de.participationGate),
 					operatorAddresses,
 					protocolID,
 					sender,

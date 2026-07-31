@@ -76,6 +76,12 @@ type signingExecutor struct {
 	// peer sightings observed by the signing announcer.
 	cutoverPeerRoster *participation.CutoverPeerRoster
 
+	// participationGate is the process gate that issued the wallet action
+	// permit. Signing uses the permit's immutable mode for protocol decisions;
+	// the shared gate is retained only so mismatch logs report the process's
+	// current gate state.
+	participationGate participation.Gate
+
 	// announcerMismatchLogLimiter bounds the volume of session-ID mismatch INFO
 	// logs to a burst of 5 with one line every 30 seconds, matching the
 	// observability contract. Metrics retain every event.
@@ -91,6 +97,7 @@ func newSigningExecutor(
 	getCurrentBlockFn getCurrentBlockFn,
 	waitForBlockFn waitForBlockFn,
 	signingAttemptsLimit uint,
+	participationGate participation.Gate,
 ) *signingExecutor {
 	return &signingExecutor{
 		lock:                        semaphore.NewWeighted(1),
@@ -102,6 +109,7 @@ func newSigningExecutor(
 		getCurrentBlockFn:           getCurrentBlockFn,
 		waitForBlockFn:              waitForBlockFn,
 		signingAttemptsLimit:        signingAttemptsLimit,
+		participationGate:           participationGate,
 		announcerMismatchLogLimiter: rate.NewLimiter(rate.Every(30*time.Second), 5),
 	}
 }
@@ -408,6 +416,7 @@ func (se *signingExecutor) sign(
 					se.metricsRecorder,
 					se.cutoverPeerRoster,
 					currentMode,
+					currentParticipationGateState(se.participationGate),
 					operatorAddresses,
 					protocolID,
 					sender,

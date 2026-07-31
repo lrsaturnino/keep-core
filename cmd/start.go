@@ -205,6 +205,7 @@ func start(cmd *cobra.Command) error {
 		blockCounter,
 		rosterRetentionBlocks,
 		rosterMetrics,
+		participation.WithCutoverSchedule(participationSchedule),
 	)
 	if err != nil {
 		return fmt.Errorf("cannot create cutover peer roster: [%v]", err)

@@ -572,6 +572,7 @@ func TestSigningCutover_PostCutoverSplitFailsClosedWithEvidence(t *testing.T) {
 		blockCounter.CurrentBlock,
 		newChainWaitForBlockFn(blockCounter),
 		2,
+		gate,
 	)
 
 	recorder := newDispatcherMetricsRecorder()
@@ -784,6 +785,7 @@ func TestSigningCutover_LoopNeverInvokesSigningBelowThreshold(t *testing.T) {
 				recorder,
 				roster,
 				currentMode,
+				gate.State().State.String(),
 				rosterOperators,
 				observedProtocolID,
 				sender,

@@ -94,6 +94,29 @@ type CutoverRosterMetricsRecorder interface {
 	SetGauge(name string, value float64)
 }
 
+type cutoverPeerRosterOptions struct {
+	cutoverBlock uint64
+}
+
+// CutoverPeerRosterOption configures immutable cutover context used by the
+// node-local roster's observability contract.
+type CutoverPeerRosterOption func(*cutoverPeerRosterOptions) error
+
+// WithCutoverSchedule gives the roster the exact resolved schedule supplied to
+// the process participation gate. The roster does not use the schedule to
+// classify or authorize observations; it carries C only so an entry log names
+// the cutover boundary the observation is evidence for.
+func WithCutoverSchedule(schedule Schedule) CutoverPeerRosterOption {
+	return func(options *cutoverPeerRosterOptions) error {
+		if err := validateMetricProjectable(schedule.CutoverBlock); err != nil {
+			return fmt.Errorf("invalid roster cutover schedule: [%w]", err)
+		}
+
+		options.cutoverBlock = schedule.CutoverBlock
+		return nil
+	}
+}
+
 type sightingKey struct {
 	protocolID  string
 	memberIndex group.MemberIndex
@@ -120,6 +143,7 @@ type CutoverPeerRoster struct {
 
 	blockCounter    chain.BlockCounter
 	retentionBlocks uint64
+	cutoverBlock    uint64
 	metrics         CutoverRosterMetricsRecorder
 	clock           func() time.Time
 
@@ -138,12 +162,15 @@ type CutoverPeerRoster struct {
 // retention, synchronously reads the chain clock to seed the current block,
 // initializes all fixed metrics to zero, and starts one context-bound sweep
 // loop. The roster is intended to be constructed unconditionally, including
-// when client-info diagnostics are disabled.
+// when client-info diagnostics are disabled. A process with an active cutover
+// schedule supplies WithCutoverSchedule using the same resolved Schedule given
+// to its Gate; omitting it represents the developer-only disabled schedule.
 func NewCutoverPeerRoster(
 	ctx context.Context,
 	blockCounter chain.BlockCounter,
 	retentionBlocks uint64,
 	metrics CutoverRosterMetricsRecorder,
+	options ...CutoverPeerRosterOption,
 ) (*CutoverPeerRoster, error) {
 	return newCutoverPeerRoster(
 		ctx,
@@ -151,6 +178,7 @@ func NewCutoverPeerRoster(
 		retentionBlocks,
 		metrics,
 		time.Now,
+		options...,
 	)
 }
 
@@ -163,7 +191,21 @@ func newCutoverPeerRoster(
 	retentionBlocks uint64,
 	metrics CutoverRosterMetricsRecorder,
 	clock func() time.Time,
+	optionFunctions ...CutoverPeerRosterOption,
 ) (*CutoverPeerRoster, error) {
+	options := &cutoverPeerRosterOptions{}
+	for _, option := range optionFunctions {
+		if option == nil {
+			return nil, fmt.Errorf("nil cutover peer roster option")
+		}
+		if err := option(options); err != nil {
+			return nil, fmt.Errorf(
+				"invalid cutover peer roster option: [%w]",
+				err,
+			)
+		}
+	}
+
 	if retentionBlocks == 0 {
 		return nil, fmt.Errorf("retention blocks must be non-zero")
 	}
@@ -190,6 +232,7 @@ func newCutoverPeerRoster(
 		loopDone:        make(chan struct{}),
 		blockCounter:    blockCounter,
 		retentionBlocks: retentionBlocks,
+		cutoverBlock:    options.cutoverBlock,
 		metrics:         metrics,
 		clock:           clock,
 		logLimiter:      rate.NewLimiter(rate.Every(30*time.Second), 5),
@@ -346,20 +389,15 @@ func (r *CutoverPeerRoster) ObserveLegacy(
 		r.metrics.IncrementCounter(metricLegacyPeerAdditionsTotal, 1)
 
 		if r.logLimiter.Allow() {
-			// The spec's log form also includes [cutoverBlock=%d], but the cutover
-			// block C is owned by Part A's release gate, which is deliberately out
-			// of scope for this pass (this package has no C). The field is omitted
-			// rather than fabricated: emitting a placeholder or zero C would be
-			// misleading evidence during a go/no-go. Part A can add the field here
-			// once it supplies the canonical C.
 			rosterLogger.Infof(
 				"protocol legacy peer entered cutover roster "+
 					"[operator=%s] [protocol=%s] [member=%d] "+
-					"[firstSeenBlock=%d]",
+					"[firstSeenBlock=%d] [cutoverBlock=%d]",
 				normalized,
 				protocolID,
 				memberIndex,
 				block,
+				r.cutoverBlock,
 			)
 		}
 	} else {
