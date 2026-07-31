@@ -163,6 +163,38 @@ jobs:
           imageName: keep-random-beacon-hardhat
           context: ./solidity/random-beacon
           push: false
+          load: true
+
+      - name: Smoke Docker image on native AMD64
+        env:
+          EXPECTED_REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          {
+            runner_architecture="$(uname -m)"
+            image_platform="$(docker image inspect \
+              --format '{{.Os}}/{{.Architecture}}' \
+              keep-random-beacon-hardhat)"
+            image_revision="$(docker image inspect \
+              --format '{{index .Config.Labels "revision"}}' \
+              keep-random-beacon-hardhat)"
+            echo "runner architecture: ${runner_architecture}"
+            echo "image platform: ${image_platform}"
+            echo "image revision: ${image_revision}"
+            test "${runner_architecture}" = "x86_64"
+            test "${image_platform}" = "linux/amd64"
+            test "${image_revision}" = "${EXPECTED_REVISION}"
+            docker run --rm --pull=never keep-random-beacon-hardhat --version
+          } 2>&1 | tee docker-image-smoke.log
+
+      - name: Preserve Docker image smoke log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: random-beacon-hardhat-docker-smoke-${{ github.sha }}
+          path: solidity/random-beacon/docker-image-smoke.log
+          if-no-files-found: error
+          retention-days: 30
 
   contracts-deployment-testnet:
     needs: [contracts-build-and-test]

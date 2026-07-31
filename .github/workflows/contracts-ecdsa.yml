@@ -164,7 +164,39 @@ jobs:
         with:
           imageName: keep-ecdsa-hardhat
           push: false
+          load: true
           context: ./solidity/ecdsa
+
+      - name: Smoke Docker image on native AMD64
+        env:
+          EXPECTED_REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          {
+            runner_architecture="$(uname -m)"
+            image_platform="$(docker image inspect \
+              --format '{{.Os}}/{{.Architecture}}' \
+              keep-ecdsa-hardhat)"
+            image_revision="$(docker image inspect \
+              --format '{{index .Config.Labels "revision"}}' \
+              keep-ecdsa-hardhat)"
+            echo "runner architecture: ${runner_architecture}"
+            echo "image platform: ${image_platform}"
+            echo "image revision: ${image_revision}"
+            test "${runner_architecture}" = "x86_64"
+            test "${image_platform}" = "linux/amd64"
+            test "${image_revision}" = "${EXPECTED_REVISION}"
+            docker run --rm --pull=never keep-ecdsa-hardhat --version
+          } 2>&1 | tee docker-image-smoke.log
+
+      - name: Preserve Docker image smoke log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ecdsa-hardhat-docker-smoke-${{ github.sha }}
+          path: solidity/ecdsa/docker-image-smoke.log
+          if-no-files-found: error
+          retention-days: 30
 
   contracts-deployment-testnet:
     needs: [contracts-build-and-test]
