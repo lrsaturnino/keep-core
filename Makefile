@@ -146,4 +146,20 @@ cmd-help: build
 	@echo '$$ $(app_name) start --help' > docs/resources/client-start-help
 	./$(app_name) start --help >> docs/resources/client-start-help
 
-.PHONY: all development sepolia download_artifacts generate gen_proto build cmd-help release build_multi
+# verify-cutover is the repository-owned completion gate for changes to the
+# coordinated cutover. Keeping the Go checks and rehearsal-scaffold analysis
+# behind one entry point prevents a green Go-only run from masking a broken
+# workflow, evidence validator, or shell harness.
+EVIDENCE_DIR ?= $(CURDIR)/rehearsal-evidence
+
+verify-cutover:
+	go build ./...
+	go vet ./...
+	go test -timeout 15m ./...
+	go test -race -timeout 5m ./pkg/protocol/...
+	@mkdir -p "$(EVIDENCE_DIR)"
+	EVIDENCE_DIR="$(EVIDENCE_DIR)" \
+		./scripts/release/pr4109/rehearse.sh shell-analysis
+	@echo 'PASS: build+vet+unit-suite+participation-race+scaffold-shell-analysis green'
+
+.PHONY: all development sepolia download_artifacts generate gen_proto build cmd-help release build_multi verify-cutover

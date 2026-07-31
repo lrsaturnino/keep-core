@@ -54,6 +54,20 @@ fail-closed binding instead: the stage refuses to run at all unless the
 tree under test is exactly that commit, so a log carrying a verified stamp
 is proof the stamped bytes were the tested bytes.
 
+For a local or automation-loop completion check, use the repository-owned
+aggregate gate from the repository root:
+
+```
+make verify-cutover
+```
+
+It runs `go build ./...`, `go vet ./...`, the full unit suite, the protocol
+packages under the race detector, and `shell-analysis` as one fail-fast
+command. A Go-only completion command is not sufficient for changes that can
+reach this scaffold, because it does not exercise the workflow and evidence
+validators. Set `EVIDENCE_DIR` to place the analysis log somewhere other than
+the ignored repository-root `rehearsal-evidence/` directory.
+
 The offline state classification the rollback barrier requires runs with
 `go run ./cmd/participation-state-audit --storage-snapshot <copy>`: it
 records the snapshot identity (aggregate checksum and access mode), flags any
