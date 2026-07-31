@@ -3,9 +3,14 @@ FROM node:22.23.1-alpine
 RUN apk add --update --no-cache \
     git \
     bash \
+    python3 \
+    make \
+    g++ \
     && \
     rm -rf /var/cache/apk/ && mkdir /var/cache/apk/ && \
     rm -rf /usr/share/man
+
+COPY --chmod=0755 git-yarn-compat /usr/local/bin/git
 
 ENV WORK_DIR=/random-beacon
 

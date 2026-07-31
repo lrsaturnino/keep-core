@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+# Yarn 4.8.1 passes the clone configuration as one combined argument. Git
+# 2.54 rejects that legacy form, so split only this exact invocation before
+# delegating to the Git binary installed by apk.
+if [ "$#" -ge 2 ] && [ "$1" = "clone" ]; then
+    case "$2" in
+        "-c "*)
+            clone_config=${2#-c }
+            shift 2
+            exec /usr/bin/git clone -c "$clone_config" "$@"
+            ;;
+    esac
+fi
+
+exec /usr/bin/git "$@"
