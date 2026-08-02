@@ -149,14 +149,21 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Resolve Docker tags
+        id: docker-tags
+        run: |
+          {
+            echo 'tags<<EOF'
+            ./scripts/release/pr4109/release-docker-tags.sh \
+              "${dockerhub_org}" "${version}"
+            echo 'EOF'
+          } >> "${GITHUB_OUTPUT}"
+
       - name: Build and Push Docker Images
         uses: docker/build-push-action@v5
         with:
           target: runtime-docker
-          tags: |
-            ${{ env.dockerhub_org }}/keep-client:latest
-            ${{ env.dockerhub_org }}/keep-client:${{ env.version }}
-            ${{ env.dockerhub_org }}/keep-client:mainnet
+          tags: ${{ steps.docker-tags.outputs.tags }}
           labels: |
             version=${{ env.version }}
             revision=${{ env.revision }}
@@ -172,4 +179,4 @@ jobs:
       - name: Move Docker cache
         run: |
           rm -rf /tmp/.buildx-cache
-          mv /tmp/.buildx-cache-docker-new /tmp/.buildx-cache          
+          mv /tmp/.buildx-cache-docker-new /tmp/.buildx-cache

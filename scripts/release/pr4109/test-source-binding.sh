@@ -2692,6 +2692,104 @@ run_provenance_wiring "${T}"
 check "provenance wiring: a commit carrying no rehearsal workflow fails" 1 \
   "carries no \.github/workflows/cutover-rehearsal\.yml"
 
+# The release publisher has one tested source of Docker tags. The workflow
+# fixtures below prove the wiring check rejects every way the publisher could
+# bypass that source and move a stable alias during a prerelease.
+write_release_tag_workflow() {
+  local repo="$1" invoke_selector="$2" consume_output="$3"
+  local literal_alias="$4" selector_id="$5"
+
+  mkdir -p "${repo}/.github/workflows"
+  {
+    printf 'name: Release\non:\n  push:\n    tags:\n      - "v*"\n'
+    printf 'jobs:\n  %s:\n    runs-on: ubuntu-latest\n    steps:\n' \
+      "${RELEASE_PUBLISH_JOB}"
+    printf '      - uses: actions/checkout@v4\n'
+    printf '      - name: Resolve Docker tags\n'
+    if [[ "${selector_id}" == "yes" ]]; then
+      printf '        id: %s\n' "${RELEASE_DOCKER_TAG_STEP}"
+    fi
+    printf '        run: |\n'
+    if [[ "${invoke_selector}" == "yes" ]]; then
+      # GITHUB_OUTPUT is fixture text, not a variable in this test process.
+      # shellcheck disable=SC2016
+      printf '          ./%s thresholdnetwork v1.2.3 >> "$GITHUB_OUTPUT"\n' \
+        "${RELEASE_DOCKER_TAG_SELECTOR}"
+    else
+      # shellcheck disable=SC2016
+      printf '          echo "tags=thresholdnetwork/keep-client:v1.2.3" >> "$GITHUB_OUTPUT"\n'
+    fi
+    if [[ "${literal_alias}" == "yes" ]]; then
+      printf '          echo thresholdnetwork/keep-client:latest\n'
+    fi
+    printf '      - uses: %s@v5\n        with:\n' "${BUILD_ACTION}"
+    if [[ "${consume_output}" == "yes" ]]; then
+      # The workflow expression is fixture text, not a shell expansion.
+      # shellcheck disable=SC2016
+      printf '          tags: ${{ steps.docker-tags.outputs.tags }}\n'
+    else
+      printf '          tags: thresholdnetwork/keep-client:v1.2.3\n'
+    fi
+  } >"${repo}/${RELEASE_WORKFLOW}"
+}
+
+make_release_tag_repo() {
+  local repo="$1"
+  shift
+  mkdir -p "${repo}"
+  (
+    cd "${repo}"
+    git_q init -q
+    write_release_tag_workflow "${repo}" "$@"
+    git_q add -Af
+    git_q commit -q -m 'release tag fixture'
+  )
+}
+
+run_release_tag_isolation() {
+  local root="$1"
+  set +e
+  CASE_OUT="$(
+    (
+      # shellcheck disable=SC2034
+      REPO_ROOT="${root}"
+      verify_release_candidate_tag_isolation
+    ) 2>&1
+  )"
+  CASE_RC=$?
+  set -e
+}
+
+T="${WORK}/release-tags-isolated"
+make_release_tag_repo "${T}" yes yes no yes
+run_release_tag_isolation "${T}"
+check "release tags: tested selector output is the only publication source" \
+  0 "prereleases remain version-only"
+
+T="${WORK}/release-tags-selector-bypassed"
+make_release_tag_repo "${T}" no yes no yes
+run_release_tag_isolation "${T}"
+check "release tags: a publisher bypassing the selector fails" 1 \
+  "does not invoke ${RELEASE_DOCKER_TAG_SELECTOR}"
+
+T="${WORK}/release-tags-output-unused"
+make_release_tag_repo "${T}" yes no no yes
+run_release_tag_isolation "${T}"
+check "release tags: an unused selector output fails" 1 \
+  "instead of the complete output of ${RELEASE_DOCKER_TAG_STEP}"
+
+T="${WORK}/release-tags-literal-alias"
+make_release_tag_repo "${T}" yes yes yes yes
+run_release_tag_isolation "${T}"
+check "release tags: a hard-coded stable alias fails" 1 \
+  "hard-codes a mutable Docker alias"
+
+T="${WORK}/release-tags-selector-id-missing"
+make_release_tag_repo "${T}" yes yes no no
+run_release_tag_isolation "${T}"
+check "release tags: an unaddressable selector output fails" 1 \
+  "0 steps with id ${RELEASE_DOCKER_TAG_STEP}"
+
 # ----------------------------------------------------------------------------
 
 printf '%d passed, %d failed\n' "${PASS}" "${FAILED}"

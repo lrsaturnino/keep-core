@@ -979,6 +979,9 @@ ${REHEARSAL_WORKFLOW}'s ${SOLIDITY_PROOFS_JOB} job both pin Node ${ci_version}"
 
 # The workflow that builds the artifact a cutover record binds its identity to.
 RELEASE_WORKFLOW=".github/workflows/release.yml"
+RELEASE_PUBLISH_JOB="publish-docker-images"
+RELEASE_DOCKER_TAG_STEP="docker-tags"
+RELEASE_DOCKER_TAG_SELECTOR="scripts/release/pr4109/release-docker-tags.sh"
 
 # The released artifact must name its source commit exactly.
 #
@@ -1023,6 +1026,71 @@ abbreviation is not that commit"
   note "release stamp: ${RELEASE_WORKFLOW} writes the full source SHA into \
 every artifact it builds ($(printf '%s\n' "${stamps}" | wc -l | tr -d ' ') \
 assignment(s))"
+}
+
+# A prerelease image must be available by its versioned tag without moving the
+# mutable aliases operators use for stable production releases. The release
+# workflow therefore delegates its complete tag set to one tested selector:
+# exact vMAJOR.MINOR.PATCH tags receive the stable aliases and every other
+# accepted Docker tag receives only its versioned name.
+verify_release_candidate_tag_isolation() {
+  local content i body selector_steps raw_tags expected_tags
+  content="$(git -C "${REPO_ROOT}" show "HEAD:${RELEASE_WORKFLOW}" \
+    2>/dev/null)" ||
+    fail "the commit under test carries no ${RELEASE_WORKFLOW}; there is no \
+release publication path to verify for prerelease alias isolation"
+
+  yaml_index_lines "${RELEASE_WORKFLOW}" "${content}"
+  yaml_locate_job "${RELEASE_WORKFLOW}" "${RELEASE_PUBLISH_JOB}"
+
+  selector_steps=0
+  for ((i = YAML_JOB_START; i < YAML_JOB_END; i++)); do
+    body="${YAML_BODIES[i]}"
+    [[ "${body}" == "id: ${RELEASE_DOCKER_TAG_STEP}" ]] &&
+      selector_steps=$((selector_steps + 1))
+
+    if [[ "${body}" == *':latest'* || "${body}" == *':mainnet'* ]]; then
+      fail "${RELEASE_WORKFLOW}'s ${RELEASE_PUBLISH_JOB} job hard-codes a \
+mutable Docker alias on line $((i + 1)); all tags must come from \
+${RELEASE_DOCKER_TAG_SELECTOR}, whose stable-release test keeps prereleases \
+off latest and mainnet"
+    fi
+  done
+
+  ((selector_steps == 1)) ||
+    fail "${RELEASE_WORKFLOW}'s ${RELEASE_PUBLISH_JOB} job has \
+${selector_steps} steps with id ${RELEASE_DOCKER_TAG_STEP}; exactly one step \
+must resolve the complete tag set"
+
+  yaml_body_carries "${YAML_JOB_START}" "${YAML_JOB_END}" \
+    "./${RELEASE_DOCKER_TAG_SELECTOR}" ||
+    fail "${RELEASE_WORKFLOW}'s ${RELEASE_PUBLISH_JOB} job does not invoke \
+${RELEASE_DOCKER_TAG_SELECTOR}; prerelease isolation is no longer decided by \
+the selector this gate tests"
+
+  yaml_body_carries "${YAML_JOB_START}" "${YAML_JOB_END}" 'GITHUB_OUTPUT' ||
+    fail "${RELEASE_WORKFLOW}'s ${RELEASE_PUBLISH_JOB} job does not write the \
+selected Docker tags to GITHUB_OUTPUT"
+
+  yaml_locate_action_step "${RELEASE_WORKFLOW}" "${BUILD_ACTION}" \
+    "${YAML_JOB_START}" "${YAML_JOB_END}"
+  raw_tags="$(yaml_step_input tags)" ||
+    fail "the ${BUILD_ACTION} step in ${RELEASE_WORKFLOW}'s \
+${RELEASE_PUBLISH_JOB} job publishes no tag set"
+  raw_tags="${raw_tags#"${raw_tags%%[![:space:]]*}"}"
+  raw_tags="${raw_tags%"${raw_tags##*[![:space:]]}"}"
+
+  # The expression is workflow syntax, not a shell expansion.
+  # shellcheck disable=SC2016
+  expected_tags='${{ steps.docker-tags.outputs.tags }}'
+  [[ "${raw_tags}" == "${expected_tags}" ]] ||
+    fail "the ${BUILD_ACTION} step in ${RELEASE_WORKFLOW}'s \
+${RELEASE_PUBLISH_JOB} job publishes [${raw_tags}] instead of the complete \
+output of ${RELEASE_DOCKER_TAG_STEP}; another tag source could move stable \
+aliases during a prerelease"
+
+  note "release tags: ${RELEASE_WORKFLOW} publishes exactly the tag set from \
+${RELEASE_DOCKER_TAG_SELECTOR}; prereleases remain version-only"
 }
 
 # The dispatch input a release run hands the detached provenance in, the
@@ -3108,6 +3176,7 @@ validator self-tests"
     # of this scaffold. Same reason, same gate.
     verify_contracts_toolchain_pin
     verify_release_revision_stamp
+    verify_release_candidate_tag_isolation
     # And the one piece of the release path whose absence has no local
     # symptom: a dispatch that cannot hand in the detached provenance passes
     # every proof and produces evidence acceptance refuses.
@@ -3119,6 +3188,8 @@ validator self-tests"
     # which is to say only when somebody remembers.
     note "source-binding verifier self-test"
     "${SCRIPT_DIR}/test-source-binding.sh"
+    note "release Docker-tag selector self-test"
+    "${SCRIPT_DIR}/test-release-docker-tags.sh"
     note "evidence-record validator self-test"
     "${SCRIPT_DIR}/test-validate-evidence.sh"
     note "native-runner matrix validator self-test"

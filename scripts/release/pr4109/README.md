@@ -265,9 +265,14 @@ compiled protocol epoch, and armed cutover block, from *every* R1 node and not
 the first. Any disagreement between nodes refuses the run, as does a revision
 that is not exactly the commit the run is bound to — an abbreviation names a
 commit only as far as it goes, which is why the release workflow stamps the
-whole SHA and `shell-analysis` holds it to that — an armed cutover block that is not
-the rehearsed C, or a protocol epoch that is not the one the reviewed manifest
-was derived for. The record is
+whole SHA and `shell-analysis` holds it to that. The same gate holds release
+publication to `release-docker-tags.sh`: every tag publishes a versioned image,
+but only an exact stable `vMAJOR.MINOR.PATCH` release may move `latest` or
+`mainnet`. A candidate or any unrecognized version shape remains version-only,
+so publishing an image for rehearsal cannot change either production alias.
+The fleet capture also refuses an armed cutover block that is not the rehearsed
+C, or a protocol epoch that is not the one the reviewed manifest was derived
+for. The record is
 then built from what was captured rather than from what the driver was told,
 so its epoch and C are the fleet's own and not a restatement of the
 environment. Capturing up front is also what lets the rollback gate emit a
