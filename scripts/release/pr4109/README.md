@@ -265,11 +265,17 @@ compiled protocol epoch, and armed cutover block, from *every* R1 node and not
 the first. Any disagreement between nodes refuses the run, as does a revision
 that is not exactly the commit the run is bound to — an abbreviation names a
 commit only as far as it goes, which is why the release workflow stamps the
-whole SHA and `shell-analysis` holds it to that. The same gate holds release
-publication to `release-docker-tags.sh`: every tag publishes a versioned image,
-but only an exact stable `vMAJOR.MINOR.PATCH` release may move `latest` or
-`mainnet`. A candidate or any unrecognized version shape remains version-only,
-so publishing an image for rehearsal cannot change either production alias.
+whole SHA and `shell-analysis` holds it to that. The same gate requires both
+release jobs to resolve their version with `release-trigger-tag.sh` from the
+exact `github.ref`/`github.ref_name` pair that caused the run. Repository tag
+discovery is forbidden because a stable tag and a candidate tag can point at
+the same commit without identifying which one triggered the workflow. The
+publisher then passes that single identity to `release-docker-tags.sh`: every
+tag publishes a versioned image, but only an exact stable
+`vMAJOR.MINOR.PATCH` release may move `latest` or `mainnet`. The GitHub Release
+prerelease decision consumes the same identity. A candidate or any
+unrecognized version shape remains version-only, so publishing an image for
+rehearsal cannot change either production alias.
 The fleet capture also refuses an armed cutover block that is not the rehearsed
 C, or a protocol epoch that is not the one the reviewed manifest was derived
 for. The record is

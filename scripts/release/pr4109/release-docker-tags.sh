@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 
-# Selects the Docker tags published for one release tag. Every release gets a
-# versioned image. Only an exact stable vMAJOR.MINOR.PATCH release may move the
-# mutable latest and mainnet aliases; a prerelease or any unrecognized version
-# shape is isolated to its versioned tag.
+# Selects the Docker tags published for one release tag. The release workflow
+# supplies the exact triggering tag after release-trigger-tag.sh validates its
+# GitHub ref identity. Every release gets a versioned image. Only an exact
+# stable vMAJOR.MINOR.PATCH release may move the mutable latest and mainnet
+# aliases; a prerelease or any unrecognized version shape is isolated to its
+# versioned tag.
 
 set -euo pipefail
 

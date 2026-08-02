@@ -14,14 +14,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Fetch the whole history for the `git describe` command to work.
+          # Release notes need the previous tag and its history.
           fetch-depth: 0
 
-      - name: Resolve versions
+      - name: Resolve release identity
+        env:
+          RELEASE_TRIGGER_REF: ${{ github.ref }}
+          RELEASE_TRIGGER_TAG: ${{ github.ref_name }}
         run: |
-          echo "version=$(git describe --tags --match 'v[0-9]*' HEAD)" \
-            >> $GITHUB_ENV
-          echo "revision=$(git rev-parse HEAD)" >> $GITHUB_ENV
+          version="$(./scripts/release/pr4109/release-trigger-tag.sh "${RELEASE_TRIGGER_REF}" "${RELEASE_TRIGGER_TAG}")"
+          echo "version=${version}" >> "${GITHUB_ENV}"
+          echo "revision=$(git rev-parse HEAD)" >> "${GITHUB_ENV}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -124,13 +127,17 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Resolve versions
-        run: |
-          echo "version=$(git describe --tags --match 'v[0-9]*' HEAD)" >> $GITHUB_ENV
-          echo "revision=$(git rev-parse HEAD)" >> $GITHUB_ENV
-          echo "dockerhub_org=${DOCKERHUB_ORG:-thresholdnetwork}" >> $GITHUB_ENV
+      - name: Resolve release identity
         env:
+          RELEASE_TRIGGER_REF: ${{ github.ref }}
+          RELEASE_TRIGGER_TAG: ${{ github.ref_name }}
           DOCKERHUB_ORG: ${{ secrets.DOCKERHUB_ORG }}
+        run: |
+          version="$(./scripts/release/pr4109/release-trigger-tag.sh "${RELEASE_TRIGGER_REF}" "${RELEASE_TRIGGER_TAG}")"
+          # shellcheck disable=SC2129
+          echo "version=${version}" >> "${GITHUB_ENV}"
+          echo "revision=$(git rev-parse HEAD)" >> "${GITHUB_ENV}"
+          echo "dockerhub_org=${DOCKERHUB_ORG:-thresholdnetwork}" >> "${GITHUB_ENV}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -154,8 +161,7 @@ jobs:
         run: |
           {
             echo 'tags<<EOF'
-            ./scripts/release/pr4109/release-docker-tags.sh \
-              "${dockerhub_org}" "${version}"
+            ./scripts/release/pr4109/release-docker-tags.sh "${dockerhub_org}" "${version}"
             echo 'EOF'
           } >> "${GITHUB_OUTPUT}"
 

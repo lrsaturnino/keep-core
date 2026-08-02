@@ -2692,19 +2692,73 @@ run_provenance_wiring "${T}"
 check "provenance wiring: a commit carrying no rehearsal workflow fails" 1 \
   "carries no \.github/workflows/cutover-rehearsal\.yml"
 
-# The release publisher has one tested source of Docker tags. The workflow
-# fixtures below prove the wiring check rejects every way the publisher could
-# bypass that source and move a stable alias during a prerelease.
+# The release jobs derive one identity from the exact triggering tag, and the
+# publisher has one tested source of Docker tags. The workflow fixtures below
+# prove the wiring check rejects repository tag discovery in either job, a
+# selector that receives anything but the resolved trigger identity, a GitHub
+# release decision made from another value, and every way the publisher could
+# bypass the selector and move a stable alias during a prerelease.
+write_release_identity_step() {
+  local identity_source="$1"
+
+  case "${identity_source}" in
+  trigger | trigger-overwritten)
+    printf '      - name: Resolve release identity\n'
+    printf '        env:\n'
+    # Workflow expressions and shell variables are fixture text.
+    # shellcheck disable=SC2016
+    printf '          RELEASE_TRIGGER_REF: ${{ github.ref }}\n'
+    # shellcheck disable=SC2016
+    printf '          RELEASE_TRIGGER_TAG: ${{ github.ref_name }}\n'
+    printf '        run: |\n'
+    # shellcheck disable=SC2016
+    printf '          version="$(./%s "${RELEASE_TRIGGER_REF}" "${RELEASE_TRIGGER_TAG}")"\n' \
+      "${RELEASE_TRIGGER_TAG_RESOLVER}"
+    # shellcheck disable=SC2016
+    printf '          echo "version=${version}" >> "${GITHUB_ENV}"\n'
+    if [[ "${identity_source}" == "trigger-overwritten" ]]; then
+      # shellcheck disable=SC2016
+      printf '          echo "version=v1.2.3" >> "${GITHUB_ENV}"\n'
+    fi
+    ;;
+  describe)
+    printf '      - name: Resolve release identity\n'
+    printf '        run: |\n'
+    # shellcheck disable=SC2016
+    printf '          echo "version=$(git describe --tags HEAD)" >> "${GITHUB_ENV}"\n'
+    ;;
+  *)
+    echo "unknown release identity fixture source [${identity_source}]" >&2
+    return 1
+    ;;
+  esac
+}
+
 write_release_tag_workflow() {
-  local repo="$1" invoke_selector="$2" consume_output="$3"
-  local literal_alias="$4" selector_id="$5"
+  local repo="$1" build_identity="$2" publish_identity="$3"
+  local invoke_selector="$4" consume_output="$5" literal_alias="$6"
+  local selector_id="$7" selector_input="$8" prerelease_input="$9"
 
   mkdir -p "${repo}/.github/workflows"
   {
     printf 'name: Release\non:\n  push:\n    tags:\n      - "v*"\n'
     printf 'jobs:\n  %s:\n    runs-on: ubuntu-latest\n    steps:\n' \
+      "${RELEASE_BUILD_JOB}"
+    printf '      - uses: actions/checkout@v4\n'
+    write_release_identity_step "${build_identity}"
+    printf '      - uses: %s@v2\n        with:\n' \
+      "${RELEASE_GITHUB_RELEASE_ACTION}"
+    if [[ "${prerelease_input}" == "version" ]]; then
+      # The workflow expression is fixture text, not a shell expansion.
+      printf "          prerelease: \${{ contains(env.version, '-') }}\n"
+    else
+      printf '          prerelease: false\n'
+    fi
+
+    printf '  %s:\n    runs-on: ubuntu-latest\n    steps:\n' \
       "${RELEASE_PUBLISH_JOB}"
     printf '      - uses: actions/checkout@v4\n'
+    write_release_identity_step "${publish_identity}"
     printf '      - name: Resolve Docker tags\n'
     if [[ "${selector_id}" == "yes" ]]; then
       printf '        id: %s\n' "${RELEASE_DOCKER_TAG_STEP}"
@@ -2713,8 +2767,13 @@ write_release_tag_workflow() {
     if [[ "${invoke_selector}" == "yes" ]]; then
       # GITHUB_OUTPUT is fixture text, not a variable in this test process.
       # shellcheck disable=SC2016
-      printf '          ./%s thresholdnetwork v1.2.3 >> "$GITHUB_OUTPUT"\n' \
-        "${RELEASE_DOCKER_TAG_SELECTOR}"
+      if [[ "${selector_input}" == "version" ]]; then
+        printf '          ./%s thresholdnetwork "${version}" >> "$GITHUB_OUTPUT"\n' \
+          "${RELEASE_DOCKER_TAG_SELECTOR}"
+      else
+        printf '          ./%s thresholdnetwork v1.2.3 >> "$GITHUB_OUTPUT"\n' \
+          "${RELEASE_DOCKER_TAG_SELECTOR}"
+      fi
     else
       # shellcheck disable=SC2016
       printf '          echo "tags=thresholdnetwork/keep-client:v1.2.3" >> "$GITHUB_OUTPUT"\n'
@@ -2761,34 +2820,65 @@ run_release_tag_isolation() {
 }
 
 T="${WORK}/release-tags-isolated"
-make_release_tag_repo "${T}" yes yes no yes
+make_release_tag_repo "${T}" trigger trigger yes yes no yes version version
 run_release_tag_isolation "${T}"
 check "release tags: tested selector output is the only publication source" \
-  0 "prereleases remain version-only"
+  0 "both release jobs derive identity from the exact triggering tag" \
+  "prereleases remain version-only"
 
 T="${WORK}/release-tags-selector-bypassed"
-make_release_tag_repo "${T}" no yes no yes
+make_release_tag_repo "${T}" trigger trigger no yes no yes version version
 run_release_tag_isolation "${T}"
 check "release tags: a publisher bypassing the selector fails" 1 \
-  "does not invoke ${RELEASE_DOCKER_TAG_SELECTOR}"
+  "invokes ${RELEASE_DOCKER_TAG_SELECTOR} \[0\] times"
 
 T="${WORK}/release-tags-output-unused"
-make_release_tag_repo "${T}" yes no no yes
+make_release_tag_repo "${T}" trigger trigger yes no no yes version version
 run_release_tag_isolation "${T}"
 check "release tags: an unused selector output fails" 1 \
   "instead of the complete output of ${RELEASE_DOCKER_TAG_STEP}"
 
 T="${WORK}/release-tags-literal-alias"
-make_release_tag_repo "${T}" yes yes yes yes
+make_release_tag_repo "${T}" trigger trigger yes yes yes yes version version
 run_release_tag_isolation "${T}"
 check "release tags: a hard-coded stable alias fails" 1 \
   "hard-codes a mutable Docker alias"
 
 T="${WORK}/release-tags-selector-id-missing"
-make_release_tag_repo "${T}" yes yes no no
+make_release_tag_repo "${T}" trigger trigger yes yes no no version version
 run_release_tag_isolation "${T}"
 check "release tags: an unaddressable selector output fails" 1 \
   "0 steps with id ${RELEASE_DOCKER_TAG_STEP}"
+
+T="${WORK}/release-tags-build-describe"
+make_release_tag_repo "${T}" describe trigger yes yes no yes version version
+run_release_tag_isolation "${T}"
+check "release tags: build job repository tag discovery fails closed" 1 \
+  "${RELEASE_BUILD_JOB} job derives the release version with git describe"
+
+T="${WORK}/release-tags-publish-describe"
+make_release_tag_repo "${T}" trigger describe yes yes no yes version version
+run_release_tag_isolation "${T}"
+check "release tags: publish job repository tag discovery fails closed" 1 \
+  "${RELEASE_PUBLISH_JOB} job derives the release version with git describe"
+
+T="${WORK}/release-tags-publish-trigger-overwritten"
+make_release_tag_repo "${T}" trigger trigger-overwritten yes yes no yes version version
+run_release_tag_isolation "${T}"
+check "release tags: a later version export cannot replace the trigger" 1 \
+  "writes a release version to GITHUB_ENV outside the exact triggering-tag export"
+
+T="${WORK}/release-tags-selector-literal-version"
+make_release_tag_repo "${T}" trigger trigger yes yes no yes literal version
+run_release_tag_isolation "${T}"
+check "release tags: selector not receiving triggering identity fails" 1 \
+  "does not pass the exact triggering-tag version"
+
+T="${WORK}/release-tags-prerelease-literal"
+make_release_tag_repo "${T}" trigger trigger yes yes no yes version literal
+run_release_tag_isolation "${T}"
+check "release tags: GitHub prerelease decision not using trigger fails" 1 \
+  "derives prerelease from \[false\] instead of the exact triggering-tag identity"
 
 # ----------------------------------------------------------------------------
 

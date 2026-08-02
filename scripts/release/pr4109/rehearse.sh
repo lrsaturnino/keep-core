@@ -979,9 +979,12 @@ ${REHEARSAL_WORKFLOW}'s ${SOLIDITY_PROOFS_JOB} job both pin Node ${ci_version}"
 
 # The workflow that builds the artifact a cutover record binds its identity to.
 RELEASE_WORKFLOW=".github/workflows/release.yml"
+RELEASE_BUILD_JOB="build-and-release"
 RELEASE_PUBLISH_JOB="publish-docker-images"
+RELEASE_GITHUB_RELEASE_ACTION="softprops/action-gh-release"
 RELEASE_DOCKER_TAG_STEP="docker-tags"
 RELEASE_DOCKER_TAG_SELECTOR="scripts/release/pr4109/release-docker-tags.sh"
+RELEASE_TRIGGER_TAG_RESOLVER="scripts/release/pr4109/release-trigger-tag.sh"
 
 # The released artifact must name its source commit exactly.
 #
@@ -1028,26 +1031,133 @@ every artifact it builds ($(printf '%s\n' "${stamps}" | wc -l | tr -d ' ') \
 assignment(s))"
 }
 
+# Verify one release job derives its version only from the exact tag ref that
+# triggered the workflow. A commit may carry both a stable tag and a release-
+# candidate tag, so repository tag discovery cannot identify the release the
+# runner is processing. Both jobs must resolve the same GitHub event fields
+# through the fail-closed helper and publish that exact result as `version`.
+verify_release_job_trigger_identity() {
+  local content="$1" job="$2" i body
+  local trigger_ref_bindings=0 trigger_tag_bindings=0
+  local resolver_invocations=0 version_exports=0 version_env_writes=0
+  local expected_ref_binding="RELEASE_TRIGGER_REF: \${{ github.ref }}"
+  local expected_tag_binding="RELEASE_TRIGGER_TAG: \${{ github.ref_name }}"
+  local expected_version_export="echo \"version=\${version}\" >> \"\${GITHUB_ENV}\""
+  local expected_image_label="version=\${{ env.version }}"
+  local resolver_assignment="version=\"\$("
+  local trigger_ref_argument="\"\${RELEASE_TRIGGER_REF}\""
+  local trigger_tag_argument="\"\${RELEASE_TRIGGER_TAG}\""
+
+  yaml_index_lines "${RELEASE_WORKFLOW}" "${content}"
+  yaml_locate_job "${RELEASE_WORKFLOW}" "${job}"
+
+  for ((i = YAML_JOB_START; i < YAML_JOB_END; i++)); do
+    body="${YAML_BODIES[i]}"
+
+    [[ "${body}" == "${expected_ref_binding}" ]] &&
+      trigger_ref_bindings=$((trigger_ref_bindings + 1))
+    [[ "${body}" == "${expected_tag_binding}" ]] &&
+      trigger_tag_bindings=$((trigger_tag_bindings + 1))
+
+    if [[ "${body}" == *"version="* && "${body}" == *'git describe'* ]]; then
+      fail "${RELEASE_WORKFLOW}'s ${job} job derives the release version with \
+git describe on line $((i + 1)); a commit can carry stable and prerelease \
+tags simultaneously, so the release identity must come from the exact \
+triggering tag"
+    fi
+
+    if [[ "${body}" == *'version='* && "${body}" == *'GITHUB_ENV'* ]]; then
+      version_env_writes=$((version_env_writes + 1))
+      if [[ "${body}" == "${expected_version_export}" ]]; then
+        version_exports=$((version_exports + 1))
+      else
+        fail "${RELEASE_WORKFLOW}'s ${job} job writes a release version to \
+GITHUB_ENV outside the exact triggering-tag export on line $((i + 1)); a \
+later write can replace the identity the resolver proved"
+      fi
+    fi
+
+    if [[ "${body}" == version:* ]]; then
+      fail "${RELEASE_WORKFLOW}'s ${job} job declares a separate version \
+environment value on line $((i + 1)); the triggering-tag resolver must be the \
+only release-identity source"
+    fi
+    if [[ "${body}" == version=* &&
+      "${body}" != *"./${RELEASE_TRIGGER_TAG_RESOLVER}"* &&
+      "${body}" != "${expected_image_label}" ]]; then
+      fail "${RELEASE_WORKFLOW}'s ${job} job reassigns version outside the \
+triggering-tag resolver on line $((i + 1)); the selector and release action \
+must consume the identity the resolver returned"
+    fi
+
+    if [[ "${body}" == *"./${RELEASE_TRIGGER_TAG_RESOLVER}"* ]]; then
+      resolver_invocations=$((resolver_invocations + 1))
+      if [[ "${body}" != *"${resolver_assignment}"* ||
+        "${body}" != *"${trigger_ref_argument}"* ||
+        "${body}" != *"${trigger_tag_argument}"* ]]; then
+        fail "${RELEASE_WORKFLOW}'s ${job} job does not assign version from \
+${RELEASE_TRIGGER_TAG_RESOLVER} with both exact triggering-ref inputs on line \
+$((i + 1))"
+      fi
+    fi
+  done
+
+  ((trigger_ref_bindings == 1)) ||
+    fail "${RELEASE_WORKFLOW}'s ${job} job binds RELEASE_TRIGGER_REF to \
+github.ref [${trigger_ref_bindings}] times; exactly one binding is required"
+  ((trigger_tag_bindings == 1)) ||
+    fail "${RELEASE_WORKFLOW}'s ${job} job binds RELEASE_TRIGGER_TAG to \
+github.ref_name [${trigger_tag_bindings}] times; exactly one binding is \
+required"
+  ((resolver_invocations == 1)) ||
+    fail "${RELEASE_WORKFLOW}'s ${job} job invokes \
+${RELEASE_TRIGGER_TAG_RESOLVER} [${resolver_invocations}] times; exactly one \
+invocation must derive its release identity"
+  ((version_exports == 1)) ||
+    fail "${RELEASE_WORKFLOW}'s ${job} job exports the resolved triggering tag \
+as version [${version_exports}] times; exactly one GITHUB_ENV export is \
+required"
+  ((version_env_writes == 1)) ||
+    fail "${RELEASE_WORKFLOW}'s ${job} job writes version to GITHUB_ENV \
+[${version_env_writes}] times; exactly one triggering-tag export is required"
+}
+
 # A prerelease image must be available by its versioned tag without moving the
 # mutable aliases operators use for stable production releases. The release
-# workflow therefore delegates its complete tag set to one tested selector:
-# exact vMAJOR.MINOR.PATCH tags receive the stable aliases and every other
-# accepted Docker tag receives only its versioned name.
+# workflow therefore derives one identity from the triggering tag in both
+# release jobs and delegates its complete Docker tag set to one tested
+# selector: exact vMAJOR.MINOR.PATCH tags receive the stable aliases and every
+# other accepted Docker tag receives only its versioned name. The GitHub
+# release prerelease decision must consume that same identity.
 verify_release_candidate_tag_isolation() {
-  local content i body selector_steps raw_tags expected_tags
+  local content i body selector_steps selector_invocations
+  local raw_tags expected_tags raw_prerelease expected_prerelease
+  local version_argument="\"\${version}\""
   content="$(git -C "${REPO_ROOT}" show "HEAD:${RELEASE_WORKFLOW}" \
     2>/dev/null)" ||
     fail "the commit under test carries no ${RELEASE_WORKFLOW}; there is no \
 release publication path to verify for prerelease alias isolation"
 
+  verify_release_job_trigger_identity "${content}" "${RELEASE_BUILD_JOB}"
+  verify_release_job_trigger_identity "${content}" "${RELEASE_PUBLISH_JOB}"
+
   yaml_index_lines "${RELEASE_WORKFLOW}" "${content}"
   yaml_locate_job "${RELEASE_WORKFLOW}" "${RELEASE_PUBLISH_JOB}"
 
   selector_steps=0
+  selector_invocations=0
   for ((i = YAML_JOB_START; i < YAML_JOB_END; i++)); do
     body="${YAML_BODIES[i]}"
     [[ "${body}" == "id: ${RELEASE_DOCKER_TAG_STEP}" ]] &&
       selector_steps=$((selector_steps + 1))
+
+    if [[ "${body}" == *"./${RELEASE_DOCKER_TAG_SELECTOR}"* ]]; then
+      selector_invocations=$((selector_invocations + 1))
+      [[ "${body}" == *"${version_argument}"* ]] ||
+        fail "${RELEASE_WORKFLOW}'s ${RELEASE_PUBLISH_JOB} job does not pass \
+the exact triggering-tag version to ${RELEASE_DOCKER_TAG_SELECTOR} on line \
+$((i + 1))"
+    fi
 
     if [[ "${body}" == *':latest'* || "${body}" == *':mainnet'* ]]; then
       fail "${RELEASE_WORKFLOW}'s ${RELEASE_PUBLISH_JOB} job hard-codes a \
@@ -1062,11 +1172,10 @@ off latest and mainnet"
 ${selector_steps} steps with id ${RELEASE_DOCKER_TAG_STEP}; exactly one step \
 must resolve the complete tag set"
 
-  yaml_body_carries "${YAML_JOB_START}" "${YAML_JOB_END}" \
-    "./${RELEASE_DOCKER_TAG_SELECTOR}" ||
-    fail "${RELEASE_WORKFLOW}'s ${RELEASE_PUBLISH_JOB} job does not invoke \
-${RELEASE_DOCKER_TAG_SELECTOR}; prerelease isolation is no longer decided by \
-the selector this gate tests"
+  ((selector_invocations == 1)) ||
+    fail "${RELEASE_WORKFLOW}'s ${RELEASE_PUBLISH_JOB} job invokes \
+${RELEASE_DOCKER_TAG_SELECTOR} [${selector_invocations}] times; exactly one \
+invocation must decide the complete published tag set"
 
   yaml_body_carries "${YAML_JOB_START}" "${YAML_JOB_END}" 'GITHUB_OUTPUT' ||
     fail "${RELEASE_WORKFLOW}'s ${RELEASE_PUBLISH_JOB} job does not write the \
@@ -1089,8 +1198,27 @@ ${RELEASE_PUBLISH_JOB} job publishes [${raw_tags}] instead of the complete \
 output of ${RELEASE_DOCKER_TAG_STEP}; another tag source could move stable \
 aliases during a prerelease"
 
-  note "release tags: ${RELEASE_WORKFLOW} publishes exactly the tag set from \
-${RELEASE_DOCKER_TAG_SELECTOR}; prereleases remain version-only"
+  yaml_index_lines "${RELEASE_WORKFLOW}" "${content}"
+  yaml_locate_job "${RELEASE_WORKFLOW}" "${RELEASE_BUILD_JOB}"
+  yaml_locate_action_step "${RELEASE_WORKFLOW}" \
+    "${RELEASE_GITHUB_RELEASE_ACTION}" "${YAML_JOB_START}" "${YAML_JOB_END}"
+  raw_prerelease="$(yaml_step_input prerelease)" ||
+    fail "the ${RELEASE_GITHUB_RELEASE_ACTION} step in ${RELEASE_WORKFLOW}'s \
+${RELEASE_BUILD_JOB} job makes no prerelease decision"
+  raw_prerelease="${raw_prerelease#"${raw_prerelease%%[![:space:]]*}"}"
+  raw_prerelease="${raw_prerelease%"${raw_prerelease##*[![:space:]]}"}"
+
+  # The expression is workflow syntax, not a shell expansion.
+  # shellcheck disable=SC2016
+  expected_prerelease="\${{ contains(env.version, '-') }}"
+  [[ "${raw_prerelease}" == "${expected_prerelease}" ]] ||
+    fail "the ${RELEASE_GITHUB_RELEASE_ACTION} step in ${RELEASE_WORKFLOW}'s \
+${RELEASE_BUILD_JOB} job derives prerelease from [${raw_prerelease}] instead \
+of the exact triggering-tag identity [${expected_prerelease}]"
+
+  note "release tags: both release jobs derive identity from the exact \
+triggering tag; ${RELEASE_WORKFLOW} publishes exactly the tag set from \
+${RELEASE_DOCKER_TAG_SELECTOR}, and prereleases remain version-only"
 }
 
 # The dispatch input a release run hands the detached provenance in, the
