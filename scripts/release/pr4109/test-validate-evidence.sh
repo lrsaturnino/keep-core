@@ -52,6 +52,15 @@ export PR4109_EVIDENCE_SELFTEST=1
 # shellcheck source=/dev/null
 source "${TEST_DIR}/rehearse.sh"
 
+# The helpers below that are reached only through a dispatch the analyzer
+# cannot follow are suppressed under both SC2317 and SC2329. ShellCheck
+# reports that one false positive under a different code either side of
+# 0.11.0, the release that added SC2329 — before it the finding lands on
+# the function's body as SC2317, from it on the definition as SC2329 — and
+# shell-analysis runs under whatever version the runner image ships rather
+# than a pinned one, so naming only the code the local version emits leaves
+# the gate failing under the other.
+
 # The stage reads these from the environment; the container running the proof
 # stages exports them, and every case below sets what it needs explicitly, so
 # an ambient value must never decide a verdict here.
@@ -2151,7 +2160,7 @@ set +e
     : >"${SAMPLER_FETCH_LOG}"
 
     # Invoked indirectly by sample_quarantine_preservation_signals.
-    # shellcheck disable=SC2329
+    # shellcheck disable=SC2317,SC2329
     probe_metrics() {
       local service="$1" base metric offset
       printf '%s\n' "${service}" >>"${SAMPLER_FETCH_LOG}"
@@ -2379,7 +2388,7 @@ restart_recovery_case() {
   set -e
   RECOVERY_CASE=""
 
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   compose() {
     [[ "$1" == "start" && "$2" == "r1-node-1" ]] ||
       return 99
@@ -2387,13 +2396,13 @@ restart_recovery_case() {
     return 0
   }
 
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   node_reachable() {
     [[ "$1" == "r1-node-1" ]] || return 1
     [[ "${RECOVERY_CASE}" == "success" ]]
   }
 
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   probe_metrics() {
     [[ "$1" == "r1-node-1" && "${RECOVERY_CASE}" == "success" ]] ||
       return 1
@@ -3191,7 +3200,7 @@ RESOLVER_PLATFORM_RC=0
 
 # The two questions the resolver asks the daemon, answered from nothing but the
 # fixture above.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 docker() {
   case "$1 $2" in
   "manifest inspect")
@@ -3769,7 +3778,7 @@ CASE_OUT="$(
     # Serves only internal, unprefixed names — the exposition of a node the
     # probe is asking the wrong questions of. Invoked through the reader
     # under test, which shellcheck cannot see across.
-    # shellcheck disable=SC2329
+    # shellcheck disable=SC2317,SC2329
     probe_metrics() { printf 'participation_gate_state 7 1769040000000\n'; }
     observe_gate_gauges r1-node-1
   ) 2>&1
@@ -3842,7 +3851,7 @@ read_terminal_outcomes() {
     (
       # Invoked through the reader under test, which shellcheck cannot see
       # across the source boundary into rehearse.sh.
-      # shellcheck disable=SC2329
+      # shellcheck disable=SC2317,SC2329
       probe_diagnostics() { printf '%s' "${state}"; }
       service_terminal_outcomes r1-node-1
     ) 2>&1
@@ -4227,7 +4236,7 @@ held_permit_identities() {
 
 # The collector reaches this by name rather than through anything an analyzer
 # can follow from here, which is the whole point of overriding it.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 sleep() {
   SECONDS=$((SECONDS + 60))
 }
@@ -4660,7 +4669,7 @@ SAVED_R1_SERVICES=("${REHEARSAL_R1_SERVICES[@]}")
 REHEARSAL_R1_SERVICES=("r1-node-1" "r1-node-2")
 PROVENANCE_OUT="$(
   (
-    # shellcheck disable=SC2329
+    # shellcheck disable=SC2317,SC2329
     probe_diagnostics() {
       local instance="0123456789abcdef0123456789abcdef"
       if [[ "$1" == r1-node-1 ]]; then
@@ -4692,7 +4701,7 @@ SAVED_R1_SERVICES=("${REHEARSAL_R1_SERVICES[@]}")
 REHEARSAL_R1_SERVICES=("r1-node-1" "r1-node-2")
 ACCOUNT_OUT="$(
   (
-    # shellcheck disable=SC2329
+    # shellcheck disable=SC2317,SC2329
     probe_diagnostics() {
       printf '{"protocol_participation":{"active_permits":['
       if [[ "$1" == r1-node-1 ]]; then
@@ -4733,7 +4742,7 @@ SAVED_R1_SERVICES=("${REHEARSAL_R1_SERVICES[@]}")
 REHEARSAL_R1_SERVICES=("r1-node-1")
 ACCOUNT_OUT="$(
   (
-    # shellcheck disable=SC2329
+    # shellcheck disable=SC2317,SC2329
     probe_diagnostics() { return 1; }
     fleet_account_snapshot
   ) 2>/dev/null
@@ -4755,7 +4764,7 @@ REHEARSAL_R1_SERVICES=("r1-node-1")
 set +e
 CASE_OUT="$(
   (
-    # shellcheck disable=SC2329
+    # shellcheck disable=SC2317,SC2329
     probe_diagnostics() {
       printf '{"protocol_participation":{"active_permits":['
       printf '{"ceremony":"tbtc_dkg","mode":"legacy",'
@@ -4781,7 +4790,7 @@ REHEARSAL_R1_SERVICES=("r1-node-1")
 set +e
 CASE_OUT="$(
   (
-    # shellcheck disable=SC2329
+    # shellcheck disable=SC2317,SC2329
     probe_diagnostics() { return 1; }
     fleet_terminal_outcomes
   ) 2>&1
@@ -4888,7 +4897,7 @@ homogeneous_fleet() { :; }
 # one — can see that the fleet is not one release under test.
 mixed_release_fleet() {
   # Installed into the capture's subshell, which shellcheck cannot follow.
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   probe_diagnostics() {
     if [[ "$1" == "r1-node-2" ]]; then
       diagnostics_document "${FIXTURE_SHA}" security_v2_cutover 9000000 \
@@ -4901,7 +4910,7 @@ mixed_release_fleet() {
 
 # A homogeneous fleet built from bytes this run is not bound to.
 foreign_revision_fleet() {
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   probe_diagnostics() { diagnostics_document "$(printf 'd%.0s' {1..40})"; }
 }
 
@@ -4909,7 +4918,7 @@ foreign_revision_fleet() {
 # and refusal it produces is evidence about a cutover this record does not
 # describe.
 wrong_cutover_fleet() {
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   probe_diagnostics() {
     diagnostics_document "${FIXTURE_SHA}" security_v2_cutover 8000000
   }
@@ -4931,7 +4940,7 @@ check "a fleet built from bytes this run is not bound to refuses the run" 3 \
 # used to pass, because the comparison asked whether the attested SHA started
 # with what the node reported — which the empty string also satisfies.
 abbreviated_revision_fleet() {
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   probe_diagnostics() { diagnostics_document "${FIXTURE_SHA:0:7}"; }
 }
 
@@ -4940,7 +4949,7 @@ check "a fleet naming the bound commit only in abbreviation refuses the run" \
   3 "does not name that commit exactly"
 
 silent_revision_fleet() {
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   probe_diagnostics() { diagnostics_document ""; }
 }
 
@@ -4953,7 +4962,7 @@ check "a fleet reporting no revision at all refuses the run" 3 \
 # block is a count on one chain, so a fleet on another chain crossed a
 # different schedule.
 wrong_chain_fleet() {
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   probe_diagnostics() {
     diagnostics_document "${FIXTURE_SHA}" security_v2_cutover 9000000 \
       v2.0.0-rehearsal 1
@@ -4965,7 +4974,7 @@ check "a fleet connected to another chain refuses the run" 3 \
   "connected to Ethereum chain \[1\]"
 
 silent_chain_fleet() {
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   probe_diagnostics() {
     diagnostics_document "${FIXTURE_SHA}" security_v2_cutover 9000000 \
       v2.0.0-rehearsal ""
@@ -4983,7 +4992,7 @@ check "a fleet armed with another cutover block refuses the run" 3 \
 # A release whose epoch is not the one the reviewed manifest was derived for:
 # every bound this run measures it against was computed for something else.
 wrong_epoch_fleet() {
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   probe_diagnostics() { diagnostics_document "${FIXTURE_SHA}" legacy_epoch; }
 }
 
@@ -5015,7 +5024,7 @@ FIXTURE_RECEIPT_BLOCK="0x1"
 FIXTURE_RECEIPT_ABSENT=""
 FIXTURE_RPC_BODY=""
 
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 chain_rpc() {
   if [[ -n "${FIXTURE_RPC_BODY}" ]]; then
     printf '%s' "${FIXTURE_RPC_BODY}"
@@ -5119,7 +5128,7 @@ FIXTURE_VOLUMES="/mnt/storage"
 FIXTURE_CP_RC=0
 FIXTURE_STORAGE="${WORK}/fixture-storage"
 
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 compose() {
   case "$1" in
   create) return "${FIXTURE_CREATE_RC}" ;;
@@ -5130,7 +5139,7 @@ compose() {
 
 # The subset of the daemon the two functions under test speak to, dispatched
 # on the same shapes they call it with.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 docker() {
   case "$1" in
   image)
@@ -5328,7 +5337,7 @@ AUDIT_TOOL_STATUS=0
 AUDIT_TOOL_MANIFEST=""
 AUDIT_IDENTITY_STATUS=3
 AUDIT_IDENTITY_MANIFEST='{"consistent":true,"snapshot":{"aggregate_sha256":"deadbeef"}}'
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 go() {
   local argument previous="" output="" authorizing=0
   for argument in "$@"; do
@@ -8195,7 +8204,7 @@ quiesce_sequencing_stubs() {
   # The reading taken before the stop is issued, which is the only one the
   # control still takes a field at a time: it needs a held permit there, or the
   # ladder stops at "nothing was in flight" before reaching the anchors.
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   participation_field() {
     case "$2" in
     gate_state) printf 'quiescing' ;;
@@ -8214,7 +8223,7 @@ quiesce_sequencing_stubs() {
   QUIESCE_SEQ_REFUSED_BY_CEREMONY="${WORK}/quiesce-seq-refused-ceremony"
   rm -f "${QUIESCE_SEQ_REFUSED}" "${QUIESCE_SEQ_REFUSED_BY_CEREMONY}"
 
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   metric_value() {
     case "$2" in
     participation_refusals_total)
@@ -8228,7 +8237,7 @@ quiesce_sequencing_stubs() {
     *) printf '0' ;;
     esac
   }
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   ceremony_refusal_counters() {
     if [[ -f "${QUIESCE_SEQ_REFUSED_BY_CEREMONY}" ]]; then
       printf 'tbtc_signing=1'
@@ -8237,11 +8246,11 @@ quiesce_sequencing_stubs() {
       printf 'tbtc_signing=0'
     fi
   }
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   manifest_termination_grace() { printf '4'; }
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   compose() { return 0; }
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   node_reachable() { return 1; }
 
   # The gate's own list of what it is holding, which the control reads beside
@@ -8249,7 +8258,7 @@ quiesce_sequencing_stubs() {
   # node; the other mode stands for a permit live beside it, which the seeded
   # control requires and a mutation can take away.
   QUIESCE_SEQ_COLIVE="r1-node-1@tbtc_signing@1200@colive900#other-1"
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   node_mode_permits() {
     case "$2" in
     legacy)
@@ -8272,7 +8281,7 @@ quiesce_sequencing_stubs() {
   # population it goes on to drain rather than a second one beside it.
   QUIESCE_SEQ_SEEDED=0
 
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   run_work_driver() {
     WORK_DRIVER_RC=0
     WORK_DRIVER_TX_COUNT=1
@@ -8306,7 +8315,7 @@ ${QUIESCE_SEQ_COLIVE_TERMINAL}"
 #
 # Invoked by the control under test, which shellcheck cannot see across the
 # source boundary into rehearse.sh.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 quiesce_stub_snapshot() {
   service_gate_snapshot() {
     printf 'state=quiescing\nactive=0\noutcomes=%s\n' "$(quiesce_seq_endings)"
@@ -8471,7 +8480,7 @@ quiesce_race_case() {
   : >"${QUIESCE_RACE_FETCHES}"
   # Invoked by the reader under test, which shellcheck cannot see across the
   # source boundary into rehearse.sh.
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   probe_diagnostics() {
     printf 'x' >>"${QUIESCE_RACE_FETCHES}"
     if (($(wc -c <"${QUIESCE_RACE_FETCHES}") > QUIESCE_RACE_ANSWERS)); then
