@@ -15,6 +15,28 @@ CODEOWNERS
 Dockerfile
 *.adoc
 
+# ...except the files under those trees that the client's own tests open at
+# run time: the release manifest, the schemas its records are validated
+# against, the deployment scaffolds its termination grace is compared to, and
+# the metrics reference the participation family is held to. Those tests
+# execute inside this image, so a file one of them reads has to reach the
+# context or the test fails there and nowhere else. Nothing else under docs/
+# or scripts/ does.
+#
+# Every file is named rather than the two directories holding them, so a file
+# added beside one of these does not reach the build on its own.
+#
+# Listed after every rule above that could match them rather than beside the
+# rule each excepts, because the last matching entry is the one that decides.
+!docs/performance-metrics.adoc
+!scripts/release/pr4109/compose.rehearsal.yaml
+!scripts/release/pr4109/deploy/keep-client-termination-grace.k8s-patch.yaml
+!scripts/release/pr4109/deploy/keep-client-termination-grace.systemd-dropin.conf
+!scripts/release/pr4109/rehearsal-evidence.schema.json
+!scripts/release/pr4109/release-manifest.json
+!scripts/release/pr4109/release-manifest.schema.json
+!scripts/release/pr4109/release-provenance.schema.json
+
 # NPM stuff.
 **/node_modules/*
 

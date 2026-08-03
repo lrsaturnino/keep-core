@@ -445,6 +445,15 @@ dockerignore_excluded_path() {
   if [[ "${path}" =~ ^\.clusterfuzzlite(/|$) ]]; then
     return 1
   fi
+  # The files .dockerignore negates back out of docs/ and scripts/ for the
+  # tests that open them, which run inside the image: an absence here is the
+  # missing input those tests fail on, never the image's construction. Listed
+  # one for one with the negations so the two can be read against each other.
+  if [[ "${path}" =~ ^docs/performance-metrics\.adoc$ ]] ||
+    [[ "${path}" =~ ^scripts/release/pr4109/(compose\.rehearsal\.yaml|rehearsal-evidence\.schema\.json|release-manifest\.json|release-manifest\.schema\.json|release-provenance\.schema\.json)$ ]] ||
+    [[ "${path}" =~ ^scripts/release/pr4109/deploy/keep-client-termination-grace\.(k8s-patch\.yaml|systemd-dropin\.conf)$ ]]; then
+    return 1
+  fi
   [[ "${path}" =~ ^\.[^/]*(/|$) ]] && return 0
   [[ "${path}" =~ ^docs[^/]*/ ]] && return 0
   [[ "${path}" =~ ^(infrastructure|scripts|tmp|solidity|token-stakedrop|token-tracker)/ ]] &&
