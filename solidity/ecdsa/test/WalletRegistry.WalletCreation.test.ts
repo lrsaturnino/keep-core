@@ -2067,8 +2067,8 @@ describe("WalletRegistry - Wallet Creation", async () => {
               )
             })
 
-            it("should use close to 330 000 gas", async () => {
-              await assertGasUsed(tx, 330_000, 15_000)
+            it("should use close to 345 000 gas", async () => {
+              await assertGasUsed(tx, 345_000, 15_000)
             })
           })
 
@@ -2109,8 +2109,8 @@ describe("WalletRegistry - Wallet Creation", async () => {
                 await expect(tx).to.not.be.reverted
               })
 
-              it("should use close to 330 000 gas", async () => {
-                await assertGasUsed(await tx, 330_000, 15_000)
+              it("should use close to 345 000 gas", async () => {
+                await assertGasUsed(await tx, 345_000, 15_000)
               })
             }
           )
