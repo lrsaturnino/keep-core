@@ -513,11 +513,12 @@ func testDKGCutoverHomogeneousRealKeyGeneration(
 	}
 
 	// A block time roomy enough for the real key-generation transcript to
-	// complete within one attempt's protocol window, race detector included.
+	// complete within one attempt's protocol window under CI package
+	// parallelism, race detector included.
 	cutoverGroup := setupDKGCutoverGroup(
 		t,
 		groupParameters.GroupSize,
-		100*time.Millisecond,
+		200*time.Millisecond,
 	)
 
 	testData, err := tecdsatest.LoadPrivateKeyShareTestFixtures(
@@ -709,10 +710,13 @@ func TestDKGCutover_RealKeyGenerationExcludesSilentPeer(t *testing.T) {
 		HonestThreshold: 2,
 	}
 
+	// A block time roomy enough for the real key-generation transcript to
+	// complete within one attempt's protocol window under CI package
+	// parallelism, race detector included.
 	cutoverGroup := setupDKGCutoverGroup(
 		t,
 		groupParameters.GroupSize,
-		100*time.Millisecond,
+		200*time.Millisecond,
 	)
 
 	testData, err := tecdsatest.LoadPrivateKeyShareTestFixtures(
@@ -1292,10 +1296,13 @@ func TestDKGCutover_RealKeyGenerationExcludesLegacyPeerAtQuorum(t *testing.T) {
 		HonestThreshold: 2,
 	}
 
+	// A block time roomy enough for the real key-generation transcript to
+	// complete within one attempt's protocol window under CI package
+	// parallelism, race detector included.
 	cutoverGroup := setupDKGCutoverGroup(
 		t,
 		groupParameters.GroupSize,
-		100*time.Millisecond,
+		200*time.Millisecond,
 	)
 
 	testData, err := tecdsatest.LoadPrivateKeyShareTestFixtures(
