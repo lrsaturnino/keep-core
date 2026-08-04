@@ -9687,7 +9687,7 @@ fi
 GO_TRANSCRIPT_CEREMONIES="$(sed -n \
   '/^var transcriptContributionCeremonies/,/^}/p' \
   "${TEST_DIR}/../../../pkg/protocol/participation/quiescence.go" |
-  grep -oE '^\t[A-Za-z]+:' | tr -d '\t:' |
+  grep -oE $'^\t[A-Za-z]+:' | tr -d '\t:' |
   while IFS= read -r ceremony; do
     grep -oE "\b${ceremony}\s+Ceremony = \"[a-z_]+\"" \
       "${TEST_DIR}/../../../pkg/protocol/participation/gate.go" |
@@ -9718,7 +9718,7 @@ fi
 GO_REMAPPED_CEREMONIES="$(sed -n \
   '/^var permitSpaceMappingCeremonies/,/^}/p' \
   "${TEST_DIR}/../../../pkg/protocol/participation/quiescence.go" |
-  grep -oE '^\t[A-Za-z]+:' | tr -d '\t:' |
+  grep -oE $'^\t[A-Za-z]+:' | tr -d '\t:' |
   while IFS= read -r ceremony; do
     grep -oE "\b${ceremony}\s+Ceremony = \"[a-z_]+\"" \
       "${TEST_DIR}/../../../pkg/protocol/participation/gate.go" |
@@ -9811,7 +9811,7 @@ fi
 GO_SINGLE_SEAT_CEREMONIES="$(sed -n \
   '/^func ValidatePermitOperatedShape(/,/^}/p' \
   "${TEST_DIR}/../../../pkg/protocol/participation/quiescence.go" |
-  grep -m1 -E '^\tcase .*:$' | grep -oE '\b(Beacon|TBTC)[A-Za-z]+' |
+  grep -m1 -E $'^\tcase .*:$' | grep -oE '\b(Beacon|TBTC)[A-Za-z]+' |
   while IFS= read -r ceremony; do
     grep -oE "\b${ceremony}\s+Ceremony = \"[a-z_]+\"" \
       "${TEST_DIR}/../../../pkg/protocol/participation/gate.go" |
