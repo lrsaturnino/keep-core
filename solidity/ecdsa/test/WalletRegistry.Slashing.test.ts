@@ -192,7 +192,7 @@ describe("WalletRegistry - Slashing", () => {
       // TODO: Add a unit test ensuring `seize` call reverts if the staking
       // contract `seize` call reverts.
       // Currently blocked by https://github.com/defi-wonderland/smock/issues/101
-      // See https://github.com/keep-network/keep-core/issues/2870
+      // See https://github.com/threshold-network/keep-core/issues/2870
     })
   })
 })
