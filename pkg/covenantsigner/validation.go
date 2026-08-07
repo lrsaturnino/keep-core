@@ -229,6 +229,22 @@ func decodeBytes32HexString(name string, value string) ([32]byte, error) {
 	return decoded, nil
 }
 
+func decodeBytes20HexString(name string, value string) ([20]byte, error) {
+	var decoded [20]byte
+
+	if err := validateAddressString(name, value); err != nil {
+		return decoded, err
+	}
+
+	rawValue, err := hex.DecodeString(strings.TrimPrefix(value, "0x"))
+	if err != nil {
+		return decoded, &inputError{fmt.Sprintf("%s must be valid hex", name)}
+	}
+
+	copy(decoded[:], rawValue)
+	return decoded, nil
+}
+
 func normalizeLowerHex(value string) string {
 	return strings.ToLower(value)
 }

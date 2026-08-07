@@ -218,6 +218,47 @@ func newRequestID(prefix string) (string, error) {
 	return fmt.Sprintf("%s_%s", prefix, hex.EncodeToString(randomBytes)), nil
 }
 
+// IssueSignerApprovalCertificate asks the engine to threshold-sign a v2
+// SignerApprovalCertificate for the given wallet and approval digest. Engines
+// that do not implement SignerApprovalCertificateIssuer return
+// ErrSignerApprovalCertificateIssuerUnsupported.
+func (s *Service) IssueSignerApprovalCertificate(
+	ctx context.Context,
+	input IssueSignerApprovalCertificateInput,
+) (*SignerApprovalCertificate, error) {
+	issuer, ok := s.engine.(SignerApprovalCertificateIssuer)
+	if !ok {
+		return nil, ErrSignerApprovalCertificateIssuerUnsupported
+	}
+
+	walletPublicKeyHash, err := decodeBytes20HexString(
+		"walletPublicKeyHash",
+		input.WalletPublicKeyHash,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	approvalDigest, err := decodeBytes32HexString(
+		"approvalDigest",
+		input.ApprovalDigest,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if input.EndBlock == 0 {
+		return nil, NewInputError("endBlock is required")
+	}
+
+	return issuer.IssueSignerApprovalCertificate(
+		ctx,
+		walletPublicKeyHash,
+		approvalDigest[:],
+		input.EndBlock,
+	)
+}
+
 func applyTransition(job *Job, transition *Transition, now time.Time) {
 	if transition == nil {
 		return

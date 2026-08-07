@@ -3,6 +3,7 @@ package covenantsigner
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1078,5 +1079,281 @@ func TestSubmitHandlerPreservesServiceContextValues(t *testing.T) {
 			testValue,
 			capturedValue,
 		)
+	}
+}
+
+type scriptedIssuerEngine struct {
+	scriptedEngine
+	issue func(
+		ctx context.Context,
+		walletPublicKeyHash [20]byte,
+		approvalDigest []byte,
+		endBlock uint64,
+	) (*SignerApprovalCertificate, error)
+}
+
+func (sie *scriptedIssuerEngine) IssueSignerApprovalCertificate(
+	ctx context.Context,
+	walletPublicKeyHash [20]byte,
+	approvalDigest []byte,
+	endBlock uint64,
+) (*SignerApprovalCertificate, error) {
+	if sie.issue == nil {
+		return nil, fmt.Errorf("issue function not configured")
+	}
+	return sie.issue(ctx, walletPublicKeyHash, approvalDigest, endBlock)
+}
+
+func TestServerIssuesSignerApprovalCertificate(t *testing.T) {
+	endBlock := uint64(12345678)
+	expected := &SignerApprovalCertificate{
+		CertificateVersion: 2,
+		SignatureAlgorithm: "tecdsa-secp256k1",
+		ApprovalDigest:     "0x" + strings.Repeat("11", 32),
+		WalletPublicKey:    "0x04" + strings.Repeat("22", 64),
+		SignerSetHash:      "0x" + strings.Repeat("33", 32),
+		Signature:          "0x30" + strings.Repeat("44", 32),
+		EndBlock:           &endBlock,
+	}
+
+	handle := newMemoryHandle()
+	service, err := NewService(handle, &scriptedIssuerEngine{
+		issue: func(
+			_ context.Context,
+			walletPublicKeyHash [20]byte,
+			approvalDigest []byte,
+			gotEndBlock uint64,
+		) (*SignerApprovalCertificate, error) {
+			if gotEndBlock != endBlock {
+				t.Fatalf("unexpected endBlock: %d", gotEndBlock)
+			}
+			if hex.EncodeToString(walletPublicKeyHash[:]) != strings.Repeat("12", 20) {
+				t.Fatalf("unexpected wallet pkh: %x", walletPublicKeyHash)
+			}
+			if hex.EncodeToString(approvalDigest) != strings.Repeat("11", 32) {
+				t.Fatalf("unexpected approval digest: %x", approvalDigest)
+			}
+			return expected, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := httptest.NewServer(newHandler(service, context.Background(), "", true))
+	defer server.Close()
+
+	payload := mustJSON(t, IssueSignerApprovalCertificateInput{
+		WalletPublicKeyHash: "0x" + strings.Repeat("12", 20),
+		ApprovalDigest:      "0x" + strings.Repeat("11", 32),
+		EndBlock:            endBlock,
+	})
+
+	response, err := http.Post(
+		server.URL+"/v1/admin/signer-approval-certificates",
+		"application/json",
+		bytes.NewReader(payload),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("unexpected status: %d %s", response.StatusCode, string(body))
+	}
+
+	var got SignerApprovalCertificate
+	if err := json.NewDecoder(response.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ApprovalDigest != expected.ApprovalDigest {
+		t.Fatalf("unexpected certificate: %+v", got)
+	}
+}
+
+func TestServerReturns501WhenEngineLacksCertificateIssuer(t *testing.T) {
+	handle := newMemoryHandle()
+	service, err := NewService(handle, &scriptedEngine{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := httptest.NewServer(newHandler(service, context.Background(), "", true))
+	defer server.Close()
+
+	payload := mustJSON(t, IssueSignerApprovalCertificateInput{
+		WalletPublicKeyHash: "0x" + strings.Repeat("12", 20),
+		ApprovalDigest:      "0x" + strings.Repeat("11", 32),
+		EndBlock:            12345678,
+	})
+
+	response, err := http.Post(
+		server.URL+"/v1/admin/signer-approval-certificates",
+		"application/json",
+		bytes.NewReader(payload),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusNotImplemented {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("expected 501, got %d %s", response.StatusCode, string(body))
+	}
+}
+
+func TestServerRequiresBearerTokenForCertificateIssuer(t *testing.T) {
+	handle := newMemoryHandle()
+	service, err := NewService(handle, &scriptedIssuerEngine{
+		issue: func(
+			context.Context,
+			[20]byte,
+			[]byte,
+			uint64,
+		) (*SignerApprovalCertificate, error) {
+			endBlock := uint64(1)
+			return &SignerApprovalCertificate{EndBlock: &endBlock}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := httptest.NewServer(newHandler(service, context.Background(), "test-token", true))
+	defer server.Close()
+
+	payload := mustJSON(t, IssueSignerApprovalCertificateInput{
+		WalletPublicKeyHash: "0x" + strings.Repeat("12", 20),
+		ApprovalDigest:      "0x" + strings.Repeat("11", 32),
+		EndBlock:            12345678,
+	})
+
+	unauthorized, err := http.NewRequest(
+		http.MethodPost,
+		server.URL+"/v1/admin/signer-approval-certificates",
+		bytes.NewReader(payload),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unauthorized.Header.Set("Content-Type", "application/json")
+
+	response, err := http.DefaultClient.Do(unauthorized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusUnauthorized {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("expected 401, got %d %s", response.StatusCode, string(body))
+	}
+
+	authorized, err := http.NewRequest(
+		http.MethodPost,
+		server.URL+"/v1/admin/signer-approval-certificates",
+		bytes.NewReader(payload),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorized.Header.Set("Content-Type", "application/json")
+	authorized.Header.Set("Authorization", "Bearer test-token")
+
+	authorizedResponse, err := http.DefaultClient.Do(authorized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer authorizedResponse.Body.Close()
+	if authorizedResponse.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(authorizedResponse.Body)
+		t.Fatalf("expected 200, got %d %s", authorizedResponse.StatusCode, string(body))
+	}
+}
+
+func TestServerRejectsUnknownFieldsOnCertificateIssuer(t *testing.T) {
+	handle := newMemoryHandle()
+	service, err := NewService(handle, &scriptedIssuerEngine{
+		issue: func(
+			context.Context,
+			[20]byte,
+			[]byte,
+			uint64,
+		) (*SignerApprovalCertificate, error) {
+			t.Fatal("issuer should not be called for malformed bodies")
+			return nil, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := httptest.NewServer(newHandler(service, context.Background(), "", true))
+	defer server.Close()
+
+	payload := []byte(`{
+		"walletPublicKeyHash":"0x` + strings.Repeat("12", 20) + `",
+		"approvalDigest":"0x` + strings.Repeat("11", 32) + `",
+		"endBlock":12345678,
+		"unexpected":true
+	}`)
+
+	response, err := http.Post(
+		server.URL+"/v1/admin/signer-approval-certificates",
+		"application/json",
+		bytes.NewReader(payload),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("expected 400, got %d %s", response.StatusCode, string(body))
+	}
+}
+
+func TestServerRejectsInvalidCertificateIssuerInput(t *testing.T) {
+	handle := newMemoryHandle()
+	service, err := NewService(handle, &scriptedIssuerEngine{
+		issue: func(
+			context.Context,
+			[20]byte,
+			[]byte,
+			uint64,
+		) (*SignerApprovalCertificate, error) {
+			t.Fatal("issuer should not be called for invalid input")
+			return nil, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := httptest.NewServer(newHandler(service, context.Background(), "", true))
+	defer server.Close()
+
+	payload := mustJSON(t, IssueSignerApprovalCertificateInput{
+		WalletPublicKeyHash: "0x" + strings.Repeat("12", 20),
+		ApprovalDigest:      "0x" + strings.Repeat("11", 32),
+		EndBlock:            0,
+	})
+
+	response, err := http.Post(
+		server.URL+"/v1/admin/signer-approval-certificates",
+		"application/json",
+		bytes.NewReader(payload),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("expected 400, got %d %s", response.StatusCode, string(body))
 	}
 }

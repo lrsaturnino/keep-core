@@ -232,6 +232,14 @@ type SignerApprovalCertificate struct {
 	EndBlock           *uint64  `json:"endBlock"`
 }
 
+// IssueSignerApprovalCertificateInput is the request body for
+// POST /v1/admin/signer-approval-certificates.
+type IssueSignerApprovalCertificateInput struct {
+	WalletPublicKeyHash string `json:"walletPublicKeyHash"`
+	ApprovalDigest      string `json:"approvalDigest"`
+	EndBlock            uint64 `json:"endBlock"`
+}
+
 type SigningRequirements struct {
 	SignerRequired    bool `json:"signerRequired"`
 	CustodianRequired bool `json:"custodianRequired"`

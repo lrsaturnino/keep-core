@@ -337,6 +337,10 @@ func newHandler(service *Service, serviceCtx context.Context, authToken string, 
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
 
+	mux.HandleFunc(
+		"POST /v1/admin/signer-approval-certificates",
+		issueSignerApprovalCertificateHandler(service, serviceCtx, submitLimiter),
+	)
 	mux.HandleFunc("POST /v1/qc_v1/signer/requests", submitHandler(service, serviceCtx, TemplateQcV1, submitLimiter))
 	mux.HandleFunc("POST /v1/qc_v1/signer/requests:poll", pollBodyHandler(service, TemplateQcV1, pollLimiter))
 	mux.HandleFunc("/v1/qc_v1/signer/requests/", pollPathHandler(service, TemplateQcV1, pollLimiter))
@@ -431,6 +435,10 @@ func handleError(w http.ResponseWriter, err error) {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
+	if errors.Is(err, ErrSignerApprovalCertificateIssuerUnsupported) {
+		http.Error(w, err.Error(), http.StatusNotImplemented)
+		return
+	}
 
 	logger.Errorf("covenant signer request failed: [%v]", err)
 	http.Error(w, "internal server error", http.StatusInternalServerError)
@@ -476,6 +484,37 @@ func submitHandler(service *Service, serviceCtx context.Context, route TemplateI
 		}
 
 		writeJSON(w, http.StatusOK, result)
+	}
+}
+
+func issueSignerApprovalCertificateHandler(
+	service *Service,
+	serviceCtx context.Context,
+	limiter *rate.Limiter,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !limiter.Allow() {
+			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
+
+		input := IssueSignerApprovalCertificateInput{}
+		if !decodeJSON(w, r, &input) {
+			return
+		}
+
+		// Certificate issuance runs a full threshold signing round, so use the
+		// same service-level timeout and detached context as submit.
+		issueCtx, cancelIssue := context.WithTimeout(serviceCtx, submitTimeout)
+		defer cancelIssue()
+
+		certificate, err := service.IssueSignerApprovalCertificate(issueCtx, input)
+		if err != nil {
+			handleError(w, err)
+			return
+		}
+
+		writeJSON(w, http.StatusOK, certificate)
 	}
 }
 
