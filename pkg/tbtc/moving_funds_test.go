@@ -125,6 +125,7 @@ func TestMovingFundsAction_Execute(t *testing.T) {
 					return nil
 				},
 				newTestPermit(participation.TBTCSigning),
+				nil,
 			)
 
 			// Modify the default parameters of the action to make

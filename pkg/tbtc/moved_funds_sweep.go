@@ -114,6 +114,7 @@ func newMovedFundsSweepAction(
 	proposalExpiryBlock uint64,
 	waitForBlockFn waitForBlockFn,
 	permit participation.Permit,
+	transactionMonitor *transactionMonitor,
 ) *movedFundsSweepAction {
 	transactionExecutor := newWalletTransactionExecutor(
 		btcChain,
@@ -123,6 +124,8 @@ func newMovedFundsSweepAction(
 		permit,
 		"tbtc_moved_funds_sweep_bitcoin_broadcast",
 	)
+
+	transactionExecutor.setTransactionMonitor(transactionMonitor)
 
 	return &movedFundsSweepAction{
 		logger:                           logger,

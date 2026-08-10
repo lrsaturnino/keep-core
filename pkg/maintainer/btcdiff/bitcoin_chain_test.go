@@ -1,6 +1,7 @@
 package btcdiff
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
@@ -31,6 +32,7 @@ func (lbc *localBitcoinChain) GetTransaction(
 // transaction with the given transaction hash. If the transaction with the
 // given hash was not found on the chain, this function returns an error.
 func (lbc *localBitcoinChain) GetTransactionConfirmations(
+	_ context.Context,
 	transactionHash bitcoin.Hash,
 ) (uint, error) {
 	panic("unsupported")

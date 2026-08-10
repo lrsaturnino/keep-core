@@ -209,6 +209,7 @@ func TestDepositSweepAction_Execute(t *testing.T) {
 					return nil
 				},
 				permit,
+				nil,
 			)
 
 			// Modify the default parameters of the action to make

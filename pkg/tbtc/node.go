@@ -143,6 +143,10 @@ type node struct {
 	// heartbeat and derived inactivity work — acquires a permit from it and
 	// fails closed without one.
 	participationGate participation.Gate
+
+	// transactionMonitor watches broadcast wallet transactions and alerts on
+	// ones that remain unconfirmed long enough to be considered stuck.
+	transactionMonitor *transactionMonitor
 }
 
 // walletPermitIdentity binds a wallet permit to the wallet and canonical block
@@ -236,6 +240,7 @@ func newNode(
 		inactivityClaimExecutors: make(map[string]*inactivityClaimExecutor),
 		coordinationExecutors:    make(map[string]*coordinationExecutor),
 		proposalGenerator:        proposalGenerator,
+		transactionMonitor:       newTransactionMonitor(btcChain),
 	}
 
 	// Archive any wallets that might have been closed or terminated while the
@@ -285,6 +290,10 @@ func (n *node) setPerformanceMetrics(metrics interface {
 	// Keep metrics for the last 100 windows (approximately 25 hours at 900 blocks per window)
 	if perfMetrics, ok := metrics.(clientinfo.PerformanceMetricsRecorder); ok {
 		n.windowMetricsTracker = newCoordinationWindowMetrics(perfMetrics, 100)
+
+		if n.transactionMonitor != nil {
+			n.transactionMonitor.setMetricsRecorder(perfMetrics)
+		}
 	}
 
 	if n.walletDispatcher != nil {
@@ -883,6 +892,7 @@ func (n *node) handleDepositSweepProposal(
 		expiryBlock,
 		n.waitForBlockHeight,
 		permit,
+		n.transactionMonitor,
 	)
 
 	// Wire metrics recorder if available
@@ -969,6 +979,7 @@ func (n *node) handleRedemptionProposal(
 		expiryBlock,
 		n.waitForBlockHeight,
 		permit,
+		n.transactionMonitor,
 	)
 
 	// Wire metrics recorder if available
@@ -1055,6 +1066,7 @@ func (n *node) handleMovingFundsProposal(
 		expiryBlock,
 		n.waitForBlockHeight,
 		permit,
+		n.transactionMonitor,
 	)
 
 	err = n.walletDispatcher.dispatch(action)
@@ -1136,6 +1148,7 @@ func (n *node) handleMovedFundsSweepProposal(
 		expiryBlock,
 		n.waitForBlockHeight,
 		permit,
+		n.transactionMonitor,
 	)
 
 	err = n.walletDispatcher.dispatch(action)

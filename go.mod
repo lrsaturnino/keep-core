@@ -6,11 +6,18 @@ toolchain go1.25.10
 
 replace (
 	github.com/bnb-chain/tss-lib => github.com/threshold-network/tss-lib v0.0.0-20260729021955-d847ce003019
-	// btcd in version v.0.23 extracted `btcd/btcec` to a separate package `btcd/btcec/v2`.
-	// Some of the dependencies still require the old version, which we workaround
-	// here:
-	github.com/btcsuite/btcd => github.com/btcsuite/btcd v0.22.3
-	github.com/btcsuite/btcd/v2 => github.com/btcsuite/btcd v0.23.4
+	// btcd v0.23 extracted `btcd/btcec` into the separate module `btcd/btcec/v2`
+	// and later btcd versions no longer ship the pre-split package. The tss-lib
+	// fork (replace above) and first-party key-handling code still import the
+	// pre-split `btcd/btcec` path, so that single package is served from an
+	// in-tree copy of the btcec sources from btcd v0.22.3 (unmodified except
+	// for a mechanical gofmt pass — see third_party/btcsuite/btcec/VENDOR.md
+	// for provenance and verification). This lets the main btcd module stay
+	// on a current, fully patched release instead of being downgraded to v0.22.3
+	// for btcec's sake, which reintroduced fixed security advisories
+	// (GO-2022-1098, GO-2024-2818, GO-2024-3189) into the Bitcoin consensus,
+	// wire, and script packages.
+	github.com/btcsuite/btcd/btcec => ./third_party/btcsuite/btcec
 	github.com/checksum0/go-electrum => github.com/keep-network/go-electrum v0.0.0-20240206170935-6038cb594daa
 	// v1.7.1-tlabs.1 fixes the //go:linkname targets in the Ethereum codegen
 	// (bind -> abigen) so it links against go-ethereum v1.16+.
@@ -19,11 +26,23 @@ replace (
 
 require (
 	github.com/bnb-chain/tss-lib v1.3.5
-	github.com/btcsuite/btcd v0.23.2
+	// v0.24.2 is the lowest release that fixes every advisory open against the
+	// former v0.22.3 pin, and going higher is not currently possible:
+	//
+	//   - v0.25.0 requires btcec/v2 v2.3.5, and btcec/v2 v2.3.4 changed
+	//     `ecdsa.SignCompact` to drop its error return. go-ethereum v1.13.15
+	//     calls the two-value form in crypto/signature_nocgo.go, so pulling
+	//     btcec/v2 that far forward breaks every cgo-less build (notably the
+	//     cross-compiled release binaries). Raising btcd past v0.24.2 requires
+	//     upgrading go-ethereum first.
+	//   - v0.26 additionally moved wire, txscript and chaincfg into separate
+	//     /v2 modules and dropped the plain import paths that the go-electrum
+	//     and tss-lib forks above use.
+	github.com/btcsuite/btcd v0.24.2
+	github.com/btcsuite/btcd/btcec v0.0.0-00010101000000-000000000000
 	github.com/btcsuite/btcd/btcec/v2 v2.2.0
-	github.com/btcsuite/btcd/chaincfg/chainhash v1.0.1
-	github.com/btcsuite/btcd/v2 v2.0.0-00010101000000-000000000000
-	github.com/btcsuite/btcutil v1.0.3-0.20201208143702-a53e38424cce
+	github.com/btcsuite/btcd/btcutil v1.1.5
+	github.com/btcsuite/btcd/chaincfg/chainhash v1.1.0
 	github.com/checksum0/go-electrum v0.0.0-20220912200153-b862ac442cf9
 	github.com/ethereum/go-ethereum v1.17.3
 	github.com/ferranbt/fastssz v0.1.4
@@ -60,8 +79,10 @@ require (
 
 require (
 	github.com/ProjectZKM/Ziren/crates/go-runtime/zkvm_runtime v0.0.0-20251001021608-1fe7b43fc4d6 // indirect
+	github.com/btcsuite/btcutil v0.0.0-20190425235716-9e5f4b9a998d // indirect
 	github.com/crate-crypto/go-eth-kzg v1.5.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
+	github.com/decred/dcrd/crypto/blake256 v1.0.1 // indirect
 	github.com/emicklei/dot v1.6.2 // indirect
 	github.com/ethereum/c-kzg-4844/v2 v2.1.6 // indirect
 	github.com/go-task/slim-sprig/v3 v3.0.0 // indirect
@@ -84,6 +105,7 @@ require (
 	github.com/pion/turn/v2 v2.1.6 // indirect
 	github.com/pion/webrtc/v3 v3.3.5 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
+	github.com/stretchr/objx v0.5.2 // indirect
 	github.com/stretchr/testify v1.11.1 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
 	golang.org/x/telemetry v0.0.0-20251203150158-8fff8a5912fc // indirect
@@ -96,7 +118,6 @@ require (
 	github.com/benbjohnson/clock v1.3.5 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.20.0 // indirect
-	github.com/btcsuite/btcd/btcutil v1.1.1 // indirect
 	github.com/btcsuite/btclog v0.0.0-20170628155309-84c8d2346e9f // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/consensys/gnark-crypto v0.18.1 // indirect
