@@ -250,7 +250,10 @@ func (s *stubBitcoinChain) GetTransaction(bitcoin.Hash) (*bitcoin.Transaction, e
 	panic("unexpected GetTransaction call")
 }
 
-func (s *stubBitcoinChain) GetTransactionConfirmations(bitcoin.Hash) (uint, error) {
+func (s *stubBitcoinChain) GetTransactionConfirmations(
+	context.Context,
+	bitcoin.Hash,
+) (uint, error) {
 	panic("unexpected GetTransactionConfirmations call")
 }
 
