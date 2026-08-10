@@ -416,12 +416,20 @@ func (cse *covenantSignerEngine) IssueSignerApprovalCertificate(
 		)
 	}
 
-	return signingExecutor.issueSignerApprovalCertificate(
+	certificate, err := signingExecutor.issueSignerApprovalCertificate(
 		ctx,
 		approvalDigest,
 		startBlock,
 		endBlock,
 	)
+	if err != nil {
+		if errors.Is(err, errSigningExecutorBusy) {
+			return nil, covenantsigner.ErrSignerApprovalCertificateIssuerBusy
+		}
+		return nil, err
+	}
+
+	return certificate, nil
 }
 
 func (cse *covenantSignerEngine) submitSelfV1(

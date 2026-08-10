@@ -219,9 +219,10 @@ func newRequestID(prefix string) (string, error) {
 }
 
 // IssueSignerApprovalCertificate asks the engine to threshold-sign a v2
-// SignerApprovalCertificate for the given wallet and approval digest. Engines
-// that do not implement SignerApprovalCertificateIssuer return
-// ErrSignerApprovalCertificateIssuerUnsupported.
+// SignerApprovalCertificate for the given wallet over a digest this node
+// derives itself from an authenticated artifact approval -- never a
+// caller-asserted digest. Engines that do not implement
+// SignerApprovalCertificateIssuer return ErrSignerApprovalCertificateIssuerUnsupported.
 func (s *Service) IssueSignerApprovalCertificate(
 	ctx context.Context,
 	input IssueSignerApprovalCertificateInput,
@@ -239,22 +240,42 @@ func (s *Service) IssueSignerApprovalCertificate(
 		return nil, err
 	}
 
-	approvalDigest, err := decodeBytes32HexString(
-		"approvalDigest",
-		input.ApprovalDigest,
+	if input.EndBlock == 0 {
+		return nil, NewInputError("endBlock is required")
+	}
+
+	approvalDigest, err := deriveIssuanceApprovalDigest(
+		input.Route,
+		input.Reserve,
+		input.Network,
+		input.ArtifactApprovals,
+		s.depositorTrustRoots,
+		s.custodianTrustRoots,
+		s.eip712ChainID,
+		s.eip712Salt,
 	)
 	if err != nil {
 		return nil, err
 	}
 
-	if input.EndBlock == 0 {
-		return nil, NewInputError("endBlock is required")
+	// Certificate issuance runs the same class of expensive threshold-signing
+	// round as Submit and Poll, so it is bounded by the same maxInFlight
+	// semaphore -- an unbounded number of concurrent issuance rounds must
+	// never be able to saturate the engine when Submit/Poll already respect
+	// this cap.
+	if s.inFlightSlots != nil {
+		select {
+		case s.inFlightSlots <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		defer func() { <-s.inFlightSlots }()
 	}
 
 	return issuer.IssueSignerApprovalCertificate(
 		ctx,
 		walletPublicKeyHash,
-		approvalDigest[:],
+		approvalDigest,
 		input.EndBlock,
 	)
 }

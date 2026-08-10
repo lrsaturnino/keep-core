@@ -95,6 +95,15 @@ var ErrSignerApprovalCertificateIssuerUnsupported = errors.New(
 	"covenant signer engine does not support signer approval certificate issuance",
 )
 
+// ErrSignerApprovalCertificateIssuerBusy is returned when the engine's signing
+// executor for the requested wallet is already running another signing
+// operation (e.g. a concurrent Submit or a concurrent issuance). Callers
+// should retry after a short delay; the request was rejected before any
+// threshold signing began, so retrying is always safe.
+var ErrSignerApprovalCertificateIssuerBusy = errors.New(
+	"covenant signer engine is busy signing for this wallet",
+)
+
 type passiveEngine struct{}
 
 func NewPassiveEngine() Engine {

@@ -35,7 +35,7 @@ func TestServerHandlesSubmitAndPathPoll(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	server := httptest.NewServer(newHandler(service, context.Background(), "", true))
+	server := httptest.NewServer(newHandler(service, context.Background(), "", "", true))
 	defer server.Close()
 
 	submitPayload := mustJSON(t, SignerSubmitInput{
@@ -89,7 +89,7 @@ func TestServerRejectsUnknownFieldsOnSubmit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	server := httptest.NewServer(newHandler(service, context.Background(), "", true))
+	server := httptest.NewServer(newHandler(service, context.Background(), "", "", true))
 	defer server.Close()
 
 	base := baseRequest(TemplateSelfV1)
@@ -194,7 +194,7 @@ func TestServerRejectsTrailingJSONOnSubmit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	server := httptest.NewServer(newHandler(service, context.Background(), "", true))
+	server := httptest.NewServer(newHandler(service, context.Background(), "", "", true))
 	defer server.Close()
 
 	validPayload := mustJSON(t, SignerSubmitInput{
@@ -517,9 +517,10 @@ func TestInitializeRequiresTrustRootsForNonLoopbackListenAddress(t *testing.T) {
 	_, enabled, err := Initialize(
 		ctx,
 		Config{
-			Port:          availableLoopbackPort(t),
-			ListenAddress: "0.0.0.0",
-			AuthToken:     "test-token",
+			Port:           availableLoopbackPort(t),
+			ListenAddress:  "0.0.0.0",
+			AuthToken:      "test-token",
+			AdminAuthToken: "test-admin-token",
 		},
 		handle,
 		&scriptedVerifierEngine{},
@@ -542,9 +543,10 @@ func TestInitializeRequiresSignerApprovalVerifierForNonLoopbackListenAddress(t *
 	_, enabled, err := Initialize(
 		ctx,
 		Config{
-			Port:          availableLoopbackPort(t),
-			ListenAddress: "0.0.0.0",
-			AuthToken:     "test-token",
+			Port:           availableLoopbackPort(t),
+			ListenAddress:  "0.0.0.0",
+			AuthToken:      "test-token",
+			AdminAuthToken: "test-admin-token",
 			DepositorTrustRoots: []DepositorTrustRoot{
 				testDepositorTrustRoot(TemplateQcV1),
 			},
@@ -583,7 +585,7 @@ func TestServerRequiresBearerTokenWhenConfigured(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	server := httptest.NewServer(newHandler(service, context.Background(), "test-token", true))
+	server := httptest.NewServer(newHandler(service, context.Background(), "test-token", "", true))
 	defer server.Close()
 
 	submitPayload := mustJSON(t, SignerSubmitInput{
@@ -656,7 +658,7 @@ func TestServerCanKeepSelfV1RoutesDark(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	server := httptest.NewServer(newHandler(service, context.Background(), "", false))
+	server := httptest.NewServer(newHandler(service, context.Background(), "", "", false))
 	defer server.Close()
 
 	response, err := http.Post(
@@ -712,7 +714,7 @@ func TestServerBoundaryErrorMatrix(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	server := httptest.NewServer(newHandler(service, context.Background(), "test-token", true))
+	server := httptest.NewServer(newHandler(service, context.Background(), "test-token", "", true))
 	defer server.Close()
 
 	submitPayload := mustJSON(t, SignerSubmitInput{
@@ -879,7 +881,7 @@ func TestSubmitHandlerDetachesContextFromHTTPLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	handler := newHandler(service, context.Background(), "", true)
+	handler := newHandler(service, context.Background(), "", "", true)
 
 	submitPayload := mustJSON(t, SignerSubmitInput{
 		RouteRequestID: "ors_detach_cancel",
@@ -969,7 +971,7 @@ func TestSubmitHandlerPreCancelledContextStillSucceeds(t *testing.T) {
 	// Test through the handler directly using httptest.ResponseRecorder
 	// because an HTTP client would fail to send a request with a
 	// pre-cancelled context.
-	handler := newHandler(service, context.Background(), "", true)
+	handler := newHandler(service, context.Background(), "", "", true)
 
 	submitPayload := mustJSON(t, SignerSubmitInput{
 		RouteRequestID: "ors_detach_precancel",
@@ -1044,7 +1046,7 @@ func TestSubmitHandlerPreservesServiceContextValues(t *testing.T) {
 	// its timeout context from serviceCtx (not from the HTTP request), so
 	// values on the service context must be visible to the engine.
 	serviceCtx := context.WithValue(context.Background(), testKey, testValue)
-	handler := newHandler(service, serviceCtx, "", true)
+	handler := newHandler(service, serviceCtx, "", "", true)
 
 	server := httptest.NewServer(handler)
 	defer server.Close()
@@ -1105,11 +1107,38 @@ func (sie *scriptedIssuerEngine) IssueSignerApprovalCertificate(
 }
 
 func TestServerIssuesSignerApprovalCertificate(t *testing.T) {
+	route := TemplateQcV1
+	payload := ArtifactApprovalPayload{
+		ApprovalVersion:           artifactApprovalVersion,
+		Route:                     route,
+		ScriptTemplateID:          route,
+		DestinationCommitmentHash: "0x" + strings.Repeat("aa", 32),
+		PlanCommitmentHash:        "0x" + strings.Repeat("bb", 32),
+	}
+	artifactApprovals := ArtifactApprovalEnvelope{
+		Payload: payload,
+		Approvals: []ArtifactRoleApproval{
+			{
+				Role:      ArtifactApprovalRoleDepositor,
+				Signature: mustArtifactApprovalSignature(testDepositorPrivateKey, payload),
+			},
+			{
+				Role:      ArtifactApprovalRoleCustodian,
+				Signature: mustArtifactApprovalSignature(testCustodianPrivateKey, payload),
+			},
+		},
+	}
+	expectedApprovalDigest, err := ComputeArtifactApprovalDigest(payload, testEIP712ChainID, testEIP712Salt)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	depositorTrustRoot := testDepositorTrustRoot(route)
 	endBlock := uint64(12345678)
 	expected := &SignerApprovalCertificate{
 		CertificateVersion: 2,
 		SignatureAlgorithm: "tecdsa-secp256k1",
-		ApprovalDigest:     "0x" + strings.Repeat("11", 32),
+		ApprovalDigest:     "0x" + hex.EncodeToString(expectedApprovalDigest),
 		WalletPublicKey:    "0x04" + strings.Repeat("22", 64),
 		SignerSetHash:      "0x" + strings.Repeat("33", 32),
 		Signature:          "0x30" + strings.Repeat("44", 32),
@@ -1117,42 +1146,50 @@ func TestServerIssuesSignerApprovalCertificate(t *testing.T) {
 	}
 
 	handle := newMemoryHandle()
-	service, err := NewService(handle, &scriptedIssuerEngine{
-		issue: func(
-			_ context.Context,
-			walletPublicKeyHash [20]byte,
-			approvalDigest []byte,
-			gotEndBlock uint64,
-		) (*SignerApprovalCertificate, error) {
-			if gotEndBlock != endBlock {
-				t.Fatalf("unexpected endBlock: %d", gotEndBlock)
-			}
-			if hex.EncodeToString(walletPublicKeyHash[:]) != strings.Repeat("12", 20) {
-				t.Fatalf("unexpected wallet pkh: %x", walletPublicKeyHash)
-			}
-			if hex.EncodeToString(approvalDigest) != strings.Repeat("11", 32) {
-				t.Fatalf("unexpected approval digest: %x", approvalDigest)
-			}
-			return expected, nil
+	service, err := NewService(
+		handle,
+		&scriptedIssuerEngine{
+			issue: func(
+				_ context.Context,
+				walletPublicKeyHash [20]byte,
+				approvalDigest []byte,
+				gotEndBlock uint64,
+			) (*SignerApprovalCertificate, error) {
+				if gotEndBlock != endBlock {
+					t.Fatalf("unexpected endBlock: %d", gotEndBlock)
+				}
+				if hex.EncodeToString(walletPublicKeyHash[:]) != strings.Repeat("12", 20) {
+					t.Fatalf("unexpected wallet pkh: %x", walletPublicKeyHash)
+				}
+				if !bytes.Equal(approvalDigest, expectedApprovalDigest) {
+					t.Fatalf("unexpected approval digest: %x", approvalDigest)
+				}
+				return expected, nil
+			},
 		},
-	})
+		WithDepositorTrustRoots([]DepositorTrustRoot{depositorTrustRoot}),
+		WithCustodianTrustRoots([]CustodianTrustRoot{testCustodianTrustRoot(route)}),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	server := httptest.NewServer(newHandler(service, context.Background(), "", true))
+	server := httptest.NewServer(newHandler(service, context.Background(), "", "", true))
 	defer server.Close()
 
-	payload := mustJSON(t, IssueSignerApprovalCertificateInput{
+	payloadBytes := mustJSON(t, IssueSignerApprovalCertificateInput{
 		WalletPublicKeyHash: "0x" + strings.Repeat("12", 20),
-		ApprovalDigest:      "0x" + strings.Repeat("11", 32),
+		Route:               route,
+		Reserve:             depositorTrustRoot.Reserve,
+		Network:             depositorTrustRoot.Network,
+		ArtifactApprovals:   artifactApprovals,
 		EndBlock:            endBlock,
 	})
 
 	response, err := http.Post(
 		server.URL+"/v1/admin/signer-approval-certificates",
 		"application/json",
-		bytes.NewReader(payload),
+		bytes.NewReader(payloadBytes),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1168,8 +1205,15 @@ func TestServerIssuesSignerApprovalCertificate(t *testing.T) {
 	if err := json.NewDecoder(response.Body).Decode(&got); err != nil {
 		t.Fatal(err)
 	}
-	if got.ApprovalDigest != expected.ApprovalDigest {
-		t.Fatalf("unexpected certificate: %+v", got)
+	if got.CertificateVersion != expected.CertificateVersion ||
+		got.SignatureAlgorithm != expected.SignatureAlgorithm ||
+		got.ApprovalDigest != expected.ApprovalDigest ||
+		got.WalletPublicKey != expected.WalletPublicKey ||
+		got.SignerSetHash != expected.SignerSetHash ||
+		got.Signature != expected.Signature ||
+		got.EndBlock == nil ||
+		*got.EndBlock != *expected.EndBlock {
+		t.Fatalf("unexpected certificate: got %+v, want %+v", got, expected)
 	}
 }
 
@@ -1180,12 +1224,13 @@ func TestServerReturns501WhenEngineLacksCertificateIssuer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	server := httptest.NewServer(newHandler(service, context.Background(), "", true))
+	server := httptest.NewServer(newHandler(service, context.Background(), "", "", true))
 	defer server.Close()
 
+	// The unsupported-issuer check runs before any input is validated, so a
+	// minimal body is enough to exercise this path.
 	payload := mustJSON(t, IssueSignerApprovalCertificateInput{
 		WalletPublicKeyHash: "0x" + strings.Repeat("12", 20),
-		ApprovalDigest:      "0x" + strings.Repeat("11", 32),
 		EndBlock:            12345678,
 	})
 
@@ -1205,71 +1250,179 @@ func TestServerReturns501WhenEngineLacksCertificateIssuer(t *testing.T) {
 	}
 }
 
-func TestServerRequiresBearerTokenForCertificateIssuer(t *testing.T) {
-	handle := newMemoryHandle()
-	service, err := NewService(handle, &scriptedIssuerEngine{
-		issue: func(
-			context.Context,
-			[20]byte,
-			[]byte,
-			uint64,
-		) (*SignerApprovalCertificate, error) {
-			endBlock := uint64(1)
-			return &SignerApprovalCertificate{EndBlock: &endBlock}, nil
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
+// TestServerRequiresAdminBearerTokenForCertificateIssuer proves the admin
+// certificate-issuer route is gated by its own credential, distinct from the
+// ordinary submit/poll authToken: the submit token must be rejected here even
+// though it is accepted on every other route.
+func TestServerRequiresAdminBearerTokenForCertificateIssuer(t *testing.T) {
+	route := TemplateSelfV1
+	payload := ArtifactApprovalPayload{
+		ApprovalVersion:           artifactApprovalVersion,
+		Route:                     route,
+		ScriptTemplateID:          route,
+		DestinationCommitmentHash: "0x" + strings.Repeat("aa", 32),
+		PlanCommitmentHash:        "0x" + strings.Repeat("bb", 32),
 	}
+	artifactApprovals := ArtifactApprovalEnvelope{
+		Payload: payload,
+		Approvals: []ArtifactRoleApproval{
+			{
+				Role:      ArtifactApprovalRoleDepositor,
+				Signature: mustArtifactApprovalSignature(testDepositorPrivateKey, payload),
+			},
+		},
+	}
+	depositorTrustRoot := testDepositorTrustRoot(route)
 
-	server := httptest.NewServer(newHandler(service, context.Background(), "test-token", true))
-	defer server.Close()
-
-	payload := mustJSON(t, IssueSignerApprovalCertificateInput{
-		WalletPublicKeyHash: "0x" + strings.Repeat("12", 20),
-		ApprovalDigest:      "0x" + strings.Repeat("11", 32),
-		EndBlock:            12345678,
-	})
-
-	unauthorized, err := http.NewRequest(
-		http.MethodPost,
-		server.URL+"/v1/admin/signer-approval-certificates",
-		bytes.NewReader(payload),
+	handle := newMemoryHandle()
+	service, err := NewService(
+		handle,
+		&scriptedIssuerEngine{
+			issue: func(
+				context.Context,
+				[20]byte,
+				[]byte,
+				uint64,
+			) (*SignerApprovalCertificate, error) {
+				endBlock := uint64(1)
+				return &SignerApprovalCertificate{EndBlock: &endBlock}, nil
+			},
+		},
+		WithDepositorTrustRoots([]DepositorTrustRoot{depositorTrustRoot}),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	unauthorized.Header.Set("Content-Type", "application/json")
 
-	response, err := http.DefaultClient.Do(unauthorized)
+	server := httptest.NewServer(newHandler(service, context.Background(), "submit-token", "admin-token", true))
+	defer server.Close()
+
+	payloadBytes := mustJSON(t, IssueSignerApprovalCertificateInput{
+		WalletPublicKeyHash: "0x" + strings.Repeat("12", 20),
+		Route:               route,
+		Reserve:             depositorTrustRoot.Reserve,
+		Network:             depositorTrustRoot.Network,
+		ArtifactApprovals:   artifactApprovals,
+		EndBlock:            12345678,
+	})
+
+	doRequest := func(bearerToken string) *http.Response {
+		request, err := http.NewRequest(
+			http.MethodPost,
+			server.URL+"/v1/admin/signer-approval-certificates",
+			bytes.NewReader(payloadBytes),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		if bearerToken != "" {
+			request.Header.Set("Authorization", "Bearer "+bearerToken)
+		}
+
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+
+	noTokenResponse := doRequest("")
+	defer noTokenResponse.Body.Close()
+	if noTokenResponse.StatusCode != http.StatusUnauthorized {
+		body, _ := io.ReadAll(noTokenResponse.Body)
+		t.Fatalf("expected 401 with no token, got %d %s", noTokenResponse.StatusCode, string(body))
+	}
+
+	// The ordinary submit/poll token must never authorize the admin route --
+	// this is the exact regression this test exists to catch.
+	submitTokenResponse := doRequest("submit-token")
+	defer submitTokenResponse.Body.Close()
+	if submitTokenResponse.StatusCode != http.StatusUnauthorized {
+		body, _ := io.ReadAll(submitTokenResponse.Body)
+		t.Fatalf("expected 401 with the submit token, got %d %s", submitTokenResponse.StatusCode, string(body))
+	}
+
+	adminTokenResponse := doRequest("admin-token")
+	defer adminTokenResponse.Body.Close()
+	if adminTokenResponse.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(adminTokenResponse.Body)
+		t.Fatalf("expected 200 with the admin token, got %d %s", adminTokenResponse.StatusCode, string(body))
+	}
+}
+
+// TestServerRejectsCertificateIssuanceWithForgedApproval proves the server
+// derives and signs only a digest it authenticated itself: a well-formed
+// ArtifactApprovals envelope whose depositor signature was not produced by
+// the trust-rooted depositor key must be rejected before the engine is ever
+// invoked, even though every other field is valid.
+func TestServerRejectsCertificateIssuanceWithForgedApproval(t *testing.T) {
+	route := TemplateSelfV1
+	payload := ArtifactApprovalPayload{
+		ApprovalVersion:           artifactApprovalVersion,
+		Route:                     route,
+		ScriptTemplateID:          route,
+		DestinationCommitmentHash: "0x" + strings.Repeat("aa", 32),
+		PlanCommitmentHash:        "0x" + strings.Repeat("bb", 32),
+	}
+	artifactApprovals := ArtifactApprovalEnvelope{
+		Payload: payload,
+		Approvals: []ArtifactRoleApproval{
+			{
+				Role: ArtifactApprovalRoleDepositor,
+				// Signed by a key other than the pinned depositorTrustRoots
+				// key -- not the depositor's signature.
+				Signature: mustArtifactApprovalSignature(testSignerPrivateKey, payload),
+			},
+		},
+	}
+	depositorTrustRoot := testDepositorTrustRoot(route)
+
+	handle := newMemoryHandle()
+	service, err := NewService(
+		handle,
+		&scriptedIssuerEngine{
+			issue: func(
+				context.Context,
+				[20]byte,
+				[]byte,
+				uint64,
+			) (*SignerApprovalCertificate, error) {
+				t.Fatal("issuer should not be called for a forged approval")
+				return nil, nil
+			},
+		},
+		WithDepositorTrustRoots([]DepositorTrustRoot{depositorTrustRoot}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := httptest.NewServer(newHandler(service, context.Background(), "", "", true))
+	defer server.Close()
+
+	payloadBytes := mustJSON(t, IssueSignerApprovalCertificateInput{
+		WalletPublicKeyHash: "0x" + strings.Repeat("12", 20),
+		Route:               route,
+		Reserve:             depositorTrustRoot.Reserve,
+		Network:             depositorTrustRoot.Network,
+		ArtifactApprovals:   artifactApprovals,
+		EndBlock:            12345678,
+	})
+
+	response, err := http.Post(
+		server.URL+"/v1/admin/signer-approval-certificates",
+		"application/json",
+		bytes.NewReader(payloadBytes),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusUnauthorized {
+
+	if response.StatusCode != http.StatusBadRequest {
 		body, _ := io.ReadAll(response.Body)
-		t.Fatalf("expected 401, got %d %s", response.StatusCode, string(body))
-	}
-
-	authorized, err := http.NewRequest(
-		http.MethodPost,
-		server.URL+"/v1/admin/signer-approval-certificates",
-		bytes.NewReader(payload),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	authorized.Header.Set("Content-Type", "application/json")
-	authorized.Header.Set("Authorization", "Bearer test-token")
-
-	authorizedResponse, err := http.DefaultClient.Do(authorized)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer authorizedResponse.Body.Close()
-	if authorizedResponse.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(authorizedResponse.Body)
-		t.Fatalf("expected 200, got %d %s", authorizedResponse.StatusCode, string(body))
+		t.Fatalf("expected 400, got %d %s", response.StatusCode, string(body))
 	}
 }
 
@@ -1290,12 +1443,12 @@ func TestServerRejectsUnknownFieldsOnCertificateIssuer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	server := httptest.NewServer(newHandler(service, context.Background(), "", true))
+	server := httptest.NewServer(newHandler(service, context.Background(), "", "", true))
 	defer server.Close()
 
 	payload := []byte(`{
 		"walletPublicKeyHash":"0x` + strings.Repeat("12", 20) + `",
-		"approvalDigest":"0x` + strings.Repeat("11", 32) + `",
+		"route":"self_v1",
 		"endBlock":12345678,
 		"unexpected":true
 	}`)
@@ -1333,12 +1486,11 @@ func TestServerRejectsInvalidCertificateIssuerInput(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	server := httptest.NewServer(newHandler(service, context.Background(), "", true))
+	server := httptest.NewServer(newHandler(service, context.Background(), "", "", true))
 	defer server.Close()
 
 	payload := mustJSON(t, IssueSignerApprovalCertificateInput{
 		WalletPublicKeyHash: "0x" + strings.Repeat("12", 20),
-		ApprovalDigest:      "0x" + strings.Repeat("11", 32),
 		EndBlock:            0,
 	})
 
