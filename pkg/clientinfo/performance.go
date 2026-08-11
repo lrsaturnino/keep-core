@@ -125,6 +125,7 @@ func (pm *PerformanceMetrics) registerAllMetrics() {
 		MetricWalletHeartbeatFailuresTotal,
 		MetricStuckWalletTransactionsTotal,
 		MetricUnmonitoredWalletTransactionsTotal,
+		MetricTransactionMonitorCheckCyclesTotal,
 		MetricCoordinationWindowsDetectedTotal,
 		MetricCoordinationProceduresExecutedTotal,
 		MetricCoordinationFailedTotal,
@@ -321,6 +322,8 @@ func (pm *PerformanceMetrics) registerAllMetrics() {
 	// Register all gauge metrics with 0 initial value
 	gauges := []string{
 		MetricWalletDispatcherActiveActions,
+		MetricTransactionMonitorRunning,
+		MetricTransactionMonitorTrackedTransactions,
 		MetricIncomingMessageQueueSize,
 		MetricMessageHandlerQueueSize,
 		MetricSigningAttemptsPerOperation,
@@ -678,6 +681,21 @@ const (
 	MetricWalletHeartbeatFailuresTotal       = "wallet_heartbeat_failures_total"
 	MetricStuckWalletTransactionsTotal       = "stuck_wallet_transactions_total"
 	MetricUnmonitoredWalletTransactionsTotal = "unmonitored_wallet_transactions_total"
+
+	// Transaction Monitor Metrics
+	//
+	// The two counters above are negative evidence: they sit at zero both when
+	// nothing is stuck and when the monitor's polling loop was never started,
+	// so an inert monitor is indistinguishable from a healthy one. These three
+	// are the positive counterpart an operator can gate on - the loop is alive,
+	// it is making forward progress, and this is how much it is watching.
+	//
+	// A check-cycle increment proves a check pass returned; it does not prove
+	// every tracked transaction was reached in that pass, because a pass that
+	// exhausts its time budget defers the remainder to the next one.
+	MetricTransactionMonitorCheckCyclesTotal    = "transaction_monitor_check_cycles_total"
+	MetricTransactionMonitorRunning             = "transaction_monitor_running"
+	MetricTransactionMonitorTrackedTransactions = "transaction_monitor_tracked_transactions"
 
 	// Wallet Action Metrics (per-action type)
 	// These are generated dynamically using WalletActionMetricName helper function

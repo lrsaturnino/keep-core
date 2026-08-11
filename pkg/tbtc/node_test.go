@@ -503,6 +503,190 @@ loop:
 	}
 }
 
+// TestNode_RunCoordinationLayer_StartsTransactionMonitor is the regression test
+// for the lost transaction-monitor launch: the monitor was constructed, wired
+// into every wallet action, and fed by every successful broadcast, but nothing
+// ever started its polling loop. Registering a transaction therefore had no
+// observable consequence - nothing polled confirmations, nothing evicted, and
+// nothing alerted - while the stuck- and unmonitored-transaction counters sat at
+// zero exactly as they do on a healthy node.
+//
+// This test drives the production lifecycle path and joins a real confirmation
+// lookup, so it fails against a node that only constructs the monitor.
+func TestNode_RunCoordinationLayer_StartsTransactionMonitor(t *testing.T) {
+	groupParameters := &GroupParameters{
+		GroupSize:       5,
+		GroupQuorum:     4,
+		HonestThreshold: 3,
+	}
+
+	localChain := Connect(1 * time.Millisecond)
+	localProvider := local.Connect()
+
+	btcChain := newRecordingTransactionConfirmationsChain()
+
+	// The node archives closed wallets on construction, so the mock signer's
+	// wallet has to be known to the chain first.
+	signer := createMockSigner(t)
+	walletID, err := localChain.CalculateWalletID(signer.wallet.publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localChain.setWallet(
+		bitcoin.PublicKeyHash(signer.wallet.publicKey),
+		&WalletChainData{
+			EcdsaWalletID: walletID,
+			State:         StateLive,
+		},
+	)
+
+	n, err := newNode(
+		groupParameters,
+		localChain,
+		btcChain,
+		localProvider,
+		createMockKeyStorePersistence(t, signer),
+		&mockPersistenceHandle{},
+		newTestScheduler(t),
+		&mockCoordinationProposalGenerator{},
+		Config{PreParamsPoolSize: 1, PreParamsGenerationTimeout: time.Hour},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wire metrics the way the production startup path does, so the liveness
+	// telemetry under test travels the same route an operator's endpoint does.
+	recorder := newCountingMetricsRecorder()
+	n.setPerformanceMetrics(recorder)
+
+	// Poll fast enough for the loop to make progress within the test, without
+	// touching the production interval.
+	setCheckInterval(n.transactionMonitor, 5*time.Millisecond)
+
+	// A transaction the local chain has never seen: its lookup fails, so the
+	// monitor keeps it tracked and keeps polling it.
+	monitoredTxHash := bitcoin.Hash{0xab, 0xcd}
+	n.transactionMonitor.track(monitoredTxHash, [20]byte{1})
+
+	ctx, cancelCtx := context.WithCancel(context.Background())
+
+	// The monitor goroutine is started by the call below and the node keeps no
+	// handle on it, so the join is registered before the launch: whichever
+	// assertion this test exits on, the loop is cancelled and awaited rather
+	// than left polling the chain for the rest of the package run.
+	joinOnCleanup(t, "the monitor goroutine", cancelCtx, n.transactionMonitor.stopped)
+
+	// The coordination procedure is stubbed out; this test is about the monitor
+	// the coordination layer owns, not about coordination results.
+	err = n.runCoordinationLayer(
+		ctx,
+		&coordinationLayerSettings{
+			executeCoordinationProcedureFn: func(
+				*node,
+				*coordinationWindow,
+				*ecdsa.PublicKey,
+			) (*coordinationResult, bool) {
+				return nil, false
+			},
+			processCoordinationResultFn: func(
+				context.Context,
+				*node,
+				*coordinationResult,
+			) {
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The proof that the loop is alive: a real confirmation lookup for the
+	// pre-tracked transaction, joined through a channel rather than inferred
+	// from elapsed time.
+	select {
+	case hash := <-btcChain.lookups:
+		if hash != monitoredTxHash {
+			t.Fatalf(
+				"expected a confirmation lookup for [%s]; got [%s]",
+				monitoredTxHash.Hex(bitcoin.ReversedByteOrder),
+				hash.Hex(bitcoin.ReversedByteOrder),
+			)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal(
+			"no confirmation lookup within the timeout; the coordination layer " +
+				"did not start the transaction monitor",
+		)
+	}
+
+	if got := recorder.GetGaugeValue(
+		clientinfo.MetricTransactionMonitorRunning,
+	); got != 1 {
+		t.Fatalf("expected the running gauge at [1]; got [%v]", got)
+	}
+
+	// A returned cycle is the metric an operator polls for forward progress.
+	// Waiting on the recorder's own events keeps the timer out of the
+	// synchronization path - it is only the failure bound.
+	if !recorder.awaitCounterAtLeast(
+		clientinfo.MetricTransactionMonitorCheckCyclesTotal,
+		1,
+		5*time.Second,
+	) {
+		t.Fatal("the monitor never counted a completed check cycle")
+	}
+
+	if got := recorder.trackedGauge(); got != 1 {
+		t.Fatalf("expected the tracked-count gauge at [1]; got [%d]", got)
+	}
+
+	cancelCtx()
+
+	// Two separate claims, and the gauge alone would only support the first.
+	// The loop publishes zero from its defer path and then keeps unwinding, so
+	// the gauge says the monitor announced it was stopping; the monitor's own
+	// termination signal is what says the goroutine is actually gone. The node
+	// starts that goroutine itself, so this channel is the only handle a test
+	// has on it.
+	if !recorder.awaitGauge(
+		clientinfo.MetricTransactionMonitorRunning,
+		0,
+		5*time.Second,
+	) {
+		t.Fatal(
+			"the monitor did not publish a stopped running gauge after the " +
+				"node's context was cancelled",
+		)
+	}
+
+	select {
+	case <-n.transactionMonitor.stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal(
+			"the monitor goroutine did not terminate after the node's " +
+				"context was cancelled",
+		)
+	}
+
+	// The loop this test joined is provably gone, so what the remaining window
+	// watches for is a second one: a duplicate launch site would leave a monitor
+	// still polling this chain, at ten times the interval held open here.
+	for len(btcChain.lookups) > 0 {
+		<-btcChain.lookups
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	select {
+	case hash := <-btcChain.lookups:
+		t.Fatalf(
+			"the monitor issued a confirmation lookup for [%s] after it stopped",
+			hash.Hex(bitcoin.ReversedByteOrder),
+		)
+	default:
+	}
+}
+
 type mockCoordinationProposal struct {
 	action WalletActionType
 }
