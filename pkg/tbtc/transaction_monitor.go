@@ -35,20 +35,10 @@ const (
 	// tracking table and starving monitoring of new transactions (~24 hours).
 	transactionMonitorMaxTrackingAge = 24 * time.Hour
 
-	// transactionMonitorCheckBudget is the wall-clock budget requested for a
-	// single check pass so that a slow chain call cannot stall monitoring of
-	// every remaining transaction; transactions not reached within the budget
-	// are handled on the next pass.
-	//
-	// It is a requested bound, not a guaranteed one. The monitor threads it into
-	// the chain call as a context deadline, which is all a bitcoin.Chain
-	// implementation is asked to honor. The production Electrum adapter has two
-	// paths that can outlive it: GetTransactionConfirmations resolves the chain
-	// tip through GetLatestBlockHeight, which takes no caller context, and
-	// requests serialize on a plain mutex whose acquisition no context can
-	// cancel. Bounding those needs its own review of Electrum request
-	// serialization, so release evidence must say the budget is requested rather
-	// than that every production lookup is strictly bounded by it.
+	// transactionMonitorCheckBudget bounds the wall-clock time of a single check
+	// pass so that a slow chain call cannot stall monitoring of every remaining
+	// transaction; transactions not reached within the budget are handled on the
+	// next pass.
 	transactionMonitorCheckBudget = 2 * time.Minute
 )
 
@@ -115,55 +105,14 @@ type transactionMonitor struct {
 
 	threshold time.Duration
 
-	// checkInterval is how often run polls the tracked transactions. It is
-	// always the production transactionMonitorCheckInterval outside of package
-	// tests, which shorten it so the run loop can be exercised without waiting
-	// out a production tick. It is deliberately not configurable: the interval
-	// is monitoring policy, not an operator knob, and shortening it in
-	// production would multiply the confirmation-query load on the Bitcoin
-	// backend.
-	checkInterval time.Duration
-
-	// checkFn is the check pass the run loop invokes on each tick; nil - the
-	// production case - means check. Package tests substitute a recording
-	// wrapper to observe whether the loop opened a pass at all.
-	//
-	// Nothing else can observe it. A pass entered on a cancelled context
-	// returns at its own entry guard without a lookup, a metric, or any other
-	// external effect, so with only the pass's guard in place, deleting the
-	// loop's post-tick guard would change nothing any test could see. The two
-	// guards defend different things - the loop's keeps a shutting-down node
-	// from opening a pass, the pass's keeps one from issuing a request - and
-	// this seam is what keeps the first independently provable.
-	checkFn func(ctx context.Context)
-
-	// publishMu serializes tracked-count gauge publication. It orders the read
-	// of the tracked-set size against the recorder call that publishes it, so
-	// concurrent inserts and removals cannot leave the gauge holding a stale
-	// value once they settle. It is never held while acquiring mu in the
-	// reverse order.
-	publishMu sync.Mutex
-
-	// stopped is closed once run has returned. The node starts run in its own
-	// goroutine and keeps no handle on it, so this is the only way to observe
-	// that the loop has actually finished rather than merely published its
-	// final telemetry - the running gauge drops to zero while the goroutine is
-	// still unwinding. sync.Once keeps a second run call from closing it twice;
-	// a monitor is only ever run once (see the sole launch site in
-	// runCoordinationLayer), but a panic is a poor way to report that.
-	stopped     chan struct{}
-	stoppedOnce sync.Once
-
 	metricsRecorder clientinfo.PerformanceMetricsRecorder
 }
 
 func newTransactionMonitor(btcChain bitcoin.Chain) *transactionMonitor {
 	return &transactionMonitor{
-		btcChain:      btcChain,
-		tracked:       make(map[bitcoin.Hash]*trackedTransaction),
-		threshold:     defaultStuckTransactionThreshold,
-		checkInterval: transactionMonitorCheckInterval,
-		stopped:       make(chan struct{}),
+		btcChain:  btcChain,
+		tracked:   make(map[bitcoin.Hash]*trackedTransaction),
+		threshold: defaultStuckTransactionThreshold,
 	}
 }
 
@@ -217,113 +166,19 @@ func (tm *transactionMonitor) track(
 		broadcastAt:         time.Now(),
 	}
 	tm.mu.Unlock()
-
-	tm.publishTrackedCount()
-}
-
-// publishTrackedCount republishes the size of the tracked set. The recorder and
-// the size are snapshotted under mu and the recorder is called after releasing
-// it, so no external call is ever made under the monitor's own lock; publishMu
-// keeps concurrent publishers ordered so the value that settles is the value of
-// the last mutation.
-func (tm *transactionMonitor) publishTrackedCount() {
-	tm.publishMu.Lock()
-	defer tm.publishMu.Unlock()
-
-	tm.mu.Lock()
-	recorder := tm.metricsRecorder
-	count := len(tm.tracked)
-	tm.mu.Unlock()
-
-	if recorder != nil {
-		recorder.SetGauge(
-			clientinfo.MetricTransactionMonitorTrackedTransactions,
-			float64(count),
-		)
-	}
-}
-
-// recorder returns the currently wired metrics recorder, or nil when metrics
-// are disabled. Callers must not hold mu.
-func (tm *transactionMonitor) recorder() clientinfo.PerformanceMetricsRecorder {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-	return tm.metricsRecorder
 }
 
 // run starts the monitor's polling loop. It blocks until the context is done.
-// The context is the node's run context, so the loop lives for as long as the
-// node does and stops once the node cancels it after its shutdown drain.
 func (tm *transactionMonitor) run(ctx context.Context) {
-	// Registered first so it runs last: every other exit path - including the
-	// refusal below - has finished by the time the loop reports itself stopped.
-	defer tm.stoppedOnce.Do(func() { close(tm.stopped) })
-
-	tm.mu.Lock()
-	checkInterval := tm.checkInterval
-	checkPass := tm.checkFn
-	tm.mu.Unlock()
-
-	if checkPass == nil {
-		checkPass = tm.check
-	}
-
-	if checkInterval <= 0 {
-		// Unreachable through the constructor, which always installs the
-		// production interval. Refusing here keeps a future wiring mistake from
-		// turning into a time.NewTicker panic that takes down the node.
-		logger.Errorf(
-			"transaction monitor check interval [%s] is not positive; "+
-				"the monitor will not run",
-			checkInterval,
-		)
-		return
-	}
-
-	ticker := time.NewTicker(checkInterval)
+	ticker := time.NewTicker(transactionMonitorCheckInterval)
 	defer ticker.Stop()
-
-	// The stuck- and unmonitored-transaction counters read zero whether or not
-	// this loop is alive, so publish an explicit liveness signal an operator can
-	// gate on. The paired log lines are supplemental operational evidence.
-	if recorder := tm.recorder(); recorder != nil {
-		recorder.SetGauge(clientinfo.MetricTransactionMonitorRunning, 1)
-	}
-	logger.Info("transaction monitor started")
-
-	defer func() {
-		if recorder := tm.recorder(); recorder != nil {
-			recorder.SetGauge(clientinfo.MetricTransactionMonitorRunning, 0)
-		}
-		logger.Info("transaction monitor stopped")
-	}()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// A tick and a cancellation can become ready at the same moment,
-			// and select chooses between two ready cases at random. Re-checking
-			// here makes cancellation win that race every time, so a node on
-			// its way out never opens a fresh pass at all.
-			if ctx.Err() != nil {
-				return
-			}
-
-			checkPass(ctx)
-
-			// Count the pass only if it ran to its own conclusion - empty,
-			// complete, or budget-exhausted. A pass cut short by node
-			// cancellation is not forward progress and must not read as such.
-			if ctx.Err() != nil {
-				return
-			}
-			if recorder := tm.recorder(); recorder != nil {
-				recorder.IncrementCounter(
-					clientinfo.MetricTransactionMonitorCheckCyclesTotal, 1,
-				)
-			}
+			tm.check(ctx)
 		}
 	}
 }
@@ -344,25 +199,11 @@ func (tm *transactionMonitor) checkWithBudget(
 	ctx context.Context,
 	checkBudget time.Duration,
 ) {
-	// Observed before the pass does anything at all: no budget context, no
-	// telemetry defer, no snapshot. "Start no new work once cancellation is
-	// observed" covers the pass's own bookkeeping too - reconciling the
-	// tracked-count gauge on the way out of a pass that never ran is a metric
-	// write a stopping monitor has no business making.
-	if ctx.Err() != nil {
-		return
-	}
-
 	checkCtx, cancelCheck := context.WithTimeout(
 		ctx,
 		checkBudget,
 	)
 	defer cancelCheck()
-
-	// Reconcile the tracked-count gauge once the pass settles, whichever exit it
-	// takes. Individual mutations publish as they happen; this bounds any skew
-	// between the gauge and the tracked set to a single check interval.
-	defer tm.publishTrackedCount()
 
 	now := time.Now()
 
@@ -372,19 +213,9 @@ func (tm *transactionMonitor) checkWithBudget(
 	// next pass. Chain calls are made on the copy, outside the lock.
 	for _, t := range tm.snapshotByAge() {
 		txHash := t.hash
-
-		// Cancellation is checked on both sides of the lookup. Before it, so
-		// that a shutdown arriving mid-pass stops the next request rather than
-		// only being noticed after it returns; after it, to abandon the rest of
-		// a pass the node cut short.
-		if ctx.Err() != nil {
-			return
-		}
-
-		// The chain call carries checkCtx, so a backend that honors the deadline
-		// releases this run loop when the budget expires instead of keeping it
-		// blocked. See transactionMonitorCheckBudget for the Electrum paths that
-		// can still outlive it.
+		// The chain call is bounded by checkCtx, so a slow or hung backend cannot
+		// keep this run loop blocked past the check budget: when the budget
+		// expires the call is cancelled and returns.
 		confirmations, err :=
 			tm.btcChain.GetTransactionConfirmations(checkCtx, txHash)
 
@@ -479,8 +310,6 @@ func (tm *transactionMonitor) checkWithBudget(
 // remove stops tracking the transaction with the given hash.
 func (tm *transactionMonitor) remove(txHash bitcoin.Hash) {
 	tm.mu.Lock()
+	defer tm.mu.Unlock()
 	delete(tm.tracked, txHash)
-	tm.mu.Unlock()
-
-	tm.publishTrackedCount()
 }

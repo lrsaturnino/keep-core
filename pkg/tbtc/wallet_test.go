@@ -698,21 +698,11 @@ func (c *noConfirmBtcChain) GetTransactionConfirmations(context.Context, bitcoin
 }
 
 func TestWalletTransactionExecutor_BroadcastTransaction_Success(t *testing.T) {
-	btcChain := newLocalBitcoinChain()
-
-	// The producer side of the stuck-transaction pipeline: a successful
-	// broadcast must hand the transaction to the monitor, or the monitor's run
-	// loop has nothing to poll no matter how healthy it is.
-	recorder := newCountingMetricsRecorder()
-	monitor := newTransactionMonitor(btcChain)
-	monitor.setMetricsRecorder(recorder)
-
 	executor := &walletTransactionExecutor{
 		permit:          newTestPermit(participation.TBTCSigning),
-		btcChain:        btcChain,
+		btcChain:        newLocalBitcoinChain(),
 		executingWallet: generateWallet(big.NewInt(1)),
 	}
-	executor.setTransactionMonitor(monitor)
 
 	tx := &bitcoin.Transaction{
 		Version: 1,
@@ -739,17 +729,6 @@ func TestWalletTransactionExecutor_BroadcastTransaction_Success(t *testing.T) {
 
 	if err != nil {
 		t.Errorf("expected no error, got: %v", err)
-	}
-
-	if !isTracked(monitor, tx.Hash()) {
-		t.Errorf(
-			"expected the broadcast transaction [%s] to be registered with "+
-				"the transaction monitor",
-			tx.Hash().Hex(bitcoin.ReversedByteOrder),
-		)
-	}
-	if got := recorder.trackedGauge(); got != 1 {
-		t.Errorf("expected tracked-count gauge [1] after broadcast; got [%d]", got)
 	}
 }
 
