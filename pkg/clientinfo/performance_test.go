@@ -457,3 +457,154 @@ func TestJoinFailureAndOnChainCountersRegistered(t *testing.T) {
 		}
 	}
 }
+
+// transactionMonitorMetrics pairs each transaction-monitor metric with the exact
+// series an operator scrapes. ObserveApplicationSource prepends the
+// "performance" application prefix, so the exported name is "performance_" plus
+// the internal constant.
+var transactionMonitorMetrics = []struct {
+	internal string
+	exported string
+	isGauge  bool
+}{
+	{
+		MetricTransactionMonitorCheckCyclesTotal,
+		"performance_transaction_monitor_check_cycles_total",
+		false,
+	},
+	{
+		MetricTransactionMonitorRunning,
+		"performance_transaction_monitor_running",
+		true,
+	},
+	{
+		MetricTransactionMonitorTrackedTransactions,
+		"performance_transaction_monitor_tracked_transactions",
+		true,
+	},
+}
+
+// TestTransactionMonitorMetrics_RegisteredAndExported proves both layers the
+// monitor's liveness evidence depends on: the recorder pre-registers each metric
+// in the correct counter or gauge map, and the client-info registry that backs
+// /metrics actually exposes it under the expected name.
+//
+// Both layers are load-bearing. IncrementCounter and SetGauge create an entry
+// for any name they are handed, so a metric omitted from registerAllMetrics
+// still reads back correctly through GetCounterValue/GetGaugeValue while being
+// absent from the exposition - which is precisely the failure that would leave
+// an operator unable to tell a running monitor from an inert one. Registry
+// membership is asserted by re-registering the exported name: the registry
+// refuses a name it already holds, and that refusal set is what the exposition
+// enumerates.
+func TestTransactionMonitorMetrics_RegisteredAndExported(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	registry := &Registry{keepclientinfo.NewRegistry(), ctx}
+	pm := NewPerformanceMetrics(ctx, registry)
+
+	for _, metric := range transactionMonitorMetrics {
+		if exported := "performance_" + metric.internal; exported != metric.exported {
+			t.Errorf(
+				"internal metric %q exposes as %q, want %q",
+				metric.internal,
+				exported,
+				metric.exported,
+			)
+		}
+
+		if metric.isGauge {
+			pm.gaugesMutex.RLock()
+			_, preRegistered := pm.gauges[metric.internal]
+			pm.gaugesMutex.RUnlock()
+			if !preRegistered {
+				t.Errorf(
+					"gauge %q is not pre-registered, so it is missing from "+
+						"/metrics until something sets it",
+					metric.internal,
+				)
+			}
+			if value := pm.GetGaugeValue(metric.internal); value != 0 {
+				t.Errorf("gauge %q should start at 0, got %v", metric.internal, value)
+			}
+		} else {
+			pm.countersMutex.RLock()
+			_, preRegistered := pm.counters[metric.internal]
+			pm.countersMutex.RUnlock()
+			if !preRegistered {
+				t.Errorf(
+					"counter %q is not pre-registered, so it is missing from "+
+						"/metrics until something increments it",
+					metric.internal,
+				)
+			}
+			if value := pm.GetCounterValue(metric.internal); value != 0 {
+				t.Errorf("counter %q should start at 0, got %v", metric.internal, value)
+			}
+		}
+
+		if _, err := registry.NewMetricGauge(metric.exported); err == nil {
+			t.Errorf(
+				"metric %q is not registered with the registry, so it is "+
+					"absent from /metrics until something records it",
+				metric.exported,
+			)
+		}
+	}
+
+	// A name nothing registered must register cleanly, otherwise the membership
+	// assertions above would pass against a registry that refuses everything.
+	if _, err := registry.NewMetricGauge(
+		"performance_transaction_monitor_absent_control",
+	); err != nil {
+		t.Fatalf(
+			"an unregistered name must be registrable, otherwise the "+
+				"membership assertions above are vacuous: %v",
+			err,
+		)
+	}
+}
+
+// TestTransactionMonitorMetrics_Recordable proves the three metrics record
+// through the production recorder the tBTC monitor holds, with gauges that can
+// fall back as well as rise - the running gauge has to return to zero on
+// shutdown, and the tracked count has to follow removals.
+func TestTransactionMonitorMetrics_Recordable(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	registry := &Registry{keepclientinfo.NewRegistry(), ctx}
+	pm := NewPerformanceMetrics(ctx, registry)
+
+	pm.SetGauge(MetricTransactionMonitorRunning, 1)
+	pm.IncrementCounter(MetricTransactionMonitorCheckCyclesTotal, 1)
+	pm.IncrementCounter(MetricTransactionMonitorCheckCyclesTotal, 1)
+	pm.SetGauge(MetricTransactionMonitorTrackedTransactions, 4)
+
+	if got := pm.GetGaugeValue(MetricTransactionMonitorRunning); got != 1 {
+		t.Errorf("running gauge = %v, want 1", got)
+	}
+	if got := pm.GetCounterValue(
+		MetricTransactionMonitorCheckCyclesTotal,
+	); got != 2 {
+		t.Errorf("check cycles counter = %v, want 2", got)
+	}
+	if got := pm.GetGaugeValue(
+		MetricTransactionMonitorTrackedTransactions,
+	); got != 4 {
+		t.Errorf("tracked transactions gauge = %v, want 4", got)
+	}
+
+	pm.SetGauge(MetricTransactionMonitorTrackedTransactions, 1)
+	pm.SetGauge(MetricTransactionMonitorRunning, 0)
+
+	if got := pm.GetGaugeValue(MetricTransactionMonitorRunning); got != 0 {
+		t.Errorf("running gauge after stop = %v, want 0", got)
+	}
+	if got := pm.GetGaugeValue(
+		MetricTransactionMonitorTrackedTransactions,
+	); got != 1 {
+		t.Errorf("tracked transactions gauge after removal = %v, want 1", got)
+	}
+}
