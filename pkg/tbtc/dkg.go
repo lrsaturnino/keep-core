@@ -1677,8 +1677,16 @@ func (de *dkgExecutor) executeDkgValidation(
 
 	isValid, err := de.chain.IsDKGResultValid(result)
 	if err != nil {
-		dkgLogger.Errorf("cannot validate DKG result: [%v]", err)
-		return
+		// A free-call validator revert (e.g. high-s signature / OpenZeppelin
+		// ECDSA.recover) surfaces here as an error. On-chain
+		// challengeDkgResult catches the same revert and emits reason
+		// "validation reverted". Treat the check failure as an invalid
+		// result and enter the challenge loop instead of returning early.
+		dkgLogger.Warnf(
+			"cannot validate DKG result: [%v]; treating as invalid and challenging",
+			err,
+		)
+		isValid = false
 	}
 
 	if !isValid {

@@ -1062,14 +1062,138 @@ func TestDkgExecutor_ExecuteDkgIfEligible_PreParamExhaustion(t *testing.T) {
 	de.executeDkgIfEligible(big.NewInt(1), 0, 0)
 }
 
-// TestDkgExecutor_ExecuteDkgValidation_ValidationCheckError verifies that
-// executeDkgValidation returns gracefully when IsDKGResultValid returns an
-// error (e.g. chain temporarily unavailable).
-func TestDkgExecutor_ExecuteDkgValidation_ValidationCheckError(t *testing.T) {
-	c := &dkgResultValidErrChain{Connect()}
-	de := &dkgExecutor{chain: c}
+// TestDkgExecutor_ExecuteDkgValidation_ValidationCheckErrorChallenges verifies
+// that when IsDKGResultValid returns an error (e.g. validator call reverts on
+// high-s), executeDkgValidation treats the result as invalid and submits an
+// on-chain challenge — matching challengeDkgResult's "validation reverted" path.
+func TestDkgExecutor_ExecuteDkgValidation_ValidationCheckErrorChallenges(
+	t *testing.T,
+) {
+	testData, err := tecdsatest.LoadPrivateKeyShareTestFixtures(1)
+	if err != nil {
+		t.Fatalf("failed to load test data: [%v]", err)
+	}
 
-	de.executeDkgValidation(big.NewInt(1), 0, &DKGChainResult{}, [32]byte{})
+	groupParameters := &GroupParameters{
+		GroupSize:       5,
+		GroupQuorum:     3,
+		HonestThreshold: 2,
+	}
+
+	tecdsaDkgResult := &dkg.Result{
+		Group: group.NewGroup(
+			groupParameters.DishonestThreshold(),
+			groupParameters.GroupSize,
+		),
+		PrivateKeyShare: tecdsa.NewPrivateKeyShare(testData[0]),
+	}
+
+	groupPublicKey, err := tecdsaDkgResult.GroupPublicKeyBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	base := Connect()
+	chainStub := &dkgResultValidErrChain{localChain: base}
+
+	operatorAddress, err := base.operatorAddress()
+	if err != nil {
+		t.Fatal(err)
+	}
+	operatorID, err := base.GetOperatorID(operatorAddress)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	signatures := make(map[group.MemberIndex][]byte)
+	operatorsIDs := make(chain.OperatorIDs, groupParameters.GroupSize)
+	operatorsAddresses := make(chain.Addresses, groupParameters.GroupSize)
+	for memberIndex := uint8(1); int(memberIndex) <= groupParameters.GroupSize; memberIndex++ {
+		signatures[memberIndex] = []byte{memberIndex}
+		operatorsIDs[memberIndex-1] = operatorID
+		operatorsAddresses[memberIndex-1] = operatorAddress
+	}
+
+	groupSelectionResult := &GroupSelectionResult{
+		OperatorsIDs:       operatorsIDs,
+		OperatorsAddresses: operatorsAddresses,
+	}
+
+	submittedChan := make(chan *DKGResultSubmittedEvent, 1)
+	_ = base.OnDKGResultSubmitted(func(event *DKGResultSubmittedEvent) {
+		submittedChan <- event
+	})
+
+	if err := base.startDKG(); err != nil {
+		t.Fatal(err)
+	}
+
+	pubKey, err := tecdsaDkgResult.GroupPublicKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dkgResult, err := base.AssembleDKGResult(
+		group.MemberIndex(1),
+		pubKey,
+		tecdsaDkgResult.Group.OperatingMemberIndexes(),
+		tecdsaDkgResult.MisbehavedMembersIndexes(),
+		signatures,
+		groupSelectionResult,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := base.SubmitDKGResult(dkgResult); err != nil {
+		t.Fatal(err)
+	}
+
+	submitted := <-submittedChan
+
+	eventChan := make(chan *DKGResultChallengedEvent, 1)
+	_ = base.OnDKGResultChallenged(func(event *DKGResultChallengedEvent) {
+		eventChan <- event
+	})
+
+	de := &dkgExecutor{
+		groupParameters: groupParameters,
+		operatorIDFn: func() (chain.OperatorID, error) {
+			return operatorID, nil
+		},
+		operatorAddress: operatorAddress,
+		chain:           chainStub,
+		waitForBlockFn:  testWaitForBlockFn(base),
+	}
+
+	de.executeDkgValidation(
+		submitted.Seed,
+		submitted.BlockNumber,
+		submitted.Result,
+		submitted.ResultHash,
+	)
+
+	var challenged *DKGResultChallengedEvent
+	select {
+	case challenged = <-eventChan:
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected DKG result challenge after IsDKGResultValid error")
+	}
+
+	expectedHash := sha3.Sum256(groupPublicKey)
+	if challenged.ResultHash != expectedHash {
+		t.Errorf(
+			"unexpected challenged result hash\nexpected: [%x]\nactual:   [%x]",
+			expectedHash,
+			challenged.ResultHash,
+		)
+	}
+
+	state, err := base.GetDKGState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	testutils.AssertIntsEqual(t, "DKG state", int(AwaitingResult), int(state))
 }
 
 // TestDkgExecutor_ExecuteDkgValidation_InvalidResult_ChallengeFails verifies
@@ -1188,13 +1312,15 @@ func TestDkgExecutor_GenerateSigningGroup_DKGParametersError(t *testing.T) {
 }
 
 // dkgResultValidErrChain wraps localChain and returns an error from
-// IsDKGResultValid to exercise the early-return error path in executeDkgValidation.
+// IsDKGResultValid, simulating a validator-call revert (high-s / OZ recover).
 type dkgResultValidErrChain struct {
 	*localChain
 }
 
 func (c *dkgResultValidErrChain) IsDKGResultValid(*DKGChainResult) (bool, error) {
-	return false, fmt.Errorf("chain unavailable")
+	return false, fmt.Errorf(
+		"cannot check result validity: [execution reverted]",
+	)
 }
 
 // dkgParamsErrChain wraps localChain and returns an error from DKGParameters
