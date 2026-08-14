@@ -1189,6 +1189,16 @@ func (n *node) runCoordinationLayer(
 	ctx context.Context,
 	settings ...*coordinationLayerSettings,
 ) error {
+	// Start the background monitor that alerts on stuck (long-unconfirmed)
+	// wallet transactions. This is the single production launch site: the
+	// supported initialization path calls runCoordinationLayer exactly once, so
+	// the monitor's assumption of a sole check goroutine holds. The loop is
+	// bound to this context - the node's run context - so it outlives every
+	// individual wallet action and stops only when the node shuts down.
+	if n.transactionMonitor != nil {
+		go n.transactionMonitor.run(ctx)
+	}
+
 	// Resolve settings for the coordination layer.
 	var cls *coordinationLayerSettings
 	switch len(settings) {
