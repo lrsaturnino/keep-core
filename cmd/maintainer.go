@@ -66,7 +66,7 @@ func maintainers(cmd *cobra.Command, args []string) error {
 		)
 	}
 
-	_, tbtcChain, _, _, _, err := ethereum.Connect(
+	_, tbtcChain, _, _, _, _, err := ethereum.Connect(
 		ctx,
 		clientConfig.Ethereum,
 	)

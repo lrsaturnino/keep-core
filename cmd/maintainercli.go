@@ -75,7 +75,7 @@ var listDepositsCommand = cobra.Command{
 			return fmt.Errorf("failed to find head flag: %v", err)
 		}
 
-		_, tbtcChain, _, _, _, err := ethereum.Connect(
+		_, tbtcChain, _, _, _, _, err := ethereum.Connect(
 			ctx,
 			clientConfig.Ethereum,
 		)
@@ -171,7 +171,7 @@ var estimateDepositsSweepFeeCommand = cobra.Command{
 			return fmt.Errorf("failed to find deposits count flag: %v", err)
 		}
 
-		_, tbtcChain, _, _, _, err := ethereum.Connect(ctx, clientConfig.Ethereum)
+		_, tbtcChain, _, _, _, _, err := ethereum.Connect(ctx, clientConfig.Ethereum)
 		if err != nil {
 			return fmt.Errorf(
 				"could not connect to Ethereum chain: [%v]",
@@ -285,7 +285,7 @@ var submitDepositSweepProofCommand = cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		_, tbtcChain, _, _, _, err := ethereum.Connect(
+		_, tbtcChain, _, _, _, _, err := ethereum.Connect(
 			ctx,
 			clientConfig.Ethereum,
 		)
@@ -375,7 +375,7 @@ var submitRedemptionProofCommand = cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		_, tbtcChain, _, _, _, err := ethereum.Connect(
+		_, tbtcChain, _, _, _, _, err := ethereum.Connect(
 			ctx,
 			clientConfig.Ethereum,
 		)

@@ -67,13 +67,14 @@ func Connect(
 	*BeaconChain,
 	*TbtcChain,
 	chain.BlockCounter,
+	chain.AuthoritativeClock,
 	chain.Signing,
 	*operator.PrivateKey,
 	error,
 ) {
 	client, err := ethclient.Dial(config.URL)
 	if err != nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf(
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf(
 			"error Connecting to Ethereum Server: %s [%v]",
 			config.URL,
 			err,
@@ -82,7 +83,7 @@ func Connect(
 
 	baseChain, err := newBaseChain(ctx, config, client)
 	if err != nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf(
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf(
 			"could not create base chain handle: [%v]",
 			err,
 		)
@@ -90,7 +91,7 @@ func Connect(
 
 	beaconChain, err := newBeaconChain(config, baseChain)
 	if err != nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf(
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf(
 			"could not create beacon chain handle: [%v]",
 			err,
 		)
@@ -98,7 +99,7 @@ func Connect(
 
 	tbtcChain, err := newTbtcChain(config, baseChain)
 	if err != nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf(
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf(
 			"could not create TBTC chain handle: [%v]",
 			err,
 		)
@@ -106,14 +107,14 @@ func Connect(
 
 	operatorPrivateKey, _, err := baseChain.OperatorKeyPair()
 	if err != nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf(
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf(
 			"could not get operator key pair: [%v]",
 			err,
 		)
 	}
 
 	if err := validateContractsAddresses(config, beaconChain, tbtcChain); err != nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf(
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf(
 			"contracts addresses validation failed: [%w]", err,
 		)
 	}
@@ -121,6 +122,7 @@ func Connect(
 	return beaconChain,
 		tbtcChain,
 		baseChain.blockCounter,
+		baseChain,
 		baseChain.Signing(),
 		operatorPrivateKey,
 		nil
