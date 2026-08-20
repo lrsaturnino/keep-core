@@ -316,7 +316,7 @@ func NewCutoverPeerRoster(
 // deterministic clock without racing the loop.
 func newCutoverPeerRoster(
 	ctx context.Context,
-	blockCounter chain.BlockCounter,
+	blockCounter chain.BlockCounter, // retained for API compatibility / future waiter use; height authority uses authoritativeClock
 	authoritativeClock chain.AuthoritativeClock,
 	retentionBlocks uint64,
 	metrics CutoverRosterMetricsRecorder,
@@ -387,7 +387,10 @@ func newCutoverPeerRoster(
 	// Synchronously seed the current block from the chain clock. A clock error
 	// here is tolerated: the roster is still constructed with the clock marked
 	// unavailable, so it can be built unconditionally beside the gate.
-	if currentBlock, err := authoritativeClock.CurrentHeight(loopCtx); err != nil {
+	seedCtx, cancelSeed := context.WithTimeout(loopCtx, authoritativeClockTimeout)
+	currentBlock, err := authoritativeClock.CurrentHeight(seedCtx)
+	cancelSeed()
+	if err != nil {
 		rosterLogger.Warnf(
 			"cutover peer roster could not read the chain clock at "+
 				"construction: [%v]; continuing with the clock marked "+
@@ -443,7 +446,9 @@ func (r *CutoverPeerRoster) run() {
 // pollAndSweep reads the chain clock and either sweeps at the new height or, on
 // a clock error, retains all state and evicts nothing.
 func (r *CutoverPeerRoster) pollAndSweep() {
-	currentBlock, err := r.authoritativeClock.CurrentHeight(r.ctx)
+	ctx, cancel := context.WithTimeout(r.ctx, authoritativeClockTimeout)
+	defer cancel()
+	currentBlock, err := r.authoritativeClock.CurrentHeight(ctx)
 	if err != nil {
 		r.markClockUnavailable()
 		return
@@ -495,7 +500,9 @@ func (r *CutoverPeerRoster) ObserveLegacy(
 	// would be discarded by the central fleet collector as pre-cutover evidence,
 	// losing a genuine post-cutover legacy sighting. The read happens outside the
 	// lock so a slow chain call never blocks Snapshot/Sweep.
-	currentBlock, clockErr := r.authoritativeClock.CurrentHeight(r.ctx)
+	ctx, cancel := context.WithTimeout(r.ctx, authoritativeClockTimeout)
+	defer cancel()
+	currentBlock, clockErr := r.authoritativeClock.CurrentHeight(ctx)
 	now := r.clock()
 
 	r.mu.Lock()
