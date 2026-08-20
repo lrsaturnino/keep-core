@@ -798,6 +798,10 @@ func (f *gateBlockCounter) CurrentBlock() (uint64, error) {
 	return block, err
 }
 
+func (f *gateBlockCounter) CurrentHeight(context.Context) (uint64, error) {
+	return f.CurrentBlock()
+}
+
 func (f *gateBlockCounter) WaitForBlockHeight(uint64) error { return nil }
 
 func (f *gateBlockCounter) BlockHeightWaiter(
@@ -1548,6 +1552,53 @@ func TestGate_ClockFailureCancelsPermits(t *testing.T) {
 	fresh.Close()
 	legacy.Close()
 	hardened.Close()
+}
+
+func TestGate_SupervisorUsesAuthoritativeClockNotCache(t *testing.T) {
+	t.Parallel()
+
+	cache := newGateBlockCounter(1000)
+	auth := &staticAuthClock{err: errors.New("rpc unavailable")}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// After Task 2, newGate takes auth explicitly. For the RED step on
+	// pre-change code this test will not compile — implement Task 2's
+	// signature first with auth ignored, then make readClock use auth.
+	gate, err := newGate(
+		ctx,
+		Schedule{CutoverBlock: 1000},
+		cache,
+		auth,
+		newFakeMetrics(),
+		time.Millisecond*20,
+	)
+	if err != nil {
+		t.Fatalf("newGate: %v", err)
+	}
+	defer gate.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if gate.State().State == StateClockUnavailable {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf(
+		"expected clock_unavailable while cache still returns height; got %s",
+		gate.State().State,
+	)
+}
+
+type staticAuthClock struct {
+	height uint64
+	err    error
+}
+
+func (s *staticAuthClock) CurrentHeight(context.Context) (uint64, error) {
+	return s.height, s.err
 }
 
 func TestGate_ClockFailureViaSupervisorPoll(t *testing.T) {
