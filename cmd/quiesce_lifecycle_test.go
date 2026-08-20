@@ -67,7 +67,7 @@ func TestSignalLifecycleController_FirstSignalPreventsNewPermits(t *testing.T) {
 		context.Background(),
 		participation.Schedule{CutoverBlock: 1_000_000},
 		blockCounter,
-		blockCounterAuthoritativeClock{blockCounter},
+		authFromCounter{blockCounter},
 		&clientinfo.NoOpPerformanceMetrics{},
 	)
 	if err != nil {
@@ -279,7 +279,7 @@ func TestSignalLifecycleController_TeardownFitsExitHeadroom(t *testing.T) {
 		context.Background(),
 		participation.Schedule{CutoverBlock: 1_000_000},
 		blockCounter,
-		blockCounterAuthoritativeClock{blockCounter},
+		authFromCounter{blockCounter},
 		&clientinfo.NoOpPerformanceMetrics{},
 	)
 	if err != nil {
@@ -373,7 +373,7 @@ func TestSignalLifecycleController_JoinsForcedCancellationCleanup(t *testing.T) 
 		context.Background(),
 		participation.Schedule{CutoverBlock: 1_000_000},
 		blockCounter,
-		blockCounterAuthoritativeClock{blockCounter},
+		authFromCounter{blockCounter},
 		&clientinfo.NoOpPerformanceMetrics{},
 	)
 	if err != nil {
@@ -468,7 +468,7 @@ func TestSignalLifecycleController_CancellationAllowanceBoundsTheWait(
 		context.Background(),
 		participation.Schedule{CutoverBlock: 1_000_000},
 		blockCounter,
-		blockCounterAuthoritativeClock{blockCounter},
+		authFromCounter{blockCounter},
 		&clientinfo.NoOpPerformanceMetrics{},
 	)
 	if err != nil {
