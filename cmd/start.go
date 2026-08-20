@@ -222,6 +222,7 @@ func start(cmd *cobra.Command) error {
 	cutoverRoster, err := participation.NewCutoverPeerRoster(
 		ctx,
 		blockCounter,
+		authoritativeClock,
 		rosterRetentionBlocks,
 		rosterMetrics,
 		participation.WithCutoverSchedule(participationSchedule),

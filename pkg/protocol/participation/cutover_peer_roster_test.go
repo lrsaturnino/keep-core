@@ -128,6 +128,16 @@ func (f *fakeBlockCounter) WatchBlocks(ctx context.Context) <-chan uint64 {
 	return ch
 }
 
+type testRosterAuthoritativeClock struct {
+	blockCounter chain.BlockCounter
+}
+
+func (c testRosterAuthoritativeClock) CurrentHeight(
+	context.Context,
+) (uint64, error) {
+	return c.blockCounter.CurrentBlock()
+}
+
 type mutableRosterClock struct {
 	mu  sync.Mutex
 	now time.Time
@@ -213,6 +223,7 @@ func newRunLoopTestRoster(
 	roster, err := newCutoverPeerRoster(
 		context.Background(),
 		blockCounter,
+		testRosterAuthoritativeClock{blockCounter},
 		retention,
 		newFakeMetrics(),
 		clock.Now,
@@ -332,6 +343,7 @@ func newTestRoster(
 	roster, err := newCutoverPeerRoster(
 		context.Background(),
 		bc,
+		testRosterAuthoritativeClock{bc},
 		retention,
 		metrics,
 		fixedClock(),
@@ -365,9 +377,11 @@ func observeStraggler(
 }
 
 func TestCutoverPeerRoster_ConstructionRejectsZeroRetention(t *testing.T) {
+	blockCounter := newFakeBlockCounter(0)
 	_, err := NewCutoverPeerRoster(
 		context.Background(),
-		newFakeBlockCounter(0),
+		blockCounter,
+		testRosterAuthoritativeClock{blockCounter},
 		0,
 		newFakeMetrics(),
 	)
@@ -377,9 +391,11 @@ func TestCutoverPeerRoster_ConstructionRejectsZeroRetention(t *testing.T) {
 }
 
 func TestCutoverPeerRoster_ConstructionRejectsOverflowRetention(t *testing.T) {
+	blockCounter := newFakeBlockCounter(0)
 	_, err := NewCutoverPeerRoster(
 		context.Background(),
-		newFakeBlockCounter(0),
+		blockCounter,
+		testRosterAuthoritativeClock{blockCounter},
 		maxSafeMetricInteger+1,
 		newFakeMetrics(),
 	)
@@ -391,9 +407,11 @@ func TestCutoverPeerRoster_ConstructionRejectsOverflowRetention(t *testing.T) {
 func TestCutoverPeerRoster_ConstructionRejectsUnprojectableCutoverSchedule(
 	t *testing.T,
 ) {
+	blockCounter := newFakeBlockCounter(0)
 	_, err := NewCutoverPeerRoster(
 		context.Background(),
-		newFakeBlockCounter(0),
+		blockCounter,
+		testRosterAuthoritativeClock{blockCounter},
 		1000,
 		newFakeMetrics(),
 		WithCutoverSchedule(Schedule{
@@ -408,9 +426,11 @@ func TestCutoverPeerRoster_ConstructionRejectsUnprojectableCutoverSchedule(
 func TestCutoverPeerRoster_ConstructionRejectsNilEvidenceWindowSignal(
 	t *testing.T,
 ) {
+	blockCounter := newFakeBlockCounter(0)
 	_, err := NewCutoverPeerRoster(
 		context.Background(),
-		newFakeBlockCounter(0),
+		blockCounter,
+		testRosterAuthoritativeClock{blockCounter},
 		1000,
 		newFakeMetrics(),
 		WithCutoverEvidenceWindowSignal(nil),
@@ -455,6 +475,7 @@ func TestCutoverPeerRoster_ConstructionClockFailureIsTolerated(t *testing.T) {
 	roster, err := NewCutoverPeerRoster(
 		context.Background(),
 		bc,
+		testRosterAuthoritativeClock{bc},
 		1000,
 		newFakeMetrics(),
 	)
@@ -466,6 +487,40 @@ func TestCutoverPeerRoster_ConstructionClockFailureIsTolerated(t *testing.T) {
 	snapshot := roster.Snapshot()
 	if snapshot.ClockAvailable {
 		t.Error("expected clock to be marked unavailable after a construction clock error")
+	}
+}
+
+func TestCutoverPeerRoster_ConstructionUsesAuthoritativeClock(t *testing.T) {
+	blockCounter := newFakeBlockCounter(1234)
+	clock := &staticAuthClock{
+		height: 1234,
+		err:    fmt.Errorf("authoritative clock unavailable"),
+	}
+
+	roster, err := NewCutoverPeerRoster(
+		context.Background(),
+		blockCounter,
+		clock,
+		1000,
+		newFakeMetrics(),
+	)
+	if err != nil {
+		t.Fatalf("construction should tolerate a clock error, got: [%v]", err)
+	}
+	t.Cleanup(roster.Close)
+
+	snapshot := roster.Snapshot()
+	if snapshot.ClockAvailable {
+		t.Error(
+			"counter height must not make the roster ready when the " +
+				"authoritative clock is unavailable",
+		)
+	}
+	if snapshot.CurrentBlock != 0 {
+		t.Errorf(
+			"counter height must not seed current block; got [%d]",
+			snapshot.CurrentBlock,
+		)
 	}
 }
 
@@ -487,9 +542,11 @@ func TestCutoverPeerRoster_EntryLogIncludesResolvedCutoverBlock(t *testing.T) {
 	)
 
 	entries := captureRosterLogs(t, func() {
+		blockCounter := newFakeBlockCounter(currentBlock)
 		roster, err := NewCutoverPeerRoster(
 			context.Background(),
-			newFakeBlockCounter(currentBlock),
+			blockCounter,
+			testRosterAuthoritativeClock{blockCounter},
 			1000,
 			newFakeMetrics(),
 			WithCutoverSchedule(Schedule{CutoverBlock: cutoverBlock}),

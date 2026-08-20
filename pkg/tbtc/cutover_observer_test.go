@@ -147,9 +147,11 @@ func newTestRoster(
 	block uint64,
 ) *participation.CutoverPeerRoster {
 	t.Helper()
+	blockCounter := &cutoverFakeBlockCounter{block: block}
 	roster, err := participation.NewCutoverPeerRoster(
 		context.Background(),
-		&cutoverFakeBlockCounter{block: block},
+		blockCounter,
+		testAuthoritativeClock{blockCounter},
 		1500,
 		metrics,
 	)
