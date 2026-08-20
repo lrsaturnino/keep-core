@@ -127,6 +127,7 @@ func TestNode_BeginWalletActionPermit(t *testing.T) {
 			t.Context(),
 			participation.Schedule{CutoverBlock: 1_000_000},
 			blockCounter,
+			testAuthoritativeClock{blockCounter},
 			testGateMetrics{},
 		)
 		if err != nil {

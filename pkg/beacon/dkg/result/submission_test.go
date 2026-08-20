@@ -15,6 +15,14 @@ import (
 	"github.com/keep-network/keep-core/pkg/protocol/participation"
 )
 
+type testAuthoritativeClock struct{ chain.BlockCounter }
+
+func (c testAuthoritativeClock) CurrentHeight(
+	context.Context,
+) (uint64, error) {
+	return c.CurrentBlock()
+}
+
 // testCommitPermit issues a real gate permit over the given block counter with
 // the developer-only disabled schedule, so submissions exercise the production
 // commit fence. The returned permit doubles as the commit guard.
@@ -28,6 +36,7 @@ func testCommitPermit(
 		context.Background(),
 		participation.Schedule{},
 		blockCounter,
+		testAuthoritativeClock{blockCounter},
 		&clientinfo.NoOpPerformanceMetrics{},
 	)
 	if err != nil {
@@ -304,6 +313,7 @@ func TestSubmitDKGResult_RefusedByGateFence(t *testing.T) {
 		context.Background(),
 		participation.Schedule{},
 		blockCounter,
+		testAuthoritativeClock{blockCounter},
 		&clientinfo.NoOpPerformanceMetrics{},
 	)
 	if err != nil {

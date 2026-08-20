@@ -44,6 +44,14 @@ type Result struct {
 	loggedErrors []string
 }
 
+type authoritativeClockFromBlockCounter struct{ chain.BlockCounter }
+
+func (c authoritativeClockFromBlockCounter) CurrentHeight(
+	context.Context,
+) (uint64, error) {
+	return c.CurrentBlock()
+}
+
 // GetSigners returns all signers created from DKG protocol execution.
 // If no signers were created because of protocol failures, empty slice
 // is returned.
@@ -239,6 +247,7 @@ func executeDKG(
 		context.Background(),
 		participation.Schedule{},
 		blockCounter,
+		authoritativeClockFromBlockCounter{blockCounter},
 		&clientinfo.NoOpPerformanceMetrics{},
 	)
 	if err != nil {

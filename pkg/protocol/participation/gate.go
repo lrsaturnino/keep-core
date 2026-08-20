@@ -390,6 +390,8 @@ const (
 // polls the current chain height between authoritative per-operation reads.
 const gateSupervisorPollInterval = 15 * time.Second
 
+const authoritativeClockTimeout = 8 * time.Second
+
 type permit struct {
 	gate                *chainGate
 	ceremony            Ceremony
@@ -419,11 +421,12 @@ func (p *permit) Mode() ProtocolMode          { return p.mode }
 func (p *permit) WorkID() string              { return p.workID }
 func (p *permit) PermitID() string            { return p.permitID }
 
-// chainGate is the production Gate implementation, clocked exclusively by the
-// shared Ethereum block counter.
+// chainGate is the production Gate implementation. Authoritative reads use the
+// direct chain clock; the block counter remains only for cutover waiters.
 type chainGate struct {
 	schedule     Schedule
 	blockCounter chain.BlockCounter
+	clock        chain.AuthoritativeClock
 	metrics      GateMetricsRecorder
 
 	ctx      context.Context
@@ -520,6 +523,7 @@ func NewGate(
 	ctx context.Context,
 	schedule Schedule,
 	blockCounter chain.BlockCounter,
+	clock chain.AuthoritativeClock,
 	metrics GateMetricsRecorder,
 	options ...GateOption,
 ) (Gate, error) {
@@ -527,6 +531,7 @@ func NewGate(
 		ctx,
 		schedule,
 		blockCounter,
+		clock,
 		metrics,
 		gateSupervisorPollInterval,
 		options...,
@@ -538,6 +543,7 @@ func newGate(
 	ctx context.Context,
 	schedule Schedule,
 	blockCounter chain.BlockCounter,
+	clock chain.AuthoritativeClock,
 	metrics GateMetricsRecorder,
 	pollInterval time.Duration,
 	optionFunctions ...GateOption,
@@ -561,6 +567,9 @@ func newGate(
 	if blockCounter == nil {
 		return nil, fmt.Errorf("block counter is required")
 	}
+	if clock == nil {
+		return nil, fmt.Errorf("authoritative clock is required")
+	}
 	if metrics == nil {
 		return nil, fmt.Errorf("metrics recorder is required")
 	}
@@ -571,8 +580,35 @@ func newGate(
 		return nil, err
 	}
 
-	currentBlock, err := blockCounter.CurrentBlock()
+	loopCtx, cancel := context.WithCancel(ctx)
+	gate := &chainGate{
+		schedule:          schedule,
+		blockCounter:      blockCounter,
+		clock:             clock,
+		metrics:           metrics,
+		ctx:               loopCtx,
+		cancel:            cancel,
+		loopDone:          make(chan struct{}),
+		modeLogLimiter:    rate.NewLimiter(rate.Every(30*time.Second), 5),
+		refusalLogLimiter: rate.NewLimiter(rate.Every(30*time.Second), 5),
+		releaseVersion:    options.releaseVersion,
+		releaseRevision:   options.releaseRevision,
+		recorder:          options.recorder,
+		now:               options.now,
+		quiesceDone:       make(chan struct{}),
+		drained:           make(chan struct{}),
+		permits:           make(map[*permit]struct{}),
+		instance:          newGateInstance(),
+	}
+
+	clockCtx, cancelClock := context.WithTimeout(
+		gate.ctx,
+		authoritativeClockTimeout,
+	)
+	currentBlock, err := clock.CurrentHeight(clockCtx)
+	cancelClock()
 	if err != nil {
+		gate.cancel()
 		return nil, fmt.Errorf(
 			"could not read the chain clock at gate construction: [%w]",
 			err,
@@ -582,6 +618,7 @@ func newGate(
 	// metric surface; a chain reporting an unprojectable height is as unusable
 	// as one reporting an error.
 	if err := validateMetricProjectable(currentBlock); err != nil {
+		gate.cancel()
 		return nil, fmt.Errorf(
 			"could not accept the chain height at gate construction: [%w]",
 			err,
@@ -597,6 +634,7 @@ func newGate(
 			schedule.CutoverBlock,
 		)
 		if err != nil {
+			gate.cancel()
 			return nil, fmt.Errorf(
 				"could not arm the cutover block waiter: [%w]",
 				err,
@@ -604,28 +642,8 @@ func newGate(
 		}
 	}
 
-	loopCtx, cancel := context.WithCancel(ctx)
-
-	gate := &chainGate{
-		schedule:          schedule,
-		blockCounter:      blockCounter,
-		metrics:           metrics,
-		ctx:               loopCtx,
-		cancel:            cancel,
-		loopDone:          make(chan struct{}),
-		modeLogLimiter:    rate.NewLimiter(rate.Every(30*time.Second), 5),
-		refusalLogLimiter: rate.NewLimiter(rate.Every(30*time.Second), 5),
-		releaseVersion:    options.releaseVersion,
-		releaseRevision:   options.releaseRevision,
-		recorder:          options.recorder,
-		now:               options.now,
-		quiesceDone:       make(chan struct{}),
-		drained:           make(chan struct{}),
-		permits:           make(map[*permit]struct{}),
-		currentBlock:      currentBlock,
-		clockAvailable:    true,
-		instance:          newGateInstance(),
-	}
+	gate.currentBlock = currentBlock
+	gate.clockAvailable = true
 
 	gate.initMetrics()
 
@@ -738,7 +756,9 @@ func (g *chainGate) poll(operation string) {
 // even when a newer concurrent sample supersedes this one.
 func (g *chainGate) readClock() (ticket uint64, height uint64, err error) {
 	ticket = g.clockSeq.Add(1)
-	height, err = g.blockCounter.CurrentBlock()
+	ctx, cancel := context.WithTimeout(g.ctx, authoritativeClockTimeout)
+	defer cancel()
+	height, err = g.clock.CurrentHeight(ctx)
 	if err == nil {
 		err = validateMetricProjectable(height)
 	}

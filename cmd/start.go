@@ -50,6 +50,16 @@ var StartCommand = &cobra.Command{
 	},
 }
 
+// blockCounterAuthoritativeClock is temporary wiring until Task 4 passes the
+// Ethereum base chain directly as the gate's authoritative RPC clock.
+type blockCounterAuthoritativeClock struct{ chain.BlockCounter }
+
+func (c blockCounterAuthoritativeClock) CurrentHeight(
+	context.Context,
+) (uint64, error) {
+	return c.CurrentBlock()
+}
+
 func init() {
 	initFlags(StartCommand, &configFilePath, clientConfig, config.StartCmdCategories...)
 
@@ -191,6 +201,7 @@ func start(cmd *cobra.Command) error {
 		ctx,
 		participationSchedule,
 		blockCounter,
+		blockCounterAuthoritativeClock{blockCounter},
 		gateMetrics,
 		participation.WithArtifactIdentity(build.Version, build.Revision),
 		participation.WithQuiescenceSnapshotRecorder(quiescenceRecorder),
