@@ -79,6 +79,12 @@ func (c *auditGateBlockCounter) CurrentBlock() (uint64, error) {
 	return c.block, nil
 }
 
+func (c *auditGateBlockCounter) CurrentHeight(
+	context.Context,
+) (uint64, error) {
+	return c.CurrentBlock()
+}
+
 func (c *auditGateBlockCounter) WaitForBlockHeight(uint64) error {
 	return nil
 }
@@ -594,6 +600,7 @@ func persistRealGateQuiescenceSnapshot(
 	gate, err := participation.NewGate(
 		context.Background(),
 		participation.Schedule{CutoverBlock: 1_000},
+		&auditGateBlockCounter{block: 1_100},
 		&auditGateBlockCounter{block: 1_100},
 		auditGateMetrics{},
 		participation.WithArtifactIdentity(

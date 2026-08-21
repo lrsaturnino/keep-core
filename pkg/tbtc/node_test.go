@@ -1285,6 +1285,7 @@ func newTestCutoverRoster(
 	roster, err := participation.NewCutoverPeerRoster(
 		ctx,
 		blockCounter,
+		testAuthoritativeClock{blockCounter},
 		1500,
 		&clientinfo.NoOpPerformanceMetrics{},
 	)

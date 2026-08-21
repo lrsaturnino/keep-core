@@ -581,6 +581,7 @@ func TestSigningCutover_PostCutoverSplitFailsClosedWithEvidence(t *testing.T) {
 	roster, err := participation.NewCutoverPeerRoster(
 		context.Background(),
 		blockCounter,
+		testAuthoritativeClock{blockCounter},
 		1500,
 		newCutoverFakeMetrics(),
 	)
@@ -758,6 +759,7 @@ func TestSigningCutover_LoopNeverInvokesSigningBelowThreshold(t *testing.T) {
 	roster, err := participation.NewCutoverPeerRoster(
 		context.Background(),
 		blockCounter,
+		testAuthoritativeClock{blockCounter},
 		1500,
 		newCutoverFakeMetrics(),
 	)

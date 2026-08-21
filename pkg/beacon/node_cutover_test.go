@@ -272,6 +272,7 @@ func newCutoverNodeHarness(
 		context.Background(),
 		participation.Schedule{CutoverBlock: cutoverBlockFor(currentBlock)},
 		gateClock,
+		testAuthoritativeClock{gateClock},
 		gateMetrics,
 	)
 	if err != nil {
@@ -619,6 +620,7 @@ func TestJoinDKGIfEligible_LegacyAnchorInteroperatesWithLegacyPeers(t *testing.T
 		context.Background(),
 		participation.Schedule{},
 		externalBlockCounter,
+		testAuthoritativeClock{externalBlockCounter},
 		externalMetrics,
 	)
 	if err != nil {
@@ -1198,6 +1200,7 @@ func TestBlockOnIncompleteQuarantine_QuiescesOnEitherMissingHalf(t *testing.T) {
 				context.Background(),
 				participation.Schedule{CutoverBlock: currentBlock + 100_000},
 				blockCounter,
+				testAuthoritativeClock{blockCounter},
 				newCutoverGateMetrics(),
 			)
 			if err != nil {
@@ -1592,6 +1595,7 @@ func TestMonitorRelayEntry_LegacyTimeoutReportSuppressedAfterCutover(t *testing.
 		context.Background(),
 		participation.Schedule{CutoverBlock: currentBlock + 5},
 		blockCounter,
+		testAuthoritativeClock{blockCounter},
 		gateMetrics,
 	)
 	if err != nil {
@@ -1660,6 +1664,7 @@ func TestMonitorRelayEntry_TimeoutReportedBelowCutover(t *testing.T) {
 		context.Background(),
 		participation.Schedule{CutoverBlock: currentBlock + 100_000},
 		blockCounter,
+		testAuthoritativeClock{blockCounter},
 		gateMetrics,
 	)
 	if err != nil {
@@ -1763,6 +1768,7 @@ func TestForwardSignatureShares_GateCancellationClosesForwarder(t *testing.T) {
 		context.Background(),
 		participation.Schedule{CutoverBlock: currentBlock + 100_000},
 		blockCounter,
+		testAuthoritativeClock{blockCounter},
 		gateMetrics,
 	)
 	if err != nil {
@@ -1828,6 +1834,7 @@ func TestForwardSignatureShares_ForwarderEndClosesPermit(t *testing.T) {
 		context.Background(),
 		participation.Schedule{CutoverBlock: currentBlock + 100_000},
 		blockCounter,
+		testAuthoritativeClock{blockCounter},
 		gateMetrics,
 	)
 	if err != nil {

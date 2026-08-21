@@ -41,6 +41,14 @@ type Result struct {
 	populations map[group.MemberIndex]participation.MemberIndexes
 }
 
+type authoritativeClockFromBlockCounter struct{ chain.BlockCounter }
+
+func (c authoritativeClockFromBlockCounter) CurrentHeight(
+	context.Context,
+) (uint64, error) {
+	return c.CurrentBlock()
+}
+
 // EntryValue returns the value of relay entry from the result as G1 or
 // nil if no entry was produced because of signers failures.
 // Error is returned if the entry produced by signers can not be unmarshalled
@@ -155,6 +163,7 @@ func executeSigning(
 		context.Background(),
 		participation.Schedule{},
 		blockCounter,
+		authoritativeClockFromBlockCounter{blockCounter},
 		&clientinfo.NoOpPerformanceMetrics{},
 	)
 	if err != nil {

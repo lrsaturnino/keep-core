@@ -1094,6 +1094,7 @@ func TestDKGCutover_PostCutoverSplitExcludesLegacyPeersAtProductionScale(t *test
 	roster, err := participation.NewCutoverPeerRoster(
 		context.Background(),
 		blockCounter,
+		testAuthoritativeClock{blockCounter},
 		1500,
 		newCutoverFakeMetrics(),
 	)
@@ -1329,6 +1330,7 @@ func TestDKGCutover_RealKeyGenerationExcludesLegacyPeerAtQuorum(t *testing.T) {
 	roster, err := participation.NewCutoverPeerRoster(
 		context.Background(),
 		cutoverGroup.blockCounter,
+		testAuthoritativeClock{cutoverGroup.blockCounter},
 		1500,
 		newCutoverFakeMetrics(),
 	)
@@ -1614,6 +1616,7 @@ func TestDKGCutover_RealKeyGenerationExcludesTenLegacyPeers(t *testing.T) {
 	roster, err := participation.NewCutoverPeerRoster(
 		context.Background(),
 		cutoverGroup.blockCounter,
+		testAuthoritativeClock{cutoverGroup.blockCounter},
 		1500,
 		newCutoverFakeMetrics(),
 	)

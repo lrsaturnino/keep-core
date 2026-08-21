@@ -129,8 +129,13 @@ func start(cmd *cobra.Command) error {
 		participationSchedule.Disabled(),
 	)
 
-	beaconChain, tbtcChain, blockCounter, signing, operatorPrivateKey, err :=
-		ethereum.Connect(ctx, clientConfig.Ethereum)
+	beaconChain,
+		tbtcChain,
+		blockCounter,
+		authoritativeClock,
+		signing,
+		operatorPrivateKey,
+		err := ethereum.Connect(ctx, clientConfig.Ethereum)
 	if err != nil {
 		return fmt.Errorf("error connecting to Ethereum node: [%v]", err)
 	}
@@ -191,6 +196,7 @@ func start(cmd *cobra.Command) error {
 		ctx,
 		participationSchedule,
 		blockCounter,
+		authoritativeClock,
 		gateMetrics,
 		participation.WithArtifactIdentity(build.Version, build.Revision),
 		participation.WithQuiescenceSnapshotRecorder(quiescenceRecorder),
@@ -216,6 +222,7 @@ func start(cmd *cobra.Command) error {
 	cutoverRoster, err := participation.NewCutoverPeerRoster(
 		ctx,
 		blockCounter,
+		authoritativeClock,
 		rosterRetentionBlocks,
 		rosterMetrics,
 		participation.WithCutoverSchedule(participationSchedule),

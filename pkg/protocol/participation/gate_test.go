@@ -36,6 +36,7 @@ func TestGate_CeremonySpecificPermitIdentityValidation(t *testing.T) {
 		context.Background(),
 		Schedule{CutoverBlock: cutover},
 		newGateBlockCounter(cutover),
+		newGateBlockCounter(cutover),
 		newFakeMetrics(),
 		inertPollInterval,
 		WithArtifactIdentity("v2.1.0", "revision-test"),
@@ -208,6 +209,7 @@ func TestGate_NodeAuthoredTerminalOutcomes(t *testing.T) {
 		context.Background(),
 		Schedule{CutoverBlock: cutover},
 		newGateBlockCounter(cutover),
+		newGateBlockCounter(cutover),
 		newFakeMetrics(),
 		inertPollInterval,
 		WithArtifactIdentity("v2.1.0", "revision-test"),
@@ -296,6 +298,7 @@ func TestGate_RetainsTerminalOutcomesOfClosedPermits(t *testing.T) {
 	gate, err := newGate(
 		context.Background(),
 		Schedule{CutoverBlock: cutover},
+		newGateBlockCounter(cutover),
 		newGateBlockCounter(cutover),
 		newFakeMetrics(),
 		inertPollInterval,
@@ -407,6 +410,7 @@ func TestGate_TerminalOutcomeAccountIsBounded(t *testing.T) {
 		context.Background(),
 		Schedule{CutoverBlock: cutover},
 		newGateBlockCounter(cutover),
+		newGateBlockCounter(cutover),
 		newFakeMetrics(),
 		inertPollInterval,
 	)
@@ -480,6 +484,7 @@ func TestGate_PublishesAProcessInstanceIdentity(t *testing.T) {
 			context.Background(),
 			Schedule{CutoverBlock: cutover},
 			newGateBlockCounter(cutover),
+			newGateBlockCounter(cutover),
 			newFakeMetrics(),
 			inertPollInterval,
 		)
@@ -520,6 +525,7 @@ func TestGate_TerminalOutcomeAccountIsNotAliased(t *testing.T) {
 	gate, err := newGate(
 		context.Background(),
 		Schedule{CutoverBlock: cutover},
+		newGateBlockCounter(cutover),
 		newGateBlockCounter(cutover),
 		newFakeMetrics(),
 		inertPollInterval,
@@ -584,6 +590,7 @@ func TestGate_NodeAuthoredTerminalOutcomeRetriesPersistence(t *testing.T) {
 	gate, err := newGate(
 		context.Background(),
 		Schedule{CutoverBlock: cutover},
+		newGateBlockCounter(cutover),
 		newGateBlockCounter(cutover),
 		newFakeMetrics(),
 		inertPollInterval,
@@ -798,6 +805,10 @@ func (f *gateBlockCounter) CurrentBlock() (uint64, error) {
 	return block, err
 }
 
+func (f *gateBlockCounter) CurrentHeight(context.Context) (uint64, error) {
+	return f.CurrentBlock()
+}
+
 func (f *gateBlockCounter) WaitForBlockHeight(uint64) error { return nil }
 
 func (f *gateBlockCounter) BlockHeightWaiter(
@@ -848,6 +859,7 @@ func newTestGate(
 		context.Background(),
 		schedule,
 		blockCounter,
+		blockCounter,
 		metrics,
 		pollInterval,
 	)
@@ -878,19 +890,30 @@ func TestNewGate_Validation(t *testing.T) {
 	blockCounter := newGateBlockCounter(100)
 
 	if _, err := newGate(
-		context.Background(), Schedule{}, nil, metrics, time.Second,
+		context.Background(), Schedule{}, nil, blockCounter, metrics, time.Second,
 	); err == nil {
 		t.Error("expected a nil block counter rejection")
 	}
 
 	if _, err := newGate(
-		context.Background(), Schedule{}, blockCounter, nil, time.Second,
+		context.Background(), Schedule{}, blockCounter, nil, metrics, time.Second,
+	); err == nil {
+		t.Error("expected a nil authoritative clock rejection")
+	}
+
+	if _, err := newGate(
+		context.Background(),
+		Schedule{},
+		blockCounter,
+		blockCounter,
+		nil,
+		time.Second,
 	); err == nil {
 		t.Error("expected a nil metrics recorder rejection")
 	}
 
 	if _, err := newGate(
-		context.Background(), Schedule{}, blockCounter, metrics, 0,
+		context.Background(), Schedule{}, blockCounter, blockCounter, metrics, 0,
 	); err == nil {
 		t.Error("expected a non-positive poll interval rejection")
 	}
@@ -898,6 +921,7 @@ func TestNewGate_Validation(t *testing.T) {
 	if _, err := newGate(
 		context.Background(),
 		Schedule{CutoverBlock: maxSafeMetricInteger + 1},
+		blockCounter,
 		blockCounter,
 		metrics,
 		time.Second,
@@ -908,14 +932,19 @@ func TestNewGate_Validation(t *testing.T) {
 	failing := newGateBlockCounter(100)
 	failing.set(100, fmt.Errorf("clock down"))
 	if _, err := newGate(
-		context.Background(), Schedule{}, failing, metrics, time.Second,
+		context.Background(), Schedule{}, failing, failing, metrics, time.Second,
 	); err == nil {
 		t.Error("expected a chain-clock error at startup to be rejected")
 	}
 
 	unprojectable := newGateBlockCounter(maxSafeMetricInteger + 1)
 	if _, err := newGate(
-		context.Background(), Schedule{}, unprojectable, metrics, time.Second,
+		context.Background(),
+		Schedule{},
+		unprojectable,
+		unprojectable,
+		metrics,
+		time.Second,
 	); err == nil {
 		t.Error("expected an unprojectable chain height rejection")
 	}
@@ -925,6 +954,7 @@ func TestNewGate_Validation(t *testing.T) {
 	if _, err := newGate(
 		context.Background(),
 		Schedule{CutoverBlock: 1000},
+		noWaiter,
 		noWaiter,
 		metrics,
 		time.Second,
@@ -1550,6 +1580,62 @@ func TestGate_ClockFailureCancelsPermits(t *testing.T) {
 	hardened.Close()
 }
 
+func TestGate_SupervisorUsesAuthoritativeClockNotCache(t *testing.T) {
+	t.Parallel()
+
+	cache := newGateBlockCounter(1000)
+	auth := &staticAuthClock{height: 1000}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	gate, err := newGate(
+		ctx,
+		Schedule{CutoverBlock: 1000},
+		cache,
+		auth,
+		newFakeMetrics(),
+		time.Millisecond*20,
+	)
+	if err != nil {
+		t.Fatalf("newGate: %v", err)
+	}
+	defer gate.Close()
+
+	auth.set(0, errors.New("rpc unavailable"))
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if gate.State().State == StateClockUnavailable {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf(
+		"expected clock_unavailable while cache still returns height; got %s",
+		gate.State().State,
+	)
+}
+
+type staticAuthClock struct {
+	mu     sync.Mutex
+	height uint64
+	err    error
+}
+
+func (s *staticAuthClock) CurrentHeight(context.Context) (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.height, s.err
+}
+
+func (s *staticAuthClock) set(height uint64, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.height = height
+	s.err = err
+}
+
 func TestGate_ClockFailureViaSupervisorPoll(t *testing.T) {
 	gate, blockCounter, _ := newTestGate(
 		t, Schedule{CutoverBlock: 1000}, 999, 5*time.Millisecond,
@@ -1700,6 +1786,7 @@ func TestGate_QuiescenceCapturesRealPermitInventoryAtomically(t *testing.T) {
 	gate, err := newGate(
 		context.Background(),
 		Schedule{CutoverBlock: cutover},
+		blockCounter,
 		blockCounter,
 		newFakeMetrics(),
 		inertPollInterval,
@@ -2684,6 +2771,7 @@ func TestGate_TerminalOutcomeRetryComparesSettlementByValue(t *testing.T) {
 	gate, err := newGate(
 		context.Background(),
 		Schedule{CutoverBlock: cutover},
+		newGateBlockCounter(cutover),
 		newGateBlockCounter(cutover),
 		newFakeMetrics(),
 		inertPollInterval,

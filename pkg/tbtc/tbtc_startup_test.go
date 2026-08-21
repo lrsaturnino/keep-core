@@ -68,6 +68,7 @@ func TestInitialize_UnreadableQuarantineStopsStartupBeforeCoordination(
 	roster, err := participation.NewCutoverPeerRoster(
 		ctx,
 		blockCounter,
+		testAuthoritativeClock{blockCounter},
 		retention,
 		testGateMetrics{},
 	)

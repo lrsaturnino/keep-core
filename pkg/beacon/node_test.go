@@ -7,9 +7,18 @@ import (
 	"testing"
 
 	beaconchain "github.com/keep-network/keep-core/pkg/beacon/chain"
+	"github.com/keep-network/keep-core/pkg/chain"
 	"github.com/keep-network/keep-core/pkg/chain/local_v1"
 	"github.com/keep-network/keep-core/pkg/protocol/participation"
 )
+
+type testAuthoritativeClock struct{ chain.BlockCounter }
+
+func (c testAuthoritativeClock) CurrentHeight(
+	context.Context,
+) (uint64, error) {
+	return c.CurrentBlock()
+}
 
 var relayEntryTimeout = uint64(15)
 
@@ -37,6 +46,7 @@ func newMonitorTestNode(
 		context.Background(),
 		participation.Schedule{},
 		blockCounter,
+		testAuthoritativeClock{blockCounter},
 		newCutoverGateMetrics(),
 	)
 	if err != nil {

@@ -15,6 +15,14 @@ type testGateMetrics struct{}
 func (testGateMetrics) IncrementCounter(string, float64) {}
 func (testGateMetrics) SetGauge(string, float64)         {}
 
+type testAuthoritativeClock struct{ chain.BlockCounter }
+
+func (c testAuthoritativeClock) CurrentHeight(
+	context.Context,
+) (uint64, error) {
+	return c.CurrentBlock()
+}
+
 // newTestGate constructs a real participation gate over the given block
 // counter with an already-crossed cutover block, so every permit with a
 // nonzero anchor pins the security-v2 mode — the only mode the tECDSA stack
@@ -42,6 +50,7 @@ func newTestGateWithCutover(
 		context.Background(),
 		participation.Schedule{CutoverBlock: cutoverBlock},
 		blockCounter,
+		testAuthoritativeClock{blockCounter},
 		testGateMetrics{},
 	)
 	if err != nil {

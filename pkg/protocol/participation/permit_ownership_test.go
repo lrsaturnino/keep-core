@@ -62,6 +62,7 @@ func TestPermit_OperatedSeatsSurviveEveryEnding(t *testing.T) {
 				context.Background(),
 				Schedule{CutoverBlock: cutover},
 				newGateBlockCounter(cutover),
+				newGateBlockCounter(cutover),
 				newFakeMetrics(),
 				inertPollInterval,
 			)
@@ -122,6 +123,7 @@ func TestPermit_UnresolvedEndingStillNamesItsSeats(t *testing.T) {
 	gate, err := newGate(
 		context.Background(),
 		Schedule{CutoverBlock: cutover},
+		newGateBlockCounter(cutover),
 		newGateBlockCounter(cutover),
 		newFakeMetrics(),
 		inertPollInterval,
@@ -232,6 +234,7 @@ func TestPermit_TranscriptCannotClaimAnUnoperatedSeat(t *testing.T) {
 				context.Background(),
 				Schedule{CutoverBlock: cutover},
 				newGateBlockCounter(cutover),
+				newGateBlockCounter(cutover),
 				newFakeMetrics(),
 				inertPollInterval,
 			)
@@ -306,6 +309,7 @@ func TestPermit_TBTCDKGTranscriptIsHeldToItsPermitSeatThroughTheMapping(
 				context.Background(),
 				Schedule{CutoverBlock: cutover},
 				newGateBlockCounter(cutover),
+				newGateBlockCounter(cutover),
 				newFakeMetrics(),
 				inertPollInterval,
 			)
@@ -374,6 +378,7 @@ func TestPermit_TBTCDKGTranscriptRequiresItsPermitSpaceMapping(t *testing.T) {
 	gate, err := newGate(
 		context.Background(),
 		Schedule{CutoverBlock: cutover},
+		newGateBlockCounter(cutover),
 		newGateBlockCounter(cutover),
 		newFakeMetrics(),
 		inertPollInterval,
@@ -453,6 +458,7 @@ func TestPermit_OperatedSeatsAreNotAliased(t *testing.T) {
 		context.Background(),
 		Schedule{CutoverBlock: cutover},
 		newGateBlockCounter(cutover),
+		newGateBlockCounter(cutover),
 		newFakeMetrics(),
 		inertPollInterval,
 	)
@@ -514,6 +520,7 @@ func TestPermit_ConcurrentReadersSeeTheirOwnOperatedSeats(t *testing.T) {
 	gate, err := newGate(
 		context.Background(),
 		Schedule{CutoverBlock: cutover},
+		newGateBlockCounter(cutover),
 		newGateBlockCounter(cutover),
 		newFakeMetrics(),
 		inertPollInterval,
