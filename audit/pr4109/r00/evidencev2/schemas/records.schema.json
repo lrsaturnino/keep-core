@@ -1,0 +1,337 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://threshold.network/schemas/pr4109/r00/evidence-v2-records.json",
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "hexBytes": { "type": "string", "pattern": "^0x(?:[0-9a-f]{2})*$" },
+    "fixedHex": { "type": "string", "pattern": "^0x[0-9a-f]{64}$" },
+    "role": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,127}$" },
+    "sourceIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "commit", "tree_sha256"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "commit": { "$ref": "#/$defs/commit" },
+        "tree_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["diagnostic_only", "release_authority", "root_gate"],
+      "properties": {
+        "diagnostic_only": { "const": true },
+        "release_authority": { "const": false },
+        "root_gate": { "const": "blocked" }
+      }
+    },
+    "legacyV1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reproduction_catalog_sha256", "frozen_inputs_sha256", "catalog_status", "case_count", "baseline_evidence_status"],
+      "properties": {
+        "reproduction_catalog_sha256": { "const": "79dd86ea28b595de2da49033c5ce9ad0c0b95eaa2152b944d6045db8dba69f6e" },
+        "frozen_inputs_sha256": { "const": "03cecccccb2dc1eb24e0fda9bb05f5403a6e7d962d46d836179b4db09cad5e8b" },
+        "catalog_status": { "const": "blocked" },
+        "case_count": { "const": 18 },
+        "baseline_evidence_status": { "const": "not_run" }
+      }
+    },
+    "fileReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "role", "media_type", "sha256", "size"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "role": { "$ref": "#/$defs/role" },
+        "media_type": { "enum": ["application/json", "text/plain", "application/octet-stream"] },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "size": { "type": "integer", "minimum": 0, "maximum": 67108864 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "media_type": { "const": "application/json" } } },
+          "then": { "properties": { "size": { "maximum": 8388608 } } }
+        },
+        {
+          "if": { "properties": { "media_type": { "const": "text/plain" } } },
+          "then": { "properties": { "size": { "maximum": 16777216 } } }
+        }
+      ]
+    },
+    "toolBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tool_id", "role", "implementation", "executable_role", "build_info_role", "module_graph_role", "source_asset_role"],
+      "properties": {
+        "tool_id": { "type": "string", "minLength": 1 },
+        "role": { "type": "string", "minLength": 1 },
+        "implementation": { "type": "string", "minLength": 1 },
+        "executable_role": { "$ref": "#/$defs/role" },
+        "build_info_role": { "$ref": "#/$defs/role" },
+        "module_graph_role": { "$ref": "#/$defs/role" },
+        "source_asset_role": { "$ref": "#/$defs/role" }
+      }
+    },
+    "evidenceRoot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "version", "repository", "pull_request", "baseline_source", "prior_source", "runner_source", "fixture_manifest_sha256", "legacy_v1", "scope", "authority", "tools", "files"],
+      "properties": {
+        "schema": { "const": "pr4109/r00-reproduction-evidence-bundle/v2" },
+        "version": { "const": 2 },
+        "repository": { "const": "threshold-network/keep-core" },
+        "pull_request": { "const": 4109 },
+        "baseline_source": { "$ref": "#/$defs/sourceIdentity" },
+        "prior_source": { "$ref": "#/$defs/sourceIdentity" },
+        "runner_source": { "$ref": "#/$defs/sourceIdentity" },
+        "fixture_manifest_sha256": { "const": "7b934fd6db3a109e1c3c70ec2be50aab3af3f955951d02f18841331eb988c42c" },
+        "legacy_v1": { "$ref": "#/$defs/legacyV1" },
+        "scope": { "type": "array", "prefixItems": [{"const":"R00-01"},{"const":"R00-02"},{"const":"R00-03"}], "items": false, "minItems": 3, "maxItems": 3 },
+        "authority": { "$ref": "#/$defs/authority" },
+        "tools": { "type": "array", "items": { "$ref": "#/$defs/toolBinding" }, "minItems": 6, "maxItems": 6 },
+        "files": { "type": "array", "items": { "$ref": "#/$defs/fileReference" }, "minItems": 1, "maxItems": 512 }
+      }
+    },
+    "toolchain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["go_version", "goos", "goarch", "cgo_enabled", "gotoolchain", "gowork", "module_mode"],
+      "properties": {
+        "go_version": { "const": "go1.25.10" },
+        "goos": { "const": "linux" },
+        "goarch": { "const": "amd64" },
+        "cgo_enabled": { "const": false },
+        "gotoolchain": { "const": "local" },
+        "gowork": { "const": "off" },
+        "module_mode": { "const": "readonly" }
+      }
+    },
+    "mainModule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "version", "sum"],
+      "properties": {
+        "path": { "const": "github.com/keep-network/keep-core" },
+        "version": { "const": "(devel)" },
+        "sum": { "const": "" }
+      }
+    },
+    "moduleIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requested_path", "requested_version", "requested_sum", "replacement_path", "replacement_version", "replacement_sum"],
+      "properties": {
+        "requested_path": { "type": "string", "minLength": 1 },
+        "requested_version": { "type": "string", "minLength": 1 },
+        "requested_sum": { "type": "string" },
+        "replacement_path": { "type": "string", "minLength": 1 },
+        "replacement_version": { "type": "string", "minLength": 1 },
+        "replacement_sum": { "type": "string", "minLength": 1 }
+      }
+    },
+    "buildInfo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "version", "tool_id", "tool_role", "implementation", "executable_sha256", "baseline_source", "prior_source", "runner_source", "compile_source", "fixture_manifest_sha256", "injected_source_sha256", "main_module", "go_mod_sha256", "go_sum_sha256", "module_graph_sha256", "modules", "toolchain", "vcs_modified"],
+      "properties": {
+        "schema": { "const": "pr4109/r00-tool-build-info/v2" },
+        "version": { "const": 2 },
+        "tool_id": { "type": "string", "minLength": 1 },
+        "tool_role": { "type": "string", "minLength": 1 },
+        "implementation": { "type": "string", "minLength": 1 },
+        "executable_sha256": { "$ref": "#/$defs/sha256" },
+        "baseline_source": { "$ref": "#/$defs/sourceIdentity" },
+        "prior_source": { "$ref": "#/$defs/sourceIdentity" },
+        "runner_source": { "$ref": "#/$defs/sourceIdentity" },
+        "compile_source": { "$ref": "#/$defs/sourceIdentity" },
+        "fixture_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "injected_source_sha256": { "$ref": "#/$defs/sha256" },
+        "main_module": { "$ref": "#/$defs/mainModule" },
+        "go_mod_sha256": { "$ref": "#/$defs/sha256" },
+        "go_sum_sha256": { "$ref": "#/$defs/sha256" },
+        "module_graph_sha256": { "$ref": "#/$defs/sha256" },
+        "modules": { "type": "array", "items": { "$ref": "#/$defs/moduleIdentity" }, "minItems": 1 },
+        "toolchain": { "$ref": "#/$defs/toolchain" },
+        "vcs_modified": { "const": false }
+      }
+    },
+    "envVar": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "value"],
+      "properties": { "name": {"type":"string","minLength":1}, "value": {"type":"string"} }
+    },
+    "processEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "version", "purpose", "tool_id", "argv", "environment", "working_directory", "input_roles", "pid", "started", "stdin_closed", "stdout_drained", "stderr_drained", "waited", "exit_code", "signal", "timed_out", "panic_detected", "stdout_role", "stderr_role"],
+      "properties": {
+        "schema": { "const": "pr4109/r00-process-event/v2" },
+        "version": { "const": 2 },
+        "purpose": { "type": "string", "minLength": 1 },
+        "tool_id": { "type": "string", "minLength": 1 },
+        "argv": { "type": "array", "items": {"type":"string"}, "minItems": 1 },
+        "environment": { "type": "array", "items": {"$ref":"#/$defs/envVar"} },
+        "working_directory": { "type": "string", "minLength": 1 },
+        "input_roles": { "type": "array", "items": {"$ref":"#/$defs/role"} },
+        "pid": { "type": "integer", "minimum": 1 },
+        "started": { "type": "boolean" },
+        "stdin_closed": { "type": "boolean" },
+        "stdout_drained": { "type": "boolean" },
+        "stderr_drained": { "type": "boolean" },
+        "waited": { "type": "boolean" },
+        "exit_code": { "type": "integer" },
+        "signal": { "type": "string" },
+        "timed_out": { "type": "boolean" },
+        "panic_detected": { "type": "boolean" },
+        "stdout_role": { "$ref": "#/$defs/role" },
+        "stderr_role": { "$ref": "#/$defs/role" }
+      }
+    },
+    "toolExecution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["purpose", "tool_id", "event_role"],
+      "properties": {
+        "purpose": { "type": "string", "minLength": 1 },
+        "tool_id": { "type": "string", "minLength": 1 },
+        "event_role": { "$ref": "#/$defs/role" }
+      }
+    },
+    "curvePoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x_hex", "y_hex"],
+      "properties": { "x_hex": {"$ref":"#/$defs/fixedHex"}, "y_hex": {"$ref":"#/$defs/fixedHex"} }
+    },
+    "curveDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "prime_hex", "order_hex", "generator"],
+      "properties": {
+        "name": {"const":"secp256k1"},
+        "prime_hex": {"$ref":"#/$defs/fixedHex"},
+        "order_hex": {"$ref":"#/$defs/fixedHex"},
+        "generator": {"$ref":"#/$defs/curvePoint"}
+      }
+    },
+    "proofVector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "version", "vector_id", "producer_tool_id", "kind", "curve", "session_hex", "candidate_domain_hex", "candidate_equation", "historical_equation", "public", "auxiliary", "alpha", "t_hex", "u_hex"],
+      "properties": {
+        "schema": {"const":"pr4109/r00-proof-vector/v2"},
+        "version": {"const":2},
+        "vector_id": {"type":"string","minLength":1},
+        "producer_tool_id": {"type":"string","minLength":1},
+        "kind": {"enum":["zk","zkv"]},
+        "curve": {"$ref":"#/$defs/curveDefinition"},
+        "session_hex": {"$ref":"#/$defs/hexBytes"},
+        "candidate_domain_hex": {"$ref":"#/$defs/hexBytes"},
+        "candidate_equation": {"type":"string","minLength":1},
+        "historical_equation": {"type":"string","minLength":1},
+        "public": {"$ref":"#/$defs/curvePoint"},
+        "auxiliary": {"anyOf":[{"$ref":"#/$defs/curvePoint"},{"type":"null"}]},
+        "alpha": {"$ref":"#/$defs/curvePoint"},
+        "t_hex": {"$ref":"#/$defs/fixedHex"},
+        "u_hex": {"anyOf":[{"$ref":"#/$defs/fixedHex"},{"type":"null"}]}
+      }
+    },
+    "proofEvidence": {
+      "type":"object", "additionalProperties":false,
+      "required":["vector_role","producer_tool_id","historical_verifier_tool_id","candidate_verifier_tool_id","executions"],
+      "properties": {
+        "vector_role":{"$ref":"#/$defs/role"},
+        "producer_tool_id":{"type":"string","minLength":1},
+        "historical_verifier_tool_id":{"type":"string","minLength":1},
+        "candidate_verifier_tool_id":{"type":"string","minLength":1},
+        "executions":{"type":"array","items":{"$ref":"#/$defs/toolExecution"},"minItems":3,"maxItems":3}
+      }
+    },
+    "topology": {
+      "type":"object", "additionalProperties":false,
+      "required":["parties","threshold","historical_parties","nominal_legacy_parties"],
+      "properties": {
+        "parties":{"type":"integer","minimum":1}, "threshold":{"type":"integer","minimum":1},
+        "historical_parties":{"type":"integer","minimum":0}, "nominal_legacy_parties":{"type":"integer","minimum":0}
+      }
+    },
+    "signingObservation": {
+      "type":"object", "additionalProperties":false,
+      "required":["run_id","coordinator","topology","worker_event_roles"],
+      "properties": {
+        "run_id":{"type":"string","minLength":1}, "coordinator":{"$ref":"#/$defs/toolExecution"},
+        "topology":{"$ref":"#/$defs/topology"},
+        "worker_event_roles":{"type":"array","items":{"$ref":"#/$defs/role"},"minItems":11,"maxItems":11}
+      }
+    },
+    "caseEvidence": {
+      "type":"object", "additionalProperties":false,
+      "required":["schema","version","case_id","tool_inventory_sha256","runner_execution","proofs","signing_runs"],
+      "properties": {
+        "schema":{"const":"pr4109/r00-case-evidence/v2"}, "version":{"const":2},
+        "case_id":{"enum":["R00-01","R00-02","R00-03"]},
+        "tool_inventory_sha256":{"$ref":"#/$defs/sha256"},
+        "runner_execution":{"$ref":"#/$defs/toolExecution"},
+        "proofs":{"type":"array","items":{"$ref":"#/$defs/proofEvidence"},"minItems":1,"maxItems":2},
+        "signing_runs":{"type":"array","items":{"$ref":"#/$defs/signingObservation"},"maxItems":3}
+      }
+    },
+    "signatureData": {
+      "type":"object", "additionalProperties":false,
+      "required":["signature_hex","signature_recovery_hex","r_hex","s_hex","m_hex","requested_message_hex","public_key"],
+      "properties": {
+        "signature_hex":{"$ref":"#/$defs/hexBytes"}, "signature_recovery_hex":{"$ref":"#/$defs/hexBytes"},
+        "r_hex":{"$ref":"#/$defs/fixedHex"}, "s_hex":{"$ref":"#/$defs/fixedHex"},
+        "m_hex":{"$ref":"#/$defs/hexBytes"}, "requested_message_hex":{"$ref":"#/$defs/fixedHex"},
+        "public_key":{"$ref":"#/$defs/curvePoint"}
+      }
+    },
+    "typedRefusal": {
+      "type":"object", "additionalProperties":false,
+      "required":["task","round","cause","trigger_delivery_id","victim","culprits"],
+      "properties": {
+        "task":{"type":"string","minLength":1}, "round":{"type":"integer","minimum":0},
+        "cause":{"type":"string","minLength":1}, "trigger_delivery_id":{"$ref":"#/$defs/role"},
+        "victim":{"type":"integer","minimum":0},
+        "culprits":{"type":"array","items":{"type":"integer","minimum":0}}
+      }
+    },
+    "protocolEvent": {
+      "type":"object", "additionalProperties":false,
+      "required":["sequence","direction","delivery_id","message_type","peer_ordinal","payload_sha256","signature","refusal"],
+      "properties": {
+        "sequence":{"type":"integer","minimum":0},
+        "direction":{"enum":["received","emitted","signature","refusal","quiesced","stopped"]},
+        "delivery_id":{"type":"string"}, "message_type":{"type":"string","minLength":1},
+        "peer_ordinal":{"anyOf":[{"type":"integer","minimum":0},{"type":"null"}]},
+        "payload_sha256":{"$ref":"#/$defs/sha256"},
+        "signature":{"anyOf":[{"$ref":"#/$defs/signatureData"},{"type":"null"}]},
+        "refusal":{"anyOf":[{"$ref":"#/$defs/typedRefusal"},{"type":"null"}]}
+      }
+    },
+    "workerEvent": {
+      "type":"object", "additionalProperties":false,
+      "required":["schema","version","run_id","ordinal","tool_id","terminal_state","process","events"],
+      "properties": {
+        "schema":{"const":"pr4109/r00-worker-event/v2"}, "version":{"const":2},
+        "run_id":{"type":"string","minLength":1}, "ordinal":{"type":"integer","minimum":0},
+        "tool_id":{"type":"string","minLength":1}, "terminal_state":{"type":"string","minLength":1},
+        "process":{"$ref":"#/$defs/processEvent"},
+        "events":{"type":"array","items":{"$ref":"#/$defs/protocolEvent"},"minItems":2}
+      }
+    },
+    "proofToolResult": {
+      "type":"object", "additionalProperties":false,
+      "required":["schema","version","operation","vector_sha256","decoded","accepted","tool_id"],
+      "properties": {
+        "schema":{"const":"pr4109/r00-proof-tool-result/v2"}, "version":{"const":2},
+        "operation":{"enum":["produce","verify"]}, "vector_sha256":{"$ref":"#/$defs/sha256"},
+        "decoded":{"type":"boolean"}, "accepted":{"type":"boolean"}, "tool_id":{"type":"string","minLength":1}
+      }
+    }
+  }
+}

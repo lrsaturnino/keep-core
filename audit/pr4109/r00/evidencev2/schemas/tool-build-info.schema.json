@@ -1,0 +1,1 @@
+{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://threshold.network/schemas/pr4109/r00/tool-build-info-v2.json","$ref":"evidence-v2-records.json#/$defs/buildInfo"}
