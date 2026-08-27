@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://threshold.network/schemas/pr4109/r00/reproduction-catalog-v1.json",
+  "title": "PR #4109 R00 reproduction catalog",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "baseline_source_commit",
+    "evaluated_candidate_commit",
+    "status",
+    "cases",
+    "blockers"
+  ],
+  "properties": {
+    "schema": { "const": "pr4109/r00-reproduction-catalog/v1" },
+    "version": { "const": 1 },
+    "baseline_source_commit": {
+      "const": "1bc7edf9965cac43de3bd18060e07ba678670073"
+    },
+    "evaluated_candidate_commit": {
+      "const": "d7bf8c0753f3aac574f8d20d93c75268f350b389"
+    },
+    "status": { "const": "blocked" },
+    "cases": {
+      "type": "array",
+      "minItems": 18,
+      "maxItems": 18,
+      "prefixItems": [
+        { "$ref": "#/$defs/case01" },
+        { "$ref": "#/$defs/case02" },
+        { "$ref": "#/$defs/case03" },
+        { "$ref": "#/$defs/case04" },
+        { "$ref": "#/$defs/case05" },
+        { "$ref": "#/$defs/case06" },
+        { "$ref": "#/$defs/case07" },
+        { "$ref": "#/$defs/case08" },
+        { "$ref": "#/$defs/case09" },
+        { "$ref": "#/$defs/case10" },
+        { "$ref": "#/$defs/case11" },
+        { "$ref": "#/$defs/case12" },
+        { "$ref": "#/$defs/case13" },
+        { "$ref": "#/$defs/case14" },
+        { "$ref": "#/$defs/case15" },
+        { "$ref": "#/$defs/case16" },
+        { "$ref": "#/$defs/case17" },
+        { "$ref": "#/$defs/case18" }
+      ],
+      "items": false
+    },
+    "blockers": {
+      "type": "array",
+      "minItems": 1,
+	  "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    }
+  },
+  "$defs": {
+    "negativeCase": {
+      "$ref": "reproduction-evidence.schema.json#/$defs/reproductionCase",
+      "properties": { "kind": { "const": "negative" } }
+    },
+    "positiveCase": {
+      "$ref": "reproduction-evidence.schema.json#/$defs/reproductionCase",
+      "properties": { "kind": { "const": "positive" } }
+    },
+    "case01": { "$ref": "#/$defs/negativeCase", "properties": { "id": { "const": "R00-01" } } },
+    "case02": { "$ref": "#/$defs/negativeCase", "properties": { "id": { "const": "R00-02" } } },
+    "case03": { "$ref": "#/$defs/negativeCase", "properties": { "id": { "const": "R00-03" } } },
+    "case04": { "$ref": "#/$defs/negativeCase", "properties": { "id": { "const": "R00-04" } } },
+    "case05": { "$ref": "#/$defs/negativeCase", "properties": { "id": { "const": "R00-05" } } },
+    "case06": { "$ref": "#/$defs/negativeCase", "properties": { "id": { "const": "R00-06" } } },
+    "case07": { "$ref": "#/$defs/negativeCase", "properties": { "id": { "const": "R00-07" } } },
+    "case08": { "$ref": "#/$defs/negativeCase", "properties": { "id": { "const": "R00-08" } } },
+    "case09": { "$ref": "#/$defs/negativeCase", "properties": { "id": { "const": "R00-09" } } },
+    "case10": { "$ref": "#/$defs/negativeCase", "properties": { "id": { "const": "R00-10" } } },
+    "case11": { "$ref": "#/$defs/negativeCase", "properties": { "id": { "const": "R00-11" } } },
+    "case12": { "$ref": "#/$defs/negativeCase", "properties": { "id": { "const": "R00-12" } } },
+    "case13": { "$ref": "#/$defs/negativeCase", "properties": { "id": { "const": "R00-13" } } },
+    "case14": { "$ref": "#/$defs/negativeCase", "properties": { "id": { "const": "R00-14" } } },
+    "case15": { "$ref": "#/$defs/negativeCase", "properties": { "id": { "const": "R00-15" } } },
+    "case16": { "$ref": "#/$defs/negativeCase", "properties": { "id": { "const": "R00-16" } } },
+    "case17": { "$ref": "#/$defs/negativeCase", "properties": { "id": { "const": "R00-17" } } },
+    "case18": { "$ref": "#/$defs/positiveCase", "properties": { "id": { "const": "R00-18" } } }
+  }
+}

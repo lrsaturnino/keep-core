@@ -1,0 +1,255 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://threshold.network/schemas/pr4109/r00/reproduction-evidence.schema.json",
+  "title": "PR #4109 R00 reproduction evidence types",
+  "$ref": "#/$defs/baselineEvidence",
+  "$defs": {
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "sourceAnchor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "commit", "path", "symbol"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "commit": { "$ref": "#/$defs/commit" },
+        "path": { "type": "string", "minLength": 1 },
+        "symbol": { "type": "string", "minLength": 1 }
+      }
+    },
+    "toolchain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["go_version", "goos", "goarch"],
+      "properties": {
+        "go_version": { "type": "string", "minLength": 1 },
+        "goos": { "type": "string", "minLength": 1 },
+        "goarch": { "type": "string", "minLength": 1 }
+      }
+    },
+    "control": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "coverage",
+        "command",
+        "working_directory",
+        "executed_source_commit",
+        "source_tree_digest",
+        "exit_code",
+        "stdout_path",
+        "stdout_sha256",
+        "stderr_path",
+        "stderr_sha256",
+        "toolchain",
+        "module_sums",
+        "covers",
+        "does_not_cover"
+      ],
+      "properties": {
+        "coverage": { "enum": ["partial", "complete"] },
+        "command": { "type": "string", "minLength": 1 },
+        "working_directory": { "type": "string", "minLength": 1 },
+        "executed_source_commit": { "$ref": "#/$defs/commit" },
+        "source_tree_digest": { "$ref": "#/$defs/sha256" },
+        "exit_code": { "type": "integer" },
+        "stdout_path": { "type": "string", "minLength": 1 },
+        "stdout_sha256": { "$ref": "#/$defs/sha256" },
+        "stderr_path": { "type": "string", "minLength": 1 },
+        "stderr_sha256": { "$ref": "#/$defs/sha256" },
+        "toolchain": { "$ref": "#/$defs/toolchain" },
+        "module_sums": {
+          "type": "object",
+          "minProperties": 1,
+          "patternProperties": {
+            "^[^@\\s]+@[^=\\s]+=>[^\\s]*$": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
+        },
+        "covers": {
+          "type": "array",
+          "minItems": 1,
+		  "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "does_not_cover": {
+          "type": "array",
+		  "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "baselineEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "controls", "blockers"],
+      "properties": {
+        "status": { "enum": ["not_run", "partial", "complete"] },
+        "controls": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/control" }
+        },
+        "blockers": {
+          "type": "array",
+		  "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "status": { "const": "not_run" } },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "controls": { "maxItems": 0 },
+              "blockers": { "minItems": 1 }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "status": { "const": "partial" } },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "controls": {
+                "minItems": 1,
+                "items": {
+                  "properties": {
+                    "coverage": { "const": "partial" },
+                    "does_not_cover": { "minItems": 1 }
+                  }
+                }
+              },
+              "blockers": { "minItems": 1 }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "status": { "const": "complete" } },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "controls": {
+                "minItems": 1,
+                "items": {
+                  "properties": {
+                    "coverage": { "const": "complete" },
+                    "exit_code": { "const": 0 },
+                    "does_not_cover": { "maxItems": 0 }
+                  }
+                }
+              },
+              "blockers": { "maxItems": 0 }
+            }
+          }
+        }
+      ]
+    },
+    "evidenceReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit", "path", "symbol"],
+      "properties": {
+        "commit": { "const": "d7bf8c0753f3aac574f8d20d93c75268f350b389" },
+        "path": { "type": "string", "minLength": 1 },
+        "symbol": { "type": "string", "minLength": 1 }
+      }
+    },
+    "headAssessment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evaluated_commit",
+        "status",
+        "basis",
+        "evidence_refs",
+        "limitations"
+      ],
+      "properties": {
+        "evaluated_commit": { "const": "d7bf8c0753f3aac574f8d20d93c75268f350b389" },
+        "status": {
+          "enum": ["present", "resolved", "partially_mitigated", "unknown"]
+        },
+        "basis": { "enum": ["runtime_test", "source_review", "none"] },
+        "evidence_refs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/evidenceReference" }
+        },
+        "limitations": {
+          "type": "array",
+          "minItems": 1,
+		  "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "basis": { "const": "none" } },
+            "required": ["basis"]
+          },
+          "then": {
+            "properties": {
+              "status": { "const": "unknown" },
+              "evidence_refs": { "maxItems": 0 }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "basis": { "enum": ["runtime_test", "source_review"] }
+            },
+            "required": ["basis"]
+          },
+          "then": {
+            "properties": { "evidence_refs": { "minItems": 1 } }
+          }
+        }
+      ]
+    },
+    "reproductionCase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "title",
+        "predicate",
+        "source_anchors",
+        "baseline_evidence",
+        "head_assessment",
+        "release_gate"
+      ],
+      "properties": {
+        "id": { "type": "string", "pattern": "^R00-(0[1-9]|1[0-8])$" },
+        "kind": { "enum": ["negative", "positive"] },
+        "title": { "type": "string", "minLength": 1 },
+        "predicate": { "type": "string", "minLength": 1 },
+        "source_anchors": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/sourceAnchor" }
+        },
+        "baseline_evidence": { "$ref": "#/$defs/baselineEvidence" },
+        "head_assessment": { "$ref": "#/$defs/headAssessment" },
+        "release_gate": { "const": "blocking" }
+      }
+    }
+  }
+}

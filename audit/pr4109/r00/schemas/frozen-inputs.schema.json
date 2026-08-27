@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://threshold.network/schemas/pr4109/r00/frozen-inputs-v1.json",
+  "title": "PR #4109 R00 frozen inputs",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "captured_at_utc",
+    "repository",
+    "pull_request",
+    "baseline_source_commit",
+    "baseline_parent_commit",
+    "evaluated_candidate_commit",
+    "evaluated_candidate_base",
+    "inputs"
+  ],
+  "properties": {
+    "schema": { "const": "pr4109/r00-frozen-inputs/v1" },
+    "version": { "const": 1 },
+    "captured_at_utc": { "type": "string", "format": "date-time" },
+    "repository": { "const": "threshold-network/keep-core" },
+    "pull_request": { "const": 4109 },
+    "baseline_source_commit": { "const": "1bc7edf9965cac43de3bd18060e07ba678670073" },
+    "baseline_parent_commit": { "const": "d2a95eed0b259805aa710e4184377180ade368bc" },
+    "evaluated_candidate_commit": { "const": "d7bf8c0753f3aac574f8d20d93c75268f350b389" },
+    "evaluated_candidate_base": { "const": "a7ac8989b662d51d8a94fa28f1ac226058d5d6cc" },
+    "inputs": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "items": { "$ref": "#/$defs/input" },
+      "allOf": [
+        { "contains": { "$ref": "#/$defs/independentlyTestedR1" }, "minContains": 1, "maxContains": 1 },
+        { "contains": { "$ref": "#/$defs/priorKeepCore" }, "minContains": 1, "maxContains": 1 },
+        { "contains": { "$ref": "#/$defs/candidateTssLib" }, "minContains": 1, "maxContains": 1 },
+        { "contains": { "$ref": "#/$defs/priorTssLib" }, "minContains": 1, "maxContains": 1 },
+        { "contains": { "$ref": "#/$defs/candidateKeepCommon" }, "minContains": 1, "maxContains": 1 },
+        { "contains": { "$ref": "#/$defs/tbtcV2LifecycleReference" }, "minContains": 1, "maxContains": 1 },
+        { "contains": { "$ref": "#/$defs/externalDoHarnessReference" }, "minContains": 1, "maxContains": 1 }
+      ]
+    }
+  },
+  "$defs": {
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "repository",
+        "identity",
+        "version",
+        "checksum",
+        "verification",
+        "purpose"
+      ],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "repository": { "type": "string", "minLength": 1 },
+        "identity": { "type": "string", "minLength": 1 },
+        "version": { "type": ["string", "null"] },
+        "checksum": { "type": ["string", "null"] },
+        "verification": { "type": "string", "minLength": 1 },
+        "purpose": { "type": "string", "minLength": 1 }
+      }
+    },
+    "independentlyTestedR1": {
+      "$ref": "#/$defs/input",
+      "properties": {
+        "name": { "const": "independently_tested_r1" },
+        "repository": { "const": "threshold-network/keep-core" },
+        "identity": { "const": "2228ba0860455dc36672459565741b0a74697b13" },
+        "version": { "const": null },
+        "checksum": { "const": null },
+        "verification": { "const": "local_git_object" }
+      }
+    },
+    "priorKeepCore": {
+      "$ref": "#/$defs/input",
+      "properties": {
+        "name": { "const": "prior_keep_core" },
+        "repository": { "const": "threshold-network/keep-core" },
+        "identity": { "const": "66b187efdbe1cd567950de0efe9728de95886b13" },
+        "version": { "const": "v2.5.2" },
+        "checksum": { "const": null },
+        "verification": { "const": "local_git_object_and_tag" }
+      }
+    },
+    "candidateTssLib": {
+      "$ref": "#/$defs/input",
+      "properties": {
+        "name": { "const": "candidate_tss_lib" },
+        "repository": { "const": "threshold-network/tss-lib" },
+        "identity": { "const": "d847ce0030193ccf5dbec0097571dcce5a2a5cf6" },
+        "version": { "const": "v0.0.0-20260729021955-d847ce003019" },
+        "checksum": { "const": "h1:EmD85fdfi20RKON39+Hho5zmB57gHj7EWd7pTYwsqRY=" },
+        "verification": { "const": "go_mod_go_sum_and_upstream_commit" }
+      }
+    },
+    "priorTssLib": {
+      "$ref": "#/$defs/input",
+      "properties": {
+        "name": { "const": "prior_tss_lib" },
+        "repository": { "const": "threshold-network/tss-lib" },
+        "identity": { "const": "2e712689cfbeefede15f95a0ec7112227d86f702" },
+        "version": { "const": "v0.0.0-20230901144531-2e712689cfbe" },
+        "checksum": { "const": "h1:dOKhoYxZjXwFIyGnxgU+Sa1obZPMHRhu6e44oOLkzU4=" },
+        "verification": { "const": "prior_keep_core_go_mod_go_sum_and_upstream_commit" }
+      }
+    },
+    "candidateKeepCommon": {
+      "$ref": "#/$defs/input",
+      "properties": {
+        "name": { "const": "candidate_keep_common" },
+        "repository": { "const": "threshold-network/keep-common" },
+        "identity": { "const": "v1.7.1-tlabs.1" },
+        "version": { "const": "v1.7.1-tlabs.1" },
+        "checksum": { "const": "h1:GcaQUb/5TOdc1Vhs4ZsbLM5a1C0CXx7Nmqv4npNKTag=" },
+        "verification": { "const": "go_mod_go_sum" }
+      }
+    },
+    "tbtcV2LifecycleReference": {
+      "$ref": "#/$defs/input",
+      "properties": {
+        "name": { "const": "tbtc_v2_lifecycle_reference" },
+        "repository": { "const": "threshold-network/tbtc-v2" },
+        "identity": { "const": "280da5c4ca6aa066f0ea7291076e4c70085723a9" },
+        "version": { "const": null },
+        "checksum": { "const": null },
+        "verification": { "const": "upstream_commit" }
+      }
+    },
+    "externalDoHarnessReference": {
+      "$ref": "#/$defs/input",
+      "properties": {
+        "name": { "const": "external_do_harness_reference" },
+        "repository": { "const": "tlabs-xyz/pr4109-do-infra" },
+        "identity": { "const": "7cbecdde357af30eecb25cfba767851da9ce3dd4" },
+        "version": { "const": null },
+        "checksum": { "const": null },
+        "verification": { "const": "unverified_external_scope_reference" }
+      }
+    }
+  }
+}

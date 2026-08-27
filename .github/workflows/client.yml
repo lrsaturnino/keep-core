@@ -44,7 +44,7 @@ jobs:
       - uses: actions/checkout@v4
         if: github.event_name == 'pull_request'
 
-      - uses: dorny/paths-filter@v2
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         if: github.event_name == 'pull_request'
         id: filter
         with:
@@ -63,7 +63,7 @@ jobs:
       - uses: actions/checkout@v4
         if: github.event_name == 'pull_request'
 
-      - uses: dorny/paths-filter@v2
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         if: github.event_name == 'pull_request'
         id: filter
         with:
@@ -71,6 +71,7 @@ jobs:
             path-filter:
               - './config/_electrum_urls/**'
               - './pkg/bitcoin/electrum/**'
+
   btcec-vendor-byte-identity:
     # Enforces the VENDOR.md byte-identity recipe and runs the
     # vendored upstream test suite. The root module's `go test ./...`
@@ -125,10 +126,20 @@ jobs:
   client-build-test-publish:
     needs: client-detect-changes
     if: |
-      github.event_name != 'pull_request'
-        || needs.client-detect-changes.outputs.path-filter == 'true'
+      always()
+        && (
+          needs.client-detect-changes.result != 'success'
+          || github.event_name != 'pull_request'
+          || needs.client-detect-changes.outputs.path-filter == 'true'
+        )
     runs-on: ubuntu-latest
     steps:
+      - name: Require successful change detection
+        if: needs.client-detect-changes.result != 'success'
+        run: |
+          echo "client change detection did not succeed" >&2
+          exit 1
+
       - name: Free disk space
         # The multi-arch client binary build exhausts the default ~14GB free
         # on ubuntu-latest. Reclaim ~30GB by removing preinstalled toolchains
@@ -147,6 +158,19 @@ jobs:
         with:
           # Fetch the whole history for the `git describe` command to work.
           fetch-depth: 0
+
+      - name: Set up Go for provenance verification
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.10'
+          cache: false
+
+      # Keep this in the existing required client job. A separate prerequisite
+      # job could fail while this job is merely marked skipped, which is not a
+      # fail-closed branch-protection signal. The build image excludes .git, so
+      # immutable provenance must be checked in the host checkout.
+      - name: Verify R00 immutable source anchors
+        run: audit/pr4109/r00/verify-source-anchors.sh
 
       - name: Resolve versions
         run: |
