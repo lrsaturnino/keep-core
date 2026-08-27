@@ -1,9 +1,18 @@
 # Security Fix Breaking Changes
 
 This document tracks breaking cryptographic changes introduced by the security
-remediation branch. Each change alters wire-level or key-derivation behavior
-and requires a **coordinated network upgrade** -- all nodes must upgrade before
-the new code activates. Rolling upgrades will cause protocol failures.
+remediation branch and the intended release contract still required around
+them. Each change requires a **coordinated network upgrade**: every production
+process and eligible seat must run R1 before the reviewed cutover block `C`.
+The target contract durably seals a compatibility strategy to a verified
+canonical work anchor. After R01 restores complete PRIOR transcript
+compatibility, pre-`C` R1 work can use that legacy-compatible strategy while
+work anchored at or after `C` uses security-v2. The current candidate has only
+number-based, process-local permit selection and a nominal-legacy TSS branch
+whose ZK/ZKV equations differ from PRIOR; R01, canonical-hash binding, and
+restart-safe sealing remain pending. Cross-mode contributions inside one
+ceremony do not interoperate; complete fleet/subset behavior remains an
+R00-03/R01 qualification requirement.
 
 ---
 
@@ -33,8 +42,8 @@ different G1 point.
 **Impact:**
 
 Any distributed protocol that relies on consistent G1HashToPoint output across
-nodes (e.g., BLS signature aggregation in the random beacon DKG) will fail if
-nodes run mismatched versions.
+members (e.g., the random beacon DKG) will fail if one ceremony mixes the
+legacy and security-v2 mappings.
 
 **On-chain consumer:**
 
@@ -60,9 +69,13 @@ below guarantees.
 
 **Mitigation / upgrade path:**
 
-1. Schedule a hard-fork block or protocol version bump.
-2. Deploy the new binary to all nodes simultaneously at the upgrade height.
-3. Verify with a coordinated test on a staging network first.
+1. Implement the pending canonical-hash/durable binding, then verify both
+   homogeneous strategies and the cutover boundary on staging.
+2. Deploy the exact R1 artifact to every production process and eligible seat
+   before `C`, with zero residual PRIOR participation at the boundary.
+3. Under the completed release contract, preserve the durably sealed mode for
+   every ceremony and reject mixed-mode input; never switch an in-flight
+   ceremony at current head.
 
 **Follow-up (tracked in GH issue):**
 
@@ -115,22 +128,26 @@ otherwise members whose IDs collide modulo 256 will derive identical keys.
 **Why it breaks:**
 
 HKDF with a non-empty `info` label produces a different 32-byte key than
-`SHA-256(shared_secret)` for the same ECDH shared secret. Two nodes running
-mismatched versions will derive different session keys and fail to decrypt each
-other's shares.
+`SHA-256(shared_secret)` for the same ECDH shared secret. Two members using
+different compatibility modes derive different session keys and fail to
+decrypt each other's shares.
 
 **Impact:**
 
 Any phase of the GJKR DKG, tECDSA DKG, or tECDSA signing protocol that
-involves peer-to-peer encrypted share exchange will fail if nodes run
-mismatched versions. This covers the full distributed key generation and
-signing flows.
+involves peer-to-peer encrypted share exchange will fail if a ceremony mixes
+legacy and security-v2 members. This covers the full distributed key
+generation and signing flows.
 
 **Mitigation / upgrade path:**
 
-1. Schedule a hard-fork block or protocol version bump.
-2. Deploy the new binary to all nodes simultaneously at the upgrade height.
-3. Verify with a coordinated test on a staging network first.
+1. Verify the exact R1 artifact and cutover schedule on a staging network.
+2. Deploy R1 to every production process and eligible seat before the reviewed
+   cutover block `C`; prove the residual PRIOR process/seat count is zero.
+3. Under the completed release contract, let durably sealed work anchored below
+   `C` retain the legacy derivation and require work anchored at or above `C` to
+   use the security-v2 derivation. Never mix modes within one ceremony or retry
+   security-v2 work as legacy.
 4. No on-chain data migration is required -- the ECDH keys are ephemeral
    (generated fresh each session) and not persisted.
 
@@ -138,9 +155,13 @@ signing flows.
 
 ## Security release operator reference (BC-1..BC-10, OV-1..OV-3)
 
-The table below is the operator-facing index for the coordinated security
-release (`security-release/candidate-1`). Items marked **breaking** require a
-flag-day upgrade of every participant in the same DKG or signing ceremony.
+The table below is the operator-facing index for the target coordinated
+security release (`security-release/candidate-1`); it is not a present-readiness
+claim. Items marked **breaking** require a homogeneous mode among every
+participant in the same DKG or signing ceremony. The fleet must be entirely on
+R1 before `C`; only after R01 repairs full transcript compatibility and R03/R04
+supply canonical durable sealing may `< C` work use R1's legacy-compatible
+strategy.
 Operator-visible (OV) items do not change wire formats but may require config or
 monitoring updates.
 
@@ -148,13 +169,13 @@ monitoring updates.
 
 | ID | Area | What breaks | Who must act |
 |----|------|-------------|--------------|
-| **BC-1** | tss-lib | Fiat-Shamir / proof challenges use tagged hashing + session binding; old and new proofs **do not cross-verify** | **All operators simultaneously** |
-| **BC-2** | tss-lib + keep-core | `SetSessionNonce` / `SetSessionNonceBytes` **mandatory** before keygen/signing `Start()`; session ID must be ≥16 bytes | keep-core wires this; external callers with short IDs **panic** |
+| **BC-1** | tss-lib | Security-v2 Fiat-Shamir / proof challenges use tagged hashing + session binding; legacy and security-v2 proofs **do not cross-verify** | Every ceremony must use one mode; every eligible seat runs R1 before `C` |
+| **BC-2** | tss-lib + keep-core | Security-v2 requires `SetSessionNonce` / `SetSessionNonceBytes` before keygen/signing `Start()` and a session ID ≥16 bytes. The current `d847` nominal-legacy ZK/ZKV equations differ from PRIOR, so historical compatibility is not yet restored | keep-core wires explicit modes; R01 must repair and prove the PRIOR transcript before rollout |
 | **BC-3** | tss-lib + keep-core | ECDSA signing requires positive `fullBytesLen` at construction (panic if omitted/zero) | keep-core passes curve-order byte width |
-| **BC-4** | keep-core | **Session ID formats changed** (wire): DKG `dkg-<seedHex>-<attempt:016x>`; signing `signing-<messageHex>-<startBlock:016x>-<attempt:016x>` | All parties in a ceremony |
-| **BC-5** | keep-core | Signing session ID now includes **attempt start block** — peers disagreeing on block derive different IDs | Coordinator / announcer agreement |
-| **BC-6** | keep-core | `ephemeral.PrivateKey.Ecdh(info []byte)` — **compile break** + HKDF-derived keys differ (wire-incompatible); see **F-03** above | Any external code calling the old signature |
-| **BC-7** | keep-core | `G1HashToPoint` reimplemented — **different G1 point** for the same input; see **F-02** above | Beacon / crypto paths using hash-to-curve |
+| **BC-4** | keep-core | Security-v2 **session ID formats change** (wire): DKG `dkg-<seedHex>-<attempt:016x>`; signing `signing-<messageHex>-<startBlock:016x>-<attempt:016x>`; legacy retains the prior forms | All parties in a ceremony use one selected mode; durable sealing remains pending R03/R04 |
+| **BC-5** | keep-core | The security-v2 signing session ID includes **attempt start block** — peers disagreeing on that shared input derive different IDs | Coordinator / announcer agreement |
+| **BC-6** | keep-core | `ephemeral.PrivateKey.Ecdh(info []byte)` is a **compile break**; the security-v2 strategy uses wire-incompatible HKDF while legacy retains the prior derivation; see **F-03** above | Any external code calling the old signature |
+| **BC-7** | keep-core | Security-v2 uses the new `G1HashToPoint` result while legacy retains the prior mapping; see **F-02** above | Beacon / crypto paths must carry one selected mode; durable sealing remains pending R03/R04 |
 | **BC-8** | keep-core | `PrepareForSigning` returns `(wi, bigWs, err)` — **compile break** for callers | Go integrators (no in-tree keep-core callers found) |
 | **BC-9** | keep-core | Bootstrap removal (#3909): embedded well-known peers + **AllowList decoupling** — all peers pass `IsRecognized()` | Operators with custom bootstrap config |
 | **BC-10** | keep-core | RandomBeacon **new storage slot** for the reentrancy guard (append-only bytecode change). RandomBeacon is **directly deployed, not proxied**, so this activates **only** by deploying a new RandomBeacon and cutting over to its address — never by an in-place / proxy implementation swap | Only if this release **redeploys RandomBeacon**: perform the address cutover (see the BC-10 note below). If there is no beacon redeployment, BC-10 is **staged but not activated** on the existing deployment |
@@ -233,7 +254,7 @@ partly unmeasured — plus headroom, tuned for the heavier
   over-reimbursement ceilings require contract/security-owner sign-off before
   release: `[x]` approved (2026-07-24).
 
-**tss-lib pin (this release):** `github.com/threshold-network/tss-lib@v0.0.0-20260615180949-86bd1a375cc0` (`86bd1a3`).
+**tss-lib pin (this release):** `github.com/threshold-network/tss-lib@v0.0.0-20260729021955-d847ce003019` (`d847ce0`). This revision is one commit after `86bd1a3` and adds immutable per-party transcript-mode selection for the legacy/security-v2 cutover.
 
 **tECDSA signing copylock fix (this candidate, reviewed and accepted 2026-07-24).**
 Merging current `main` exposed a `go vet` copylock failure in
@@ -258,44 +279,64 @@ separately.
 
 ---
 
-## Coordinated upgrade (flag-day) requirement
+## Coordinated upgrade and work-anchor cutover
 
-These changes activate by code alone. There is no on-chain version gate and no
-peer-version negotiation: an upgraded node has no runtime switch to fall back to
-the old key-derivation, session-ID, or hash-to-point behavior when it meets an
-un-upgraded peer. The whole set of nodes taking part in a given ceremony must
-therefore be upgraded together -- a flag-day cutover, not a rolling upgrade.
+This candidate contains the chain-clocked participation gate and immutable
+per-permit legacy/security-v2 strategy bundles. The currently landed gate
+classifies the caller-supplied ceremony start-block number once: numbers below
+the cutover block `C` select legacy behavior, while numbers at or above `C`
+select security-v2. In-process retries carry that selected mode. Canonical
+block-hash/incarnation binding and durable restart inheritance are not yet
+implemented; R03 and R04 must add them before this can be called a verified,
+restart-safe work-anchor cutover.
 
-This requirement covers every breaking change in this release that feeds a
-shared cryptographic computation:
+The current candidate is intentionally not a deployable mainnet artifact:
+`participation.MainnetCutoverBlock` is still the zero release blocker, and
+mainnet startup fails closed until a reviewed release commit supplies `C`.
+Before that selected block is armed, every production process and every
+eligible seat must run the exact R1 artifact; the permitted residual is zero
+PRIOR processes and zero PRIOR-eligible seats. This fleet transition is
+coordinated. The intended release policy is not a blanket one-instant
+cryptographic flag day: after R01 restores the PRIOR transcript, an enumerated,
+durably sealed `< C` R1 incarnation may finish with legacy-compatible behavior
+while an independently admitted `>= C` incarnation uses security-v2. That
+compatibility and durable policy remain release requirements, not claims about
+the current nominal-legacy, number-only, process-local permit.
 
-- **Key derivation (F-03)** -- HKDF-SHA256 with a domain-separation `info` label.
-- **Session IDs (tECDSA DKG and signing)** -- the typed, fixed-width session-ID
-  formats and the signing session ID's added dependency on the attempt start
-  block. Tracked in `CHANGELOG.md` under `### Changed` (BREAKING).
-- **Hash-to-curve (F-02)** -- the counter-based `G1HashToPoint`.
+The per-mode differences that feed shared cryptographic computation are:
 
-Within a single DKG or signing ceremony, mixed-version peers derive different
-keys, session IDs, or points and fail to interoperate. The failure mode is
-liveness-only: the ceremony does not complete. It is not a fund-safety or
-consensus-safety issue -- mismatched cryptography fails closed (shares do not
-decrypt, signatures do not verify) and never yields a valid-but-wrong result.
-Operators must upgrade the entire ceremony fleet atomically and must not run a
-mixed-version set through a live DKG or signing session.
+- **Key derivation (F-03)** -- legacy retains the prior derivation;
+  security-v2 uses HKDF-SHA256 with a domain-separation `info` label.
+- **Session IDs (tECDSA DKG and signing)** -- legacy retains the prior forms;
+  security-v2 uses typed, fixed-width IDs and binds signing to the attempt
+  start block. See `CHANGELOG.md` under `### Changed`.
+- **Hash-to-curve (F-02)** -- legacy retains the prior mapping; security-v2
+  uses the counter-based `G1HashToPoint`.
+
+A single DKG or signing ceremony must remain homogeneous. Mixed R1
+nominal-legacy and security-v2 participants derive different keys, session IDs,
+or points and fail to interoperate. Separately, the current nominal-legacy
+ZK/ZKV transcript does not cross-verify with PRIOR, which is the R01 blocker.
+Cross-mode contributions and proofs fail closed: their shares do not decrypt or
+their proofs/signatures do not verify, and they may prevent the ceremony from
+completing. Whether a larger homogeneous subset can still reach quorum remains
+blocked on the exact-binary R00-03/R01 fleet matrix. A mismatch does not
+authorize a PRIOR process at `C`, an unsealed legacy session, or a downgrade
+retry.
 
 ### Coordinated release-model context
 
-The mixed-version hazard above is why the coordinated release is _designed_
-around a single required operator update and one release-baked cutover block
-(`C`): under that design, before `C` participants speak the legacy wire formats
-and canonically post-`C` work speaks security-v2. That block-height cutover gate,
-and its per-ceremony legacy/security-v2 mode strategies, are a separate,
-not-yet-landed change. **This build does not contain the gate and therefore
-still requires the atomic flag-day upgrade described in the section above — there
-is no runtime height switch yet.** The fail-closed property holds regardless
-(mismatched cryptography does not decrypt or verify and never yields a
-valid-but-wrong result), so an un-upgraded peer that meets upgraded peers in a
-ceremony loses liveness rather than fund safety.
+The release is designed to carry one compiled mainnet cutover block `C`;
+mainnet cannot override it at runtime. Today the participation gate selects a
+mode from a supplied start-block number, and the compatibility bundle carries
+that decision through session IDs, ECDH, hash-to-curve, and TSS transcript
+configuration. A live legacy permit can complete after `C` under the gate's
+completion checks, while its new legacy penalty commits are suppressed at or
+after `C`; durable restart and canonical-hash fences remain pending R03/R04.
+The landed tECDSA and Beacon cryptographic strategy paths fail on mixed-mode
+transcripts rather than downgrading. The broader authenticated tBTC
+coordination-envelope rejection boundary is not yet implemented and remains a
+blocking R00-08/R00B requirement.
 
 Two supporting changes ship to keep the coordinated release observable and to
 identify who has not converged:
@@ -314,17 +355,15 @@ identify who has not converged:
   inventory so readiness is measured against exact revision/epoch/digest, not
   merely a quiet mismatch counter.
 
-**Release epoch.** The coordinated cutover artifact is identified by the release
-epoch `security_v2_cutover`. Exporting that epoch (and the cutover block) as a
-`client_info` label and diagnostics field is part of the not-yet-landed gate
-change and is NOT present in this build; today the go/no-go evidence is a node's
-exact revision plus the stranded-peer observability below, not the container tag.
-Note the exact revision is carried by the `/diagnostics` `client_info` field
-only; the `client_info` **Prometheus metric** carries just the `version` label in
-this build (revision/epoch labels arrive with the not-yet-landed gate change). The
-`cutover-roster` aggregator's `--expectedEpoch` flag carries the expected
-`security_v2_cutover` value as plain operator-supplied configuration until the
-gate ships.
+**Release epoch.** The compiled artifact epoch is `security_v2_cutover`. The
+client-info metric and diagnostics expose the release version, exact revision,
+and protocol epoch; participation diagnostics expose the resolved cutover block
+and live per-mode permit counts. These fields describe the artifact and gate,
+not the mode of every ceremony in the process. The `cutover-roster` aggregator
+still receives the expected epoch, revision, image digest, and cutover block as
+operator-supplied release inputs and must match them against every eligible
+instance. With the compiled mainnet `C` still zero, this candidate remains
+blocked from mainnet regardless of those operator-supplied values.
 
 ---
 
@@ -335,5 +374,7 @@ For each breaking change:
 - [ ] Hard-fork block / protocol version agreed and documented
 - [ ] Staging network upgrade tested
 - [ ] Node operators notified with sufficient lead time
-- [ ] Rollback plan in place (revert binary, block range)
+- [ ] Signed rollback plan in place for pre-`C`, pre-R04-enrollment use only
+      (authorized artifact and block range); binary downgrade at or after `C`
+      is prohibited
 - [ ] Post-upgrade monitoring in place (alert on share decryption failures)
