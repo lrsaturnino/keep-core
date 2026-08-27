@@ -127,13 +127,30 @@ independently_tested_r1=$(input_field independently_tested_r1 identity)
 prior_keep_core=$(input_field prior_keep_core identity)
 prior_keep_core_tag=$(input_field prior_keep_core version)
 
+# The PR owner fork does not necessarily mirror every canonical upstream tag.
+# Resolve PRIOR from the repository named by the frozen input instead of
+# trusting whatever tag set happens to be present in the pull-request checkout.
+if ! git check-ref-format "refs/tags/$prior_keep_core_tag" >/dev/null; then
+  echo "invalid frozen PRIOR tag: $prior_keep_core_tag" >&2
+  exit 1
+fi
+prior_keep_core_root="$scratch/prior-keep-core"
+git init -q "$prior_keep_core_root"
+git -C "$prior_keep_core_root" remote add origin \
+  https://github.com/threshold-network/keep-core.git
+git -C "$prior_keep_core_root" fetch -q --depth=1 --filter=blob:none origin \
+  "refs/tags/$prior_keep_core_tag:refs/tags/$prior_keep_core_tag"
+require_commit \
+  "$prior_keep_core_root" \
+  threshold-network/keep-core \
+  "$prior_keep_core"
+
 for keep_core_commit in \
   "$baseline_source" \
   "$baseline_parent" \
   "$evaluated_candidate" \
   "$evaluated_base" \
-  "$independently_tested_r1" \
-  "$prior_keep_core"
+  "$independently_tested_r1"
 do
   require_commit \
     "$repository_root" \
@@ -161,7 +178,7 @@ if ! git -C "$repository_root" merge-base --is-ancestor \
   echo "evaluated candidate base is not an ancestor of the candidate" >&2
   exit 1
 fi
-if [[ $(git -C "$repository_root" rev-parse "$prior_keep_core_tag^{commit}") != \
+if [[ $(git -C "$prior_keep_core_root" rev-parse "$prior_keep_core_tag^{commit}") != \
   "$prior_keep_core" ]]; then
   echo "$prior_keep_core_tag does not resolve to the frozen PRIOR commit" >&2
   exit 1
@@ -175,8 +192,8 @@ prior_go_sum="$scratch/prior.sum"
 prior_go_mod_json="$scratch/prior.mod.json"
 git -C "$repository_root" show "$evaluated_candidate:go.mod" >"$evaluated_go_mod"
 git -C "$repository_root" show "$evaluated_candidate:go.sum" >"$evaluated_go_sum"
-git -C "$repository_root" show "$prior_keep_core:go.mod" >"$prior_go_mod"
-git -C "$repository_root" show "$prior_keep_core:go.sum" >"$prior_go_sum"
+git -C "$prior_keep_core_root" show "$prior_keep_core:go.mod" >"$prior_go_mod"
+git -C "$prior_keep_core_root" show "$prior_keep_core:go.sum" >"$prior_go_sum"
 go mod edit -json "$evaluated_go_mod" >"$evaluated_go_mod_json"
 go mod edit -json "$prior_go_mod" >"$prior_go_mod_json"
 
@@ -228,7 +245,11 @@ anchor_count=0
 while IFS=$'\t' read -r source_repository source_commit source_path source_symbol; do
   case "$source_repository" in
     threshold-network/keep-core)
-      source_root=$repository_root
+      if [[ $source_commit == "$prior_keep_core" ]]; then
+        source_root=$prior_keep_core_root
+      else
+        source_root=$repository_root
+      fi
       ;;
     threshold-network/tss-lib)
       source_root="$scratch/tss-lib"
