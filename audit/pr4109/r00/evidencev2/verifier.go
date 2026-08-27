@@ -27,6 +27,9 @@ const (
 	maxTextArtifactBytes   int64  = 16 << 20
 	maxBinaryArtifactBytes int64  = 64 << 20
 	maxBundleArtifactBytes uint64 = 512 << 20
+	maxArtifactPathBytes          = 4096
+	maxArtifactPathDepth          = 32
+	layoutReadBatch               = 64
 )
 
 var (
@@ -38,6 +41,27 @@ var (
 type verifiedArtifact struct {
 	reference FileReference
 	data      []byte
+}
+
+type pinnedRootStep struct {
+	parent *os.Root
+	root   *os.Root
+	name   string
+	info   fs.FileInfo
+}
+
+type pinnedBundleRoot struct {
+	root     *os.Root
+	absolute string
+	info     fs.FileInfo
+}
+
+type layoutState struct {
+	expectedFiles       map[string]struct{}
+	expectedDirectories map[string]struct{}
+	seenFiles           map[string]struct{}
+	seenDirectories     map[string]struct{}
+	entries             int
 }
 
 type toolDigestEntry struct {
@@ -57,15 +81,22 @@ type toolDigestEntry struct {
 // CI provenance and reproducible-build verification are required before an
 // evidence consumer can make either determination.
 func VerifyBundle(bundleDirectory string) (*Report, error) {
+	bundleRoot, err := openBundleRoot(bundleDirectory)
+	if err != nil {
+		return nil, fmt.Errorf("bundle root: %w", err)
+	}
+	defer bundleRoot.root.Close()
+
 	rootData, err := readRegularFile(
-		filepath.Join(bundleDirectory, RootFilename),
+		bundleRoot.root,
+		RootFilename,
 		maxRootBytes,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("evidence root: %w", err)
 	}
 	rootDigest := sha256.Sum256(rootData)
-	if err := validateBundleAddress(bundleDirectory, hex.EncodeToString(rootDigest[:])); err != nil {
+	if err := validateBundleAddress(bundleRoot.absolute, hex.EncodeToString(rootDigest[:])); err != nil {
 		return nil, fmt.Errorf("evidence root: %w", err)
 	}
 	var root EvidenceRoot
@@ -78,12 +109,15 @@ func VerifyBundle(bundleDirectory string) (*Report, error) {
 	if err := verifyLegacyV1(); err != nil {
 		return nil, fmt.Errorf("legacy v1 binding: %w", err)
 	}
-	if err := verifyClosedLayout(bundleDirectory, root.Files); err != nil {
+	if err := verifyClosedLayout(bundleRoot.root, root.Files); err != nil {
 		return nil, fmt.Errorf("bundle layout: %w", err)
 	}
-	artifacts, err := verifyReferencedFiles(bundleDirectory, root.Files)
+	artifacts, err := verifyReferencedFiles(bundleRoot.root, root.Files)
 	if err != nil {
 		return nil, err
+	}
+	if err := verifyClosedLayout(bundleRoot.root, root.Files); err != nil {
+		return nil, fmt.Errorf("bundle layout changed while being read: %w", err)
 	}
 
 	bindings, inventoryDigest, consumed, err := verifyToolInventory(&root, artifacts)
@@ -151,6 +185,9 @@ func VerifyBundle(bundleDirectory string) (*Report, error) {
 		}
 		sort.Strings(unused)
 		return nil, fmt.Errorf("bundle contains unreferenced artifact roles %v", unused)
+	}
+	if err := verifyPinnedBundleRoot(bundleRoot); err != nil {
+		return nil, fmt.Errorf("bundle root changed while being verified: %w", err)
 	}
 	return report, nil
 }
@@ -480,13 +517,9 @@ func validateBuildInfo(
 	return validateModuleInventory(buildInfo.Modules, binding.Implementation)
 }
 
-func validateBundleAddress(bundleDirectory, rootDigest string) error {
-	absolute, err := filepath.Abs(bundleDirectory)
-	if err != nil {
-		return err
-	}
-	if filepath.Base(filepath.Dir(absolute)) != "sha256" ||
-		filepath.Base(absolute) != rootDigest {
+func validateBundleAddress(absoluteBundleDirectory, rootDigest string) error {
+	if filepath.Base(filepath.Dir(absoluteBundleDirectory)) != "sha256" ||
+		filepath.Base(absoluteBundleDirectory) != rootDigest {
 		return errors.New("bundle path must be sha256/<SHA-256(evidence-root.json)>")
 	}
 	return nil
@@ -575,12 +608,15 @@ func consumeArtifact(
 }
 
 func validateSafeRelativePath(name string) error {
-	if name == "" || !utf8.ValidString(name) || strings.Contains(name, `\`) ||
+	components := strings.Split(name, "/")
+	if name == "" || len(name) > maxArtifactPathBytes ||
+		len(components) > maxArtifactPathDepth || !utf8.ValidString(name) ||
+		strings.ContainsAny(name, "\\:\x00") ||
 		path.IsAbs(name) || path.Clean(name) != name || name == "." || name == ".." ||
 		strings.HasPrefix(name, "../") {
 		return errors.New("path is not canonical relative slash form")
 	}
-	for _, component := range strings.Split(name, "/") {
+	for _, component := range components {
 		if component == "" || component == "." || component == ".." {
 			return errors.New("path contains unsafe component")
 		}
@@ -588,66 +624,168 @@ func validateSafeRelativePath(name string) error {
 	return nil
 }
 
-func verifyClosedLayout(bundleDirectory string, references []FileReference) error {
-	root, err := filepath.Abs(bundleDirectory)
+func openBundleRoot(bundleDirectory string) (*pinnedBundleRoot, error) {
+	absolute, err := filepath.Abs(bundleDirectory)
+	if err != nil {
+		return nil, err
+	}
+	pathInfo, err := os.Lstat(absolute)
+	if err != nil {
+		return nil, err
+	}
+	if pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.IsDir() {
+		return nil, errors.New("bundle root is not a real directory")
+	}
+	bundleRoot, err := os.OpenRoot(absolute)
+	if err != nil {
+		return nil, err
+	}
+	openedInfo, err := bundleRoot.Stat(".")
+	if err != nil {
+		return nil, errors.Join(err, bundleRoot.Close())
+	}
+	pathInfoAfterOpen, err := os.Lstat(absolute)
+	if err != nil {
+		return nil, errors.Join(err, bundleRoot.Close())
+	}
+	if !openedInfo.IsDir() ||
+		pathInfoAfterOpen.Mode()&os.ModeSymlink != 0 ||
+		!pathInfoAfterOpen.IsDir() ||
+		!os.SameFile(pathInfo, openedInfo) ||
+		!os.SameFile(pathInfo, pathInfoAfterOpen) {
+		return nil, errors.Join(
+			errors.New("bundle root changed while being opened"),
+			bundleRoot.Close(),
+		)
+	}
+	return &pinnedBundleRoot{bundleRoot, absolute, pathInfo}, nil
+}
+
+func verifyPinnedBundleRoot(bundleRoot *pinnedBundleRoot) error {
+	pathInfo, err := os.Lstat(bundleRoot.absolute)
 	if err != nil {
 		return err
 	}
-	rootInfo, err := os.Lstat(root)
+	openedInfo, err := bundleRoot.root.Stat(".")
 	if err != nil {
 		return err
 	}
-	if rootInfo.Mode()&os.ModeSymlink != 0 || !rootInfo.IsDir() {
-		return errors.New("bundle root is not a real directory")
+	if pathInfo.Mode()&os.ModeSymlink != 0 ||
+		!pathInfo.IsDir() ||
+		!openedInfo.IsDir() ||
+		!os.SameFile(bundleRoot.info, pathInfo) ||
+		!os.SameFile(bundleRoot.info, openedInfo) {
+		return errors.New("bundle path no longer identifies the opened directory")
 	}
-	expectedFiles := map[string]struct{}{RootFilename: {}}
-	expectedDirectories := make(map[string]struct{})
+	return nil
+}
+
+func verifyClosedLayout(bundleRoot *os.Root, references []FileReference) error {
+	state := &layoutState{
+		expectedFiles:       map[string]struct{}{RootFilename: {}},
+		expectedDirectories: make(map[string]struct{}),
+		seenFiles:           make(map[string]struct{}),
+		seenDirectories:     make(map[string]struct{}),
+	}
 	for _, reference := range references {
-		expectedFiles[reference.Path] = struct{}{}
+		state.expectedFiles[reference.Path] = struct{}{}
 		for directory := path.Dir(reference.Path); directory != "."; directory = path.Dir(directory) {
-			expectedDirectories[directory] = struct{}{}
+			state.expectedDirectories[directory] = struct{}{}
 			if !strings.Contains(directory, "/") {
 				break
 			}
 		}
 	}
-	return filepath.WalkDir(root, func(entryPath string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entryPath == root {
-			return nil
-		}
-		relative, err := filepath.Rel(root, entryPath)
-		if err != nil {
-			return err
-		}
-		relative = filepath.ToSlash(relative)
-		if entry.Type()&os.ModeSymlink != 0 {
-			return fmt.Errorf("%s is a symlink", relative)
-		}
-		if entry.IsDir() {
-			if _, expected := expectedDirectories[relative]; !expected {
-				return fmt.Errorf("unexpected directory %s", relative)
+	if err := verifyClosedDirectory(bundleRoot, "", state); err != nil {
+		return err
+	}
+	if len(state.seenFiles) != len(state.expectedFiles) ||
+		len(state.seenDirectories) != len(state.expectedDirectories) {
+		return errors.New("bundle layout is missing expected files or directories")
+	}
+	return nil
+}
+
+func verifyClosedDirectory(
+	directoryRoot *os.Root,
+	prefix string,
+	state *layoutState,
+) (resultErr error) {
+	directory, err := directoryRoot.Open(".")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr, directory.Close())
+	}()
+	directoryInfo, err := directory.Stat()
+	if err != nil {
+		return err
+	}
+	if !directoryInfo.IsDir() {
+		return errors.New("opened layout component is not a directory")
+	}
+
+	for {
+		entries, readErr := directory.ReadDir(layoutReadBatch)
+		for _, entry := range entries {
+			state.entries++
+			if state.entries > len(state.expectedFiles)+len(state.expectedDirectories) {
+				return errors.New("bundle layout contains too many entries")
 			}
+			entryPath := entry.Name()
+			if prefix != "" {
+				entryPath = prefix + "/" + entryPath
+			}
+			entryInfo, err := directoryRoot.Lstat(entry.Name())
+			if err != nil {
+				return err
+			}
+			if entry.Type()&os.ModeSymlink != 0 || entryInfo.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("%s is a symlink", entryPath)
+			}
+			if entryInfo.IsDir() {
+				if _, expected := state.expectedDirectories[entryPath]; !expected {
+					return fmt.Errorf("unexpected directory %s", entryPath)
+				}
+				if _, duplicate := state.seenDirectories[entryPath]; duplicate {
+					return fmt.Errorf("duplicate directory %s", entryPath)
+				}
+				state.seenDirectories[entryPath] = struct{}{}
+				step, err := openPinnedSubroot(directoryRoot, entry.Name())
+				if err != nil {
+					return fmt.Errorf("directory %s: %w", entryPath, err)
+				}
+				childErr := verifyClosedDirectory(step.root, entryPath, state)
+				identityErr := verifyPinnedSubroot(step)
+				closeErr := step.root.Close()
+				if err := errors.Join(childErr, identityErr, closeErr); err != nil {
+					return fmt.Errorf("directory %s: %w", entryPath, err)
+				}
+				continue
+			}
+			if !entryInfo.Mode().IsRegular() {
+				return fmt.Errorf("%s is not a regular file", entryPath)
+			}
+			if _, expected := state.expectedFiles[entryPath]; !expected {
+				return fmt.Errorf("unexpected file %s", entryPath)
+			}
+			if _, duplicate := state.seenFiles[entryPath]; duplicate {
+				return fmt.Errorf("duplicate file %s", entryPath)
+			}
+			state.seenFiles[entryPath] = struct{}{}
+		}
+		if errors.Is(readErr, io.EOF) {
 			return nil
 		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
+		if readErr != nil {
+			return readErr
 		}
-		if !info.Mode().IsRegular() {
-			return fmt.Errorf("%s is not a regular file", relative)
-		}
-		if _, expected := expectedFiles[relative]; !expected {
-			return fmt.Errorf("unexpected file %s", relative)
-		}
-		return nil
-	})
+	}
 }
 
 func verifyReferencedFiles(
-	bundleDirectory string,
+	bundleRoot *os.Root,
 	references []FileReference,
 ) (map[string]verifiedArtifact, error) {
 	result := make(map[string]verifiedArtifact, len(references))
@@ -657,7 +795,8 @@ func verifyReferencedFiles(
 			return nil, fmt.Errorf("artifact %s: unsupported media type", reference.Path)
 		}
 		data, err := readRegularFile(
-			filepath.Join(bundleDirectory, filepath.FromSlash(reference.Path)),
+			bundleRoot,
+			reference.Path,
 			limit,
 		)
 		if err != nil {
@@ -675,28 +814,149 @@ func verifyReferencedFiles(
 	return result, nil
 }
 
-func readRegularFile(name string, limit int64) ([]byte, error) {
-	info, err := os.Lstat(name)
+func openPinnedSubroot(parent *os.Root, name string) (pinnedRootStep, error) {
+	pathInfo, err := parent.Lstat(name)
+	if err != nil {
+		return pinnedRootStep{}, err
+	}
+	if pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.IsDir() {
+		return pinnedRootStep{}, errors.New("path component is not a real directory")
+	}
+	child, err := parent.OpenRoot(name)
+	if err != nil {
+		return pinnedRootStep{}, err
+	}
+	openedInfo, err := child.Stat(".")
+	if err != nil {
+		return pinnedRootStep{}, errors.Join(err, child.Close())
+	}
+	pathInfoAfterOpen, err := parent.Lstat(name)
+	if err != nil {
+		return pinnedRootStep{}, errors.Join(err, child.Close())
+	}
+	if !openedInfo.IsDir() ||
+		pathInfoAfterOpen.Mode()&os.ModeSymlink != 0 ||
+		!pathInfoAfterOpen.IsDir() ||
+		!os.SameFile(pathInfo, openedInfo) ||
+		!os.SameFile(pathInfo, pathInfoAfterOpen) {
+		return pinnedRootStep{}, errors.Join(
+			errors.New("path component changed while being opened"),
+			child.Close(),
+		)
+	}
+	return pinnedRootStep{parent, child, name, pathInfo}, nil
+}
+
+func verifyPinnedSubroot(step pinnedRootStep) error {
+	pathInfo, err := step.parent.Lstat(step.name)
+	if err != nil {
+		return err
+	}
+	openedInfo, err := step.root.Stat(".")
+	if err != nil {
+		return err
+	}
+	if pathInfo.Mode()&os.ModeSymlink != 0 ||
+		!pathInfo.IsDir() ||
+		!openedInfo.IsDir() ||
+		!os.SameFile(step.info, pathInfo) ||
+		!os.SameFile(step.info, openedInfo) {
+		return errors.New("path component changed while being read")
+	}
+	return nil
+}
+
+func readRegularFile(
+	bundleRoot *os.Root,
+	name string,
+	limit int64,
+) (data []byte, resultErr error) {
+	if err := validateSafeRelativePath(name); err != nil {
+		return nil, err
+	}
+	components := strings.Split(name, "/")
+	currentRoot := bundleRoot
+	steps := make([]pinnedRootStep, 0, len(components)-1)
+	defer func() {
+		for index := len(steps) - 1; index >= 0; index-- {
+			resultErr = errors.Join(resultErr, steps[index].root.Close())
+		}
+	}()
+	for _, component := range components[:len(components)-1] {
+		step, err := openPinnedSubroot(currentRoot, component)
+		if err != nil {
+			return nil, err
+		}
+		steps = append(steps, step)
+		currentRoot = step.root
+	}
+
+	filename := components[len(components)-1]
+	pathInfo, err := currentRoot.Lstat(filename)
 	if err != nil {
 		return nil, err
 	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+	if pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.Mode().IsRegular() {
 		return nil, errors.New("not a regular, nonsymlink file")
 	}
-	if info.Size() < 0 || info.Size() > limit {
-		return nil, fmt.Errorf("file size %d exceeds limit %d", info.Size(), limit)
+	if pathInfo.Size() < 0 || pathInfo.Size() > limit {
+		return nil, fmt.Errorf("file size %d exceeds limit %d", pathInfo.Size(), limit)
 	}
-	file, err := os.Open(name)
+	file, err := currentRoot.Open(filename)
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
-	data, err := io.ReadAll(io.LimitReader(file, limit+1))
+	defer func() {
+		resultErr = errors.Join(resultErr, file.Close())
+	}()
+	openedInfo, err := file.Stat()
 	if err != nil {
 		return nil, err
 	}
-	if int64(len(data)) != info.Size() {
+	pathInfoAfterOpen, err := currentRoot.Lstat(filename)
+	if err != nil {
+		return nil, err
+	}
+	if !openedInfo.Mode().IsRegular() ||
+		pathInfoAfterOpen.Mode()&os.ModeSymlink != 0 ||
+		!pathInfoAfterOpen.Mode().IsRegular() ||
+		!os.SameFile(pathInfo, openedInfo) ||
+		!os.SameFile(pathInfo, pathInfoAfterOpen) {
+		return nil, errors.New("file changed while being opened")
+	}
+	if openedInfo.Size() < 0 || openedInfo.Size() > limit {
+		return nil, fmt.Errorf("file size %d exceeds limit %d", openedInfo.Size(), limit)
+	}
+
+	data, err = io.ReadAll(io.LimitReader(file, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("file size exceeds limit %d", limit)
+	}
+	openedInfoAfterRead, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	pathInfoAfterRead, err := currentRoot.Lstat(filename)
+	if err != nil {
+		return nil, err
+	}
+	if pathInfoAfterRead.Mode()&os.ModeSymlink != 0 ||
+		!pathInfoAfterRead.Mode().IsRegular() ||
+		!openedInfoAfterRead.Mode().IsRegular() ||
+		!os.SameFile(pathInfo, pathInfoAfterRead) ||
+		!os.SameFile(pathInfo, openedInfoAfterRead) ||
+		openedInfoAfterRead.Size() != openedInfo.Size() ||
+		pathInfoAfterRead.Size() != openedInfo.Size() ||
+		int64(len(data)) != openedInfo.Size() {
 		return nil, errors.New("file changed while being read")
+	}
+	for _, step := range steps {
+		if err := verifyPinnedSubroot(step); err != nil {
+			return nil, err
+		}
 	}
 	return data, nil
 }

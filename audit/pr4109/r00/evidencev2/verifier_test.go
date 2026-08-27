@@ -101,6 +101,31 @@ func TestStrictJSONRejectsUnknownAndDuplicateFields(t *testing.T) {
 	})
 }
 
+func TestSafeRelativePathRejectsPlatformEscapes(t *testing.T) {
+	unsafePaths := []string{
+		"../escape",
+		"/absolute",
+		`C:\absolute`,
+		"C:volume-relative",
+		`directory\file`,
+		"directory/../file",
+		"directory//file",
+		"directory/\x00file",
+		strings.Repeat("a/", maxArtifactPathDepth) + "file",
+		strings.Repeat("a", maxArtifactPathBytes+1),
+	}
+	for index, unsafePath := range unsafePaths {
+		t.Run(fmt.Sprintf("case-%02d", index), func(t *testing.T) {
+			if err := validateSafeRelativePath(unsafePath); err == nil {
+				t.Fatalf("unsafe path %q was accepted", unsafePath)
+			}
+		})
+	}
+	if err := validateSafeRelativePath("cases/R00-01.json"); err != nil {
+		t.Fatalf("canonical path was rejected: %v", err)
+	}
+}
+
 func TestIdentityArtifactAndLayoutMutationsFailClosed(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -161,6 +186,33 @@ func TestIdentityArtifactAndLayoutMutationsFailClosed(t *testing.T) {
 			},
 			"symlink",
 		},
+		{
+			"in-root file symlink",
+			func(t *testing.T, fixture *syntheticFixture) {
+				path := fixture.pathForRole(t, "case_r00-01")
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink("R00-02.json", path); err != nil {
+					t.Skipf("symlink unavailable: %v", err)
+				}
+			},
+			"symlink",
+		},
+		{
+			"intermediate directory symlink",
+			func(t *testing.T, fixture *syntheticFixture) {
+				cases := filepath.Join(fixture.directory, "cases")
+				realCases := filepath.Join(fixture.directory, "cases-real")
+				if err := os.Rename(cases, realCases); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink("cases-real", cases); err != nil {
+					t.Skipf("symlink unavailable: %v", err)
+				}
+			},
+			"symlink",
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -179,6 +231,109 @@ func TestContentAddressedRootCannotBeReplacedInPlace(t *testing.T) {
 	}
 	fixture.directory = wrong
 	assertVerifyFails(t, fixture, "bundle path must be sha256")
+}
+
+func TestBundleRootSymlinkFailsClosed(t *testing.T) {
+	fixture := newSyntheticFixture(t)
+	realDirectory := fixture.directory + "-real"
+	if err := os.Rename(fixture.directory, realDirectory); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realDirectory, fixture.directory); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	assertVerifyFails(t, fixture, "bundle root is not a real directory")
+}
+
+func TestPinnedBundleRootDetectsPersistentReplacement(t *testing.T) {
+	fixture := newSyntheticFixture(t)
+	bundleRoot, err := openBundleRoot(fixture.directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := bundleRoot.root.Close(); err != nil {
+			t.Errorf("close bundle root: %v", err)
+		}
+	})
+	realDirectory := fixture.directory + "-real"
+	if err := os.Rename(fixture.directory, realDirectory); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(fixture.directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyPinnedBundleRoot(bundleRoot); err == nil ||
+		!strings.Contains(err.Error(), "no longer identifies") {
+		t.Fatalf("persistent bundle-root replacement error is %v", err)
+	}
+}
+
+func TestReadRegularFileRejectsSymlinkComponentsDirectly(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*testing.T, string) string
+	}{
+		{
+			"in-root final symlink",
+			func(t *testing.T, root string) string {
+				if err := os.WriteFile(filepath.Join(root, "target"), []byte("target"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink("target", filepath.Join(root, "link")); err != nil {
+					t.Skipf("symlink unavailable: %v", err)
+				}
+				return "link"
+			},
+		},
+		{
+			"external final symlink",
+			func(t *testing.T, root string) string {
+				target := filepath.Join(t.TempDir(), "target")
+				if err := os.WriteFile(target, []byte("target"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, filepath.Join(root, "link")); err != nil {
+					t.Skipf("symlink unavailable: %v", err)
+				}
+				return "link"
+			},
+		},
+		{
+			"intermediate directory symlink",
+			func(t *testing.T, root string) string {
+				realDirectory := filepath.Join(root, "real")
+				if err := os.Mkdir(realDirectory, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(realDirectory, "payload"), []byte("payload"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink("real", filepath.Join(root, "alias")); err != nil {
+					t.Skipf("symlink unavailable: %v", err)
+				}
+				return "alias/payload"
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			name := test.setup(t, directory)
+			root, err := os.OpenRoot(directory)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := root.Close(); err != nil {
+					t.Errorf("close root: %v", err)
+				}
+			})
+			if _, err := readRegularFile(root, name, 1024); err == nil {
+				t.Fatal("symlinked path was accepted")
+			}
+		})
+	}
 }
 
 func TestR0001And02DirectionDecodeTimeoutPanicAndResultMutations(t *testing.T) {

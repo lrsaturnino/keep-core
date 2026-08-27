@@ -61,6 +61,12 @@ paths, unreferenced artifacts, and hash/size drift. Empty `text/plain` logs are
 valid so an honestly empty stderr remains empty. It caps individual JSON
 artifacts at 8 MiB, text artifacts at 16 MiB, binary artifacts at 64 MiB, and
 all referenced artifacts together at 512 MiB before retaining them in memory.
+Directory enumeration is streamed in bounded batches. The verifier pins the
+bundle root, each traversed directory, and each opened file by filesystem
+identity, then repeats the closed-layout and root-identity checks before
+success. This is not an atomic filesystem snapshot: verification must run over
+a private, read-only artifact directory with no concurrent writers or mount
+changes.
 
 ## Fixture identity
 
