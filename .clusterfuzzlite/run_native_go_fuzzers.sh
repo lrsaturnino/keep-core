@@ -46,7 +46,7 @@ fi
 mkdir -p "$fuzz_log_dir"
 
 targets=()
-packages=()
+representative_targets=()
 declare -A seen_targets=()
 declare -A seen_packages=()
 while read -r package fuzz_function; do
@@ -65,7 +65,7 @@ while read -r package fuzz_function; do
 	targets+=("$package $fuzz_function")
 	if [[ -z "${seen_packages[$package]:-}" ]]; then
 		seen_packages["$package"]=1
-		packages+=("$package")
+		representative_targets+=("$package $fuzz_function")
 	fi
 done < <(
 	awk '$1 == "compile_native_go_fuzzer" {print $2, $3}' \
@@ -94,15 +94,27 @@ for target in "${targets[@]}"; do
 	scheduled_targets+=("$target $per_target_seconds")
 done
 
-# Compile every package with the same ASAN setting before starting the bounded
-# fuzz phase. This keeps dependency/toolchain setup out of the fuzz budget and
-# makes a compile failure a direct, fail-closed result.
-echo "Preflighting ${#packages[@]} native Go fuzz packages with ASAN."
-GOMAXPROCS="$fuzz_max_parallel" go test \
-	-asan \
-	-count=1 \
-	-run='^$' \
-	"${packages[@]}"
+# A normal `go test -run=^$` build does not warm the separately instrumented
+# build used by `go test -fuzz`. Compile one representative fuzz target from
+# every package before the timed phase; target selection does not change the
+# resulting test binary, so the remaining targets reuse the same build cache.
+# This makes the per-target deadline measure fuzz execution rather than
+# machine-dependent cold compilation.
+preflight_binary="$(mktemp "$fuzz_log_dir/.preflight.test.XXXXXX")"
+trap 'rm -f -- "$preflight_binary"' EXIT
+echo "Precompiling ${#representative_targets[@]} fuzz-instrumented Go packages with ASAN."
+for representative_target in "${representative_targets[@]}"; do
+	read -r package fuzz_function <<<"$representative_target"
+	echo "PRECOMPILE $package $fuzz_function"
+	GOMAXPROCS="$fuzz_max_parallel" go test \
+		-c \
+		-asan \
+		-fuzz="^${fuzz_function}$" \
+		-o "$preflight_binary" \
+		"$package"
+done
+rm -f -- "$preflight_binary"
+trap - EXIT
 
 run_target() {
 	local package="$1"

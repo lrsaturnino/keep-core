@@ -25,6 +25,13 @@ ClusterFuzzLite build action, then avoids the failing run path by using
 `go test -asan -fuzz` directly. CI enforces these choices with
 `check_workflow_contract.sh`.
 
+The PR runner accounts for cold hosted workers explicitly. Before starting
+the bounded phase, it compiles one fuzz-instrumented ASAN test binary for each
+unique package; every target in that package then reuses the warmed build
+cache. This keeps machine-dependent compilation outside the 300-second phase
+cap while preserving the eight-second-per-target fuzz budget and the tight
+per-target runtime deadline.
+
 ## Adding / regenerating targets
 
 `build.sh` must list one `compile_native_go_fuzzer` line per `Fuzz*` target.
