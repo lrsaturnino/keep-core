@@ -1,15 +1,17 @@
 name: ClusterFuzzLite PR fuzzing
 
-# Builds the native Go fuzz targets and fuzzes only the code changed in a PR
-# (code-change mode), giving fast per-PR feedback. Exits on the first crash.
-# Complements the nightly -race job and the batch fuzzer below.
+# Builds the ClusterFuzzLite binaries, then runs every registered testing.F
+# target with Go's native coverage engine and AddressSanitizer. Keeping the
+# build action validates the scheduled batch path; replacing only run_fuzzers
+# avoids its intermittent native-Go inline-counter startup crash. The scheduled
+# ClusterFuzzLite batch job remains separate for longer corpus runs.
 on:
   pull_request:
     paths:
       - "pkg/**"
       - ".clusterfuzzlite/**"
-      # Infra the fuzz build depends on: a change here can break the
-      # CFLite build without touching pkg/, and would otherwise only be
+      # Infra the fuzz runners depend on: a change here can break fuzzing
+      # without touching pkg/, and would otherwise only be
       # caught by the nightly batch run.
       - "go.mod"
       - "go.sum"
@@ -17,24 +19,29 @@ on:
       - ".github/workflows/cflite_pr.yml"
       - ".github/workflows/cflite_batch.yml"
 
-# No security-events permission: this repo has no GitHub Advanced
-# Security, so SARIF upload to code scanning would 403. Crash artifacts
-# are reported via the action's run output and artifacts instead.
+# The native runner needs no write or security-events permission. Crash
+# evidence is reported through the job log and a failure-only artifact.
 permissions:
   contents: read
 
 jobs:
   target-sync:
     # build.sh's registration list is a second source of truth: a new
-    # Fuzz* function that is not registered silently gets zero CFLite
+    # Fuzz* function that is not registered silently gets zero continuous
     # coverage. Fail the PR instead.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Check fuzz targets are registered in build.sh
         run: ./.clusterfuzzlite/check_targets.sh
+      - name: Check workflow language contract
+        run: ./.clusterfuzzlite/check_workflow_contract.sh
 
   PR:
+    needs: target-sync
+    # Preserve the required PR check even when the dependency fails. Without
+    # this, GitHub can treat the skipped required job as successful.
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     concurrency:
       group: ${{ github.workflow }}-${{ matrix.sanitizer }}-${{ github.ref }}
@@ -42,21 +49,43 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Go native fuzzing builds under libFuzzer + AddressSanitizer.
+        # Go's native coverage engine with AddressSanitizer enabled.
         sanitizer: [address]
     steps:
-      - name: Build fuzzers (${{ matrix.sanitizer }})
-        id: build
+      - name: Require successful fuzz-infrastructure checks
+        if: ${{ needs.target-sync.result != 'success' }}
+        run: |
+          echo "target-sync finished with: ${{ needs.target-sync.result }}" >&2
+          exit 1
+      - uses: actions/checkout@v4
+      - name: Build ClusterFuzzLite fuzzers (${{ matrix.sanitizer }})
+        id: cflite-build
         uses: google/clusterfuzzlite/actions/build_fuzzers@82652fb49e77bc29c35da1167bb286e93c6bcc05 # v1
         with:
           language: go
           github-token: ${{ secrets.GITHUB_TOKEN }}
           sanitizer: ${{ matrix.sanitizer }}
-      - name: Run fuzzers (${{ matrix.sanitizer }})
-        id: run
-        uses: google/clusterfuzzlite/actions/run_fuzzers@82652fb49e77bc29c35da1167bb286e93c6bcc05 # v1
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          fuzz-seconds: 300
-          mode: "code-change"
-          sanitizer: ${{ matrix.sanitizer }}
+          # Keep CI on the repository's exact toolchain directive rather than
+          # setup-go's newest matching patch release.
+          go-version: "1.25.10"
+      - name: Run native Go fuzzers (${{ matrix.sanitizer }})
+        id: native-fuzz
+        env:
+          FUZZ_LOG_DIR: ${{ runner.temp }}/native-go-fuzz-logs
+          FUZZ_MAX_PARALLEL: 2
+          FUZZ_TARGET_GRACE_SECONDS: 45
+          FUZZ_TOTAL_SECONDS: 300
+          FUZZ_WALL_TIMEOUT_SECONDS: 300
+        run: ./.clusterfuzzlite/run_native_go_fuzzers.sh
+      - name: Upload native Go fuzz failure evidence
+        if: ${{ failure() && steps.native-fuzz.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-go-fuzz-failure-${{ matrix.sanitizer }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/native-go-fuzz-logs
+            pkg/**/testdata/fuzz/**
+          if-no-files-found: warn

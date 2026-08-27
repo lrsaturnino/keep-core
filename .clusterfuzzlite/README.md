@@ -1,10 +1,10 @@
 # Continuous fuzzing
 
 This directory wires keep-core's native Go fuzz targets (the `Fuzz*` functions
-under `pkg/**/fuzz_test.go`) into **ClusterFuzzLite** — OSS-Fuzz's self-hosted
-variant that runs in this repo's own GitHub Actions and **works on private
-repos**. That last property is why ClusterFuzzLite, not OSS-Fuzz, is the right
-tool for this fork (OSS-Fuzz only fuzzes public projects).
+under `pkg/**/fuzz_test.go`) into two complementary runners: Go's native fuzz
+engine for required pull-request checks and **ClusterFuzzLite** for scheduled
+batch runs. ClusterFuzzLite is OSS-Fuzz's self-hosted variant and works on
+private repositories; OSS-Fuzz itself only fuzzes public projects.
 
 ## Files
 
@@ -13,13 +13,23 @@ tool for this fork (OSS-Fuzz only fuzzes public projects).
 | `Dockerfile` | build image (`base-builder-go`) |
 | `build.sh` | compiles every `Fuzz*` target into a libFuzzer binary (path-qualified output names — several `Fuzz*` funcs share a name across packages) |
 | `project.yaml` | `language: go` |
-| `../.github/workflows/cflite_pr.yml` | per-PR fuzzing of changed code (fast, exits on first crash) |
+| `run_native_go_fuzzers.sh` | runs every registered target with native Go coverage and ASAN under the PR budget |
+| `../.github/workflows/cflite_pr.yml` | required CFLite build validation plus native-Go PR fuzzing over every registered target |
 | `../.github/workflows/cflite_batch.yml` | scheduled longer run over all targets |
+
+Every `build_fuzzers` and `run_fuzzers` step must set `language: go`; the
+actions have independent inputs and otherwise default to `c++`. That is a
+configuration contract, not a workaround for libFuzzer's intermittent
+native-Go inline-counter startup failure. The PR workflow retains the pinned
+ClusterFuzzLite build action, then avoids the failing run path by using
+`go test -asan -fuzz` directly. CI enforces these choices with
+`check_workflow_contract.sh`.
 
 ## Adding / regenerating targets
 
 `build.sh` must list one `compile_native_go_fuzzer` line per `Fuzz*` target.
-CI enforces this (`check_targets.sh` runs on every PR and fails on drift).
+CI enforces this (`check_targets.sh` runs on every relevant PR and fails on
+drift).
 Regenerate after adding targets:
 
 ```sh
@@ -53,25 +63,26 @@ Until then, each batch run starts from the in-tree seed corpus.
 
 ## Fork-lifecycle policy (why this exists)
 
-This is a **private fork** of the public `github.com/keep-network/keep-core`.
-Fuzzing finds bugs in code; whether a finding is fork-relevant depends on how
-far the fork has diverged. Two facts drive the policy:
+Security release branches and downstream forks can diverge from public
+`github.com/keep-network/keep-core`. Fuzzing finds bugs in code; whether a
+finding applies depends on how far the tested branch has diverged. Two facts
+drive the policy:
 
 - **Fixes do not flow back automatically.** A bug fixed upstream stays open in
-  this fork until deliberately back-merged (this engagement already hit exactly
-  that: upstream's OOB fix was incomplete and had to be back-merged by hand).
-- **Fork-divergent code gets no upstream coverage.** OSS-Fuzz on the upstream
-  cannot see code that only exists here.
+  a divergent branch until deliberately back-merged.
+- **Branch-divergent code gets no upstream coverage.** OSS-Fuzz on the public
+  upstream cannot see code that only exists on another branch or fork.
 
 Policy:
 
-1. **Run ClusterFuzzLite here** (this directory) so the fork's own code —
-   including divergent paths — is fuzzed in its own CI.
+1. **Run native Go PR fuzzing and scheduled ClusterFuzzLite here** (this
+   directory) so this repository's code — including divergent paths — is
+   fuzzed in its own CI.
 2. **Track upstream `main`**: reconcile within a bounded window (e.g. N commits
-   or one release) so shared-parser fixes found upstream reach the fork.
+   or one release) so shared-parser fixes reach downstream branches.
 3. **Contribute the fuzz targets upstream** (below) so the shared parsers get
-   continuous OSS-Fuzz coverage at Google's scale, and so this fork inherits
-   that coverage on the shared code after each reconcile.
+   continuous OSS-Fuzz coverage at Google's scale, and so downstream branches
+   inherit that coverage on shared code after each reconcile.
 
 ## OSS-Fuzz for the public upstream
 

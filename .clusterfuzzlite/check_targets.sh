@@ -22,13 +22,46 @@ expected="$(
 		sort -u
 )"
 
-registered="$(
-	grep -E '^compile_native_go_fuzzer ' .clusterfuzzlite/build.sh |
-		awk '{print $2, $3}' |
-		sort -u
+malformed_registrations="$(
+	awk '
+		$1 == "compile_native_go_fuzzer" && NF != 4 {
+			print NR ":" $0
+		}
+	' .clusterfuzzlite/build.sh
+)"
+if [[ -n "$malformed_registrations" ]]; then
+	echo "Malformed fuzz target registration(s); expected exactly four fields:" >&2
+	printf '  %s\n' "$malformed_registrations" >&2
+	exit 1
+fi
+
+registered_raw="$(
+	awk '$1 == "compile_native_go_fuzzer" {print $2, $3}' \
+		.clusterfuzzlite/build.sh
 )"
 
-if ! diff <(echo "$expected") <(echo "$registered") >&2; then
+duplicate_registrations="$(printf '%s\n' "$registered_raw" | sort | uniq -d)"
+if [[ -n "$duplicate_registrations" ]]; then
+	echo "Duplicate fuzz target registration(s) in .clusterfuzzlite/build.sh:" >&2
+	printf '  %s\n' "$duplicate_registrations" >&2
+	exit 1
+fi
+
+duplicate_outputs="$(
+	awk '$1 == "compile_native_go_fuzzer" {print $4}' \
+		.clusterfuzzlite/build.sh |
+		sort |
+		uniq -d
+)"
+if [[ -n "$duplicate_outputs" ]]; then
+	echo "Duplicate fuzz target output name(s) in .clusterfuzzlite/build.sh:" >&2
+	printf '  %s\n' "$duplicate_outputs" >&2
+	exit 1
+fi
+
+registered="$(printf '%s\n' "$registered_raw" | sort)"
+
+if ! diff <(printf '%s\n' "$expected") <(printf '%s\n' "$registered") >&2; then
 	echo >&2
 	echo "Fuzz target drift detected:" >&2
 	echo "  < targets found in pkg/ but not registered in .clusterfuzzlite/build.sh" >&2
@@ -37,4 +70,4 @@ if ! diff <(echo "$expected") <(echo "$registered") >&2; then
 	exit 1
 fi
 
-echo "OK: $(echo "$expected" | wc -l) fuzz targets, build.sh registration list in sync."
+echo "OK: $(printf '%s\n' "$expected" | wc -l) fuzz targets, build.sh registration list in sync."
