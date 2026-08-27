@@ -89,6 +89,12 @@ fi
 # hard aggregate wall cap while two single-worker targets run concurrently.
 per_target_seconds="$(((fuzz_total_seconds + target_count - 1) / target_count))"
 scheduled_fuzz_seconds="$((per_target_seconds * target_count))"
+if [[ "$fuzz_target_grace_seconds" -lt "$((per_target_seconds + 5))" ]]; then
+	echo "FUZZ_TARGET_GRACE_SECONDS must be at least one target interval plus 5 seconds" >&2
+	echo "  target interval: ${per_target_seconds}s" >&2
+	echo "  configured grace: ${fuzz_target_grace_seconds}s" >&2
+	exit 1
+fi
 scheduled_targets=()
 for target in "${targets[@]}"; do
 	scheduled_targets+=("$target $per_target_seconds")
@@ -116,23 +122,14 @@ done
 rm -f -- "$preflight_binary"
 trap - EXIT
 
-run_target() {
+run_go_fuzz_attempt() {
 	local package="$1"
 	local fuzz_function="$2"
 	local target_seconds="$3"
-	local package_suffix="${package#github.com/keep-network/keep-core/}"
-	local log_name="${package_suffix//\//_}_${fuzz_function}.log"
-	local log_path="$fuzz_log_dir/$log_name"
-	local go_grace_seconds="$fuzz_target_grace_seconds"
-	local go_timeout_seconds
-	local status
+	local go_timeout_seconds="$4"
+	local log_path="$5"
 
-	if [[ "$go_grace_seconds" -gt 5 ]]; then
-		go_grace_seconds="$((go_grace_seconds - 5))"
-	fi
-	go_timeout_seconds="$((target_seconds + go_grace_seconds))"
-
-	if env GOMAXPROCS=1 \
+	env GOMAXPROCS=1 \
 		go test \
 			-asan \
 			-count=1 \
@@ -143,17 +140,147 @@ run_target() {
 			-fuzzminimizetime=0 \
 			-timeout="${go_timeout_seconds}s" \
 			"$package" >"$log_path" 2>&1
+}
+
+# Go issue 75804 can leak the fuzz-time context deadline as exit 1 even after
+# the requested fuzz duration completed without a target failure. The upstream
+# fix (golang/go@5a957dc) is newer than the repository's pinned Go 1.25 line.
+# Match its exact harness-only signature; any crash, failing corpus input,
+# panic, sanitizer finding, generic error, or incomplete fuzz interval remains
+# a hard failure.
+is_go_fuzztime_deadline_race() {
+	local log_path="$1"
+	local package="$2"
+	local fuzz_function="$3"
+	local target_seconds="$4"
+
+	awk \
+		-v package_path="$package" \
+		-v fuzz_function="$fuzz_function" \
+		-v target_seconds="$target_seconds" '
+		BEGIN {
+			baseline_pattern = "^fuzz: elapsed: [0-9]+s, gathering baseline coverage: "
+			baseline_pattern = baseline_pattern "[0-9]+/[0-9]+ completed"
+			baseline_pattern = baseline_pattern "(, now fuzzing with 1 workers)?$"
+			progress_pattern = "^fuzz: elapsed: [0-9]+s, execs: [0-9]+ "
+			progress_pattern = progress_pattern "\\([0-9]+/sec\\), new interesting: "
+			progress_pattern = progress_pattern "[0-9]+ \\(total: [0-9]+\\)$"
+			completed_pattern = "^fuzz: elapsed: " target_seconds "s, execs: [1-9][0-9]* "
+			completed_pattern = completed_pattern "\\([0-9]+/sec\\), new interesting: "
+			completed_pattern = completed_pattern "[0-9]+ \\(total: [0-9]+\\)$"
+			fail_pattern = "^--- FAIL: " fuzz_function " \\("
+			fail_pattern = fail_pattern target_seconds "(\\.[0-9]+)?s\\)$"
+			duration_pattern = "^[0-9]+(\\.[0-9]+)?s$"
+		}
+
+		{ lines[++line_count] = $0 }
+
+		END {
+			# The exact Go issue 75804 failure ends in six contiguous lines:
+			# completed fuzz stats, target failure, sole deadline diagnostic,
+			# FAIL, exit status 1, and the package FAIL trailer. Nothing may
+			# follow the trailer or appear before it except normal fuzz stats.
+			if (line_count < 7) {
+				exit 1
+			}
+
+			terminal_start = line_count - 5
+			for (i = 1; i < terminal_start; i++) {
+				if (lines[i] ~ /, now fuzzing with 1 workers$/) {
+					saw_fuzz_start = 1
+				}
+				if (lines[i] !~ baseline_pattern && lines[i] !~ progress_pattern) {
+					exit 1
+				}
+			}
+
+			if (!saw_fuzz_start || lines[terminal_start] !~ completed_pattern ||
+				lines[terminal_start + 1] !~ fail_pattern ||
+				lines[terminal_start + 2] != "    context deadline exceeded" ||
+				lines[terminal_start + 3] != "FAIL" ||
+				lines[terminal_start + 4] != "exit status 1") {
+				exit 1
+			}
+
+			field_count = split(lines[terminal_start + 5], trailer, /[[:space:]]+/)
+			if (field_count != 3 || trailer[1] != "FAIL" ||
+				trailer[2] != package_path || trailer[3] !~ duration_pattern) {
+				exit 1
+			}
+		}
+	' "$log_path"
+}
+
+run_target() {
+	local package="$1"
+	local fuzz_function="$2"
+	local target_seconds="$3"
+	local package_suffix="${package#github.com/keep-network/keep-core/}"
+	local log_name="${package_suffix//\//_}_${fuzz_function}.log"
+	local log_path="$fuzz_log_dir/$log_name"
+	local first_attempt_log="${log_path%.log}.fuzztime-deadline-race.log"
+	local go_grace_seconds="$fuzz_target_grace_seconds"
+	local go_timeout_seconds
+	local status
+
+	if [[ "$go_grace_seconds" -gt 5 ]]; then
+		go_grace_seconds="$((go_grace_seconds - 5))"
+	fi
+	go_timeout_seconds="$((target_seconds + go_grace_seconds))"
+
+	if run_go_fuzz_attempt \
+		"$package" \
+		"$fuzz_function" \
+		"$target_seconds" \
+		"$go_timeout_seconds" \
+		"$log_path"
 	then
 		echo "PASS $package $fuzz_function (${target_seconds}s)"
 		return 0
 	else
 		status=$?
-		echo "FAIL $package $fuzz_function (exit $status)" >&2
+	fi
+
+	if [[ "$status" -eq 1 ]] && is_go_fuzztime_deadline_race \
+		"$log_path" \
+		"$package" \
+		"$fuzz_function" \
+		"$target_seconds"
+	then
+		if ! mv -- "$log_path" "$first_attempt_log"; then
+			echo "FAIL $package $fuzz_function: could not preserve first attempt" >&2
+			cat "$log_path" >&2
+			return 1
+		fi
+		echo "RETRY $package $fuzz_function after Go fuzztime deadline race"
+		cat "$first_attempt_log" >&2
+		if run_go_fuzz_attempt \
+			"$package" \
+			"$fuzz_function" \
+			"$target_seconds" \
+			"$go_timeout_seconds" \
+			"$log_path"
+		then
+			echo "PASS $package $fuzz_function (${target_seconds}s; one deadline-race retry)"
+			return 0
+		else
+			status=$?
+		fi
+		echo "FAIL $package $fuzz_function after deadline-race retry (exit $status)" >&2
+		echo "first attempt (matched Go issue 75804):" >&2
+		cat "$first_attempt_log" >&2
+		echo "retry:" >&2
 		cat "$log_path" >&2
 		return "$status"
 	fi
+
+	echo "FAIL $package $fuzz_function (exit $status)" >&2
+	cat "$log_path" >&2
+	return "$status"
 }
 
+export -f run_go_fuzz_attempt
+export -f is_go_fuzztime_deadline_race
 export -f run_target
 export fuzz_log_dir fuzz_target_grace_seconds
 

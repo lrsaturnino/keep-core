@@ -165,6 +165,19 @@ if [[ "$native_runner_count" -ne 1 ]]; then
 	exit 1
 fi
 
+native_runner_test_count="$(
+	awk '
+		/^[[:space:]]*run:[[:space:]]*\.\/\.clusterfuzzlite\/test_native_go_fuzzers\.sh[[:space:]]*(#.*)?$/ {
+			found++
+		}
+		END { print found + 0 }
+	' "$pr_workflow"
+)"
+if [[ "$native_runner_test_count" -ne 1 ]]; then
+	echo "$pr_workflow: expected exactly one native Go runner contract-test step" >&2
+	exit 1
+fi
+
 native_go_version="$(
 	action_input \
 		"$pr_workflow" \

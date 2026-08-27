@@ -14,6 +14,7 @@ private repositories; OSS-Fuzz itself only fuzzes public projects.
 | `build.sh` | compiles every `Fuzz*` target into a libFuzzer binary (path-qualified output names — several `Fuzz*` funcs share a name across packages) |
 | `project.yaml` | `language: go` |
 | `run_native_go_fuzzers.sh` | runs every registered target with native Go coverage and ASAN under the PR budget |
+| `test_native_go_fuzzers.sh` | exercises the runner's deadline-race retry and fail-closed behavior with a fake Go command on Linux |
 | `../.github/workflows/cflite_pr.yml` | required CFLite build validation plus native-Go PR fuzzing over every registered target |
 | `../.github/workflows/cflite_batch.yml` | scheduled longer run over all targets |
 
@@ -31,6 +32,19 @@ unique package; every target in that package then reuses the warmed build
 cache. This keeps machine-dependent compilation outside the 300-second phase
 cap while preserving the eight-second-per-target fuzz budget and the tight
 per-target runtime deadline.
+
+The pinned Go 1.25 fuzz coordinator also has a known termination race
+([golang/go#75804](https://github.com/golang/go/issues/75804)): after the
+requested `-fuzztime` completes, the harness can rarely leak its own
+`context deadline exceeded` as exit 1. The runner permits one retry only when
+the complete log matches that exact harness grammar through its package
+trailer and EOF, with a nonzero execution count and a completed fuzz interval.
+A second occurrence, incomplete interval, extra diagnostic, panic, sanitizer
+finding, failing corpus input, signal, or any other error still fails the job.
+The configured target grace must reserve at least one additional target
+interval plus five seconds, and the original process-group and aggregate
+deadlines remain authoritative across the retry. Linux contract tests enforce
+those boundaries.
 
 ## Adding / regenerating targets
 

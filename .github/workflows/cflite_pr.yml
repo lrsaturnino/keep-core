@@ -36,6 +36,8 @@ jobs:
         run: ./.clusterfuzzlite/check_targets.sh
       - name: Check workflow language contract
         run: ./.clusterfuzzlite/check_workflow_contract.sh
+      - name: Test native Go runner contracts
+        run: ./.clusterfuzzlite/test_native_go_fuzzers.sh
 
   PR:
     needs: target-sync
